@@ -89,3 +89,20 @@ Erster, bewusst schmaler Schnitt. EVtivity erhält eine Zahlungsart **Rechnung**
 ### Umsetzung
 
 Zweig `feature/invoice-payment-mode` ab `v0.1.25`, `--no-ff` in `rhiem/main`.
+
+## Umsetzungsstand (29.09.2026)
+
+Umgesetzt auf `feature/invoice-payment-mode` (`801493e`), gemergt in `rhiem/main`.
+
+- Schema: Enum `payment_mode` in eigener Schema-Datei (`packages/database/src/schema/payment-mode.ts`), weil sich `drivers.ts` und `charging.ts` gegenseitig importieren. Migration `0089_payment_mode` von Hand angelegt (siehe [ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)).
+- Auflösung: `resolvePaymentMode()` in `packages/api/src/services/driver.service.ts`. Im OCPP-Pfad setzt `snapshotPaymentMode()` den Wert per `UPDATE … RETURNING` in einem Schritt am Vorgang.
+- Portal-Start: Die Zahlungsprüfung greift wie bisher nur, wenn Stripe konfiguriert ist. Im Rechnungsmodus wird sie übersprungen.
+- Oberfläche: Die Auswahl der Zahlungsart steht in den Detail- bzw. Bearbeitungsformularen von Fahrer und Flotte. In den Anlageformularen fehlt sie, dort lässt sich die Zahlungsart vorerst nur über die API setzen.
+- Tests: Unit- und Routentests (Auflösung, Portal-Start, OCPP-Gate beim RFID-Start, Fahrer-/Flotten-API, Karten-Filter). Das Repo hat keine Integrationstests (`test:integration` verweist auf eine fehlende Konfiguration). Zusätzlich wurden das SQL gegen die lokale Datenbank und der Ablauf über die laufende API geprüft.
+
+Abhängigkeiten (eigene Fix-Zweige, jeweils Kandidat für einen Upstream-PR):
+
+- `fix/hash-based-migrations`: Offene Migrationen werden am Hash erkannt. Voraussetzung dafür, dass `0089` in die Pilot-Datenbank darf.
+- `fix/nullable-enum-schema`: `null` für nullable Enums in Request-Bodies. Der Feature-Zweig baut darauf auf.
+
+Noch offen vor dem Feldversuch: Test mit der KEBA KC-P30 (OCPP 1.6J, RFID) bzw. dem Simulator. Bisher ist der Pfad nur mit gemockter Datenbank getestet.
