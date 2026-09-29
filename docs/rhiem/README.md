@@ -15,6 +15,7 @@ Konzepte und Architekturentscheidungen für den RHIEM-Fork. Liegt nur auf `rhiem
 
 ## Entscheidungen
 
-| Nr.                                           | Titel                             | Status     |
-| --------------------------------------------- | --------------------------------- | ---------- |
-| [0001](adr/0001-fork-und-branch-strategie.md) | Eigener Fork und Branch-Strategie | Angenommen |
+| Nr.                                             | Titel                                      | Status     |
+| ----------------------------------------------- | ------------------------------------------ | ---------- |
+| [0001](adr/0001-fork-und-branch-strategie.md)   | Eigener Fork und Branch-Strategie          | Angenommen |
+| [0002](adr/0002-eigene-datenbankmigrationen.md) | Eigene Datenbankmigrationen neben Upstream | Angenommen |

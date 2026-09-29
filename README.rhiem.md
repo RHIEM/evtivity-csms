@@ -73,6 +73,10 @@ git fetch upstream --tags
 git switch rhiem/main && git merge v0.1.xx
 ```
 
+### Eigene Datenbankmigrationen
+
+Details: [ADR 0002](docs/rhiem/adr/0002-eigene-datenbankmigrationen.md). Migrationen von Hand anlegen (`db:generate` ist nicht nutzbar): `NNNN_name.sql` plus Journaleintrag mit `idx` und `when` jeweils +1, dann `npm run check:migrations`. Bringt ein Upstream-Release neue Migrationen, unsere dahinter umnummerieren (Datei, `idx`, `tag`, `when`), Inhalt nie ändern.
+
 ## Hinweise
 
 - PostgreSQL (5433) und Redis (6379) ignorieren `BIND_IP` und lauschen auf allen Adressen – innerhalb von WSL unkritisch.
