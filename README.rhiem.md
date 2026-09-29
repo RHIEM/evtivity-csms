@@ -32,7 +32,7 @@ npm run dev:portal
 npm run dev:css          # optional: Ladestationssimulator
 ```
 
-Stoppen: Dienste mit `Ctrl+C` beenden (oder `pkill -f "npm run dev:"`), dann `npm run dev:infra:down`.
+Stoppen: Dienste mit `Ctrl+C` beenden (oder `pkill -f "npm run dev:"`), dann `docker compose --profile tools --profile monitoring down` (`npm run dev:infra:down` lässt das Monitoring laufen).
 
 ## Adressen
 
@@ -49,30 +49,32 @@ Alle Mails landen in Mailpit, nichts wird tatsächlich versendet.
 
 ## Git-Workflow
 
-`rhiem/main` ist unser Stand: ein EVtivity-Release-Tag (derzeit `v0.1.25`) plus die RHIEM-eigenen Dateien `README.rhiem.md`, `shell.nix`, `.envrc` (plus `.direnv/` in `.gitignore`). Diese Änderungen gehen nie in Pull-Requests an EVtivity – deshalb zweigen Features für Upstream **nicht** von `rhiem/main` ab:
+Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategie.md).
 
-| Zweck                                          | Abzweigen von   | Präfix               |
-| ---------------------------------------------- | --------------- | -------------------- |
-| Feature/Fix, der als PR zu EVtivity soll       | `upstream/main` | `feature/…`, `fix/…` |
-| Nur für uns (z. B. Konfiguration, Anpassungen) | `rhiem/main`    | `rhiem/…`            |
+- `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.25`) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
+- Features zweigen deshalb vom **Upstream-Tag** ab, auf dem `rhiem/main` steht – nicht von `rhiem/main`.
+
+| Zweck                                    | Abzweigen von                 | Präfix               |
+| ---------------------------------------- | ----------------------------- | -------------------- |
+| Feature/Fix, der als PR zu EVtivity soll | Upstream-Tag von `rhiem/main` | `feature/…`, `fix/…` |
+| Nur für uns                              | `rhiem/main`                  | `rhiem/…`            |
 
 ```bash
-# Upstream-fähiges Feature
-git fetch upstream
-git switch -c feature/laden-auf-rechnung upstream/main
-# … entwickeln, dann in unseren Stand übernehmen:
-git switch rhiem/main && git merge feature/laden-auf-rechnung
-# PR an EVtivity aus feature/laden-auf-rechnung stellen
+# Feature anlegen und in unseren Stand übernehmen
+git switch -c feature/<name> v0.1.25
+git switch rhiem/main && git merge --no-ff feature/<name>
+
+# Später als PR an EVtivity: auf aktuellen Upstream bringen
+git fetch upstream && git switch feature/<name> && git rebase upstream/main
+git diff --stat upstream/main...HEAD   # darf keine RHIEM-Dateien zeigen
 
 # Neues Upstream-Release übernehmen
 git fetch upstream --tags
 git switch rhiem/main && git merge v0.1.xx
 ```
 
-Vor einem PR prüfen: `git diff --stat upstream/main...HEAD` darf keine RHIEM-Dateien zeigen.
-
 ## Hinweise
 
 - PostgreSQL (5433) und Redis (6379) ignorieren `BIND_IP` und lauschen auf allen Adressen – innerhalb von WSL unkritisch.
-- Die Umgebung ist vom Dokploy-Piloten vollständig getrennt; Pilot-Dumps lassen sich bei Bedarf mit `pg_restore` in die lokale Datenbank einspielen.
+- Die Umgebung ist vom Dokploy-Piloten (`../evtivity-pilot/`) vollständig getrennt; Pilot-Dumps lassen sich bei Bedarf mit `pg_restore` in die lokale Datenbank einspielen.
 - KEBA KC-P30 spricht OCPP 1.6J – Tests mit dem Simulator bzw. `npm run octt:1.6` entsprechend auf 1.6 ausrichten.
