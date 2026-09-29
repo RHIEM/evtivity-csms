@@ -50,6 +50,10 @@ const driverItem = z
     email: z.string().email().max(255).nullable().describe('Driver email address'),
     phone: z.string().max(50).nullable().describe('Driver phone number in E.164 format'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
+    paymentMode: z
+      .enum(['card', 'invoice'])
+      .nullable()
+      .describe('Driver payment mode override; null inherits the fleet payment mode'),
     createdAt: z.coerce.date().describe('Timestamp when the driver was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the driver was last updated'),
   })
@@ -137,11 +141,20 @@ const driverReservationItem = z
   })
   .passthrough();
 
+const paymentModeField = z
+  .enum(['card', 'invoice'])
+  .nullable()
+  .optional()
+  .describe(
+    'Payment mode override: card (payment method + pre-authorization) or invoice (billed later through an aggregated invoice). Null inherits the fleet payment mode.',
+  );
+
 const createDriverBody = z.object({
   firstName: z.string().max(100),
   lastName: z.string().max(100),
   email: z.string().email().optional(),
   phone: z.string().max(50).optional(),
+  paymentMode: paymentModeField,
 });
 
 const updateDriverBody = z.object({
@@ -151,6 +164,7 @@ const updateDriverBody = z.object({
   phone: z.string().max(50).optional(),
   isActive: z.boolean().optional().describe('Whether the driver account is active'),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
+  paymentMode: paymentModeField,
 });
 
 const createTokenBody = z.object({
@@ -272,6 +286,7 @@ const driverSafeSelect = {
   mfaEnabled: drivers.mfaEnabled,
   mfaMethod: drivers.mfaMethod,
   isActive: drivers.isActive,
+  paymentMode: drivers.paymentMode,
   emailVerified: drivers.emailVerified,
   lastNotificationReadAt: drivers.lastNotificationReadAt,
   createdAt: drivers.createdAt,
@@ -477,6 +492,7 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.phone !== undefined) fields['phone'] = body.phone;
       if (body.isActive !== undefined) fields['isActive'] = body.isActive;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
+      if (body.paymentMode !== undefined) fields['paymentMode'] = body.paymentMode;
 
       // before is used only for the audit row — writeAudit's redactor masks
       // sensitive fields, so it's safe to fetch the full row here. The

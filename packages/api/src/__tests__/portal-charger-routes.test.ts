@@ -133,6 +133,10 @@ vi.mock('../services/tariff.service.js', () => ({
   isTariffFree: vi.fn().mockReturnValue(true),
 }));
 
+vi.mock('../services/driver.service.js', () => ({
+  resolvePaymentMode: vi.fn().mockResolvedValue('card'),
+}));
+
 vi.mock('../lib/ocpp-command.js', () => ({
   sendOcppCommandAndWait: vi.fn().mockResolvedValue({
     response: { status: 'Accepted' },
@@ -173,6 +177,8 @@ import { registerAuth } from '../plugins/auth.js';
 import { portalChargerRoutes } from '../routes/portal/charger.js';
 import { getStripeConfig } from '../services/stripe.service.js';
 import { resolveTariff, isTariffFree } from '../services/tariff.service.js';
+import { resolvePaymentMode } from '../services/driver.service.js';
+import { db } from '@evtivity/database';
 import { isEvseInReservationBuffer } from '../lib/reservation-buffer.js';
 import { getActiveMaintenanceForStation } from '../services/maintenance.service.js';
 import { assertNoMaintenanceConflict } from '../lib/maintenance-check.js';
@@ -210,6 +216,7 @@ describe('Portal charger routes - handler logic', () => {
     vi.mocked(getStripeConfig).mockResolvedValue(null);
     vi.mocked(resolveTariff).mockResolvedValue(null);
     vi.mocked(isTariffFree).mockReturnValue(true);
+    vi.mocked(resolvePaymentMode).mockResolvedValue('card');
     vi.mocked(isEvseInReservationBuffer).mockResolvedValue(false);
     vi.mocked(getActiveMaintenanceForStation).mockResolvedValue(null);
     vi.mocked(assertNoMaintenanceConflict).mockResolvedValue(undefined);
@@ -602,6 +609,58 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(400);
       expect(response.json().code).toBe('PAYMENT_METHOD_REQUIRED');
+    });
+
+    it('starts an invoice driver on a paid tariff without a payment method', async () => {
+      vi.mocked(isTariffFree).mockReturnValue(false);
+      vi.mocked(resolvePaymentMode).mockResolvedValue('invoice');
+      setupDbResults(
+        [
+          {
+            id: VALID_STATION_ID,
+            stationId: 'CS-001',
+            siteId: 'site-1',
+            isOnline: true,
+            onboardingStatus: 'accepted',
+            ocppProtocol: 'ocpp2.1',
+          },
+        ],
+        [{ id: 'evs_000000000001' }],
+        [{ status: 'available' }],
+        [], // active reservation gate (no reservation)
+        [], // EVSE active-session check (defense-in-depth)
+        [], // driver active-session check
+        [{ id: VALID_SESSION_ID }],
+      );
+      vi.mocked(getStripeConfig).mockResolvedValue({
+        stripe: {} as never,
+        publishableKey: 'pk_test',
+        currency: 'USD',
+        preAuthAmountCents: 5000,
+        configId: 1,
+        connectedAccountId: null,
+        platformFeePercent: 0,
+      });
+      vi.mocked(db.insert).mockClear();
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(resolvePaymentMode).toHaveBeenCalledWith(DRIVER_ID);
+      expect(resolveTariff).not.toHaveBeenCalled();
+
+      // The session row snapshots the resolved payment mode.
+      const sessionInsert = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(sessionInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({ driverId: DRIVER_ID, paymentMode: 'invoice' }),
+      );
     });
 
     it('starts charging session without payment when stripe not configured', async () => {

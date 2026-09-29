@@ -1453,7 +1453,14 @@
       "cancelled": "Cancelled",
       "refunded": "Refunded",
       "partially_refunded": "Partially Refunded"
-    }
+    },
+    "paymentMode": "Payment mode",
+    "paymentModeCard": "Card",
+    "paymentModeInvoice": "Invoice",
+    "paymentModeInherit": "Inherit from fleet",
+    "paymentModeUnset": "Not set",
+    "paymentModeDriverHelp": "Overrides the fleet payment mode. Invoice drivers charge without a payment method and are billed through an aggregated invoice.",
+    "paymentModeFleetHelp": "Applies to all drivers in this fleet unless a driver sets their own payment mode. Invoice drivers charge without a payment method and are billed through an aggregated invoice."
   },
   "systemInfo": {
     "button": "System Information",

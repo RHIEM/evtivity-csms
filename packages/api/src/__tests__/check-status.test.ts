@@ -121,6 +121,10 @@ vi.mock('../services/tariff.service.js', () => ({
   isTariffFree: vi.fn().mockReturnValue(true),
 }));
 
+vi.mock('../services/driver.service.js', () => ({
+  resolvePaymentMode: vi.fn().mockResolvedValue('card'),
+}));
+
 const mockTriggerAndWaitForStatus = vi.fn().mockResolvedValue({ status: 'available' });
 
 vi.mock('../lib/ocpp-command.js', async (importOriginal) => ({

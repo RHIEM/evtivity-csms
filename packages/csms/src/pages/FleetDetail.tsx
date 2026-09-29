@@ -25,6 +25,7 @@ interface Fleet {
   id: string;
   name: string;
   description: string | null;
+  paymentMode: 'card' | 'invoice' | null;
   createdAt: string;
   updatedAt: string;
 }

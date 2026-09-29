@@ -132,6 +132,10 @@ vi.mock('../services/tariff.service.js', () => ({
   isTariffFree: vi.fn(() => false),
 }));
 
+vi.mock('../services/driver.service.js', () => ({
+  resolvePaymentMode: vi.fn(() => Promise.resolve('card')),
+}));
+
 vi.mock('@evtivity/lib', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@evtivity/lib')>();
   return {

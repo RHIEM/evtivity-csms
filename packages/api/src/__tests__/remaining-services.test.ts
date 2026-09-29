@@ -158,7 +158,9 @@ import {
   getDriverTokens,
   createDriverToken,
   deactivateDriverToken,
+  resolvePaymentMode,
 } from '../services/driver.service.js';
+import { sql } from 'drizzle-orm';
 
 import {
   listStations,
@@ -304,6 +306,36 @@ describe('Driver Service', () => {
       const result = await deactivateDriverToken('nonexistent');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('resolvePaymentMode', () => {
+    it('returns the resolved driver or fleet payment mode', async () => {
+      setupDbResults([{ payment_mode: 'invoice' }]);
+
+      const result = await resolvePaymentMode('drv_000000000001');
+
+      expect(result).toBe('invoice');
+    });
+
+    it('defaults to card when neither driver nor fleet sets a mode', async () => {
+      setupDbResults([]);
+
+      const result = await resolvePaymentMode('drv_000000000001');
+
+      expect(result).toBe('card');
+    });
+
+    it('ranks the driver override above the oldest fleet membership', async () => {
+      setupDbResults([]);
+
+      await resolvePaymentMode('drv_000000000001');
+
+      const query = vi.mocked(sql).mock.calls.at(-1)?.[0]?.join('?') ?? '';
+      expect(query).toContain('SELECT d.payment_mode, 1 AS priority');
+      expect(query).toContain('SELECT f.payment_mode, 2 AS priority');
+      expect(query).toContain('ORDER BY fd.created_at ASC');
+      expect(query).toContain('ORDER BY priority');
     });
   });
 });

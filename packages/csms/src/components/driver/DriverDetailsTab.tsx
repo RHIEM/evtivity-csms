@@ -9,6 +9,7 @@ import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TabsContent } from '@/components/ui/tabs';
@@ -22,9 +23,12 @@ interface Driver {
   email: string | null;
   phone: string | null;
   isActive: boolean;
+  paymentMode: PaymentMode | null;
   createdAt: string;
   updatedAt: string;
 }
+
+type PaymentMode = 'card' | 'invoice';
 
 export interface DriverDetailsTabProps {
   driver: Driver;
@@ -41,6 +45,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [isActive, setIsActive] = useState(true);
+  const [paymentMode, setPaymentMode] = useState<PaymentMode | ''>('');
   const [hasSubmittedEdit, setHasSubmittedEdit] = useState(false);
 
   const updateMutation = useMutation({
@@ -50,6 +55,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       email?: string;
       phone?: string;
       isActive?: boolean;
+      paymentMode?: PaymentMode | null;
     }) => api.patch<Driver>(`/v1/drivers/${driver.id}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['drivers', driver.id] });
@@ -65,6 +71,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setEmail(driver.email ?? '');
     setPhone(driver.phone ?? '');
     setIsActive(driver.isActive);
+    setPaymentMode(driver.paymentMode ?? '');
     setEditing(true);
   }
 
@@ -91,6 +98,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       ...(email !== '' ? { email } : {}),
       ...(phone !== '' ? { phone } : {}),
       isActive,
+      paymentMode: paymentMode === '' ? null : paymentMode,
     });
   }
 
@@ -155,6 +163,23 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                   }}
                 />
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-payment-mode">{t('payments.paymentMode')}</Label>
+                <Select
+                  id="edit-payment-mode"
+                  value={paymentMode}
+                  onChange={(e) => {
+                    setPaymentMode(e.target.value as PaymentMode | '');
+                  }}
+                >
+                  <option value="">{t('payments.paymentModeInherit')}</option>
+                  <option value="card">{t('payments.paymentModeCard')}</option>
+                  <option value="invoice">{t('payments.paymentModeInvoice')}</option>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('payments.paymentModeDriverHelp')}
+                </p>
+              </div>
               <div className="flex items-center gap-2">
                 <input
                   id="edit-active"
@@ -194,6 +219,16 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               <div>
                 <dt className="text-muted-foreground">{t('drivers.phone')}</dt>
                 <dd className="font-medium">{driver.phone ?? '-'}</dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
+                <dd className="font-medium">
+                  {driver.paymentMode === 'invoice'
+                    ? t('payments.paymentModeInvoice')
+                    : driver.paymentMode === 'card'
+                      ? t('payments.paymentModeCard')
+                      : t('payments.paymentModeInherit')}
+                </dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.status')}</dt>

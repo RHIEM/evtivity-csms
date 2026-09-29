@@ -21,6 +21,7 @@ import { tariffs } from './pricing.js';
 import { chargingStations, evses, connectors } from './assets.js';
 import { drivers, driverTokens, vehicles } from './drivers.js';
 import { reservations } from './reservations.js';
+import { paymentModeEnum } from './payment-mode.js';
 
 export const sessionStatusEnum = pgEnum('session_status', [
   'active',
@@ -75,6 +76,10 @@ export const chargingSessions = pgTable(
     lastUpdateNotifiedAt: timestamp('last_update_notified_at', { withTimezone: true }),
     metadata: jsonb('metadata'),
     freeVend: boolean('free_vend').notNull().default(false),
+    // Driver payment mode resolved when the session started. Null when none was
+    // resolved: no driver, or an OCPP start that skipped the payment gate
+    // (free-vend, roaming).
+    paymentMode: paymentModeEnum('payment_mode'),
     co2AvoidedKg: numeric('co2_avoided_kg'),
     electricityCostCents: integer('electricity_cost_cents'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
