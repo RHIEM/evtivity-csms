@@ -11,7 +11,7 @@ Bis `v0.1.25` galt eine Migration als offen, wenn ihr `when` größer war als da
 
 ## Entscheidung
 
-- **Offene Migrationen werden am Hash erkannt, nicht am `when`** (`fix/hash-based-migrations`, in `rhiem/main` gemergt, Kandidat für einen Upstream-PR). Offen ist jede Datei, deren SHA-256 nicht in `drizzle.__drizzle_migrations` steht. Offene Dateien laufen in Journalreihenfolge. Nachgeholte Dateien werden mit ihrem Journal-`when` eingetragen, nicht mit `Date.now()`.
+- **Offene Migrationen werden am Hash erkannt, nicht am `when`** (`fix/hash-based-migrations`, in `rhiem/main` gemergt, Upstream-PR [EVtivity/evtivity-csms#14](https://github.com/EVtivity/evtivity-csms/pull/14)). Offen ist jede Datei, deren SHA-256 nicht in `drizzle.__drizzle_migrations` steht. Offene Dateien laufen in Journalreihenfolge. Nachgeholte Dateien werden mit ihrem Journal-`when` eingetragen, nicht mit `Date.now()`.
 - **Unsere Migrationen stehen im Journal immer am Ende.** Neue Migrationen schließen an die letzte an, mit `idx` und `when` jeweils +1 (wie Upstream zuletzt).
 - **Beim Übernehmen eines Upstream-Releases werden unsere Migrationen hinter die Upstream-Migrationen umnummeriert:** Datei umbenennen, `idx`, `tag` und `when` im Journal anpassen, dann `npm run check:migrations`. Der Inhalt der Datei bleibt unverändert, denn der Hash und damit der Status in bestehenden Datenbanken hängt nur am Inhalt.
 - **Keine Migration in die Pilot-Datenbank ohne den Hash-Fix auf `rhiem/main`.**
