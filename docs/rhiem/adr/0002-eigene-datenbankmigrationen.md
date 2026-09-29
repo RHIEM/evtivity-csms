@@ -31,7 +31,7 @@ Geprüft am 29.09.2026 anhand der veröffentlichten npm-Pakete (Quelltext des Mi
 - **Anderes Migrationswerkzeug** (Flyway mit `outOfOrder`, Liquibase, node-pg-migrate, Knex): lösen das Problem, weil sie jede angewendete Migration einzeln führen. Ein Wechsel würde das Datenbankpaket dauerhaft von Upstream trennen und scheidet deshalb aus.
 - **`when`-Werte geschickt wählen:** nicht möglich. Upstream zählt zuletzt in +1-Schritten, ein echter Zeitstempel für unsere Migration würde alle späteren Upstream-Migrationen blockieren.
 
-Der Hash-Fix folgt demselben Prinzip wie Drizzle 1.0 (angewendete Migrationen einzeln erkennen), nur über den Hash, weil das Journal-Format keine stabilen Namen kennt. Wir schlagen EVtivity vor, auf das 1.0-Format umzusteigen, sobald es stabil ist. Dann entfallen unser Fix und die Regel zum Umnummerieren.
+Der Hash-Fix folgt demselben Prinzip wie Drizzle 1.0 (angewendete Migrationen einzeln erkennen), nur über den Hash, weil das Journal-Format keine stabilen Namen kennt. Wir schlagen EVtivity vor, auf das 1.0-Format umzusteigen, sobald es stabil ist ([EVtivity/evtivity-csms#13](https://github.com/EVtivity/evtivity-csms/issues/13)). Dann entfallen unser Fix und die Regel zum Umnummerieren.
 
 ## Konsequenzen
 

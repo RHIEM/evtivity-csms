@@ -13,6 +13,7 @@ Für den Feldversuch Mitarbeiterladen brauchen wir Erweiterungen an EVtivity (zu
 - `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag plus RHIEM-eigene Dateien.
 - Features entstehen als `feature/…` bzw. `fix/…` vom Upstream-Tag, auf dem `rhiem/main` steht, und werden mit `--no-ff` in `rhiem/main` gemergt.
 - Für einen PR an EVtivity wird der Feature-Zweig auf `upstream/main` rebased und nach den Regeln aus `CONTRIBUTING.md` eingereicht.
+- Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026).
 - Neue EVtivity-Releases werden per Merge des Tags in `rhiem/main` übernommen.
 
 ## Konsequenzen
