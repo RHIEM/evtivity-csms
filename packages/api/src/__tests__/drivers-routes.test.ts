@@ -145,6 +145,7 @@ vi.mock('../middleware/rbac.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { driverRoutes } from '../routes/drivers.js';
+import { db } from '@evtivity/database';
 
 const VALID_DRIVER_ID = 'drv_000000000001';
 
@@ -158,6 +159,7 @@ function makeDriver(overrides: Record<string, unknown> = {}) {
     email: 'john@example.com',
     phone: '+15551234567',
     isActive: true,
+    paymentMode: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -459,6 +461,56 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().email).toBe('new@example.com');
+    });
+
+    it('sets the invoice payment mode override', async () => {
+      const updated = makeDriver({ paymentMode: 'invoice' });
+      setupDbResults([updated], [updated]);
+      vi.mocked(db.update).mockClear();
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { paymentMode: 'invoice' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().paymentMode).toBe('invoice');
+      const update = vi.mocked(db.update).mock.results[0]?.value as {
+        set: ReturnType<typeof vi.fn>;
+      };
+      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ paymentMode: 'invoice' }));
+    });
+
+    it('clears the payment mode override with null so the fleet mode applies', async () => {
+      const updated = makeDriver({ paymentMode: null });
+      setupDbResults([updated], [updated]);
+      vi.mocked(db.update).mockClear();
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { paymentMode: null },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const update = vi.mocked(db.update).mock.results[0]?.value as {
+        set: ReturnType<typeof vi.fn>;
+      };
+      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ paymentMode: null }));
+    });
+
+    it('returns 400 for an unknown payment mode', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { paymentMode: 'cash' },
+      });
+
+      expect(res.statusCode).toBe(400);
     });
 
     it('returns 200 with only phone', async () => {

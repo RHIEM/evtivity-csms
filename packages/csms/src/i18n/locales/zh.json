@@ -1453,7 +1453,14 @@
       "cancelled": "已取消",
       "refunded": "已退款",
       "partially_refunded": "部分退款"
-    }
+    },
+    "paymentMode": "支付方式",
+    "paymentModeCard": "银行卡",
+    "paymentModeInvoice": "发票",
+    "paymentModeInherit": "继承车队设置",
+    "paymentModeUnset": "未设置",
+    "paymentModeDriverHelp": "覆盖车队的支付方式。发票方式的司机无需支付方式即可充电，并通过汇总发票结算。",
+    "paymentModeFleetHelp": "适用于该车队的所有司机，除非司机设置了自己的支付方式。发票方式的司机无需支付方式即可充电，并通过汇总发票结算。"
   },
   "systemInfo": {
     "button": "系统信息",

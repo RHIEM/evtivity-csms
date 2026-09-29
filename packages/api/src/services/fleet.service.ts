@@ -17,6 +17,7 @@ import {
   pricingGroupFleets,
   pricingGroups,
 } from '@evtivity/database';
+import type { PaymentMode } from '@evtivity/database';
 import type { PaginationParams } from '../lib/pagination.js';
 import { sessionCurrencySql } from '../lib/company-currency.js';
 
@@ -40,6 +41,7 @@ export async function listFleets(params: PaginationParams) {
         id: fleets.id,
         name: fleets.name,
         description: fleets.description,
+        paymentMode: fleets.paymentMode,
         createdAt: fleets.createdAt,
         updatedAt: fleets.updatedAt,
         driverCount: sql<number>`count(distinct ${fleetDrivers.id})::int`,
@@ -67,14 +69,22 @@ export async function getFleet(id: string) {
   return fleet ?? null;
 }
 
-export async function createFleet(data: { name: string; description?: string | undefined }) {
+export async function createFleet(data: {
+  name: string;
+  description?: string | undefined;
+  paymentMode?: PaymentMode | null | undefined;
+}) {
   const [fleet] = await db.insert(fleets).values(data).returning();
   return fleet;
 }
 
 export async function updateFleet(
   id: string,
-  data: { name?: string | undefined; description?: string | undefined },
+  data: {
+    name?: string | undefined;
+    description?: string | undefined;
+    paymentMode?: PaymentMode | null | undefined;
+  },
 ) {
   const [fleet] = await db
     .update(fleets)

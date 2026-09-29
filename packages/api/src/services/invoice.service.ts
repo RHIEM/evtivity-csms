@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, sql, isNull, isNotNull, between } from 'drizzle-orm';
+import { eq, and, sql, isNull, isNotNull, between, inArray, notExists } from 'drizzle-orm';
 import {
   db,
   invoices,
@@ -10,6 +10,7 @@ import {
   tariffs,
   sessionTariffSegments,
   drivers,
+  paymentRecords,
 } from '@evtivity/database';
 import { calculateSessionCost, calculateSplitSessionCost, AppError } from '@evtivity/lib';
 import type { CostBreakdown, TariffInput, TariffSegment } from '@evtivity/lib';
@@ -403,6 +404,16 @@ export async function createSessionInvoice(sessionId: string): Promise<InvoiceWi
   return { invoice, lineItems: createdLineItems };
 }
 
+// Payment record states that mean the session is (or will be) settled by
+// card. Such sessions must not be billed a second time on an invoice. Failed
+// and cancelled attempts leave the session open for invoicing.
+const CARD_SETTLED_PAYMENT_STATUSES = [
+  'pre_authorized',
+  'captured',
+  'partially_refunded',
+  'refunded',
+] as const;
+
 export async function createAggregatedInvoice(
   driverId: string,
   startDate: Date,
@@ -433,6 +444,17 @@ export async function createAggregatedInvoice(
         isNotNull(chargingSessions.finalCostCents),
         between(chargingSessions.endedAt, startDate, endDate),
         isNull(invoiceLineItems.id),
+        notExists(
+          db
+            .select({ id: paymentRecords.id })
+            .from(paymentRecords)
+            .where(
+              and(
+                eq(paymentRecords.sessionId, chargingSessions.id),
+                inArray(paymentRecords.status, [...CARD_SETTLED_PAYMENT_STATUSES]),
+              ),
+            ),
+        ),
         inCompanyCurrency(chargingSessions.currency, currency),
       ),
     );

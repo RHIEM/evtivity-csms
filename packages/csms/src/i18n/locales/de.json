@@ -1453,7 +1453,14 @@
       "cancelled": "Abgebrochen",
       "refunded": "Erstattet",
       "partially_refunded": "Teilweise erstattet"
-    }
+    },
+    "paymentMode": "Zahlungsart",
+    "paymentModeCard": "Karte",
+    "paymentModeInvoice": "Rechnung",
+    "paymentModeInherit": "Von Flotte übernehmen",
+    "paymentModeUnset": "Nicht festgelegt",
+    "paymentModeDriverHelp": "Überschreibt die Zahlungsart der Flotte. Fahrer mit Zahlungsart Rechnung laden ohne Zahlungsmethode und werden über eine Sammelrechnung abgerechnet.",
+    "paymentModeFleetHelp": "Gilt für alle Fahrer dieser Flotte, sofern ein Fahrer keine eigene Zahlungsart hat. Fahrer mit Zahlungsart Rechnung laden ohne Zahlungsmethode und werden über eine Sammelrechnung abgerechnet."
   },
   "systemInfo": {
     "button": "Systeminformationen",

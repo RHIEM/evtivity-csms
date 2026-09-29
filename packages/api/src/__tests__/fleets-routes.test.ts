@@ -146,6 +146,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'Fleet A',
         description: null,
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         driverCount: 3,
@@ -213,6 +214,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'Fleet A',
         description: 'A fleet',
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -267,6 +269,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'New Fleet',
         description: 'Desc',
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -288,6 +291,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'Minimal Fleet',
         description: null,
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -332,6 +336,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'Updated Fleet',
         description: 'Updated',
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -346,6 +351,75 @@ describe('Fleet routes - handler logic', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.json().name).toBe('Updated Fleet');
+    });
+
+    it('sets the fleet payment mode', async () => {
+      mockFleetService.updateFleet.mockResolvedValue({
+        id: VALID_FLEET_ID,
+        name: 'Fleet',
+        description: null,
+        paymentMode: 'invoice',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { paymentMode: 'invoice' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().paymentMode).toBe('invoice');
+      expect(mockFleetService.updateFleet).toHaveBeenLastCalledWith(VALID_FLEET_ID, {
+        paymentMode: 'invoice',
+      });
+    });
+
+    it('unsets the fleet payment mode with null', async () => {
+      mockFleetService.updateFleet.mockResolvedValue({
+        id: VALID_FLEET_ID,
+        name: 'Fleet',
+        description: null,
+        paymentMode: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { paymentMode: null },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockFleetService.updateFleet).toHaveBeenLastCalledWith(VALID_FLEET_ID, {
+        paymentMode: null,
+      });
+    });
+
+    it('leaves the payment mode unchanged when the field is omitted', async () => {
+      mockFleetService.updateFleet.mockResolvedValue({
+        id: VALID_FLEET_ID,
+        name: 'Renamed',
+        description: null,
+        paymentMode: 'invoice',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { name: 'Renamed' },
+      });
+
+      expect(mockFleetService.updateFleet).toHaveBeenLastCalledWith(VALID_FLEET_ID, {
+        name: 'Renamed',
+      });
     });
 
     it('returns 404 when fleet not found', async () => {
@@ -380,6 +454,7 @@ describe('Fleet routes - handler logic', () => {
         id: VALID_FLEET_ID,
         name: 'Deleted Fleet',
         description: null,
+        paymentMode: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };

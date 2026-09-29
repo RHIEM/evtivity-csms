@@ -57,6 +57,7 @@ import type { DriverJwtPayload } from '../../plugins/auth.js';
 import { getStripeConfig, createPreAuthorization } from '../../services/stripe.service.js';
 import { isSimulatedCustomer } from '@evtivity/lib';
 import { resolveTariff, isTariffFree } from '../../services/tariff.service.js';
+import { resolvePaymentMode } from '../../services/driver.service.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
 import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
 import { isEvseInReservationBuffer } from '../../lib/reservation-buffer.js';
@@ -1723,6 +1724,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       // station begin charging and the event-projection payment gate stop it
       // asynchronously.
       const config = await getStripeConfig(station.siteId ?? null);
+      // Invoice drivers are billed afterwards through an aggregated invoice,
+      // so they start without a payment method or pre-authorization.
+      const paymentMode = await resolvePaymentMode(driverId);
 
       let pmForPreAuth: {
         id: number;
@@ -1730,7 +1734,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         stripePaymentMethodId: string;
       } | null = null;
 
-      if (config != null) {
+      if (config != null && paymentMode !== 'invoice') {
         // Check if pricing is free for this driver. Free-vend wins over the
         // tariff lookup: event-projections skips the payment gate for
         // free-vend sites, so demanding a payment method here would block
@@ -1804,6 +1808,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           startedAt: new Date(),
           remoteStartId,
           currency: sessionCurrency,
+          paymentMode,
         })
         .returning({ id: chargingSessions.id });
 

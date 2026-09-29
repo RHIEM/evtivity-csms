@@ -63,6 +63,11 @@ vi.mock('@evtivity/database', () => ({
   tariffs: {},
   sessionTariffSegments: {},
   drivers: {},
+  paymentRecords: {
+    id: 'payment_records.id',
+    sessionId: 'payment_records.session_id',
+    status: 'payment_records.status',
+  },
   getIdlingGracePeriodMinutes: vi.fn().mockResolvedValue(5),
 }));
 
@@ -76,6 +81,8 @@ vi.mock('drizzle-orm', () => ({
   isNull: vi.fn(),
   isNotNull: vi.fn(),
   between: vi.fn(),
+  inArray: vi.fn(),
+  notExists: vi.fn(),
 }));
 
 vi.mock('@evtivity/lib', () => ({
@@ -119,6 +126,7 @@ import {
   voidInvoice,
 } from '../services/invoice.service.js';
 import { calculateSessionCost } from '@evtivity/lib';
+import { inArray, notExists } from 'drizzle-orm';
 
 beforeEach(() => {
   dbResults = [];
@@ -616,6 +624,22 @@ describe('Invoice Service', () => {
         statusCode: 400,
         code: 'INVOICE_NO_SESSIONS',
       });
+    });
+
+    it('excludes sessions already settled by card', async () => {
+      setupDbResults([]);
+
+      await expect(
+        createAggregatedInvoice('driver-789', new Date('2026-01-01'), new Date('2026-01-31')),
+      ).rejects.toMatchObject({ code: 'INVOICE_NO_SESSIONS' });
+
+      expect(notExists).toHaveBeenCalledTimes(1);
+      expect(inArray).toHaveBeenCalledWith('payment_records.status', [
+        'pre_authorized',
+        'captured',
+        'partially_refunded',
+        'refunded',
+      ]);
     });
 
     it('handles a zero-tax session and a null endedAt/null energy session', async () => {
