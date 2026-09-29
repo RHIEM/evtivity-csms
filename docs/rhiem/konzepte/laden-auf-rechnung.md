@@ -1,6 +1,6 @@
 # Konzept: Laden auf Rechnung
 
-- **Status:** Entwurf – Anforderungssammlung, noch keine Lösungskonzeption
+- **Status:** Freigegeben (Lösungskonzept, erster schmaler Schnitt)
 - **Stand:** 29.09.2026
 - **Quellen:** bisherige RHIEM-Dokumente zum Mitarbeiterladen (Konzept Mitarbeiterladen, EVtivity-Produktionsabgleich, Feldversuchsplanung)
 
@@ -45,3 +45,47 @@ Laut bisheriger Prüfung ist der Ablauf im geprüften Quellstand nicht durchgän
 - Bezahlen Mitarbeitende und erhalten Rechnungen, oder werden Kosten nur intern verrechnet? (Im zweiten Fall genügen zunächst Sitzungsübersicht und Monats-CSV.)
 - Rechtliche und steuerliche Ausgestaltung der Mitarbeiterabrechnung – mit den zuständigen Fachleuten festzulegen.
 - Abstimmung mit EVtivity: Das Feature wird so umgesetzt, als läge eine Upstream-Freigabe vor, und später als Vorschlag eingereicht.
+
+## Lösungskonzept (freigegeben am 29.09.2026)
+
+Erster, bewusst schmaler Schnitt. EVtivity erhält eine Zahlungsart **Rechnung** neben der Kartenzahlung. Rechnungsempfänger ist der Fahrer. Das Clearing der Rechnung (Zahlungseingang, Buchhaltung) ist nicht Bestandteil des Portals.
+
+### Zahlungsart und Auflösung
+
+- Enum `payment_mode: 'card' | 'invoice'`.
+- `fleets.payment_mode` (nullable): gilt für alle Fahrer der Flotte; `null` = nicht festgelegt.
+- `drivers.payment_mode` (nullable): überschreibt die Flotte; `null` = von der Flotte erben.
+- Auflösung analog `resolveTariffGroup` (`packages/api/src/services/tariff.service.ts`): Fahrer > älteste Flottenmitgliedschaft mit gesetztem Wert > `'card'`. Im OCPP-Pfad wird dasselbe SQL inline ausgeführt (wie `isTariffFreeForStation`), weil `ocpp` nicht von `api` abhängt.
+- `charging_sessions.payment_mode` (nullable) hält die Zahlungsart beim Start fest (Snapshot analog `free_vend` und `tariff_*`). Spätere Flotten- oder Fahreränderungen verändern die Historie nicht.
+
+### Zahlungsschranken
+
+- **OCPP (inkl. RFID):** `runPaymentGate` löst die Zahlungsart auf. Bei `invoice` wird sie am Vorgang gespeichert, der Vorgang weder gestoppt noch vorautorisiert.
+- **Portal-Start:** Bei `invoice` ist keine Zahlungsmethode nötig; die Zahlungsart wird beim Anlegen des Vorgangs gespeichert.
+- Reservierungen verlangen weiterhin eine Karte (No-Show- und Stornogebühren) – nicht Teil dieses Schnitts.
+
+### Verwaltung
+
+- API: `payment_mode` in den Create-/Update-Routen für Fahrer und Flotten.
+- Betreiberoberfläche: Auswahl „Zahlungsart“ im Flotten- und Fahrerformular (beim Fahrer zusätzlich „Von Flotte übernehmen“).
+
+### Rechnung
+
+- Abrechnung zeitbasiert und manuell (z. B. quartalsweise) über die vorhandene Sammelrechnung `POST /invoices/aggregated` je Fahrer, direkt im Status `issued`; Versand über `POST /invoices/:id/send`.
+- Bereits abgerechnete Vorgänge (vorhandene Rechnungsposition) werden wie bisher ausgelassen.
+- Neu: Vorgänge mit einem Karten-Zahlungseintrag (`payment_records` in `pre_authorized`, `captured`, `partially_refunded`, `refunded`) werden aus der Sammelrechnung ausgeschlossen.
+- Die Sammelrechnung filtert **nicht** auf `payment_mode = 'invoice'`, damit das bisherige Verhalten erhalten bleibt.
+
+### Bekannte Einschränkungen (bewusst nicht in diesem Schnitt)
+
+- Kein automatischer Monatslauf/Cronjob; ein späterer Job ruft nur die Sammelrechnung auf.
+- Eine stornierte Rechnung gibt ihre Vorgänge nicht wieder frei (Positionen bleiben bestehen).
+- Keine Sperre gegen zwei gleichzeitige Sammelrechnungen für denselben Fahrer.
+- `createSessionInvoice` prüft nicht, ob ein Vorgang bereits abgerechnet ist.
+- Unvollständige oder nicht bepreiste Vorgänge werden weiterhin still ausgelassen statt gemeldet.
+- Keine Anzeige des Abrechnungsstands im Fahrerportal; der Status „offen auf Rechnung“ ist ableitbar (`payment_mode = 'invoice'`, `completed`, keine Rechnungsposition).
+- Unternehmensrechnungen, Transparenz, CSV-Export und Eichrecht-Regel folgen später.
+
+### Umsetzung
+
+Zweig `feature/invoice-payment-mode` ab `v0.1.25`, `--no-ff` in `rhiem/main`.
