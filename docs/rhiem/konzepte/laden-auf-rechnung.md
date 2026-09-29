@@ -92,7 +92,7 @@ Zweig `feature/invoice-payment-mode` ab `v0.1.25`, `--no-ff` in `rhiem/main`.
 
 ## Umsetzungsstand (29.09.2026)
 
-Umgesetzt auf `feature/invoice-payment-mode` (`801493e`), gemergt in `rhiem/main`.
+Umgesetzt auf `feature/invoice-payment-mode` (`cd3ef7d`), gemergt in `rhiem/main`.
 
 - Schema: Enum `payment_mode` in eigener Schema-Datei (`packages/database/src/schema/payment-mode.ts`), weil sich `drivers.ts` und `charging.ts` gegenseitig importieren. Migration `0089_payment_mode` von Hand angelegt (siehe [ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)).
 - Auflösung: `resolvePaymentMode()` in `packages/api/src/services/driver.service.ts`. Im OCPP-Pfad setzt `snapshotPaymentMode()` den Wert per `UPDATE … RETURNING` in einem Schritt am Vorgang.
