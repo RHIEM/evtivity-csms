@@ -13,7 +13,7 @@ Für den Feldversuch Mitarbeiterladen brauchen wir Erweiterungen an EVtivity (zu
 - `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag plus RHIEM-eigene Dateien.
 - Features entstehen als `feature/…` bzw. `fix/…` vom Upstream-Tag, auf dem `rhiem/main` steht, und werden mit `--no-ff` in `rhiem/main` gemergt.
 - Für einen PR an EVtivity wird der Feature-Zweig auf `upstream/main` rebased und nach den Regeln aus `CONTRIBUTING.md` eingereicht.
-- Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026).
+- Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026). Unterschrieben wird per PR-Kommentar mit exakt `I have read the CLA Document and I hereby sign the CLA` (die Checkbox im PR-Template wertet der Bot nicht aus). Der CLA-Workflow bei EVtivity kann Unterschriften derzeit nicht speichern (`contents: read`); bis das behoben ist, ist der Kommentar in jedem PR nötig und der Check bleibt rot.
 - Neue EVtivity-Releases werden per Merge des Tags in `rhiem/main` übernommen.
 
 ## Konsequenzen

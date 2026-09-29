@@ -102,7 +102,7 @@ Umgesetzt auf `feature/invoice-payment-mode` (`cd3ef7d`), gemergt in `rhiem/main
 
 Abhängigkeiten (eigene Fix-Zweige, jeweils Kandidat für einen Upstream-PR):
 
-- `fix/hash-based-migrations`: Offene Migrationen werden am Hash erkannt. Voraussetzung dafür, dass `0089` in die Pilot-Datenbank darf.
-- `fix/nullable-enum-schema`: `null` für nullable Enums in Request-Bodies. Der Feature-Zweig baut darauf auf.
+- `fix/hash-based-migrations`: Offene Migrationen werden am Hash erkannt. Voraussetzung dafür, dass `0089` in die Pilot-Datenbank darf. Upstream: Issue [#13](https://github.com/EVtivity/evtivity-csms/issues/13), PR [#14](https://github.com/EVtivity/evtivity-csms/pull/14).
+- `fix/nullable-enum-schema`: `null` für nullable Enums in Request-Bodies. Der Feature-Zweig baut darauf auf. Upstream: Issue [#15](https://github.com/EVtivity/evtivity-csms/issues/15), PR [#16](https://github.com/EVtivity/evtivity-csms/pull/16).
 
 Noch offen vor dem Feldversuch: Test mit der KEBA KC-P30 (OCPP 1.6J, RFID) bzw. dem Simulator. Bisher ist der Pfad nur mit gemockter Datenbank getestet.
