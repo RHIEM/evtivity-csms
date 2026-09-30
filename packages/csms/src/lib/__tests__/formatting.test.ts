@@ -11,6 +11,7 @@ import {
   formatFileSize,
   formatNumber,
   formatRatePerKwh,
+  getDecimalSeparator,
 } from '../formatting';
 
 describe('formatCents', () => {
@@ -41,6 +42,21 @@ describe('formatRatePerKwh', () => {
 
   it('falls back to "CODE 0.1234" instead of throwing for an invalid currency code', () => {
     expect(formatRatePerKwh(0.1234, 'not-a-code')).toBe('NOT-A-CODE 0.1234');
+  });
+});
+
+describe('getDecimalSeparator', () => {
+  it('returns the decimal separator of each supported UI language', () => {
+    expect(getDecimalSeparator('en')).toBe('.');
+    expect(getDecimalSeparator('de')).toBe(',');
+    expect(getDecimalSeparator('es')).toBe(',');
+    expect(getDecimalSeparator('ko')).toBe('.');
+    expect(getDecimalSeparator('zh')).toBe('.');
+    expect(getDecimalSeparator('zh-TW')).toBe('.');
+  });
+
+  it('falls back to "." for an invalid locale', () => {
+    expect(getDecimalSeparator('not a locale!')).toBe('.');
   });
 });
 
