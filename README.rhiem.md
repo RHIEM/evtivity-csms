@@ -80,5 +80,5 @@ Details: [ADR 0002](docs/rhiem/adr/0002-eigene-datenbankmigrationen.md). Migrati
 ## Hinweise
 
 - PostgreSQL (5433) und Redis (6379) ignorieren `BIND_IP` und lauschen auf allen Adressen – innerhalb von WSL unkritisch.
-- Die Umgebung ist vom Dokploy-Piloten (`../evtivity-pilot/`) vollständig getrennt; Pilot-Dumps lassen sich bei Bedarf mit `pg_restore` in die lokale Datenbank einspielen.
+- Die Umgebung ist vom Dokploy-Piloten (`../evtivity-pilot/`) vollständig getrennt. Deployment, Datenbanksicherung und Wiederherstellung des Piloten beschreibt `../evtivity-pilot/Deployment.md` (außerhalb des Repos, enthält interne Hostnamen); Dumps bleiben dort auf dem Server und werden nicht auf Arbeitsrechner kopiert.
 - KEBA KC-P30 spricht OCPP 1.6J – Tests mit dem Simulator bzw. `npm run octt:1.6` entsprechend auf 1.6 ausrichten.
