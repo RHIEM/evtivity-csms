@@ -22,7 +22,7 @@ Upstream gibt es zu keinem Punkt ein Issue oder einen PR (geprüft 30.09.2026).
 
 ## Lösungskonzept
 
-Vier getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert. 1, 2 und 5 sind als PR an EVtivity vorgesehen; der Zeitpunkt wird gesondert entschieden. Das Signatur-Feature (3 und 4) wird vorerst **nicht** an EVtivity gegeben, weder als PR noch als Feature-Request oder Issue (Entscheidung 30.09.2026).
+Fünf getrennte Zweige ab `v0.1.27` (einschließlich des nachträglichen Punkts 6), jeweils mit `--no-ff` in `rhiem/main` ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert. 1, 2, 5 und 6 sind als PR an EVtivity vorgesehen; der Zeitpunkt wird gesondert entschieden. Das Signatur-Feature (3 und 4) wird vorerst **nicht** an EVtivity gegeben, weder als PR noch als Feature-Request oder Issue (Entscheidung 30.09.2026).
 
 ### 1. Anmeldung vor dem Upgrade prüfen (`fix/ocpp-auth-http-401`)
 
@@ -72,6 +72,13 @@ Zusammengelegt mit 3 (30.09.2026): Nachweis und Schlüssel gehören fachlich zus
 - Ist ein Steuersatz gesetzt, zeigt das Formular darunter den Bruttopreis (z. B. „entspricht 0,2561 € brutto“), formatiert nach der UI-Sprache ([ADR 0003](../adr/0003-dezimalzahlen-eingabe.md)).
 - Datenmodell und Kostenberechnung bleiben unverändert.
 
+### 6. Ping/Pong als Lebenszeichen (`fix/ocpp-idle-timeout-keepalive`, nachträglich freigegeben am 30.09.2026)
+
+- Befund aus dem Pilot: Der OCPP-Server schloss Verbindungen nach 5 Minuten ohne OCPP-Nachricht (`IDLE_TIMEOUT_MS`), während die BootNotification-Antwort ein Heartbeat-Intervall von 300 s vergibt. Die KC-P30 hält das Intervall exakt ein; ihr Heartbeat kam Millisekunden nach Ablauf des Zeitgebers. Im Leerlauf wurde sie deshalb alle 5 bis 10 Minuten getrennt und verband sich etwa eine Minute später neu.
+- Pings der Station und Pongs auf den Ping-Monitor (alle 30 s) setzen den Zeitgeber ebenfalls zurück; geschlossen werden nur Verbindungen ohne jedes Lebenszeichen. Zeit einstellbar über `OCPP_IDLE_TIMEOUT_MS` (Standard 5 Minuten).
+- Tests: `ocpp-server-idle.test.ts` mit echtem Server und verkürzter Zeit; ohne den Fix scheitern die Ping- und Pong-Fälle.
+- Vorgesehen als PR an EVtivity.
+
 ### Migrationen
 
 Die Tabellen aus 3 und 4 kommen als eine Migration im Namenskreis `rhiem_` ([ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)), von Hand geschrieben wie bei Upstream. 1, 2 und 5 brauchen keine Migration.
@@ -107,9 +114,11 @@ Je Zweig: `npm run typecheck && npm run lint && npm test` grün, neue Tests wie 
 | 2     | `fix/ocpp16-session-energy-meter-stop` | `1767cc5`                                             | in `rhiem/main`; SQL zusätzlich gegen Postgres geprüft (normal, `meterStop` 0, ohne `meterStart`, ohne `meterStop`)                                                                                         |
 | 3 + 4 | `feature/ocpp16-signed-meter-data`     | `dfc6213`, `18b6651`                                  | in `rhiem/main`; Migration `rhiem_0002_signed_meter_data`; Tabellen `signed_meter_values` und `meter_public_keys`; Routen `GET /sessions/:id/signed-meter-values` und `GET /stations/:id/meter-public-keys` |
 | 5     | `fix/tariff-price-net-label`           | `fcf8b7b` (PR-Variante), `c4a9924` (v0.1.27-Variante) | in `rhiem/main`; Beschriftung „netto“ in sechs Sprachen, Brutto-Vorschau `GrossPriceHint` / `formatGrossPrice`                                                                                              |
+| 6     | `fix/ocpp-idle-timeout-keepalive`      | `3b152e1`                                             | in `rhiem/main`; Konflikt mit 1 im selben Abschnitt von `ocpp-server.ts` beim Merge aufgelöst                                                                                                               |
 
 - Zu 1: Auch SP2 ohne TLS bekommt `401` **ohne** `WWW-Authenticate`, damit keine Station aufgefordert wird, ihr Passwort unverschlüsselt zu senden (Konzept nannte das nur für SP3). Verbindungen über dem Pro-IP-Limit werden weiterhin erst nach dem Upgrade mit `1008` geschlossen; für sie entfällt nur die Stationsabfrage. Datenbankfehler ergeben `503`.
 - Zu 2: Umgesetzt als `GREATEST(bisherige Energie, meter_stop − meter_start)` und nur, wenn `meter_stop ≥ meter_start`. Die Energie sinkt dadurch nie, etwa bei einer Station, die `meterStop` 0 meldet. Die Ursache dafür, dass der letzte periodische Wert der Testladung die Sitzungsenergie nicht mehr aktualisierte, ist nicht geklärt. Im Code findet sich keine Erklärung; mit den gemockten Projektionstests lässt sie sich nicht nachstellen. Der Fix über `meterStop` macht das Ergebnis unabhängig davon richtig. Bei der nächsten Testladung die Sitzungsenergie vor dem Stopp mit dem letzten Messwert vergleichen.
 - Zu 3 + 4: Wiederholte Datensätze einer Station ergeben eine Zeile, `Transaction.End` gewinnt als Kontext. Der Verweis auf den Schlüssel ist der zuletzt gemeldete Schlüssel des Anschlusses beim Eintreffen des Datensatzes; ist noch keiner bekannt, bleibt er leer. Migration, Deduplizierung, Verweis und Erhalt nach dem Löschen von Station, EVSE und Sitzung wurden gegen Postgres 17 geprüft.
 - Zu 5: Baut auf den offenen Upstream-PRs #18 (Dezimaleingabe) und #21 (Zahlenanzeige) auf. `fix/tariff-price-net-label` basiert wie diese auf `upstream/main` und ist für den späteren PR gedacht, erst nachdem #18 und #21 gemergt sind. In `rhiem/main` ist die Variante `fix/tariff-price-net-label-v0.1.27` gemergt (auf den v0.1.27-Fassungen der beiden Locale-Fixes), damit keine ungetaggten Upstream-Commits nach `rhiem/main` gelangen.
-- 1 bis 4 sind seit 30.09.2026 im Pilot ausgerollt (`ad748f7`). Prüfung mit der KC-P30 steht aus.
+- Im Pilot (30.09.2026): 1 bis 5 seit `2689620`, 6 mit `8c24b0d`. Mit der KC-P30 bestätigt: 1 (Anmeldung nach `401`, Traefik-Middleware entfernt) und 4 (Zählerschlüssel nach Reset per API gespeichert, identisch mit dem zuvor gesicherten). 2, 3 und 6 werden mit der nächsten Testladung bzw. im Leerlauf geprüft.
+- Nebenbefund: Nach der BootNotification schickt EVtivity Werte aus der automatisch angelegten Konfigurationsvorlage. Die KC-P30 lehnt `MeterValuesSampledData` mit `SoC` ab (AC-Wallbox ohne Ladestand); die Vorlage ist anzupassen.
