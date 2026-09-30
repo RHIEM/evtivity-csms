@@ -22,7 +22,7 @@ Upstream gibt es zu keinem Punkt ein Issue oder einen PR (geprüft 30.09.2026).
 
 ## Lösungskonzept
 
-Fünf getrennte Zweige ab `v0.1.27` (einschließlich des nachträglichen Punkts 6), jeweils mit `--no-ff` in `rhiem/main` ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert. 1, 2, 5 und 6 sind als PR an EVtivity vorgesehen; der Zeitpunkt wird gesondert entschieden. Das Signatur-Feature (3 und 4) wird vorerst **nicht** an EVtivity gegeben, weder als PR noch als Feature-Request oder Issue (Entscheidung 30.09.2026).
+Sieben getrennte Zweige ab `v0.1.27` (einschließlich der nachträglichen Punkte 6 bis 8), jeweils mit `--no-ff` in `rhiem/main` ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert. 1, 2, 5, 6, 7 und 8 sind als PR an EVtivity vorgesehen; der Zeitpunkt wird gesondert entschieden. Das Signatur-Feature (3 und 4) wird vorerst **nicht** an EVtivity gegeben, weder als PR noch als Feature-Request oder Issue (Entscheidung 30.09.2026).
 
 ### 1. Anmeldung vor dem Upgrade prüfen (`fix/ocpp-auth-http-401`)
 
@@ -79,6 +79,18 @@ Zusammengelegt mit 3 (30.09.2026): Nachweis und Schlüssel gehören fachlich zus
 - Tests: `ocpp-server-idle.test.ts` mit echtem Server und verkürzter Zeit; ohne den Fix scheitern die Ping- und Pong-Fälle.
 - Vorgesehen als PR an EVtivity.
 
+### 7. Energiewerte mit Nachkommastellen (`fix/ocpp-decimal-meter-readings`, nachträglich freigegeben am 30.09.2026)
+
+- Befund aus der zweiten Testladung: Die KC-P30 meldet `Energy.Active.Import.Register` mit einer Nachkommastelle als Text (`"2909465.9"`). Die MeterValues-Projektion übergab den Wert ohne Typ an `SET meter_start = …` und `… - meter_start`; `meter_start` ist `integer`, Postgres lehnte ab (`invalid input syntax for type integer`) und die ganze Projektion scheiterte. Folgen: Sitzungsenergie nur bei Werten auf `.0` fortgeschrieben (daher die 947 Wh der ersten Testladung), Live-Kosten nie berechnet („n/a“ im Portal), keine Standzeit-Erkennung, und die übrigen Werte der Nachricht gingen verloren – bei `StopTransaction.transactionData` auch die OCMF-Datensätze (3 griff deshalb nicht).
+- Wert in SQL als `numeric` (für `meter_start` gerundet); nicht numerische Werte überspringen die Energieberechnung. Betrifft auch OCPP 2.1, wo `meter_start` aus dem ersten Messwert gesetzt wird.
+- Tests: Projektion mit dem Wertmuster der KC-P30 und mit einem nicht numerischen Wert; Fehler und Behebung gegen Postgres 17 nachgestellt.
+
+### 8. Portal- und Stopp-Befehle übersetzen lassen (`fix/portal-commands-version-translation`, nachträglich freigegeben am 30.09.2026)
+
+- Befund: `sendOcppCommandAndWait()` mit `version` schickt Befehl und Nutzdaten unverändert (für bereits versionsgerechte Nutzdaten). Portal-Start und -Stopp, Gast-Start, Stopp einer aktiven Sitzung in der Betreiberoberfläche und `SendLocalList` bauten 2.1-Nutzdaten, gaben aber trotzdem die Version der Station mit. Die KC-P30 bekam deshalb wörtlich `RequestStopTransaction` mit `"transactionId":"4"` und antwortete `CALLERROR InternalError`; ein Stopp aus dem Portal war nicht möglich, Start und lokale Kartenliste wären ebenso betroffen.
+- Diese sieben Aufrufe geben keine Version mehr mit; die vorhandene Übersetzung (`RemoteStopTransaction` mit ganzzahliger `transactionId` usw.) greift. `triggerAndWaitForStatus()` baut versionsgerechte Nutzdaten und übergibt die Version weiterhin. Der Parameter ist dokumentiert.
+- Tests: Portal-Stopp einer 1.6-Sitzung ohne Versionsangabe; der bisherige Stationstest, der den Aufruf mit Version festschrieb, ist angepasst.
+
 ### Migrationen
 
 Die Tabellen aus 3 und 4 kommen als eine Migration im Namenskreis `rhiem_` ([ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)), von Hand geschrieben wie bei Upstream. 1, 2 und 5 brauchen keine Migration.
@@ -108,13 +120,15 @@ Je Zweig: `npm run typecheck && npm run lint && npm test` grün, neue Tests wie 
 
 ## Umsetzungsstand (30.09.2026)
 
-| #     | Zweig                                  | Commits                                               | Stand                                                                                                                                                                                                       |
-| ----- | -------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | `fix/ocpp-auth-http-401`               | `b2cd1b1`                                             | in `rhiem/main`; neue Tests `ocpp-server-auth.test.ts` (echter Server) und `rejectionFor`                                                                                                                   |
-| 2     | `fix/ocpp16-session-energy-meter-stop` | `1767cc5`                                             | in `rhiem/main`; SQL zusätzlich gegen Postgres geprüft (normal, `meterStop` 0, ohne `meterStart`, ohne `meterStop`)                                                                                         |
-| 3 + 4 | `feature/ocpp16-signed-meter-data`     | `dfc6213`, `18b6651`                                  | in `rhiem/main`; Migration `rhiem_0002_signed_meter_data`; Tabellen `signed_meter_values` und `meter_public_keys`; Routen `GET /sessions/:id/signed-meter-values` und `GET /stations/:id/meter-public-keys` |
-| 5     | `fix/tariff-price-net-label`           | `fcf8b7b` (PR-Variante), `c4a9924` (v0.1.27-Variante) | in `rhiem/main`; Beschriftung „netto“ in sechs Sprachen, Brutto-Vorschau `GrossPriceHint` / `formatGrossPrice`                                                                                              |
-| 6     | `fix/ocpp-idle-timeout-keepalive`      | `3b152e1`                                             | in `rhiem/main`; Konflikt mit 1 im selben Abschnitt von `ocpp-server.ts` beim Merge aufgelöst                                                                                                               |
+| #     | Zweig                                     | Commits                                               | Stand                                                                                                                                                                                                       |
+| ----- | ----------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `fix/ocpp-auth-http-401`                  | `b2cd1b1`                                             | in `rhiem/main`; neue Tests `ocpp-server-auth.test.ts` (echter Server) und `rejectionFor`                                                                                                                   |
+| 2     | `fix/ocpp16-session-energy-meter-stop`    | `1767cc5`                                             | in `rhiem/main`; SQL zusätzlich gegen Postgres geprüft (normal, `meterStop` 0, ohne `meterStart`, ohne `meterStop`)                                                                                         |
+| 3 + 4 | `feature/ocpp16-signed-meter-data`        | `dfc6213`, `18b6651`                                  | in `rhiem/main`; Migration `rhiem_0002_signed_meter_data`; Tabellen `signed_meter_values` und `meter_public_keys`; Routen `GET /sessions/:id/signed-meter-values` und `GET /stations/:id/meter-public-keys` |
+| 5     | `fix/tariff-price-net-label`              | `fcf8b7b` (PR-Variante), `c4a9924` (v0.1.27-Variante) | in `rhiem/main`; Beschriftung „netto“ in sechs Sprachen, Brutto-Vorschau `GrossPriceHint` / `formatGrossPrice`                                                                                              |
+| 6     | `fix/ocpp-idle-timeout-keepalive`         | `3b152e1`                                             | in `rhiem/main`; Konflikt mit 1 im selben Abschnitt von `ocpp-server.ts` beim Merge aufgelöst                                                                                                               |
+| 7     | `fix/ocpp-decimal-meter-readings`         | `ec54c34`                                             | in `rhiem/main`                                                                                                                                                                                             |
+| 8     | `fix/portal-commands-version-translation` | `fd9d69b`                                             | in `rhiem/main`                                                                                                                                                                                             |
 
 - Zu 1: Auch SP2 ohne TLS bekommt `401` **ohne** `WWW-Authenticate`, damit keine Station aufgefordert wird, ihr Passwort unverschlüsselt zu senden (Konzept nannte das nur für SP3). Verbindungen über dem Pro-IP-Limit werden weiterhin erst nach dem Upgrade mit `1008` geschlossen; für sie entfällt nur die Stationsabfrage. Datenbankfehler ergeben `503`.
 - Zu 2: Umgesetzt als `GREATEST(bisherige Energie, meter_stop − meter_start)` und nur, wenn `meter_stop ≥ meter_start`. Die Energie sinkt dadurch nie, etwa bei einer Station, die `meterStop` 0 meldet. Die Ursache dafür, dass der letzte periodische Wert der Testladung die Sitzungsenergie nicht mehr aktualisierte, ist nicht geklärt. Im Code findet sich keine Erklärung; mit den gemockten Projektionstests lässt sie sich nicht nachstellen. Der Fix über `meterStop` macht das Ergebnis unabhängig davon richtig. Bei der nächsten Testladung die Sitzungsenergie vor dem Stopp mit dem letzten Messwert vergleichen.
