@@ -536,6 +536,62 @@ export function registerProjections(
     return (rows[0]?.id as string | null) ?? null;
   }
 
+  // Store a signed meter record as billing evidence (signed_meter_values is
+  // not pruned). OCPP 2.x sends it as sampledValue.signedMeterValue; OCPP 1.6
+  // has no such field, so stations put the record into sampledValue.value
+  // with format SignedData. A repeated record from the same station is stored
+  // once; a later Transaction.End occurrence wins as context because the
+  // record then covers the whole transaction.
+  async function storeSignedMeterValue(record: {
+    stationUuid: string;
+    stationIdentity: string;
+    evseUuid: string | null;
+    sessionId: string | null;
+    transactionId: string | undefined;
+    timestamp: string;
+    measurand: string | null;
+    context: string | null;
+    source: string | null;
+    signedData: string;
+    encodingMethod: string | null;
+    signingMethod: string | null;
+    publicKey: string | null;
+  }): Promise<void> {
+    const signedDataSha256 = crypto.createHash('sha256').update(record.signedData).digest('hex');
+    await sql`
+      INSERT INTO signed_meter_values (
+        station_id, evse_id, session_id, station_identity, transaction_id, timestamp,
+        measurand, context, encoding_method, signing_method, public_key,
+        signed_data, signed_data_sha256, source
+      )
+      VALUES (
+        ${record.stationUuid},
+        COALESCE(
+          ${record.evseUuid}::text,
+          (SELECT evse_id FROM charging_sessions WHERE id = ${record.sessionId})
+        ),
+        ${record.sessionId},
+        ${record.stationIdentity},
+        ${record.transactionId ?? null},
+        ${record.timestamp},
+        ${record.measurand},
+        ${record.context},
+        ${record.encodingMethod},
+        ${record.signingMethod},
+        ${record.publicKey},
+        ${record.signedData},
+        ${signedDataSha256},
+        ${record.source}
+      )
+      ON CONFLICT (station_identity, signed_data_sha256) DO UPDATE SET
+        session_id = COALESCE(signed_meter_values.session_id, EXCLUDED.session_id),
+        context = CASE
+          WHEN EXCLUDED.context = 'Transaction.End' THEN EXCLUDED.context
+          ELSE signed_meter_values.context
+        END
+    `;
+  }
+
   function invalidateStationCache(stationId: string): void {
     const uuid = stationIdCache.get(stationId);
     stationIdCache.delete(stationId);
@@ -2773,6 +2829,46 @@ export function registerProjections(
         const location = getString(sv, 'location');
         const context = getString(sv, 'context');
         const signedMeterValue = sv.signedMeterValue ?? null;
+
+        const signedRecord = {
+          stationUuid,
+          stationIdentity: stationId,
+          evseUuid,
+          sessionId,
+          transactionId,
+          timestamp: mvTimestamp,
+          measurand,
+          context,
+          source,
+        };
+        if (signedMeterValue != null && typeof signedMeterValue === 'object') {
+          const smv = signedMeterValue as Record<string, unknown>;
+          const signedMeterData = getString(smv, 'signedMeterData');
+          if (signedMeterData != null) {
+            await storeSignedMeterValue({
+              ...signedRecord,
+              signedData: signedMeterData,
+              encodingMethod: getString(smv, 'encodingMethod'),
+              signingMethod: getString(smv, 'signingMethod'),
+              publicKey: getString(smv, 'publicKey'),
+            });
+          }
+        }
+        // OCPP 1.6: value holds the signed record, not a number. It must not
+        // reach meter_values.value (numeric) or the energy calculation.
+        if (getString(sv, 'format') === 'SignedData') {
+          const signedData = getString(sv, 'value');
+          if (signedData != null && signedData !== '') {
+            await storeSignedMeterValue({
+              ...signedRecord,
+              signedData,
+              encodingMethod: signedData.startsWith('OCMF|') ? 'OCMF' : null,
+              signingMethod: null,
+              publicKey: null,
+            });
+          }
+          continue;
+        }
 
         const mvInserted = await sql`
           INSERT INTO meter_values (

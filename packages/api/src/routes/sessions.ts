@@ -17,6 +17,7 @@ import {
   paymentRecords,
   paymentStatusEnum,
   meterValues,
+  signedMeterValues,
   guestSessions,
   sessionStatusEnum,
 } from '@evtivity/database';
@@ -267,6 +268,33 @@ const meterValueItem = z
       .max(50)
       .nullable()
       .describe('OCPP reading context (e.g. Sample.Periodic, Transaction.Begin, Transaction.End)'),
+  })
+  .passthrough();
+
+const signedMeterValueItem = z
+  .object({
+    id: z.number().int().min(1).describe('Internal signed meter value identifier'),
+    timestamp: z.coerce.date().describe('Timestamp of the sample that carried the signed record'),
+    measurand: z.string().max(100).nullable().describe('OCPP measurand of the sample'),
+    context: z
+      .string()
+      .max(50)
+      .nullable()
+      .describe('OCPP reading context (Transaction.Begin, Transaction.End, Sample.Periodic, etc.)'),
+    encodingMethod: z
+      .string()
+      .max(50)
+      .nullable()
+      .describe('Encoding of the signed record (e.g. OCMF)'),
+    signingMethod: z.string().max(50).nullable().describe('Signing method reported by the station'),
+    publicKey: z
+      .string()
+      .nullable()
+      .describe('Public key sent inline with the signed value (OCPP 2.x), if any'),
+    signedData: z.string().describe('Signed record exactly as received from the station'),
+    signedDataSha256: z.string().max(64).describe('SHA-256 of signedData (hex)'),
+    source: z.string().max(30).nullable().describe('OCPP message the record arrived in'),
+    createdAt: z.coerce.date().describe('When the record was stored'),
   })
   .passthrough();
 
@@ -701,6 +729,82 @@ export function sessionRoutes(app: FastifyInstance): void {
           .select({ count: sql<number>`count(*)::int` })
           .from(meterValues)
           .where(where),
+      ]);
+
+      return { data, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
+        (typeof data)[number]
+      >;
+    },
+  );
+
+  // Signed meter data (e.g. OCMF) kept as billing evidence for the session.
+  // Stored records are not verified; checking the signature is up to the
+  // consumer (e.g. transparency software) with the meter's public key.
+  app.get(
+    '/sessions/:id/signed-meter-values',
+    {
+      onRequest: [authorize('sessions:read')],
+      schema: {
+        tags: ['Sessions'],
+        summary: 'List signed meter values for a charging session',
+        operationId: 'listSessionSignedMeterValues',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(sessionParams),
+        querystring: zodSchema(paginationQuery),
+        response: {
+          200: paginatedResponse(signedMeterValueItem),
+          404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof sessionParams>;
+      const { page, limit } = request.query as { page: number; limit: number };
+      const offset = (page - 1) * limit;
+
+      const [session] = await db
+        .select({ id: chargingSessions.id, siteId: chargingStations.siteId })
+        .from(chargingSessions)
+        .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
+        .where(eq(chargingSessions.id, id))
+        .limit(1);
+
+      if (session == null) {
+        await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+        return;
+      }
+
+      const { userId } = request.user as JwtPayload;
+      const smvSiteIds = await getUserSiteIds(userId);
+      if (smvSiteIds != null && session.siteId != null && !smvSiteIds.includes(session.siteId)) {
+        await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+        return;
+      }
+
+      const [data, countRows] = await Promise.all([
+        db
+          .select({
+            id: signedMeterValues.id,
+            timestamp: signedMeterValues.timestamp,
+            measurand: signedMeterValues.measurand,
+            context: signedMeterValues.context,
+            encodingMethod: signedMeterValues.encodingMethod,
+            signingMethod: signedMeterValues.signingMethod,
+            publicKey: signedMeterValues.publicKey,
+            signedData: signedMeterValues.signedData,
+            signedDataSha256: signedMeterValues.signedDataSha256,
+            source: signedMeterValues.source,
+            createdAt: signedMeterValues.createdAt,
+          })
+          .from(signedMeterValues)
+          .where(eq(signedMeterValues.sessionId, id))
+          .orderBy(signedMeterValues.timestamp, signedMeterValues.id)
+          .limit(limit)
+          .offset(offset),
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(signedMeterValues)
+          .where(eq(signedMeterValues.sessionId, id)),
       ]);
 
       return { data, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<

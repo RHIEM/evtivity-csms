@@ -96,6 +96,7 @@ vi.mock('@evtivity/database', () => ({
     ] as const,
   },
   meterValues: {},
+  signedMeterValues: {},
   guestSessions: {},
   vehicles: {},
   sessionStatusEnum: {
@@ -691,6 +692,62 @@ describe('Session routes', () => {
       expect(body.total).toBe(0);
       // eq should be called for both session_id filter and measurand filter
       expect(eq).toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /v1/sessions/:id/signed-meter-values', () => {
+    it('returns 401 without token', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}/signed-meter-values`,
+      });
+      expect(response.statusCode).toBe(401);
+    });
+
+    it('returns 404 for unknown session', async () => {
+      setupDbResults([]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}/signed-meter-values`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SESSION_NOT_FOUND');
+    });
+
+    it('returns the signed records unchanged', async () => {
+      const ocmf = 'OCMF|{"FV":"1.1","RD":[{"TX":"B"},{"TX":"E"}]}|{"SD":"3045"}';
+      const record = {
+        id: 1,
+        timestamp: '2026-09-30T14:46:12.175Z',
+        measurand: 'Energy.Active.Import.Register',
+        context: 'Transaction.End',
+        encodingMethod: 'OCMF',
+        signingMethod: null,
+        publicKey: null,
+        signedData: ocmf,
+        signedDataSha256: 'a'.repeat(64),
+        source: 'TransactionEvent',
+        createdAt: '2026-09-30T14:53:48.600Z',
+      };
+      // session lookup, signed records, count
+      setupDbResults([{ id: VALID_SESSION_ID }], [record], [{ count: 1 }]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}/signed-meter-values`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.total).toBe(1);
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].signedData).toBe(ocmf);
+      expect(body.data[0].encodingMethod).toBe('OCMF');
+      expect(body.data[0].context).toBe('Transaction.End');
     });
   });
 });

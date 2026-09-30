@@ -196,3 +196,44 @@ export const meterValues = pgTable(
     ),
   ],
 );
+
+// Signed meter data as received from the station (e.g. OCMF records required
+// as billing evidence under German calibration law). Unlike meter_values this
+// table is not pruned by log retention, and deleting a station or session
+// keeps the record: the foreign keys are set to null and station_identity and
+// transaction_id still identify it.
+export const signedMeterValues = pgTable(
+  'signed_meter_values',
+  {
+    id: serial('id').primaryKey(),
+    stationId: text('station_id').references(() => chargingStations.id, {
+      onDelete: 'set null',
+    }),
+    evseId: text('evse_id').references(() => evses.id, { onDelete: 'set null' }),
+    sessionId: text('session_id').references(() => chargingSessions.id, {
+      onDelete: 'set null',
+    }),
+    // OCPP identity of the station (charging_stations.station_id).
+    stationIdentity: varchar('station_identity', { length: 255 }).notNull(),
+    transactionId: varchar('transaction_id', { length: 36 }),
+    timestamp: timestamp('timestamp', { withTimezone: true }).notNull(),
+    measurand: varchar('measurand', { length: 100 }),
+    context: varchar('context', { length: 50 }),
+    // OCPP 2.x signedMeterValue.encodingMethod; 'OCMF' for OCPP 1.6 records
+    // with the OCMF| prefix.
+    encodingMethod: varchar('encoding_method', { length: 50 }),
+    signingMethod: varchar('signing_method', { length: 50 }),
+    publicKey: text('public_key'),
+    // The signed record exactly as received.
+    signedData: text('signed_data').notNull(),
+    signedDataSha256: varchar('signed_data_sha256', { length: 64 }).notNull(),
+    source: varchar('source', { length: 30 }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_signed_meter_values_session_id').on(table.sessionId),
+    // A station may repeat the same record (the KEBA KC-P30 sends one OCMF
+    // record as both Transaction.Begin and Transaction.End sample).
+    uniqueIndex('signed_meter_values_dedup_idx').on(table.stationIdentity, table.signedDataSha256),
+  ],
+);
