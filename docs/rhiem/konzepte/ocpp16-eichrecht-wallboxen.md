@@ -1,7 +1,7 @@
 # Konzept: Eichrechtskonforme OCPP-1.6-Wallboxen (KEBA KC-P30)
 
 - **Status:** Freigegeben (30.09.2026)
-- **Stand:** 30.09.2026
+- **Stand:** 30.09.2026, geändert 30.09.2026 (3 und 4 zusammengelegt, Signatur-Feature vorerst nicht an EVtivity)
 - **Anlass:** Erste echte Wallbox im Pilot (KEBA KC-P30, Firmware 2.1.0, OCPP 1.6J, RFID). Befunde aus der ersten Testladung am 30.09.2026 mit `v0.1.27` + RHIEM-Änderungen.
 
 ## Ziel
@@ -22,7 +22,7 @@ Upstream gibt es zu keinem Punkt ein Issue oder einen PR (geprüft 30.09.2026).
 
 ## Lösungskonzept
 
-Fünf getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` und später als eigener PR an EVtivity ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert.
+Vier getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)). Reihenfolge wie nummeriert. 1, 2 und 5 sind als PR an EVtivity vorgesehen; der Zeitpunkt wird gesondert entschieden. Das Signatur-Feature (3 und 4) wird vorerst **nicht** an EVtivity gegeben, weder als PR noch als Feature-Request oder Issue (Entscheidung 30.09.2026).
 
 ### 1. Anmeldung vor dem Upgrade prüfen (`fix/ocpp-auth-http-401`)
 
@@ -42,12 +42,12 @@ Fünf getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` und s
 - Bei der Umsetzung wird zusätzlich per Test geklärt, warum der letzte periodische Wert die Sitzung nicht mehr aktualisiert hat. Ein Fix dafür nur, wenn er klein bleibt; sonst eigenes Issue.
 - Tests: Projektion mit einer 1.6-Sitzung, deren letzte `MeterValues` hinter `meterStop` liegen; Kostenberechnung mit der korrigierten Energie.
 
-### 3. Messnachweise speichern (`feature/ocpp16-signed-meter-data`)
+### 3. Messnachweise speichern (`feature/ocpp16-signed-meter-data`, zusammen mit 4)
 
 - Neue Tabelle für Messnachweise je Sitzung, angelehnt an OCPI `SignedData` (`packages/ocpi/src/types/ocpi.ts`):
   - Bezug: Sitzung, Station, EVSE (sofern bekannt).
-  - `encoding_method` (`OCMF`), Art (`start`/`end`/`intermediate`, aus dem Kontext abgeleitet), Zeitpunkt, Quelle (`StopTransaction`, `MeterValues`, `TransactionEvent`).
-  - Rohdaten **unverändert als Text**, dazu ihr SHA-256 für die Deduplizierung (eindeutig je Sitzung).
+  - `encoding_method` (`OCMF`), OCPP-Kontext (`Transaction.Begin`/`Transaction.End`/…; die Art Start/Ende lässt sich daraus ableiten), Zeitpunkt, Quelle (`StopTransaction`, `MeterValues`, `TransactionEvent`).
+  - Rohdaten **unverändert als Text**, dazu ihr SHA-256 für die Deduplizierung (eindeutig je Station).
   - Verweis auf den zum Zeitpunkt gültigen Zählerschlüssel (aus 4), sofern bekannt.
 - **Keine automatische Löschung:** Die Tabelle steht nicht in `log-retention-prune.ts`. Beim Löschen einer Sitzung darf der Nachweis nicht still mitgelöscht werden (kein `ON DELETE CASCADE`).
 - Projektion: Werte mit `format: SignedData` (1.6) bzw. `signedMeterValue` (2.x) werden als Nachweis gespeichert und nicht als Zahl in `meter_values.value` geschrieben. Identische Datensätze (KC-P30: Begin und End) ergeben einen Eintrag.
@@ -55,7 +55,9 @@ Fünf getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` und s
 - Nicht in diesem Schnitt: Anzeige in Betreiberoberfläche und Fahrerportal, Export, kryptografische Prüfung. Ein gespeicherter Nachweis gilt noch nicht als geprüft.
 - Tests: Projektion mit dem 1.6-Muster der KC-P30 (Raw und SignedData gemischt, doppelter Datensatz); 2.x-`signedMeterValue`; Bereinigung lässt die Tabelle unberührt.
 
-### 4. Zählerschlüssel übernehmen (`feature/ocpp16-meter-public-key`)
+### 4. Zählerschlüssel übernehmen (im Zweig von 3)
+
+Zusammengelegt mit 3 (30.09.2026): Nachweis und Schlüssel gehören fachlich zusammen, und der Verweis vom Nachweis auf den Schlüssel wird fest gespeichert.
 
 - `DataTransfer` mit `vendorId: generalConfiguration` und `messageId: setMeterConfiguration` wird ausgewertet. Die Nutzdaten werden validiert (`meters[]` mit `connectorId`, `meterSerial`, `type`, `publicKey`).
 - Neue Tabelle für Zählerschlüssel: Station, Anschluss, Zählerseriennummer, Typ, Schlüssel (wie empfangen), erstmals und zuletzt gemeldet. Ein neuer Schlüssel für denselben Anschluss wird als neuer Eintrag geführt; der alte bleibt erhalten. Keine automatische Löschung.
@@ -72,7 +74,7 @@ Fünf getrennte Zweige ab `v0.1.27`, jeweils mit `--no-ff` in `rhiem/main` und s
 
 ### Migrationen
 
-Neue Tabellen aus 3 und 4 kommen als eigene Migrationen im Namenskreis `rhiem_` ([ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)), von Hand geschrieben wie bei Upstream. 1, 2 und 5 brauchen keine Migration.
+Die Tabellen aus 3 und 4 kommen als eine Migration im Namenskreis `rhiem_` ([ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)), von Hand geschrieben wie bei Upstream. 1, 2 und 5 brauchen keine Migration.
 
 ### Fertig heißt
 
@@ -95,4 +97,18 @@ Je Zweig: `npm run typecheck && npm run lint && npm test` grün, neue Tests wie 
 ## Offene Punkte
 
 - Gesetzliche Aufbewahrungsfrist der Messnachweise klären; bis dahin werden sie nicht gelöscht.
-- Abstimmung mit EVtivity, ob Schlüssel und Messnachweise als eigene Tabellen oder anders gewünscht sind, vor den PRs zu 3 und 4.
+- Falls das Signatur-Feature später doch an EVtivity geht: vorher abstimmen, ob Schlüssel und Messnachweise als eigene Tabellen gewünscht sind.
+
+## Umsetzungsstand (30.09.2026)
+
+| #     | Zweig                                  | Commits              | Stand                                                                                                                                                                                                       |
+| ----- | -------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `fix/ocpp-auth-http-401`               | `b2cd1b1`            | in `rhiem/main`; neue Tests `ocpp-server-auth.test.ts` (echter Server) und `rejectionFor`                                                                                                                   |
+| 2     | `fix/ocpp16-session-energy-meter-stop` | `1767cc5`            | in `rhiem/main`; SQL zusätzlich gegen Postgres geprüft (normal, `meterStop` 0, ohne `meterStart`, ohne `meterStop`)                                                                                         |
+| 3 + 4 | `feature/ocpp16-signed-meter-data`     | `dfc6213`, `18b6651` | in `rhiem/main`; Migration `rhiem_0002_signed_meter_data`; Tabellen `signed_meter_values` und `meter_public_keys`; Routen `GET /sessions/:id/signed-meter-values` und `GET /stations/:id/meter-public-keys` |
+| 5     | `fix/tariff-price-net-label`           | –                    | offen                                                                                                                                                                                                       |
+
+- Zu 1: Auch SP2 ohne TLS bekommt `401` **ohne** `WWW-Authenticate`, damit keine Station aufgefordert wird, ihr Passwort unverschlüsselt zu senden (Konzept nannte das nur für SP3). Verbindungen über dem Pro-IP-Limit werden weiterhin erst nach dem Upgrade mit `1008` geschlossen; für sie entfällt nur die Stationsabfrage. Datenbankfehler ergeben `503`.
+- Zu 2: Umgesetzt als `GREATEST(bisherige Energie, meter_stop − meter_start)` und nur, wenn `meter_stop ≥ meter_start`. Die Energie sinkt dadurch nie, etwa bei einer Station, die `meterStop` 0 meldet. Die Ursache dafür, dass der letzte periodische Wert der Testladung die Sitzungsenergie nicht mehr aktualisierte, ist nicht geklärt. Im Code findet sich keine Erklärung; mit den gemockten Projektionstests lässt sie sich nicht nachstellen. Der Fix über `meterStop` macht das Ergebnis unabhängig davon richtig. Bei der nächsten Testladung die Sitzungsenergie vor dem Stopp mit dem letzten Messwert vergleichen.
+- Zu 3 + 4: Wiederholte Datensätze einer Station ergeben eine Zeile, `Transaction.End` gewinnt als Kontext. Der Verweis auf den Schlüssel ist der zuletzt gemeldete Schlüssel des Anschlusses beim Eintreffen des Datensatzes; ist noch keiner bekannt, bleibt er leer. Migration, Deduplizierung, Verweis und Erhalt nach dem Löschen von Station, EVSE und Sitzung wurden gegen Postgres 17 geprüft.
+- Prüfung im Pilot mit der KC-P30 steht aus.
