@@ -45,6 +45,13 @@ import { config } from '../lib/config.js';
 
 const MAX_CONNECTIONS_PER_IP = config.OCPP_MAX_CONNECTIONS_PER_IP;
 const MAX_MESSAGES_PER_IP_PER_SECOND = config.OCPP_MAX_MESSAGES_PER_IP_PER_SECOND;
+// Close connections without any sign of life for this long. WebSocket
+// ping/pong counts as a sign of life: the ping monitor pings every station
+// every 30s, while heartbeats may be as rare as the interval handed out in
+// BootNotification (300s, the same as this default). Counting only OCPP
+// messages closed idle stations whose heartbeat arrived a few milliseconds
+// after the timer fired.
+const IDLE_TIMEOUT_MS = config.OCPP_IDLE_TIMEOUT_MS;
 const IP_MESSAGE_WINDOW_MS = 1000;
 
 const ipConnectionCounts = new Map<string, number>();
@@ -312,9 +319,7 @@ export class OcppServer {
       }
     });
 
-    // Idle timeout: close connections with no messages for 5 minutes.
-    // OCPP heartbeat interval is typically 30-60 seconds, so 5 minutes is generous.
-    const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+    // Idle timeout: close connections without messages or ping/pong frames.
     let idleTimer = setTimeout(() => {
       this.logger.info({ remoteIp }, 'Closing idle WebSocket connection');
       ws.close(1000, 'Idle timeout');
@@ -356,12 +361,18 @@ export class OcppServer {
 
     this.pingMonitor.writeNow();
 
-    ws.on('message', (data: Buffer) => {
+    const restartIdleTimer = (): void => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         this.logger.info({ stationId }, 'Closing idle WebSocket connection');
         ws.close(1000, 'Idle timeout');
       }, IDLE_TIMEOUT_MS);
+    };
+    // Stations may ping on their own schedule (e.g. WebSocketPingInterval).
+    ws.on('ping', restartIdleTimer);
+
+    ws.on('message', (data: Buffer) => {
+      restartIdleTimer();
       // Per-IP message rate limit
       const now = Date.now();
       let ipCounter = ipMessageCounters.get(remoteIp);
@@ -396,6 +407,7 @@ export class OcppServer {
     });
 
     ws.on('pong', () => {
+      restartIdleTimer();
       this.pingMonitor.recordPong(stationId);
     });
 
