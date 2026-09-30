@@ -1,7 +1,7 @@
 # ADR 0001: Eigener Fork und Branch-Strategie
 
 - **Status:** Angenommen
-- **Datum:** 29.09.2026
+- **Datum:** 29.09.2026, ergänzt 30.09.2026
 
 ## Kontext
 
@@ -13,9 +13,9 @@ Für den Feldversuch Mitarbeiterladen brauchen wir Erweiterungen an EVtivity (zu
 - `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag plus RHIEM-eigene Dateien.
 - Features entstehen als `feature/…` bzw. `fix/…` vom Upstream-Tag, auf dem `rhiem/main` steht, und werden mit `--no-ff` in `rhiem/main` gemergt.
 - Für einen PR an EVtivity wird der Feature-Zweig auf `upstream/main` rebased und nach den Regeln aus `CONTRIBUTING.md` eingereicht.
-- Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026). Unterschrieben wird per PR-Kommentar mit exakt `I have read the CLA Document and I hereby sign the CLA` (die Checkbox im PR-Template wertet der Bot nicht aus). Der CLA-Workflow bei EVtivity kann Unterschriften derzeit nicht speichern (`contents: read`); bis das behoben ist, ist der Kommentar in jedem PR nötig und der Check bleibt rot.
+- Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026). Unterschrieben wird per PR-Kommentar mit exakt `I have read the CLA Document and I hereby sign the CLA` (die Checkbox im PR-Template wertet der Bot nicht aus). Bis `v0.1.26` konnte der CLA-Workflow bei EVtivity Unterschriften nicht speichern (`contents: read`), deshalb war der Kommentar in jedem PR nötig. Seit `ce9fef9` (in `v0.1.27`) ist das behoben.
 - Neue EVtivity-Releases werden per Merge des Tags in `rhiem/main` übernommen.
-  - Ausnahme 29.09.2026: `upstream/main` (`4de16e7`, noch ohne Release) wurde gemergt. v0.1.25 lässt sich ohne diesen Fix nicht als Docker-Image bauen: Das Portal-Image kopiert `packages/lib` nicht, obwohl das Portal seit v0.1.25 `@evtivity/lib/currency` importiert. Mit dem nächsten Release-Tag wird wieder regulär übernommen.
+  - Ausnahme 29.09.2026: `upstream/main` (`4de16e7`, noch ohne Release) wurde gemergt. v0.1.25 lässt sich ohne diesen Fix nicht als Docker-Image bauen: Das Portal-Image kopiert `packages/lib` nicht, obwohl das Portal seit v0.1.25 `@evtivity/lib/currency` importiert. Mit `v0.1.27` (30.09.2026) wieder regulär übernommen.
 
 ## Konsequenzen
 

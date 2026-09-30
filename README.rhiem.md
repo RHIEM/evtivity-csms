@@ -51,7 +51,7 @@ Alle Mails landen in Mailpit, nichts wird tatsächlich versendet.
 
 Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategie.md).
 
-- `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.25`) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
+- `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.27`) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
 - Features zweigen deshalb vom **Upstream-Tag** ab, auf dem `rhiem/main` steht – nicht von `rhiem/main`.
 
 | Zweck                                    | Abzweigen von                 | Präfix               |
@@ -61,7 +61,7 @@ Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategi
 
 ```bash
 # Feature anlegen und in unseren Stand übernehmen
-git switch -c feature/<name> v0.1.25
+git switch -c feature/<name> v0.1.27
 git switch rhiem/main && git merge --no-ff feature/<name>
 
 # Später als PR an EVtivity: auf aktuellen Upstream bringen
@@ -75,7 +75,7 @@ git switch rhiem/main && git merge v0.1.xx
 
 ### Eigene Datenbankmigrationen
 
-Details: [ADR 0002](docs/rhiem/adr/0002-eigene-datenbankmigrationen.md). Migrationen von Hand anlegen (`db:generate` ist nicht nutzbar): `NNNN_name.sql` plus Journaleintrag mit `idx` und `when` jeweils +1, dann `npm run check:migrations`. Bringt ein Upstream-Release neue Migrationen, unsere dahinter umnummerieren (Datei, `idx`, `tag`, `when`), Inhalt nie ändern.
+Details: [ADR 0002](docs/rhiem/adr/0002-eigene-datenbankmigrationen.md). Migrationen von Hand anlegen (`db:generate` ist nicht nutzbar): `rhiem_NNNN_name.sql` mit eigener, fortlaufender Nummer plus Journaleintrag am Ende mit `idx` und `when` jeweils +1, dann `npm run check:migrations`. Bringt ein Upstream-Release neue Migrationen, entsteht ein Konflikt am Ende von `_journal.json`: Upstream-Einträge übernehmen, unsere dahinter setzen, `idx` und `when` weiterzählen. Dateiname und Inhalt bleiben unverändert.
 
 ## Hinweise
 
