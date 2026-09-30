@@ -125,6 +125,13 @@ describe('logRetentionPruneHandler', () => {
     expect(targeted).toEqual(TABLE_DEFAULTS.map((t) => t.table));
   });
 
+  it('never prunes signed meter values kept as billing evidence', async () => {
+    const { logRetentionPruneHandler } = await import('../../handlers/log-retention-prune.js');
+    await logRetentionPruneHandler(makeLog());
+    const targeted = mockPruneOldRows.mock.calls.map((c) => (c[0] as { table: string }).table);
+    expect(targeted).not.toContain('signed_meter_values');
+  });
+
   it('uses the operator-configured numeric override over the default', async () => {
     settingRows = [
       { key: 'logs.access.retentionDays', value: 7 },

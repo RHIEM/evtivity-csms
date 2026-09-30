@@ -2271,6 +2271,196 @@ describe('Event projections', () => {
       // unwraps to the raw object rather than a stringified JSON blob.
       expect(insertCall!.values).toContain(signedData);
     });
+
+    it('keeps a 2.x signedMeterValue as evidence in signed_meter_values', async () => {
+      await setup();
+
+      setupSqlResults([{ id: 'sta_000000000001' }]); // resolveStationUuid
+
+      await eventBus.emit(
+        'ocpp.MeterValues',
+        makeDomainEvent('ocpp.MeterValues', 'CS-001', {
+          stationId: 'CS-001',
+          meterValues: [
+            {
+              timestamp: '2024-01-01T00:30:00Z',
+              sampledValue: [
+                {
+                  measurand: 'Energy.Active.Import.Register',
+                  value: 5000,
+                  unitOfMeasure: { unit: 'Wh' },
+                  signedMeterValue: {
+                    signedMeterData: 'OCMF|{"FV":"1.0"}|{"SD":"30"}',
+                    signingMethod: 'ECDSA-secp256r1-SHA256',
+                    encodingMethod: 'OCMF',
+                    publicKey: '3059301306072A8648CE3D0201',
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const evidence = sqlCalls.find((c) =>
+        c.strings.join('').includes('INSERT INTO signed_meter_values'),
+      );
+      expect(evidence).toBeDefined();
+      expect(evidence!.values).toContain('OCMF|{"FV":"1.0"}|{"SD":"30"}');
+      expect(evidence!.values).toContain('ECDSA-secp256r1-SHA256');
+      expect(evidence!.values).toContain('3059301306072A8648CE3D0201');
+      expect(evidence!.values).toContain('CS-001');
+      // The telemetry row is still written as before.
+      const telemetry = sqlCalls.find((c) =>
+        c.strings.join('').includes('INSERT INTO meter_values'),
+      );
+      expect(telemetry).toBeDefined();
+    });
+
+    it('stores OCPP 1.6 SignedData from StopTransaction transactionData as evidence only', async () => {
+      await setup();
+
+      const ocmf =
+        'OCMF|{"FV":"1.1","GI":"KEBA_KCP30","RD":[{"TX":"B","RV":2908.2472},{"TX":"E","RV":2909.4659}]}|{"SD":"3045"}';
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationUuid
+        [{ id: 'ses_000000000001' }], // resolveActiveSessionId (completed session allowed)
+      );
+
+      // Shape of a KEBA KC-P30 StopTransaction.transactionData: raw Begin/End
+      // readings plus the same OCMF record as Begin and End sample.
+      await eventBus.emit(
+        'ocpp.MeterValues',
+        makeDomainEvent('ocpp.MeterValues', 'CS-001', {
+          stationId: 'CS-001',
+          evseId: 0,
+          transactionId: '3',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2026-09-30T14:46:12.175Z',
+              sampledValue: [
+                {
+                  unit: 'Wh',
+                  value: '2908247.2',
+                  format: 'Raw',
+                  context: 'Transaction.Begin',
+                  measurand: 'Energy.Active.Import.Register',
+                },
+              ],
+            },
+            {
+              timestamp: '2026-09-30T14:46:12.175Z',
+              sampledValue: [
+                {
+                  value: ocmf,
+                  format: 'SignedData',
+                  context: 'Transaction.Begin',
+                  measurand: 'Energy.Active.Import.Register',
+                },
+              ],
+            },
+            {
+              timestamp: '2026-09-30T14:53:42.516Z',
+              sampledValue: [
+                {
+                  value: ocmf,
+                  format: 'SignedData',
+                  context: 'Transaction.End',
+                  measurand: 'Energy.Active.Import.Register',
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const evidence = sqlCalls.filter((c) =>
+        c.strings.join('').includes('INSERT INTO signed_meter_values'),
+      );
+      // Both samples are written; the unique index on (station_identity,
+      // signed_data_sha256) folds them into one row.
+      expect(evidence).toHaveLength(2);
+      for (const call of evidence) {
+        expect(call.values).toContain(ocmf);
+        expect(call.values).toContain('OCMF');
+        expect(call.values).toContain('ses_000000000001');
+        expect(call.values).toContain('3');
+      }
+      expect(evidence[0]!.strings.join('')).toContain(
+        'ON CONFLICT (station_identity, signed_data_sha256)',
+      );
+      // The record references the latest meter key of the connector.
+      expect(evidence[0]!.strings.join('')).toContain('FROM meter_public_keys k');
+
+      // Only the raw reading reaches meter_values; the OCMF text never does.
+      const telemetry = sqlCalls.filter((c) =>
+        c.strings.join('').includes('INSERT INTO meter_values'),
+      );
+      expect(telemetry.length).toBeGreaterThan(0);
+      for (const call of telemetry) {
+        expect(call.values).not.toContain(ocmf);
+      }
+    });
+  });
+
+  describe('ocpp.DataTransfer (setMeterConfiguration)', () => {
+    const publicKey = '3059301306072A8648CE3D020106082A8648CE3D030107034200';
+
+    it('stores the announced meter public key per connector', async () => {
+      await setup();
+
+      setupSqlResults([{ id: 'sta_000000000001' }]); // resolveStationUuid
+
+      await eventBus.emit(
+        'ocpp.DataTransfer',
+        makeDomainEvent('ocpp.DataTransfer', 'CS-001', {
+          stationId: 'CS-001',
+          vendorId: 'generalConfiguration',
+          messageId: 'setMeterConfiguration',
+          data: JSON.stringify({
+            meters: [{ connectorId: 1, meterSerial: 'M-1', type: 'SIGNATURE', publicKey }],
+          }),
+        }),
+      );
+
+      const insert = sqlCalls.find((c) =>
+        c.strings.join('').includes('INSERT INTO meter_public_keys'),
+      );
+      expect(insert).toBeDefined();
+      expect(insert!.values).toEqual([
+        'sta_000000000001',
+        'CS-001',
+        1,
+        'M-1',
+        'SIGNATURE',
+        publicKey,
+      ]);
+      // A repeated announcement only refreshes last_seen_at; a new key is a new row.
+      expect(insert!.strings.join('')).toContain(
+        'ON CONFLICT (station_identity, connector_id, public_key) DO UPDATE',
+      );
+      expect(insert!.strings.join('')).toContain('last_seen_at = now()');
+    });
+
+    it('ignores other DataTransfer messages and malformed data', async () => {
+      await setup();
+
+      for (const payload of [
+        { vendorId: 'TestVendor', messageId: 'setMeterConfiguration', data: '{}' },
+        { vendorId: 'generalConfiguration', messageId: 'setMeterConfiguration', data: 'nope' },
+      ]) {
+        await eventBus.emit(
+          'ocpp.DataTransfer',
+          makeDomainEvent('ocpp.DataTransfer', 'CS-001', { stationId: 'CS-001', ...payload }),
+        );
+      }
+
+      expect(
+        sqlCalls.some((c) => c.strings.join('').includes('INSERT INTO meter_public_keys')),
+      ).toBe(false);
+    });
   });
 
   describe('ocpp.FirmwareStatusNotification', () => {

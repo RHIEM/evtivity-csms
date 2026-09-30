@@ -90,6 +90,8 @@ const LOG_TABLES: readonly LogTable[] = [
     // `timestamp` is indexed (idx_meter_values_timestamp) and is the meter
     // reading time, set on insert. Sessions read only recent rows; energy
     // totals live on charging_sessions, so old samples are safe to drop.
+    // Signed records (billing evidence) live in signed_meter_values, which is
+    // deliberately not listed here.
     cutoffColumn: 'timestamp',
   },
 ];

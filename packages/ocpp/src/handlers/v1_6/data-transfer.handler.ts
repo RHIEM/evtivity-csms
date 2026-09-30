@@ -3,6 +3,7 @@
 
 import type { HandlerContext } from '../../server/middleware/pipeline.js';
 import type { DataTransfer } from '../../generated/v1_6/types/messages/DataTransfer.js';
+import { isMeterConfiguration, parseMeterConfiguration } from '../../lib/meter-configuration.js';
 
 export async function handleDataTransfer(ctx: HandlerContext): Promise<Record<string, unknown>> {
   const request = ctx.payload as unknown as DataTransfer;
@@ -28,6 +29,16 @@ export async function handleDataTransfer(ctx: HandlerContext): Promise<Record<st
       data: request.data,
     },
   });
+
+  // Public key of the calibration-law meter; stored by the DataTransfer
+  // projection. Other vendor messages are not supported.
+  if (isMeterConfiguration(request.vendorId, request.messageId)) {
+    if (parseMeterConfiguration(request.data) == null) {
+      ctx.logger.warn({ stationId: ctx.stationId }, 'Invalid setMeterConfiguration data');
+      return { status: 'Rejected' };
+    }
+    return { status: 'Accepted' };
+  }
 
   return { status: 'UnknownVendorId' };
 }

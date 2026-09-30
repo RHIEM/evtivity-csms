@@ -34,6 +34,7 @@ import {
   vendors,
   ocppMessageLogs,
   connectionLogs,
+  meterPublicKeys,
   stationCertificates,
   pricingGroupStations,
   pricingGroups,
@@ -654,6 +655,18 @@ const ocppLogsResponse = z
     actions: z
       .array(z.string())
       .describe('Distinct OCPP action names seen on this station, for filter dropdowns'),
+  })
+  .passthrough();
+
+const meterPublicKeyItem = z
+  .object({
+    id: z.number().int().min(1).describe('Internal meter public key identifier'),
+    connectorId: z.number().int().describe('OCPP connector the meter belongs to'),
+    meterSerial: z.string().max(255).nullable().describe('Serial number of the meter'),
+    keyType: z.string().max(50).nullable().describe('Key type reported by the station'),
+    publicKey: z.string().describe('Public key exactly as reported by the station'),
+    firstSeenAt: z.coerce.date().describe('When the station first reported this key'),
+    lastSeenAt: z.coerce.date().describe('When the station last reported this key'),
   })
   .passthrough();
 
@@ -5986,6 +5999,48 @@ export function stationRoutes(app: FastifyInstance): void {
       return { data, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
         (typeof data)[number]
       >;
+    },
+  );
+
+  // Public keys of the calibration-law meters of a station, newest first.
+  // Needed to verify signed meter data (e.g. OCMF) of the station's sessions.
+  app.get(
+    '/stations/:id/meter-public-keys',
+    {
+      onRequest: [authorize('stations:read')],
+      schema: {
+        tags: ['Stations'],
+        summary: 'List meter public keys reported by a station',
+        operationId: 'listStationMeterPublicKeys',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(stationParams),
+        response: {
+          200: arrayResponse(meterPublicKeyItem),
+          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof stationParams>;
+      const { userId } = request.user as JwtPayload;
+      if (!(await checkStationSiteAccess(id, userId))) {
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+
+      return db
+        .select({
+          id: meterPublicKeys.id,
+          connectorId: meterPublicKeys.connectorId,
+          meterSerial: meterPublicKeys.meterSerial,
+          keyType: meterPublicKeys.keyType,
+          publicKey: meterPublicKeys.publicKey,
+          firstSeenAt: meterPublicKeys.firstSeenAt,
+          lastSeenAt: meterPublicKeys.lastSeenAt,
+        })
+        .from(meterPublicKeys)
+        .where(eq(meterPublicKeys.stationId, id))
+        .orderBy(desc(meterPublicKeys.lastSeenAt), desc(meterPublicKeys.id));
     },
   );
 }

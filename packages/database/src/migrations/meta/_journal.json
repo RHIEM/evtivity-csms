@@ -638,6 +638,13 @@
       "when": 1781230951115,
       "tag": "rhiem_0001_payment_mode",
       "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1781230951116,
+      "tag": "rhiem_0002_signed_meter_data",
+      "breakpoints": true
     }
   ]
 }
