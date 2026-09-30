@@ -629,7 +629,14 @@
       "idx": 89,
       "version": "7",
       "when": 1781230951114,
-      "tag": "0089_payment_mode",
+      "tag": "0089_single_currency_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1781230951115,
+      "tag": "rhiem_0001_payment_mode",
       "breakpoints": true
     }
   ]

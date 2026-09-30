@@ -2087,7 +2087,6 @@ export function portalChargerRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
 
-      const companyCurrency = await getCompanyCurrency();
       const sessions = await db
         .select({
           id: chargingSessions.id,
@@ -2097,7 +2096,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           startedAt: chargingSessions.startedAt,
           energyDeliveredWh: chargingSessions.energyDeliveredWh,
           currentCostCents: chargingSessions.currentCostCents,
-          currency: sessionCurrencySql(companyCurrency),
+          currency: sessionCurrencySql(),
         })
         .from(chargingSessions)
         .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
