@@ -716,7 +716,7 @@ export function registerProjections(
         WHERE fd.driver_id = ${driverId} AND f.payment_mode IS NOT NULL
         ORDER BY fd.created_at ASC
         LIMIT 1
-      )
+      ),
       resolved AS (
         SELECT payment_mode FROM (
           SELECT payment_mode, priority FROM driver_mode
