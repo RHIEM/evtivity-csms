@@ -2303,6 +2303,8 @@ describe('Event projections', () => {
       expect(evidence[0]!.strings.join('')).toContain(
         'ON CONFLICT (station_identity, signed_data_sha256)',
       );
+      // The record references the latest meter key of the connector.
+      expect(evidence[0]!.strings.join('')).toContain('FROM meter_public_keys k');
 
       // Only the raw reading reaches meter_values; the OCMF text never does.
       const telemetry = sqlCalls.filter((c) =>
@@ -2312,6 +2314,64 @@ describe('Event projections', () => {
       for (const call of telemetry) {
         expect(call.values).not.toContain(ocmf);
       }
+    });
+  });
+
+  describe('ocpp.DataTransfer (setMeterConfiguration)', () => {
+    const publicKey = '3059301306072A8648CE3D020106082A8648CE3D030107034200';
+
+    it('stores the announced meter public key per connector', async () => {
+      await setup();
+
+      setupSqlResults([{ id: 'sta_000000000001' }]); // resolveStationUuid
+
+      await eventBus.emit(
+        'ocpp.DataTransfer',
+        makeDomainEvent('ocpp.DataTransfer', 'CS-001', {
+          stationId: 'CS-001',
+          vendorId: 'generalConfiguration',
+          messageId: 'setMeterConfiguration',
+          data: JSON.stringify({
+            meters: [{ connectorId: 1, meterSerial: 'M-1', type: 'SIGNATURE', publicKey }],
+          }),
+        }),
+      );
+
+      const insert = sqlCalls.find((c) =>
+        c.strings.join('').includes('INSERT INTO meter_public_keys'),
+      );
+      expect(insert).toBeDefined();
+      expect(insert!.values).toEqual([
+        'sta_000000000001',
+        'CS-001',
+        1,
+        'M-1',
+        'SIGNATURE',
+        publicKey,
+      ]);
+      // A repeated announcement only refreshes last_seen_at; a new key is a new row.
+      expect(insert!.strings.join('')).toContain(
+        'ON CONFLICT (station_identity, connector_id, public_key) DO UPDATE',
+      );
+      expect(insert!.strings.join('')).toContain('last_seen_at = now()');
+    });
+
+    it('ignores other DataTransfer messages and malformed data', async () => {
+      await setup();
+
+      for (const payload of [
+        { vendorId: 'TestVendor', messageId: 'setMeterConfiguration', data: '{}' },
+        { vendorId: 'generalConfiguration', messageId: 'setMeterConfiguration', data: 'nope' },
+      ]) {
+        await eventBus.emit(
+          'ocpp.DataTransfer',
+          makeDomainEvent('ocpp.DataTransfer', 'CS-001', { stationId: 'CS-001', ...payload }),
+        );
+      }
+
+      expect(
+        sqlCalls.some((c) => c.strings.join('').includes('INSERT INTO meter_public_keys')),
+      ).toBe(false);
     });
   });
 

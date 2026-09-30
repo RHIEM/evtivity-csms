@@ -727,6 +727,7 @@ describe('Session routes', () => {
         encodingMethod: 'OCMF',
         signingMethod: null,
         publicKey: null,
+        meterPublicKeyId: 7,
         signedData: ocmf,
         signedDataSha256: 'a'.repeat(64),
         source: 'TransactionEvent',
@@ -748,6 +749,7 @@ describe('Session routes', () => {
       expect(body.data[0].signedData).toBe(ocmf);
       expect(body.data[0].encodingMethod).toBe('OCMF');
       expect(body.data[0].context).toBe('Transaction.End');
+      expect(body.data[0].meterPublicKeyId).toBe(7);
     });
   });
 });

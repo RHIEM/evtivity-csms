@@ -63,6 +63,7 @@ import {
   ALL_TEMPLATES_DIRS,
 } from './notification-dispatcher.js';
 import { TransactionBuffer } from './transaction-buffer.js';
+import { isMeterConfiguration, parseMeterConfiguration } from '../lib/meter-configuration.js';
 
 const OCPP_STATUS_MAP: Record<string, string> = {
   // OCPP 2.1 connector statuses
@@ -559,17 +560,20 @@ export function registerProjections(
   }): Promise<void> {
     const signedDataSha256 = crypto.createHash('sha256').update(record.signedData).digest('hex');
     await sql`
+      WITH target AS (
+        SELECT COALESCE(
+          ${record.evseUuid}::text,
+          (SELECT evse_id FROM charging_sessions WHERE id = ${record.sessionId})
+        ) AS evse_id
+      )
       INSERT INTO signed_meter_values (
         station_id, evse_id, session_id, station_identity, transaction_id, timestamp,
         measurand, context, encoding_method, signing_method, public_key,
-        signed_data, signed_data_sha256, source
+        meter_public_key_id, signed_data, signed_data_sha256, source
       )
-      VALUES (
+      SELECT
         ${record.stationUuid},
-        COALESCE(
-          ${record.evseUuid}::text,
-          (SELECT evse_id FROM charging_sessions WHERE id = ${record.sessionId})
-        ),
+        target.evse_id,
         ${record.sessionId},
         ${record.stationIdentity},
         ${record.transactionId ?? null},
@@ -579,12 +583,26 @@ export function registerProjections(
         ${record.encodingMethod},
         ${record.signingMethod},
         ${record.publicKey},
+        -- Latest key the station announced for the connector (OCPP 1.6 EVSE
+        -- and connector numbers coincide for single-connector EVSEs).
+        (
+          SELECT k.id FROM meter_public_keys k
+          JOIN evses e ON e.id = target.evse_id
+          WHERE k.station_identity = ${record.stationIdentity}
+            AND k.connector_id = e.evse_id
+          ORDER BY k.last_seen_at DESC, k.id DESC
+          LIMIT 1
+        ),
         ${record.signedData},
         ${signedDataSha256},
         ${record.source}
-      )
+      FROM target
       ON CONFLICT (station_identity, signed_data_sha256) DO UPDATE SET
         session_id = COALESCE(signed_meter_values.session_id, EXCLUDED.session_id),
+        meter_public_key_id = COALESCE(
+          signed_meter_values.meter_public_key_id,
+          EXCLUDED.meter_public_key_id
+        ),
         context = CASE
           WHEN EXCLUDED.context = 'Transaction.End' THEN EXCLUDED.context
           ELSE signed_meter_values.context
@@ -4652,6 +4670,41 @@ export function registerProjections(
 
     const siteId = await resolveSiteId(stationUuid);
     await notifyChange('certificate.signed', stationUuid, siteId);
+  });
+
+  // Public keys of calibration-law meters (OCPP 1.6 DataTransfer
+  // generalConfiguration/setMeterConfiguration). The handler already answered
+  // Rejected for malformed data; re-parse here because the event carries the
+  // raw string.
+  safeSubscribe('ocpp.DataTransfer', async (event: DomainEvent) => {
+    const payload = event.payload;
+    if (!isMeterConfiguration(payload.vendorId, payload.messageId)) return;
+    const configuration = parseMeterConfiguration(payload.data);
+    if (configuration == null) return;
+
+    const stationId = payload.stationId as string;
+    const stationUuid = await resolveStationUuid(stationId);
+
+    for (const meter of configuration.meters) {
+      await sql`
+        INSERT INTO meter_public_keys (
+          station_id, station_identity, connector_id, meter_serial, key_type, public_key
+        )
+        VALUES (
+          ${stationUuid},
+          ${stationId},
+          ${meter.connectorId},
+          ${meter.meterSerial ?? null},
+          ${meter.type ?? null},
+          ${meter.publicKey}
+        )
+        ON CONFLICT (station_identity, connector_id, public_key) DO UPDATE SET
+          station_id = COALESCE(EXCLUDED.station_id, meter_public_keys.station_id),
+          meter_serial = COALESCE(EXCLUDED.meter_serial, meter_public_keys.meter_serial),
+          key_type = COALESCE(EXCLUDED.key_type, meter_public_keys.key_type),
+          last_seen_at = now()
+      `;
+    }
   });
 
   // --- Notification dispatch ---

@@ -141,6 +141,7 @@ vi.mock('@evtivity/database', () => {
     vendors: { id: 'id', name: 'name' },
     ocppMessageLogs: {},
     connectionLogs: {},
+    meterPublicKeys: {},
     stationCertificates: {},
     pricingGroupStations: {},
     pricingGroups: {},
@@ -1171,6 +1172,52 @@ describe('Station routes - handler logic', () => {
       expect(body.data[0].severity).toBeNull();
       expect(body.data[1].source).toBe('security');
       expect(body.data[1].severity).toBe('critical');
+    });
+  });
+
+  // --- GET /v1/stations/:id/meter-public-keys ---
+
+  describe('GET /v1/stations/:id/meter-public-keys', () => {
+    it('returns the meter keys reported by the station', async () => {
+      const key = {
+        id: 1,
+        connectorId: 1,
+        meterSerial: 'M-1',
+        keyType: 'SIGNATURE',
+        publicKey: '3059301306072A8648CE3D020106082A8648CE3D030107034200',
+        firstSeenAt: '2026-09-30T14:28:36.339Z',
+        lastSeenAt: '2026-09-30T14:28:36.339Z',
+      };
+      setupDbResults([key]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/stations/${VALID_STATION_ID}/meter-public-keys`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body).toHaveLength(1);
+      expect(body[0].publicKey).toBe(key.publicKey);
+      expect(body[0].connectorId).toBe(1);
+      expect(body[0].keyType).toBe('SIGNATURE');
+    });
+
+    it('returns 404 when the user has no access to the station', async () => {
+      const { checkStationSiteAccess } = (await import('../lib/site-access.js')) as unknown as {
+        checkStationSiteAccess: ReturnType<typeof vi.fn>;
+      };
+      checkStationSiteAccess.mockResolvedValueOnce(false);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/stations/${VALID_STATION_ID}/meter-public-keys`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('STATION_NOT_FOUND');
     });
   });
 

@@ -303,6 +303,69 @@ describe('OCPP 1.6 DataTransfer handler', () => {
 
     expect(response).toEqual({ status: 'UnknownVendorId' });
   });
+
+  it('accepts a valid setMeterConfiguration and publishes it', async () => {
+    const data = JSON.stringify({
+      meters: [
+        {
+          connectorId: 1,
+          meterSerial: 'M-1',
+          type: 'SIGNATURE',
+          publicKey: '3059301306072A8648CE3D020106082A8648CE3D030107034200',
+        },
+      ],
+    });
+    const { ctx, publishMock } = makeCtx('DataTransfer', {
+      vendorId: 'generalConfiguration',
+      messageId: 'setMeterConfiguration',
+      data,
+    });
+
+    const response = await handleDataTransfer(ctx);
+
+    expect(response).toEqual({ status: 'Accepted' });
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'ocpp.DataTransfer',
+        payload: expect.objectContaining({
+          vendorId: 'generalConfiguration',
+          messageId: 'setMeterConfiguration',
+          data,
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('rejects setMeterConfiguration with malformed data', async () => {
+    for (const data of [
+      'not json',
+      JSON.stringify({ meters: [] }),
+      JSON.stringify({ meters: [{ connectorId: 1, publicKey: 'not-hex' }] }),
+      undefined,
+    ]) {
+      const { ctx } = makeCtx('DataTransfer', {
+        vendorId: 'generalConfiguration',
+        messageId: 'setMeterConfiguration',
+        ...(data != null ? { data } : {}),
+      });
+
+      const response = await handleDataTransfer(ctx);
+
+      expect(response).toEqual({ status: 'Rejected' });
+    }
+  });
+
+  it('keeps UnknownVendorId for other generalConfiguration messages', async () => {
+    const { ctx } = makeCtx('DataTransfer', {
+      vendorId: 'generalConfiguration',
+      messageId: 'somethingElse',
+      data: '{}',
+    });
+
+    const response = await handleDataTransfer(ctx);
+
+    expect(response).toEqual({ status: 'UnknownVendorId' });
+  });
 });
 
 describe('OCPP 1.6 DiagnosticsStatusNotification handler', () => {

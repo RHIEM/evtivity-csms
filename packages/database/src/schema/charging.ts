@@ -197,6 +197,37 @@ export const meterValues = pgTable(
   ],
 );
 
+// Public keys of calibration-law meters as announced by the station (OCPP 1.6
+// DataTransfer generalConfiguration/setMeterConfiguration). A new key for the
+// same connector is a new row; earlier keys stay so older signed records can
+// still be verified. Not pruned; deleting the station keeps the keys.
+export const meterPublicKeys = pgTable(
+  'meter_public_keys',
+  {
+    id: serial('id').primaryKey(),
+    stationId: text('station_id').references(() => chargingStations.id, {
+      onDelete: 'set null',
+    }),
+    // OCPP identity of the station (charging_stations.station_id).
+    stationIdentity: varchar('station_identity', { length: 255 }).notNull(),
+    // OCPP connector (1.6) the meter belongs to.
+    connectorId: integer('connector_id').notNull(),
+    meterSerial: varchar('meter_serial', { length: 255 }),
+    keyType: varchar('key_type', { length: 50 }),
+    // Key as received (hex-encoded DER SubjectPublicKeyInfo for the KEBA KC-P30).
+    publicKey: text('public_key').notNull(),
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('meter_public_keys_station_connector_key_idx').on(
+      table.stationIdentity,
+      table.connectorId,
+      table.publicKey,
+    ),
+  ],
+);
+
 // Signed meter data as received from the station (e.g. OCMF records required
 // as billing evidence under German calibration law). Unlike meter_values this
 // table is not pruned by log retention, and deleting a station or session
@@ -224,6 +255,10 @@ export const signedMeterValues = pgTable(
     encodingMethod: varchar('encoding_method', { length: 50 }),
     signingMethod: varchar('signing_method', { length: 50 }),
     publicKey: text('public_key'),
+    // Meter key known for the station and connector when the record arrived.
+    meterPublicKeyId: integer('meter_public_key_id').references(() => meterPublicKeys.id, {
+      onDelete: 'set null',
+    }),
     // The signed record exactly as received.
     signedData: text('signed_data').notNull(),
     signedDataSha256: varchar('signed_data_sha256', { length: 64 }).notNull(),

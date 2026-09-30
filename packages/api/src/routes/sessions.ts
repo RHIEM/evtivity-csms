@@ -291,6 +291,11 @@ const signedMeterValueItem = z
       .string()
       .nullable()
       .describe('Public key sent inline with the signed value (OCPP 2.x), if any'),
+    meterPublicKeyId: z
+      .number()
+      .int()
+      .nullable()
+      .describe('Meter public key known for the station and connector when the record arrived'),
     signedData: z.string().describe('Signed record exactly as received from the station'),
     signedDataSha256: z.string().max(64).describe('SHA-256 of signedData (hex)'),
     source: z.string().max(30).nullable().describe('OCPP message the record arrived in'),
@@ -791,6 +796,7 @@ export function sessionRoutes(app: FastifyInstance): void {
             encodingMethod: signedMeterValues.encodingMethod,
             signingMethod: signedMeterValues.signingMethod,
             publicKey: signedMeterValues.publicKey,
+            meterPublicKeyId: signedMeterValues.meterPublicKeyId,
             signedData: signedMeterValues.signedData,
             signedDataSha256: signedMeterValues.signedDataSha256,
             source: signedMeterValues.source,
