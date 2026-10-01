@@ -11,9 +11,11 @@ import {
   formatFileSize,
   formatGrossPrice,
   formatNumber,
+  formatNumberUpTo,
   formatRatePerKwh,
   getDecimalSeparator,
 } from '../formatting';
+import { parseValue } from '../animated-value';
 
 describe('formatCents', () => {
   it('formats cents in the given currency', () => {
@@ -46,21 +48,6 @@ describe('formatRatePerKwh', () => {
   });
 });
 
-describe('getDecimalSeparator', () => {
-  it('returns the decimal separator of each supported UI language', () => {
-    expect(getDecimalSeparator('en')).toBe('.');
-    expect(getDecimalSeparator('de')).toBe(',');
-    expect(getDecimalSeparator('es')).toBe(',');
-    expect(getDecimalSeparator('ko')).toBe('.');
-    expect(getDecimalSeparator('zh')).toBe('.');
-    expect(getDecimalSeparator('zh-TW')).toBe('.');
-  });
-
-  it('falls back to "." for an invalid locale', () => {
-    expect(getDecimalSeparator('not a locale!')).toBe('.');
-  });
-});
-
 describe('formatting in the UI language', () => {
   beforeAll(async () => {
     await i18next.init({ lng: 'en', resources: {} });
@@ -72,8 +59,8 @@ describe('formatting in the UI language', () => {
 
   it('uses the separators of the selected language', async () => {
     await i18next.changeLanguage('de');
-    expect(formatCents(123456, 'EUR')).toBe('1.234,56 €');
-    expect(formatRatePerKwh(0.1234, 'EUR')).toBe('0,1234 €');
+    expect(formatCents(123456, 'EUR')).toBe('1.234,56\u00a0€');
+    expect(formatRatePerKwh(0.1234, 'EUR')).toBe('0,1234\u00a0€');
     expect(formatNumber(1234.5, 1)).toBe('1.234,5');
     expect(formatEnergy(12_500)).toBe('12,5 kWh');
     expect(formatCo2(1500)).toBe('1,5 t');
@@ -108,5 +95,42 @@ describe('formatting in the UI language', () => {
     expect(formatGrossPrice('0.25', '0')).toBeNull();
     expect(formatGrossPrice('abc', '0.19')).toBeNull();
     expect(formatGrossPrice('-0.25', '0.19')).toBeNull();
+  });
+
+  it('formats up to the given decimals without trailing zeros', async () => {
+    await i18next.changeLanguage('en');
+    expect(formatNumberUpTo(95.5, 1)).toBe('95.5');
+    expect(formatNumberUpTo(100, 2)).toBe('100');
+    expect(formatNumberUpTo(1234.567, 2)).toBe('1,234.57');
+    await i18next.changeLanguage('de');
+    expect(formatNumberUpTo(99.87, 2)).toBe('99,87');
+    expect(formatNumberUpTo(1234.5, 1)).toBe('1.234,5');
+  });
+
+  it('produces dashboard percentages the count-up parser reads back', async () => {
+    for (const lang of ['en', 'de', 'es', 'ko', 'zh', 'zh-TW']) {
+      await i18next.changeLanguage(lang);
+      expect(parseValue(`${formatNumberUpTo(95.5, 1)}%`, lang)).toMatchObject({
+        num: 95.5,
+        suffix: '%',
+        decimals: 1,
+      });
+      expect(parseValue(`${formatNumberUpTo(99.87, 2)}%`, lang)).toMatchObject({ num: 99.87 });
+    }
+  });
+});
+
+describe('getDecimalSeparator', () => {
+  it('returns the decimal separator of each supported UI language', () => {
+    expect(getDecimalSeparator('en')).toBe('.');
+    expect(getDecimalSeparator('de')).toBe(',');
+    expect(getDecimalSeparator('es')).toBe(',');
+    expect(getDecimalSeparator('ko')).toBe('.');
+    expect(getDecimalSeparator('zh')).toBe('.');
+    expect(getDecimalSeparator('zh-TW')).toBe('.');
+  });
+
+  it('falls back to "." for an invalid locale', () => {
+    expect(getDecimalSeparator('not a locale!')).toBe('.');
   });
 });

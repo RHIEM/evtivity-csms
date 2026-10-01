@@ -7,6 +7,7 @@ import type WebSocket from 'ws';
 import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
 import type postgres from 'postgres';
 import { createLogger, InMemoryEventBus, OcppError } from '@evtivity/lib';
+import { getHeartbeatIntervalSeconds } from '@evtivity/database';
 import type { Logger, EventBus, EventPersistence } from '@evtivity/lib';
 import { ConnectionManager } from './connection-manager.js';
 import { createSessionState } from './session-state.js';
@@ -45,16 +46,13 @@ import { config } from '../lib/config.js';
 
 const MAX_CONNECTIONS_PER_IP = config.OCPP_MAX_CONNECTIONS_PER_IP;
 const MAX_MESSAGES_PER_IP_PER_SECOND = config.OCPP_MAX_MESSAGES_PER_IP_PER_SECOND;
-// Close connections without any sign of life for this long. WebSocket
-// ping/pong counts as a sign of life: the ping monitor pings every station
-// every 30s, while heartbeats may be as rare as the interval handed out in
-// BootNotification (300s, the same as this default). Counting only OCPP
-// messages closed idle stations whose heartbeat arrived a few milliseconds
-// after the timer fired.
-const IDLE_TIMEOUT_MS = config.OCPP_IDLE_TIMEOUT_MS;
 const IP_MESSAGE_WINDOW_MS = 1000;
 
 const ipConnectionCounts = new Map<string, number>();
+// Upgrade requests per IP whose authentication is still running. They count
+// toward the per-IP connection limit, so one IP cannot queue unbounded station
+// lookups and argon2 verifications.
+const ipPendingAuthCounts = new Map<string, number>();
 const ipMessageCounters = new Map<string, { count: number; windowStart: number }>();
 
 // ipMessageCounters entries are only refreshed when the same IP sends
@@ -100,6 +98,19 @@ export interface OcppServerOptions {
   // Comma-separated CIDRs of load balancers whose X-Forwarded-For is trusted.
   trustedProxyCidrs?: string | undefined;
   tls?: TlsOptions | undefined;
+  // Fixed idle timeout (tests). By default it follows the heartbeat setting.
+  idleTimeoutMs?: number | undefined;
+}
+
+// A connection with no OCPP message and no WebSocket ping or pong for this long
+// is closed. The default is twice the heartbeat interval handed out at boot,
+// never less than 5 minutes, so a station that heartbeats exactly on schedule
+// and does not answer pings is not closed as its heartbeat arrives.
+const MIN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const IDLE_TIMEOUT_REFRESH_MS = 60_000;
+
+export function idleTimeoutForHeartbeat(heartbeatSeconds: number): number {
+  return Math.max(MIN_IDLE_TIMEOUT_MS, heartbeatSeconds * 2 * 1000);
 }
 
 export class OcppServer {
@@ -114,6 +125,9 @@ export class OcppServer {
   private readonly pingMonitor: PingMonitor;
   private readonly sql: postgres.Sql | null;
   private readonly trustedProxies: ReturnType<typeof parseTrustedProxies>;
+  private readonly fixedIdleTimeoutMs: number | null;
+  private idleTimeoutMs = MIN_IDLE_TIMEOUT_MS;
+  private idleTimeoutRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private wss: WebSocketServer | null = null;
   private wssSecure: WebSocketServer | null = null;
   // Auth results from verifyClient, handed to handleConnection for the same
@@ -139,6 +153,8 @@ export class OcppServer {
     this.pingMonitor = new PingMonitor(this.connectionManager, this.logger);
     this.sql = options?.sql ?? null;
     this.trustedProxies = parseTrustedProxies(options?.trustedProxyCidrs ?? '');
+    this.fixedIdleTimeoutMs = options?.idleTimeoutMs ?? null;
+    if (this.fixedIdleTimeoutMs != null) this.idleTimeoutMs = this.fixedIdleTimeoutMs;
 
     // Set up middleware pipeline
     this.pipeline = new MiddlewarePipeline();
@@ -247,6 +263,14 @@ export class OcppServer {
 
     this.pingMonitor.start(this.sql);
 
+    if (this.fixedIdleTimeoutMs == null && this.sql != null) {
+      await this.refreshIdleTimeout();
+      this.idleTimeoutRefreshTimer = setInterval(() => {
+        void this.refreshIdleTimeout();
+      }, IDLE_TIMEOUT_REFRESH_MS);
+      this.idleTimeoutRefreshTimer.unref();
+    }
+
     this.logger.info(
       { port: options.port, host: options.host ?? '0.0.0.0' },
       'OCPP server started',
@@ -275,8 +299,28 @@ export class OcppServer {
       return;
     }
 
+    const pendingCount = ipPendingAuthCounts.get(remoteIp) ?? 0;
+    if ((ipConnectionCounts.get(remoteIp) ?? 0) + pendingCount >= MAX_CONNECTIONS_PER_IP) {
+      this.logger.warn(
+        { remoteIp, pending: pendingCount },
+        'Per-IP pending authentication limit exceeded',
+      );
+      callback(false, 429, 'Too Many Requests');
+      return;
+    }
+    ipPendingAuthCounts.set(remoteIp, pendingCount + 1);
+    const releasePending = (): void => {
+      const count = ipPendingAuthCounts.get(remoteIp) ?? 1;
+      if (count <= 1) {
+        ipPendingAuthCounts.delete(remoteIp);
+      } else {
+        ipPendingAuthCounts.set(remoteIp, count - 1);
+      }
+    };
+
     authenticateConnection(req, this.logger, this.sql, remoteIp === 'unknown' ? null : remoteIp)
       .then((auth) => {
+        releasePending();
         if (auth.authenticated && auth.stationId != null) {
           this.verifiedRequests.set(req, auth);
           callback(true);
@@ -290,6 +334,7 @@ export class OcppServer {
         callback(false, rejection.status, rejection.message, rejection.headers);
       })
       .catch((err: unknown) => {
+        releasePending();
         this.logger.error(
           { error: err instanceof Error ? err.message : String(err) },
           'Connection authentication failed',
@@ -319,11 +364,25 @@ export class OcppServer {
       }
     });
 
-    // Idle timeout: close connections without messages or ping/pong frames.
-    let idleTimer = setTimeout(() => {
+    // Any OCPP message or WebSocket ping/pong restarts the idle timer. The
+    // ping monitor pings every station every 30s, so live connections answer.
+    const closeIdle = (): void => {
       this.logger.info({ remoteIp }, 'Closing idle WebSocket connection');
       ws.close(1000, 'Idle timeout');
-    }, IDLE_TIMEOUT_MS);
+    };
+    let armedIdleMs = this.idleTimeoutMs;
+    let idleTimer = setTimeout(closeIdle, armedIdleMs);
+    const restartIdleTimer = (): void => {
+      if (armedIdleMs === this.idleTimeoutMs) {
+        idleTimer.refresh();
+        return;
+      }
+      clearTimeout(idleTimer);
+      armedIdleMs = this.idleTimeoutMs;
+      idleTimer = setTimeout(closeIdle, armedIdleMs);
+    };
+    ws.on('ping', restartIdleTimer);
+    ws.on('pong', restartIdleTimer);
 
     const auth = this.verifiedRequests.get(req);
     this.verifiedRequests.delete(req);
@@ -361,16 +420,6 @@ export class OcppServer {
 
     this.pingMonitor.writeNow();
 
-    const restartIdleTimer = (): void => {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        this.logger.info({ stationId }, 'Closing idle WebSocket connection');
-        ws.close(1000, 'Idle timeout');
-      }, IDLE_TIMEOUT_MS);
-    };
-    // Stations may ping on their own schedule (e.g. WebSocketPingInterval).
-    ws.on('ping', restartIdleTimer);
-
     ws.on('message', (data: Buffer) => {
       restartIdleTimer();
       // Per-IP message rate limit
@@ -407,7 +456,6 @@ export class OcppServer {
     });
 
     ws.on('pong', () => {
-      restartIdleTimer();
       this.pingMonitor.recordPong(stationId);
     });
 
@@ -415,6 +463,12 @@ export class OcppServer {
       this.logger.error({ stationId, error: err.message }, 'WebSocket error');
       ws.close(1011, 'WebSocket error');
     });
+  }
+
+  private async refreshIdleTimeout(): Promise<void> {
+    const heartbeatSeconds = await getHeartbeatIntervalSeconds();
+    this.idleTimeoutMs = idleTimeoutForHeartbeat(heartbeatSeconds);
+    this.pingMonitor.setHeartbeatIntervalSeconds(heartbeatSeconds);
   }
 
   private async resolveStationDbId(stationId: string, session: SessionState): Promise<void> {
@@ -665,6 +719,10 @@ export class OcppServer {
     if (ipMessageCleanupTimer != null) {
       clearInterval(ipMessageCleanupTimer);
       ipMessageCleanupTimer = null;
+    }
+    if (this.idleTimeoutRefreshTimer != null) {
+      clearInterval(this.idleTimeoutRefreshTimer);
+      this.idleTimeoutRefreshTimer = null;
     }
     await this.pingMonitor.stop();
     if (this.wssSecure != null) {

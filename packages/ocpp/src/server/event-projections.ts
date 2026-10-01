@@ -64,6 +64,14 @@ import {
 } from './notification-dispatcher.js';
 import { TransactionBuffer } from './transaction-buffer.js';
 import { isMeterConfiguration, parseMeterConfiguration } from '../lib/meter-configuration.js';
+import {
+  DEFAULT_LOCATION,
+  DEFAULT_MEASURAND,
+  applyMultiplier,
+  energyToWh,
+  overallValue,
+} from './meter-units.js';
+import type { PhaseSample } from './meter-units.js';
 
 const OCPP_STATUS_MAP: Record<string, string> = {
   // OCPP 2.1 connector statuses
@@ -2891,13 +2899,20 @@ export function registerProjections(
       const mvTimestamp = mv.timestamp as string;
       const sampledValues = mv.sampledValue as Array<Record<string, unknown>> | undefined;
       if (sampledValues == null) continue;
+      const energySamples: PhaseSample[] = [];
+      const powerSamples: PhaseSample[] = [];
 
       for (const sv of sampledValues) {
-        const measurand = getString(sv, 'measurand');
+        const measurand = getString(sv, 'measurand') ?? DEFAULT_MEASURAND;
         // 2.1: sv.unitOfMeasure.unit, 1.6: sv.unit
         const unitOfMeasure = sv.unitOfMeasure as Record<string, unknown> | undefined;
         const unit =
           unitOfMeasure != null ? getString(unitOfMeasure, 'unit') : getString(sv, 'unit');
+        // 2.1 only. Stored values carry the multiplier applied, so every reader of
+        // meter_values sees the value in `unit` without knowing the multiplier.
+        const multiplier =
+          typeof unitOfMeasure?.multiplier === 'number' ? unitOfMeasure.multiplier : 0;
+        const value = applyMultiplier(Number(sv.value), multiplier);
         const phase = getString(sv, 'phase');
         const location = getString(sv, 'location');
         const context = getString(sv, 'context');
@@ -2954,7 +2969,7 @@ export function registerProjections(
             ${sessionId},
             ${mvTimestamp},
             ${measurand},
-            ${sv.value as number},
+            ${value},
             ${unit},
             ${phase},
             ${location},
@@ -2979,7 +2994,7 @@ export function registerProjections(
               ${sessionId},
               ${mvTimestamp},
               ${measurand},
-              ${sv.value as number},
+              ${value},
               ${unit},
               ${phase},
               ${location},
@@ -2991,78 +3006,68 @@ export function registerProjections(
           `;
         }
 
-        // Update energy_delivered_wh on active sessions when we get an energy reading.
-        // Energy registers are cumulative, so we compute: currentValue - meterStart.
-        // If meterStart is not yet set (OCPP 2.1 sessions), capture the first reading as meterStart.
-        // Both transaction-scoped (TransactionEvent, 1.6 MeterValues with transactionId) and
-        // standalone 2.1 MeterValues update energy if an active session exists on the EVSE.
-        // Registers are often reported with decimals (e.g. "2909465.9" Wh), and
-        // OCPP 1.6 sends them as strings. Values are cast to numeric in SQL:
-        // meter_start is an integer column, and an untyped decimal parameter
-        // compared or assigned to it fails with "invalid input syntax for type
-        // integer", which aborted the whole projection (energy, live cost,
-        // idle detection and the remaining samples of the message).
-        const meterValue = Number(sv.value);
-        if (measurand === 'Energy.Active.Import.Register' && Number.isFinite(meterValue)) {
-          // Capture previous energy and meter_start for flat-reading idle detection
-          const prevRows = await sql`
-            SELECT energy_delivered_wh, meter_start FROM charging_sessions
-            WHERE station_id = ${stationUuid} AND status = 'active'
-              AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
-          `;
-          const prevEnergyWh = Number(prevRows[0]?.energy_delivered_wh ?? -1);
-          const existingMeterStart = prevRows[0]?.meter_start as string | null | undefined;
-
-          // Set meter_start from the first energy reading if not already set (OCPP 2.1 path)
-          await sql`
-            UPDATE charging_sessions
-            SET meter_start = ROUND(${meterValue}::numeric), updated_at = now()
-            WHERE station_id = ${stationUuid} AND status = 'active'
-              AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
-              AND meter_start IS NULL
-          `;
-          // Compute energy as delta: currentReading - meterStart (clamp to 0 if meter resets)
-          await sql`
-            UPDATE charging_sessions
-            SET energy_delivered_wh = GREATEST(0, ${meterValue}::numeric - meter_start), updated_at = now()
-            WHERE station_id = ${stationUuid} AND status = 'active'
-              AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
-              AND meter_start IS NOT NULL
-          `;
-
-          // Flat energy reading idle detection (Priority 3 fallback).
-          // If energy_delivered_wh did not change after this reading, no power is flowing.
-          // The idle_started_at IS NULL guard ensures higher-priority signals are not overwritten.
-          if (existingMeterStart != null && prevEnergyWh >= 0) {
-            const newEnergyWh = meterValue - Number(existingMeterStart);
-            if (Math.abs(newEnergyWh - prevEnergyWh) < 1) {
-              // Energy unchanged: mark idle if not already set
-              await sql`
-                UPDATE charging_sessions
-                SET idle_started_at = ${mvTimestamp}, updated_at = now()
-                WHERE station_id = ${stationUuid} AND status = 'active' AND idle_started_at IS NULL
-                  AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
-              `;
+        // Session energy and idle state use the overall Outlet value of each
+        // MeterValue, collected here and applied once after the loop, so
+        // per-phase or Inlet samples never overwrite them.
+        if ((location ?? DEFAULT_LOCATION) === DEFAULT_LOCATION) {
+          if (measurand === DEFAULT_MEASURAND) {
+            // Session energy and meter_start are in Wh; a kWh register is converted.
+            const wh = energyToWh(value, unit);
+            if (wh == null) {
+              logger.warn(
+                { stationId, unit, value: sv.value },
+                'Energy register reading with an unsupported unit; session energy not updated',
+              );
             } else {
-              // Energy increased: accumulate idle time and clear idle_started_at
-              await sql`
-                UPDATE charging_sessions
-                SET idle_minutes = idle_minutes + EXTRACT(EPOCH FROM (${mvTimestamp}::timestamptz - idle_started_at)) / 60,
-                    idle_started_at = NULL,
-                    updated_at = now()
-                WHERE station_id = ${stationUuid} AND status = 'active' AND idle_started_at IS NOT NULL
-                  AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
-              `;
+              energySamples.push({ value: wh, phase });
             }
+          } else if (measurand === 'Power.Active.Import') {
+            powerSamples.push({ value, phase });
           }
         }
+      }
 
-        // Power-based idle detection (fallback for OCPP 1.6 and stations without chargingState)
-        // Only transaction-scoped readings should update session idle state.
-        if (isTransactionScoped && measurand === 'Power.Active.Import') {
-          const powerValue = Number(sv.value);
-          if (powerValue === 0) {
-            // No power flowing: mark idle start if not already set
+      // Update energy_delivered_wh on active sessions when we get an energy reading.
+      // Energy registers are cumulative, so we compute: currentValue - meterStart.
+      // If meterStart is not yet set (OCPP 2.1 sessions), capture the first reading as meterStart.
+      // Both transaction-scoped (TransactionEvent, 1.6 MeterValues with transactionId) and
+      // standalone 2.1 MeterValues update energy if an active session exists on the EVSE.
+      const meterValue = overallValue(energySamples);
+      if (meterValue != null) {
+        // Capture previous energy and meter_start for flat-reading idle detection
+        const prevRows = await sql`
+          SELECT energy_delivered_wh, meter_start FROM charging_sessions
+          WHERE station_id = ${stationUuid} AND status = 'active'
+            AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
+        `;
+        const prevEnergyWh = Number(prevRows[0]?.energy_delivered_wh ?? -1);
+        const existingMeterStart = prevRows[0]?.meter_start as string | null | undefined;
+
+        // Set meter_start from the first energy reading if not already set (OCPP 2.1 path)
+        await sql`
+          UPDATE charging_sessions
+          SET meter_start = ${Math.round(meterValue)}, updated_at = now()
+          WHERE station_id = ${stationUuid} AND status = 'active'
+            AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
+            AND meter_start IS NULL
+        `;
+        // Compute energy as delta: currentReading - meterStart (clamp to 0 if meter resets).
+        // The cast is required: untyped, Postgres infers integer from meter_start and rejects decimals.
+        await sql`
+          UPDATE charging_sessions
+          SET energy_delivered_wh = GREATEST(0, ${meterValue}::numeric - meter_start), updated_at = now()
+          WHERE station_id = ${stationUuid} AND status = 'active'
+            AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
+            AND meter_start IS NOT NULL
+        `;
+
+        // Flat energy reading idle detection (Priority 3 fallback).
+        // If energy_delivered_wh did not change after this reading, no power is flowing.
+        // The idle_started_at IS NULL guard ensures higher-priority signals are not overwritten.
+        if (existingMeterStart != null && prevEnergyWh >= 0) {
+          const newEnergyWh = meterValue - Number(existingMeterStart);
+          if (Math.abs(newEnergyWh - prevEnergyWh) < 1) {
+            // Energy unchanged: mark idle if not already set
             await sql`
               UPDATE charging_sessions
               SET idle_started_at = ${mvTimestamp}, updated_at = now()
@@ -3070,7 +3075,7 @@ export function registerProjections(
                 AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
             `;
           } else {
-            // Power resumed: accumulate idle time and clear idle_started_at
+            // Energy increased: accumulate idle time and clear idle_started_at
             await sql`
               UPDATE charging_sessions
               SET idle_minutes = idle_minutes + EXTRACT(EPOCH FROM (${mvTimestamp}::timestamptz - idle_started_at)) / 60,
@@ -3080,6 +3085,31 @@ export function registerProjections(
                 AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
             `;
           }
+        }
+      }
+
+      // Power-based idle detection (fallback for OCPP 1.6 and stations without chargingState)
+      // Only transaction-scoped readings should update session idle state.
+      const powerValue = overallValue(powerSamples);
+      if (isTransactionScoped && powerValue != null) {
+        if (powerValue === 0) {
+          // No power flowing: mark idle start if not already set
+          await sql`
+            UPDATE charging_sessions
+            SET idle_started_at = ${mvTimestamp}, updated_at = now()
+            WHERE station_id = ${stationUuid} AND status = 'active' AND idle_started_at IS NULL
+              AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
+          `;
+        } else {
+          // Power resumed: accumulate idle time and clear idle_started_at
+          await sql`
+            UPDATE charging_sessions
+            SET idle_minutes = idle_minutes + EXTRACT(EPOCH FROM (${mvTimestamp}::timestamptz - idle_started_at)) / 60,
+                idle_started_at = NULL,
+                updated_at = now()
+            WHERE station_id = ${stationUuid} AND status = 'active' AND idle_started_at IS NOT NULL
+              AND (${evseUuid}::text IS NULL OR evse_id = ${evseUuid})
+          `;
         }
       }
     }

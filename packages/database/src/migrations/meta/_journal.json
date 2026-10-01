@@ -636,13 +636,20 @@
       "idx": 90,
       "version": "7",
       "when": 1781230951115,
-      "tag": "rhiem_0001_payment_mode",
+      "tag": "0090_pending_security_profile",
       "breakpoints": true
     },
     {
       "idx": 91,
       "version": "7",
       "when": 1781230951116,
+      "tag": "rhiem_0001_payment_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1781230951117,
       "tag": "rhiem_0002_signed_meter_data",
       "breakpoints": true
     }

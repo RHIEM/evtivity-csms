@@ -1,6 +1,8 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { toAuthorizationKeyHex } from '@evtivity/lib';
+
 export interface CommandTranslation {
   action: string;
   translatePayload: (payload: Record<string, unknown>) => Record<string, unknown>;
@@ -87,8 +89,20 @@ function mapClearChargingProfile16(payload: Record<string, unknown>): Record<str
 }
 
 function mapGetCompositeSchedule16(payload: Record<string, unknown>): Record<string, unknown> {
-  const evseId = payload.evseId;
-  return { ...payload, connectorId: evseId };
+  // The 1.6 schema is `additionalProperties: false`; keep only its fields.
+  const { evseId, customData: _customData, ...rest } = payload;
+  void _customData;
+  return { ...rest, connectorId: evseId ?? 0 };
+}
+
+// A 1.6 configuration key is the 2.1 variable name (HeartbeatInterval), not the
+// component (OCPPCommCtrlr). Templates for 1.6 store an empty component name.
+function configKey16(entry: Record<string, unknown>): string | undefined {
+  const component = entry.component as Record<string, unknown> | undefined;
+  const variable = entry.variable as Record<string, unknown> | undefined;
+  const name = (value: unknown): string | undefined =>
+    typeof value === 'string' && value !== '' ? value : undefined;
+  return name(variable?.name) ?? name(component?.name);
 }
 
 function mapReserveNow16(payload: Record<string, unknown>): Record<string, unknown> {
@@ -134,10 +148,8 @@ function mapGetVariables16(payload: Record<string, unknown>): Record<string, unk
   }
   const first = variables[0];
   if (first == null) return {};
-  const component = first.component as Record<string, unknown> | undefined;
-  const variable = first.variable as Record<string, unknown> | undefined;
   return {
-    key: [component?.name ?? variable?.name].filter(Boolean),
+    key: [configKey16(first)].filter(Boolean),
   };
 }
 
@@ -157,10 +169,16 @@ function mapSetVariables16(payload: Record<string, unknown>): Record<string, unk
   }
   const first = variables[0];
   if (first == null) return {};
-  const component = first.component as Record<string, unknown> | undefined;
-  const variable = first.variable as Record<string, unknown> | undefined;
+  // OCPP 1.6 sets the Basic Auth password as AuthorizationKey, hex-encoded
+  // (Security Whitepaper; OCTT TC_073).
+  if (
+    (first.component as Record<string, unknown> | undefined)?.name === 'SecurityCtrlr' &&
+    (first.variable as Record<string, unknown> | undefined)?.name === 'BasicAuthPassword'
+  ) {
+    return { key: 'AuthorizationKey', value: toAuthorizationKeyHex(String(first.attributeValue)) };
+  }
   return {
-    key: component?.name ?? variable?.name,
+    key: configKey16(first),
     value: first.attributeValue,
   };
 }

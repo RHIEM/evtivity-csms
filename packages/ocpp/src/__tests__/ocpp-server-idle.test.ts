@@ -1,23 +1,12 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import WebSocket from 'ws';
-import type { OcppServer as OcppServerType } from '../server/ocpp-server.js';
-
-// Shorten the idle timeout BEFORE the OCPP server (and its config module) is
-// imported, as in ocpp-server-limits.test.ts. Vitest isolates module state per
-// file, so the override does not affect the other server tests.
-let OcppServer: typeof OcppServerType;
-
-beforeAll(async () => {
-  process.env['OCPP_IDLE_TIMEOUT_MS'] = '300';
-  const mod = await import('../server/ocpp-server.js');
-  OcppServer = mod.OcppServer;
-});
+import { OcppServer, idleTimeoutForHeartbeat } from '../server/ocpp-server.js';
 
 let testPort = 19800;
-let server: OcppServerType | null = null;
+let server: OcppServer | null = null;
 
 afterEach(async () => {
   if (server != null) {
@@ -32,7 +21,7 @@ async function connect(): Promise<{
   closed: Promise<{ code: number; reason: string }>;
 }> {
   const port = testPort++;
-  const srv = new OcppServer();
+  const srv = new OcppServer({ idleTimeoutMs: 300 });
   server = srv;
   await srv.start({ port, host: '127.0.0.1' });
 
@@ -83,14 +72,23 @@ describe('OcppServer idle timeout', () => {
   it('keeps a connection open while pongs arrive', async () => {
     const { ws } = await connect();
 
-    // Stand-in for the station answering the ping monitor, which pings every
-    // 30s and is too slow for this test; an unsolicited pong reaches the same
-    // server handler.
+    // Stands in for answering the ping monitor, which pings every 30s.
     await keepAliveFor(900, () => {
       ws.pong();
     });
 
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
+  });
+});
+
+describe('idleTimeoutForHeartbeat', () => {
+  it('is twice the heartbeat interval', () => {
+    expect(idleTimeoutForHeartbeat(300)).toBe(600_000);
+    expect(idleTimeoutForHeartbeat(900)).toBe(1_800_000);
+  });
+
+  it('is never less than 5 minutes', () => {
+    expect(idleTimeoutForHeartbeat(30)).toBe(300_000);
   });
 });
