@@ -27,8 +27,8 @@ Ein Zweig `fix/ocpp16-connector-0-station-status` ab dem Upstream-Tag, auf dem `
 ### 1. Projektion: kein EVSE/Anschluss für die 0
 
 - Der Handler bleibt unverändert, das Ereignis `ocpp.StatusNotification` wird weiter veröffentlicht. Damit laufen Benachrichtigungen, `isFaulted` und die Vorlagenvariablen wie bisher.
-- Am Anfang des Abonnenten in `event-projections.ts` ein Zweig: `evseId === 0 && connectorId === 0` (OCPP 1.6; 2.1 kennt keine `evseId 0` in dieser Meldung). Dann werden weder `evses`, `connectors` noch `port_status_log` geschrieben. Der Stationsstatus wird nach 2 behandelt, danach kehrt der Zweig zurück.
-- Der gemeinsame Rest (Benachrichtigung der Oberfläche über `notifyChange('station.status', …)` und OCPI-Push) läuft auch für die 0, damit die Anzeige aktuell bleibt.
+- Am Anfang des Abonnenten in `event-projections.ts` ein Zweig: `evseId === 0 && connectorId === 0` (OCPP 1.6; 2.1 kennt keine `evseId 0` in dieser Meldung). Dann werden weder `evses`, `connectors` noch `port_status_log` geschrieben. Danach kehrt der Zweig zurück (Variante a, siehe 2).
+- Umsetzung (abweichend vom ersten Entwurf): Der Zweig kehrt ohne `notifyChange` und OCPI-Push zurück, weil sich in der Datenbank nichts ändert. Die Benachrichtigungsregeln laufen über einen eigenen Abonnenten und sind nicht betroffen.
 
 ### 2. Stationsstatus aus der 0 (Entscheidung offen)
 
