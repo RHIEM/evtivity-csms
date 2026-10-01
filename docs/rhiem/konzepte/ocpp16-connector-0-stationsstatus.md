@@ -1,6 +1,6 @@
 # Konzept: OCPP 1.6 `connectorId 0` als Stationsstatus (Fix 9)
 
-- **Status:** Entwurf (01.10.2026), noch nicht freigegeben
+- **Status:** Freigegeben (01.10.2026), Variante a
 - **Anlass:** Die KEBA KC-P30 (Station `28980051`, `sta_ppofemilek3o`) wird im Pilot mit zwei Anschlüssen angezeigt. Ein Löschen der überzähligen „EVSE 0“ ist nicht möglich.
 
 ## Befund
@@ -39,12 +39,12 @@ Die bisherige Ableitung nimmt nur `connectors` als Quelle. Ohne Zeile für die 0
 | **a**    | Die 0 wird nur verworfen. Der Stationsstatus bleibt aus den Anschlüssen abgeleitet.                                                                                                                        | Kein Schema. Ein Fehler, den die Box nur über die 0 meldet (z. B. Gehäuse- oder Zählerfehler ohne Anschluss-Fehler), wird nicht als Stationsfehler sichtbar. Das Ereignis löst weiter die Benachrichtigung aus. |
 | **b**    | Neue Spalte, z. B. `charging_stations.ocpp_station_status` (nullable), hält den letzten Status der 0. Die Ableitung von `availability` berücksichtigt sie: `faulted`, wenn Anschluss oder 0 `faulted` ist. | Vollständig, aber Schemaänderung (Drizzle-Migration, `check:migrations`), UI und Berichte prüfen. Mehr Aufwand und mehr Berührung mit Upstream.                                                                 |
 
-Empfehlung: **a als erster PR**, **b nur bei Bedarf** (ein Fehler der KEBA nur über die 0 ist noch nicht beobachtet). Ohne Zeile in `connectors` würde ein einzelnes `availability = 'faulted'` aus der 0 beim nächsten Anschluss-Ereignis wieder überschrieben; deshalb ist ein halber Weg (Status direkt setzen, ohne Speicher) nicht vorgesehen.
+Entscheidung 01.10.2026: **Variante a**. Empfehlung war: **a als erster PR**, **b nur bei Bedarf** (ein Fehler der KEBA nur über die 0 ist noch nicht beobachtet). Ohne Zeile in `connectors` würde ein einzelnes `availability = 'faulted'` aus der 0 beim nächsten Anschluss-Ereignis wieder überschrieben; deshalb ist ein halber Weg (Status direkt setzen, ohne Speicher) nicht vorgesehen.
 
 ### 3. Bestandsdaten
 
 - Im Pilot einmalig die EVSE 0 der Station `28980051` entfernen. Vorher prüfen, dass keine `charging_sessions` auf sie verweisen (`charging_sessions.evse_id`), sonst nicht löschen. `port_status_log`-Zeilen bleiben unverändert.
-- Ob der PR zusätzlich eine Migration enthält, die bei anderen Installationen automatisch angelegte EVSEs mit `evse_id = 0` ohne Sitzungen entfernt, ist offen. Empfehlung: nein, die Bereinigung bleibt Sache der Betreiber; ein Hinweis im PR genügt.
+- Ob der PR zusätzlich eine Migration enthält, die bei anderen Installationen automatisch angelegte EVSEs mit `evse_id = 0` ohne Sitzungen entfernt, Entscheidung 01.10.2026: nein, die Bereinigung bleibt Sache der Betreiber; ein Hinweis im PR genügt.
 
 ### 4. Nicht Teil dieses Konzepts
 
@@ -63,8 +63,8 @@ Empfehlung: **a als erster PR**, **b nur bei Bedarf** (ein Fehler der KEBA nur �
 
 `npm run typecheck`, `lint`, `format:check`, alle Tests, `check:migrations` (und `test:integration` ohne stderr), vorher die CI von `upstream/main` ansehen.
 
-## Offene Fragen
+## Entscheidungen (01.10.2026, Marco Spittka)
 
-1. Variante a oder b für den Stationsstatus (Empfehlung a)?
-2. Bereinigungsmigration für Altbestand mitliefern (Empfehlung nein)?
-3. Soll der Stationsstatus der 0 im Statusverlauf (`port_status_log`) stehen (Empfehlung nein, die Tabelle ist je Anschluss)?
+1. Stationsstatus: **Variante a**, die 0 wird verworfen, keine neue Spalte.
+2. Keine Bereinigungsmigration für Altbestand; ein Hinweis im PR genügt.
+3. Kein Eintrag der 0 in `port_status_log`.
