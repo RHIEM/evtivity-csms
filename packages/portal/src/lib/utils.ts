@@ -8,6 +8,7 @@ import {
   formatUnitPrice as formatLocaleUnitPrice,
 } from '@evtivity/lib/currency';
 import { formatNumber as formatLocaleNumber } from '@evtivity/lib/number';
+import { formatDateTime } from '@evtivity/lib/timezone';
 import i18next from 'i18next';
 
 export function cn(...inputs: ClassValue[]): string {
@@ -15,7 +16,7 @@ export function cn(...inputs: ClassValue[]): string {
 }
 
 /**
- * The selected UI language, which drives number and currency formatting. Read
+ * The selected UI language, which drives number, currency and date formatting. Read
  * from the global i18next instance that @/i18n initializes; falls back to "en"
  * before initialization (e.g. in unit tests).
  */
@@ -52,16 +53,18 @@ export function formatEnergy(wh: string | number | null | undefined): string {
   return `${formatNumber(value / 1000, 2)} kWh`;
 }
 
+/**
+ * Format date and time without seconds in the UI language, e.g. "Mar 5, 2026, 9:04 AM"
+ * (en) or "05.03.2026, 09:04" (de). Without a time zone the browser's is used.
+ */
 export function formatDate(date: string | Date | null | undefined, timezone?: string): string {
   if (date == null) return 'n/a';
-  return new Date(date).toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    ...(timezone != null ? { timeZone: timezone } : {}),
-  });
+  return formatDateTime(
+    date,
+    timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+    { dateStyle: 'medium', timeStyle: 'short' },
+    uiLocale(),
+  );
 }
 
 export function formatDuration(
@@ -95,5 +98,5 @@ export function formatDistance(
 }
 
 export function formatMonthYear(date: Date): string {
-  return date.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }).toUpperCase();
+  return date.toLocaleDateString(uiLocale(), { month: 'long', year: 'numeric' }).toUpperCase();
 }

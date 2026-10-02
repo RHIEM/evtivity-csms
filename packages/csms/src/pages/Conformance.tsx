@@ -22,6 +22,7 @@ import {
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { formatNumber } from '@/lib/formatting';
+import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 
 interface OcttRun {
   id: number;
@@ -67,6 +68,7 @@ function formatDuration(ms: number | null): string {
 }
 
 export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -186,7 +188,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                       }}
                     >
                       <TableCell className="text-xs" data-testid="row-click-target">
-                        {new Date(run.createdAt).toLocaleString()}
+                        {formatDateTime(run.createdAt, timezone)}
                       </TableCell>
                       <TableCell>
                         <Badge variant="outline">{run.ocppVersion}</Badge>

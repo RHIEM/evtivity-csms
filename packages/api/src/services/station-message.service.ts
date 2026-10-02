@@ -11,12 +11,14 @@ import {
   connectors,
   reservations,
   drivers,
+  sites,
   chargingSessions,
   meterValues,
   stationMessagePushes,
   getStationMessagePricingFormat,
   isStationMessageEnabled,
   getCompanyCurrency,
+  getSystemTimezone,
 } from '@evtivity/database';
 import {
   formatPricingDisplay,
@@ -208,9 +210,12 @@ async function resolveIdleState(internalStationId: string): Promise<IdleResoluti
       .select({
         expiresAt: reservations.expiresAt,
         driverFirstName: drivers.firstName,
+        siteTimezone: sites.timezone,
       })
       .from(reservations)
       .leftJoin(drivers, eq(reservations.driverId, drivers.id))
+      .leftJoin(chargingStations, eq(reservations.stationId, chargingStations.id))
+      .leftJoin(sites, eq(chargingStations.siteId, sites.id))
       .where(
         and(
           eq(reservations.stationId, internalStationId),
@@ -225,7 +230,8 @@ async function resolveIdleState(internalStationId: string): Promise<IdleResoluti
       result.driverFirstName = reservation.driverFirstName;
     }
     if (reservation?.expiresAt != null) {
-      result.reservationExpiresAt = formatExpiresAt(reservation.expiresAt);
+      const timezone = reservation.siteTimezone ?? (await getSystemTimezone());
+      result.reservationExpiresAt = formatExpiresAt(reservation.expiresAt, timezone);
     }
     return result;
   }
@@ -250,8 +256,10 @@ async function resolveIdleState(internalStationId: string): Promise<IdleResoluti
   return { state: 'available' };
 }
 
-function formatExpiresAt(date: Date): string {
+// Shown on the station display, so in the time zone of the station's site.
+function formatExpiresAt(date: Date, timezone: string): string {
   return date.toLocaleString('en-US', {
+    timeZone: timezone,
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
