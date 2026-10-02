@@ -74,6 +74,7 @@ const {
 
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getSystemTimezone: vi.fn(() => Promise.resolve('America/New_York')),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -100,6 +101,7 @@ vi.mock('@evtivity/database', () => ({
     driverId: 'driverId',
   },
   drivers: { id: 'id', firstName: 'firstName' },
+  sites: { id: 'id', timezone: 'timezone' },
   chargingSessions: {
     stationId: 'stationId',
     status: 'status',
@@ -340,7 +342,41 @@ describe('station-message.service', () => {
         'reserved',
         expect.objectContaining({
           driverFirstName: 'Alex',
-          reservationExpiresAt: expect.any(String),
+          reservationExpiresAt: expect.stringMatching(/^11:45\sAM$/),
+        }),
+      );
+    });
+
+    it('shows the reservation end in the time zone of the site', async () => {
+      const reservationRow = {
+        expiresAt: new Date('2026-05-06T15:45:00Z'),
+        driverFirstName: null,
+        siteTimezone: 'Europe/Berlin',
+      };
+
+      setupDbResults(
+        [STATION_ROW],
+        [{ status: 'reserved' }],
+        [reservationRow],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+      );
+
+      await pushAllStationMessages(
+        STATION_OCPP_ID,
+        INTERNAL_STATION_ID,
+        'ocpp2.1',
+        mockLogger as never,
+      );
+
+      expect(mockRenderStationMessage).toHaveBeenCalledWith(
+        'reserved',
+        expect.objectContaining({
+          reservationExpiresAt: expect.stringMatching(/^5:45\sPM$/),
         }),
       );
     });
