@@ -20,6 +20,9 @@
     "./number": {
       "import": "./src/number.ts"
     },
+    "./timezone": {
+      "import": "./src/timezone.ts"
+    },
     "./station-password": {
       "import": "./src/station-password.ts"
     }
