@@ -15,6 +15,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TabsContent } from '@/components/ui/tabs';
 import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
+import { DriverPortalAccessCard, type PortalAccess } from './DriverPortalAccessCard';
 
 interface Driver {
   id: string;
@@ -26,6 +27,7 @@ interface Driver {
   paymentMode: PaymentMode | null;
   createdAt: string;
   updatedAt: string;
+  portalAccess?: PortalAccess;
 }
 
 type PaymentMode = 'card' | 'invoice';
@@ -214,11 +216,11 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.email')}</dt>
-                <dd className="font-medium">{driver.email ?? '-'}</dd>
+                <dd className="font-medium">{driver.email ?? t('common.na')}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('drivers.phone')}</dt>
-                <dd className="font-medium">{driver.phone ?? '-'}</dd>
+                <dd className="font-medium">{driver.phone ?? t('common.na')}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
@@ -250,6 +252,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
           )}
         </CardContent>
       </Card>
+      <DriverPortalAccessCard driver={driver} timezone={timezone} />
     </TabsContent>
   );
 }

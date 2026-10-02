@@ -22,6 +22,7 @@ import { api } from '@/lib/api';
 import { useHasPermission } from '@/lib/auth';
 import { useUserTimezone } from '@/lib/timezone';
 import { DriverDetailsTab } from '@/components/driver/DriverDetailsTab';
+import type { PortalAccess } from '@/components/driver/DriverPortalAccessCard';
 import { DriverInvoicesTab } from '@/components/driver/DriverInvoicesTab';
 import { DriverPaymentMethodsTab } from '@/components/driver/DriverPaymentMethodsTab';
 import { DriverPricingTab } from '@/components/driver/DriverPricingTab';
@@ -39,6 +40,7 @@ interface Driver {
   paymentMode: 'card' | 'invoice' | null;
   createdAt: string;
   updatedAt: string;
+  portalAccess?: PortalAccess;
 }
 
 interface DriverToken {
