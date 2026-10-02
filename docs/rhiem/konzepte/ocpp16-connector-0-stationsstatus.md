@@ -1,6 +1,7 @@
 # Konzept: OCPP 1.6 `connectorId 0` als Stationsstatus (Fix 9)
 
 - **Status:** Freigegeben (01.10.2026), Variante a
+- **Upstream-Stand (02.10.2026):** EVtivity hat das Problem in `v0.1.32` selbst gelöst (`a75ce60`): `evseId 0` (OCPP 1.6 `connectorId 0`, OCPP 2.x `evseId 0`) wird als gemeldeter Stationsstatus gespeichert (`charging_stations.reported_status`, Migration `0092_station_reported_status`) statt als EVSE. Das entspricht Variante b. Beim Merge von `v0.1.32` wurde die Upstream-Fassung übernommen und unser Fix (`1dfd7d9`) samt Test entfernt; PR #32 ist damit überholt.
 - **Anlass:** Die KEBA KC-P30 (Station `28980051`, `sta_ppofemilek3o`) wird im Pilot mit zwei Anschlüssen angezeigt. Ein Löschen der überzähligen „EVSE 0“ ist nicht möglich.
 
 ## Befund
