@@ -127,6 +127,8 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
+  // Signed-out visitors see times in the browser's time zone.
+  const timezone = useAuth((s) => s.driver?.timezone);
   const currentDriverId = useAuth((s) => s.driver?.id ?? null);
   useStationEvents(stationId);
 
@@ -507,7 +509,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
           {station.maintenance.plannedEndAt != null && (
             <p className="mt-1 text-sm">
               {t('charger.maintenanceUntil', {
-                time: new Date(station.maintenance.plannedEndAt).toLocaleString(),
+                time: formatDate(station.maintenance.plannedEndAt, timezone),
               })}
             </p>
           )}
@@ -638,7 +640,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
                     <p className="text-xs text-muted-foreground">
                       {evse.reservationExpiresAt != null
                         ? t('charger.reservedUntil', {
-                            time: formatDate(evse.reservationExpiresAt),
+                            time: formatDate(evse.reservationExpiresAt, timezone),
                           })
                         : t('charger.reserved')}
                     </p>
