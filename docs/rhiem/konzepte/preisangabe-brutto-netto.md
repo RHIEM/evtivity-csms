@@ -2,7 +2,7 @@
 
 - **Status:** Freigegeben (02.10.2026), umgesetzt
 - **Zweig:** `fix/tariff-price-net-label` (zusammen mit Fix 5 aus [ocpp16-eichrecht-wallboxen.md](ocpp16-eichrecht-wallboxen.md)), in `rhiem/main` mit `33df57f`
-- **Upstream:** Sammel-Issue zur Steuerthematik und PR an EVtivity stehen aus
+- **Upstream:** Sammel-Issue [#33](https://github.com/EVtivity/evtivity-csms/issues/33), PR [#34](https://github.com/EVtivity/evtivity-csms/pull/34) (erfüllt Punkte 1–4 aus #33)
 
 ## Ausgangslage
 
