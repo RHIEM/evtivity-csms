@@ -1,7 +1,7 @@
 # Datums- und Uhrzeitformat je nach Sprache
 
-- **Status:** Freigegeben (02.10.2026)
-- **Zweig:** `fix/locale-date-display` (Basis `v0.1.32`)
+- **Status:** Freigegeben (02.10.2026), umgesetzt, im Pilot seit 02.10.2026
+- **Zweig:** `fix/locale-date-display` (Basis `v0.1.32`), in `rhiem/main` mit `9718bba`
 - **Upstream:** PR folgt (Anzeige und Benachrichtigungen ggf. getrennt)
 
 ## Ausgangslage
