@@ -680,6 +680,13 @@
       "when": 1790917217502,
       "tag": "rhiem_0002_signed_meter_data",
       "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1790917217503,
+      "tag": "rhiem_0003_driver_price_display",
+      "breakpoints": true
     }
   ]
 }
