@@ -106,3 +106,21 @@ Abhängigkeiten (eigene Fixes, beide in EVtivity `v0.1.27` übernommen):
 - `fix/nullable-enum-schema`: `null` für nullable Enums in Request-Bodies. Der Feature-Zweig baut darauf auf. Upstream: Issue [#15](https://github.com/EVtivity/evtivity-csms/issues/15), PR [#16](https://github.com/EVtivity/evtivity-csms/pull/16).
 
 Noch offen vor dem Feldversuch: Test mit der KEBA KC-P30 (OCPP 1.6J, RFID) bzw. dem Simulator. Bisher ist der Pfad nur mit gemockter Datenbank getestet.
+
+## Anpassung an EVtivity v0.1.37 (05.10.2026)
+
+Mit `v0.1.37` hat EVtivity die Zahlungen in ein eigenes Paket `@evtivity/payments` verlagert: austauschbare Zahlungsanbieter (Stripe, Adyen) und eine gemeinsame Einordnung je Vorgang, `classifySessionPayment()` (`roaming`, `free_vend`, `prepaid`, `card`, `guest`, `anonymous`), die Zahlungsschranke beim Start und Abrechnung am Ende teilen.
+
+Entscheidungen (05.10.2026):
+
+- **Rechnung ist eine Zahlungsart, kein Zahlungsanbieter.** Ein Anbieter ist eine Kartenanbindung (Karten hinterlegen, Betrag vormerken, abbuchen, erstatten), und systemweit ist nur einer aktiv (`payments.provider`). Rechnung wird stattdessen als `invoice` in `classifySessionPayment()` eingeordnet, nach `prepaid` und vor `card`. Vorbild ist `prepaid`: keine Vormerkung, Abrechnung außerhalb des Kartenanbieters.
+- **Die Sammelrechnung enthält auch bereits Bezahltes**, wie bei Upstream. Unser Filter gegen Vorgänge mit Kartenzahlung entfällt. Heute unkritisch, weil ein Fahrer entweder ganz auf Rechnung oder ganz per Karte lädt.
+
+Umsetzung auf `feature/invoice-payment-mode` (Merge von `v0.1.37`, `3f51627`):
+
+- `SessionPaymentFacts.invoice`; die OCPP-Schranke ruft `snapshotPaymentMode()` für Fahrer außerhalb von Roaming auf und kehrt bei `invoice` ohne Vormerkung zurück. `settleSessionPayment()` liest `charging_sessions.payment_mode`; ohne Vormerkung wird nichts abgebucht.
+- Portal-Start: Bei aktivem Zahlungsanbieter wird die Zahlungsmethode im Rechnungsmodus nicht verlangt.
+- Migration als `rhiem_0001_payment_mode` (Inhalt unverändert) am Ende des Journals.
+- Das Rechnungs-PDF ist seit `v0.1.36` übersetzt (u. a. Deutsch) und weist Steuern je Steuersatz aus (`v0.1.34`).
+
+Bekannte Einschränkung: Storno- und No-Show-Gebühren einer Reservierung werden per Karte bezahlt und stehen zusätzlich auf der Sammelrechnung (Upstream-Verhalten). Reservierungen verlangen weiterhin eine Karte; im Feldversuch wird nicht reserviert.

@@ -16,9 +16,9 @@ Fahrerportal, CSMS und Benachrichtigungen formatieren Datum und Uhrzeit fest mit
 - **Umsetzung:** `@evtivity/lib/timezone` erhält einen Parameter `locale` und wird zur gemeinsamen Implementierung (eigener Export wie `@evtivity/lib/number`). CSMS und Portal setzen `uiLocale()` ein, der Server die Sprache des Empfängers.
 - **Relative Zeit** im CSMS („5s ago“) über `Intl.RelativeTimeFormat` (`style: 'narrow'`).
 - **Benachrichtigungen:** `formatDateVariables` bekommt die Sprache des Empfängers; im OCPP-Dispatcher wird je Empfänger formatiert.
-- **Säulendisplay:** Reservierungsende in der Zeitzone des Standorts (bisher Serverzeit). Format bleibt `en-US`, da es weder Sprache je Säule noch eine systemweite Sprache gibt und die Display-Vorlagen englisch sind.
+- **Säulendisplay:** Reservierungsende in der Zeitzone des Standorts (bisher Serverzeit). Seit `v0.1.37` hat das Display eine eigene Sprache (`formatStationTime`); beim Merge hat `formatStationTime` einen optionalen Parameter für die Zeitzone erhalten, das Format folgt der Display-Sprache.
 
 ## Nicht umgesetzt
 
-- Rechnungs-PDF (Texte, Datum, Beträge nur Englisch): gesondertes Thema, siehe Issue #33.
-- Sprache des Säulendisplays (Standort- oder Systemsprache).
+- Rechnungs-PDF: seit `v0.1.36` von EVtivity übersetzt (Texte, Datum, Beträge in der Sprache des Fahrers).
+- Sprache des Säulendisplays: seit `v0.1.37` von EVtivity umgesetzt.

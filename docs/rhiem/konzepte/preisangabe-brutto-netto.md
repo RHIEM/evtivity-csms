@@ -19,9 +19,11 @@ Das Fahrerportal zeigte den Nettopreis als Hauptpreis, auf Cent gerundet, und di
 - **Beträge** (Listen, Summen, Monatsübersicht, E-Mails): bleiben die abgerechneten Bruttobeträge und tragen „inkl. Steuer“.
 - **E-Mail IdlingStarted:** Standgebühr nach Wahl des Fahrers mit Steuerhinweis (`idleFeeFormatted`, `idleFeeIncludesTax`, `taxRatePercent`). Behoben: Ohne Standgebühr wurden trotzdem Standgebühren angekündigt (`'0'` ist in Handlebars wahr).
 - Kostenberechnung und Datenmodell der Tarife bleiben unverändert.
-- Migration im Fork `rhiem_0003_driver_price_display`, im PR `0095_driver_price_display` mit identischem Inhalt (ADR 0002).
+- Migration im Fork `rhiem_0003_driver_price_display`, im PR `0095_driver_price_display` mit identischem Inhalt (ADR 0002). Upstream als `0104_driver_price_display` übernommen; beim Merge von `v0.1.37` ersetzt sie `rhiem_0003` (gleicher Hash, gilt in bestehenden Datenbanken als angewendet).
 
 ## Nicht umgesetzt (Sammel-Issue)
+
+Upstream-Stand (05.10.2026): PR #34 ist in `v0.1.34` gemergt. `v0.1.34` greift weitere Punkte aus #33 auf (Rechnungen je Steuersatz, OCPI-Steuer, Nettoumsatz, Berechnungsmethode), `v0.1.36` übersetzt das Rechnungs-PDF. Welche der folgenden Punkte damit vollständig erledigt sind, ist noch nicht einzeln geprüft.
 
 - Rechnungs-PDF ohne Steuersatz, Texte nur Englisch (für „Laden auf Rechnung“ relevant; perspektivisch eigene RHIEM-Rechnung).
 - Umsatzbericht: Umsatz inklusive Steuer, Gewinn um die Steuer zu hoch.

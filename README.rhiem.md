@@ -51,7 +51,7 @@ Alle Mails landen in Mailpit, nichts wird tatsächlich versendet.
 
 Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategie.md).
 
-- `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.32`) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
+- `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.37`) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
 - Features zweigen deshalb vom **Upstream-Tag** ab, auf dem `rhiem/main` steht – nicht von `rhiem/main`.
 
 | Zweck                                    | Abzweigen von                 | Präfix               |
@@ -61,7 +61,7 @@ Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategi
 
 ```bash
 # Feature anlegen und in unseren Stand übernehmen
-git switch -c feature/<name> v0.1.32
+git switch -c feature/<name> v0.1.37
 git switch rhiem/main && git merge --no-ff feature/<name>
 
 # Später als PR an EVtivity: auf aktuellen Upstream bringen
