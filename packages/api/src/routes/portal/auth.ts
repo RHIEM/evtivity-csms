@@ -3,7 +3,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, and, isNull, ilike } from 'drizzle-orm';
+import { eq, and, isNull, isNotNull, ilike } from 'drizzle-orm';
 import argon2 from 'argon2';
 import { db, client, isPortalRegistrationEnabled } from '@evtivity/database';
 import { drivers, userTokens } from '@evtivity/database';
@@ -32,6 +32,7 @@ import {
   revokeAllDriverRefreshTokens,
 } from '../../services/refresh-token.service.js';
 import { config as apiConfig } from '../../lib/config.js';
+import { activateDriverPortal } from '../../services/driver-portal-access.service.js';
 import {
   issueDriverSession,
   isMobileClient,
@@ -59,6 +60,12 @@ const portalDriverItem = z
     timezone: z.string().max(50).nullable(),
     themePreference: z.enum(['light', 'dark']),
     distanceUnit: z.enum(['miles', 'km']),
+    priceDisplay: z
+      .enum(['gross', 'net'])
+      .nullable()
+      .describe(
+        'Whether prices are shown including (gross) or excluding (net) tax. Null follows the company setting.',
+      ),
     isActive: z.boolean(),
     emailVerified: z.boolean(),
     createdAt: z.coerce.date(),
@@ -129,6 +136,7 @@ const driverSelect = {
   timezone: drivers.timezone,
   themePreference: drivers.themePreference,
   distanceUnit: drivers.distanceUnit,
+  priceDisplay: drivers.priceDisplay,
   isActive: drivers.isActive,
   emailVerified: drivers.emailVerified,
   createdAt: drivers.createdAt,
@@ -390,13 +398,15 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       // Use ilike so a driver who registered as Jane@x.com can log in
       // typing jane@x.com. The register path already uses ilike for the
       // duplicate check, so login must match for the round-trip to work.
+      // A driver an operator created has no password until they accept a
+      // portal invite.
       const [driver] = await db
         .select()
         .from(drivers)
         .where(
           and(
             ilike(drivers.email, email),
-            eq(drivers.registrationSource, 'portal'),
+            isNotNull(drivers.passwordHash),
             eq(drivers.isActive, true),
           ),
         );
@@ -459,6 +469,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         timezone: driver.timezone,
         themePreference: driver.themePreference,
         distanceUnit: driver.distanceUnit,
+        priceDisplay: driver.priceDisplay,
         isActive: driver.isActive,
         emailVerified: driver.emailVerified,
         createdAt: driver.createdAt,
@@ -722,6 +733,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         timezone: driver.timezone,
         themePreference: driver.themePreference,
         distanceUnit: driver.distanceUnit,
+        priceDisplay: driver.priceDisplay,
         isActive: driver.isActive,
         emailVerified: driver.emailVerified,
         createdAt: driver.createdAt,
@@ -862,7 +874,9 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       }
 
       // Match register/login path: ilike so a driver who registered with
-      // Jane@x.com can recover via jane@x.com.
+      // Jane@x.com can recover via jane@x.com. A driver without a password
+      // gets no reset email, so knowing their address cannot take over the
+      // record. The operator grants first access with a portal invite.
       const [driver] = await db
         .select({
           id: drivers.id,
@@ -876,7 +890,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         .where(
           and(
             ilike(drivers.email, email),
-            eq(drivers.registrationSource, 'portal'),
+            isNotNull(drivers.passwordHash),
             eq(drivers.isActive, true),
           ),
         );
@@ -932,6 +946,44 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       }
 
       return { success: true };
+    },
+  );
+
+  const activateBody = z.object({
+    token: z.string().min(1).describe('Invitation token from the portal invite email link'),
+    password: z.string().min(12).describe('New portal password'),
+  });
+
+  app.post(
+    '/portal/auth/activate',
+    {
+      schema: {
+        tags: ['Portal Auth'],
+        summary: 'Activate driver portal access from an operator invitation',
+        description:
+          'Sets the first portal password on a driver an operator created, using the single-use token from the invitation email. Marks the email as verified. The driver then signs in through the normal login. Returns 400 INVALID_TOKEN for an unknown, used, replaced, or expired link.',
+        operationId: 'portalActivate',
+        security: [],
+        body: zodSchema(activateBody),
+        response: {
+          200: successResponse,
+          400: errorWith('Invalid invitation or weak password', [
+            ERROR_CODES.INVALID_TOKEN,
+            ERROR_CODES.WEAK_PASSWORD,
+          ]),
+        },
+      },
+      config: {
+        rateLimit: {
+          max: apiConfig.AUTH_RATE_LIMIT_MAX,
+          timeWindow: apiConfig.AUTH_RATE_LIMIT_WINDOW,
+        },
+      },
+    },
+    async (request) => {
+      const { token, password } = request.body as z.infer<typeof activateBody>;
+      await activateDriverPortal(token, password, request.log);
+      return { success: true as const };
     },
   );
 

@@ -15,6 +15,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TabsContent } from '@/components/ui/tabs';
 import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
+import { DriverPortalAccessCard, type PortalAccess } from './DriverPortalAccessCard';
 
 interface Driver {
   id: string;
@@ -26,6 +27,7 @@ interface Driver {
   paymentMode: PaymentMode | null;
   createdAt: string;
   updatedAt: string;
+  portalAccess?: PortalAccess;
 }
 
 type PaymentMode = 'card' | 'invoice';
@@ -114,7 +116,9 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
             <form onSubmit={handleSave} noValidate className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-first">{t('drivers.firstName')}</Label>
+                  <Label htmlFor="edit-first" className="leading-6">
+                    {t('drivers.firstName')}
+                  </Label>
                   <Input
                     id="edit-first"
                     value={firstName}
@@ -128,7 +132,9 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                   )}
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-last">{t('drivers.lastName')}</Label>
+                  <Label htmlFor="edit-last" className="leading-6">
+                    {t('drivers.lastName')}
+                  </Label>
                   <Input
                     id="edit-last"
                     value={lastName}
@@ -143,7 +149,9 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 </div>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-email">{t('common.email')}</Label>
+                <Label htmlFor="edit-email" className="leading-6">
+                  {t('common.email')}
+                </Label>
                 <Input
                   id="edit-email"
                   type="email"
@@ -154,7 +162,9 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-phone">{t('drivers.phone')}</Label>
+                <Label htmlFor="edit-phone" className="leading-6">
+                  {t('drivers.phone')}
+                </Label>
                 <Input
                   id="edit-phone"
                   value={phone}
@@ -214,11 +224,11 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.email')}</dt>
-                <dd className="font-medium">{driver.email ?? '-'}</dd>
+                <dd className="font-medium">{driver.email ?? t('common.na')}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('drivers.phone')}</dt>
-                <dd className="font-medium">{driver.phone ?? '-'}</dd>
+                <dd className="font-medium">{driver.phone ?? t('common.na')}</dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
@@ -250,6 +260,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
           )}
         </CardContent>
       </Card>
+      <DriverPortalAccessCard driver={driver} timezone={timezone} />
     </TabsContent>
   );
 }

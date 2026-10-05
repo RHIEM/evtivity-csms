@@ -62,6 +62,7 @@ function makeCtx(
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action,
@@ -372,6 +373,98 @@ describe('NotifyEvent handler', () => {
       expect.objectContaining({ eventType: 'ocpp.NotifyEvent' }),
     );
   });
+
+  it('applies a Connector AvailabilityState as a connector status', async () => {
+    const { handleNotifyEvent } = await import('../handlers/v2_1/notify-event.handler.js');
+    const { ctx, publishMock } = makeCtx('NotifyEvent', {
+      generatedAt: '2024-01-01T00:00:00Z',
+      seqNo: 0,
+      eventData: [
+        {
+          eventId: 1,
+          timestamp: '2024-01-01T00:00:05Z',
+          trigger: 'Delta',
+          actualValue: 'Occupied',
+          component: { name: 'Connector', evse: { id: 2, connectorId: 1 } },
+          variable: { name: 'AvailabilityState' },
+        },
+      ],
+    });
+    await handleNotifyEvent(ctx);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'ocpp.StatusNotification',
+        payload: expect.objectContaining({
+          evseId: 2,
+          connectorId: 1,
+          connectorStatus: 'Occupied',
+          timestamp: '2024-01-01T00:00:05Z',
+          source: 'NotifyEvent',
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('applies a ChargingStation AvailabilityState as the station status (EVSE 0)', async () => {
+    const { handleNotifyEvent } = await import('../handlers/v2_1/notify-event.handler.js');
+    const { ctx, publishMock } = makeCtx('NotifyEvent', {
+      generatedAt: '2024-01-01T00:00:00Z',
+      seqNo: 0,
+      eventData: [
+        {
+          eventId: 1,
+          timestamp: '2024-01-01T00:00:00Z',
+          trigger: 'Delta',
+          actualValue: 'Faulted',
+          component: { name: 'ChargingStation' },
+          variable: { name: 'AvailabilityState' },
+        },
+      ],
+    });
+    await handleNotifyEvent(ctx);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'ocpp.StatusNotification',
+        payload: expect.objectContaining({
+          evseId: 0,
+          connectorId: 0,
+          connectorStatus: 'Faulted',
+          source: 'NotifyEvent',
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('ignores EVSE AvailabilityState and unknown values', async () => {
+    const { handleNotifyEvent } = await import('../handlers/v2_1/notify-event.handler.js');
+    const { ctx, publishMock } = makeCtx('NotifyEvent', {
+      generatedAt: '2024-01-01T00:00:00Z',
+      seqNo: 0,
+      eventData: [
+        {
+          eventId: 2,
+          timestamp: '2024-01-01T00:00:00Z',
+          trigger: 'Delta',
+          actualValue: 'Unavailable',
+          component: { name: 'EVSE', evse: { id: 1 } },
+          variable: { name: 'AvailabilityState' },
+        },
+        {
+          eventId: 3,
+          timestamp: '2024-01-01T00:00:00Z',
+          trigger: 'Delta',
+          actualValue: 'Bogus',
+          component: { name: 'Connector', evse: { id: 1, connectorId: 1 } },
+          variable: { name: 'AvailabilityState' },
+        },
+      ],
+    });
+    await handleNotifyEvent(ctx);
+    expect(publishMock).toHaveBeenCalledTimes(1);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'ocpp.NotifyEvent' }),
+    );
+  });
 });
 
 describe('NotifyMonitoringReport handler', () => {
@@ -419,22 +512,6 @@ describe('NotifyPriorityCharging handler', () => {
     expect(response).toEqual({});
     expect(publishMock).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'ocpp.NotifyPriorityCharging' }),
-    );
-  });
-});
-
-describe('NotifyQRCodeScanned handler', () => {
-  it('publishes event and returns empty object', async () => {
-    const { handleNotifyQRCodeScanned } =
-      await import('../handlers/v2_1/notify-qr-code-scanned.handler.js');
-    const { ctx, publishMock } = makeCtx('NotifyQRCodeScanned', {
-      evseId: 1,
-      timeout: 30,
-    });
-    const response = await handleNotifyQRCodeScanned(ctx);
-    expect(response).toEqual({});
-    expect(publishMock).toHaveBeenCalledWith(
-      expect.objectContaining({ eventType: 'ocpp.NotifyQRCodeScanned' }),
     );
   });
 });
@@ -503,22 +580,6 @@ describe('NotifySettlement handler', () => {
   });
 });
 
-describe('NotifyWebPaymentStarted handler', () => {
-  it('publishes event and returns empty object', async () => {
-    const { handleNotifyWebPaymentStarted } =
-      await import('../handlers/v2_1/notify-web-payment-started.handler.js');
-    const { ctx, publishMock } = makeCtx('NotifyWebPaymentStarted', {
-      evseId: 1,
-      timeout: 60,
-    });
-    const response = await handleNotifyWebPaymentStarted(ctx);
-    expect(response).toEqual({});
-    expect(publishMock).toHaveBeenCalledWith(
-      expect.objectContaining({ eventType: 'ocpp.NotifyWebPaymentStarted' }),
-    );
-  });
-});
-
 describe('PublishFirmwareStatusNotification handler', () => {
   it('publishes event and returns empty object', async () => {
     const { handlePublishFirmwareStatusNotification } =
@@ -569,17 +630,65 @@ describe('ReportChargingProfiles handler', () => {
 });
 
 describe('ReportDERControl handler', () => {
-  it('publishes event and returns empty object', async () => {
+  it('publishes the reported control lists and returns empty object', async () => {
     const { handleReportDERControl } =
       await import('../handlers/v2_1/report-der-control.handler.js');
+    const enterService = [
+      {
+        id: 'enterservice_1',
+        enterService: {
+          priority: 1,
+          highVoltage: 250,
+          lowVoltage: 210,
+          highFreq: 50.5,
+          lowFreq: 49.5,
+        },
+      },
+    ];
+    const freqDroop = [
+      {
+        id: 'freqdroop_1',
+        isDefault: true,
+        isSuperseded: false,
+        freqDroop: {
+          priority: 6,
+          overFreq: 50.5,
+          underFreq: 49.5,
+          overDroop: 0.05,
+          underDroop: 0.05,
+          responseTime: 10,
+        },
+      },
+    ];
     const { ctx, publishMock } = makeCtx('ReportDERControl', {
       requestId: 1,
-      derControlStatus: [],
+      tbc: true,
+      enterService,
+      freqDroop,
     });
     const response = await handleReportDERControl(ctx);
     expect(response).toEqual({});
     expect(publishMock).toHaveBeenCalledWith(
-      expect.objectContaining({ eventType: 'ocpp.ReportDERControl' }),
+      expect.objectContaining({
+        eventType: 'ocpp.ReportDERControl',
+        payload: expect.objectContaining({
+          requestId: 1,
+          tbc: true,
+          derControl: { enterService, freqDroop },
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('defaults tbc to false and reports no controls when none are sent', async () => {
+    const { handleReportDERControl } =
+      await import('../handlers/v2_1/report-der-control.handler.js');
+    const { ctx, publishMock } = makeCtx('ReportDERControl', { requestId: 2 });
+    await handleReportDERControl(ctx);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({ requestId: 2, tbc: false, derControl: {} }) as unknown,
+      }),
     );
   });
 });

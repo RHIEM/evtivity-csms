@@ -15,6 +15,7 @@ import {
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { inCompanyCurrency, sessionCurrencySql } from '../lib/company-currency.js';
+import { queryRevenue, queryRevenueTotal, revenueItem } from '../lib/session-revenue.js';
 import { siteNameEq } from '../lib/site-lookup.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
@@ -44,7 +45,7 @@ import {
   deriveElectricityRatePriority,
 } from '@evtivity/lib';
 import type { ElectricityRatePeriodRestrictions } from '@evtivity/lib';
-import { zodSchema } from '../lib/zod-schema.js';
+import { assertZodRefinements, zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
@@ -56,6 +57,10 @@ import {
   errorWith,
   errorResponse,
 } from '../lib/response-schemas.js';
+import {
+  buildDerivedStatusSubquery,
+  buildStatusReasonSubquery,
+} from '../lib/station-derived-status.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import {
   exportSitesCsv,
@@ -370,20 +375,38 @@ const siteMetricsResponse = z
       .number()
       .int()
       .min(0)
-      .describe('Total revenue collected in cents (smallest currency unit)'),
-    avgRevenueCentsPerSession: z.number().describe('Average revenue per billable session in cents'),
+      .describe(
+        'Total revenue in the period in cents, tax included. Revenue is the final cost of ended sessions plus reservation fees charged, minus refunds, in the company currency; active sessions are not counted',
+      ),
+    avgRevenueCentsPerSession: z
+      .number()
+      .describe('Average revenue per ended session billed in the company currency, in cents'),
     totalTransactions: z
       .number()
-      .describe('Number of billable transactions (sessions with cost data)'),
+      .describe('Number of revenue items: ended billed sessions plus reservation fee charges'),
     totalElectricityCostCents: z
       .number()
       .int()
       .min(0)
       .describe('Total wholesale electricity cost in cents over the reporting period'),
+    totalNetRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Total revenue excluding tax in cents. Each amount is split at its own tax rate (a session at its tariff tax rate, a reservation fee at the rate it was taxed at).',
+      ),
+    totalTaxCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Tax collected in cents (total revenue minus total net revenue)'),
     totalProfitCents: z
       .number()
       .int()
-      .describe('Total profit in cents (revenue minus electricity cost); may be negative'),
+      .describe(
+        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative',
+      ),
     periodMonths: z.number().describe('Number of months covered by this metrics report'),
     currency: z
       .string()
@@ -407,6 +430,10 @@ const siteStationItem = z
     securityProfile: z
       .number()
       .describe('OCPP security profile level (0=none, 1=basic auth, 2=basic auth + TLS, 3=mTLS)'),
+    ocppProtocol: z
+      .string()
+      .nullable()
+      .describe('OCPP protocol the station speaks (ocpp1.6 or ocpp2.1), null before it connects'),
     lastHeartbeat: z.coerce
       .date()
       .nullable()
@@ -417,7 +444,13 @@ const siteStationItem = z
     status: z
       .string()
       .describe(
-        'Derived station status from connector states (charging, reserved, faulted, available, unavailable, unknown)',
+        'Station status: a disable, firmware, or station-reported state first, else the connector summary (charging, reserved, faulted, available, unavailable, unknown)',
+      ),
+    statusReason: z
+      .string()
+      .nullable()
+      .describe(
+        'Why the station is not available (operator_disabled, security_disabled, firmware_failed, station_faulted, connector_faulted, firmware_installing, station_unavailable), null when it is',
       ),
     connectorCount: z.number().describe('Number of connectors installed on this station'),
     connectorTypes: z
@@ -445,9 +478,13 @@ const revenueHistoryItem = z
       .int()
       .min(0)
       .describe(
-        'Total revenue collected on this date in cents, from sessions billed in the company currency',
+        'Revenue on this date in cents, tax included: final costs of sessions started that day plus reservation fees charged that day, minus refunds, in the company currency. Active sessions are not counted',
       ),
-    sessionCount: z.number().describe('Number of billable sessions on this date'),
+    sessionCount: z
+      .number()
+      .describe(
+        'Number of ended sessions billed in the company currency that started on this date',
+      ),
   })
   .passthrough();
 
@@ -538,7 +575,18 @@ const layoutStation = z
     id: z.string().describe('Internal station identifier (UUID)'),
     stationId: z.string().describe('OCPP station identifier'),
     model: z.string().nullable().describe('Hardware model name'),
-    status: z.string().nullable().describe('Station availability state'),
+    status: z
+      .string()
+      .nullable()
+      .describe(
+        'Station status: a disable, firmware, or station-reported state first, else the connector summary (charging, reserved, faulted, available, unavailable, unknown)',
+      ),
+    statusReason: z
+      .string()
+      .nullable()
+      .describe(
+        'Why the station is not available (operator_disabled, security_disabled, firmware_failed, station_faulted, connector_faulted, firmware_installing, station_unavailable), null when it is',
+      ),
     isOnline: z.boolean().describe('Whether the station is currently connected to the CSMS'),
     securityProfile: z.number().describe('OCPP security profile level (0-3)'),
     positionX: z.number().describe('X coordinate on the site layout canvas'),
@@ -753,7 +801,13 @@ export function siteRoutes(app: FastifyInstance): void {
       const { rows, updateExisting } = request.body as z.infer<typeof importSiteBody>;
       const { userId } = request.user as { userId: string };
       const allowedSiteIds = await getUserSiteIds(userId);
-      return importSitesCsv(rows, updateExisting, getAuditActor(request), allowedSiteIds);
+      return importSitesCsv(
+        rows,
+        updateExisting,
+        getAuditActor(request),
+        allowedSiteIds,
+        request.log,
+      );
     },
   );
 
@@ -813,6 +867,7 @@ export function siteRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      assertZodRefinements(createSiteBody, request.body);
       const body = request.body as z.infer<typeof createSiteBody>;
 
       // Pre-check the unique name constraint (case-insensitive) so duplicate
@@ -875,6 +930,7 @@ export function siteRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
+      assertZodRefinements(updateSiteBody, request.body);
       const body = request.body as z.infer<typeof updateSiteBody>;
       const [before] = await db.select().from(sites).where(eq(sites.id, id));
 
@@ -1116,16 +1172,27 @@ export function siteRoutes(app: FastifyInstance): void {
 
       const currency = await getCompanyCurrency();
       const billed = inCompanyCurrency(chargingSessions.currency, currency);
-      const [financialStats] = await db
-        .select({
-          totalRevenueCents: sql<number>`coalesce(sum(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-          avgRevenueCentsPerSession: sql<number>`coalesce(avg(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-          totalTransactions: sql<number>`count(*) filter (where coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents}) is not null)`,
-          totalElectricityCostCents: sql<number>`coalesce(sum(${chargingSessions.electricityCostCents}) filter (where ${billed}), 0)`,
-        })
-        .from(chargingSessions)
-        .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-        .where(and(eq(chargingStations.siteId, id), gte(chargingSessions.startedAt, since)));
+      const [[financialStats], revenue] = await Promise.all([
+        db
+          .select({
+            totalElectricityCostCents:
+              sql<number>`coalesce(sum(${chargingSessions.electricityCostCents}) filter (where ${billed}), 0)`.mapWith(
+                Number,
+              ),
+          })
+          .from(chargingSessions)
+          .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
+          .where(and(eq(chargingStations.siteId, id), gte(chargingSessions.startedAt, since))),
+        // Revenue (session-revenue.ts): ended sessions and reservation fees,
+        // minus refunds.
+        queryRevenueTotal({
+          companyCurrency: currency,
+          where: [
+            sql`${revenueItem.siteId} = ${id}`,
+            sql`${revenueItem.occurredAt} >= ${since.toISOString()}::timestamptz`,
+          ],
+        }),
+      ]);
 
       const total = sessionStats?.totalSessions ?? 0;
       const completed = sessionStats?.completedSessions ?? 0;
@@ -1168,13 +1235,16 @@ export function siteRoutes(app: FastifyInstance): void {
         disconnectCount: Number(disconnectRow?.disconnect_count ?? 0),
         avgDowntimeMinutes: Math.round(Number(disconnectRow?.avg_downtime_minutes ?? 0)),
         maxDowntimeMinutes: Math.round(Number(disconnectRow?.max_downtime_minutes ?? 0)),
-        totalRevenueCents: financialStats?.totalRevenueCents ?? 0,
-        avgRevenueCentsPerSession: Math.round(financialStats?.avgRevenueCentsPerSession ?? 0),
-        totalTransactions: financialStats?.totalTransactions ?? 0,
+        totalRevenueCents: revenue.grossCents,
+        avgRevenueCentsPerSession:
+          revenue.sessionCount > 0
+            ? Math.round(revenue.sessionGrossCents / revenue.sessionCount)
+            : 0,
+        totalTransactions: revenue.itemCount,
         totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
-        totalProfitCents:
-          (financialStats?.totalRevenueCents ?? 0) -
-          (financialStats?.totalElectricityCostCents ?? 0),
+        totalNetRevenueCents: revenue.netCents,
+        totalTaxCents: revenue.taxCents,
+        totalProfitCents: revenue.netCents - (financialStats?.totalElectricityCostCents ?? 0),
         periodMonths: months,
         currency,
       };
@@ -1221,14 +1291,6 @@ export function siteRoutes(app: FastifyInstance): void {
       }
 
       const where = eq(chargingStations.siteId, id);
-      const derivedStatus = sql<string>`CASE
-        WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'occupied') > 0 THEN 'charging'
-        WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'reserved') > 0 THEN 'reserved'
-        WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'faulted') > 0 THEN 'faulted'
-        WHEN COUNT(${connectors.id}) = 0 THEN 'unknown'
-        WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'available') = COUNT(${connectors.id}) THEN 'available'
-        ELSE 'unavailable'
-      END`;
       const [data, countRows] = await Promise.all([
         db
           .select({
@@ -1239,11 +1301,13 @@ export function siteRoutes(app: FastifyInstance): void {
             serialNumber: chargingStations.serialNumber,
             availability: chargingStations.availability,
             securityProfile: chargingStations.securityProfile,
+            ocppProtocol: chargingStations.ocppProtocol,
             lastHeartbeat: chargingStations.lastHeartbeat,
             isOnline: chargingStations.isOnline,
             createdAt: chargingStations.createdAt,
             updatedAt: chargingStations.updatedAt,
-            status: derivedStatus,
+            status: buildDerivedStatusSubquery(chargingStations.id),
+            statusReason: buildStatusReasonSubquery(chargingStations.id),
             connectorCount: sql<number>`COUNT(${connectors.id})::int`,
             connectorTypes: sql<
               string[]
@@ -1361,34 +1425,28 @@ export function siteRoutes(app: FastifyInstance): void {
         .where(eq(sites.id, id));
       const tz = siteRow?.timezone ?? 'America/New_York';
 
-      const billed = inCompanyCurrency(chargingSessions.currency, await getCompanyCurrency());
-
-      const rows = await db
-        .select({
-          date: sql<string>`date_trunc('day', ${chargingSessions.startedAt} AT TIME ZONE ${tz})::date::text`,
-          revenueCents: sql<number>`coalesce(sum(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-          sessionCount: count(),
-        })
-        .from(chargingSessions)
-        .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-        .where(
-          and(
-            eq(chargingStations.siteId, id),
-            gte(chargingSessions.startedAt, since),
-            until ? lte(chargingSessions.startedAt, until) : undefined,
-            sql`coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents}) is not null`,
-          ),
-        )
-        .groupBy(sql`1`)
-        .orderBy(sql`1`);
+      // Revenue per day (session-revenue.ts): ended sessions and reservation
+      // fees billed in the company currency, minus refunds, tax included.
+      const where = [
+        sql`${revenueItem.siteId} = ${id}`,
+        sql`${revenueItem.occurredAt} >= ${since.toISOString()}::timestamptz`,
+      ];
+      if (until) where.push(sql`${revenueItem.occurredAt} <= ${until.toISOString()}::timestamptz`);
+      const byDay = await queryRevenue({
+        companyCurrency: await getCompanyCurrency(),
+        key: sql`date_trunc('day', ${revenueItem.occurredAt} AT TIME ZONE ${tz})::date`,
+        where,
+      });
 
       return zeroFillDays(
         enumerateLocalDays(since, until, tz),
-        rows.map((r) => ({
-          date: r.date,
-          revenueCents: r.revenueCents,
-          sessionCount: r.sessionCount,
-        })),
+        [...byDay]
+          .filter((entry): entry is [string, (typeof entry)[1]] => entry[0] != null)
+          .map(([date, revenue]) => ({
+            date,
+            revenueCents: revenue.grossCents,
+            sessionCount: revenue.sessionCount,
+          })),
         (date) => ({ date, revenueCents: 0, sessionCount: 0 }),
       );
     },
@@ -1624,7 +1682,6 @@ export function siteRoutes(app: FastifyInstance): void {
           conditions.push(eq(chargingSessions.status, status));
         }
       }
-      const companyCurrency = await getCompanyCurrency();
       const where = and(...conditions);
 
       const [rows, countRows] = await Promise.all([
@@ -1643,7 +1700,7 @@ export function siteRoutes(app: FastifyInstance): void {
             energyDeliveredWh: chargingSessions.energyDeliveredWh,
             currentCostCents: chargingSessions.currentCostCents,
             finalCostCents: chargingSessions.finalCostCents,
-            currency: sessionCurrencySql(companyCurrency),
+            currency: sessionCurrencySql(),
             startedAt: chargingSessions.startedAt,
             endedAt: chargingSessions.endedAt,
             freeVend: chargingSessions.freeVend,
@@ -1703,7 +1760,8 @@ export function siteRoutes(app: FastifyInstance): void {
           id: chargingStations.id,
           stationId: chargingStations.stationId,
           model: chargingStations.model,
-          availability: chargingStations.availability,
+          status: buildDerivedStatusSubquery(chargingStations.id),
+          statusReason: buildStatusReasonSubquery(chargingStations.id),
           isOnline: chargingStations.isOnline,
           securityProfile: chargingStations.securityProfile,
           positionX: stationLayoutPositions.positionX,
@@ -1804,7 +1862,8 @@ export function siteRoutes(app: FastifyInstance): void {
           id: station.id,
           stationId: station.stationId,
           model: station.model,
-          status: station.availability,
+          status: station.status,
+          statusReason: station.statusReason,
           isOnline: station.isOnline,
           securityProfile: station.securityProfile,
           positionX: Number(station.positionX ?? '0'),

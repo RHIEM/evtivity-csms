@@ -76,9 +76,11 @@ describe('command-translation', () => {
             },
           ],
         });
+        // The 1.6 key is the variable name; OCPPCommCtrlr is a 2.1 component
+        // that no 1.6 station knows as a configuration key.
         expect(result).toEqual({
           action: 'GetConfiguration',
-          payload: { key: ['OCPPCommCtrlr'] },
+          payload: { key: ['HeartbeatInterval'] },
         });
       });
     });
@@ -180,8 +182,8 @@ describe('command-translation', () => {
           evseId: 1,
           duration: 3600,
         });
-        expect(result?.payload).toHaveProperty('connectorId', 1);
-        expect(result?.payload).toHaveProperty('evseId', 1);
+        // The 1.6 schema rejects additional properties, so evseId must not leak.
+        expect(result?.payload).toEqual({ connectorId: 1, duration: 3600 });
       });
     });
 
@@ -274,6 +276,48 @@ describe('command-translation', () => {
         expect(result?.payload).toHaveProperty('location', 'https://example.com/fw.bin');
         expect(result?.payload).toHaveProperty('retrieveDate', '2026-01-01T00:00:00Z');
       });
+
+      const signed = {
+        requestId: 42,
+        firmware: {
+          location: 'https://example.com/fw.bin',
+          retrieveDateTime: '2026-01-01T00:00:00Z',
+          signingCertificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----',
+          signature: 'c2lnbmF0dXJl',
+        },
+        retries: 2,
+      };
+
+      it('sends a signed update to an ocpp1.6 station as SignedUpdateFirmware', () => {
+        const result = translateCommand('UpdateFirmware', 'ocpp1.6', signed);
+        expect(result).toEqual({
+          action: 'SignedUpdateFirmware',
+          payload: {
+            requestId: 42,
+            retries: 2,
+            firmware: {
+              location: 'https://example.com/fw.bin',
+              retrieveDateTime: '2026-01-01T00:00:00Z',
+              signingCertificate: signed.firmware.signingCertificate,
+              signature: 'c2lnbmF0dXJl',
+            },
+          },
+        });
+      });
+
+      it('passes the signing certificate and signature to an ocpp2.1 station', () => {
+        const result = translateCommand('UpdateFirmware', 'ocpp2.1', signed);
+        expect(result).toEqual({ action: 'UpdateFirmware', payload: signed });
+      });
+
+      it('keeps plain UpdateFirmware on ocpp1.6 when only one signing field is set', () => {
+        const result = translateCommand('UpdateFirmware', 'ocpp1.6', {
+          requestId: 42,
+          firmware: { ...signed.firmware, signature: undefined },
+        });
+        expect(result?.action).toBe('UpdateFirmware');
+        expect(result?.payload).toHaveProperty('location', 'https://example.com/fw.bin');
+      });
     });
 
     describe('GetLog', () => {
@@ -327,6 +371,59 @@ describe('command-translation', () => {
           getVariableData: [null],
         });
         expect(result?.payload).toEqual({});
+      });
+    });
+
+    describe('1.6 Basic Auth password', () => {
+      it('maps SecurityCtrlr.BasicAuthPassword to a hex AuthorizationKey (OCTT TC_073)', () => {
+        const result = translateCommand('SetVariables', 'ocpp1.6', {
+          setVariableData: [
+            {
+              component: { name: 'SecurityCtrlr' },
+              variable: { name: 'BasicAuthPassword' },
+              attributeValue: 'OCA_OCTT_admin_test',
+            },
+          ],
+        });
+        expect(result).toEqual({
+          action: 'ChangeConfiguration',
+          payload: { key: 'AuthorizationKey', value: '4F43415F4F4354545F61646D696E5F74657374' },
+        });
+      });
+    });
+
+    describe('1.6 configuration keys', () => {
+      it('uses the variable name when the component name is empty (1.6 templates)', () => {
+        const result = translateCommand('SetVariables', 'ocpp1.6', {
+          setVariableData: [
+            {
+              component: { name: '' },
+              variable: { name: 'HeartbeatInterval' },
+              attributeValue: '300',
+            },
+          ],
+        });
+        expect(result?.payload).toEqual({ key: 'HeartbeatInterval', value: '300' });
+      });
+
+      it('uses the variable name, not the 2.1 component, for SecurityProfile', () => {
+        const result = translateCommand('SetVariables', 'ocpp1.6', {
+          setVariableData: [
+            {
+              component: { name: 'SecurityCtrlr' },
+              variable: { name: 'SecurityProfile' },
+              attributeValue: '1',
+            },
+          ],
+        });
+        expect(result?.payload).toEqual({ key: 'SecurityProfile', value: '1' });
+      });
+
+      it('falls back to the component name when the variable name is empty', () => {
+        const result = translateCommand('GetVariables', 'ocpp1.6', {
+          getVariableData: [{ component: { name: 'LegacyKey' }, variable: { name: '' } }],
+        });
+        expect(result?.payload).toEqual({ key: ['LegacyKey'] });
       });
     });
 
@@ -550,6 +647,102 @@ describe('command-translation', () => {
       const response = { status: 'OK' };
       const result = translateResponse('Reset', 'ocpp99.9', response);
       expect(result).toEqual({ status: 'OK' });
+    });
+  });
+
+  describe('1.6 Security Whitepaper certificate commands', () => {
+    const hash = {
+      hashAlgorithm: 'SHA256',
+      issuerNameHash: 'aa',
+      issuerKeyHash: 'bb',
+      serialNumber: '01',
+    };
+
+    it('maps InstallCertificate types to the 1.6 names', () => {
+      expect(
+        translateCommand('InstallCertificate', 'ocpp1.6', {
+          certificateType: 'CSMSRootCertificate',
+          certificate: 'PEM',
+          customData: { vendorId: 'x' },
+        }),
+      ).toEqual({
+        action: 'InstallCertificate',
+        payload: { certificateType: 'CentralSystemRootCertificate', certificate: 'PEM' },
+      });
+      expect(
+        translateCommand('InstallCertificate', 'ocpp1.6', {
+          certificateType: 'ManufacturerRootCertificate',
+          certificate: 'PEM',
+        })?.payload,
+      ).toEqual({ certificateType: 'ManufacturerRootCertificate', certificate: 'PEM' });
+    });
+
+    it('refuses certificate types without a 1.6 equivalent', () => {
+      for (const type of ['V2GRootCertificate', 'MORootCertificate', 'OEMRootCertificate']) {
+        expect(() =>
+          translateCommand('InstallCertificate', 'ocpp1.6', {
+            certificateType: type,
+            certificate: 'PEM',
+          }),
+        ).toThrow('not supported on ocpp1.6 stations');
+      }
+      expect(() =>
+        translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {
+          certificateType: ['V2GCertificateChain'],
+        }),
+      ).toThrow('not supported on ocpp1.6 stations');
+    });
+
+    it('keeps 2.1 certificate payloads unchanged for 2.1 stations', () => {
+      const payload = { certificateType: 'V2GRootCertificate', certificate: 'PEM' };
+      expect(translateCommand('InstallCertificate', 'ocpp2.1', payload)?.payload).toBe(payload);
+    });
+
+    it('requests exactly one certificate type with GetInstalledCertificateIds', () => {
+      expect(
+        translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {
+          certificateType: ['CSMSRootCertificate'],
+        }),
+      ).toEqual({
+        action: 'GetInstalledCertificateIds',
+        payload: { certificateType: 'CentralSystemRootCertificate' },
+      });
+      expect(() => translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {})).toThrow(
+        'exactly one certificate type',
+      );
+      expect(() =>
+        translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {
+          certificateType: ['CSMSRootCertificate', 'ManufacturerRootCertificate'],
+        }),
+      ).toThrow('exactly one certificate type');
+    });
+
+    it('maps the GetInstalledCertificateIds response to a 2.1 hash data chain', () => {
+      const request = { certificateType: ['CSMSRootCertificate'] };
+      expect(
+        translateResponse(
+          'GetInstalledCertificateIds',
+          'ocpp1.6',
+          { status: 'Accepted', certificateHashData: [hash] },
+          request,
+        ),
+      ).toEqual({
+        status: 'Accepted',
+        certificateHashDataChain: [
+          { certificateType: 'CSMSRootCertificate', certificateHashData: hash },
+        ],
+      });
+      expect(
+        translateResponse('GetInstalledCertificateIds', 'ocpp1.6', { status: 'NotFound' }, request),
+      ).toEqual({ status: 'NotFound' });
+    });
+
+    it('sends DeleteCertificate hash data without 2.1-only fields', () => {
+      expect(
+        translateCommand('DeleteCertificate', 'ocpp1.6', {
+          certificateHashData: { ...hash, customData: { vendorId: 'x' } },
+        }),
+      ).toEqual({ action: 'DeleteCertificate', payload: { certificateHashData: hash } });
     });
   });
 });

@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
+COPY packages/payments/package.json packages/payments/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
 COPY packages/ocpi/package.json packages/ocpi/
@@ -26,8 +27,8 @@ RUN VITE_CSMS_AUTO_LOGIN=$VITE_CSMS_AUTO_LOGIN npm run build --workspace=package
 FROM nginx:alpine
 
 COPY --from=build /app/packages/csms/dist /usr/share/nginx/html
-COPY packages/csms/nginx.conf /etc/nginx/conf.d/default.conf
+COPY packages/csms/nginx.dev.conf /etc/nginx/conf.d/default.conf
 COPY packages/csms/docker-runtime-config.sh /docker-entrypoint.d/40-runtime-config.sh
 RUN chmod +x /docker-entrypoint.d/40-runtime-config.sh
 
-EXPOSE 7100
+EXPOSE 8080

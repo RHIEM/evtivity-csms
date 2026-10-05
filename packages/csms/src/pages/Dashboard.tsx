@@ -28,7 +28,7 @@ import { localDateString } from '@/lib/date-range';
 import { useUpdateCheck } from '@/hooks/use-update-check';
 import { useDayDeltaContext, type SnapshotData } from '@/hooks/use-day-delta-context';
 import { useCompanyCurrency } from '@/hooks/use-company-currency';
-import { formatCents } from '@/lib/formatting';
+import { formatCents, formatNumber, formatNumberUpTo } from '@/lib/formatting';
 import { parseValue, formatParsedValue } from '@/lib/animated-value';
 
 interface DashboardStats {
@@ -84,6 +84,10 @@ interface UptimeStats {
 interface FinancialStats {
   totalRevenueCents: number;
   todayRevenueCents: number;
+  totalNetRevenueCents: number;
+  todayNetRevenueCents: number;
+  totalTaxCents: number;
+  todayTaxCents: number;
   avgRevenueCentsPerSession: number;
   totalTransactions: number;
   totalElectricityCostCents: number;
@@ -123,7 +127,8 @@ interface CarbonStats {
 }
 
 function useAnimatedValue(value: string | number): string {
-  const parsed = parseValue(value);
+  const { i18n } = useTranslation();
+  const parsed = parseValue(value, i18n.language);
   const { num } = parsed;
   const [display, setDisplay] = useState(num);
   const prevRef = useRef(num);
@@ -155,7 +160,7 @@ function useAnimatedValue(value: string | number): string {
     };
   }, [num]);
 
-  return formatParsedValue(parsed, display);
+  return formatParsedValue(parsed, display, i18n.language);
 }
 
 function ScrollSnapRow({
@@ -183,7 +188,7 @@ function ScrollSnapRow({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [-ms-overflow-style:none] scrollbar-none [&::-webkit-scrollbar]:hidden"
       >
         {pages.map((page) => (
           <div key={page.id} className="w-full shrink-0 snap-start">
@@ -240,7 +245,7 @@ function StatCard({
     delta != null
       ? isZero
         ? `No change (${deltaLabel ?? ''})`
-        : `${isPositive ? '+' : ''}${String(delta)}% (${deltaLabel ?? ''})`
+        : `${isPositive ? '+' : ''}${formatNumberUpTo(delta, 1)}% (${deltaLabel ?? ''})`
       : null;
 
   return (
@@ -347,7 +352,7 @@ function TrendStatCard({
             }`}
           >
             {delta > 0 ? '+' : ''}
-            {String(delta)}%
+            {formatNumberUpTo(delta, 1)}%
           </div>
         )}
       </CardContent>
@@ -364,9 +369,9 @@ function NoDataOverlay({
 }): React.JSX.Element {
   return (
     <div className="relative">
-      <div className="pointer-events-none select-none blur-sm opacity-50">{children}</div>
+      <div className="pointer-events-none select-none blur-xs opacity-50">{children}</div>
       <div className="absolute inset-0 flex items-center justify-center">
-        <div className="rounded-lg bg-card border border-border px-6 py-3 shadow-sm text-sm text-muted-foreground">
+        <div className="rounded-lg bg-card border border-border px-6 py-3 shadow-xs text-sm text-muted-foreground">
           {message}
         </div>
       </div>
@@ -588,7 +593,7 @@ function AdminDashboard({
     currency != null ? formatCents(cents, currency) : MONEY_PLACEHOLDER;
 
   const formatCo2 = (kg: number): string =>
-    kg >= 1000 ? `${(kg / 1000).toFixed(1)}\u00a0t` : `${kg.toFixed(1)}\u00a0kg`;
+    kg >= 1000 ? `${formatNumber(kg / 1000, 1)}\u00a0t` : `${formatNumber(kg, 1)}\u00a0kg`;
 
   function dateControl(range: ReturnType<typeof useDateRange>): React.JSX.Element {
     return (
@@ -604,8 +609,8 @@ function AdminDashboard({
 
   const formatEnergy = (wh: number): string =>
     wh >= 100_000_000
-      ? `${(wh / 1_000_000).toFixed(1)}\u00a0MWh`
-      : `${(wh / 1000).toFixed(1)}\u00a0kWh`;
+      ? `${formatNumber(wh / 1_000_000, 1)}\u00a0MWh`
+      : `${formatNumber(wh / 1000, 1)}\u00a0kWh`;
 
   function renderLiveStatCards(): React.JSX.Element {
     const revenueGrid = (
@@ -637,6 +642,31 @@ function AdminDashboard({
           info={t('dashboard.info.totalTransactions')}
           dayDelta={dayDelta(yd?.totalTransactions, db?.totalTransactions)}
           deltaLabel={deltaLabel}
+        />
+      </div>
+    );
+
+    const taxGrid = (
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          title={t('dashboard.netRevenue')}
+          value={formatMoney(financialStats.data?.totalNetRevenueCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.netRevenue')}
+        />
+        <StatCard
+          title={t('dashboard.todayNetRevenue')}
+          value={formatMoney(financialStats.data?.todayNetRevenueCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.todayNetRevenue')}
+        />
+        <StatCard
+          title={t('dashboard.taxCollected')}
+          value={formatMoney(financialStats.data?.totalTaxCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.taxCollected')}
+        />
+        <StatCard
+          title={t('dashboard.todayTaxCollected')}
+          value={formatMoney(financialStats.data?.todayTaxCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.todayTaxCollected')}
         />
       </div>
     );
@@ -678,14 +708,14 @@ function AdminDashboard({
           />
           <StatCard
             title={t('dashboard.online')}
-            value={`${String(stats.onlinePercent)}%`}
+            value={`${formatNumberUpTo(stats.onlinePercent, 1)}%`}
             info={t('dashboard.info.online')}
             dayDelta={dayDelta(yd?.onlinePercent, db?.onlinePercent)}
             deltaLabel={deltaLabel}
           />
           <StatCard
             title={t('dashboard.uptime')}
-            value={`${String(uptimeQuery.data?.uptimePercent ?? 100)}%`}
+            value={`${formatNumberUpTo(uptimeQuery.data?.uptimePercent ?? 100, 2)}%`}
             info={t('dashboard.info.uptime')}
             dayDelta={dayDelta(yd?.uptimePercent, db?.uptimePercent)}
             deltaLabel={deltaLabel}
@@ -744,7 +774,7 @@ function AdminDashboard({
           />
           <StatCard
             title={t('dashboard.pingLatency')}
-            value={`${String(ocppHealth.data?.avgPingLatencyMs ?? 0)}\u00a0ms`}
+            value={`${formatNumberUpTo(ocppHealth.data?.avgPingLatencyMs ?? 0, 2)}\u00a0ms`}
             info={t('dashboard.info.pingLatency')}
             positiveIsGood={false}
             dayDelta={dayDelta(yd?.avgPingLatencyMs, db?.avgPingLatencyMs)}
@@ -752,7 +782,7 @@ function AdminDashboard({
           />
           <StatCard
             title={t('dashboard.pingSuccessRate')}
-            value={`${String(ocppHealth.data?.pingSuccessRate ?? 100)}%`}
+            value={`${formatNumberUpTo(ocppHealth.data?.pingSuccessRate ?? 100, 1)}%`}
             info={t('dashboard.info.pingSuccessRate')}
             dayDelta={dayDelta(yd?.pingSuccessRate, db?.pingSuccessRate)}
             deltaLabel={deltaLabel}
@@ -769,6 +799,7 @@ function AdminDashboard({
         <ScrollSnapRow
           pages={[
             { id: 'revenue', content: revenueGrid },
+            { id: 'tax', content: taxGrid },
             { id: 'cost', content: costGrid },
           ]}
         />
@@ -802,12 +833,12 @@ function AdminDashboard({
           />
           <StatCard
             title={t('dashboard.online')}
-            value={`${String(Math.round(s.onlinePercent * 10) / 10)}%`}
+            value={`${formatNumberUpTo(s.onlinePercent, 1)}%`}
             info={t('dashboard.historicalInfo.online', d)}
           />
           <StatCard
             title={t('dashboard.uptime')}
-            value={`${String(s.uptimePercent)}%`}
+            value={`${formatNumberUpTo(s.uptimePercent, 2)}%`}
             info={t('dashboard.historicalInfo.uptime', d)}
           />
           <StatCard
@@ -895,13 +926,13 @@ function AdminDashboard({
         />
         <TrendStatCard
           title={t('dashboard.online')}
-          value={`${String(Math.round(avg('onlinePercent') * 10) / 10)}%`}
+          value={`${formatNumberUpTo(avg('onlinePercent'), 1)}%`}
           data={pluck('onlinePercent')}
           info={t('dashboard.trendInfo.online', tr)}
         />
         <TrendStatCard
           title={t('dashboard.uptime')}
-          value={`${String(Math.round(avg('uptimePercent') * 10) / 10)}%`}
+          value={`${formatNumberUpTo(avg('uptimePercent'), 1)}%`}
           data={pluck('uptimePercent')}
           info={t('dashboard.trendInfo.uptime', tr)}
         />

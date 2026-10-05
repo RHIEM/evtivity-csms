@@ -4,24 +4,25 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and, ne, count, sql, desc } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import {
+  db,
+  client,
+  getPricingHolidays,
+  loadStationPricing,
+  pickTariff,
+  resolveGroupTariffs,
+} from '@evtivity/database';
 import {
   pricingGroups,
   tariffs,
-  pricingHolidays,
   pricingGroupAuditLog,
   tariffAuditLog,
   chargingSessions,
   sessionTariffSegments,
   writeAudit,
 } from '@evtivity/database';
-import {
-  tariffRestrictionsSchema,
-  derivePriority,
-  validateNoOverlap,
-  resolveActiveTariff,
-} from '@evtivity/lib';
-import type { TariffRestrictions, TariffWithRestrictions } from '@evtivity/lib';
+import { tariffRestrictionsSchema, derivePriority, validateNoOverlap } from '@evtivity/lib';
+import type { TariffRestrictions } from '@evtivity/lib';
 import { zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import {
@@ -32,7 +33,6 @@ import {
 } from '../lib/response-schemas.js';
 import { paginationQuery } from '../lib/pagination.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { resolveTariffGroup } from '../services/tariff.service.js';
 import { authorize } from '../middleware/rbac.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { getAuditActor } from '../lib/audit-actor.js';
@@ -170,8 +170,13 @@ const stationParams = z.object({
   id: ID_PARAMS.stationId.describe('Station ID'),
 });
 
-const nonNegativePrice = z.string().refine((val) => !isNaN(Number(val)) && Number(val) >= 0, {
-  message: 'Price must be a non-negative number',
+// Bounds are expressed as regex patterns rather than .refine(): zod-to-json-schema
+// strips refines when converting to the JSON Schema Fastify actually validates,
+// so a refine here would let "0,49" through to Postgres and surface as a 500.
+// The API accepts "." as the only decimal separator; locale formats are
+// handled by the frontend.
+const nonNegativePrice = z.string().regex(/^(\d+(\.\d*)?|\.\d+)$/, {
+  message: 'Price must be a non-negative decimal number using "." as decimal separator',
 });
 
 // Tax rate is a decimal fraction (0.0825 = 8.25%), NOT a percent. A value > 1
@@ -179,11 +184,9 @@ const nonNegativePrice = z.string().refine((val) => !isNaN(Number(val)) && Numbe
 // calculator multiplies subtotal by this number verbatim, so 8.25 would bill
 // 825% tax. Cap at 1.0 (100%) which is already higher than any real tax
 // jurisdiction and well below the "obvious data-entry error" threshold.
-const taxRate = z
-  .string()
-  .refine((val) => !isNaN(Number(val)) && Number(val) >= 0 && Number(val) <= 1, {
-    message: 'Tax rate must be a decimal between 0 and 1 (e.g. 0.0825 for 8.25%)',
-  });
+const taxRate = z.string().regex(/^(0*\.\d+|0+(\.\d*)?|0*1(\.0*)?)$/, {
+  message: 'Tax rate must be a decimal between 0 and 1 (e.g. 0.0825 for 8.25%)',
+});
 
 const createGroupBody = z.object({
   name: z.string().max(255),
@@ -243,11 +246,6 @@ const updateTariffBody = z.object({
     .describe('Tariff restrictions; null to clear'),
   isDefault: z.boolean().optional().describe('Whether this is the default tariff for the group'),
 });
-
-async function loadHolidays(): Promise<Date[]> {
-  const rows = await db.select({ date: pricingHolidays.date }).from(pricingHolidays);
-  return rows.map((r) => new Date(r.date));
-}
 
 export function pricingRoutes(app: FastifyInstance): void {
   // Pricing Groups CRUD
@@ -941,28 +939,12 @@ export function pricingRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const activeTariffs = await db
-        .select()
-        .from(tariffs)
-        .where(and(eq(tariffs.pricingGroupId, id), eq(tariffs.isActive, true)));
-
-      const holidays = await loadHolidays();
-      const now = new Date();
-
-      const tariffInputs: TariffWithRestrictions[] = activeTariffs.map((t) => ({
-        id: t.id,
-        pricePerKwh: t.pricePerKwh,
-        pricePerMinute: t.pricePerMinute,
-        pricePerSession: t.pricePerSession,
-        idleFeePricePerMinute: t.idleFeePricePerMinute,
-        reservationFeePerMinute: t.reservationFeePerMinute,
-        taxRate: t.taxRate,
-        restrictions: t.restrictions as TariffRestrictions | null,
-        priority: t.priority,
-        isDefault: t.isDefault,
-      }));
-
-      const currentTariff = resolveActiveTariff(tariffInputs, now, holidays, 0);
+      // Evaluated in the server's local time: a group has no site of its own.
+      const { tariffs: activeTariffs, current: currentTariff } = await resolveGroupTariffs(
+        id,
+        { at: new Date() },
+        client,
+      );
 
       const schedule = activeTariffs
         .map((t) => ({
@@ -997,59 +979,37 @@ export function pricingRoutes(app: FastifyInstance): void {
         params: zodSchema(stationParams),
         response: {
           200: itemResponse(activeTariffItem),
-          404: errorWith('No tariffs', [ERROR_CODES.NO_TARIFFS]),
+          404: errorWith('No pricing for the station', [
+            ERROR_CODES.NO_PRICING_GROUP,
+            ERROR_CODES.NO_TARIFFS,
+            ERROR_CODES.NO_MATCHING_TARIFF,
+          ]),
         },
       },
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof stationParams>;
 
-      const result = await resolveTariffGroup(id);
-      if (result == null) {
+      // The station's pricing group, its active tariffs and the site timezone
+      // (off-peak and holiday boundaries fire at the operator's local clock).
+      const pricing = await loadStationPricing({ stationUuid: id, driverUuid: null }, client);
+      if (pricing == null) {
         await reply
           .status(404)
           .send({ error: 'No pricing group found for station', code: 'NO_PRICING_GROUP' });
         return;
       }
 
-      const activeTariffs = await db
-        .select()
-        .from(tariffs)
-        .where(and(eq(tariffs.pricingGroupId, result.groupId), eq(tariffs.isActive, true)));
-
-      if (activeTariffs.length === 0) {
+      if (pricing.tariffs.length === 0) {
         await reply.status(404).send({ error: 'No active tariffs found', code: 'NO_TARIFFS' });
         return;
       }
 
-      const holidays = await loadHolidays();
-      const now = new Date();
-
-      // Use the station's site timezone so off-peak / holiday boundaries fire
-      // at the operator's local clock.
-      const tzRows = await db.execute<{ timezone: string | null }>(sql`
-        SELECT s.timezone
-        FROM charging_stations cs
-        LEFT JOIN sites s ON s.id = cs.site_id
-        WHERE cs.id = ${id}
-        LIMIT 1
-      `);
-      const timezone = tzRows[0]?.timezone ?? undefined;
-
-      const tariffInputs: TariffWithRestrictions[] = activeTariffs.map((t) => ({
-        id: t.id,
-        pricePerKwh: t.pricePerKwh,
-        pricePerMinute: t.pricePerMinute,
-        pricePerSession: t.pricePerSession,
-        idleFeePricePerMinute: t.idleFeePricePerMinute,
-        reservationFeePerMinute: t.reservationFeePerMinute,
-        taxRate: t.taxRate,
-        restrictions: t.restrictions as TariffRestrictions | null,
-        priority: t.priority,
-        isDefault: t.isDefault,
-      }));
-
-      const current = resolveActiveTariff(tariffInputs, now, holidays, 0, timezone);
+      const current = pickTariff(
+        pricing.tariffs,
+        { at: new Date(), timezone: pricing.timezone },
+        await getPricingHolidays(client),
+      );
       if (current == null) {
         await reply
           .status(404)
@@ -1057,13 +1017,12 @@ export function pricingRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const match = activeTariffs.find((t) => t.id === current.id);
-
+      const { name, ...tariff } = current;
       return {
-        ...current,
-        name: match?.name ?? '',
-        pricingGroupId: result.groupId,
-        pricingGroupName: result.groupName,
+        ...tariff,
+        name,
+        pricingGroupId: pricing.group.id,
+        pricingGroupName: pricing.group.name,
       };
     },
   );

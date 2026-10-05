@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import type { EventBus, DomainEvent, PubSubClient } from '@evtivity/lib';
 
 // SQL mock: records every tagged-template call (strings + interpolated values)
@@ -32,6 +32,10 @@ function createSqlMock() {
     return Promise.resolve(resultWithCount);
   };
   (sqlFn as unknown as { json: (v: unknown) => unknown }).json = (v) => v;
+  (sqlFn as unknown as { unsafe: (text: string) => string }).unsafe = (text) => text;
+  // Transactions run on the same mock, so their statements are recorded in order.
+  (sqlFn as unknown as { begin: (fn: (tx: unknown) => unknown) => unknown }).begin = (fn) =>
+    fn(sqlFn);
   return sqlFn as unknown;
 }
 
@@ -50,6 +54,24 @@ vi.mock('postgres', () => {
 });
 
 const mockIsRoamingEnabled = vi.fn().mockResolvedValue(false);
+
+// The payment service (@evtivity/payments): the gate's hold, the settlement on
+// Ended, and the NotifySettlement record. The mode classification stays real.
+const mockAuthorizeSessionHold = vi.fn();
+const mockSettleSessionPayment = vi.fn();
+const mockRecordTerminalSettlement = vi.fn();
+vi.mock('@evtivity/payments', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  authorizeSessionHold: (...args: unknown[]) => mockAuthorizeSessionHold(...args) as unknown,
+  settleSessionPayment: (...args: unknown[]) => mockSettleSessionPayment(...args) as unknown,
+  recordTerminalSettlement: (...args: unknown[]) =>
+    mockRecordTerminalSettlement(...args) as unknown,
+}));
+const mockPaymentContext = { registry: {}, logger: {} };
+vi.mock('../lib/payments.js', () => ({
+  paymentRegistry: {},
+  paymentContext: () => mockPaymentContext,
+}));
 const mockIsAutoDisableOnCritical = vi.fn().mockResolvedValue(false);
 const mockWriteAudit = vi.fn().mockResolvedValue(undefined);
 const mockWriteReservationAudit = vi.fn().mockResolvedValue(undefined);
@@ -61,7 +83,46 @@ const mockGetTxEndedMeasurands = vi.fn().mockResolvedValue('');
 const mockIsSiteFreeVend = vi.fn().mockResolvedValue(false);
 const mockIsSplitBilling = vi.fn().mockResolvedValue(false);
 
-vi.mock('@evtivity/database', () => ({
+// The one cost assembly (@evtivity/database session-pricing), mocked per test.
+// By default every priced session costs 15.00 (net 15.00, no tax).
+function costBreakdown(grossCents: number, taxRate = 0, taxCents = 0) {
+  const netCents = grossCents - taxCents;
+  return {
+    basis: 'net' as const,
+    netCents,
+    taxCents,
+    grossCents,
+    taxLines: grossCents === 0 ? [] : [{ taxRate, netCents, taxCents }],
+    components: null,
+  };
+}
+const mockPriceSessionAt = vi.fn().mockResolvedValue(costBreakdown(1500));
+const mockStoreRunningCost = vi.fn().mockResolvedValue(true);
+// session-pricing's own settings readers, so the real module loads without a database.
+vi.mock('../../../database/src/lib/idling-setting.js', () => ({
+  getIdlingGracePeriodMinutes: vi.fn().mockResolvedValue(0),
+}));
+vi.mock('../../../database/src/lib/pricing-settings.js', () => ({
+  isSplitBillingEnabled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  // The real status entry point, running on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/station-status.js',
+  )),
+  // The real session pricing writes (tariff snapshot, segments, final cost),
+  // running on the mocked client. The cost itself comes from mockPriceSessionAt.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/session-pricing.js',
+  )),
+  // The real tariff resolver, running on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/tariff-resolution.js',
+  )),
+  getCompanyTaxBasis: vi.fn().mockResolvedValue('net'),
+  priceSessionAt: (...args: unknown[]) => mockPriceSessionAt(...args) as unknown,
+  storeRunningCost: (...args: unknown[]) => mockStoreRunningCost(...args) as unknown,
   client: createSqlMock(),
   isRoamingEnabled: mockIsRoamingEnabled,
   getIdlingGracePeriodMinutes: vi.fn().mockResolvedValue(0),
@@ -80,6 +141,7 @@ vi.mock('@evtivity/database', () => ({
   isAutoDisableOnCriticalEnabled: mockIsAutoDisableOnCritical,
   isSiteFreeVendEnabledByStation: mockIsSiteFreeVend,
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
+  getCompanyPriceDisplay: vi.fn().mockResolvedValue('net'),
 }));
 
 const mockDispatchOcpp = vi.fn().mockResolvedValue(undefined);
@@ -98,7 +160,6 @@ const mockLoggerError = vi.fn();
 const mockLoggerDebug = vi.fn();
 
 const mockDecryptString = vi.fn().mockReturnValue('sk_test_decrypted');
-const mockShouldSimulateFailure = vi.fn().mockReturnValue(false);
 
 vi.mock('@evtivity/lib', async () => {
   const actual = await vi.importActual<typeof import('@evtivity/lib')>('@evtivity/lib');
@@ -111,7 +172,6 @@ vi.mock('@evtivity/lib', async () => {
   return {
     ...actual,
     decryptString: mockDecryptString,
-    shouldSimulatePaymentFailure: mockShouldSimulateFailure,
     createLogger: () => ({
       info: vi.fn(),
       warn: mockLoggerWarn,
@@ -121,26 +181,6 @@ vi.mock('@evtivity/lib', async () => {
     }),
   };
 });
-
-const mockStripeCreate = vi.fn().mockResolvedValue({ id: 'pi_topup' });
-const mockStripeCapture = vi.fn().mockResolvedValue({});
-const mockStripeCancel = vi.fn().mockResolvedValue({});
-const mockStripeRetrieve = vi.fn().mockResolvedValue({
-  customer: 'cus_x',
-  payment_method: 'pm_x',
-  on_behalf_of: null,
-});
-
-vi.mock('stripe', () => ({
-  default: class MockStripe {
-    paymentIntents = {
-      create: mockStripeCreate,
-      capture: mockStripeCapture,
-      cancel: mockStripeCancel,
-      retrieve: mockStripeRetrieve,
-    };
-  },
-}));
 
 const mockHandleCsrSigned = vi.fn().mockResolvedValue(undefined);
 const mockHandleInstallCertificateResult = vi.fn().mockResolvedValue(undefined);
@@ -235,16 +275,14 @@ describe('Event projections - coverage round 2', () => {
     mockGetTxEndedMeasurands.mockResolvedValue('');
     mockIsSiteFreeVend.mockResolvedValue(false);
     mockIsSplitBilling.mockResolvedValue(false);
-    mockShouldSimulateFailure.mockReturnValue(false);
     mockDecryptString.mockReturnValue('sk_test_decrypted');
-    mockStripeCreate.mockResolvedValue({ id: 'pi_topup' });
-    mockStripeCapture.mockResolvedValue({});
-    mockStripeCancel.mockResolvedValue({});
-    mockStripeRetrieve.mockResolvedValue({
-      customer: 'cus_x',
-      payment_method: 'pm_x',
-      on_behalf_of: null,
+    mockAuthorizeSessionHold.mockResolvedValue({
+      outcome: 'authorized',
+      paymentRecordId: 1,
+      paymentId: 'pi_test',
     });
+    mockSettleSessionPayment.mockResolvedValue({ mode: 'none' });
+    mockRecordTerminalSettlement.mockResolvedValue(true);
     process.env['SETTINGS_ENCRYPTION_KEY'] = 'test-encryption-key-32chars!!!!!';
 
     mockPubSub = {
@@ -339,9 +377,7 @@ describe('Event projections - coverage round 2', () => {
       ['ocpp.NotifyEVChargingSchedule', {}],
       ['ocpp.BatterySwap', {}],
       ['ocpp.NotifyPeriodicEventStream', {}],
-      ['ocpp.NotifyQRCodeScanned', {}],
       ['ocpp.VatNumberValidation', {}],
-      ['ocpp.NotifyWebPaymentStarted', {}],
       ['ocpp.NotifyAllowedEnergyTransfer', {}],
       ['ocpp.NotifyDERAlarm', {}],
       ['ocpp.NotifyDERStartStop', {}],
@@ -372,7 +408,7 @@ describe('Event projections - coverage round 2', () => {
       expect(sqlCalls.length).toBe(1);
     });
 
-    it('accepted station: sets availability=available and pushes 2.1 SetVariables config', async () => {
+    it('accepted station: leaves availability alone and pushes 2.1 SetVariables config', async () => {
       mockGetMeterValueInterval.mockResolvedValue(60);
       mockGetClockAlignedInterval.mockResolvedValue(900);
       mockGetSampledMeasurands.mockResolvedValue('Energy.Active.Import.Register,Temperature');
@@ -383,6 +419,9 @@ describe('Event projections - coverage round 2', () => {
         STA, // resolveStationUuid
         [{ onboarding_status: 'accepted' }], // SELECT onboarding_status
         [], // UPDATE charging_stations (accepted)
+        [], // UPDATE firmware_state (a reboot ends an install)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute (unchanged)
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp2.1' }], // SELECT protocol (config push)
         [{ ocpp_protocol: 'ocpp2.1' }], // SELECT protocol (station message refresh)
@@ -392,7 +431,12 @@ describe('Event projections - coverage round 2', () => {
         model: 'M',
         vendorName: 'Acme',
       });
-      expect(findSql(/availability = 'available'/)).toBeDefined();
+      // Boot never sets availability directly: it only recomputes it from its
+      // inputs, so a disable or fault survives a reboot.
+      expect(findSql(/availability = 'available'/)).toBeUndefined();
+      expect(findSql(/SET availability = .*IS DISTINCT FROM/s)).toBeDefined();
+      // A reboot ends an install, so only an 'installing' state is cleared.
+      expect(findSql(/SET firmware_state = NULL.*firmware_state = 'installing'/s)).toBeDefined();
       const cmds = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
         (c) => c[0] === 'ocpp_commands',
       );
@@ -435,6 +479,9 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ onboarding_status: 'accepted' }],
         [],
+        [], // UPDATE firmware_state (a reboot ends an install)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute
         [{ site_id: null }],
         [{ ocpp_protocol: 'ocpp1.6' }], // config push
         [{ ocpp_protocol: 'ocpp1.6' }], // station message check
@@ -454,6 +501,9 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ onboarding_status: 'accepted' }],
         [],
+        [], // UPDATE firmware_state (a reboot ends an install)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute
         [{ site_id: null }],
         [{ ocpp_protocol: 'ocpp2.1' }],
         [{ ocpp_protocol: 'ocpp2.1' }],
@@ -472,6 +522,9 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ onboarding_status: 'accepted' }],
         [],
+        [], // UPDATE firmware_state (a reboot ends an install)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute
         [{ site_id: null }],
         [{ ocpp_protocol: 'ocpp1.6' }],
         [{ ocpp_protocol: 'ocpp1.6' }],
@@ -490,6 +543,9 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ onboarding_status: 'accepted' }],
         [],
+        [], // UPDATE firmware_state (a reboot ends an install)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute
         [{ site_id: null }],
         [{ ocpp_protocol: 'ocpp2.1' }], // station message refresh check
       );
@@ -606,6 +662,36 @@ describe('Event projections - coverage round 2', () => {
       });
       const ins = findSql(/INSERT INTO station_configurations/);
       expect(ins?.values).toContain(null);
+    });
+
+    it('keeps variable instances apart (ItemsPerMessage[GetReport] vs [GetVariables])', async () => {
+      await setup();
+      setupSqlResults(STA, [], []);
+      await emit('ocpp.NotifyReport', 'CS-1', {
+        reportData: [
+          {
+            component: { name: 'DeviceDataCtrlr' },
+            variable: { name: 'ItemsPerMessage', instance: 'GetReport' },
+            variableAttribute: [{ type: 'Actual', value: '10' }],
+          },
+          {
+            component: { name: 'DeviceDataCtrlr' },
+            variable: { name: 'ItemsPerMessage', instance: 'GetVariables' },
+            variableAttribute: [{ type: 'Actual', value: '4' }],
+          },
+        ],
+      });
+      const inserts = sqlCalls.filter((c) =>
+        /INSERT INTO station_configurations/.test(c.strings.join(' ')),
+      );
+      expect(inserts).toHaveLength(2);
+      for (const ins of inserts) {
+        const text = ins.strings.join(' ');
+        expect(text).toContain("(COALESCE(instance, ''))");
+        expect(text).toContain("(COALESCE(variable_instance, ''))");
+      }
+      expect(inserts[0]?.values).toEqual(expect.arrayContaining(['GetReport', '10']));
+      expect(inserts[1]?.values).toEqual(expect.arrayContaining(['GetVariables', '4']));
     });
   });
 
@@ -747,8 +833,9 @@ describe('Event projections - coverage round 2', () => {
           ],
         },
       });
-      const ins = findSql(/INSERT INTO station_configurations .* 'GetVariables'/s);
+      const ins = findSql(/INSERT INTO station_configurations/);
       expect(ins).toBeDefined();
+      expect(ins?.values).toContain('GetVariables');
       expect(ins?.values).toContain('5');
     });
   });
@@ -774,8 +861,9 @@ describe('Event projections - coverage round 2', () => {
           ],
         },
       });
-      const ins = findSql(/INSERT INTO station_configurations .* 'GetConfiguration'/s);
+      const ins = findSql(/INSERT INTO station_configurations/);
       expect(ins).toBeDefined();
+      expect(ins?.values).toContain('GetConfiguration');
       expect(ins?.values).toContain('HeartbeatInterval');
       expect(ins?.values).toContain('300');
     });
@@ -989,14 +1077,6 @@ describe('Event projections - coverage round 2', () => {
       const ins = findSql(/INSERT INTO periodic_event_streams/);
       expect(ins?.values).toContain(7);
     });
-
-    it('NotifyQRCodeScanned inserts a row', async () => {
-      await setup();
-      setupSqlResults(STA, []);
-      await emit('ocpp.NotifyQRCodeScanned', 'CS-1', { evseId: 2, timeout: 30 });
-      const ins = findSql(/INSERT INTO qr_scan_events/);
-      expect(ins?.values).toEqual(['sta_0001', 2, 30]);
-    });
   });
 
   // ---- ocpp.StatusNotification ----
@@ -1047,6 +1127,8 @@ describe('Event projections - coverage round 2', () => {
         [{ id: 'evs_new' }], // INSERT evses
         [], // INSERT connectors
         [], // INSERT port_status_log
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute (unchanged)
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp2.1' }], // GetBaseReport branch
         [{ ocpp_protocol: 'ocpp2.1' }], // station_message_refresh branch
@@ -1125,6 +1207,7 @@ describe('Event projections - coverage round 2', () => {
         [{ id: 'evs_1' }],
         [{ status: 'occupied' }],
         [], // UPDATE connectors
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: 'site-9' }], // resolveSiteId
       );
@@ -1147,6 +1230,7 @@ describe('Event projections - coverage round 2', () => {
         [{ status: 'charging' }],
         [], // INSERT port_status_log (charging -> suspended_ev)
         [], // UPDATE connectors
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
         [], // UPDATE charging_sessions set idle_started_at
@@ -1216,7 +1300,7 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA, // resolveStationUuid
-        [], // resolveActiveSessionId by transactionId -> none
+        [], // resolveMeterValueSession by transactionId -> none
         [], // allowCompleted -> none
         [], // by station active -> none
       );
@@ -1248,7 +1332,7 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA, // 0 resolveStationUuid
-        [{ id: 'ses_1' }], // 1 resolveActiveSessionId by transactionId
+        [{ id: 'ses_1' }], // 1 resolveMeterValueSession by transactionId
         [], // 2 INSERT meter_values (count 1, success)
         [{ energy_delivered_wh: 100, meter_start: '50' }], // 3 prev energy/meter_start
         [], // 4 UPDATE meter_start (no-op, already set)
@@ -1276,9 +1360,9 @@ describe('Event projections - coverage round 2', () => {
             ocpp_protocol: 'ocpp2.1',
           },
         ], // 7 active sessions
-        [], // 8 UPDATE current_cost_cents
-        [{ site_id: null }], // 9 resolveSiteId
+        [{ site_id: null }], // 8 resolveSiteId
       );
+      mockPriceSessionAt.mockResolvedValueOnce(costBreakdown(24));
       await emit('ocpp.MeterValues', 'CS-1', {
         stationId: 'CS-1',
         evseId: 0,
@@ -1292,11 +1376,123 @@ describe('Event projections - coverage round 2', () => {
         ],
       });
       expect(findSql(/INSERT INTO meter_values/)).toBeDefined();
-      expect(findSql(/SET current_cost_cents/)).toBeDefined();
+      expect(mockStoreRunningCost).toHaveBeenCalledWith(
+        expect.anything(),
+        'ses_1',
+        expect.objectContaining({ grossCents: 24 }),
+      );
       const cost = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
         (c) => c[0] === 'ocpp_commands' && (c[1] as string).includes('CostUpdated'),
       );
       expect(cost.length).toBe(1);
+    });
+
+    describe('prepaid credit on OCPP 1.6', () => {
+      const costSession = (ocppProtocol: string, prepaidBalanceCents: number | null) => ({
+        id: 'ses_1',
+        transaction_id: '1001',
+        tariff_id: 'trf_1',
+        driver_id: 'drv_1',
+        started_at: new Date(Date.now() - 3_600_000).toISOString(),
+        energy_delivered_wh: 950,
+        current_cost_cents: 0,
+        currency: 'USD',
+        tariff_price_per_kwh: '0.25',
+        tariff_price_per_minute: '0',
+        tariff_price_per_session: '0',
+        tariff_idle_fee_price_per_minute: '0',
+        tariff_tax_rate: '0',
+        idle_started_at: null,
+        idle_minutes: 0,
+        ocpp_protocol: ocppProtocol,
+        prepaid_balance_cents: prepaidBalanceCents,
+      });
+      // 950 Wh at 0.25/kWh costs 24 cents (the cost assembly is mocked to that).
+      beforeEach(() => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(24));
+      });
+      afterEach(() => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(1500));
+      });
+      const results = (session: Record<string, unknown>, claim: unknown[]) => [
+        STA, // resolveStationUuid
+        [{ id: 'ses_1' }], // resolveMeterValueSession
+        [], // INSERT meter_values
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [], // UPDATE meter_start
+        [], // UPDATE energy_delivered_wh
+        [], // UPDATE idle accrue
+        [session], // active sessions
+        claim, // claim the prepaid stop (only when the credit is used up)
+        [{ site_id: null }], // resolveSiteId
+      ];
+      const emitReading = () =>
+        emit('ocpp.MeterValues', 'CS-1', {
+          stationId: 'CS-1',
+          evseId: 0,
+          transactionId: '1001',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2026-01-01T01:00:00Z',
+              sampledValue: [{ measurand: 'Energy.Active.Import.Register', value: 1000 }],
+            },
+          ],
+        });
+      const stopCommands = () =>
+        (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c) => c[0] === 'ocpp_commands' && (c[1] as string).includes('RequestStopTransaction'),
+        );
+
+      it('records the stop and sends RequestStopTransaction when the cost reaches the credit', async () => {
+        await setup();
+        setupSqlResults(...results(costSession('ocpp1.6', 20), [{ id: 'ses_1' }]));
+
+        await emitReading();
+
+        const claim = findSql(/stopped_reason IS NULL/);
+        expect(claim).toBeDefined();
+        expect(claim?.values).toContain('PrepaidCreditExhausted');
+        const stops = stopCommands();
+        expect(stops).toHaveLength(1);
+        expect(JSON.parse(stops[0]?.[1] as string)).toMatchObject({
+          stationId: 'CS-1',
+          action: 'RequestStopTransaction',
+          payload: { transactionId: '1001' },
+        });
+        // The session is not faulted: the StopTransaction settles the balance.
+        expect(findSql(/SET status = 'faulted'/)).toBeUndefined();
+      });
+
+      it('sends the stop only once (the session was already claimed)', async () => {
+        await setup();
+        setupSqlResults(...results(costSession('ocpp1.6', 20), []));
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeDefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('keeps charging while the cost is below the credit', async () => {
+        await setup();
+        setupSqlResults(...results(costSession('ocpp1.6', 5000), []));
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('leaves an OCPP 2.1 prepaid transaction to the station transactionLimit', async () => {
+        await setup();
+        setupSqlResults(...results(costSession('ocpp2.1', 20), []));
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
     });
 
     it('flat energy reading marks session idle (Power not changing)', async () => {
@@ -1385,35 +1581,70 @@ describe('Event projections - coverage round 2', () => {
   // ---- ocpp.FirmwareStatusNotification ----
 
   describe('ocpp.FirmwareStatusNotification', () => {
-    it('marks station available on Installed and upserts firmware (2.1 path), no campaign', async () => {
+    it('clears the firmware state on Installed and upserts firmware (2.1 path), no campaign', async () => {
       await setup();
-      setupSqlResults(STA, [], [{ campaign_id: null }]);
+      // firmware_state UPDATE, availability recompute (unchanged), firmware upsert
+      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', { status: 'Installed', requestId: 5 });
-      const avail = findSql(/UPDATE charging_stations\s+SET availability = 'available'/);
-      expect(avail).toBeDefined();
+      expect(findSql(/SET firmware_state = /)?.values[0]).toBeNull();
+      expect(findSql(/SET availability = /)).toBeDefined();
       expect(findSql(/INSERT INTO firmware_updates .* ON CONFLICT/s)).toBeDefined();
       // No campaign linked -> no campaign station update
       expect(findSql(/UPDATE firmware_campaign_stations/)).toBeUndefined();
     });
 
-    it('marks station faulted on InstallationFailed', async () => {
+    it('records a failed install on InstallationFailed', async () => {
       await setup();
-      setupSqlResults(STA, [], [{ campaign_id: null }]);
+      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
         status: 'InstallationFailed',
         requestId: 6,
       });
-      expect(findSql(/SET availability = 'faulted'/)).toBeDefined();
+      expect(findSql(/SET firmware_state = /)?.values[0]).toBe('failed');
     });
 
-    it('marks station unavailable on Installing', async () => {
+    it('records an install in progress on Installing', async () => {
       await setup();
-      setupSqlResults(STA, [], [{ campaign_id: null }]);
+      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
         status: 'Installing',
         requestId: 7,
       });
-      expect(findSql(/SET availability = 'unavailable'/)).toBeDefined();
+      expect(findSql(/SET firmware_state = /)?.values[0]).toBe('installing');
+    });
+
+    it.each(['Idle', 'DownloadFailed'])(
+      'ends an install in progress on %s but keeps a failed install',
+      async (status) => {
+        await setup();
+        setupSqlResults(
+          STA,
+          [],
+          [],
+          [{ id: 'sta_1' }],
+          [{ site_id: null }],
+          [{ campaign_id: null }],
+        );
+        await emit('ocpp.FirmwareStatusNotification', 'CS-1', { status, requestId: 11 });
+        const clear = findSql(/SET firmware_state = NULL/);
+        expect(clear?.strings.join(' ')).toContain("firmware_state = 'installing'");
+        expect(findSql(/SET firmware_state = 'failed'/)).toBeUndefined();
+        const published = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.map(
+          (c) => c[1] as string,
+        );
+        expect(published.some((p) => p.includes('station.status'))).toBe(true);
+      },
+    );
+
+    it('leaves the firmware state alone for a download in progress', async () => {
+      await setup();
+      setupSqlResults(STA, [{ campaign_id: null }]);
+      await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
+        status: 'Downloading',
+        requestId: 12,
+      });
+      expect(findSql(/SET firmware_state/)).toBeUndefined();
+      expect(findSql(/SET availability/)).toBeUndefined();
     });
 
     it('1.6 path: updates most recent non-terminal firmware row', async () => {
@@ -1435,7 +1666,9 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA,
-        [], // UPDATE charging_stations (Installed)
+        [], // UPDATE charging_stations firmware_state (Installed)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute (unchanged)
         [{ campaign_id: 'fwc_1' }], // upsert firmware_updates RETURNING
         [], // UPDATE firmware_campaign_stations
         [{ id: 'fwc_1' }], // UPDATE firmware_campaigns RETURNING (completed)
@@ -1457,8 +1690,9 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA,
-        // DownloadFailed does not flip charging_stations availability, so the
-        // next SQL call is the firmware_updates upsert.
+        [], // UPDATE firmware_state (DownloadFailed ends an install in progress)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // availability recompute (unchanged)
         [{ campaign_id: 'fwc_2' }], // upsert RETURNING
         [], // UPDATE firmware_campaign_stations
         EMPTY, // UPDATE firmware_campaigns -> count 0 (not all terminal)
@@ -1483,8 +1717,8 @@ describe('Event projections - coverage round 2', () => {
         timestamp: 't',
       });
       expect(findSql(/INSERT INTO security_events/)).toBeDefined();
-      // non-critical -> no availability flip
-      expect(findSql(/SET availability = 'unavailable'/)).toBeUndefined();
+      // non-critical -> no disable
+      expect(findSql(/SET disabled_reason = 'security'/)).toBeUndefined();
     });
 
     it('auto-disables station and writes audit when critical and toggle enabled', async () => {
@@ -1493,15 +1727,31 @@ describe('Event projections - coverage round 2', () => {
       setupSqlResults(
         STA,
         [], // INSERT security_events
-        [{ prior_availability: 'available' }], // CTE flip RETURNING prior
-        [{ site_id: 'site-1' }], // resolveSiteId
+        [{ availability: 'available', disabled_reason: null }], // prior state
+        [], // UPDATE disabled_reason
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [{ id: 'sta_1' }], // availability recompute (changed)
+        [{ site_id: 'site-1' }], // resolveSiteId (station.status)
+        [{ site_id: 'site-1' }], // resolveSiteId (station.securityEvent)
       );
       // FirmwareSignatureVerificationFailed is a critical security event
       await emit('ocpp.SecurityEventNotification', 'CS-1', {
         type: 'InvalidFirmwareSignature',
         timestamp: 't',
       });
-      expect(findSql(/SET availability = 'unavailable'/)).toBeDefined();
+      expect(findSql(/SET disabled_reason = 'security'/)).toBeDefined();
+      const published = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.map(
+        (c) => c[1] as string,
+      );
+      expect(published.some((p) => p.includes('station.status'))).toBe(true);
+      const command = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c) => c[0] === 'ocpp_commands',
+      );
+      expect(JSON.parse(command?.[1] as string)).toMatchObject({
+        stationId: 'CS-1',
+        action: 'ChangeAvailability',
+        payload: { operationalStatus: 'Inoperative' },
+      });
       expect(mockWriteAudit).toHaveBeenCalledWith(
         { table: { __table: 'station_audit_log' }, idColumn: 'station_id' },
         expect.objectContaining({
@@ -1515,19 +1765,25 @@ describe('Event projections - coverage round 2', () => {
       );
     });
 
-    it('critical but already unavailable: no audit (CTE returns no prior)', async () => {
+    it('critical but already disabled: no audit', async () => {
       mockIsAutoDisableOnCritical.mockResolvedValue(true);
       await setup();
       setupSqlResults(
         STA,
         [], // INSERT
-        [], // CTE flip -> already unavailable, no prior returned
+        [{ availability: 'unavailable', disabled_reason: 'operator' }], // already disabled
         [{ site_id: null }],
       );
       await emit('ocpp.SecurityEventNotification', 'CS-1', {
         type: 'InvalidFirmwareSignature',
       });
       expect(mockWriteAudit).not.toHaveBeenCalled();
+      // Already disabled: the station was told when that happened.
+      expect(
+        (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.some(
+          (c) => c[0] === 'ocpp_commands',
+        ),
+      ).toBe(false);
     });
 
     it('critical but toggle disabled: no flip', async () => {
@@ -1535,7 +1791,7 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(STA, [], [{ site_id: null }]);
       await emit('ocpp.SecurityEventNotification', 'CS-1', { type: 'InvalidFirmwareSignature' });
-      expect(findSql(/SET availability = 'unavailable'/)).toBeUndefined();
+      expect(findSql(/SET disabled_reason = 'security'/)).toBeUndefined();
     });
   });
 
@@ -1637,23 +1893,25 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults([]); // session lookup empty
       await emit('ocpp.NotifySettlement', 'CS-1', { transactionId: 'tx-1', settlementAmount: 10 });
-      expect(findSql(/INSERT INTO payment_records/)).toBeUndefined();
+      expect(mockRecordTerminalSettlement).not.toHaveBeenCalled();
     });
 
     it('inserts payment record, notifies SSE and driver', async () => {
       await setup();
       setupSqlResults(
-        [{ id: 'ses_1', driver_id: 'drv_1', station_id: 'sta_1' }], // session lookup
-        [], // INSERT payment_records (count 1)
+        [{ id: 'ses_1', driver_id: 'drv_1', station_id: 'sta_1', currency: 'USD' }], // session lookup
         [{ name: 'Site A' }], // resolveSiteName
       );
       await emit('ocpp.NotifySettlement', 'CS-1', {
         transactionId: 'tx-1',
         settlementAmount: 12.5,
       });
-      const ins = findSql(/INSERT INTO payment_records/);
-      expect(ins).toBeDefined();
-      expect(ins?.values).toContain(1250); // 12.50 -> cents
+      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith({
+        sessionId: 'ses_1',
+        driverId: 'drv_1',
+        currency: 'USD',
+        capturedCents: 1250, // 12.50 -> cents
+      });
       expect(mockDispatchDriver).toHaveBeenCalledWith(
         expect.anything(),
         'session.PaymentReceived',
@@ -1672,32 +1930,40 @@ describe('Event projections - coverage round 2', () => {
       );
     });
 
-    it('ignores duplicate settlement (ON CONFLICT count 0)', async () => {
+    it('ignores duplicate settlement (the session already has a record)', async () => {
+      mockRecordTerminalSettlement.mockResolvedValueOnce(false);
       await setup();
-      setupSqlResults(
-        [{ id: 'ses_1', driver_id: 'drv_1', station_id: 'sta_1' }],
-        EMPTY, // INSERT count 0 -> duplicate
-      );
+      setupSqlResults([{ id: 'ses_1', driver_id: 'drv_1', station_id: 'sta_1' }]);
       await emit('ocpp.NotifySettlement', 'CS-1', { transactionId: 'tx-1', settlementAmount: 5 });
+      expect(mockRecordTerminalSettlement).toHaveBeenCalledTimes(1);
       expect(mockDispatchDriver).not.toHaveBeenCalled();
-      expect(mockLoggerWarn).toHaveBeenCalled();
+      expect(mockLoggerWarn).toHaveBeenCalledWith(
+        { transactionId: 'tx-1', sessionId: 'ses_1' },
+        'Duplicate NotifySettlement ignored; payment already exists for session',
+      );
+      expect(
+        (mockPubSub.publish as Mock<PubSubClient['publish']>).mock.calls.some((c) =>
+          c[1].includes('payment.settled'),
+        ),
+      ).toBe(false);
     });
 
     it('anonymous session: inserts but no driver notification', async () => {
       await setup();
-      setupSqlResults([{ id: 'ses_2', driver_id: null, station_id: 'sta_1' }], []);
+      setupSqlResults([{ id: 'ses_2', driver_id: null, station_id: 'sta_1' }]);
       await emit('ocpp.NotifySettlement', 'CS-1', { transactionId: 'tx-2', settlementAmount: 3 });
-      expect(findSql(/INSERT INTO payment_records/)).toBeDefined();
+      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: 'ses_2', driverId: null, capturedCents: 300 }),
+      );
       expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
   });
 
-  // ---- ocpp.TransactionEvent Ended: auto-capture (second subscriber) ----
+  // ---- ocpp.TransactionEvent Ended: settlement (second subscriber) ----
 
-  describe('ocpp.TransactionEvent Ended auto-capture', () => {
-    // Drive ONLY the second subscriber. The first subscriber for the same event
-    // also runs; we provide enough SQL results so both complete without throwing
-    // and assert on the capture-specific writes.
+  describe('ocpp.TransactionEvent Ended settlement', () => {
+    // Drive ONLY the settlement subscriber; the payment service is mocked, so
+    // its SQL stream is the session lookup and the receipt's site name.
 
     function endedEvent() {
       return makeDomainEvent('ocpp.TransactionEvent', 'CS-1', {
@@ -1709,7 +1975,7 @@ describe('Event projections - coverage round 2', () => {
 
     async function emitEndedSecondOnly(...secondSqlResults: unknown[][]) {
       await setup();
-      // Run only the auto-capture subscriber (index 1) to control its SQL stream.
+      // Run only the settlement subscriber (index 1) to control its SQL stream.
       const handlers = eventBus.subscribers.get('ocpp.TransactionEvent') ?? [];
       const second = handlers[1];
       expect(second).toBeDefined();
@@ -1717,232 +1983,177 @@ describe('Event projections - coverage round 2', () => {
       await second?.(endedEvent());
     }
 
+    const sessionRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'ses_1',
+      final_cost_cents: 1500,
+      currency: 'EUR',
+      station_uuid: 'sta_1',
+      station_ocpp_id: 'CS-1',
+      site_id: 'site_1',
+      ...overrides,
+    });
+    const captured = (overrides: Record<string, unknown> = {}) => ({
+      mode: 'card',
+      status: 'captured',
+      paymentRecordId: 1,
+      driverId: 'drv_1',
+      capturedCents: 1500,
+      shortfallCents: 0,
+      recorded: true,
+      ...overrides,
+    });
+    const driverCalls = (eventType: string) =>
+      mockDispatchDriver.mock.calls.filter((c: unknown[]) => c[1] === eventType);
+    const csmsEvents = () =>
+      (mockPubSub.publish as Mock<PubSubClient['publish']>).mock.calls
+        .filter((c) => c[0] === 'csms_events')
+        .map((c) => JSON.parse(c[1]) as Record<string, unknown>);
+
     it('returns when session not found', async () => {
       await emitEndedSecondOnly([]); // session lookup empty
-      expect(findSql(/payment_records/)).toBeUndefined();
+      expect(mockSettleSessionPayment).not.toHaveBeenCalled();
     });
 
-    it('returns when no pre_authorized payment record', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 100, currency: 'USD', station_uuid: 'sta_1' }],
-        [], // payment_records pre_authorized -> none
-      );
-      expect(findSql(/UPDATE payment_records/)).toBeUndefined();
+    it('settles the session through the payment service', async () => {
+      await emitEndedSecondOnly([sessionRow()]);
+      expect(mockSettleSessionPayment).toHaveBeenCalledWith('ses_1', mockPaymentContext);
+      // Nothing to settle (the default outcome): no notification.
+      expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
 
-    it('returns when guest payment record (driver_id null)', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 100, currency: 'USD' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: 'pi_sim_1', driver_id: null }],
-      );
-      expect(findSql(/UPDATE payment_records/)).toBeUndefined();
-    });
-
-    it('simulated success: captures and notifies driver', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 1500, currency: 'EUR', station_uuid: 'sta_1' }],
+    it('captured and recorded: sends the receipt in the session currency', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce(captured({ capturedCents: 1750 }));
+      await emitEndedSecondOnly([sessionRow()], [{ name: 'Site A' }]);
+      expect(driverCalls('session.PaymentReceived')).toEqual([
         [
-          {
-            id: 'pr_1',
-            stripe_payment_intent_id: 'pi_sim_1',
-            driver_id: 'drv_1',
-            pre_auth_amount_cents: 2000,
-          },
+          expect.anything(),
+          'session.PaymentReceived',
+          'drv_1',
+          expect.objectContaining({
+            siteName: 'Site A',
+            stationId: 'CS-1',
+            transactionId: 'tx-cap',
+            amountCents: 1750,
+            currency: 'EUR',
+          }),
+          ['/mock/templates'],
+          mockPubSub,
         ],
-        [], // UPDATE payment_records captured
-      );
-      const upd = findSql(/UPDATE payment_records\s+SET status = 'captured'/);
-      expect(upd).toBeDefined();
-      expect(upd?.values).toContain(1500);
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
-        'session.PaymentReceived',
-        'drv_1',
-        expect.objectContaining({ currency: 'EUR', amountCents: 1500 }),
-        expect.anything(),
-        expect.anything(),
+      ]);
+      const vars = driverCalls('session.PaymentReceived')[0]?.[3] as {
+        amountFormatted: { format: (locale: string) => string };
+      };
+      expect(vars.amountFormatted.format('en-US')).toBe('€17.50');
+    });
+
+    it('captured on a station without a row id: receipt without a site name', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce(captured());
+      await emitEndedSecondOnly([sessionRow({ station_uuid: null })]);
+      expect(findSql(/FROM sites/)).toBeUndefined();
+      expect(driverCalls('session.PaymentReceived')[0]?.[3]).toMatchObject({ siteName: '' });
+    });
+
+    it('captured but not recorded: no receipt and no failure notice', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce(captured({ recorded: false }));
+      await emitEndedSecondOnly([sessionRow()]);
+      expect(driverCalls('session.PaymentReceived')).toHaveLength(0);
+      expect(driverCalls('payment.CaptureFailed')).toHaveLength(0);
+    });
+
+    it('failed: notifies CaptureFailed with the final cost and the reason', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce({
+        mode: 'card',
+        status: 'failed',
+        paymentRecordId: 1,
+        driverId: 'drv_1',
+        reason: 'provider boom',
+      });
+      await emitEndedSecondOnly([sessionRow({ final_cost_cents: 500, currency: 'USD' })]);
+      const calls = driverCalls('payment.CaptureFailed');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[2]).toBe('drv_1');
+      const vars = calls[0]?.[3] as {
+        stationId: string;
+        transactionId: string;
+        reason: string;
+        amountFormatted: { format: (locale: string) => string };
+      };
+      expect(vars).toMatchObject({
+        stationId: 'CS-1',
+        transactionId: 'tx-cap',
+        reason: 'provider boom',
+      });
+      expect(vars.amountFormatted.format('en-US')).toBe('$5.00');
+      expect(driverCalls('session.PaymentReceived')).toHaveLength(0);
+    });
+
+    it('failed: a dispatch that throws is logged and the settlement continues', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce({
+        mode: 'card',
+        status: 'failed',
+        paymentRecordId: 1,
+        driverId: 'drv_1',
+        reason: 'provider boom',
+      });
+      mockDispatchDriver.mockImplementationOnce(() => {
+        throw new Error('dispatch boom');
+      });
+      await emitEndedSecondOnly([sessionRow()]);
+      expect(mockLoggerDebug).toHaveBeenCalledWith(
+        expect.objectContaining({ driverId: 'drv_1', transactionId: 'tx-cap' }),
+        'CaptureFailed notification dispatch failed; continuing',
       );
     });
 
-    it('simulated zero-cost: cancels payment record', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 0, currency: 'USD', station_uuid: 'sta_1' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: 'pi_sim_1', driver_id: 'drv_1' }],
-        [], // UPDATE cancelled
-      );
-      expect(findSql(/UPDATE payment_records\s+SET status = 'cancelled'/)).toBeDefined();
+    it('prepaid: reports the settlement and the token balance change', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce({
+        mode: 'prepaid',
+        tokenId: 'dtk_1',
+        debitedCents: 1500,
+        balanceCents: 500,
+      });
+      await emitEndedSecondOnly([sessionRow()]);
+      const events = csmsEvents();
+      expect(events).toContainEqual({ eventType: 'token.changed', tokenId: 'dtk_1' });
+      expect(events.find((e) => e['eventType'] === 'payment.settled')).toMatchObject({
+        sessionId: 'ses_1',
+        siteId: 'site_1',
+      });
+      expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
 
-    it('simulated failure: marks failed and notifies CaptureFailed', async () => {
-      mockShouldSimulateFailure.mockReturnValue(true);
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 1000, currency: 'USD', station_uuid: 'sta_1' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: 'pi_sim_1', driver_id: 'drv_1' }],
-        [], // UPDATE failed
+    it('prepaid: a failed token.changed publish is logged and ignored', async () => {
+      mockSettleSessionPayment.mockResolvedValueOnce({
+        mode: 'prepaid',
+        tokenId: 'dtk_1',
+        debitedCents: 1500,
+        balanceCents: 500,
+      });
+      await setup();
+      vi.mocked(mockPubSub.publish).mockImplementation((_channel, message) =>
+        message.includes('token.changed')
+          ? Promise.reject(new Error('redis down'))
+          : Promise.resolve(),
       );
-      expect(findSql(/SET status = 'failed'/)).toBeDefined();
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
-        'payment.CaptureFailed',
-        'drv_1',
-        expect.objectContaining({ reason: 'Simulated capture failure' }),
-        expect.anything(),
-        expect.anything(),
-      );
-    });
-
-    it('real Stripe capture (finalCost <= preAuth): captures and records', async () => {
-      await emitEndedSecondOnly(
-        [
-          {
-            id: 'ses_1',
-            final_cost_cents: 1200,
-            currency: 'USD',
-            station_uuid: 'sta_1',
-            station_ocpp_id: 'CS-1',
-          },
-        ],
-        [
-          {
-            id: 'pr_1',
-            stripe_payment_intent_id: 'pi_real_1',
-            driver_id: 'drv_1',
-            pre_auth_amount_cents: 2000,
-          },
-        ],
-        [{ value: 'enc-secret' }], // settings stripe.secretKeyEnc
-        [], // UPDATE payment_records captured
-        [{ name: 'Site A' }], // resolveSiteName
-      );
-      expect(mockStripeCapture).toHaveBeenCalledWith(
-        'pi_real_1',
-        { amount_to_capture: 1200 },
-        expect.objectContaining({ idempotencyKey: 'capture_pr_1' }),
-      );
-      expect(findSql(/UPDATE payment_records\s+SET status = 'captured'/)).toBeDefined();
-    });
-
-    it('real Stripe top-up when finalCost > preAuth', async () => {
-      await emitEndedSecondOnly(
-        [
-          {
-            id: 'ses_1',
-            final_cost_cents: 3000,
-            currency: 'USD',
-            station_uuid: 'sta_1',
-            station_ocpp_id: 'CS-1',
-          },
-        ],
-        [
-          {
-            id: 'pr_1',
-            stripe_payment_intent_id: 'pi_real_1',
-            driver_id: 'drv_1',
-            pre_auth_amount_cents: 2000,
-          },
-        ],
-        [{ value: 'enc-secret' }], // stripe secret
-        [], // UPDATE captured
-        [{ name: 'Site A' }], // resolveSiteName
-      );
-      expect(mockStripeCapture).toHaveBeenCalledWith(
-        'pi_real_1',
-        { amount_to_capture: 2000 },
-        expect.anything(),
-      );
-      expect(mockStripeRetrieve).toHaveBeenCalledWith('pi_real_1');
-      expect(mockStripeCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ amount: 1000 }),
-        expect.objectContaining({ idempotencyKey: 'topup_pr_1' }),
+      const second = (eventBus.subscribers.get('ocpp.TransactionEvent') ?? [])[1];
+      setupSqlResults([sessionRow({ site_id: null })]);
+      await second?.(endedEvent());
+      expect(mockLoggerDebug).toHaveBeenCalledWith(
+        { err: expect.any(Error) },
+        'token.changed SSE publish failed; continuing',
       );
     });
 
-    it('top-up failure leaves capture recorded with failure_reason', async () => {
-      mockStripeCreate.mockRejectedValueOnce(new Error('card declined'));
-      await emitEndedSecondOnly(
-        [
-          {
-            id: 'ses_1',
-            final_cost_cents: 3000,
-            currency: 'USD',
-            station_uuid: 'sta_1',
-            station_ocpp_id: 'CS-1',
-          },
-        ],
-        [
-          {
-            id: 'pr_1',
-            stripe_payment_intent_id: 'pi_real_1',
-            driver_id: 'drv_1',
-            pre_auth_amount_cents: 2000,
-          },
-        ],
-        [{ value: 'enc-secret' }],
-        [], // UPDATE captured (with failure_reason)
-        [{ name: 'Site A' }],
-      );
-      expect(mockLoggerWarn).toHaveBeenCalledWith(
-        expect.objectContaining({ paymentRecordId: 'pr_1' }),
-        'Top-up PaymentIntent failed; pre-auth was captured but delta uncollected',
-      );
-      const upd = findSql(/UPDATE payment_records\s+SET status = 'captured'/);
-      expect(upd?.values.some((v) => typeof v === 'string' && v.includes('Top-up declined'))).toBe(
-        true,
-      );
-    });
-
-    it('real Stripe cancel when finalCost is zero', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 0, currency: 'USD', station_uuid: 'sta_1' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: 'pi_real_1', driver_id: 'drv_1' }],
-        [{ value: 'enc-secret' }], // stripe secret
-        [], // UPDATE cancelled
-      );
-      expect(mockStripeCancel).toHaveBeenCalledWith('pi_real_1');
-      expect(findSql(/UPDATE payment_records\s+SET status = 'cancelled'/)).toBeDefined();
-    });
-
-    it('returns when stripe secret missing', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 100, currency: 'USD', station_uuid: 'sta_1' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: 'pi_real_1', driver_id: 'drv_1' }],
-        [], // settings -> no secret
-      );
-      expect(mockStripeCapture).not.toHaveBeenCalled();
-    });
-
-    it('Stripe capture error marks failed and notifies CaptureFailed', async () => {
-      mockStripeCapture.mockRejectedValueOnce(new Error('stripe boom'));
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 500, currency: 'USD', station_uuid: 'sta_1' }],
-        [
-          {
-            id: 'pr_1',
-            stripe_payment_intent_id: 'pi_real_1',
-            driver_id: 'drv_1',
-            pre_auth_amount_cents: 1000,
-          },
-        ],
-        [{ value: 'enc-secret' }],
-        [], // UPDATE failed
-      );
-      expect(findSql(/SET status = 'failed'/)).toBeDefined();
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
-        'payment.CaptureFailed',
-        'drv_1',
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-      );
-    });
-
-    it('returns when payment intent id is null', async () => {
-      await emitEndedSecondOnly(
-        [{ id: 'ses_1', final_cost_cents: 100, currency: 'USD', station_uuid: 'sta_1' }],
-        [{ id: 'pr_1', stripe_payment_intent_id: null, driver_id: 'drv_1' }],
-      );
-      expect(mockStripeCapture).not.toHaveBeenCalled();
+    it.each([
+      { mode: 'card', status: 'cancelled', paymentRecordId: 1, recorded: true },
+      { mode: 'guest' },
+      { mode: 'none' },
+    ])('sends nothing for outcome %o', async (outcome) => {
+      mockSettleSessionPayment.mockResolvedValueOnce(outcome);
+      await emitEndedSecondOnly([sessionRow()]);
+      expect(mockSettleSessionPayment).toHaveBeenCalledTimes(1);
+      expect(mockDispatchDriver).not.toHaveBeenCalled();
+      expect(csmsEvents()).toHaveLength(0);
     });
   });
 

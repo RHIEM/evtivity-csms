@@ -8,12 +8,14 @@ import { useInfiniteQuery, useQuery, useQueries } from '@tanstack/react-query';
 import { ChevronLeft, ChevronRight, FileText, Leaf } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { api } from '@/lib/api';
+import { costIncludesTax } from '@evtivity/lib/price-display';
 import {
   formatCents,
   formatEnergy,
   formatDuration,
   formatDistance,
   formatMonthYear,
+  formatNumber,
 } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
@@ -24,6 +26,7 @@ interface Session {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   finalCostCents: number | null;
+  tariffTaxRate: string | null;
   currency: string;
   stationName: string | null;
   siteName: string | null;
@@ -171,9 +174,9 @@ export function Activity(): React.JSX.Element {
     centerText = formatEnergy(totalEnergyWh);
   } else if (distanceUnit === 'km') {
     const totalKm = totalMiles * 1.60934;
-    centerText = `${totalKm.toFixed(0)} ${t('activity.km')}`;
+    centerText = `${formatNumber(totalKm, 0)} ${t('activity.km')}`;
   } else {
-    centerText = `${totalMiles.toFixed(0)} ${t('activity.miles')}`;
+    centerText = `${formatNumber(totalMiles, 0)} ${t('activity.miles')}`;
   }
 
   // Per-month value for the trend bars. Energy and distance scale together, so
@@ -234,6 +237,9 @@ export function Activity(): React.JSX.Element {
         <CardContent className="space-y-4 py-6">
           <div className="text-center">
             <p className="text-xl font-bold">{centerText}</p>
+            {selectedMetric === 'cost' && (
+              <p className="text-xs text-muted-foreground">{t('common.inclTax')}</p>
+            )}
             <p className="text-xs text-muted-foreground">
               {summary?.sessionCount ?? 0} {t('activity.sessions')}
             </p>
@@ -289,7 +295,7 @@ export function Activity(): React.JSX.Element {
             <Leaf className="h-5 w-5 text-success" />
             <span className="text-sm font-medium text-success">
               {t('activity.co2AvoidedMessage', {
-                amount: summary.totalCo2AvoidedKg.toFixed(1),
+                amount: formatNumber(summary.totalCo2AvoidedKg, 1),
               })}
             </span>
           </CardContent>
@@ -344,6 +350,9 @@ export function Activity(): React.JSX.Element {
                 <p className="text-sm font-medium">
                   {formatCents(session.finalCostCents, session.currency)}
                 </p>
+                {costIncludesTax(session.finalCostCents, session.tariffTaxRate) && (
+                  <p className="text-xs text-muted-foreground">{t('common.inclTax')}</p>
+                )}
                 <p className="text-xs text-muted-foreground">
                   {formatDuration(session.startedAt, session.endedAt)}
                 </p>

@@ -39,6 +39,7 @@ import { usePaginatedQuery } from '@/hooks/use-paginated-query';
 import { api } from '@/lib/api';
 import { TableSkeleton } from '@/components/TableSkeleton';
 import { formatDate, useUserTimezone } from '@/lib/timezone';
+import { formatNumber } from '@/lib/formatting';
 
 interface Site {
   id: string;
@@ -196,12 +197,12 @@ export function Sites(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('sites.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('sites.subtitle')}</p>
         </div>
-        <div className="flex flex-col gap-2 [&>*]:w-full sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 sm:[&>*]:w-auto">
+        <div className="flex flex-col gap-2 *:w-full sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 sm:*:w-auto">
           <TemplateButton label={t('sites.downloadTemplate')} onClick={handleDownloadTemplate} />
           <ImportButton
             label={importMutation.isPending ? t('sites.importing') : t('sites.importCsv')}
@@ -287,7 +288,7 @@ export function Sites(): React.JSX.Element {
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('sites.location')}</Label>
+              <Label className="leading-6">{t('sites.location')}</Label>
               <Select
                 aria-label={t('sites.location')}
                 className="h-10"
@@ -306,7 +307,7 @@ export function Sites(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('sites.loadManagementFilter')}</Label>
+              <Label className="leading-6">{t('sites.loadManagementFilter')}</Label>
               <Select
                 aria-label={t('sites.loadManagementFilter')}
                 className="h-10"
@@ -344,7 +345,7 @@ export function Sites(): React.JSX.Element {
               <div className="hidden items-end gap-4 md:flex">
                 <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
                   <div className="space-y-2">
-                    <Label>{t('sites.search')}</Label>
+                    <Label className="leading-6">{t('sites.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}
@@ -399,7 +400,9 @@ export function Sites(): React.JSX.Element {
                   <TableCell>{site.stationCount}</TableCell>
                   <TableCell>
                     <span className="inline-flex items-center gap-1.5">
-                      <span className="font-medium">{Number(site.totalDrawKw).toFixed(1)} kW</span>
+                      <span className="font-medium">
+                        {formatNumber(Number(site.totalDrawKw), 1)} kW
+                      </span>
                       {site.maxPowerKw != null && Number(site.maxPowerKw) > 0 && (
                         <span className="text-muted-foreground">
                           / {Number(site.maxPowerKw)} kW

@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { randomBytes, randomUUID, X509Certificate } from 'node:crypto';
+import { randomUUID, X509Certificate } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { hash } from 'argon2';
@@ -19,7 +19,14 @@ import {
   isNotNull,
   isNull,
 } from 'drizzle-orm';
-import { db, writeAudit, stationAuditLog, getCompanyCurrency } from '@evtivity/database';
+import {
+  db,
+  client,
+  writeAudit,
+  stationAuditLog,
+  getCompanyCurrency,
+  setStationDisabled,
+} from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
@@ -33,7 +40,6 @@ import {
   sites,
   vendors,
   ocppMessageLogs,
-  connectionLogs,
   stationCertificates,
   pricingGroupStations,
   pricingGroups,
@@ -53,7 +59,7 @@ import {
   cssStations,
   cssEvses,
 } from '@evtivity/database';
-import { zodSchema } from '../lib/zod-schema.js';
+import { assertZodRefinements, zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { getPubSub } from '../lib/pubsub.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -67,6 +73,7 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { inCompanyCurrency, sessionCurrencySql } from '../lib/company-currency.js';
+import { queryRevenue, queryRevenueTotal, revenueItem } from '../lib/session-revenue.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds, checkStationSiteAccess, userCanAccessSite } from '../lib/site-access.js';
 import { dateRangeQuery, parseDateRange } from '../lib/date-range.js';
@@ -76,10 +83,20 @@ import {
   sendStatusCheckError,
   triggerAndWaitForStatus,
 } from '../lib/ocpp-command.js';
-import { buildDerivedStatusSubquery } from '../lib/station-derived-status.js';
+import {
+  buildDerivedStatusSubquery,
+  buildStatusReasonSubquery,
+} from '../lib/station-derived-status.js';
 import { buildUnderMaintenanceSubquery } from '../lib/station-maintenance-flag.js';
 import { enableCssPair, disableCssPair } from '../lib/css-pairing.js';
-import { mapConnectorTypeToCss } from '@evtivity/lib';
+import { sendAvailabilityCommand } from '../lib/availability-command.js';
+import { publishStationStatusChanged } from '../lib/station-status-events.js';
+import {
+  changeSecurityProfile,
+  changeStationPassword,
+  rotateStationPassword,
+} from '../services/station-security.service.js';
+import { mapConnectorTypeToCss, validateStationPassword } from '@evtivity/lib';
 import { authorize } from '../middleware/rbac.js';
 import type { JwtPayload } from '../plugins/auth.js';
 
@@ -178,6 +195,17 @@ const stationListQuery = paginationQuery.merge(
   }),
 );
 
+// OCPP passwordString, 16-40 characters (2.1 A00.FR.205). The 1.6 limit of 20
+// is checked against the station's protocol by the station security service.
+const stationPassword = z
+  .string()
+  .min(16)
+  .max(40)
+  .regex(/^[a-zA-Z0-9*\-_=:+|@.]+$/)
+  .describe(
+    'Basic Auth password: 16-40 characters (16-20 for OCPP 1.6) from a-z A-Z 0-9 * - _ = : + | @ .',
+  );
+
 const createStationBody = z.object({
   stationId: z.string().min(1).max(255).describe('OCPP station identifier'),
   model: z.string().max(255).optional(),
@@ -196,7 +224,7 @@ const createStationBody = z.object({
     .max(3)
     .optional()
     .describe('OCPP security profile (0=none, 1=basic auth, 2=TLS+basic auth, 3=mTLS)'),
-  password: z.string().min(8).max(128).optional().describe('Basic auth password for SP1/SP2'),
+  password: stationPassword.optional(),
   isSimulator: z.boolean().optional().describe('Whether this station is a simulator'),
   latitude: z.string().max(20).optional().describe('Station latitude'),
   longitude: z.string().max(20).optional().describe('Station longitude'),
@@ -206,9 +234,11 @@ const updateStationBody = z.object({
   model: z.string().max(255).optional(),
   serialNumber: z.string().max(255).optional(),
   availability: z
-    .enum(['available', 'unavailable', 'faulted'])
+    .enum(['available', 'unavailable'])
     .optional()
-    .describe('Station availability status'),
+    .describe(
+      'Enable (available) or disable (unavailable) the station. Sends ChangeAvailability to the station. Faulted is computed, not set.',
+    ),
   siteId: ID_PARAMS.siteId.nullable().optional().describe('Site ID to assign the station to'),
   securityProfile: z
     .number()
@@ -217,7 +247,7 @@ const updateStationBody = z.object({
     .max(3)
     .optional()
     .describe('OCPP security profile (0=none, 1=basic auth, 2=TLS+basic auth, 3=mTLS)'),
-  password: z.string().min(8).max(128).optional().describe('Basic auth password for SP1/SP2'),
+  password: stationPassword.optional(),
   isSimulator: z.boolean().optional().describe('Whether this station is a simulator'),
   latitude: z.string().max(20).optional().describe('Station latitude'),
   longitude: z.string().max(20).optional().describe('Station longitude'),
@@ -228,8 +258,18 @@ const updateStationBody = z.object({
 });
 
 const setCredentialsBody = z.object({
-  password: z.string().min(8).max(128),
+  password: stationPassword,
 });
+
+const passwordChangeResponse = z
+  .object({
+    appliedTo: z
+      .enum(['station', 'stored'])
+      .describe(
+        'station: the station accepted the password. stored: saved for an offline station or one not using a password yet; configure it on the station.',
+      ),
+  })
+  .passthrough();
 
 const stationItem = z
   .object({
@@ -247,7 +287,27 @@ const stationItem = z
     imsi: z.string().max(20).nullable().describe('SIM card IMSI for cellular-connected stations'),
     availability: z
       .enum(['available', 'unavailable', 'faulted'])
-      .describe('Operator-controlled availability state'),
+      .describe(
+        'Station availability computed from the operator or security disable, firmware state, station-reported status, and connector faults',
+      ),
+    reportedStatus: z
+      .enum(['available', 'unavailable', 'faulted'])
+      .nullable()
+      .describe(
+        'Status the station reports for itself (OCPP 1.6 connector 0, 2.x ChargingStation), null until reported',
+      ),
+    statusReason: z
+      .enum([
+        'operator_disabled',
+        'security_disabled',
+        'firmware_failed',
+        'station_faulted',
+        'connector_faulted',
+        'firmware_installing',
+        'station_unavailable',
+      ])
+      .nullable()
+      .describe('Why the station is not available, null when it is'),
     onboardingStatus: z
       .enum(['pending', 'accepted', 'blocked'])
       .describe('Provisioning lifecycle state (pending awaiting approval, accepted, blocked)'),
@@ -271,6 +331,13 @@ const stationItem = z
       .min(0)
       .max(3)
       .describe('OCPP security profile: 0=plain, 1=Basic Auth, 2=TLS+Basic, 3=mTLS'),
+    pendingSecurityProfile: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Security profile an upgrade was sent for; the station is moved to it when it connects with that profile',
+      ),
     ocppProtocol: z
       .enum(['ocpp1.6', 'ocpp2.1'])
       .nullable()
@@ -330,7 +397,37 @@ const stationDetail = z
     imsi: z.string().max(20).nullable().describe('SIM card IMSI for cellular-connected stations'),
     availability: z
       .enum(['available', 'unavailable', 'faulted'])
-      .describe('Operator-controlled availability state'),
+      .describe(
+        'Station availability computed from the operator or security disable, firmware state, station-reported status, and connector faults',
+      ),
+    reportedStatus: z
+      .enum(['available', 'unavailable', 'faulted'])
+      .nullable()
+      .describe(
+        'Status the station reports for itself (OCPP 1.6 connector 0, 2.x ChargingStation), null until reported',
+      ),
+    disabledReason: z
+      .enum(['operator', 'security'])
+      .nullable()
+      .describe(
+        'Why the station is switched off: operator (disabled by an operator) or security (disabled after a critical security event), null when enabled',
+      ),
+    firmwareState: z
+      .enum(['installing', 'failed'])
+      .nullable()
+      .describe('Firmware install state: installing, failed, or null when no install is pending'),
+    statusReason: z
+      .enum([
+        'operator_disabled',
+        'security_disabled',
+        'firmware_failed',
+        'station_faulted',
+        'connector_faulted',
+        'firmware_installing',
+        'station_unavailable',
+      ])
+      .nullable()
+      .describe('Why the station is not available, null when it is'),
     onboardingStatus: z
       .enum(['pending', 'accepted', 'blocked'])
       .describe('Provisioning lifecycle state (pending awaiting approval, accepted, blocked)'),
@@ -354,6 +451,13 @@ const stationDetail = z
       .min(0)
       .max(3)
       .describe('OCPP security profile: 0=plain, 1=Basic Auth, 2=TLS+Basic, 3=mTLS'),
+    pendingSecurityProfile: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Security profile an upgrade was sent for; the station is moved to it when it connects with that profile',
+      ),
     ocppProtocol: z
       .enum(['ocpp1.6', 'ocpp2.1'])
       .nullable()
@@ -401,7 +505,9 @@ const stationCreated = z
     firmwareVersion: z.string().max(50).nullable().describe('Currently installed firmware version'),
     availability: z
       .enum(['available', 'unavailable', 'faulted'])
-      .describe('Operator-controlled availability state'),
+      .describe(
+        'Station availability computed from the operator or security disable, firmware state, station-reported status, and connector faults',
+      ),
     onboardingStatus: z
       .enum(['pending', 'accepted', 'blocked'])
       .describe('Provisioning lifecycle state (pending awaiting approval, accepted, blocked)'),
@@ -421,6 +527,13 @@ const stationCreated = z
       .min(0)
       .max(3)
       .describe('OCPP security profile: 0=plain, 1=Basic Auth, 2=TLS+Basic, 3=mTLS'),
+    pendingSecurityProfile: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Security profile an upgrade was sent for; the station is moved to it when it connects with that profile',
+      ),
     hasPassword: z
       .boolean()
       .describe('Whether a Basic Auth password is configured for this station'),
@@ -520,9 +633,13 @@ const revenueHistoryItem = z
       .int()
       .min(0)
       .describe(
-        'Total revenue collected on that date in cents, from sessions billed in the company currency',
+        'Revenue on this date in cents, tax included: final costs of sessions started that day plus reservation fees charged that day, minus refunds, in the company currency. Active sessions are not counted',
       ),
-    sessionCount: z.number().describe('Number of revenue-generating sessions on that date'),
+    sessionCount: z
+      .number()
+      .describe(
+        'Number of ended sessions billed in the company currency that started on this date',
+      ),
   })
   .passthrough();
 
@@ -558,22 +675,38 @@ const stationMetricsResponse = z
       .number()
       .int()
       .min(0)
-      .describe('Total revenue in the period in the smallest currency unit (cents)'),
+      .describe(
+        'Total revenue in the period in cents, tax included. Revenue is the final cost of ended sessions plus reservation fees charged, minus refunds, in the company currency; active sessions are not counted',
+      ),
     avgRevenueCentsPerSession: z
       .number()
-      .describe('Average revenue per session in the smallest currency unit (cents)'),
+      .describe('Average revenue per ended session billed in the company currency, in cents'),
     totalTransactions: z
       .number()
-      .describe('Number of revenue-generating transactions in the period'),
+      .describe('Number of revenue items: ended billed sessions plus reservation fee charges'),
     totalElectricityCostCents: z
       .number()
       .int()
       .min(0)
       .describe('Total wholesale electricity cost in the period in cents'),
+    totalNetRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Total revenue excluding tax in cents. Each amount is split at its own tax rate (a session at its tariff tax rate, a reservation fee at the rate it was taxed at).',
+      ),
+    totalTaxCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Tax collected in cents (total revenue minus total net revenue)'),
     totalProfitCents: z
       .number()
       .int()
-      .describe('Total profit in cents (revenue minus electricity cost); may be negative'),
+      .describe(
+        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative',
+      ),
     periodMonths: z.number().describe('Number of months covered by these metrics'),
     currency: z
       .string()
@@ -780,18 +913,21 @@ export function stationRoutes(app: FastifyInstance): void {
           iccid: chargingStations.iccid,
           imsi: chargingStations.imsi,
           availability: chargingStations.availability,
+          reportedStatus: chargingStations.reportedStatus,
           onboardingStatus: chargingStations.onboardingStatus,
           lastHeartbeat: chargingStations.lastHeartbeat,
           isOnline: chargingStations.isOnline,
           isSimulator: chargingStations.isSimulator,
           loadPriority: chargingStations.loadPriority,
           securityProfile: chargingStations.securityProfile,
+          pendingSecurityProfile: chargingStations.pendingSecurityProfile,
           ocppProtocol: chargingStations.ocppProtocol,
           hasPassword: sql<boolean>`${chargingStations.basicAuthPasswordHash} IS NOT NULL`,
           metadata: chargingStations.metadata,
           createdAt: chargingStations.createdAt,
           updatedAt: chargingStations.updatedAt,
           status: derivedStatusSubquery,
+          statusReason: buildStatusReasonSubquery(chargingStations.id),
           connectorCount: sql<number>`(
             SELECT COUNT(c3.id)::int
             FROM ${evses} e3
@@ -864,18 +1000,23 @@ export function stationRoutes(app: FastifyInstance): void {
           iccid: chargingStations.iccid,
           imsi: chargingStations.imsi,
           availability: chargingStations.availability,
+          reportedStatus: chargingStations.reportedStatus,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
           onboardingStatus: chargingStations.onboardingStatus,
           lastHeartbeat: chargingStations.lastHeartbeat,
           isOnline: chargingStations.isOnline,
           isSimulator: chargingStations.isSimulator,
           loadPriority: chargingStations.loadPriority,
           securityProfile: chargingStations.securityProfile,
+          pendingSecurityProfile: chargingStations.pendingSecurityProfile,
           ocppProtocol: chargingStations.ocppProtocol,
           hasPassword: sql<boolean>`${chargingStations.basicAuthPasswordHash} IS NOT NULL`,
           metadata: chargingStations.metadata,
           createdAt: chargingStations.createdAt,
           updatedAt: chargingStations.updatedAt,
           status: derivedStatus,
+          statusReason: buildStatusReasonSubquery(chargingStations.id),
           siteHoursOfOperation: sites.hoursOfOperation,
           siteFreeVendEnabled: sql<boolean>`coalesce(${sites.freeVendEnabled}, false)`,
           underMaintenance: buildUnderMaintenanceSubquery(
@@ -988,6 +1129,7 @@ export function stationRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         body: zodSchema(createStationBody),
         response: {
+          400: errorWith('Invalid station', [ERROR_CODES.VALIDATION_ERROR]),
           201: itemResponse(stationCreated),
           404: errorWith('Resource not found', [
             ERROR_CODES.SITE_NOT_FOUND,
@@ -1030,6 +1172,14 @@ export function stationRoutes(app: FastifyInstance): void {
       }
 
       const { password, ...insertFields } = body;
+      // The schema allows 16-40 characters; an OCPP 1.6 AuthorizationKey is at most 20.
+      if (password != null && validateStationPassword(password, body.ocppProtocol) != null) {
+        await reply.status(400).send({
+          error: 'Password must be 16-20 characters for an OCPP 1.6 station',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
       const basicAuthPasswordHash = password != null ? await hash(password) : undefined;
 
       // The chargingStations INSERT and the css_stations pairing must commit
@@ -1062,6 +1212,7 @@ export function stationRoutes(app: FastifyInstance): void {
               isSimulator: chargingStations.isSimulator,
               loadPriority: chargingStations.loadPriority,
               securityProfile: chargingStations.securityProfile,
+              pendingSecurityProfile: chargingStations.pendingSecurityProfile,
               ocppProtocol: chargingStations.ocppProtocol,
               createdAt: chargingStations.createdAt,
               updatedAt: chargingStations.updatedAt,
@@ -1156,10 +1307,19 @@ export function stationRoutes(app: FastifyInstance): void {
         body: zodSchema(updateStationBody),
         response: {
           200: itemResponse(stationCreated),
-          400: errorWith('Password required', [ERROR_CODES.PASSWORD_REQUIRED]),
+          400: errorWith('Invalid security change', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.PASSWORD_REQUIRED,
+            ERROR_CODES.SECURITY_PROFILE_DOWNGRADE,
+            ERROR_CODES.STATION_TLS_URL_NOT_CONFIGURED,
+          ]),
           404: errorWith('Resource not found', [
             ERROR_CODES.SITE_NOT_FOUND,
             ERROR_CODES.STATION_NOT_FOUND,
+          ]),
+          502: errorWith('The station did not accept the change', [
+            ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
           ]),
         },
       },
@@ -1182,41 +1342,27 @@ export function stationRoutes(app: FastifyInstance): void {
           return;
         }
       }
-      const { password, ...body } = request.body as z.infer<typeof updateStationBody>;
+      const { password, securityProfile, availability, ...body } = request.body as z.infer<
+        typeof updateStationBody
+      >;
       // Check access to the new siteId if being reassigned
       if (body.siteId != null && !(await userCanAccessSite(userId, body.siteId))) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
 
-      // Upgrading to SP1/SP2 requires a password if none is configured (SP3 uses client certs)
-      if (
-        body.securityProfile != null &&
-        body.securityProfile >= 1 &&
-        body.securityProfile < 3 &&
-        password == null
-      ) {
-        const [existing] = await db
-          .select({
-            hasPassword: sql<boolean>`${chargingStations.basicAuthPasswordHash} IS NOT NULL`,
-          })
-          .from(chargingStations)
-          .where(eq(chargingStations.id, id));
-        if (existing != null && !existing.hasPassword) {
-          await reply.status(400).send({
-            error: 'Password required when upgrading to SP1 or SP2',
-            code: 'PASSWORD_REQUIRED',
-          });
-          return;
+      // Password and security profile changes go through the station security
+      // service: version-correct OCPP commands, applied only once accepted.
+      if (securityProfile != null || password != null) {
+        const securityCtx = { actor: getAuditActor(request), log: request.log };
+        if (securityProfile != null) {
+          await changeSecurityProfile(id, securityProfile, password, securityCtx);
+        } else if (password != null) {
+          await changeStationPassword(id, password, securityCtx);
         }
       }
 
       const updates: Record<string, unknown> = { ...body, updatedAt: new Date() };
-      if (password != null) {
-        updates.basicAuthPasswordHash = await hash(password);
-      } else if (body.securityProfile === 0 || body.securityProfile === 3) {
-        updates.basicAuthPasswordHash = null;
-      }
 
       // When enabling simulator, ensure ocpp_protocol is set so the simulator can negotiate
       // a WebSocket subprotocol. Stations created without an explicit protocol default to 1.6.
@@ -1235,6 +1381,39 @@ export function stationRoutes(app: FastifyInstance): void {
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
 
+      // Enable/disable goes through the station status entry point, which
+      // stores the operator's choice and recomputes availability, before the
+      // station is told (so the state is right even if the command is lost).
+      let availabilityChanged = false;
+      let disableStateChanged = false;
+      if (availability != null && beforeStation != null) {
+        const change = await setStationDisabled(
+          client,
+          id,
+          availability === 'unavailable' ? 'operator' : null,
+        );
+        availabilityChanged = change.availabilityChanged;
+        const [afterInputs] = await db
+          .select({
+            disabledReason: chargingStations.disabledReason,
+            firmwareState: chargingStations.firmwareState,
+          })
+          .from(chargingStations)
+          .where(eq(chargingStations.id, id));
+        // The audit follows the operator's choice (and the firmware state an
+        // enable clears), not the computed availability, which can stay the
+        // same when a connector fault or a station-reported state wins.
+        disableStateChanged =
+          afterInputs != null &&
+          (afterInputs.disabledReason !== beforeStation.disabledReason ||
+            afterInputs.firmwareState !== beforeStation.firmwareState);
+        void sendAvailabilityCommand(
+          beforeStation.stationId,
+          availability === 'unavailable' ? 'Inoperative' : 'Operative',
+          request.log,
+        );
+      }
+
       // Run the chargingStations UPDATE and any css_stations sync atomically so
       // a failure in pairing rolls the parent update back instead of leaving
       // the two tables out of sync.
@@ -1252,11 +1431,14 @@ export function stationRoutes(app: FastifyInstance): void {
             serialNumber: chargingStations.serialNumber,
             firmwareVersion: chargingStations.firmwareVersion,
             availability: chargingStations.availability,
+            disabledReason: chargingStations.disabledReason,
+            firmwareState: chargingStations.firmwareState,
             onboardingStatus: chargingStations.onboardingStatus,
             isOnline: chargingStations.isOnline,
             isSimulator: chargingStations.isSimulator,
             loadPriority: chargingStations.loadPriority,
             securityProfile: chargingStations.securityProfile,
+            pendingSecurityProfile: chargingStations.pendingSecurityProfile,
             ocppProtocol: chargingStations.ocppProtocol,
             hasPassword: sql<boolean>`${chargingStations.basicAuthPasswordHash} IS NOT NULL`,
             createdAt: chargingStations.createdAt,
@@ -1295,11 +1477,7 @@ export function stationRoutes(app: FastifyInstance): void {
       const actor = getAuditActor(request);
       // Determine the most specific action verb
       let action: string = 'updated';
-      if (
-        beforeStation != null &&
-        body.availability != null &&
-        body.availability !== beforeStation.availability
-      ) {
+      if (disableStateChanged) {
         action = 'availability_changed';
       } else if (
         beforeStation != null &&
@@ -1322,45 +1500,8 @@ export function stationRoutes(app: FastifyInstance): void {
         request.log,
       );
 
-      // Push security profile change to station via OCPP SetVariables (if online and profile changed)
-      if (body.securityProfile != null && station.isOnline) {
-        const setVariableData: Array<{
-          component: { name: string };
-          variable: { name: string };
-          attributeValue: string;
-        }> = [
-          {
-            component: { name: 'SecurityCtrlr' },
-            variable: { name: 'SecurityProfile' },
-            attributeValue: String(body.securityProfile),
-          },
-        ];
-
-        if (password != null) {
-          setVariableData.push({
-            component: { name: 'SecurityCtrlr' },
-            variable: { name: 'BasicAuthPassword' },
-            attributeValue: password,
-          });
-        }
-
-        const commandPayload = {
-          commandId: randomUUID(),
-          stationId: station.stationId,
-          action: 'SetVariables',
-          payload: { setVariableData },
-        };
-
-        await getPubSub().publish('ocpp_commands', JSON.stringify(commandPayload));
-
-        // Reset the station so it reconnects with the new security profile
-        const resetPayload = {
-          commandId: randomUUID(),
-          stationId: station.stationId,
-          action: 'Reset',
-          payload: { type: 'OnIdle' },
-        };
-        await getPubSub().publish('ocpp_commands', JSON.stringify(resetPayload));
+      if (availabilityChanged || disableStateChanged) {
+        await publishStationStatusChanged({ id, siteId: station.siteId }, request.log);
       }
 
       return station;
@@ -1426,10 +1567,10 @@ export function stationRoutes(app: FastifyInstance): void {
         db,
         request.log,
       );
-      return {
-        ...station,
-        hasPassword: station.basicAuthPasswordHash != null,
-      };
+      // The response schema passes extra fields through, so the password hash
+      // is dropped here and only reported as hasPassword.
+      const { basicAuthPasswordHash, ...publicStation } = station;
+      return { ...publicStation, hasPassword: basicAuthPasswordHash != null };
     },
   );
 
@@ -1573,6 +1714,7 @@ export function stationRoutes(app: FastifyInstance): void {
         body: zodSchema(createEvseBody),
         response: {
           201: itemResponse(evseResponse),
+          400: errorWith('Invalid connector numbering', [ERROR_CODES.CONNECTOR_ID_MISMATCH]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
           409: errorWith('Duplicate evse id', [ERROR_CODES.DUPLICATE_EVSE_ID]),
           500: errorWith('Internal error', [ERROR_CODES.INTERNAL_ERROR]),
@@ -1586,15 +1728,29 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
+      assertZodRefinements(createEvseBody, request.body);
       const body = request.body as z.infer<typeof createEvseBody>;
 
       // Verify station exists
       const [station] = await db
-        .select({ id: chargingStations.id })
+        .select({ id: chargingStations.id, ocppProtocol: chargingStations.ocppProtocol })
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+
+      // OCPP 1.6 has no EVSEs: connector N is stored as EVSE N / connector N,
+      // which is how the station's StatusNotification for connector N lands.
+      if (
+        station.ocppProtocol === 'ocpp1.6' &&
+        (body.connectors.length !== 1 || body.connectors[0]?.connectorId !== body.evseId)
+      ) {
+        await reply.status(400).send({
+          error: 'An OCPP 1.6 EVSE has exactly one connector with the same number as the EVSE',
+          code: 'CONNECTOR_ID_MISMATCH',
+        });
         return;
       }
 
@@ -1988,12 +2144,9 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const cmdResult = await sendOcppCommandAndWait(
-        station.stationId,
-        'RequestStopTransaction',
-        { transactionId: activeSession.transactionId },
-        station.ocppProtocol ?? undefined,
-      );
+      const cmdResult = await sendOcppCommandAndWait(station.stationId, 'RequestStopTransaction', {
+        transactionId: activeSession.transactionId,
+      });
 
       if (cmdResult.error != null) {
         await reply.status(504).send({ error: 'Station did not respond', code: 'STATION_TIMEOUT' });
@@ -2065,6 +2218,7 @@ export function stationRoutes(app: FastifyInstance): void {
         body: zodSchema(addConnectorBody),
         response: {
           201: itemResponse(connectorResponse),
+          400: errorWith('Invalid connector numbering', [ERROR_CODES.CONNECTOR_ID_MISMATCH]),
           404: errorWith('Resource not found', [
             ERROR_CODES.EVSE_NOT_FOUND,
             ERROR_CODES.STATION_NOT_FOUND,
@@ -2085,11 +2239,21 @@ export function stationRoutes(app: FastifyInstance): void {
 
       // Look up EVSE
       const [evse] = await db
-        .select({ id: evses.id })
+        .select({ id: evses.id, ocppProtocol: chargingStations.ocppProtocol })
         .from(evses)
+        .innerJoin(chargingStations, eq(chargingStations.id, evses.stationId))
         .where(and(eq(evses.stationId, id), eq(evses.evseId, ocppEvseId)));
       if (evse == null) {
         await reply.status(404).send({ error: 'EVSE not found', code: 'EVSE_NOT_FOUND' });
+        return;
+      }
+
+      // A 1.6 EVSE holds only connector N (its own number).
+      if (evse.ocppProtocol === 'ocpp1.6' && body.connectorId !== ocppEvseId) {
+        await reply.status(400).send({
+          error: 'An OCPP 1.6 EVSE has exactly one connector with the same number as the EVSE',
+          code: 'CONNECTOR_ID_MISMATCH',
+        });
         return;
       }
 
@@ -2474,33 +2638,28 @@ export function stationRoutes(app: FastifyInstance): void {
         .where(eq(chargingStations.id, id));
       const tz = stationRow?.siteTimezone ?? 'America/New_York';
 
-      const billed = inCompanyCurrency(chargingSessions.currency, await getCompanyCurrency());
-
-      const rows = await db
-        .select({
-          date: sql<string>`date_trunc('day', ${chargingSessions.startedAt} AT TIME ZONE ${tz})::date::text`,
-          revenueCents: sql<number>`coalesce(sum(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-          sessionCount: count(),
-        })
-        .from(chargingSessions)
-        .where(
-          and(
-            eq(chargingSessions.stationId, id),
-            gte(chargingSessions.startedAt, since),
-            until ? lte(chargingSessions.startedAt, until) : undefined,
-            sql`coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents}) is not null`,
-          ),
-        )
-        .groupBy(sql`1`)
-        .orderBy(sql`1`);
+      // Revenue per day (session-revenue.ts): ended sessions and reservation
+      // fees billed in the company currency, minus refunds, tax included.
+      const where = [
+        sql`${revenueItem.stationId} = ${id}`,
+        sql`${revenueItem.occurredAt} >= ${since.toISOString()}::timestamptz`,
+      ];
+      if (until) where.push(sql`${revenueItem.occurredAt} <= ${until.toISOString()}::timestamptz`);
+      const byDay = await queryRevenue({
+        companyCurrency: await getCompanyCurrency(),
+        key: sql`date_trunc('day', ${revenueItem.occurredAt} AT TIME ZONE ${tz})::date`,
+        where,
+      });
 
       return zeroFillDays(
         enumerateLocalDays(since, until, tz),
-        rows.map((r) => ({
-          date: r.date,
-          revenueCents: r.revenueCents,
-          sessionCount: r.sessionCount,
-        })),
+        [...byDay]
+          .filter((entry): entry is [string, (typeof entry)[1]] => entry[0] != null)
+          .map(([date, revenue]) => ({
+            date,
+            revenueCents: revenue.grossCents,
+            sessionCount: revenue.sessionCount,
+          })),
         (date) => ({ date, revenueCents: 0, sessionCount: 0 }),
       );
     },
@@ -2829,14 +2988,24 @@ export function stationRoutes(app: FastifyInstance): void {
           .where(and(eq(chargingSessions.stationId, id), gte(chargingSessions.startedAt, since))),
         db
           .select({
-            totalRevenueCents: sql<number>`coalesce(sum(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-            avgRevenueCentsPerSession: sql<number>`coalesce(avg(coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents})) filter (where ${billed}), 0)`,
-            totalTransactions: sql<number>`count(*) filter (where coalesce(${chargingSessions.finalCostCents}, ${chargingSessions.currentCostCents}) is not null)`,
-            totalElectricityCostCents: sql<number>`coalesce(sum(${chargingSessions.electricityCostCents}) filter (where ${billed}), 0)`,
+            totalElectricityCostCents:
+              sql<number>`coalesce(sum(${chargingSessions.electricityCostCents}) filter (where ${billed}), 0)`.mapWith(
+                Number,
+              ),
           })
           .from(chargingSessions)
           .where(and(eq(chargingSessions.stationId, id), gte(chargingSessions.startedAt, since))),
       ]);
+
+      // Revenue (session-revenue.ts): ended sessions and reservation fees,
+      // minus refunds.
+      const revenue = await queryRevenueTotal({
+        companyCurrency: currency,
+        where: [
+          sql`${revenueItem.stationId} = ${id}`,
+          sql`${revenueItem.occurredAt} >= ${since.toISOString()}::timestamptz`,
+        ],
+      });
 
       const totalPortHours = (utilizationStats?.portCount ?? 1) * (periodMinutes / 60);
       const utilization =
@@ -2884,13 +3053,16 @@ export function stationRoutes(app: FastifyInstance): void {
         disconnectCount: Number(disconnectRow?.disconnect_count ?? 0),
         avgDowntimeMinutes: Math.round(Number(disconnectRow?.avg_downtime_minutes ?? 0)),
         maxDowntimeMinutes: Math.round(Number(disconnectRow?.max_downtime_minutes ?? 0)),
-        totalRevenueCents: financialStats?.totalRevenueCents ?? 0,
-        avgRevenueCentsPerSession: Math.round(financialStats?.avgRevenueCentsPerSession ?? 0),
-        totalTransactions: financialStats?.totalTransactions ?? 0,
+        totalRevenueCents: revenue.grossCents,
+        avgRevenueCentsPerSession:
+          revenue.sessionCount > 0
+            ? Math.round(revenue.sessionGrossCents / revenue.sessionCount)
+            : 0,
+        totalTransactions: revenue.itemCount,
         totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
-        totalProfitCents:
-          (financialStats?.totalRevenueCents ?? 0) -
-          (financialStats?.totalElectricityCostCents ?? 0),
+        totalNetRevenueCents: revenue.netCents,
+        totalTaxCents: revenue.taxCents,
+        totalProfitCents: revenue.netCents - (financialStats?.totalElectricityCostCents ?? 0),
         periodMonths: months,
         currency,
       };
@@ -2941,7 +3113,6 @@ export function stationRoutes(app: FastifyInstance): void {
           conditions.push(eq(chargingSessions.status, status));
         }
       }
-      const companyCurrency = await getCompanyCurrency();
       const where = and(...conditions);
 
       const [rows, countRows] = await Promise.all([
@@ -2962,7 +3133,7 @@ export function stationRoutes(app: FastifyInstance): void {
             energyDeliveredWh: chargingSessions.energyDeliveredWh,
             currentCostCents: chargingSessions.currentCostCents,
             finalCostCents: chargingSessions.finalCostCents,
-            currency: sessionCurrencySql(companyCurrency),
+            currency: sessionCurrencySql(),
             freeVend: chargingSessions.freeVend,
             guestSessionToken: guestSessions.sessionToken,
           })
@@ -3084,14 +3255,19 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Set or update station Basic Auth password',
         description:
-          'Hashes the provided password with argon2 and stores it on the station record. If the station is online, dispatches SetVariables(SecurityCtrlr.BasicAuthPassword) and a Reset(OnIdle) command so the station reconnects with the new credential. Logs a password_changed entry to the connection log.',
+          'Validates the password for the station protocol (16-20 characters for OCPP 1.6, 16-40 for OCPP 2.1, OCPP passwordString characters). When the station is online and uses security profile 1 or 2, sends it to the station (SetVariables BasicAuthPassword; ChangeConfiguration AuthorizationKey for OCPP 1.6) and stores it only after the station accepts. Otherwise stores it for provisioning. Logs a password_changed entry to the connection log.',
         operationId: 'setStationCredentials',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
         body: zodSchema(setCredentialsBody),
         response: {
-          200: successResponse,
+          200: itemResponse(passwordChangeResponse),
+          400: errorWith('Invalid password', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          502: errorWith('The station did not accept the password', [
+            ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
         },
       },
     },
@@ -3103,76 +3279,10 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
       const { password } = request.body as z.infer<typeof setCredentialsBody>;
-
-      const passwordHash = await hash(password);
-      const [station] = await db
-        .update(chargingStations)
-        .set({ basicAuthPasswordHash: passwordHash, updatedAt: new Date() })
-        .where(eq(chargingStations.id, id))
-        .returning({
-          id: chargingStations.id,
-          stationId: chargingStations.stationId,
-          isOnline: chargingStations.isOnline,
-        });
-
-      if (station == null) {
-        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
-        return;
-      }
-
-      try {
-        await db.insert(connectionLogs).values({
-          stationId: id,
-          event: 'password_changed',
-          metadata: { changedBy: 'operator' },
-        });
-      } catch (err) {
-        request.log.warn({ err, stationId: id }, 'Failed to write connection_logs row');
-      }
-
-      const actor = getAuditActor(request);
-      await writeAudit(
-        { table: stationAuditLog, idColumn: 'station_id' },
-        {
-          entityId: station.id,
-          entityIdSnapshot: station.id,
-          action: 'updated',
-          ...actor,
-          notes: 'Station credentials set',
-        },
-        db,
-        request.log,
-      );
-
-      // Push password to station via OCPP SetVariables (if online)
-      if (station.isOnline) {
-        const commandPayload = {
-          commandId: randomUUID(),
-          stationId: station.stationId,
-          action: 'SetVariables',
-          payload: {
-            setVariableData: [
-              {
-                component: { name: 'SecurityCtrlr' },
-                variable: { name: 'BasicAuthPassword' },
-                attributeValue: password,
-              },
-            ],
-          },
-        };
-        await getPubSub().publish('ocpp_commands', JSON.stringify(commandPayload));
-
-        // Reset the station so it reconnects with the new password
-        const resetPayload = {
-          commandId: randomUUID(),
-          stationId: station.stationId,
-          action: 'Reset',
-          payload: { type: 'OnIdle' },
-        };
-        await getPubSub().publish('ocpp_commands', JSON.stringify(resetPayload));
-      }
-
-      return { success: true };
+      return changeStationPassword(id, password, {
+        actor: getAuditActor(request),
+        log: request.log,
+      });
     },
   );
 
@@ -3185,7 +3295,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Rotate station Basic Auth password via OCPP',
         description:
-          'Generates a fresh 20-character Basic Auth password, dispatches SetVariables(SecurityCtrlr.BasicAuthPassword) to the station, and stores the new hash on success. Times out after 35s; the previous credential remains active until the new one is acknowledged. Returns 502 if the station rejects the SetVariables call and 409 if the station is offline.',
+          'Generates a fresh 20-character Basic Auth password, sends it to the station (SetVariables BasicAuthPassword; ChangeConfiguration AuthorizationKey for OCPP 1.6), and stores it only after the station accepts. Times out after 35s; the previous credential stays active unless the station accepts the new one. Returns 502 if the station rejects or does not answer and 409 if the station is offline.',
         operationId: 'rotateStationCredentials',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -3196,7 +3306,10 @@ export function stationRoutes(app: FastifyInstance): void {
           ]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
           409: errorWith('Station offline', [ERROR_CODES.STATION_OFFLINE]),
-          502: errorWith('Station rejected the command', [ERROR_CODES.STATION_REJECTED]),
+          502: errorWith('The station did not accept the password', [
+            ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
         },
       },
     },
@@ -3207,144 +3320,8 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-
-      // Verify station exists and is online
-      const [station] = await db
-        .select({
-          id: chargingStations.id,
-          stationId: chargingStations.stationId,
-          isOnline: chargingStations.isOnline,
-          securityProfile: chargingStations.securityProfile,
-        })
-        .from(chargingStations)
-        .where(eq(chargingStations.id, id));
-
-      if (station == null) {
-        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
-        return;
-      }
-
-      // BasicAuth password rotation only applies to SP1 (BasicAuth) and SP2
-      // (BasicAuth + TLS). SP0 has no auth and SP3 uses mTLS client certs, so
-      // pushing SecurityCtrlr.BasicAuthPassword to those profiles is a no-op
-      // that the station will reject. Reject up-front with a clear error.
-      if (station.securityProfile !== 1 && station.securityProfile !== 2) {
-        await reply.status(400).send({
-          error: 'Credential rotation only applies to security profiles 1 and 2',
-          code: 'ROTATION_NOT_APPLICABLE',
-        });
-        return;
-      }
-
-      if (!station.isOnline) {
-        await reply.status(409).send({ error: 'Station is offline', code: 'STATION_OFFLINE' });
-        return;
-      }
-
-      // Generate new password
-      const newPassword = randomBytes(15).toString('base64url').slice(0, 20);
-
-      // Send SetVariables command via pg_notify
-      const commandId = randomUUID();
-      const commandPayload = {
-        commandId,
-        stationId: station.stationId,
-        action: 'SetVariables',
-        payload: {
-          setVariableData: [
-            {
-              component: { name: 'SecurityCtrlr' },
-              variable: { name: 'BasicAuthPassword' },
-              attributeValue: newPassword,
-            },
-          ],
-        },
-      };
-
-      await getPubSub().publish('ocpp_commands', JSON.stringify(commandPayload));
-
-      // Wait for result on ocpp_command_results channel
-      const pubsub = getPubSub();
-      const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-        const timeout = setTimeout(() => {
-          resolve({ success: false, error: 'Command timed out' });
-        }, 35_000);
-
-        void pubsub
-          .subscribe('ocpp_command_results', (payload: string) => {
-            try {
-              const parsed = JSON.parse(payload) as {
-                commandId: string;
-                success: boolean;
-                error?: string;
-              };
-              if (parsed.commandId !== commandId) return;
-
-              clearTimeout(timeout);
-              resolve(
-                parsed.error != null
-                  ? { success: parsed.success, error: parsed.error }
-                  : { success: parsed.success },
-              );
-            } catch {
-              // Ignore parse errors from other messages
-            }
-          })
-          .catch(() => {
-            clearTimeout(timeout);
-            resolve({ success: false, error: 'Failed to listen for result' });
-          });
-      });
-
-      if (!result.success) {
-        await reply
-          .status(502)
-          .send({ error: result.error ?? 'Credential rotation failed', code: 'ROTATION_FAILED' });
-        return;
-      }
-
-      // On success, hash and store the new password
-      const passwordHash = await hash(newPassword);
-      await db
-        .update(chargingStations)
-        .set({ basicAuthPasswordHash: passwordHash, updatedAt: new Date() })
-        .where(eq(chargingStations.id, id));
-
-      // Log the event (best-effort: don't fail the rotation if forensic log fails)
-      try {
-        await db.insert(connectionLogs).values({
-          stationId: id,
-          event: 'credentials_rotated',
-          metadata: { rotatedBy: 'operator' },
-        });
-      } catch (err) {
-        request.log.warn({ err, stationId: id }, 'Failed to write connection_logs row');
-      }
-
-      // Reset the station so it reconnects with the new password
-      const resetPayload = {
-        commandId: randomUUID(),
-        stationId: station.stationId,
-        action: 'Reset',
-        payload: { type: 'OnIdle' },
-      };
-      await getPubSub().publish('ocpp_commands', JSON.stringify(resetPayload));
-
-      const actor = getAuditActor(request);
-      await writeAudit(
-        { table: stationAuditLog, idColumn: 'station_id' },
-        {
-          entityId: station.id,
-          entityIdSnapshot: station.id,
-          action: 'command_dispatched',
-          ...actor,
-          notes: 'Credentials rotated via SetVariables',
-        },
-        db,
-        request.log,
-      );
-
-      return { success: true };
+      await rotateStationPassword(id, { actor: getAuditActor(request), log: request.log });
+      return { success: true as const };
     },
   );
 
@@ -3356,6 +3333,8 @@ export function stationRoutes(app: FastifyInstance): void {
     'auth_failed',
     'password_changed',
     'credentials_rotated',
+    'security_profile_change_sent',
+    'security_profile_upgraded',
     'connected',
     'disconnected',
   ] as const;
@@ -3762,7 +3741,7 @@ export function stationRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof getInstalledCertsBody>;
 
       const stationRows = await db.execute(
-        sql`SELECT station_id FROM charging_stations WHERE id = ${id}`,
+        sql`SELECT station_id, ocpp_protocol FROM charging_stations WHERE id = ${id}`,
       );
       const stationRow = stationRows[0];
       if (stationRow == null) {
@@ -3770,16 +3749,26 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const commandPayload = JSON.stringify({
-        commandId: randomUUID(),
-        stationId: stationRow.station_id as string,
-        action: 'GetInstalledCertificateIds',
-        payload: {
-          certificateType: body.certificateType,
-        },
-      });
+      // An OCPP 1.6 station is asked about one certificate type per request, and only
+      // knows the Central System and Manufacturer roots.
+      const certificateTypeBatches =
+        stationRow.ocpp_protocol === 'ocpp1.6'
+          ? (body.certificateType ?? ['CSMSRootCertificate', 'ManufacturerRootCertificate'])
+              .filter((t) => t === 'CSMSRootCertificate' || t === 'ManufacturerRootCertificate')
+              .map((t) => [t])
+          : [body.certificateType];
 
-      await getPubSub().publish('ocpp_commands', commandPayload);
+      for (const certificateType of certificateTypeBatches) {
+        await getPubSub().publish(
+          'ocpp_commands',
+          JSON.stringify({
+            commandId: randomUUID(),
+            stationId: stationRow.station_id as string,
+            action: 'GetInstalledCertificateIds',
+            payload: { certificateType },
+          }),
+        );
+      }
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -4861,7 +4850,6 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const version = station.ocppProtocol === 'ocpp1.6' ? '1.6' : '2.1';
       const payload = {
         evseId: body.evseId ?? 0,
         duration: body.duration ?? 86400,
@@ -4872,7 +4860,6 @@ export function stationRoutes(app: FastifyInstance): void {
         station.stationId,
         'GetCompositeSchedule',
         payload,
-        version,
       );
 
       if (result.error != null) {
@@ -4956,8 +4943,6 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const version = station.ocppProtocol === 'ocpp1.6' ? '1.6' : '2.1';
-
       // Reshape API body into OCPP 2.1 ClearChargingProfileRequest. Criteria
       // (purpose/stackLevel/evseId) live under `chargingProfileCriteria`;
       // `chargingProfileId` stays at the top level. Empty criteria object is
@@ -4975,7 +4960,6 @@ export function stationRoutes(app: FastifyInstance): void {
         station.stationId,
         'ClearChargingProfile',
         ocppPayload,
-        version,
       );
 
       if (result.error != null) {
@@ -5126,18 +5110,13 @@ export function stationRoutes(app: FastifyInstance): void {
       // Best-effort clear existing profile with same purpose/stackLevel/evseId.
       // OCPP 2.1 wants the criteria nested under `chargingProfileCriteria`.
       try {
-        await sendOcppCommandAndWait(
-          station.stationId,
-          'ClearChargingProfile',
-          {
-            chargingProfileCriteria: {
-              chargingProfilePurpose: template.profilePurpose,
-              stackLevel: template.stackLevel,
-              evseId: template.evseId,
-            },
+        await sendOcppCommandAndWait(station.stationId, 'ClearChargingProfile', {
+          chargingProfileCriteria: {
+            chargingProfilePurpose: template.profilePurpose,
+            stackLevel: template.stackLevel,
+            evseId: template.evseId,
           },
-          version,
-        );
+        });
       } catch {
         // Non-critical: clear failure should not block set
       }
@@ -5165,12 +5144,7 @@ export function stationRoutes(app: FastifyInstance): void {
         },
       };
 
-      const result = await sendOcppCommandAndWait(
-        station.stationId,
-        'SetChargingProfile',
-        payload,
-        version,
-      );
+      const result = await sendOcppCommandAndWait(station.stationId, 'SetChargingProfile', payload);
 
       if (result.error != null) {
         return { success: false, status: 'Failed', errorInfo: result.error };
@@ -5325,20 +5299,15 @@ export function stationRoutes(app: FastifyInstance): void {
       if (ocppVersion === '1.6') {
         // OCPP 1.6: one SetVariables per variable
         for (const v of variables) {
-          const result = await sendOcppCommandAndWait(
-            station.stationId,
-            'SetVariables',
-            {
-              setVariableData: [
-                {
-                  component: { name: v.component },
-                  variable: { name: v.variable },
-                  attributeValue: v.value,
-                },
-              ],
-            },
-            ocppVersion,
-          );
+          const result = await sendOcppCommandAndWait(station.stationId, 'SetVariables', {
+            setVariableData: [
+              {
+                component: { name: v.component },
+                variable: { name: v.variable },
+                attributeValue: v.value,
+              },
+            ],
+          });
 
           if (result.error != null) {
             results.push({ component: v.component, variable: v.variable, status: result.error });

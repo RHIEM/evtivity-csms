@@ -4,7 +4,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, ne, and, or, ilike, sql, desc, asc } from 'drizzle-orm';
-import { db, getCompanyCurrency } from '@evtivity/database';
+import { db } from '@evtivity/database';
 import {
   drivers,
   driverTokens,
@@ -31,6 +31,7 @@ import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
 import * as tokenService from '../services/token.service.js';
+import { getPortalAccess, inviteDriverToPortal } from '../services/driver-portal-access.service.js';
 import { OCPP_TOKEN_TYPES } from './tokens.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { isValidTimezone } from '@evtivity/lib';
@@ -56,6 +57,30 @@ const driverItem = z
       .describe('Driver payment mode override; null inherits the fleet payment mode'),
     createdAt: z.coerce.date().describe('Timestamp when the driver was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the driver was last updated'),
+  })
+  .passthrough();
+
+const portalAccessItem = z
+  .object({
+    status: z
+      .enum(['active', 'invited', 'none'])
+      .describe(
+        'Driver portal access: active (has a password), invited (open invitation), or none',
+      ),
+    inviteExpiresAt: z.coerce
+      .date()
+      .nullable()
+      .describe('When the open invitation expires, or null when there is none'),
+  })
+  .passthrough();
+
+const driverDetailItem = driverItem
+  .extend({ portalAccess: portalAccessItem.describe('Driver portal access state') })
+  .passthrough();
+
+const portalInviteItem = z
+  .object({
+    expiresAt: z.coerce.date().describe('When the invitation link expires'),
   })
   .passthrough();
 
@@ -137,7 +162,7 @@ const driverReservationItem = z
       .number()
       .int()
       .min(0)
-      .describe('Fee actually charged (cents, 0 when waived)'),
+      .describe('Fee actually charged (cents, tax included, 0 when waived)'),
   })
   .passthrough();
 
@@ -362,7 +387,7 @@ export function driverRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
         response: {
-          200: itemResponse(driverItem),
+          200: itemResponse(driverDetailItem),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
         },
       },
@@ -374,7 +399,36 @@ export function driverRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
-      return driver;
+      return { ...driver, portalAccess: await getPortalAccess(driver.id) };
+    },
+  );
+
+  app.post(
+    '/drivers/:id/portal-invite',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Invite a driver to the driver portal',
+        description:
+          'Emails the driver a single-use link to set a password on their existing record, so they keep their sessions, tokens, payment methods, and invoices. The link expires after 7 days. Sending again replaces the earlier link. Only for active drivers with an email address and no portal password yet.',
+        operationId: 'inviteDriverToPortal',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        response: {
+          200: itemResponse(portalInviteItem),
+          400: errorWith('Driver has no email address', [ERROR_CODES.EMAIL_REQUIRED]),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Driver is inactive or already has portal access', [
+            ERROR_CODES.DRIVER_INACTIVE,
+            ERROR_CODES.PORTAL_ALREADY_ACTIVE,
+          ]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      return inviteDriverToPortal(id, { actor: getAuditActor(request), log: request.log });
     },
   );
 
@@ -999,7 +1053,6 @@ export function driverRoutes(app: FastifyInstance): void {
       const { page, limit } = request.query as z.infer<typeof sessionsQuery>;
       const offset = (page - 1) * limit;
 
-      const companyCurrency = await getCompanyCurrency();
       const where = eq(chargingSessions.driverId, id);
 
       // Run the existence check in parallel with the data + count queries.
@@ -1024,7 +1077,7 @@ export function driverRoutes(app: FastifyInstance): void {
             energyDeliveredWh: chargingSessions.energyDeliveredWh,
             currentCostCents: chargingSessions.currentCostCents,
             finalCostCents: chargingSessions.finalCostCents,
-            currency: sessionCurrencySql(companyCurrency),
+            currency: sessionCurrencySql(),
           })
           .from(chargingSessions)
           .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))

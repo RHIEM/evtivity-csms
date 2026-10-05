@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { api } from '@/lib/api';
 import { StationCard, type LayoutStation } from './StationCard';
 import { STATUS_COLORS } from '@/lib/chart-theme';
+import { formatNumber } from '@/lib/formatting';
 
 interface LoadManagementStation {
   id: string;
@@ -167,7 +168,7 @@ export function SiteLayout({ siteId }: SiteLayoutProps): React.JSX.Element {
               );
             })}
             {loadManagement != null && loadManagement.stations.length > 0 && (
-              <div className="absolute top-3 right-3 z-50 rounded-lg border bg-card/80 backdrop-blur-sm p-3 space-y-1.5 text-xs shadow-sm max-w-[180px]">
+              <div className="absolute top-3 right-3 z-50 rounded-lg border bg-card/80 backdrop-blur-xs p-3 space-y-1.5 text-xs shadow-xs max-w-[180px]">
                 <div className="flex items-center gap-1.5 font-semibold text-sm">
                   <Zap className="h-3.5 w-3.5" />
                   Power Draw
@@ -175,9 +176,10 @@ export function SiteLayout({ siteId }: SiteLayoutProps): React.JSX.Element {
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Draw</span>
                   <span className="font-medium">
-                    {loadManagement.stations
-                      .reduce((sum, s) => sum + s.currentDrawKw, 0)
-                      .toFixed(1)}{' '}
+                    {formatNumber(
+                      loadManagement.stations.reduce((sum, s) => sum + s.currentDrawKw, 0),
+                      1,
+                    )}{' '}
                     kW
                   </span>
                 </div>

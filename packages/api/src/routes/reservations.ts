@@ -22,7 +22,7 @@ import {
   writeReservationAudit,
   reservationDiffChanged,
 } from '@evtivity/database';
-import { dispatchDriverNotification, formatCurrencyAmount } from '@evtivity/lib';
+import { dispatchDriverNotification, notificationMoney } from '@evtivity/lib';
 import { zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -146,7 +146,9 @@ const reservationDetailItem = z
       .number()
       .int()
       .min(0)
-      .describe('Cancellation fee charged in cents (0 when waived or no payment method)'),
+      .describe(
+        'Cancellation fee charged in cents, tax included (0 when waived or no payment method)',
+      ),
     sessionId: z
       .string()
       .nullable()
@@ -188,7 +190,7 @@ const cancelReservationResponse = z
       .number()
       .int()
       .min(0)
-      .describe('Actual fee charged in cents (0 when waived or no payment method)'),
+      .describe('Actual fee charged in cents, tax included (0 when waived or no payment method)'),
     feeChargeFailed: z
       .boolean()
       .optional()
@@ -815,6 +817,7 @@ export function reservationRoutes(app: FastifyInstance): void {
             ERROR_CODES.EVSE_IN_USE,
             ERROR_CODES.RESERVATION_CONFLICT,
             ERROR_CODES.RESERVATION_DURING_MAINTENANCE,
+            ERROR_CODES.STATION_UNAVAILABLE,
           ]),
           500: errorWith('Reservation create failed', [ERROR_CODES.RESERVATION_CREATE_FAILED]),
           502: errorWith('Station rejected the command', [ERROR_CODES.RESERVATION_REJECTED]),
@@ -834,6 +837,9 @@ export function reservationRoutes(app: FastifyInstance): void {
           siteId: chargingStations.siteId,
           isOnline: chargingStations.isOnline,
           reservationsEnabled: chargingStations.reservationsEnabled,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
         })
         .from(chargingStations)
         .where(eq(chargingStations.stationId, body.stationId));
@@ -1694,10 +1700,11 @@ export function reservationRoutes(app: FastifyInstance): void {
       // own notification; firing another would deliver a misleading
       // "feeFormatted: ''" message and double-notify.
       if (cancelled && reservation.driverId != null) {
-        const cancellationFeeFormatted =
-          feeChargedCents > 0 && feeCurrency != null
-            ? formatCurrencyAmount(feeChargedCents, feeCurrency)
-            : '';
+        // The fee charged (tax included), formatted in the driver's language.
+        const feeCharged = feeChargedCents > 0 && feeCurrency != null;
+        const cancellationFeeFormatted = feeCharged
+          ? notificationMoney(feeChargedCents, feeCurrency)
+          : '';
         void dispatchDriverNotification(
           client,
           'reservation.Cancelled',
@@ -1706,6 +1713,8 @@ export function reservationRoutes(app: FastifyInstance): void {
             reservationId: reservation.reservationId,
             stationId: reservation.stationOcppId,
             cancellationFeeFormatted,
+            cancellationFeeCents: feeChargedCents,
+            currency: feeCurrency ?? '',
           },
           ALL_TEMPLATES_DIRS,
           getPubSub(),
@@ -1759,7 +1768,10 @@ export function reservationRoutes(app: FastifyInstance): void {
             ERROR_CODES.EVSE_NOT_FOUND,
             ERROR_CODES.STATION_NOT_FOUND,
           ]),
-          409: errorWith('Conflict', [ERROR_CODES.RESERVATION_DURING_MAINTENANCE]),
+          409: errorWith('Conflict', [
+            ERROR_CODES.RESERVATION_DURING_MAINTENANCE,
+            ERROR_CODES.STATION_UNAVAILABLE,
+          ]),
         },
       },
     },
@@ -1823,6 +1835,9 @@ export function reservationRoutes(app: FastifyInstance): void {
           siteId: chargingStations.siteId,
           isOnline: chargingStations.isOnline,
           reservationsEnabled: chargingStations.reservationsEnabled,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
         })
         .from(chargingStations)
         .where(eq(chargingStations.stationId, newStationOcppId));

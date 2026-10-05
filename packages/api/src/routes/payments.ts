@@ -12,12 +12,28 @@ import {
   paymentReconciliationRuns,
   chargingSessions,
   settings,
-  drivers,
   chargingStations,
   sites,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
-import { encryptString, decryptString, dispatchDriverNotification } from '@evtivity/lib';
+import {
+  encryptString,
+  decryptString,
+  dispatchDriverNotification,
+  notificationMoney,
+} from '@evtivity/lib';
+import {
+  authorizeSessionHold,
+  captureSessionHold,
+  PaymentProviderNotConfiguredError,
+  refundPaymentRecord,
+  removeDriverMethod,
+  retryShortfallForRecord,
+  runPaymentReconciliation,
+  saveDriverMethod,
+  setDefaultDriverMethod,
+  startDriverMethodSetup,
+} from '@evtivity/payments';
 import { zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -68,6 +84,12 @@ const stripeSettingsResponse = z
       .string()
       .nullable()
       .describe('Stripe secret API key (decrypted from storage; null when unset)'),
+    webhookSecret: z
+      .string()
+      .nullable()
+      .describe(
+        'Stripe webhook signing secret for POST /v1/webhooks/stripe (decrypted from storage; null when unset)',
+      ),
     preAuthAmountCents: z.unknown().describe('Default pre-authorization amount in cents'),
     platformFeePercent: z
       .number()
@@ -97,6 +119,7 @@ const driverPaymentMethodItem = z
 
 const setupIntentResponse = z
   .object({
+    provider: z.string().describe('Payment provider the card is added with (stripe, simulated)'),
     clientSecret: z
       .string()
       .nullable()
@@ -178,9 +201,11 @@ const preAuthFailedResponse = z
   .object({
     error: z.string().describe('Human-readable error message describing the pre-auth failure'),
     code: z.string().describe('Stable machine-readable error code'),
-    paymentRecord: paymentRecordItem.describe(
-      'Payment record created for the failed pre-authorization',
-    ),
+    paymentRecord: paymentRecordItem
+      .nullable()
+      .describe(
+        'Payment record of the failed pre-authorization (the session already had one when not new)',
+      ),
   })
   .passthrough();
 
@@ -236,17 +261,7 @@ const reconciliationResultItem = z
   })
   .passthrough();
 import { authorize } from '../middleware/rbac.js';
-import {
-  getStripeConfig,
-  createPreAuthorization,
-  capturePayment,
-  cancelPaymentIntent,
-  createRefund,
-  createSetupIntent,
-  createCustomer,
-  detachPaymentMethod,
-  clearConfigCache,
-} from '../services/stripe.service.js';
+import { clearPaymentCaches, paymentContext, paymentRegistry } from '../lib/payments.js';
 
 const siteIdParams = z.object({ id: ID_PARAMS.siteId.describe('Site ID') });
 const driverIdParams = z.object({ id: ID_PARAMS.driverId.describe('Driver ID') });
@@ -328,6 +343,13 @@ const refundBody = z.object({
 const updateStripeSettingsBody = z.object({
   secretKey: z.string().min(1).optional().describe('Stripe secret API key (stored encrypted)'),
   publishableKey: z.string().min(1).optional().describe('Stripe publishable API key'),
+  webhookSecret: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Stripe webhook signing secret (whsec_...) of the endpoint /v1/webhooks/stripe (stored encrypted)',
+    ),
   preAuthAmountCents: z
     .number()
     .int()
@@ -482,7 +504,7 @@ export function paymentRoutes(app: FastifyInstance): void {
           })
           .where(eq(sitePaymentConfigs.siteId, id))
           .returning();
-        clearConfigCache(id);
+        clearPaymentCaches();
         await writeSitePaymentConfigAudit(request, id, existing, updated);
         return updated;
       }
@@ -513,7 +535,7 @@ export function paymentRoutes(app: FastifyInstance): void {
         }
         throw err;
       }
-      clearConfigCache(id);
+      clearPaymentCaches();
       await writeSitePaymentConfigAudit(request, id, null, created);
       return created;
     },
@@ -579,7 +601,7 @@ export function paymentRoutes(app: FastifyInstance): void {
         });
         return;
       }
-      clearConfigCache(id);
+      clearPaymentCaches();
       await writeSitePaymentConfigAudit(request, id, deleted, null);
       return { success: true };
     },
@@ -608,15 +630,15 @@ export function paymentRoutes(app: FastifyInstance): void {
       for (const row of rows) {
         map.set(row.key, row.value);
       }
-      const rawSecret = map.get('stripe.secretKeyEnc');
       const encryptionKey = getEncryptionKey();
-      let secretKey: string | null = null;
-      if (typeof rawSecret === 'string' && rawSecret !== '' && encryptionKey !== '') {
-        secretKey = decryptString(rawSecret, encryptionKey);
-      }
+      const decryptSetting = (key: string): string | null => {
+        const raw = map.get(key);
+        return typeof raw === 'string' && raw !== '' ? decryptString(raw, encryptionKey) : null;
+      };
       return {
         publishableKey: map.get('stripe.publishableKey') ?? null,
-        secretKey,
+        secretKey: decryptSetting('stripe.secretKeyEnc'),
+        webhookSecret: decryptSetting('stripe.webhookSecretEnc'),
         preAuthAmountCents: map.get('stripe.preAuthAmountCents') ?? 5000,
         platformFeePercent: Number(map.get('stripe.platformFeePercent') ?? 0),
       };
@@ -651,11 +673,30 @@ export function paymentRoutes(app: FastifyInstance): void {
       if (body.publishableKey != null) {
         pairs.push({ key: 'stripe.publishableKey', value: body.publishableKey });
       }
+      if (body.webhookSecret != null) {
+        pairs.push({
+          key: 'stripe.webhookSecretEnc',
+          value: encryptString(body.webhookSecret, encryptionKey),
+        });
+      }
       if (body.preAuthAmountCents != null) {
         pairs.push({ key: 'stripe.preAuthAmountCents', value: body.preAuthAmountCents });
       }
       if (body.platformFeePercent != null) {
         pairs.push({ key: 'stripe.platformFeePercent', value: body.platformFeePercent });
+      }
+
+      // Until the provider select of the Payment settings (plan P5), saving
+      // a Stripe secret key selects Stripe when no provider is selected, as
+      // entering the keys turned payments on before the provider setting.
+      if (body.secretKey != null) {
+        const [current] = await db
+          .select({ value: settings.value })
+          .from(settings)
+          .where(eq(settings.key, 'payments.provider'));
+        if (current?.value == null || current.value === '' || current.value === 'none') {
+          pairs.push({ key: 'payments.provider', value: 'stripe' });
+        }
       }
 
       const keysToWrite = pairs.map((p) => p.key);
@@ -676,7 +717,7 @@ export function paymentRoutes(app: FastifyInstance): void {
           });
       }
 
-      clearConfigCache();
+      clearPaymentCaches();
 
       const actor = getAuditActor(request);
       await Promise.allSettled(
@@ -724,19 +765,18 @@ export function paymentRoutes(app: FastifyInstance): void {
       },
     },
     async (_request, reply) => {
-      const config = await getStripeConfig(null);
-      if (config == null) {
-        await reply.status(400).send({
-          error: 'Stripe is not configured',
-          code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
-        });
-        return;
-      }
-
       try {
-        await config.stripe.balance.retrieve();
+        const provider = await paymentRegistry.getPaymentProvider('stripe');
+        await provider.testConnection();
         return { success: true };
       } catch (err: unknown) {
+        if (err instanceof PaymentProviderNotConfiguredError) {
+          await reply.status(400).send({
+            error: 'Stripe is not configured',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+          });
+          return;
+        }
         const message = err instanceof Error ? err.message : 'Connection failed';
         await reply.status(400).send({
           error: message,
@@ -815,74 +855,35 @@ export function paymentRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof driverIdParams>;
-
-      const [driver] = await db
-        .select({
-          id: drivers.id,
-          email: drivers.email,
-          firstName: drivers.firstName,
-          lastName: drivers.lastName,
-        })
-        .from(drivers)
-        .where(eq(drivers.id, id));
-
-      if (driver == null) {
+      const result = await startDriverMethodSetup(
+        { driverId: id, channel: 'web' },
+        paymentContext(request.log),
+      );
+      if (result.status === 'driver_not_found') {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
-
-      const config = await getStripeConfig(null);
-      if (config == null) {
+      if (result.status === 'not_configured') {
         await reply.status(400).send({
-          error: 'No Stripe configuration available',
+          error: 'No payment provider configured',
           code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
         });
         return;
       }
-
-      // Find or create Stripe customer. Wrap the SDK calls so an invalid or
-      // stale API key surfaces as PAYMENT_PROVIDER_NOT_CONFIGURED instead of a 500.
-      const [existingMethod] = await db
-        .select({ stripeCustomerId: driverPaymentMethods.stripeCustomerId })
-        .from(driverPaymentMethods)
-        .where(eq(driverPaymentMethods.driverId, id))
-        .limit(1);
-
-      try {
-        let customerId: string;
-        if (existingMethod != null) {
-          customerId = existingMethod.stripeCustomerId;
-        } else {
-          const customer = await createCustomer(
-            config,
-            driver.email ?? '',
-            `${driver.firstName} ${driver.lastName}`,
-          );
-          customerId = customer.id;
-        }
-
-        const setupIntent = await createSetupIntent(config, customerId);
-        if (setupIntent.client_secret == null || setupIntent.client_secret === '') {
-          await reply.status(400).send({
-            error: 'Stripe returned an empty client secret',
-            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
-          });
-          return;
-        }
-        return {
-          clientSecret: setupIntent.client_secret,
-          customerId,
-          publishableKey: config.publishableKey,
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Stripe call failed';
-        request.log.warn({ err: message }, 'Stripe setup-intent failed');
+      if (result.status === 'failed') {
         await reply.status(400).send({
-          error: `Stripe is configured but the API rejected the request: ${message}`,
+          error: `The payment provider rejected the request: ${result.reason}`,
           code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
         });
         return;
       }
+      const session = result.session as { clientSecret?: unknown; publishableKey?: unknown };
+      return {
+        provider: result.providerId,
+        clientSecret: typeof session.clientSecret === 'string' ? session.clientSecret : null,
+        customerId: result.customerId,
+        publishableKey: typeof session.publishableKey === 'string' ? session.publishableKey : '',
+      };
     },
   );
 
@@ -897,34 +898,55 @@ export function paymentRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverIdParams),
         body: zodSchema(savePaymentMethodBody),
-        response: { 201: itemResponse(driverPaymentMethodItem) },
+        response: {
+          201: itemResponse(driverPaymentMethodItem),
+          400: errorWith('Payment provider not configured', [
+            ERROR_CODES.PAYMENT_PROVIDER_NOT_CONFIGURED,
+          ]),
+          403: errorWith('Method not attached to the customer', [ERROR_CODES.FORBIDDEN]),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+        },
       },
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof driverIdParams>;
       const body = request.body as z.infer<typeof savePaymentMethodBody>;
-
-      // Check if this is the first method to make it default
-      const existingMethods = await db
-        .select({ id: driverPaymentMethods.id })
-        .from(driverPaymentMethods)
-        .where(eq(driverPaymentMethods.driverId, id));
-
-      const isDefault = existingMethods.length === 0;
-
-      const [method] = await db
-        .insert(driverPaymentMethods)
-        .values({
+      // The operator adds a card for the driver: a driver without a customer
+      // takes the customer of the setup; the provider checks the method is
+      // attached to it.
+      const result = await saveDriverMethod(
+        {
           driverId: id,
-          stripeCustomerId: body.stripeCustomerId,
-          stripePaymentMethodId: body.stripePaymentMethodId,
-          cardBrand: body.cardBrand,
-          cardLast4: body.cardLast4,
-          isDefault,
-        })
-        .returning();
-
-      await reply.status(201).send(method);
+          customerId: body.stripeCustomerId,
+          methodId: body.stripePaymentMethodId,
+          adoptCustomer: true,
+        },
+        paymentContext(request.log),
+      );
+      switch (result.status) {
+        case 'saved':
+          await reply.status(201).send(result.method);
+          return;
+        case 'driver_not_found':
+          await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
+          return;
+        case 'forbidden':
+          await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
+          return;
+        case 'not_initialized':
+        case 'not_configured':
+          await reply.status(400).send({
+            error: 'No payment provider configured',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+          });
+          return;
+        case 'verify_failed':
+          await reply.status(400).send({
+            error: 'Could not verify payment method',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+          });
+          return;
+      }
     },
   );
 
@@ -946,32 +968,17 @@ export function paymentRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id, pmId } = request.params as z.infer<typeof paymentMethodParams>;
-
-      const [method] = await db
-        .select()
-        .from(driverPaymentMethods)
-        .where(and(eq(driverPaymentMethods.id, pmId), eq(driverPaymentMethods.driverId, id)));
-
-      if (method == null) {
+      const result = await removeDriverMethod(
+        { driverId: id, methodRowId: pmId, blockWhenInUse: false },
+        paymentContext(request.log),
+      );
+      if (result.status === 'not_found') {
         await reply.status(404).send({
           error: 'Payment method not found',
           code: 'PAYMENT_METHOD_NOT_FOUND',
         });
         return;
       }
-
-      // Detach from Stripe
-      const config = await getStripeConfig(null);
-      if (config != null) {
-        try {
-          await detachPaymentMethod(config, method.stripePaymentMethodId);
-        } catch {
-          // Payment method may already be detached
-        }
-      }
-
-      await db.delete(driverPaymentMethods).where(eq(driverPaymentMethods.id, pmId));
-
       return { success: true };
     },
   );
@@ -994,33 +1001,14 @@ export function paymentRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id, pmId } = request.params as z.infer<typeof paymentMethodParams>;
-
-      const [method] = await db
-        .select({ id: driverPaymentMethods.id })
-        .from(driverPaymentMethods)
-        .where(and(eq(driverPaymentMethods.id, pmId), eq(driverPaymentMethods.driverId, id)));
-
-      if (method == null) {
+      const updated = await setDefaultDriverMethod(id, pmId);
+      if (updated == null) {
         await reply.status(404).send({
           error: 'Payment method not found',
           code: 'PAYMENT_METHOD_NOT_FOUND',
         });
         return;
       }
-
-      // Unset all defaults for this driver
-      await db
-        .update(driverPaymentMethods)
-        .set({ isDefault: false, updatedAt: new Date() })
-        .where(eq(driverPaymentMethods.driverId, id));
-
-      // Set this one as default
-      const [updated] = await db
-        .update(driverPaymentMethods)
-        .set({ isDefault: true, updatedAt: new Date() })
-        .where(eq(driverPaymentMethods.id, pmId))
-        .returning();
-
       return updated;
     },
   );
@@ -1055,91 +1043,81 @@ export function paymentRoutes(app: FastifyInstance): void {
       const [session] = await db
         .select({
           id: chargingSessions.id,
-          stationId: chargingSessions.stationId,
           driverId: chargingSessions.driverId,
+          siteId: chargingStations.siteId,
         })
         .from(chargingSessions)
+        .innerJoin(chargingStations, eq(chargingStations.id, chargingSessions.stationId))
         .where(eq(chargingSessions.id, id));
-
       if (session == null) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }
 
-      const [pm] = await db
-        .select()
-        .from(driverPaymentMethods)
-        .where(eq(driverPaymentMethods.id, body.paymentMethodId));
-
-      if (pm == null) {
-        await reply.status(404).send({
-          error: 'Payment method not found',
-          code: 'PAYMENT_METHOD_NOT_FOUND',
-        });
-        return;
-      }
-
-      // Get site for this station
-      const [station] = await db
-        .select({ siteId: chargingStations.siteId })
-        .from(chargingStations)
-        .where(eq(chargingStations.id, session.stationId));
-
-      const config = await getStripeConfig(station?.siteId ?? null);
-      if (config == null) {
-        await reply.status(400).send({
-          error: 'No Stripe configuration available',
-          code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
-        });
-        return;
-      }
-
-      try {
-        const paymentIntent = await createPreAuthorization(
-          config,
-          pm.stripeCustomerId,
-          pm.stripePaymentMethodId,
-          body.amountCents,
-        );
-
-        const [record] = await db
-          .insert(paymentRecords)
-          .values({
-            sessionId: session.id,
-            driverId: session.driverId,
-            sitePaymentConfigId: config.configId,
-            stripePaymentIntentId: paymentIntent.id,
-            stripeCustomerId: pm.stripeCustomerId,
-            paymentSource: 'web_portal',
-            currency: config.currency,
-            preAuthAmountCents: body.amountCents ?? config.preAuthAmountCents,
-            status: 'pre_authorized',
-          })
-          .returning();
-
-        return record;
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Pre-authorization failed';
-        const [record] = await db
-          .insert(paymentRecords)
-          .values({
-            sessionId: session.id,
-            driverId: session.driverId,
-            sitePaymentConfigId: config.configId,
-            paymentSource: 'web_portal',
-            currency: config.currency,
-            preAuthAmountCents: body.amountCents ?? config.preAuthAmountCents,
-            status: 'failed',
-            failureReason: message,
-          })
-          .returning();
-
-        await reply.status(400).send({
-          error: message,
-          code: 'PRE_AUTH_FAILED',
-          paymentRecord: record,
-        });
-        return;
+      // Same key as the portal start and the OCPP gate (preauth_<sessionId>,
+      // P7): a retried request, or a pre-auth after the gate already placed
+      // one, returns the existing record instead of a second hold.
+      const outcome = await authorizeSessionHold(
+        {
+          sessionId: session.id,
+          driverId: session.driverId,
+          methodRowId: body.paymentMethodId,
+          siteId: session.siteId,
+          ...(body.amountCents != null ? { amountCents: body.amountCents } : {}),
+          trigger: 'operator',
+        },
+        paymentContext(request.log),
+      );
+      const recordOf = async (recordId: number | null): Promise<unknown> => {
+        if (recordId == null) return null;
+        const [row] = await db.select().from(paymentRecords).where(eq(paymentRecords.id, recordId));
+        return row ?? null;
+      };
+      switch (outcome.outcome) {
+        case 'authorized':
+          return recordOf(outcome.paymentRecordId);
+        case 'exists': {
+          const existing = await recordOf(outcome.paymentRecordId);
+          if (outcome.status === 'pre_authorized') return existing;
+          await reply.status(400).send({
+            error: 'The session already has a payment record',
+            code: 'PRE_AUTH_FAILED',
+            paymentRecord: existing,
+          });
+          return;
+        }
+        case 'declined': {
+          const [record] =
+            outcome.paymentRecordId != null
+              ? await db
+                  .select()
+                  .from(paymentRecords)
+                  .where(eq(paymentRecords.id, outcome.paymentRecordId))
+              : await db.select().from(paymentRecords).where(eq(paymentRecords.sessionId, id));
+          await reply.status(400).send({
+            error: outcome.reason,
+            code: 'PRE_AUTH_FAILED',
+            paymentRecord: record ?? null,
+          });
+          return;
+        }
+        case 'no_method':
+          await reply.status(404).send({
+            error: 'Payment method not found',
+            code: 'PAYMENT_METHOD_NOT_FOUND',
+          });
+          return;
+        case 'not_configured':
+          // The 400 body of this route carries the payment record (none here).
+          await reply.status(400).send({
+            error: 'No payment provider configured',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+            paymentRecord: null,
+          });
+          return;
+        case 'record_failed':
+          // The hold was cancelled again; the global handler answers 500.
+          throw new Error(`Failed to record the pre-authorization: ${outcome.reason}`);
       }
     },
   );
@@ -1170,85 +1148,34 @@ export function paymentRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof sessionIdParams>;
       const body = request.body as z.infer<typeof captureBody>;
-
-      const [record] = await db
-        .select()
-        .from(paymentRecords)
-        .where(and(eq(paymentRecords.sessionId, id), eq(paymentRecords.status, 'pre_authorized')));
-
-      if (record == null) {
-        await reply.status(404).send({
-          error: 'No pre-authorized payment for this session',
-          code: 'NO_PRE_AUTH',
-        });
-        return;
-      }
-
-      if (record.stripePaymentIntentId == null) {
-        await reply.status(400).send({
-          error: 'Payment intent missing',
-          code: 'MISSING_PAYMENT_INTENT',
-        });
-        return;
-      }
-
-      // Get session's final cost if no amount specified
-      let amountCents = body.amountCents;
-      if (amountCents == null) {
-        const [session] = await db
-          .select({ finalCostCents: chargingSessions.finalCostCents })
-          .from(chargingSessions)
-          .where(eq(chargingSessions.id, id));
-        amountCents = session?.finalCostCents ?? 0;
-      }
-
-      const [station] = await db
-        .select({ siteId: chargingStations.siteId })
-        .from(chargingStations)
-        .innerJoin(chargingSessions, eq(chargingSessions.stationId, chargingStations.id))
-        .where(eq(chargingSessions.id, id));
-
-      const config = await getStripeConfig(station?.siteId ?? null);
-      if (config == null) {
-        await reply.status(400).send({
-          error: 'No Stripe configuration available',
-          code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
-        });
-        return;
-      }
-
-      if (amountCents === 0) {
-        // Cancel the pre-auth instead of capturing 0
-        await cancelPaymentIntent(config, record.stripePaymentIntentId);
-        const [updated] = await db
-          .update(paymentRecords)
-          .set({
-            status: 'cancelled',
-            capturedAmountCents: 0,
-            updatedAt: new Date(),
-          })
-          .where(eq(paymentRecords.id, record.id))
-          .returning();
-        return updated;
-      }
-
-      await capturePayment(
-        config,
-        record.stripePaymentIntentId,
-        amountCents,
-        `capture_${String(record.id)}`,
+      // The session's final cost when no amount is given; a 0 amount cancels
+      // the hold. The platform fee is a percent of the net amount captured.
+      const outcome = await captureSessionHold(
+        { sessionId: id, ...(body.amountCents != null ? { amountCents: body.amountCents } : {}) },
+        paymentContext(request.log),
       );
-      const [updated] = await db
-        .update(paymentRecords)
-        .set({
-          status: 'captured',
-          capturedAmountCents: amountCents,
-          updatedAt: new Date(),
-        })
-        .where(eq(paymentRecords.id, record.id))
-        .returning();
-
-      return updated;
+      switch (outcome.status) {
+        case 'no_hold':
+          await reply.status(404).send({
+            error: 'No pre-authorized payment for this session',
+            code: 'NO_PRE_AUTH',
+          });
+          return;
+        case 'missing_payment_id':
+          await reply.status(400).send({
+            error: 'Payment intent missing',
+            code: 'MISSING_PAYMENT_INTENT',
+          });
+          return;
+        case 'not_configured':
+          await reply.status(400).send({
+            error: 'No payment provider configured',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+          });
+          return;
+        default:
+          return outcome.record;
+      }
     },
   );
 
@@ -1282,133 +1209,68 @@ export function paymentRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof refundBody>;
       const { userId } = request.user as JwtPayload;
 
-      // Lock the payment record for the duration of the refund so a concurrent
-      // capture or refund can't read a stale captured/refunded amount and
-      // double-spend. The transaction returns both the updated row and the
-      // amount actually refunded on THIS call so the post-commit notification
-      // can report the real delta (a "full remaining refund" without an
-      // explicit body.amountCents is computed inside; reporting the total
-      // capturedAmountCents instead would lie to the driver).
-      const txResult = await db.transaction(async (tx) => {
-        // Site access enforcement FIRST, before any payment-state response
-        // codes are leaked. Without this, an operator without access could
-        // probe via the response codes (NO_CAPTURED_PAYMENT vs valid) to
-        // learn whether a session in a restricted site has captured payment.
-        const [station] = await tx
-          .select({ siteId: chargingStations.siteId })
-          .from(chargingStations)
-          .innerJoin(chargingSessions, eq(chargingSessions.stationId, chargingStations.id))
-          .where(eq(chargingSessions.id, id));
+      // Site access first, before any payment-state answer: otherwise an
+      // operator without access could probe a restricted site's sessions
+      // through the response codes.
+      const [station] = await db
+        .select({ siteId: chargingStations.siteId })
+        .from(chargingStations)
+        .innerJoin(chargingSessions, eq(chargingSessions.stationId, chargingStations.id))
+        .where(eq(chargingSessions.id, id));
+      const siteIds = await getUserSiteIds(userId);
+      if (siteIds != null && station?.siteId != null && !siteIds.includes(station.siteId)) {
+        await reply.status(404).send({ error: 'Payment not found', code: 'PAYMENT_NOT_FOUND' });
+        return;
+      }
 
-        const siteIds = await getUserSiteIds(userId);
-        if (siteIds != null && station?.siteId != null && !siteIds.includes(station.siteId)) {
-          await reply.status(404).send({
-            error: 'Payment not found',
-            code: 'PAYMENT_NOT_FOUND',
-          });
-          return null as null | {
-            row: typeof paymentRecords.$inferSelect;
-            refundedNowCents: number;
-          };
-        }
-
-        const lockedRows = await tx.execute<{
-          id: number;
-          status: string;
-          stripe_payment_intent_id: string | null;
-          captured_amount_cents: number | null;
-          refunded_amount_cents: number;
-          driver_id: string | null;
-          currency: string;
-          session_id: string | null;
-        }>(sql`
-          SELECT id, status, stripe_payment_intent_id, captured_amount_cents,
-                 refunded_amount_cents, driver_id, currency, session_id
-          FROM payment_records
-          WHERE session_id = ${id}
-          FOR UPDATE
-        `);
-        const locked = lockedRows[0];
-
-        if (
-          locked == null ||
-          (locked.status !== 'captured' && locked.status !== 'partially_refunded')
-        ) {
+      // The record is locked for the refund, and the request key
+      // <recordId>_<refundedSoFar>_<amount> makes a retry reuse the refund
+      // while a later partial refund gets its own (P7).
+      const outcome = await refundPaymentRecord(
+        {
+          sessionId: id,
+          ...(body.amountCents != null ? { amountCents: body.amountCents } : {}),
+          actorUserId: userId,
+          actionReason: (full) => body.reason ?? (full ? 'Full refund' : 'Partial refund'),
+        },
+        paymentContext(request.log),
+      );
+      switch (outcome.status) {
+        case 'no_captured_payment':
           await reply.status(400).send({
             error: 'No captured payment to refund',
             code: 'NO_CAPTURED_PAYMENT',
           });
-          return null;
-        }
-        if (locked.stripe_payment_intent_id == null) {
+          return;
+        case 'missing_payment_id':
           await reply.status(400).send({
             error: 'Payment intent missing',
             code: 'MISSING_PAYMENT_INTENT',
           });
-          return null;
-        }
-
-        const captured = locked.captured_amount_cents ?? 0;
-        const alreadyRefunded = locked.refunded_amount_cents;
-        const remaining = captured - alreadyRefunded;
-        const requestedAmount = body.amountCents ?? remaining;
-        if (requestedAmount <= 0 || requestedAmount > remaining) {
-          await reply.status(409).send({
-            error: `Refund amount ${String(requestedAmount)} exceeds remaining refundable balance ${String(remaining)}`,
-            code: 'REFUND_EXCEEDS_REMAINING',
-          });
-          return null;
-        }
-
-        const config = await getStripeConfig(station?.siteId ?? null);
-        if (config == null) {
+          return;
+        case 'not_configured':
           await reply.status(400).send({
-            error: 'No Stripe configuration available',
+            error: 'No payment provider configured',
             code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
           });
-          return null;
+          return;
+        case 'nothing_refundable':
+        case 'exceeds_remaining': {
+          const requested = outcome.status === 'exceeds_remaining' ? outcome.requestedCents : 0;
+          await reply.status(409).send({
+            error: `Refund amount ${String(requested)} exceeds remaining refundable balance ${String(outcome.remainingCents)}`,
+            code: 'REFUND_EXCEEDS_REMAINING',
+          });
+          return;
         }
-
-        // Idempotency key derived from intent + already-refunded delta + new
-        // amount. Survives client retries (timeouts, network blips) by
-        // producing the same key for the same logical operation, while still
-        // allowing legitimate sequential partial refunds (alreadyRefunded
-        // changes between calls so the next partial refund gets a different
-        // key). Stripe holds idempotency keys for 24h.
-        const refundRequestId = `${String(locked.id)}_${String(alreadyRefunded)}_${String(requestedAmount)}`;
-        await createRefund(
-          config,
-          locked.stripe_payment_intent_id,
-          requestedAmount,
-          refundRequestId,
-        );
-
-        const refundedTotal = alreadyRefunded + requestedAmount;
-        const isFullRefund = refundedTotal >= captured;
-
-        const [row] = await tx
-          .update(paymentRecords)
-          .set({
-            status: isFullRefund ? 'refunded' : 'partially_refunded',
-            refundedAmountCents: refundedTotal,
-            lastActorUserId: userId,
-            lastActionReason: body.reason ?? (isFullRefund ? 'Full refund' : 'Partial refund'),
-            updatedAt: new Date(),
-          })
-          .where(eq(paymentRecords.id, locked.id))
-          .returning();
-        return { row, refundedNowCents: requestedAmount };
-      });
-
-      if (txResult == null) return;
-      const updated = txResult.row;
-      const refundedNowCents = txResult.refundedNowCents;
-      if (updated == null) return;
+        case 'refunded':
+          break;
+      }
+      const updated = outcome.record;
+      const refundedNowCents = outcome.refundedNowCents;
 
       // Driver notification: payment refunded. Fire-and-forget so a slow
-      // SMTP/Twilio call doesn't delay the refund response, but capture the
-      // promise rejection (the surrounding try/catch only saw synchronous
-      // throws and silently dropped async failures, which masked SMTP misconfig).
+      // SMTP/Twilio call does not delay the response; a failure is logged.
       if (updated.driverId != null) {
         dispatchDriverNotification(
           client,
@@ -1416,6 +1278,7 @@ export function paymentRoutes(app: FastifyInstance): void {
           updated.driverId,
           {
             amountCents: refundedNowCents,
+            amountFormatted: notificationMoney(refundedNowCents, updated.currency),
             currency: updated.currency,
             transactionId: updated.sessionId,
           },
@@ -1513,139 +1376,51 @@ export function paymentRoutes(app: FastifyInstance): void {
       const { id } = request.params as { id: number };
       const { userId } = request.user as JwtPayload;
 
-      const [record] = await db.select().from(paymentRecords).where(eq(paymentRecords.id, id));
-
-      if (record == null) {
-        await reply.status(404).send({ error: 'Payment not found', code: 'PAYMENT_NOT_FOUND' });
-        return;
-      }
-      if (record.stripePaymentIntentId == null) {
-        await reply.status(409).send({
-          error: 'Payment has no Stripe intent',
-          code: 'PAYMENT_RECORD_NOT_RECOVERABLE',
-        });
-        return;
-      }
-
-      // Look up the session's final cost to know the target amount.
-      const sessionId = record.sessionId;
-      if (sessionId == null) {
-        await reply.status(409).send({
-          error: 'Payment is not linked to a session',
-          code: 'PAYMENT_RECORD_NOT_RECOVERABLE',
-        });
-        return;
-      }
-      const [sessionRow] = await db.execute<{
-        final_cost_cents: number | null;
-        site_id: string | null;
-      }>(sql`
-        SELECT cs.final_cost_cents, cs2.site_id
-        FROM charging_sessions cs
-        JOIN charging_stations cs2 ON cs2.id = cs.station_id
-        WHERE cs.id = ${sessionId}
-      `);
-
-      // Site access enforcement: operators with restricted site access can
-      // only retry payments for sessions on their assigned sites.
+      // Site access: operators with restricted site access can only retry
+      // payments of sessions on their sites.
+      const [row] = await db
+        .select({ siteId: chargingStations.siteId })
+        .from(paymentRecords)
+        .innerJoin(chargingSessions, eq(chargingSessions.id, paymentRecords.sessionId))
+        .innerJoin(chargingStations, eq(chargingStations.id, chargingSessions.stationId))
+        .where(eq(paymentRecords.id, id));
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && sessionRow?.site_id != null && !siteIds.includes(sessionRow.site_id)) {
+      if (siteIds != null && row?.siteId != null && !siteIds.includes(row.siteId)) {
         await reply.status(404).send({ error: 'Payment not found', code: 'PAYMENT_NOT_FOUND' });
         return;
       }
 
-      const finalCostCents = sessionRow?.final_cost_cents ?? 0;
-      const captured = record.capturedAmountCents ?? 0;
-      const shortfall = finalCostCents - captured;
-      if (shortfall <= 0) {
-        await reply.status(409).send({
-          error: 'No shortfall to recover',
-          code: 'PAYMENT_RECORD_NOT_RECOVERABLE',
-        });
-        return;
+      // Same card and payout account, the platform fee of the increment, key
+      // topup_retry_<recordId>_<captured> shared with the daily retry.
+      const outcome = await retryShortfallForRecord(
+        { recordId: id, actorUserId: userId },
+        paymentContext(request.log),
+      );
+      switch (outcome.status) {
+        case 'not_found':
+          await reply.status(404).send({ error: 'Payment not found', code: 'PAYMENT_NOT_FOUND' });
+          return;
+        case 'not_recoverable':
+          await reply.status(409).send({
+            error: outcome.reason,
+            code: 'PAYMENT_RECORD_NOT_RECOVERABLE',
+          });
+          return;
+        case 'not_configured':
+          await reply.status(409).send({
+            error: 'Payment provider not configured',
+            code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+          });
+          return;
+        case 'failed':
+          await reply.status(502).send({
+            error: `The payment provider rejected the top-up: ${outcome.reason}`,
+            code: 'PAYMENT_TOP_UP_FAILED',
+          });
+          return;
+        case 'recovered':
+          return outcome.record;
       }
-
-      const config = await getStripeConfig(sessionRow?.site_id ?? null);
-      if (config == null) {
-        await reply.status(409).send({
-          error: 'Stripe not configured',
-          code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
-        });
-        return;
-      }
-
-      let topUpId: string;
-      try {
-        const origIntent = await config.stripe.paymentIntents.retrieve(
-          record.stripePaymentIntentId,
-        );
-        const customerId =
-          typeof origIntent.customer === 'string'
-            ? origIntent.customer
-            : (origIntent.customer?.id ?? null);
-        const pmId =
-          typeof origIntent.payment_method === 'string'
-            ? origIntent.payment_method
-            : (origIntent.payment_method?.id ?? null);
-        if (customerId == null || pmId == null) {
-          throw new Error('Original PaymentIntent missing customer or payment_method');
-        }
-        const params: Record<string, unknown> = {
-          amount: shortfall,
-          currency: record.currency.toLowerCase(),
-          customer: customerId,
-          payment_method: pmId,
-          confirm: true,
-          off_session: true,
-          capture_method: 'automatic',
-          description: `Retry top-up for session ${sessionId}`,
-        };
-        if (origIntent.on_behalf_of != null) {
-          params['on_behalf_of'] = origIntent.on_behalf_of;
-          params['transfer_data'] = {
-            destination:
-              typeof origIntent.on_behalf_of === 'string'
-                ? origIntent.on_behalf_of
-                : origIntent.on_behalf_of.id,
-          };
-          // Carry the same platform-fee rate onto the top-up. Without this
-          // the entire delta flows to the connected account and the platform
-          // gets nothing on the overage portion of the session.
-          if (
-            origIntent.application_fee_amount != null &&
-            origIntent.application_fee_amount > 0 &&
-            origIntent.amount > 0
-          ) {
-            const feeRate = origIntent.application_fee_amount / origIntent.amount;
-            params['application_fee_amount'] = Math.round(shortfall * feeRate);
-          }
-        }
-        const topUp = await config.stripe.paymentIntents.create(
-          params as unknown as Parameters<typeof config.stripe.paymentIntents.create>[0],
-          { idempotencyKey: `topup_retry_${String(record.id)}_${String(captured)}` },
-        );
-        topUpId = topUp.id;
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message.slice(0, 400) : 'Top-up failed';
-        await reply.status(502).send({
-          error: `Stripe rejected top-up: ${message}`,
-          code: 'PAYMENT_TOP_UP_FAILED',
-        });
-        return;
-      }
-
-      const [updated] = await db
-        .update(paymentRecords)
-        .set({
-          capturedAmountCents: finalCostCents,
-          failureReason: null,
-          lastActorUserId: userId,
-          lastActionReason: `Operator retry top-up; recovered ${String(shortfall)}c via ${topUpId}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(paymentRecords.id, record.id))
-        .returning();
-      return updated;
     },
   );
 
@@ -1697,19 +1472,7 @@ export function paymentRoutes(app: FastifyInstance): void {
       },
     },
     async (request) => {
-      const { reconcilePayments } = await import('../services/payment-reconciliation.service.js');
-      const result = await reconcilePayments(request.log);
-
-      await db.insert(paymentReconciliationRuns).values({
-        checkedCount: result.checked,
-        matchedCount: result.matched,
-        discrepancyCount: result.discrepancies.length,
-        errorCount: result.errors.length,
-        discrepancies: result.discrepancies,
-        errors: result.errors.length > 0 ? result.errors : null,
-      });
-
-      return result;
+      return runPaymentReconciliation(paymentContext(request.log));
     },
   );
 

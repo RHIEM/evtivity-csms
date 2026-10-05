@@ -7,6 +7,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { Tooltip } from '@/components/ui/tooltip';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { SaveButton } from '@/components/save-button';
@@ -444,6 +445,9 @@ export function ConnectorStatus({
         <CreateButton
           label={t('stations.addEvse')}
           onClick={() => {
+            if (ocppProtocol === 'ocpp1.6') {
+              setNewEvseConnector((prev) => ({ ...prev, connectorId: newEvseId }));
+            }
             setAddEvseOpen(true);
           }}
         />
@@ -549,12 +553,14 @@ export function ConnectorStatus({
                       href={`${PORTAL_BASE_URL}/charge/${stationOcppId}/${String(evse.evseId)}`}
                       title={t('stations.openGuestCharger')}
                     />
-                    <AddIconButton
-                      onClick={() => {
-                        openAddConnector(evse.evseId);
-                      }}
-                      title={t('stations.addConnector')}
-                    />
+                    {ocppProtocol !== 'ocpp1.6' && (
+                      <AddIconButton
+                        onClick={() => {
+                          openAddConnector(evse.evseId);
+                        }}
+                        title={t('stations.addConnector')}
+                      />
+                    )}
                     <EditIconButton
                       onClick={() => {
                         openEditEvse(evse);
@@ -596,10 +602,16 @@ export function ConnectorStatus({
                           )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
-                          {conn.maxPowerKw != null && (
+                          {conn.maxPowerKw != null ? (
                             <span className="text-muted-foreground">
                               {t('charts.powerValue', { value: conn.maxPowerKw })}
                             </span>
+                          ) : (
+                            <Tooltip content={t('stations.maxPowerUnknownHint')}>
+                              <Badge variant="warning" className="text-xs font-normal">
+                                {t('stations.maxPowerUnknown')}
+                              </Badge>
+                            </Tooltip>
                           )}
                           {conn.maxCurrentAmps != null && (
                             <span className="text-muted-foreground">
@@ -654,7 +666,9 @@ export function ConnectorStatus({
           </DialogHeader>
           <form onSubmit={handleAddEvse} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="new-evse-id">{t('stations.evseIdLabel')}</Label>
+              <Label htmlFor="new-evse-id" className="leading-6">
+                {t('stations.evseIdLabel')}
+              </Label>
               <Input
                 id="new-evse-id"
                 type="number"
@@ -663,24 +677,34 @@ export function ConnectorStatus({
                 value={newEvseId}
                 onChange={(e) => {
                   setNewEvseId(e.target.value);
+                  // A 1.6 EVSE holds only the connector with its own number.
+                  if (ocppProtocol === 'ocpp1.6') {
+                    const value = e.target.value;
+                    setNewEvseConnector((prev) => ({ ...prev, connectorId: value }));
+                  }
                 }}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-id">{t('stations.connectorIdLabel')}</Label>
+              <Label htmlFor="new-evse-conn-id" className="leading-6">
+                {t('stations.connectorIdLabel')}
+              </Label>
               <Input
                 id="new-evse-conn-id"
                 type="number"
                 min="1"
                 required
                 value={newEvseConnector.connectorId}
+                disabled={ocppProtocol === 'ocpp1.6'}
                 onChange={(e) => {
                   setNewEvseConnector((prev) => ({ ...prev, connectorId: e.target.value }));
                 }}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-type">{t('stations.connectorType')}</Label>
+              <Label htmlFor="new-evse-conn-type" className="leading-6">
+                {t('stations.connectorType')}
+              </Label>
               <Select
                 id="new-evse-conn-type"
                 value={newEvseConnector.connectorType}
@@ -694,7 +718,9 @@ export function ConnectorStatus({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-power">{t('stations.maxPower')}</Label>
+              <Label htmlFor="new-evse-conn-power" className="leading-6">
+                {t('stations.maxPower')}
+              </Label>
               <Input
                 id="new-evse-conn-power"
                 type="number"
@@ -707,7 +733,9 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-current">{t('stations.maxCurrent')}</Label>
+              <Label htmlFor="new-evse-conn-current" className="leading-6">
+                {t('stations.maxCurrent')}
+              </Label>
               <Input
                 id="new-evse-conn-current"
                 type="number"
@@ -742,7 +770,9 @@ export function ConnectorStatus({
           </DialogHeader>
           <form onSubmit={handleAddConnector} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="add-conn-id">{t('stations.connectorIdLabel')}</Label>
+              <Label htmlFor="add-conn-id" className="leading-6">
+                {t('stations.connectorIdLabel')}
+              </Label>
               <Input
                 id="add-conn-id"
                 type="number"
@@ -755,7 +785,9 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-type">{t('stations.connectorType')}</Label>
+              <Label htmlFor="add-conn-type" className="leading-6">
+                {t('stations.connectorType')}
+              </Label>
               <Select
                 id="add-conn-type"
                 value={newConnector.connectorType}
@@ -769,7 +801,9 @@ export function ConnectorStatus({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-power">{t('stations.maxPower')}</Label>
+              <Label htmlFor="add-conn-power" className="leading-6">
+                {t('stations.maxPower')}
+              </Label>
               <Input
                 id="add-conn-power"
                 type="number"
@@ -782,7 +816,9 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-current">{t('stations.maxCurrent')}</Label>
+              <Label htmlFor="add-conn-current" className="leading-6">
+                {t('stations.maxCurrent')}
+              </Label>
               <Input
                 id="add-conn-current"
                 type="number"
@@ -825,7 +861,9 @@ export function ConnectorStatus({
                 </p>
                 <div className="grid grid-cols-3 gap-2">
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-type-${String(i)}`}>{t('stations.connectorType')}</Label>
+                    <Label htmlFor={`edit-type-${String(i)}`} className="leading-6">
+                      {t('stations.connectorType')}
+                    </Label>
                     <Select
                       id={`edit-type-${String(i)}`}
                       value={c.connectorType}
@@ -844,7 +882,9 @@ export function ConnectorStatus({
                     </Select>
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-power-${String(i)}`}>{t('stations.maxPower')}</Label>
+                    <Label htmlFor={`edit-power-${String(i)}`} className="leading-6">
+                      {t('stations.maxPower')}
+                    </Label>
                     <Input
                       id={`edit-power-${String(i)}`}
                       type="number"
@@ -862,7 +902,9 @@ export function ConnectorStatus({
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-current-${String(i)}`}>{t('stations.maxCurrent')}</Label>
+                    <Label htmlFor={`edit-current-${String(i)}`} className="leading-6">
+                      {t('stations.maxCurrent')}
+                    </Label>
                     <Input
                       id={`edit-current-${String(i)}`}
                       type="number"

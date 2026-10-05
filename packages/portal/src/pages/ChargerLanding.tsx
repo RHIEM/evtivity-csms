@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useEffect, useState } from 'react';
-import { useParams, useNavigate, Link } from 'react-router';
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { MapPin, Plug, Info } from 'lucide-react';
@@ -14,6 +14,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { PricingDisplay } from '@/components/PricingDisplay';
+import { usePriceDisplay } from '@/hooks/use-price-display';
 import type { PricingInfo } from '@/components/PricingDisplay';
 import { EvPlugAnimation } from '@/components/EvPlugAnimation';
 import { api } from '@/lib/api';
@@ -24,7 +25,11 @@ import {
   connectorStatusClassName,
   isStartable,
 } from '@/lib/connector-status';
-import { checkGuestConnectorStatus, formatConnectorType } from '@/lib/charger-utils';
+import {
+  checkGuestConnectorStatus,
+  formatConnectorType,
+  qrTransactionLimits,
+} from '@/lib/charger-utils';
 import { useStationEvents } from '@/hooks/use-station-events';
 import { useCableCheck } from '@/hooks/use-cable-check';
 
@@ -50,13 +55,16 @@ interface ChargerInfo {
     reservationExpiresAt: string | null;
   };
   maintenance: { active: boolean; plannedEndAt: string | null; message: string | null } | null;
+  stationUnavailable: boolean;
 }
 
 export function ChargerLanding(): React.JSX.Element {
   const { t } = useTranslation();
   const { stationId, evseId } = useParams<{ stationId: string; evseId: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
+  const priceDisplay = usePriceDisplay();
   const { companyName, companyLogo, branding } = useAuthBranding();
   useStationEvents(stationId);
 
@@ -115,7 +123,7 @@ export function ChargerLanding(): React.JSX.Element {
     try {
       const result = await api.post<{ sessionToken: string }>(
         `/v1/portal/guest/start/${stationId}/${evseId}`,
-        {},
+        qrTransactionLimits(searchParams),
       );
       void navigate(`/guest-session/${result.sessionToken}`);
     } catch (err: unknown) {
@@ -139,7 +147,8 @@ export function ChargerLanding(): React.JSX.Element {
     await runWithCableCheck(
       () => checkGuestConnectorStatus(stationId, evseId),
       () => {
-        void navigate(`/charge/${stationId}/${evseId}/checkout`);
+        // Keep the QR code limit parameters (maxenergy, maxtime, maxcost).
+        void navigate(`/charge/${stationId}/${evseId}/checkout?${searchParams.toString()}`);
       },
       setFreeStartError,
     );
@@ -177,7 +186,10 @@ export function ChargerLanding(): React.JSX.Element {
   // the reservation-holder case; guests must always be blocked.
   const isReserved = charger.evse.reservationExpiresAt != null;
   const isAvailable =
-    charger.maintenance?.active !== true && isStartable(connectorStatus) && !isReserved;
+    charger.maintenance?.active !== true &&
+    !charger.stationUnavailable &&
+    isStartable(connectorStatus) &&
+    !isReserved;
   const maxPower = charger.evse.connectors.reduce((max, c) => Math.max(max, c.maxPowerKw ?? 0), 0);
   const maxCurrent = charger.evse.connectors.reduce(
     (max, c) => Math.max(max, c.maxCurrentAmps ?? 0),
@@ -207,6 +219,11 @@ export function ChargerLanding(): React.JSX.Element {
           )}
         </CardHeader>
         <CardContent className="space-y-4">
+          {charger.stationUnavailable && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-left">
+              <p className="text-sm">{t('errors.STATION_UNAVAILABLE')}</p>
+            </div>
+          )}
           {charger.maintenance?.active === true && (
             <div className="rounded-md border border-warning/40 bg-warning/10 p-3 text-left">
               <p className="font-semibold text-sm">{t('charger.maintenanceTitle')}</p>
@@ -268,7 +285,9 @@ export function ChargerLanding(): React.JSX.Element {
                   {t(`status.${connectorStatus}`)}
                 </Badge>
               </div>
-              {displayPricing != null && <PricingDisplay pricing={displayPricing} />}
+              {displayPricing != null && priceDisplay != null && (
+                <PricingDisplay pricing={displayPricing} priceDisplay={priceDisplay} />
+              )}
             </>
           )}
 

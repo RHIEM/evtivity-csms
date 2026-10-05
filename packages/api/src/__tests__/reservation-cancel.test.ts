@@ -14,7 +14,17 @@ const {
   updateMock: vi.fn(),
   getReservationSettingsMock: vi.fn(),
   writeReservationAuditMock: vi.fn(async () => undefined),
-  chargeCancellationFeeMock: vi.fn(async (): Promise<string | null> => 'USD'),
+  chargeCancellationFeeMock: vi.fn(
+    async (): Promise<Record<string, unknown>> => ({
+      status: 'charged',
+      paymentRecordId: 1,
+      grossCents: 595,
+      netCents: 500,
+      taxCents: 95,
+      taxRate: 0.19,
+      currency: 'USD',
+    }),
+  ),
 }));
 
 vi.mock('@evtivity/database', () => ({
@@ -35,8 +45,12 @@ vi.mock('drizzle-orm', () => ({
   ),
 }));
 
-vi.mock('../lib/reservation-fees.js', () => ({
-  chargeReservationCancellationFee: chargeCancellationFeeMock,
+vi.mock('@evtivity/payments', () => ({
+  chargeReservationFee: chargeCancellationFeeMock,
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  paymentContext: vi.fn((logger: unknown) => ({ registry: 'registry', logger })),
 }));
 
 import { applyReservationCancellation } from '../lib/reservation-cancel.js';
@@ -154,8 +168,18 @@ describe('applyReservationCancellation', () => {
   });
 
   it('charges the fee inside the window and persists the actual amount', async () => {
-    executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'active' }]);
-    chargeCancellationFeeMock.mockResolvedValueOnce('EUR');
+    executeMock.mockResolvedValueOnce([
+      { id: 'rsv_1', status_before: 'active', station_id: 'sta_1' },
+    ]);
+    chargeCancellationFeeMock.mockResolvedValueOnce({
+      status: 'charged',
+      paymentRecordId: 1,
+      grossCents: 595,
+      netCents: 500,
+      taxCents: 95,
+      taxRate: 0.19,
+      currency: 'EUR',
+    });
     const updateChain = makeUpdateChain();
     updateMock.mockReturnValue(updateChain);
 
@@ -163,22 +187,37 @@ describe('applyReservationCancellation', () => {
       baseInput({ startsAt: new Date(Date.now() + 5 * 60_000) }),
     );
 
-    expect(chargeCancellationFeeMock).toHaveBeenCalledWith('drv_1', 'sit_1', 500, 'rsv_1');
+    // The fee setting (500) is net; the charge adds the station tariff's tax.
+    // The charge runs with the API's payment context (registry and logger).
+    expect(chargeCancellationFeeMock).toHaveBeenCalledWith(
+      {
+        type: 'reservation_cancellation',
+        reservationId: 'rsv_1',
+        driverId: 'drv_1',
+        stationId: 'sta_1',
+        siteId: 'sit_1',
+        netCents: 500,
+      },
+      { registry: 'registry', logger: expect.anything() },
+    );
     expect(result).toEqual({
-      feeChargedCents: 500,
+      feeChargedCents: 595,
       cancelled: true,
       feeChargeFailed: false,
       feeCurrency: 'EUR',
     });
-    // The follow-up UPDATE writes the captured amount.
+    // The follow-up UPDATE writes the amount charged, tax included.
     expect(updateChain.set).toHaveBeenCalledWith(
-      expect.objectContaining({ cancellationFeeCents: 500 }),
+      expect.objectContaining({ cancellationFeeCents: 595 }),
     );
   });
 
   it('reports no fee when the charge is skipped for lack of a payment method', async () => {
     executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'active' }]);
-    chargeCancellationFeeMock.mockResolvedValueOnce(null);
+    chargeCancellationFeeMock.mockResolvedValueOnce({
+      status: 'skipped',
+      reason: 'no_payment_method',
+    });
     const updateChain = makeUpdateChain();
     updateMock.mockReturnValue(updateChain);
 
@@ -195,7 +234,7 @@ describe('applyReservationCancellation', () => {
     expect(updateChain.set).not.toHaveBeenCalled();
   });
 
-  it('surfaces feeChargeFailed=true and logs when the Stripe charge throws', async () => {
+  it('surfaces feeChargeFailed=true and logs when the fee charge throws', async () => {
     executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'active' }]);
     chargeCancellationFeeMock.mockRejectedValueOnce(new Error('card declined'));
     const errorLog = vi.fn();
@@ -216,6 +255,43 @@ describe('applyReservationCancellation', () => {
     expect(errorLog).toHaveBeenCalledWith(
       expect.objectContaining({ reservationId: 'rsv_1', plannedFeeCents: 500 }),
       'cancellation fee charge failed',
+    );
+  });
+
+  it('surfaces feeChargeFailed=true when the card is declined', async () => {
+    executeMock.mockResolvedValueOnce([
+      { id: 'rsv_1', status_before: 'active', station_id: 'sta_1' },
+    ]);
+    chargeCancellationFeeMock.mockResolvedValueOnce({
+      status: 'failed',
+      paymentRecordId: 4,
+      reason: 'Your card was declined.',
+    });
+    const warnLog = vi.fn();
+    const logger = { warn: warnLog };
+
+    const result = await applyReservationCancellation(
+      baseInput({
+        startsAt: new Date(Date.now() + 5 * 60_000),
+        logger: logger as never,
+      }),
+    );
+
+    // The caller's logger becomes the payment context logger.
+    expect(chargeCancellationFeeMock).toHaveBeenCalledWith(expect.anything(), {
+      registry: 'registry',
+      logger,
+    });
+
+    expect(result).toEqual({
+      feeChargedCents: 0,
+      cancelled: true,
+      feeChargeFailed: true,
+      feeCurrency: null,
+    });
+    expect(warnLog).toHaveBeenCalledWith(
+      { reservationId: 'rsv_1', paymentRecordId: 4 },
+      'cancellation fee charge failed: Your card was declined.',
     );
   });
 

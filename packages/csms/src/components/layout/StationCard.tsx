@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { motion, useMotionValue } from 'motion/react';
 import { MessageSquare, Plug, Zap, Circle, Plus, Minus, Power, Shield } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
-import { formatEnergy } from '@/lib/formatting';
+import { formatEnergy, formatNumber } from '@/lib/formatting';
 import { STATUS_COLORS, SVG_COLORS } from '@/lib/chart-theme';
 import { stationCardConnectorStatusVariant } from '@/lib/status-variants';
 
@@ -34,6 +35,7 @@ export interface LayoutStation {
   stationId: string;
   model: string | null;
   status: string;
+  statusReason?: string | null | undefined;
   isOnline: boolean;
   securityProfile: number;
   positionX: number;
@@ -224,7 +226,7 @@ function Tooltip({
   return (
     <span className="group/tip relative inline-flex">
       {children}
-      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover/tip:block whitespace-nowrap rounded bg-popover px-1.5 py-0.5 text-xs text-popover-foreground shadow border z-[100]">
+      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover/tip:block whitespace-nowrap rounded bg-popover px-1.5 py-0.5 text-xs text-popover-foreground shadow-sm border z-100">
         {label}
       </span>
     </span>
@@ -301,10 +303,21 @@ export function StationCard({
   allocatedLimitKw,
   collapseKey,
 }: StationCardProps): React.JSX.Element {
+  const { t } = useTranslation();
   const charging = isCharging(station);
   const energy = totalEnergy(station);
   const connectors = allConnectors(station);
   const level = stationLevel(station);
+  const reasonLabel =
+    station.statusReason != null &&
+    (station.status === 'unavailable' || station.status === 'faulted')
+      ? t(`stations.statusReason.${station.statusReason}`, station.statusReason)
+      : null;
+  const stationIcon = (
+    <StationIcon status={station.status} charging={charging} dc={level === 'DC Fast'} />
+  );
+  const iconWithReason =
+    reasonLabel != null ? <Tooltip label={reasonLabel}>{stationIcon}</Tooltip> : stationIcon;
   const motionX = useMotionValue(station.positionX);
   const motionY = useMotionValue(station.positionY);
   const [zIndex, setZIndex] = useState(0);
@@ -351,7 +364,7 @@ export function StationCard({
         onDragEnd(station.id, snappedX, snappedY);
       }}
       className={cn(
-        'rounded-lg border bg-card text-card-foreground shadow-sm select-none',
+        'rounded-lg border bg-card text-card-foreground shadow-xs select-none',
         expanded ? 'w-[280px]' : 'w-[160px]',
         isDragging && 'ring-2 ring-primary shadow-lg',
       )}
@@ -411,7 +424,7 @@ export function StationCard({
         {expanded ? (
           <>
             <div className="flex items-center gap-2">
-              <StationIcon status={station.status} charging={charging} dc={level === 'DC Fast'} />
+              {iconWithReason}
               {level !== '' && (
                 <span className="text-xs font-medium text-muted-foreground">{level}</span>
               )}
@@ -454,7 +467,7 @@ export function StationCard({
                     />
                   </div>
                   <p className="text-xs text-muted-foreground text-center">
-                    {currentDrawKw.toFixed(1)} / {allocatedLimitKw.toFixed(1)} kW
+                    {formatNumber(currentDrawKw, 1)} / {formatNumber(allocatedLimitKw, 1)} kW
                   </p>
                 </div>
               )}
@@ -514,7 +527,7 @@ export function StationCard({
         ) : (
           <>
             <div className="flex items-center gap-2">
-              <StationIcon status={station.status} charging={charging} dc={level === 'DC Fast'} />
+              {iconWithReason}
               <div className="flex flex-col gap-1 min-w-0">
                 <div className="flex flex-wrap gap-1">
                   {connectors.map((conn, i) => (
@@ -541,7 +554,7 @@ export function StationCard({
                     )}
                   >
                     <Zap className="h-2.5 w-2.5" />
-                    <span>{currentDrawKw.toFixed(1)} kW</span>
+                    <span>{formatNumber(currentDrawKw, 1)} kW</span>
                   </div>
                 )}
               </div>

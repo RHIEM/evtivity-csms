@@ -102,9 +102,13 @@ vi.mock('postgres', () => ({
   }),
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn().mockResolvedValue(null),
-  createPreAuthorization: vi.fn().mockResolvedValue({ id: 'pi_test_123' }),
+vi.mock('@evtivity/payments', () => ({
+  authorizeSessionHold: vi.fn(),
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: vi.fn().mockResolvedValue(null),
+  paymentContext: vi.fn(() => ({})),
 }));
 
 vi.mock('../lib/pubsub.js', () => ({
@@ -114,11 +118,6 @@ vi.mock('../lib/pubsub.js', () => ({
     close: vi.fn().mockResolvedValue(undefined),
   })),
   setPubSub: vi.fn(),
-}));
-
-vi.mock('../services/tariff.service.js', () => ({
-  resolveTariff: vi.fn().mockResolvedValue(null),
-  isTariffFree: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock('../services/driver.service.js', () => ({

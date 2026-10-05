@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { eq, and, or, ilike, sql, gte, count, desc } from 'drizzle-orm';
-import { db, getCompanyCurrency } from '@evtivity/database';
+import { db } from '@evtivity/database';
 import {
   fleets,
   fleetDrivers,
@@ -20,6 +20,10 @@ import {
 import type { PaymentMode } from '@evtivity/database';
 import type { PaginationParams } from '../lib/pagination.js';
 import { sessionCurrencySql } from '../lib/company-currency.js';
+import {
+  buildDerivedStatusSubquery,
+  buildStatusReasonSubquery,
+} from '../lib/station-derived-status.js';
 
 export async function listFleets(params: PaginationParams) {
   const { page, limit, search } = params;
@@ -149,15 +153,6 @@ export async function removeDriverFromFleet(fleetId: string, driverId: string) {
 }
 
 export async function getFleetStations(fleetId: string) {
-  const derivedStatus = sql<string>`CASE
-    WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'occupied') > 0 THEN 'charging'
-    WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'reserved') > 0 THEN 'reserved'
-    WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'faulted') > 0 THEN 'faulted'
-    WHEN COUNT(${connectors.id}) = 0 THEN 'unknown'
-    WHEN COUNT(${connectors.id}) FILTER (WHERE ${connectors.status} = 'available') = COUNT(${connectors.id}) THEN 'available'
-    ELSE 'unavailable'
-  END`;
-
   return db
     .select({
       id: chargingStations.id,
@@ -166,7 +161,8 @@ export async function getFleetStations(fleetId: string) {
       model: chargingStations.model,
       securityProfile: chargingStations.securityProfile,
       ocppProtocol: chargingStations.ocppProtocol,
-      status: derivedStatus,
+      status: buildDerivedStatusSubquery(chargingStations.id),
+      statusReason: buildStatusReasonSubquery(chargingStations.id),
       connectorCount: sql<number>`COUNT(${connectors.id})::int`,
       connectorTypes: sql<
         string[]
@@ -271,7 +267,6 @@ export async function searchAvailableVehicles(fleetId: string, search: string, l
 
 export async function getFleetSessions(fleetId: string, page: number, limit: number) {
   const offset = (page - 1) * limit;
-  const companyCurrency = await getCompanyCurrency();
   const driverFilter = sql`${chargingSessions.driverId} IN (select driver_id from fleet_drivers where fleet_id = ${fleetId})`;
 
   const [rows, countRows] = await Promise.all([
@@ -289,7 +284,7 @@ export async function getFleetSessions(fleetId: string, page: number, limit: num
         energyDeliveredWh: chargingSessions.energyDeliveredWh,
         currentCostCents: chargingSessions.currentCostCents,
         finalCostCents: chargingSessions.finalCostCents,
-        currency: sessionCurrencySql(companyCurrency),
+        currency: sessionCurrencySql(),
       })
       .from(chargingSessions)
       .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))

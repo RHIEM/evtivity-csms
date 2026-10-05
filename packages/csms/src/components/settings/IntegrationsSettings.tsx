@@ -10,7 +10,9 @@ import { SaveButton } from '@/components/save-button';
 import { Spinner } from '@/components/ui/spinner';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -100,6 +102,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const [pncHubjectTokenUrl, setPncHubjectTokenUrl] = useState('');
   const [pncWarningDays, setPncWarningDays] = useState('30');
   const [pncCriticalDays, setPncCriticalDays] = useState('7');
+  const [pncOcspAllowedHosts, setPncOcspAllowedHosts] = useState('');
 
   const roamingEnabled = settings != null && settings['roaming.enabled'] === true;
 
@@ -116,6 +119,10 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setPncHubjectTokenUrl(s('pnc.hubject.tokenUrl'));
     setPncWarningDays(s('pnc.expirationWarningDays') || '30');
     setPncCriticalDays(s('pnc.expirationCriticalDays') || '7');
+    const hosts = pncSettings['pnc.ocsp.allowedPrivateHosts'];
+    setPncOcspAllowedHosts(
+      Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string').join('\n') : '',
+    );
   }, [pncSettings]);
 
   useEffect(() => {
@@ -356,6 +363,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
       hubjectTokenUrl: string;
       expirationWarningDays: number;
       expirationCriticalDays: number;
+      ocspAllowedPrivateHosts: string[];
     }) => api.put('/v1/pnc/settings', vals),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['pnc-settings'] });
@@ -622,7 +630,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.roamingEnabled')}</Label>
+                <Label className="leading-6">{t('settings.roamingEnabled')}</Label>
               </div>
               <button
                 type="button"
@@ -652,7 +660,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.pncEnabled')}</Label>
+                <Label className="leading-6">{t('settings.pncEnabled')}</Label>
               </div>
               <button
                 type="button"
@@ -674,7 +682,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               <>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-provider">{t('settings.pncProvider')}</Label>
+                    <Label htmlFor="pnc-provider" className="leading-6">
+                      {t('settings.pncProvider')}
+                    </Label>
                     <Select
                       id="pnc-provider"
                       value={pncProvider}
@@ -689,7 +699,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-warning-days">
+                    <Label htmlFor="pnc-warning-days" className="leading-6">
                       {t('settings.pncExpirationWarningDays')}
                     </Label>
                     <Input
@@ -705,7 +715,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-critical-days">
+                    <Label htmlFor="pnc-critical-days" className="leading-6">
                       {t('settings.pncExpirationCriticalDays')}
                     </Label>
                     <Input
@@ -721,10 +731,28 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </div>
                 </div>
 
+                <div className="space-y-2">
+                  <Label htmlFor="pnc-ocsp-allowed-hosts" className="leading-6">
+                    {t('settings.pncOcspAllowedPrivateHosts')}
+                  </Label>
+                  <Textarea
+                    id="pnc-ocsp-allowed-hosts"
+                    rows={3}
+                    value={pncOcspAllowedHosts}
+                    onChange={(e) => {
+                      setPncOcspAllowedHosts(e.target.value);
+                    }}
+                    placeholder="ocsp.internal.example"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.pncOcspAllowedPrivateHostsHint')}
+                  </p>
+                </div>
+
                 {pncProvider === 'hubject' && (
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-base-url">
+                      <Label htmlFor="pnc-hubject-base-url" className="leading-6">
                         {t('settings.pncHubjectBaseUrl')}
                       </Label>
                       <Input
@@ -738,7 +766,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-client-id">
+                      <Label htmlFor="pnc-hubject-client-id" className="leading-6">
                         {t('settings.pncHubjectClientId')}
                       </Label>
                       <Input
@@ -751,7 +779,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-client-secret">
+                      <Label htmlFor="pnc-hubject-client-secret" className="leading-6">
                         {t('settings.pncHubjectClientSecret')}
                       </Label>
                       <PasswordInput
@@ -770,7 +798,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-token-url">
+                      <Label htmlFor="pnc-hubject-token-url" className="leading-6">
                         {t('settings.pncHubjectTokenUrl')}
                       </Label>
                       <Input
@@ -798,6 +826,10 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                         hubjectTokenUrl: pncHubjectTokenUrl,
                         expirationWarningDays: Number(pncWarningDays),
                         expirationCriticalDays: Number(pncCriticalDays),
+                        ocspAllowedPrivateHosts: pncOcspAllowedHosts
+                          .split(/[\s,]+/)
+                          .map((h) => h.trim())
+                          .filter((h) => h !== ''),
                       });
                     }}
                   />
@@ -837,7 +869,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.reservationEnabled')}</Label>
+                <Label className="leading-6">{t('settings.reservationEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">
                   {t('settings.reservationEnabledDesc')}
                 </p>
@@ -872,7 +904,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.supportEnabled')}</Label>
+                <Label className="leading-6">{t('settings.supportEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.supportEnabledDesc')}</p>
               </div>
               <button
@@ -902,7 +934,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.fleetEnabled')}</Label>
+                <Label className="leading-6">{t('settings.fleetEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.fleetEnabledDesc')}</p>
               </div>
               <button
@@ -932,7 +964,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.guestChargingEnabled')}</Label>
+                <Label className="leading-6">{t('settings.guestChargingEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">
                   {t('settings.guestChargingEnabledDesc')}
                 </p>
@@ -1044,7 +1076,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.splitBilling')}</Label>
+                <Label className="leading-6">{t('settings.splitBilling')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.splitBillingDesc')}</p>
               </div>
               <button
@@ -1106,32 +1138,22 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="grid gap-2">
                     <Label htmlFor="google-maps-lat">{t('settings.googleMapsDefaultLat')}</Label>
-                    <Input
+                    <DecimalInput
                       id="google-maps-lat"
-                      type="number"
-                      step="0.0001"
-                      min={-90}
-                      max={90}
                       placeholder="39.8283"
                       value={googleMapsDefaultLat}
-                      onChange={(e) => {
-                        setGoogleMapsDefaultLat(e.target.value);
-                      }}
+                      onChange={setGoogleMapsDefaultLat}
+                      allowNegative
                     />
                   </div>
                   <div className="grid gap-2">
                     <Label htmlFor="google-maps-lng">{t('settings.googleMapsDefaultLng')}</Label>
-                    <Input
+                    <DecimalInput
                       id="google-maps-lng"
-                      type="number"
-                      step="0.0001"
-                      min={-180}
-                      max={180}
                       placeholder="-98.5795"
                       value={googleMapsDefaultLng}
-                      onChange={(e) => {
-                        setGoogleMapsDefaultLng(e.target.value);
-                      }}
+                      onChange={setGoogleMapsDefaultLng}
+                      allowNegative
                     />
                   </div>
                 </div>
@@ -1196,7 +1218,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="s3-bucket">{t('settings.s3Bucket')}</Label>
+                <Label htmlFor="s3-bucket" className="leading-6">
+                  {t('settings.s3Bucket')}
+                </Label>
                 <Input
                   id="s3-bucket"
                   value={s3Bucket}
@@ -1208,7 +1232,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-region">{t('settings.s3Region')}</Label>
+                <Label htmlFor="s3-region" className="leading-6">
+                  {t('settings.s3Region')}
+                </Label>
                 <Input
                   id="s3-region"
                   value={s3Region}
@@ -1220,7 +1246,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-access-key">{t('settings.s3AccessKeyId')}</Label>
+                <Label htmlFor="s3-access-key" className="leading-6">
+                  {t('settings.s3AccessKeyId')}
+                </Label>
                 <Input
                   id="s3-access-key"
                   value={s3AccessKeyId}
@@ -1231,7 +1259,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-secret-key">{t('settings.s3SecretAccessKey')}</Label>
+                <Label htmlFor="s3-secret-key" className="leading-6">
+                  {t('settings.s3SecretAccessKey')}
+                </Label>
                 <PasswordInput
                   id="s3-secret-key"
                   value={s3SecretAccessKey}
@@ -1380,7 +1410,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="ftp-host">{t('settings.ftpHost')}</Label>
+                <Label htmlFor="ftp-host" className="leading-6">
+                  {t('settings.ftpHost')}
+                </Label>
                 <Input
                   id="ftp-host"
                   value={ftpHost}
@@ -1391,7 +1423,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-port">{t('settings.ftpPort')}</Label>
+                <Label htmlFor="ftp-port" className="leading-6">
+                  {t('settings.ftpPort')}
+                </Label>
                 <Input
                   id="ftp-port"
                   type="number"
@@ -1403,7 +1437,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-username">{t('settings.ftpUsername')}</Label>
+                <Label htmlFor="ftp-username" className="leading-6">
+                  {t('settings.ftpUsername')}
+                </Label>
                 <Input
                   id="ftp-username"
                   value={ftpUsername}
@@ -1414,7 +1450,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-password">{t('settings.ftpPassword')}</Label>
+                <Label htmlFor="ftp-password" className="leading-6">
+                  {t('settings.ftpPassword')}
+                </Label>
                 <PasswordInput
                   id="ftp-password"
                   value={ftpPassword}
@@ -1425,7 +1463,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="ftp-path">{t('settings.ftpPath')}</Label>
+                <Label htmlFor="ftp-path" className="leading-6">
+                  {t('settings.ftpPath')}
+                </Label>
                 <Input
                   id="ftp-path"
                   value={ftpPath}
@@ -1468,7 +1508,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.sentryEnabled')}</Label>
+                <Label className="leading-6">{t('settings.sentryEnabled')}</Label>
               </div>
               <button
                 type="button"

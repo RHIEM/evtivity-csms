@@ -14,7 +14,11 @@ vi.mock('argon2', async (importActual) => {
 });
 
 import { hash, verify } from 'argon2';
-import { authenticateConnection, extractStationId } from '../server/middleware/authenticate.js';
+import {
+  authenticateConnection,
+  extractStationId,
+  rejectionFor,
+} from '../server/middleware/authenticate.js';
 
 const verifyMock = verify as unknown as ReturnType<typeof vi.fn>;
 
@@ -189,6 +193,7 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Unknown station');
+    expect(result.failure).toBe('unknown_station');
   });
 
   it('rejects blocked station', async () => {
@@ -251,6 +256,7 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Basic auth credentials required');
+    expect(result.failure).toBe('credentials');
   });
 
   it('rejects SP1 station with wrong password', async () => {
@@ -319,6 +325,38 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Security Profile 2 requires TLS');
+    expect(result.failure).toBe('tls_required');
+  });
+
+  it('accepts SP2 station when a trusted load balancer ended TLS', async () => {
+    const passwordHash = await hash('testpass');
+    const sql = createMockSql([
+      {
+        id: 'db-id-5b',
+        security_profile: 2,
+        basic_auth_password_hash: passwordHash,
+        onboarding_status: 'accepted',
+      },
+    ]);
+    const authHeader = 'Basic ' + Buffer.from('SP2-STATION:testpass').toString('base64');
+    const req = createMockRequest('/SP2-STATION', authHeader, false);
+    const result = await authenticateConnection(req, logger, sql, null, true);
+    expect(result.authenticated).toBe(true);
+  });
+
+  it('still requires TLS on the socket for SP3 behind a load balancer', async () => {
+    const sql = createMockSql([
+      {
+        id: 'db-id-5c',
+        security_profile: 3,
+        basic_auth_password_hash: null,
+        onboarding_status: 'accepted',
+      },
+    ]);
+    const req = createMockRequest('/SP3-STATION', undefined, false);
+    const result = await authenticateConnection(req, logger, sql, null, true);
+    expect(result.authenticated).toBe(false);
+    expect(result.failure).toBe('tls_required');
   });
 
   it('rejects SP1 station with no password configured', async () => {
@@ -640,5 +678,148 @@ describe('authenticateConnection', () => {
       expect.objectContaining({ event: 'auth_failed', stationDbId: 'db-id-log-fail' }),
       'Failed to write connection_logs row',
     );
+  });
+});
+
+describe('rejectionFor', () => {
+  it('challenges credential failures with 401 and WWW-Authenticate', () => {
+    const rejection = rejectionFor({
+      authenticated: false,
+      stationId: 'CS-1',
+      stationDbId: 'sta_1',
+      failure: 'credentials',
+    });
+    expect(rejection.status).toBe(401);
+    expect(rejection.headers?.['WWW-Authenticate']).toMatch(/^Basic realm="OCPP"/);
+  });
+
+  it('rejects TLS and client certificate failures with 401 and no challenge', () => {
+    for (const failure of ['tls_required', 'client_certificate'] as const) {
+      const rejection = rejectionFor({
+        authenticated: false,
+        stationId: 'CS-1',
+        stationDbId: 'sta_1',
+        failure,
+      });
+      expect(rejection.status).toBe(401);
+      expect(rejection.headers).toBeUndefined();
+    }
+  });
+
+  it('maps unknown, blocked and unavailable to 404, 403 and 503', () => {
+    const base = { authenticated: false, stationId: 'CS-1', stationDbId: null };
+    expect(rejectionFor({ ...base, failure: 'unknown_station' }).status).toBe(404);
+    expect(rejectionFor({ ...base, failure: 'blocked' }).status).toBe(403);
+    expect(rejectionFor({ ...base, failure: 'unavailable' }).status).toBe(503);
+    expect(rejectionFor(base).status).toBe(503);
+  });
+});
+
+describe('authenticateConnection with a pending security profile upgrade', () => {
+  const PASSWORD = 'pending-upgrade-pw';
+  let passwordHash = '';
+  const basic = (user: string): string =>
+    'Basic ' + Buffer.from(`${user}:${PASSWORD}`).toString('base64');
+
+  // Records each query's SQL text and values, answering the station lookup.
+  function recordingSql(station: Record<string, unknown>) {
+    const queries: { text: string; values: unknown[] }[] = [];
+    const fn = vi.fn();
+    const proxy = new Proxy(fn, {
+      apply(_t, _this, args: unknown[]) {
+        const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
+        const text = strings.join('?');
+        queries.push({ text, values });
+        return Promise.resolve(text.includes('FROM charging_stations') ? [station] : []) as unknown;
+      },
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'json') return (v: unknown) => v;
+        return target[prop as keyof typeof target];
+      },
+    });
+    return { sql: proxy as unknown as Parameters<typeof authenticateConnection>[2], queries };
+  }
+
+  beforeEach(async () => {
+    if (passwordHash === '') passwordHash = await hash(PASSWORD);
+  });
+
+  it('accepts the pending profile and promotes it (A05.FR.06)', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 0,
+      pending_security_profile: 1,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP', basic('CS-UP')),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    const update = queries.find((q) => q.text.includes('UPDATE charging_stations'));
+    expect(update?.text).toContain('pending_security_profile = NULL');
+    expect(update?.values).toEqual([1, 1, 'sta_up', 1]);
+    // The password hash is cleared only for an upgrade to Mutual TLS (profile 3).
+    expect(update?.text).toContain('basic_auth_password_hash = CASE WHEN');
+    expect(queries.some((q) => q.values.includes('security_profile_upgraded'))).toBe(true);
+  });
+
+  it('still accepts the current profile while the upgrade is pending, without logging failures', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 0,
+      pending_security_profile: 1,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    expect(queries.some((q) => q.text.includes('UPDATE charging_stations'))).toBe(false);
+    expect(queries.some((q) => q.values.includes('auth_failed'))).toBe(false);
+  });
+
+  it('does not promote to TLS profile 2 on a plain connection; profile 1 still applies', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 1,
+      pending_security_profile: 2,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP', basic('CS-UP')),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    expect(queries.some((q) => q.text.includes('UPDATE charging_stations'))).toBe(false);
+  });
+
+  it('rejects the lower profile once the upgrade is promoted (A05.FR.07)', async () => {
+    const { sql } = recordingSql({
+      id: 'sta_up',
+      security_profile: 1,
+      pending_security_profile: null,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(false);
+    expect(result.failure).toBe('credentials');
   });
 });

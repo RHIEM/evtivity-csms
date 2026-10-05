@@ -5,8 +5,16 @@ import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and, or, ilike, desc, asc, sql, gte, gt, isNull, count, inArray } from 'drizzle-orm';
-import { db, client, getCompanyCurrency } from '@evtivity/database';
-import { decryptString, formatCurrencyAmount } from '@evtivity/lib';
+import {
+  db,
+  client,
+  getCompanyCurrency,
+  getCompanyTaxBasis,
+  isStationLevelUnavailable,
+  isStationChargingFree,
+  resolveStationTariff,
+} from '@evtivity/database';
+import { decryptString, notificationMoney, TAX_BASES } from '@evtivity/lib';
 import { config as apiConfig } from '../../lib/config.js';
 import {
   chargingStations,
@@ -54,9 +62,8 @@ import {
   setCachedConnectorStatus,
 } from '../../lib/rate-limiters.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
-import { getStripeConfig, createPreAuthorization } from '../../services/stripe.service.js';
-import { isSimulatedCustomer } from '@evtivity/lib';
-import { resolveTariff, isTariffFree } from '../../services/tariff.service.js';
+import { authorizeSessionHold } from '@evtivity/payments';
+import { activePaymentProvider, paymentContext } from '../../lib/payments.js';
 import { resolvePaymentMode } from '../../services/driver.service.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
 import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
@@ -117,6 +124,11 @@ const portalChargerDetail = z
       .passthrough()
       .nullable()
       .describe('Active maintenance window for the site; null when none'),
+    stationUnavailable: z
+      .boolean()
+      .describe(
+        'True when the whole station cannot charge right now (disabled, firmware install, or a station-level fault)',
+      ),
   })
   .passthrough();
 
@@ -179,6 +191,11 @@ const portalStationDetail = z
       .passthrough()
       .nullable()
       .describe('Active maintenance window for the site; null when none'),
+    stationUnavailable: z
+      .boolean()
+      .describe(
+        'True when the whole station cannot charge right now (disabled, firmware install, or a station-level fault)',
+      ),
   })
   .passthrough();
 
@@ -321,7 +338,7 @@ const cancelReservationResponse = z
       .number()
       .int()
       .min(0)
-      .describe('Actual fee charged in cents (0 when waived or no payment method)'),
+      .describe('Actual fee charged in cents, tax included (0 when waived or no payment method)'),
     feeChargeFailed: z
       .boolean()
       .optional()
@@ -373,6 +390,11 @@ const portalPricingInfo = z
       .nullable()
       .describe('Idle fee per minute (after grace period) in major currency units'),
     taxRate: z.string().nullable().describe('Sales tax rate as a decimal (e.g. 0.0875 = 8.75%)'),
+    taxBasis: z
+      .enum(TAX_BASES)
+      .describe(
+        'How the prices above are entered (company setting company.taxBasis): net prices exclude the tax rate, gross prices include it. Convert with the tax rate to show a price the other way.',
+      ),
     isFreeVend: z
       .boolean()
       .describe(
@@ -477,6 +499,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           siteId: chargingStations.siteId,
           model: chargingStations.model,
           isOnline: chargingStations.isOnline,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
           isSimulator: chargingStations.isSimulator,
           siteName: sites.name,
           siteAddress: sites.address,
@@ -548,7 +573,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         }
       }
 
-      const config = await getStripeConfig(station.siteId ?? null);
+      const paymentProvider = await activePaymentProvider(request.log);
       const maintenance = await getMaintenancePayloadForStation(station.id);
 
       return {
@@ -561,7 +586,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         siteAddress: station.siteAddress,
         siteCity: station.siteCity,
         siteState: station.siteState,
-        paymentEnabled: config != null,
+        paymentEnabled: paymentProvider != null,
         evse: {
           evseId: evse.evseId,
           connectors: evseConnectors,
@@ -569,6 +594,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           reservationDriverId,
         },
         maintenance,
+        stationUnavailable: isStationLevelUnavailable(station),
       };
     },
   );
@@ -622,12 +648,16 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           pricePerSession: null,
           idleFeePricePerMinute: null,
           taxRate: null,
+          taxBasis: await getCompanyTaxBasis(),
           isFreeVend: true,
           restrictions: null,
         };
       }
 
-      const tariff = await resolveTariff(station.id, driverId);
+      const tariff = await resolveStationTariff(
+        { stationUuid: station.id, driverUuid: driverId },
+        client,
+      );
       if (tariff == null) {
         await reply.status(404).send({ error: 'No pricing found', code: 'PRICING_NOT_FOUND' });
         return;
@@ -640,6 +670,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         pricePerSession: tariff.pricePerSession,
         idleFeePricePerMinute: tariff.idleFeePricePerMinute,
         taxRate: tariff.taxRate,
+        taxBasis: await getCompanyTaxBasis(),
         isFreeVend: false,
         restrictions: tariff.restrictions ?? null,
       };
@@ -1276,6 +1307,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           siteId: chargingStations.siteId,
           model: chargingStations.model,
           isOnline: chargingStations.isOnline,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
           isSimulator: chargingStations.isSimulator,
           siteName: sites.name,
           siteAddress: sites.address,
@@ -1384,7 +1418,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         }
       }
 
-      const config = await getStripeConfig(station.siteId ?? null);
+      const paymentProvider = await activePaymentProvider(request.log);
 
       const isContactPublic = station.siteContactIsPublic === true;
       const maintenance = await getMaintenancePayloadForStation(station.id);
@@ -1402,7 +1436,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         siteContactName: isContactPublic ? station.siteContactName : null,
         siteContactEmail: isContactPublic ? station.siteContactEmail : null,
         siteContactPhone: isContactPublic ? station.siteContactPhone : null,
-        paymentEnabled: config != null,
+        paymentEnabled: paymentProvider != null,
         evses: Array.from(evseMap.values()).map((e) => ({
           evseId: e.evseId,
           connectors: e.connectors,
@@ -1410,6 +1444,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           reservationDriverId: reservationDriverMap.get(e.evseUuid) ?? null,
         })),
         maintenance,
+        stationUnavailable: isStationLevelUnavailable(station),
       };
     },
   );
@@ -1559,6 +1594,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             ERROR_CODES.EVSE_IN_USE,
             ERROR_CODES.RESERVATION_BUFFER_ACTIVE,
             ERROR_CODES.MAINTENANCE_ACTIVE,
+            ERROR_CODES.STATION_UNAVAILABLE,
           ]),
           500: errorWith('Internal server error', [ERROR_CODES.INTERNAL_ERROR]),
           502: errorWith('Start rejected', [ERROR_CODES.START_REJECTED]),
@@ -1579,7 +1615,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           siteId: chargingStations.siteId,
           isOnline: chargingStations.isOnline,
           ocppProtocol: chargingStations.ocppProtocol,
-          availability: chargingStations.availability,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
           onboardingStatus: chargingStations.onboardingStatus,
           freeVendEnabled: sites.freeVendEnabled,
         })
@@ -1606,6 +1644,13 @@ export function portalChargerRoutes(app: FastifyInstance): void {
 
       if (!station.isOnline) {
         await reply.status(400).send({ error: 'Station is offline', code: 'STATION_OFFLINE' });
+        return;
+      }
+
+      if (isStationLevelUnavailable(station)) {
+        await reply
+          .status(409)
+          .send({ error: 'Station is unavailable', code: 'STATION_UNAVAILABLE' });
         return;
       }
 
@@ -1723,25 +1768,30 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       // the start request immediately (returning 402) instead of letting the
       // station begin charging and the event-projection payment gate stop it
       // asynchronously.
-      const config = await getStripeConfig(station.siteId ?? null);
+      const paymentProvider = await activePaymentProvider(request.log);
       // Invoice drivers are billed afterwards through an aggregated invoice,
       // so they start without a payment method or pre-authorization.
       const paymentMode = await resolvePaymentMode(driverId);
 
-      let pmForPreAuth: {
-        id: number;
-        stripeCustomerId: string;
-        stripePaymentMethodId: string;
-      } | null = null;
+      let pmForPreAuth: { id: number } | null = null;
 
-      if (config != null && paymentMode !== 'invoice') {
+      if (paymentProvider != null && paymentMode !== 'invoice') {
         // Check if pricing is free for this driver. Free-vend wins over the
         // tariff lookup: event-projections skips the payment gate for
         // free-vend sites, so demanding a payment method here would block
         // drivers from starting at a free-vend site that happens to have a
         // paid tariff assigned.
-        const tariff = await resolveTariff(station.id, driverId);
-        const chargingIsFree = station.freeVendEnabled === true || isTariffFree(tariff);
+        // The holder of the active reservation pays its holding fee, so a
+        // reservation fee makes their charging paid.
+        const chargingIsFree = await isStationChargingFree(
+          {
+            stationUuid: station.id,
+            driverUuid: driverId,
+            reserved: activeReservation?.driverId === driverId,
+            freeVend: station.freeVendEnabled === true,
+          },
+          client,
+        );
 
         if (!chargingIsFree) {
           // Payment is required -- validate the driver has a payment method
@@ -1755,11 +1805,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
 
           // Verify payment method belongs to driver
           const [pmRow] = await db
-            .select({
-              id: driverPaymentMethods.id,
-              stripeCustomerId: driverPaymentMethods.stripeCustomerId,
-              stripePaymentMethodId: driverPaymentMethods.stripePaymentMethodId,
-            })
+            .select({ id: driverPaymentMethods.id })
             .from(driverPaymentMethods)
             .where(
               and(
@@ -1796,7 +1842,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       }
 
       // One currency for the session row, the pre-auth, and its payment record.
-      const sessionCurrency = config?.currency ?? (await getCompanyCurrency());
+      const sessionCurrency = await getCompanyCurrency();
       const sessionRows = await db
         .insert(chargingSessions)
         .values({
@@ -1820,137 +1866,62 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Fail-fast pre-auth: charge the card BEFORE telling the station to start
-      // so a decline shortcuts to 402 without leaving a ghost session. Skips
-      // simulated customers (event-projection gate handles them) and free
-      // tariffs. Success inserts payment_records with status='pre_authorized'
-      // so the projection's gate skips via its duplicate guard.
-      if (
-        pmForPreAuth != null &&
-        config != null &&
-        !isSimulatedCustomer(pmForPreAuth.stripeCustomerId)
-      ) {
-        // Stripe call and the payment_records INSERT are intentionally in
-        // separate try/catch: a Stripe decline is a driver-facing 402, while
-        // a DB hiccup after a successful pre-auth must REVERSE the Stripe
-        // hold, otherwise we 402 the driver while holding their money and a
-        // retry would create a second hold under a new session id.
-        let paymentIntent: Awaited<ReturnType<typeof createPreAuthorization>>;
-        try {
-          paymentIntent = await createPreAuthorization(
-            config,
-            pmForPreAuth.stripeCustomerId,
-            pmForPreAuth.stripePaymentMethodId,
-            undefined,
-            `preauth_${session.id}`,
-          );
-        } catch (err: unknown) {
-          const reason = err instanceof Error ? err.message.slice(0, 500) : 'Unknown decline';
-          request.log.warn(
-            { err, sessionId: session.id, paymentMethodId: pmForPreAuth.id },
-            'Pre-auth failed, rejecting start request',
-          );
-          try {
-            await db.execute(sql`
-              INSERT INTO payment_records (
-                session_id, driver_id, site_payment_config_id,
-                stripe_customer_id, stripe_payment_method_id,
-                payment_source, currency, status, failure_reason
-              )
-              VALUES (
-                ${session.id},
-                ${driverId},
-                ${config.configId},
-                ${pmForPreAuth.stripeCustomerId},
-                ${pmForPreAuth.stripePaymentMethodId},
-                'web_portal',
-                ${sessionCurrency},
-                'failed',
-                ${reason}
-              )
-              ON CONFLICT (session_id) DO NOTHING
-            `);
-          } catch {
-            // Recording the failure is best-effort
-          }
+      // Fail-fast pre-auth: hold the card BEFORE telling the station to start
+      // so a decline shortcuts to 402 without leaving a ghost session. Skipped
+      // for free charging. The hold is recorded `pre_authorized` under the key
+      // preauth_<sessionId>, so the projection's gate finds it and skips. A
+      // hold whose record cannot be written is cancelled by the service.
+      if (pmForPreAuth != null) {
+        const hold = await authorizeSessionHold(
+          {
+            sessionId: session.id,
+            driverId,
+            methodRowId: pmForPreAuth.id,
+            siteId: station.siteId ?? null,
+            trigger: 'portal_start',
+          },
+          paymentContext(request.log),
+        );
+        if (hold.outcome === 'declined' || hold.outcome === 'record_failed') {
+          const declined = hold.outcome === 'declined';
           await db
             .update(chargingSessions)
             .set({
               status: 'failed',
-              stoppedReason: 'PreAuthDeclined',
+              stoppedReason: declined ? 'PreAuthDeclined' : 'PreAuthRecordFailed',
               endedAt: new Date(),
               updatedAt: new Date(),
             })
             .where(eq(chargingSessions.id, session.id));
-          await reply.status(402).send({
-            error: `Payment authorization declined: ${reason}`,
-            code: 'PAYMENT_PREAUTH_FAILED',
-          });
+          if (declined) {
+            await reply.status(402).send({
+              error: `Payment authorization declined: ${hold.reason}`,
+              code: 'PAYMENT_PREAUTH_FAILED',
+            });
+          } else {
+            await reply.status(500).send({
+              error: 'Failed to record payment authorization',
+              code: 'INTERNAL_ERROR',
+            });
+          }
           return;
         }
-
-        try {
-          await db.execute(sql`
-            INSERT INTO payment_records (
-              session_id, driver_id, site_payment_config_id,
-              stripe_payment_intent_id, stripe_customer_id, stripe_payment_method_id,
-              payment_source, currency, pre_auth_amount_cents, status
-            )
-            VALUES (
-              ${session.id},
-              ${driverId},
-              ${config.configId},
-              ${paymentIntent.id},
-              ${pmForPreAuth.stripeCustomerId},
-              ${pmForPreAuth.stripePaymentMethodId},
-              'web_portal',
-              ${sessionCurrency},
-              ${config.preAuthAmountCents},
-              'pre_authorized'
-            )
-            ON CONFLICT (session_id) DO NOTHING
-          `);
-        } catch (err: unknown) {
-          request.log.error(
-            { err, sessionId: session.id, paymentIntentId: paymentIntent.id },
-            'Failed to record successful pre-auth; reversing Stripe hold',
+        if (hold.outcome === 'not_configured') {
+          // The card is saved with a provider this process cannot use; the
+          // projection's gate applies the same rule when the station starts.
+          request.log.warn(
+            { sessionId: session.id, providerId: hold.providerId },
+            'Payment provider of the card not configured; session not pre-authorized',
           );
-          try {
-            await config.stripe.paymentIntents.cancel(paymentIntent.id);
-          } catch (cancelErr) {
-            request.log.error(
-              { err: cancelErr, paymentIntentId: paymentIntent.id, sessionId: session.id },
-              'Failed to cancel Stripe pre-auth after DB INSERT failure; manual reconciliation required',
-            );
-          }
-          await db
-            .update(chargingSessions)
-            .set({
-              status: 'failed',
-              stoppedReason: 'PreAuthRecordFailed',
-              endedAt: new Date(),
-              updatedAt: new Date(),
-            })
-            .where(eq(chargingSessions.id, session.id));
-          await reply.status(500).send({
-            error: 'Failed to record payment authorization',
-            code: 'INTERNAL_ERROR',
-          });
-          return;
         }
       }
 
       // Send RequestStartTransaction and wait for station response
-      const cmdResult = await sendOcppCommandAndWait(
-        station.stationId,
-        'RequestStartTransaction',
-        {
-          evseId: params.evseId,
-          remoteStartId,
-          idToken: { idToken: driverId, type: 'Central' },
-        },
-        station.ocppProtocol ?? undefined,
-      );
+      const cmdResult = await sendOcppCommandAndWait(station.stationId, 'RequestStartTransaction', {
+        evseId: params.evseId,
+        remoteStartId,
+        idToken: { idToken: driverId, type: 'Central' },
+      });
 
       if (cmdResult.error != null) {
         await db
@@ -2004,12 +1975,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
 
             // If we have the transaction ID, stop the ghost transaction first
             if (ghostTxId != null) {
-              await sendOcppCommandAndWait(
-                station.stationId,
-                'RequestStopTransaction',
-                { transactionId: ghostTxId },
-                station.ocppProtocol ?? undefined,
-              );
+              await sendOcppCommandAndWait(station.stationId, 'RequestStopTransaction', {
+                transactionId: ghostTxId,
+              });
             }
 
             // Wait for the station to finish cleaning up, then retry
@@ -2023,7 +1991,6 @@ export function portalChargerRoutes(app: FastifyInstance): void {
                 remoteStartId,
                 idToken: { idToken: driverId, type: 'Central' },
               },
-              station.ocppProtocol ?? undefined,
             );
 
             const retryStatus = retryResult.response?.['status'] as string | undefined;
@@ -2087,7 +2054,6 @@ export function portalChargerRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
 
-      const companyCurrency = await getCompanyCurrency();
       const sessions = await db
         .select({
           id: chargingSessions.id,
@@ -2097,7 +2063,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           startedAt: chargingSessions.startedAt,
           energyDeliveredWh: chargingSessions.energyDeliveredWh,
           currentCostCents: chargingSessions.currentCostCents,
-          currency: sessionCurrencySql(companyCurrency),
+          currency: sessionCurrencySql(),
         })
         .from(chargingSessions)
         .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
@@ -2159,7 +2125,6 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         session.stationOcppId,
         'RequestStopTransaction',
         { transactionId: session.transactionId },
-        session.ocppProtocol ?? undefined,
       );
 
       if (cmdResult.error != null) {
@@ -2366,6 +2331,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             ERROR_CODES.EVSE_IN_USE,
             ERROR_CODES.RESERVATION_CONFLICT,
             ERROR_CODES.RESERVATION_DURING_MAINTENANCE,
+            ERROR_CODES.STATION_UNAVAILABLE,
           ]),
           500: errorWith('Reservation create failed', [ERROR_CODES.RESERVATION_CREATE_FAILED]),
         },
@@ -2383,6 +2349,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           availability: chargingStations.availability,
           onboardingStatus: chargingStations.onboardingStatus,
           reservationsEnabled: chargingStations.reservationsEnabled,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
         })
         .from(chargingStations)
         .where(eq(chargingStations.stationId, body.stationId));
@@ -2791,10 +2760,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       // firing another would deliver a misleading "feeFormatted: ''" and
       // double-notify the driver.
       if (cancelled) {
-        const cancellationFeeFormatted =
-          feeChargedCents > 0 && feeCurrency != null
-            ? formatCurrencyAmount(feeChargedCents, feeCurrency)
-            : '';
+        // The fee charged (tax included), formatted in the driver's language.
+        const feeCharged = feeChargedCents > 0 && feeCurrency != null;
+        const cancellationFeeFormatted = feeCharged
+          ? notificationMoney(feeChargedCents, feeCurrency)
+          : '';
         void dispatchDriverNotification(
           client,
           'reservation.Cancelled',
@@ -2803,6 +2773,8 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             reservationId: reservation.reservationId,
             stationId: reservation.stationOcppId,
             cancellationFeeFormatted,
+            cancellationFeeCents: feeChargedCents,
+            currency: feeCurrency ?? '',
           },
           ALL_TEMPLATES_DIRS,
           getPubSub(),

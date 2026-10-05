@@ -76,6 +76,11 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
+vi.mock('../lib/station-derived-status.js', () => ({
+  buildDerivedStatusSubquery: vi.fn(() => 'status'),
+  buildStatusReasonSubquery: vi.fn(() => null),
+}));
+
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
@@ -130,7 +135,7 @@ vi.mock('@evtivity/database', () => ({
 }));
 
 vi.mock('drizzle-orm', () => {
-  const sqlFn = () => ({ as: vi.fn() });
+  const sqlFn = () => ({ as: vi.fn(), mapWith: vi.fn() });
   return {
     eq: vi.fn(),
     and: vi.fn(),
@@ -146,15 +151,20 @@ vi.mock('drizzle-orm', () => {
     desc: vi.fn(),
     count: vi.fn(),
     inArray: vi.fn(),
+    isNotNull: vi.fn(),
   };
 });
 
-vi.mock('@evtivity/lib', async () => {
+vi.mock('@evtivity/lib', async (importOriginal) => {
   const { z } = await import('zod');
+  const actual = await importOriginal<typeof import('@evtivity/lib')>();
   return {
-    isValidTimezone: vi.fn(() => true),
+    ValidationError: actual.ValidationError,
+    isValidTimezone: actual.isValidTimezone,
     electricityRateRestrictionsSchema: z.object({}).passthrough(),
     deriveElectricityRatePriority: vi.fn(() => 0),
+    revenueFromGrossGroups: actual.revenueFromGrossGroups,
+    createLogger: actual.createLogger,
   };
 });
 
@@ -173,6 +183,21 @@ vi.mock('../services/site-import.service.js', () => ({
     errors: [],
   }),
 }));
+
+const { mockQueryRevenue } = vi.hoisted(() => ({ mockQueryRevenue: vi.fn() }));
+
+// Revenue comes from the shared definition (session-revenue.ts); its SQL is
+// covered by the integration tests.
+vi.mock('../lib/session-revenue.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/session-revenue.js')>();
+  return {
+    ...actual,
+    queryRevenue: (input: unknown) => mockQueryRevenue(input),
+    queryRevenueTotal: async (input: unknown) =>
+      ((await mockQueryRevenue(input)) as Map<string | null, unknown>).get(null) ??
+      actual.EMPTY_REVENUE,
+  };
+});
 
 vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn().mockResolvedValue(null),
@@ -376,6 +401,17 @@ describe('Site routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(400);
     });
+
+    it('returns 400 for an invalid IANA timezone', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/sites',
+        headers: { authorization: 'Bearer ' + token },
+        payload: { name: 'New Site', timezone: 'Mars/Olympus_Mons' },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+    });
   });
 
   // --- PATCH /v1/sites/:id ---
@@ -425,6 +461,21 @@ describe('Site routes - handler logic', () => {
 
       expect(response.statusCode).toBe(404);
       expect(response.json().code).toBe('SITE_NOT_FOUND');
+    });
+
+    it('returns 400 for a latitude outside [-90, 90]', async () => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/sites/${VALID_SITE_ID}`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { latitude: '999' },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        message: 'Latitude must be a number in [-90, 90]',
+      });
     });
   });
 
@@ -505,11 +556,13 @@ describe('Site routes - handler logic', () => {
         serialNumber: null,
         availability: 'available',
         securityProfile: 0,
+        ocppProtocol: 'ocpp2.1',
         lastHeartbeat: null,
         isOnline: false,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
         status: 'available',
+        statusReason: null,
         connectorCount: 0,
         connectorTypes: null,
         underMaintenance: false,
@@ -528,6 +581,7 @@ describe('Site routes - handler logic', () => {
       expect(body).toHaveProperty('data');
       expect(body).toHaveProperty('total');
       expect(body.data).toHaveLength(1);
+      expect(body.data[0].ocppProtocol).toBe('ocpp2.1');
     });
 
     it('returns 404 when site not found', async () => {
@@ -568,9 +622,12 @@ describe('Site routes - handler logic', () => {
 
   describe('GET /v1/sites/:id/revenue-history', () => {
     it('returns daily revenue history zero-filled across the range', async () => {
-      setupDbResults(
-        [{ timezone: 'UTC' }],
-        [{ date: '2025-01-02', revenueCents: 5000, sessionCount: 10 }],
+      setupDbResults([{ timezone: 'UTC' }]);
+      const { aggregateRevenueRows } = await import('../lib/session-revenue.js');
+      mockQueryRevenue.mockResolvedValueOnce(
+        aggregateRevenueRows([
+          { key: '2025-01-02', taxRate: '0', grossCents: 500, source: 'session', count: 10 },
+        ]),
       );
 
       const response = await app.inject({
@@ -674,11 +731,16 @@ describe('Site routes - handler logic', () => {
         avgDurationMinutes: 45,
       };
       const utilizationStats = { sessionHours: 15, portCount: 4 };
-      const financialStats = {
-        totalRevenueCents: 25000,
-        avgRevenueCentsPerSession: 1250,
-        totalTransactions: 16,
-      };
+      const financialStats = { totalElectricityCostCents: 5000 };
+      // Revenue: 20 sessions of 1070 at 7%, 3600 at 20%, and a 595 fee at 19%.
+      const { aggregateRevenueRows } = await import('../lib/session-revenue.js');
+      mockQueryRevenue.mockResolvedValueOnce(
+        aggregateRevenueRows([
+          { key: null, taxRate: '0.07', grossCents: 1070, source: 'session', count: 20 },
+          { key: null, taxRate: '0.2', grossCents: 3600, source: 'session', count: 1 },
+          { key: null, taxRate: '0.19', grossCents: 595, source: 'fee', count: 1 },
+        ]),
+      );
 
       setupDbResults([sessionStats], [utilizationStats], [financialStats]);
 
@@ -693,7 +755,13 @@ describe('Site routes - handler logic', () => {
       expect(body).toHaveProperty('uptimePercent');
       expect(body).toHaveProperty('totalSessions');
       expect(body).toHaveProperty('utilizationPercent');
-      expect(body).toHaveProperty('totalRevenueCents');
+      expect(body).toHaveProperty('totalRevenueCents', 20 * 1070 + 3600 + 595);
+      expect(body).toHaveProperty('totalNetRevenueCents', 20 * 1000 + 3000 + 500);
+      expect(body).toHaveProperty('totalTaxCents', 20 * 70 + 600 + 95);
+      expect(body).toHaveProperty('totalTransactions', 22);
+      expect(body).toHaveProperty('avgRevenueCentsPerSession', Math.round((20 * 1070 + 3600) / 21));
+      // Profit is revenue excluding tax minus electricity cost.
+      expect(body).toHaveProperty('totalProfitCents', 23500 - 5000);
       expect(body).toHaveProperty('periodMonths');
       expect(body).toHaveProperty('currency', 'EUR');
     });
@@ -707,7 +775,8 @@ describe('Site routes - handler logic', () => {
         id: 'sta_000000000003',
         stationId: 'STATION-001',
         model: 'Model X',
-        availability: 'available',
+        status: 'available',
+        statusReason: null,
         isOnline: true,
         securityProfile: 0,
         positionX: '100',

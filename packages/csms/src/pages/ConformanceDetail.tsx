@@ -33,6 +33,7 @@ import { FilterPopover } from '@/components/FilterBar';
 import { BackButton } from '@/components/back-button';
 import { EntityNavButtons } from '@/components/entity-nav-buttons';
 import { api } from '@/lib/api';
+import { formatNumber } from '@/lib/formatting';
 
 interface OcttRun {
   id: number;
@@ -44,6 +45,7 @@ interface OcttRun {
   failed: number;
   skipped: number;
   errors: number;
+  notApplicable: number;
   durationMs: number | null;
   startedAt: string | null;
   completedAt: string | null;
@@ -68,6 +70,8 @@ interface TestResult {
   durationMs: number;
   steps: StepResult[] | null;
   error: string | null;
+  notApplicableItem: string | null;
+  notApplicableReason: string | null;
 }
 
 interface ModuleSummary {
@@ -78,16 +82,28 @@ interface ModuleSummary {
   failed: number;
   skipped: number;
   errors: number;
+  notApplicable: number;
 }
 
-function testStatusBadge(status: string): React.JSX.Element {
-  const variants: Record<string, 'success' | 'destructive' | 'secondary' | 'warning'> = {
+function testStatusBadge(status: string, t: TFunction): React.JSX.Element {
+  const variants: Record<string, 'success' | 'destructive' | 'secondary' | 'warning' | 'info'> = {
     passed: 'success',
     failed: 'destructive',
     skipped: 'secondary',
     error: 'warning',
+    notApplicable: 'info',
   };
-  return <Badge variant={variants[status] ?? 'secondary'}>{status}</Badge>;
+  return (
+    <Badge variant={variants[status] ?? 'secondary'}>
+      {status === 'notApplicable' ? t('conformance.notApplicable') : status}
+    </Badge>
+  );
+}
+
+/** Pass rate over the tests that apply: the PICS excludes notApplicable tests. */
+function passRate(passed: number, total: number, notApplicable: number, digits: number): string {
+  const applicable = total - notApplicable;
+  return applicable > 0 ? `${formatNumber((passed / applicable) * 100, digits)}%` : 'n/a';
 }
 
 export function ConformanceDetail(): React.JSX.Element {
@@ -146,7 +162,7 @@ export function ConformanceDetail(): React.JSX.Element {
   const run = detail?.run;
   if (run == null) return <p>{t('conformance.notFound')}</p>;
 
-  const rate = run.totalTests > 0 ? ((run.passed / run.totalTests) * 100).toFixed(1) : '0';
+  const rate = passRate(run.passed, run.totalTests, run.notApplicable, 1);
   const modules = [...new Set(detail?.results.map((r) => r.module) ?? [])].sort();
 
   return (
@@ -160,7 +176,7 @@ export function ConformanceDetail(): React.JSX.Element {
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-4">
         <Card>
           <CardContent className="p-4 text-center">
             <p className="text-xs text-muted-foreground">{t('conformance.total')}</p>
@@ -193,15 +209,21 @@ export function ConformanceDetail(): React.JSX.Element {
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
+            <p className="text-xs text-muted-foreground">{t('conformance.notApplicable')}</p>
+            <p className="text-2xl font-bold text-muted-foreground">{run.notApplicable}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4 text-center">
             <p className="text-xs text-muted-foreground">{t('conformance.passRate')}</p>
-            <p className="text-2xl font-bold">{rate}%</p>
+            <p className="text-2xl font-bold">{rate}</p>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
             <p className="text-xs text-muted-foreground">{t('conformance.duration')}</p>
             <p className="text-2xl font-bold">
-              {run.durationMs != null ? `${(run.durationMs / 1000).toFixed(1)}s` : 'n/a'}
+              {run.durationMs != null ? `${formatNumber(run.durationMs / 1000, 1)}s` : 'n/a'}
             </p>
           </CardContent>
         </Card>
@@ -245,6 +267,9 @@ export function ConformanceDetail(): React.JSX.Element {
                                   {t('conformance.failed')}
                                 </TableHead>
                                 <TableHead className="text-right">
+                                  {t('conformance.notApplicable')}
+                                </TableHead>
+                                <TableHead className="text-right">
                                   {t('conformance.passRate')}
                                 </TableHead>
                               </TableRow>
@@ -260,10 +285,11 @@ export function ConformanceDetail(): React.JSX.Element {
                                   <TableCell className="text-right text-destructive">
                                     {m.failed}
                                   </TableCell>
+                                  <TableCell className="text-right text-muted-foreground">
+                                    {m.notApplicable}
+                                  </TableCell>
                                   <TableCell className="text-right">
-                                    {m.total > 0
-                                      ? `${((m.passed / m.total) * 100).toFixed(0)}%`
-                                      : 'n/a'}
+                                    {passRate(m.passed, m.total, m.notApplicable, 0)}
                                   </TableCell>
                                 </TableRow>
                               ))}
@@ -315,6 +341,7 @@ export function ConformanceDetail(): React.JSX.Element {
                     <option value="failed">{t('conformance.failed')}</option>
                     <option value="skipped">{t('conformance.skipped')}</option>
                     <option value="error">{t('conformance.errors')}</option>
+                    <option value="notApplicable">{t('conformance.notApplicable')}</option>
                   </Select>
                 </div>
                 <FilterPopover
@@ -354,6 +381,7 @@ export function ConformanceDetail(): React.JSX.Element {
                     <option value="failed">{t('conformance.failed')}</option>
                     <option value="skipped">{t('conformance.skipped')}</option>
                     <option value="error">{t('conformance.errors')}</option>
+                    <option value="notApplicable">{t('conformance.notApplicable')}</option>
                   </Select>
                 </FilterPopover>
               </div>
@@ -442,6 +470,8 @@ function ResultRow({
       | { step: number; description: string; status: string; expected?: string; actual?: string }[]
       | null;
     error: string | null;
+    notApplicableItem: string | null;
+    notApplicableReason: string | null;
   };
   expanded: boolean;
   onToggle: () => void;
@@ -460,7 +490,7 @@ function ResultRow({
         <TableCell>{result.testId}</TableCell>
         <TableCell>{result.testName}</TableCell>
         <TableCell>{result.module}</TableCell>
-        <TableCell>{testStatusBadge(result.status)}</TableCell>
+        <TableCell>{testStatusBadge(result.status, t)}</TableCell>
         <TableCell className="text-right text-xs text-muted-foreground">
           {result.durationMs}ms
         </TableCell>
@@ -471,7 +501,16 @@ function ResultRow({
             {result.error != null && (
               <p className="text-sm text-destructive mb-2">{result.error}</p>
             )}
-            {result.steps != null && result.steps.length > 0 ? (
+            {result.status === 'notApplicable' ? (
+              <div className="space-y-1 text-sm" data-testid="conformance-not-applicable-reason">
+                {result.notApplicableItem != null && (
+                  <p className="text-muted-foreground">
+                    {t('conformance.picsItem')}: {result.notApplicableItem}
+                  </p>
+                )}
+                <p>{result.notApplicableReason ?? t('conformance.notApplicable')}</p>
+              </div>
+            ) : result.steps != null && result.steps.length > 0 ? (
               <Table>
                 <TableHeader>
                   <TableRow>

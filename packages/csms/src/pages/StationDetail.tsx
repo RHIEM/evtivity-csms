@@ -1,8 +1,10 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { useState } from 'react';
 import { useParams } from 'react-router';
 import { useTab } from '@/hooks/use-tab';
+import { stationAvailabilityActions } from '@/lib/station-availability-actions';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { BackButton } from '@/components/back-button';
@@ -35,6 +37,10 @@ import { StationQrTab } from '@/components/station/StationQrTab';
 import { StationPricingTab } from '@/components/station/StationPricingTab';
 import { StationReservationsTab } from '@/components/station/StationReservationsTab';
 import { api } from '@/lib/api';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
+import { getErrorMessage } from '@/lib/error-message';
+import { StationStatusBadge } from '@/components/StationStatusBadge';
 import { useHasPermission } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
 
@@ -57,11 +63,16 @@ interface Station {
   availability: string;
   onboardingStatus: string;
   status: string;
+  statusReason: string | null;
+  disabledReason: string | null;
+  firmwareState: string | null;
+  reportedStatus: string | null;
   isOnline: boolean;
   isSimulator: boolean;
   lastHeartbeat: string | null;
   ocppProtocol: string | null;
   securityProfile: number;
+  pendingSecurityProfile: number | null;
   hasPassword: boolean;
   latitude: string | null;
   longitude: string | null;
@@ -94,6 +105,11 @@ export function StationDetail(): React.JSX.Element {
   const { t } = useTranslation();
   const canReadAuthorizeLog = useHasPermission('drivers:read');
   const canReadAudit = useHasPermission('audit:read');
+  const canWriteStations = useHasPermission('stations:write');
+  const { toast } = useToast();
+  const [availabilityConfirm, setAvailabilityConfirm] = useState<
+    'available' | 'unavailable' | null
+  >(null);
 
   const { data: sitesResponse } = useQuery({
     queryKey: ['sites'],
@@ -134,6 +150,24 @@ export function StationDetail(): React.JSX.Element {
     },
   });
 
+  const availabilityMutation = useMutation({
+    mutationFn: (availability: 'available' | 'unavailable') =>
+      api.patch(`/v1/stations/${id ?? ''}`, { availability }),
+    onSuccess: (_data, availability) => {
+      void queryClient.invalidateQueries({ queryKey: ['stations'] });
+      toast({
+        variant: 'success',
+        title: t(
+          availability === 'unavailable' ? 'stations.disabledSuccess' : 'stations.enabledSuccess',
+        ),
+      });
+      setAvailabilityConfirm(null);
+    },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+    },
+  });
+
   const unblockMutation = useMutation({
     mutationFn: () => api.post(`/v1/stations/${id ?? ''}/unblock`, {}),
     onSuccess: () => {
@@ -150,10 +184,11 @@ export function StationDetail(): React.JSX.Element {
   }
 
   const siteTimezone = sites?.find((s) => s.id === station.siteId)?.timezone ?? 'America/New_York';
+  const availabilityActions = stationAvailabilityActions(station);
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div className="flex items-center gap-4">
           <BackButton to="/stations" />
           <div>
@@ -163,6 +198,7 @@ export function StationDetail(): React.JSX.Element {
           <Badge variant={station.isOnline ? 'success' : 'destructive'}>
             {station.isOnline ? t('status.online') : t('status.offline')}
           </Badge>
+          <StationStatusBadge status={station.status} statusReason={station.statusReason} />
           {station.isSimulator && <Badge variant="info">{t('stations.simulator')}</Badge>}
           {station.siteFreeVendEnabled && <Badge variant="info">{t('stations.freeVend')}</Badge>}
           {station.onboardingStatus === 'pending' && (
@@ -172,8 +208,58 @@ export function StationDetail(): React.JSX.Element {
             <Badge variant="destructive">{t('status.blocked')}</Badge>
           )}
         </div>
-        <EntityNavButtons resource="stations" basePath="/stations" currentId={id} />
+        <div className="flex items-center gap-2">
+          {canWriteStations && availabilityActions.enable && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAvailabilityConfirm('available');
+              }}
+            >
+              {t('stations.enableStation')}
+            </Button>
+          )}
+          {canWriteStations && availabilityActions.disable && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAvailabilityConfirm('unavailable');
+              }}
+            >
+              {t('stations.disableStation')}
+            </Button>
+          )}
+          <EntityNavButtons resource="stations" basePath="/stations" currentId={id} />
+        </div>
       </div>
+
+      <ConfirmDialog
+        open={availabilityConfirm != null}
+        onOpenChange={(open) => {
+          if (!open) setAvailabilityConfirm(null);
+        }}
+        title={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStationTitle')
+            : t('stations.disableStationTitle')
+        }
+        description={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStationDescription')
+            : t('stations.disableStationDescription')
+        }
+        confirmLabel={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStation')
+            : t('stations.disableStation')
+        }
+        variant={availabilityConfirm === 'available' ? 'default' : 'destructive'}
+        isPending={availabilityMutation.isPending}
+        onConfirm={() => {
+          if (availabilityConfirm != null) availabilityMutation.mutate(availabilityConfirm);
+          return false;
+        }}
+      />
 
       {station.onboardingStatus === 'pending' && (
         <Card className="border-warning">
@@ -294,6 +380,7 @@ export function StationDetail(): React.JSX.Element {
             stationId={station.stationId}
             stationDbId={station.id}
             securityProfile={station.securityProfile}
+            pendingSecurityProfile={station.pendingSecurityProfile}
             hasPassword={station.hasPassword}
             isOnline={station.isOnline}
             timezone={siteTimezone}
@@ -356,6 +443,8 @@ export function StationDetail(): React.JSX.Element {
             stationId={id ?? ''}
             stationOcppId={station.stationId}
             guestChargingEnabled={guestChargingEnabled}
+            ocppProtocol={station.ocppProtocol}
+            isOnline={station.isOnline}
           />
         </TabsContent>
 

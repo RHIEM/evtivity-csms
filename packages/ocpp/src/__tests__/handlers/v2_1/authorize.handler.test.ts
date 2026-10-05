@@ -12,7 +12,25 @@ import type { HandlerContext } from '../../../server/middleware/pipeline.js';
 // .limit() so both call shapes resolve to the same queued value.
 let whereQueue: Array<unknown[] | Error>;
 const insertValuesFn = vi.fn().mockResolvedValue(undefined);
+// Tariff rows the shared resolver (@evtivity/database tariff-resolution) returns, first row wins.
 const executeFn = vi.fn();
+const resolveStationTariffMock = vi.fn(
+  async (_q: { stationUuid: string; driverUuid: string | null }, _sql: unknown) => {
+    const rows = (await executeFn()) as Array<Record<string, unknown>>;
+    const row = rows[0];
+    if (row == null) return null;
+    return {
+      id: row['id'],
+      pricePerKwh: row['price_per_kwh'],
+      pricePerMinute: row['price_per_minute'],
+      pricePerSession: row['price_per_session'],
+      idleFeePricePerMinute: row['idle_fee_price_per_minute'],
+      reservationFeePerMinute: null,
+      taxRate: row['tax_rate'],
+    };
+  },
+);
+const clientMock = vi.fn(() => Promise.resolve([{ id: 'sta_cs001' }]));
 
 function nextResult(): PromiseLike<unknown[]> & { limit: () => Promise<unknown[]> } {
   const queued = whereQueue.shift();
@@ -31,14 +49,15 @@ const fromFn = vi.fn(() => ({ where: whereFn }));
 const selectFn = vi.fn(() => ({ from: fromFn }));
 
 const isRoamingEnabledMock = vi.fn().mockResolvedValue(false);
+const getCompanyTaxBasisMock = vi.fn().mockResolvedValue('net');
 const isSiteFreeVendEnabledByStationMock = vi.fn().mockResolvedValue(false);
 
 vi.mock('@evtivity/database', () => ({
   db: {
     select: selectFn,
     insert: vi.fn(() => ({ values: insertValuesFn })),
-    execute: executeFn,
   },
+  client: clientMock,
   driverTokens: {
     id: 'id',
     driverId: 'driver_id',
@@ -63,7 +82,24 @@ vi.mock('@evtivity/database', () => ({
   isRoamingEnabled: isRoamingEnabledMock,
   isSiteFreeVendEnabledByStation: isSiteFreeVendEnabledByStationMock,
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
+  getCompanyTaxBasis: (...args: unknown[]) => getCompanyTaxBasisMock(...args) as unknown,
+  resolveStationTariff: (...args: [{ stationUuid: string; driverUuid: string | null }, unknown]) =>
+    resolveStationTariffMock(...args),
 }));
+
+const validateContractCertificateMock = vi.fn();
+
+vi.mock('../../../services/pki/contract-certificate-validation.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../services/pki/contract-certificate-validation.js')
+    >();
+  return {
+    applyContractCertificateVerdict: actual.applyContractCertificateVerdict,
+    validateContractCertificate: (...args: unknown[]) =>
+      validateContractCertificateMock(...args) as unknown,
+  };
+});
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((a: unknown, b: unknown) => ({ type: 'eq', a, b })),
@@ -93,6 +129,7 @@ function makeCtx(payload: Record<string, unknown>): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'Authorize',
@@ -152,34 +189,133 @@ describe('v2_1 Authorize handler', () => {
     expect(selectFn).not.toHaveBeenCalled();
   });
 
-  it('accepts eMAID token without lookup and sets certificateStatus when certificate present', async () => {
+  it('looks up an eMAID token in driver_tokens like any other token', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-1', type: 'eMAID' } });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-1', type: 'eMAID' } },
+    });
+    expect(selectFn).toHaveBeenCalled();
+    expect(validateContractCertificateMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown eMAID as Invalid', async () => {
+    whereQueue = [[]];
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-unknown', type: 'eMAID' } });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({ idTokenInfo: { status: 'Invalid' } });
+  });
+
+  it('returns certificateStatus Accepted for a valid chain and an accepted eMAID (C07.FR.14)', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockResolvedValueOnce('Accepted');
+    const hashData = [
+      {
+        hashAlgorithm: 'SHA256',
+        issuerNameHash: 'aa',
+        issuerKeyHash: 'bb',
+        serialNumber: '1',
+        responderURL: 'https://ocsp.example.com',
+      },
+    ];
     const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({
-      idToken: { idToken: 'emaid-1', type: 'eMAID' },
+      idToken: { idToken: 'emaid-2', type: 'eMAID' },
+      iso15118CertificateHashData: hashData,
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(validateContractCertificateMock).toHaveBeenCalledWith(
+      { iso15118CertificateHashData: hashData },
+      expect.anything(),
+    );
+    expect(response).toMatchObject({
+      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-2', type: 'eMAID' } },
+      certificateStatus: 'Accepted',
+    });
+  });
+
+  it('returns Invalid and CertificateRevoked for a revoked chain on any token type (C07.FR.16)', async () => {
+    whereQueue = [
+      [{ id: 'tok-1', driverId: 'drv-1', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockResolvedValueOnce('CertificateRevoked');
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'rfid-1', type: 'ISO14443' },
+      iso15118CertificateHashData: [
+        {
+          hashAlgorithm: 'SHA256',
+          issuerNameHash: 'aa',
+          issuerKeyHash: 'bb',
+          serialNumber: '1',
+          responderURL: 'https://ocsp.example.com',
+        },
+      ],
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'CertificateRevoked',
+    });
+  });
+
+  it('returns ContractCancelled when the chain is valid but the eMAID is unknown (C07.FR.13)', async () => {
+    whereQueue = [[]];
+    validateContractCertificateMock.mockResolvedValueOnce('Accepted');
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'emaid-3', type: 'eMAID' },
+      certificate: 'cert-pem',
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(validateContractCertificateMock).toHaveBeenCalledWith(
+      { certificate: 'cert-pem' },
+      expect.anything(),
+    );
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'ContractCancelled',
+    });
+  });
+
+  it('fails closed with CertChainError when the validation throws (C07.FR.17)', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockRejectedValueOnce(new Error('db down'));
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'emaid-4', type: 'eMAID' },
       certificate: 'cert-pem',
     });
     const response = await handleAuthorize(ctx);
 
     expect(response).toEqual({
-      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-1', type: 'eMAID' } },
-      certificateStatus: 'Accepted',
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'CertChainError',
     });
   });
 
-  it('sets certificateStatus for eMAID when iso15118CertificateHashData present', async () => {
+  it('omits certificateStatus when no certificate or hash data is sent', async () => {
+    whereQueue = [[]];
     const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({
-      idToken: { idToken: 'emaid-2', type: 'eMAID' },
-      iso15118CertificateHashData: [{ hashAlgorithm: 'SHA256' }],
-    });
-    const response = await handleAuthorize(ctx);
-
-    expect(response).toMatchObject({ certificateStatus: 'Accepted' });
-  });
-
-  it('omits certificateStatus for eMAID when no certificate or hash data', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-3', type: 'eMAID' } });
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-5', type: 'eMAID' } });
     const response = await handleAuthorize(ctx);
 
     expect(response).not.toHaveProperty('certificateStatus');
@@ -351,10 +487,63 @@ describe('v2_1 Authorize handler', () => {
     expect(response['tariff']).toEqual({
       tariffId: 'trf_1',
       currency: 'USD',
-      energy: { prices: [{ priceKwh: 0.25 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      chargingTime: { prices: [{ priceMinute: 0.15 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      idleTime: { prices: [{ priceMinute: 0.05 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      fixedFee: { prices: [{ priceFixed: 2 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
+      energy: { prices: [{ priceKwh: 0.25 }], taxRates: [{ type: 'VAT', tax: 8 }] },
+      chargingTime: { prices: [{ priceMinute: 0.15 }], taxRates: [{ type: 'VAT', tax: 8 }] },
+      idleTime: { prices: [{ priceMinute: 0.05 }], taxRates: [{ type: 'VAT', tax: 8 }] },
+      fixedFee: { prices: [{ priceFixed: 2 }], taxRates: [{ type: 'VAT', tax: 8 }] },
+    });
+    // Resolved like session pricing: the station's internal id and the token's driver.
+    expect(resolveStationTariffMock).toHaveBeenCalledWith(
+      { stationUuid: 'sta_cs001', driverUuid: 'drv_8' },
+      clientMock,
+    );
+  });
+
+  it('uses the station id from the connection without looking it up', async () => {
+    whereQueue = [
+      [{ id: 'dtk_s', driverId: 'drv_s', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({ idToken: { idToken: 'known-station', type: 'ISO14443' } });
+    ctx.stationDbId = 'sta_known';
+    await handleAuthorize(ctx);
+
+    expect(clientMock).not.toHaveBeenCalled();
+    expect(resolveStationTariffMock).toHaveBeenCalledWith(
+      { stationUuid: 'sta_known', driverUuid: 'drv_s' },
+      clientMock,
+    );
+  });
+
+  it('sends net prices for a tariff entered on the gross tax basis', async () => {
+    getCompanyTaxBasisMock.mockResolvedValueOnce('gross');
+    whereQueue = [
+      [{ id: 'dtk_g', driverId: 'drv_g', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    executeFn.mockResolvedValue([
+      {
+        id: 'trf_g',
+        price_per_kwh: '0.357',
+        price_per_minute: null,
+        price_per_session: '1.19',
+        idle_fee_price_per_minute: '0.50',
+        tax_rate: '0.19',
+        pricing_group_id: 'pgr_1',
+      },
+    ]);
+    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({ idToken: { idToken: 'gross-rfid', type: 'ISO14443' } });
+    const response = await handleAuthorize(ctx);
+
+    expect(response['tariff']).toEqual({
+      tariffId: 'trf_g',
+      currency: 'USD',
+      energy: { prices: [{ priceKwh: 0.3 }], taxRates: [{ type: 'VAT', tax: 19 }] },
+      // 0.50 / 1.19 = 0.42016...
+      idleTime: { prices: [{ priceMinute: 0.4202 }], taxRates: [{ type: 'VAT', tax: 19 }] },
+      fixedFee: { prices: [{ priceFixed: 1 }], taxRates: [{ type: 'VAT', tax: 19 }] },
     });
   });
 

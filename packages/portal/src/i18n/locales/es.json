@@ -18,7 +18,9 @@
     "offline": "Estas sin conexion. Algunas funciones pueden no funcionar.",
     "add": "Añadir",
     "deactivate": "Desactivar",
-    "remove": "Quitar"
+    "remove": "Quitar",
+    "inclTax": "impuestos incluidos",
+    "amountInclTax": "{{amount}} impuestos incluidos"
   },
   "nav": {
     "home": "Inicio",
@@ -75,6 +77,12 @@
     "passwordsMustMatch": "Las contrasenas deben coincidir",
     "invalidResetLink": "Este enlace es invalido o ha expirado.",
     "requestNewLink": "Solicitar un nuevo enlace",
+    "activateTitle": "Configure su cuenta",
+    "activateSubtitle": "Elija una contraseña para iniciar sesión en el portal de conductores.",
+    "activateSubmit": "Establecer contraseña",
+    "activateSuccess": "Su contraseña está establecida. Ya puede iniciar sesión.",
+    "invalidActivateLink": "Este enlace de invitación no es válido, ya se usó o ha caducado.",
+    "activateAskOperator": "Pida a su proveedor de carga que le envíe una nueva invitación.",
     "verifyEmailTitle": "Verifica tu correo",
     "verifyEmailSubtitle": "Enviamos un enlace de verificacion a {{email}}. Revisa tu bandeja de entrada y haz clic en el enlace para verificar tu cuenta.",
     "verifyEmailChecking": "Verificando tu correo...",
@@ -119,7 +127,14 @@
     "energy": "Energia",
     "energyAdded": "Energia entregada",
     "cost": "Costo estimado",
+    "costInclTax": "Costo estimado (impuestos incluidos)",
     "totalCost": "Costo total",
+    "totalCostInclTax": "Costo total (impuestos incluidos)",
+    "netCost": "Importe neto (antes de impuestos)",
+    "taxAdded": "Impuestos ({{rate}} %)",
+    "taxAddedNoRate": "Impuestos",
+    "taxContained": "Impuestos incluidos ({{rate}} %)",
+    "taxContainedNoRate": "Impuestos incluidos",
     "stopReason": "Razon de parada",
     "rfid": "RFID",
     "payment": "Pago",
@@ -220,7 +235,12 @@
     "themeDark": "Oscuro",
     "distanceUnit": "Unidad de distancia",
     "distanceMiles": "Millas",
-    "distanceKm": "Kilometros"
+    "distanceKm": "Kilometros",
+    "priceDisplay": "Mostrar precios",
+    "priceDisplayDefault": "Predeterminado del operador ({{value}})",
+    "priceDisplayGross": "Impuestos incluidos (bruto)",
+    "priceDisplayNet": "Sin impuestos (neto)",
+    "priceDisplayHelper": "Con impuestos muestra los precios con los impuestos sumados. Sin impuestos muestra los precios antes de impuestos. El importe cobrado es el mismo en ambos casos, y mientras no elija, se aplica la opción del operador."
   },
   "charger": {
     "loadingInfo": "Cargando informacion del cargador...",
@@ -255,6 +275,8 @@
     "sessionFee": "tarifa de sesion",
     "idleFee": "/min tarifa inactiva",
     "tax": "impuesto",
+    "taxIncluded": "Precios con impuestos del {{rate}} % incluidos",
+    "taxExcluded": "Precios sin el {{rate}} % de impuestos, que se suma al importe cobrado",
     "startCharging": "Iniciar carga",
     "freeCharging": "Carga gratuita",
     "siteContact": "Contacto del sitio",
@@ -321,7 +343,9 @@
     "duration": "Duracion",
     "energyDelivered": "Energia entregada",
     "totalCost": "Costo total",
+    "totalCostInclTax": "Costo total (impuestos incluidos)",
     "estimatedCost": "Costo estimado",
+    "estimatedCostInclTax": "Costo estimado (impuestos incluidos)",
     "started": "Inicio",
     "ended": "Fin",
     "stopCharging": "Detener carga",
@@ -405,7 +429,7 @@
     "noShowFeeNote": "Se puede aplicar una tarifa de retencion incluso si no te presentas.",
     "maxHoursHint": "La duracion maxima de la reserva es de {{hours}} horas.",
     "paymentMethodRequired": "Se requiere un metodo de pago para crear una reserva.",
-    "cancellationFeeWarning": "Se cobrara una tarifa de cancelacion de {{fee}} en tu metodo de pago predeterminado.",
+    "cancellationFeeWarning": "Se cobrara una tarifa de cancelacion de {{fee}} mas los impuestos aplicables en tu metodo de pago predeterminado.",
     "cancellationPolicy": "Politica de cancelacion",
     "cancellationPolicyText": "Si cancelas dentro de los {{minutes}} minutos de la hora de inicio, se cobrara una tarifa de cancelacion de {{fee}}.",
     "upcoming": "Próximas",
@@ -479,6 +503,7 @@
     "COMMAND_FAILED": "Comando fallido",
     "COMMAND_QUEUED": "Estacion fuera de linea, comando en cola",
     "COMMAND_TIMEOUT": "Tiempo de espera del comando agotado",
+    "CONNECTOR_ID_MISMATCH": "En una estación OCPP 1.6 cada EVSE tiene un conector con el mismo número.",
     "CONNECTOR_NOT_AVAILABLE": "El conector no esta disponible para carga",
     "CONNECTOR_NOT_FOUND": "Conector no encontrado",
     "CONNECTOR_OCCUPIED": "No se puede eliminar el EVSE con conectores ocupados",
@@ -492,6 +517,7 @@
     "DRIVER_ALREADY_IN_FLEET": "El conductor ya esta en esta flota",
     "DRIVER_CREATE_FAILED": "Error al crear el conductor",
     "DRIVER_NOT_FOUND": "Conductor no encontrado",
+    "DRIVER_INACTIVE": "El conductor está inactivo",
     "DUPLICATE_API_KEY_NAME": "Ya existe una clave de API con este nombre",
     "DUPLICATE_CONNECTOR_ID": "El ID de conector ... ya existe en este EVSE",
     "DUPLICATE_EMAIL": "El correo electronico ya esta en uso",
@@ -579,7 +605,7 @@
     "NO_VALID_ENTRIES": "No se encontraron entradas validas",
     "NO_VALID_TOKENS": "No se encontraron tarjetas validas",
     "OCPP_COMMAND_FAILED": "Comando OCPP fallido",
-    "OCPP_VERSION_MISMATCH": "La accion ... requiere ..., la estacion ... es ...",
+    "OCPP_VERSION_MISMATCH": "El comando es para una versión de OCPP distinta de la que usa la estación",
     "OCTT_RUN_NOT_FOUND": "Ejecucion de conformidad no encontrada",
     "OVERSUBSCRIPTION_EXCEEDED": "La capacidad total conectada (... kW) excede la capacidad efectiva del panel (... kW)",
     "PANEL_NOT_FOUND": "Panel no encontrado",
@@ -634,7 +660,6 @@
     "RESET_NOT_REQUIRED": "No se requiere restablecimiento de contrasena",
     "ROAMING_DISABLED": "El roaming esta deshabilitado",
     "ROLE_NOT_FOUND": "El rol no existe",
-    "ROTATION_FAILED": "La rotacion de credenciales fallo",
     "ROTATION_NOT_APPLICABLE": "La rotacion de credenciales solo aplica a perfiles de seguridad 1 y 2",
     "RULE_NOT_FOUND": "Regla no encontrada",
     "SCHEDULE_NOT_FOUND": "Programacion no encontrada",
@@ -657,6 +682,7 @@
     "STATION_OFFLINE": "La estacion esta fuera de linea",
     "STATION_REJECTED": "La estacion rechazo el inicio: ...",
     "STATION_TIMEOUT": "La estacion no respondio",
+    "STATION_UNAVAILABLE": "Esta estación no está disponible en este momento. Pruebe otra estación.",
     "STORAGE_CONNECTION_FAILED": "La prueba de conexion del almacenamiento fallo",
     "STORAGE_NOT_CONFIGURED": "Almacenamiento de adjuntos no configurado",
     "SUPPORT_AI_NOT_CONFIGURED": "La IA de soporte no esta configurada",
@@ -696,7 +722,11 @@
     "TOO_MANY_WATCHES": "Estas vigilando demasiadas estaciones",
     "STATION_WATCH_NOT_FOUND": "Vigilancia no encontrada",
     "STATUS_CHECK_REJECTED": "La estación rechazó la verificación de estado",
-    "STATUS_CHECK_TIMEOUT": "La verificación de estado expiró. Vuelva a conectar el conector e inténtelo de nuevo."
+    "STATUS_CHECK_TIMEOUT": "La verificación de estado expiró. Vuelva a conectar el conector e inténtelo de nuevo.",
+    "SECURITY_PROFILE_DOWNGRADE": "Una estacion conectada no puede pasar a un perfil de seguridad inferior",
+    "STATION_TLS_URL_NOT_CONFIGURED": "La direccion TLS publica para estaciones (OCPP_STATION_TLS_URL) no esta configurada",
+    "STATION_SECURITY_CHANGE_REJECTED": "La estacion no acepto el cambio de seguridad; su configuracion actual no cambio",
+    "PORTAL_ALREADY_ACTIVE": "El conductor ya tiene acceso al portal"
   },
   "validation": {
     "required": "Este campo es obligatorio",
@@ -727,7 +757,9 @@
     "total": "Total",
     "co2Avoided": "CO₂ evitado",
     "totalCo2Avoided": "CO₂ total evitado",
-    "noSessions": "No hay sesiones de carga en este periodo."
+    "noSessions": "No hay sesiones de carga en este periodo.",
+    "cost": "Costo",
+    "costInclTax": "Costo (impuestos incluidos)"
   },
   "account": {
     "title": "Cuenta",
@@ -847,6 +879,11 @@
     "scanPhoto": "Escanear desde una foto",
     "noQrFound": "No se encontró ningún código QR en esa foto. Inténtalo de nuevo."
   },
+  "qr": {
+    "checking": "Comprobando el código QR",
+    "invalidTitle": "Código QR no válido",
+    "invalidMessage": "Este código QR no es válido o ha caducado. Vuelva a escanear el código QR que muestra la estación de carga."
+  },
   "watch": {
     "notifyWhenFree": "Avisarme cuando este libre",
     "watching": "Dejar de seguir",
@@ -857,5 +894,13 @@
     "empty": "No estas vigilando ninguna estacion.",
     "removeTitle": "Dejar de seguir",
     "removeMessage": "Ya no recibiras una notificacion cuando esta estacion este libre."
+  },
+  "authFooter": {
+    "privacyPolicy": "Política de privacidad",
+    "termsOfService": "Términos del servicio",
+    "allRightsReserved": "Todos los derechos reservados, {{year}} {{name}}",
+    "recaptchaProtected": "Protegido por reCAPTCHA.",
+    "recaptchaPrivacy": "Privacidad",
+    "recaptchaTerms": "Términos"
   }
 }

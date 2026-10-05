@@ -1,8 +1,18 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect } from 'vitest';
-import { cn, formatCents, formatEnergy, formatDate } from '../utils';
+import { describe, it, expect, afterEach, beforeAll } from 'vitest';
+import i18next from 'i18next';
+import {
+  cn,
+  formatCents,
+  formatDate,
+  formatDistance,
+  formatEnergy,
+  formatNumber,
+  formatTaxPercent,
+  formatUnitPrice,
+} from '../utils';
 
 describe('cn', () => {
   it('merges class names', () => {
@@ -139,5 +149,42 @@ describe('formatDate', () => {
 
   it('returns -- for null with timezone', () => {
     expect(formatDate(null, 'America/New_York')).toBe('n/a');
+  });
+});
+
+describe('formatting in the UI language', () => {
+  beforeAll(async () => {
+    await i18next.init({ lng: 'en', resources: {} });
+  });
+
+  afterEach(async () => {
+    await i18next.changeLanguage('en');
+  });
+
+  it('uses the separators of the selected language', async () => {
+    await i18next.changeLanguage('de');
+    expect(formatCents(123456, 'EUR')).toBe('1.234,56 €');
+    expect(formatUnitPrice(0.49, 'EUR')).toBe('0,49 €');
+    expect(formatNumber(1234.5, 1)).toBe('1.234,5');
+    expect(formatEnergy(12_345)).toBe('12,35 kWh');
+    expect(formatDistance(1_234_000, 1, 'miles')).toBe('1.234 Miles');
+  });
+
+  it('keeps English formatting for English', async () => {
+    await i18next.changeLanguage('en');
+    expect(formatUnitPrice(0.49, 'EUR')).toBe('€0.49');
+    expect(formatEnergy(12_345)).toBe('12.35 kWh');
+  });
+
+  it('keeps up to four fraction digits of a unit price', async () => {
+    await i18next.changeLanguage('en');
+    expect(formatUnitPrice(0.256088, 'EUR')).toBe('€0.2561');
+    expect(formatUnitPrice(0.5, 'EUR')).toBe('€0.50');
+  });
+
+  it('formats a tax rate as a percentage without trailing zeros', async () => {
+    await i18next.changeLanguage('de');
+    expect(formatTaxPercent(0.19)).toBe('19');
+    expect(formatTaxPercent(0.075)).toBe('7,5');
   });
 });

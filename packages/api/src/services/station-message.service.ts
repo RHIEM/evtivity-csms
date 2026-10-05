@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, gt, inArray, desc } from 'drizzle-orm';
+import { eq, and, gt, inArray, desc, sql } from 'drizzle-orm';
 import crypto from 'node:crypto';
 import {
   db,
@@ -15,19 +15,29 @@ import {
   meterValues,
   stationMessagePushes,
   getStationMessagePricingFormat,
+  getStationMessageLanguage,
   isStationMessageEnabled,
   getCompanyCurrency,
+  getCompanyPriceDisplay,
+  getCompanyTaxBasis,
+  resolveStationTariff,
 } from '@evtivity/database';
 import {
-  formatPricingDisplay,
+  buildStationPriceContext,
+  formatStationIdleFeeRate,
+  formatStationQuantity,
+  formatStationTime,
   renderStationMessage,
+  stationTaxNoteContext,
+  taxRateFraction,
+  type StationMessageLanguage,
   type StationMessageState,
   type StationMessageContext,
   type Subscription,
   formatCurrencyAmount,
+  resolveTaxBasis,
 } from '@evtivity/lib';
 import type { FastifyBaseLogger } from 'fastify';
-import { resolveTariff } from './tariff.service.js';
 import { getPubSub } from '../lib/pubsub.js';
 import { sessionCurrencySql } from '../lib/company-currency.js';
 
@@ -189,7 +199,10 @@ interface IdleResolution {
   reservationExpiresAt?: string;
 }
 
-async function resolveIdleState(internalStationId: string): Promise<IdleResolution> {
+async function resolveIdleState(
+  internalStationId: string,
+  language: StationMessageLanguage,
+): Promise<IdleResolution> {
   const connectorRows = await db
     .select({ status: connectors.status })
     .from(connectors)
@@ -225,7 +238,7 @@ async function resolveIdleState(internalStationId: string): Promise<IdleResoluti
       result.driverFirstName = reservation.driverFirstName;
     }
     if (reservation?.expiresAt != null) {
-      result.reservationExpiresAt = formatExpiresAt(reservation.expiresAt);
+      result.reservationExpiresAt = formatStationTime(reservation.expiresAt, language);
     }
     return result;
   }
@@ -248,14 +261,6 @@ async function resolveIdleState(internalStationId: string): Promise<IdleResoluti
   }
 
   return { state: 'available' };
-}
-
-function formatExpiresAt(date: Date): string {
-  return date.toLocaleString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  });
 }
 
 export async function pushAllStationMessages(
@@ -281,24 +286,39 @@ export async function pushAllStationMessages(
 
   if (station == null) return;
 
-  const [{ companyName, supportPhone }, format, idle, currency] = await Promise.all([
+  const language = await getStationMessageLanguage();
+  const [
+    { companyName, supportPhone },
+    pricingFormat,
+    idle,
+    currency,
+    priceDisplay,
+    taxBasis,
+    tariff,
+  ] = await Promise.all([
     getCompanySettings(),
     getStationMessagePricingFormat(),
-    resolveIdleState(internalStationId),
+    resolveIdleState(internalStationId, language),
     getCompanyCurrency(),
+    getCompanyPriceDisplay(),
+    getCompanyTaxBasis(),
+    resolveStationTariff({ stationUuid: internalStationId, driverUuid: null }, client),
   ]);
 
-  const tariff = await resolveTariff(internalStationId, null);
-  const pricingDisplay =
-    tariff != null
-      ? formatPricingDisplay(tariff, format === 'compact' ? 'compact' : 'standard', currency)
-      : '';
-
+  // Prices at the point of sale follow company.priceDisplay: gross adds the
+  // tariff tax (EU Price Indication Directive 98/6/EC, PAngV).
   const baseCtx: StationMessageContext = {
     companyName,
     stationOcppId,
     supportPhone,
-    pricingDisplay,
+    ...buildStationPriceContext({
+      tariff,
+      priceDisplay,
+      taxBasis,
+      pricingFormat,
+      currency,
+      language,
+    }),
   };
 
   const idleCtx: StationMessageContext = { ...baseCtx };
@@ -310,7 +330,7 @@ export async function pushAllStationMessages(
   }
 
   try {
-    const idleContent = await renderStationMessage(idle.state, idleCtx);
+    const idleContent = await renderStationMessage(idle.state, idleCtx, language);
     await dispatchAndUpsert(
       internalStationId,
       stationOcppId,
@@ -322,7 +342,7 @@ export async function pushAllStationMessages(
       log,
     );
 
-    const faultedContent = await renderStationMessage('faulted', baseCtx);
+    const faultedContent = await renderStationMessage('faulted', baseCtx, language);
     await dispatchAndUpsert(
       internalStationId,
       stationOcppId,
@@ -334,7 +354,7 @@ export async function pushAllStationMessages(
       log,
     );
 
-    const unavailableContent = await renderStationMessage('unavailable', baseCtx);
+    const unavailableContent = await renderStationMessage('unavailable', baseCtx, language);
     await dispatchAndUpsert(
       internalStationId,
       stationOcppId,
@@ -348,6 +368,34 @@ export async function pushAllStationMessages(
   } catch (err: unknown) {
     log.warn({ stationId: stationOcppId, error: err }, 'Failed to push station messages');
   }
+}
+
+// Renders for one station run one at a time. Two events close together (a
+// TransactionEvent and its meter values) would otherwise both read the old
+// content hash and send the same message twice.
+const stationRenderQueues = new Map<string, Promise<void>>();
+
+export function runStationRender(
+  internalStationId: string,
+  render: () => Promise<void>,
+): Promise<void> {
+  const previous = stationRenderQueues.get(internalStationId) ?? Promise.resolve();
+  // A failed render is logged by its caller and must not block the next one.
+  const next = previous.catch(() => undefined).then(render);
+  stationRenderQueues.set(internalStationId, next);
+  void next.then(
+    () => {
+      if (stationRenderQueues.get(internalStationId) === next) {
+        stationRenderQueues.delete(internalStationId);
+      }
+    },
+    () => {
+      if (stationRenderQueues.get(internalStationId) === next) {
+        stationRenderQueues.delete(internalStationId);
+      }
+    },
+  );
+  return next;
 }
 
 export async function startStationMessageRefreshListener(
@@ -369,11 +417,9 @@ export async function startStationMessageRefreshListener(
         ) {
           return;
         }
-        await pushAllStationMessages(
-          parsed.stationOcppId,
-          parsed.internalStationId,
-          parsed.ocppProtocol,
-          log,
+        const { stationOcppId, internalStationId, ocppProtocol } = parsed;
+        await runStationRender(internalStationId, () =>
+          pushAllStationMessages(stationOcppId, internalStationId, ocppProtocol, log),
         );
       } catch (err: unknown) {
         log.warn({ error: err }, 'station_message_refresh handler failed');
@@ -394,6 +440,8 @@ export interface TransactionSessionRow {
   currency: string;
   chargingState: string | null;
   tariffIdleFeePricePerMinute: string | number | null;
+  taxBasis: string | null;
+  tariffTaxRate: string | number | null;
 }
 
 interface TransactionMapping {
@@ -439,21 +487,7 @@ function formatElapsed(startedAt: Date | string | null): string {
   return `${hours.toString()}h ${mins.toString()}m`;
 }
 
-function formatRatePerMinute(ratePerMinute: string | number | null, currency: string): string {
-  if (ratePerMinute == null) return '';
-  const rate = typeof ratePerMinute === 'string' ? Number(ratePerMinute) : ratePerMinute;
-  if (!Number.isFinite(rate) || rate <= 0) return '';
-  try {
-    return `${new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency,
-    }).format(rate)}/min`;
-  } catch {
-    return `${rate.toFixed(2)} ${currency}/min`;
-  }
-}
-
-async function getLatestPowerKw(sessionId: string): Promise<string> {
+async function getLatestPowerKw(sessionId: string): Promise<number | null> {
   const rows = await db
     .select({ value: meterValues.value, unit: meterValues.unit })
     .from(meterValues)
@@ -464,13 +498,13 @@ async function getLatestPowerKw(sessionId: string): Promise<string> {
     .limit(1);
 
   const row = rows[0];
-  if (row == null) return '';
+  if (row == null) return null;
   let kw = Number(row.value);
-  if (!Number.isFinite(kw)) return '';
+  if (!Number.isFinite(kw)) return null;
   if (row.unit == null || row.unit === 'W') {
     kw = kw / 1000;
   }
-  return kw.toFixed(1);
+  return kw;
 }
 
 async function getDriverFirstName(driverId: string | null): Promise<string | undefined> {
@@ -550,29 +584,43 @@ export async function pushTransactionMessage(
   }
 
   const energyWh = sessionRow.energyDeliveredWh != null ? Number(sessionRow.energyDeliveredWh) : 0;
-  const energyKwh = (energyWh / 1000).toFixed(1);
 
-  const [{ companyName, supportPhone }, powerKw, driverFirstName] = await Promise.all([
-    getCompanySettings(),
-    getLatestPowerKw(sessionRow.id),
-    getDriverFirstName(sessionRow.driverId),
-  ]);
+  const [{ companyName, supportPhone }, powerKw, driverFirstName, language, priceDisplay] =
+    await Promise.all([
+      getCompanySettings(),
+      getLatestPowerKw(sessionRow.id),
+      getDriverFirstName(sessionRow.driverId),
+      getStationMessageLanguage(),
+      getCompanyPriceDisplay(),
+    ]);
 
-  const costFormatted = formatCurrencyAmount(sessionRow.currentCostCents ?? 0, sessionRow.currency);
-  const elapsedFormatted = formatElapsed(sessionRow.startedAt);
-  const idleFeeRate = formatRatePerMinute(
-    sessionRow.tariffIdleFeePricePerMinute,
+  // The session cost always includes tax. The idle fee rate is a unit price,
+  // shown net or gross per company.priceDisplay at the session's tax rate.
+  const costFormatted = formatCurrencyAmount(
+    sessionRow.currentCostCents ?? 0,
     sessionRow.currency,
+    language,
   );
+  const elapsedFormatted = formatElapsed(sessionRow.startedAt);
+  const idleFeeRate = formatStationIdleFeeRate({
+    pricePerMinute: sessionRow.tariffIdleFeePricePerMinute,
+    taxRate: sessionRow.tariffTaxRate,
+    priceDisplay,
+    // The session's prices are in the basis it was priced in.
+    taxBasis: resolveTaxBasis(sessionRow.taxBasis),
+    currency: sessionRow.currency,
+    language,
+  });
 
   const ctx: StationMessageContext = {
     companyName,
     stationOcppId,
     supportPhone,
-    energyKwh,
-    powerKw,
+    energyKwh: formatStationQuantity(energyWh / 1000, language),
+    powerKw: powerKw == null ? '' : formatStationQuantity(powerKw, language),
     costFormatted,
     elapsedFormatted,
+    ...stationTaxNoteContext(taxRateFraction(sessionRow.tariffTaxRate), priceDisplay, language),
   };
   if (idleFeeRate.length > 0) {
     ctx.idleFeeRate = idleFeeRate;
@@ -583,7 +631,7 @@ export async function pushTransactionMessage(
 
   let content: string;
   try {
-    content = await renderStationMessage(mapping.templateState, ctx);
+    content = await renderStationMessage(mapping.templateState, ctx, language);
   } catch (err: unknown) {
     log.warn(
       { stationId: stationOcppId, templateState: mapping.templateState, error: err },
@@ -708,7 +756,7 @@ export async function clearAllTransactionMessages(
   }
 }
 
-async function loadTransactionSessionById(
+export async function loadTransactionSessionById(
   sessionId: string,
 ): Promise<TransactionSessionRow | null> {
   const [row] = await db
@@ -721,8 +769,19 @@ async function loadTransactionSessionById(
       startedAt: chargingSessions.startedAt,
       energyDeliveredWh: chargingSessions.energyDeliveredWh,
       currentCostCents: chargingSessions.currentCostCents,
-      currency: sessionCurrencySql(await getCompanyCurrency()),
+      currency: sessionCurrencySql(),
       tariffIdleFeePricePerMinute: chargingSessions.tariffIdleFeePricePerMinute,
+      taxBasis: chargingSessions.taxBasis,
+      tariffTaxRate: chargingSessions.tariffTaxRate,
+      // A station sends chargingState only when it changes, so the state is the
+      // one in the latest stored TransactionEvent that carried it.
+      chargingState: sql<string | null>`(
+        SELECT te.payload->>'chargingState' FROM transaction_events te
+        WHERE te.session_id = charging_sessions.id
+          AND te.payload->>'chargingState' IS NOT NULL
+        ORDER BY te.seq_no DESC, te.id DESC
+        LIMIT 1
+      )`,
     })
     .from(chargingSessions)
     .where(eq(chargingSessions.id, sessionId))
@@ -740,8 +799,10 @@ async function loadTransactionSessionById(
     energyDeliveredWh: row.energyDeliveredWh,
     currentCostCents: row.currentCostCents,
     currency: row.currency,
-    chargingState: null,
+    chargingState: row.chargingState,
     tariffIdleFeePricePerMinute: row.tariffIdleFeePricePerMinute,
+    taxBasis: row.taxBasis,
+    tariffTaxRate: row.tariffTaxRate,
   };
 }
 
@@ -772,28 +833,27 @@ export async function startStationMessageTransactionListener(
           return;
         }
 
-        if (parsed.eventType === 'ended') {
-          await clearAllTransactionMessages(
-            parsed.internalStationId,
-            parsed.stationOcppId,
-            parsed.ocppProtocol,
+        const { sessionId, internalStationId, stationOcppId, ocppProtocol } = parsed;
+        await runStationRender(internalStationId, async () => {
+          if (parsed.eventType === 'ended') {
+            await clearAllTransactionMessages(internalStationId, stationOcppId, ocppProtocol, log);
+            return;
+          }
+
+          const sessionRow = await loadTransactionSessionById(sessionId);
+          if (sessionRow == null) return;
+
+          // Without a chargingState in the event, keep the last state the station reported.
+          if (parsed.chargingState != null) sessionRow.chargingState = parsed.chargingState;
+
+          await pushTransactionMessage(
+            internalStationId,
+            stationOcppId,
+            ocppProtocol,
+            sessionRow,
             log,
           );
-          return;
-        }
-
-        const sessionRow = await loadTransactionSessionById(parsed.sessionId);
-        if (sessionRow == null) return;
-
-        sessionRow.chargingState = parsed.chargingState ?? null;
-
-        await pushTransactionMessage(
-          parsed.internalStationId,
-          parsed.stationOcppId,
-          parsed.ocppProtocol,
-          sessionRow,
-          log,
-        );
+        });
       } catch (err: unknown) {
         log.warn({ error: err }, 'station_message_transaction handler failed');
       }

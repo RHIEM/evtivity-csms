@@ -28,6 +28,7 @@ import { InfoNote } from '@/components/ui/info-note';
 import { ReportIssue } from '@/components/ReportIssue';
 import { useToast } from '@/components/ui/toast';
 import { PricingDisplay, isPricingFree } from '@/components/PricingDisplay';
+import { usePriceDisplay } from '@/hooks/use-price-display';
 import type { PricingInfo } from '@/components/PricingDisplay';
 import { EvPlugAnimation } from '@/components/EvPlugAnimation';
 import { api } from '@/lib/api';
@@ -80,6 +81,7 @@ interface StationDetail {
   paymentEnabled: boolean;
   evses: EvseItem[];
   maintenance: MaintenanceInfo | null;
+  stationUnavailable: boolean;
 }
 
 interface PaymentMethod {
@@ -126,6 +128,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
+  const priceDisplay = usePriceDisplay();
   const currentDriverId = useAuth((s) => s.driver?.id ?? null);
   useStationEvents(stationId);
 
@@ -401,6 +404,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
         mode,
         isOnline: station.isOnline,
         maintenanceActive: station.maintenance?.active === true,
+        stationUnavailable: station.stationUnavailable,
         currentDriverId,
       }),
     );
@@ -493,6 +497,12 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
         </div>
       ) : null}
 
+      {station.stationUnavailable && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+          <p className="text-sm">{t('errors.STATION_UNAVAILABLE')}</p>
+        </div>
+      )}
+
       {station.maintenance?.active === true && (
         <div className="rounded-md border border-warning/40 bg-warning/10 p-4">
           <p className="font-semibold">{t('charger.maintenanceTitle')}</p>
@@ -551,7 +561,9 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
       )}
 
       {/* Pricing */}
-      {pricing != null && <PricingDisplay pricing={pricing} />}
+      {pricing != null && priceDisplay != null && (
+        <PricingDisplay pricing={pricing} priceDisplay={priceDisplay} />
+      )}
 
       {/* EVSE selection instruction */}
       {station.evses.length > 0 && !hasActiveSession && (
@@ -575,6 +587,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
               mode,
               isOnline: station.isOnline,
               maintenanceActive: station.maintenance?.active === true,
+              stationUnavailable: station.stationUnavailable,
               currentDriverId,
             });
             const isSelected = selectedEvseId === evse.evseId;

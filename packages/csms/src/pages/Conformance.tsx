@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
+import { formatNumber } from '@/lib/formatting';
 
 interface OcttRun {
   id: number;
@@ -32,6 +33,7 @@ interface OcttRun {
   failed: number;
   skipped: number;
   errors: number;
+  notApplicable: number;
   durationMs: number | null;
   triggeredBy: string | null;
   startedAt: string | null;
@@ -50,9 +52,11 @@ function statusBadge(status: string): React.JSX.Element {
   return <Badge variant={variants[status] ?? 'default'}>{status}</Badge>;
 }
 
+/** Pass rate over the tests that apply: the PICS excludes notApplicable tests. */
 function passRate(run: OcttRun): string {
-  if (run.totalTests === 0) return 'n/a';
-  return `${((run.passed / run.totalTests) * 100).toFixed(1)}%`;
+  const applicable = run.totalTests - run.notApplicable;
+  if (applicable <= 0) return 'n/a';
+  return `${formatNumber((run.passed / applicable) * 100, 1)}%`;
 }
 
 function formatDuration(ms: number | null): string {
@@ -102,7 +106,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         {!embedded && (
           <div>
             <h1 className="text-2xl md:text-3xl font-bold">{t('conformance.title')}</h1>
@@ -170,6 +174,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                     <TableHead className="text-right">{t('conformance.passed')}</TableHead>
                     <TableHead className="text-right">{t('conformance.failed')}</TableHead>
                     <TableHead className="text-right">{t('conformance.errors')}</TableHead>
+                    <TableHead className="text-right">{t('conformance.notApplicable')}</TableHead>
                     <TableHead className="text-right">{t('conformance.passRate')}</TableHead>
                     <TableHead className="text-right">{t('conformance.duration')}</TableHead>
                   </TableRow>
@@ -195,6 +200,9 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                       <TableCell className="text-right text-destructive">{run.failed}</TableCell>
                       <TableCell className="text-right text-warning">
                         {run.skipped + run.errors}
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {run.notApplicable}
                       </TableCell>
                       <TableCell className="text-right font-medium">{passRate(run)}</TableCell>
                       <TableCell className="text-right text-xs text-muted-foreground">

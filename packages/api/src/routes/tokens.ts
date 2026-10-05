@@ -11,7 +11,6 @@ import {
   drivers,
   sites,
   driverTokens,
-  getCompanyCurrency,
 } from '@evtivity/database';
 import * as tokenService from '../services/token.service.js';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -37,6 +36,17 @@ export const OCPP_TOKEN_TYPES = [
 ] as const;
 const tokenTypeSchema = z.enum(OCPP_TOKEN_TYPES);
 
+const prepaidBalanceSchema = z
+  .number()
+  .int()
+  .min(-100_000_000)
+  .max(100_000_000)
+  .nullable()
+  .optional()
+  .describe(
+    'Prepaid credit in cents of the company currency (OCPP 2.1 prepaid card). Null makes the token postpaid',
+  );
+
 const tokenItem = z
   .object({
     id: z.string().describe('Token ID'),
@@ -47,6 +57,13 @@ const tokenItem = z
     expiresAt: z.coerce.date().nullable().describe('Optional expiration timestamp'),
     revokedAt: z.coerce.date().nullable().describe('Timestamp the token was last deactivated'),
     revokedReason: z.string().nullable().describe('Optional operator-supplied reason'),
+    prepaidBalanceCents: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Prepaid credit in cents of the company currency. Null when the token is not prepaid; zero or less is answered NoCredit',
+      ),
     createdAt: z.coerce.date().describe('Timestamp when the token was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the token was last updated'),
     driverFirstName: z
@@ -68,6 +85,13 @@ const tokenCreated = z
     expiresAt: z.coerce.date().nullable().describe('Optional expiration timestamp'),
     revokedAt: z.coerce.date().nullable().describe('Timestamp the token was last deactivated'),
     revokedReason: z.string().nullable().describe('Optional operator-supplied reason'),
+    prepaidBalanceCents: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Prepaid credit in cents of the company currency. Null when the token is not prepaid; zero or less is answered NoCredit',
+      ),
     createdAt: z.coerce.date().describe('Timestamp when the token was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the token was last updated'),
   })
@@ -111,6 +135,7 @@ const createTokenBody = z.object({
   idToken: z.string().min(1).max(255).describe('Token identifier'),
   tokenType: tokenTypeSchema.describe('OCPP IdToken type'),
   expiresAt: z.coerce.date().nullable().optional().describe('Optional expiration timestamp'),
+  prepaidBalanceCents: prepaidBalanceSchema,
 });
 
 const updateTokenBody = z.object({
@@ -132,6 +157,7 @@ const updateTokenBody = z.object({
     .nullable()
     .optional()
     .describe('Optional reason recorded when the token is deactivated'),
+  prepaidBalanceCents: prepaidBalanceSchema,
 });
 
 const bulkActiveBody = z.object({
@@ -306,7 +332,6 @@ export function tokenRoutes(app: FastifyInstance): void {
       // Filter by token_id directly (the FK on charging_sessions). This shows
       // sessions where the OCPP authorize matched THIS card, not every session
       // by the same driver.
-      const companyCurrency = await getCompanyCurrency();
       const where = eq(chargingSessions.tokenId, id);
 
       const [data, countRows] = await Promise.all([
@@ -327,7 +352,7 @@ export function tokenRoutes(app: FastifyInstance): void {
             energyDeliveredWh: chargingSessions.energyDeliveredWh,
             currentCostCents: chargingSessions.currentCostCents,
             finalCostCents: chargingSessions.finalCostCents,
-            currency: sessionCurrencySql(companyCurrency),
+            currency: sessionCurrencySql(),
           })
           .from(chargingSessions)
           .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))

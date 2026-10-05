@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
@@ -173,7 +174,7 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
         <CardContent className="space-y-6">
           <div className="flex items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5">
-              <Label>{t('settings.chatbotAiEnabled')}</Label>
+              <Label className="leading-6">{t('settings.chatbotAiEnabled')}</Label>
               <p className="text-xs text-muted-foreground">{t('settings.chatbotAiEnabledDesc')}</p>
             </div>
             <button
@@ -194,7 +195,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="ai-provider">{t('settings.chatbotAiProvider')}</Label>
+              <Label htmlFor="ai-provider" className="leading-6">
+                {t('settings.chatbotAiProvider')}
+              </Label>
               <select
                 id="ai-provider"
                 className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -209,7 +212,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
               </select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="ai-api-key">{t('settings.chatbotAiApiKey')}</Label>
+              <Label htmlFor="ai-api-key" className="leading-6">
+                {t('settings.chatbotAiApiKey')}
+              </Label>
               <PasswordInput
                 id="ai-api-key"
                 value={chatbotAiApiKey}
@@ -226,7 +231,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
             </div>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="ai-model">{t('settings.chatbotAiModel')}</Label>
+            <Label htmlFor="ai-model" className="leading-6">
+              {t('settings.chatbotAiModel')}
+            </Label>
             <Input
               id="ai-model"
               value={chatbotAiModel}
@@ -238,17 +245,13 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="ai-temperature">{t('settings.chatbotAiTemperature')}</Label>
-              <Input
+              <Label htmlFor="ai-temperature" className="leading-6">
+                {t('settings.chatbotAiTemperature')}
+              </Label>
+              <DecimalInput
                 id="ai-temperature"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
                 value={chatbotAiTemperature}
-                onChange={(e) => {
-                  setChatbotAiTemperature(e.target.value);
-                }}
+                onChange={setChatbotAiTemperature}
                 placeholder="0.7"
               />
               <p className="text-xs text-muted-foreground">
@@ -256,23 +259,21 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
               </p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="ai-top-p">{t('settings.chatbotAiTopP')}</Label>
-              <Input
+              <Label htmlFor="ai-top-p" className="leading-6">
+                {t('settings.chatbotAiTopP')}
+              </Label>
+              <DecimalInput
                 id="ai-top-p"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
                 value={chatbotAiTopP}
-                onChange={(e) => {
-                  setChatbotAiTopP(e.target.value);
-                }}
+                onChange={setChatbotAiTopP}
                 placeholder="0.9"
               />
               <p className="text-xs text-muted-foreground">{t('settings.chatbotAiTopPHint')}</p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="ai-top-k">{t('settings.chatbotAiTopK')}</Label>
+              <Label htmlFor="ai-top-k" className="leading-6">
+                {t('settings.chatbotAiTopK')}
+              </Label>
               <Input
                 id="ai-top-k"
                 type="number"
@@ -289,7 +290,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
             </div>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="ai-system-prompt">{t('settings.chatbotAiSystemPrompt')}</Label>
+            <Label htmlFor="ai-system-prompt" className="leading-6">
+              {t('settings.chatbotAiSystemPrompt')}
+            </Label>
             <textarea
               id="ai-system-prompt"
               rows={4}
@@ -337,7 +340,7 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
         <CardContent className="space-y-6">
           <div className="flex items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5">
-              <Label>{t('settings.supportAiEnabled')}</Label>
+              <Label className="leading-6">{t('settings.supportAiEnabled')}</Label>
             </div>
             <button
               type="button"
@@ -357,7 +360,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="support-ai-provider">{t('settings.supportAiProvider')}</Label>
+              <Label htmlFor="support-ai-provider" className="leading-6">
+                {t('settings.supportAiProvider')}
+              </Label>
               <select
                 id="support-ai-provider"
                 className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -372,7 +377,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
               </select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="support-ai-api-key">{t('settings.supportAiApiKey')}</Label>
+              <Label htmlFor="support-ai-api-key" className="leading-6">
+                {t('settings.supportAiApiKey')}
+              </Label>
               <PasswordInput
                 id="support-ai-api-key"
                 value={supportAiApiKey}
@@ -389,7 +396,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
             </div>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="support-ai-model">{t('settings.supportAiModel')}</Label>
+            <Label htmlFor="support-ai-model" className="leading-6">
+              {t('settings.supportAiModel')}
+            </Label>
             <Input
               id="support-ai-model"
               value={supportAiModel}
@@ -400,37 +409,31 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="support-ai-temperature">{t('settings.supportAiTemperature')}</Label>
-              <Input
+              <Label htmlFor="support-ai-temperature" className="leading-6">
+                {t('settings.supportAiTemperature')}
+              </Label>
+              <DecimalInput
                 id="support-ai-temperature"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
                 value={supportAiTemperature}
-                onChange={(e) => {
-                  setSupportAiTemperature(e.target.value);
-                }}
+                onChange={setSupportAiTemperature}
                 placeholder="0.3"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="support-ai-top-p">{t('settings.supportAiTopP')}</Label>
-              <Input
+              <Label htmlFor="support-ai-top-p" className="leading-6">
+                {t('settings.supportAiTopP')}
+              </Label>
+              <DecimalInput
                 id="support-ai-top-p"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
                 value={supportAiTopP}
-                onChange={(e) => {
-                  setSupportAiTopP(e.target.value);
-                }}
+                onChange={setSupportAiTopP}
                 placeholder="0.9"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="support-ai-top-k">{t('settings.supportAiTopK')}</Label>
+              <Label htmlFor="support-ai-top-k" className="leading-6">
+                {t('settings.supportAiTopK')}
+              </Label>
               <Input
                 id="support-ai-top-k"
                 type="number"
@@ -446,7 +449,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
             </div>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="support-ai-tone">{t('settings.supportAiTone')}</Label>
+            <Label htmlFor="support-ai-tone" className="leading-6">
+              {t('settings.supportAiTone')}
+            </Label>
             <select
               id="support-ai-tone"
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -461,7 +466,9 @@ export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
             </select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="support-ai-system-prompt">{t('settings.supportAiSystemPrompt')}</Label>
+            <Label htmlFor="support-ai-system-prompt" className="leading-6">
+              {t('settings.supportAiSystemPrompt')}
+            </Label>
             <textarea
               id="support-ai-system-prompt"
               rows={4}

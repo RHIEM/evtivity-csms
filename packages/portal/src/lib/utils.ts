@@ -3,46 +3,60 @@
 
 import { type ClassValue, clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { formatCurrencyAmount } from '@evtivity/lib/currency';
+import {
+  formatCurrencyAmount,
+  formatFlatPrice as formatLocaleFlatPrice,
+  formatUnitPrice as formatLocaleUnitPrice,
+} from '@evtivity/lib/currency';
+import { formatNumber as formatLocaleNumber } from '@evtivity/lib/number';
+import { formatTaxRatePercent } from '@evtivity/lib/price-display';
+import i18next from 'i18next';
 
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
 }
 
-const DEFAULT_CURRENCY_SYMBOLS: Record<string, string> = {
-  USD: '$',
-  EUR: '\u20AC',
-  GBP: '\u00A3',
-  CAD: 'CA$',
-  AUD: 'A$',
-  CHF: 'CHF ',
-  SEK: 'kr',
-  NOK: 'kr',
-  DKK: 'kr',
-  MXN: 'MX$',
-  CNY: '\u00A5',
-};
-
-let customSymbols: Record<string, string> = {};
-
-export function setCurrencySymbols(symbols: Record<string, string>): void {
-  customSymbols = symbols;
+/**
+ * The selected UI language, which drives number and currency formatting. Read
+ * from the global i18next instance that @/i18n initializes; falls back to "en"
+ * before initialization (e.g. in unit tests).
+ */
+function uiLocale(): string {
+  return i18next.isInitialized ? i18next.language : 'en';
 }
 
-export function currencySymbol(currency: string): string {
-  const all = { ...DEFAULT_CURRENCY_SYMBOLS, ...customSymbols };
-  return all[currency] ?? `${currency} `;
+/** Format a number for display with fixed fraction digits in the UI language. */
+export function formatNumber(value: number, fractionDigits: number): string {
+  return formatLocaleNumber(value, uiLocale(), fractionDigits);
 }
 
 export function formatCents(cents: number | null | undefined, currency: string): string {
   if (cents == null) return 'n/a';
-  return formatCurrencyAmount(cents, currency);
+  return formatCurrencyAmount(cents, currency, uiLocale());
+}
+
+/**
+ * Format a unit price in major units (e.g. a tariff rate of 0.2561 per kWh) as
+ * currency with 2 to 4 fraction digits, so rates finer than a cent stay exact.
+ */
+export function formatUnitPrice(amount: number, currency: string): string {
+  return formatLocaleUnitPrice(amount, currency, uiLocale());
+}
+
+/** Format a flat amount in major units (a session fee) as money, rounded to the cent. */
+export function formatFlatPrice(amount: number, currency: string): string {
+  return formatLocaleFlatPrice(amount, currency, uiLocale());
+}
+
+/** Format a tax rate (0.19) as a percentage number in the UI language without trailing zeros (19). */
+export function formatTaxPercent(taxRate: number): string {
+  return formatTaxRatePercent(taxRate, uiLocale());
 }
 
 export function formatEnergy(wh: string | number | null | undefined): string {
   if (wh == null) return 'n/a';
   const value = typeof wh === 'string' ? parseFloat(wh) : wh;
-  return `${(value / 1000).toFixed(2)} kWh`;
+  return `${formatNumber(value / 1000, 2)} kWh`;
 }
 
 export function formatDate(date: string | Date | null | undefined, timezone?: string): string {
@@ -82,9 +96,9 @@ export function formatDistance(
   const miles = (wh / 1000) * efficiencyMiPerKwh;
   if (unit === 'km') {
     const km = miles * 1.60934;
-    return `${km.toFixed(0)} km`;
+    return `${formatNumber(km, 0)} km`;
   }
-  return `${miles.toFixed(0)} Miles`;
+  return `${formatNumber(miles, 0)} Miles`;
 }
 
 export function formatMonthYear(date: Date): string {

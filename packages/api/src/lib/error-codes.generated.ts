@@ -32,6 +32,7 @@ export const ERROR_CODES = {
   COMMAND_FAILED: 'COMMAND_FAILED',
   COMMAND_QUEUED: 'COMMAND_QUEUED',
   COMMAND_TIMEOUT: 'COMMAND_TIMEOUT',
+  CONNECTOR_ID_MISMATCH: 'CONNECTOR_ID_MISMATCH',
   CONNECTOR_NOT_AVAILABLE: 'CONNECTOR_NOT_AVAILABLE',
   CONNECTOR_NOT_FOUND: 'CONNECTOR_NOT_FOUND',
   CONNECTOR_OCCUPIED: 'CONNECTOR_OCCUPIED',
@@ -44,6 +45,7 @@ export const ERROR_CODES = {
   DOWNTIME_NOT_FOUND: 'DOWNTIME_NOT_FOUND',
   DRIVER_ALREADY_IN_FLEET: 'DRIVER_ALREADY_IN_FLEET',
   DRIVER_CREATE_FAILED: 'DRIVER_CREATE_FAILED',
+  DRIVER_INACTIVE: 'DRIVER_INACTIVE',
   DRIVER_NOT_FOUND: 'DRIVER_NOT_FOUND',
   DUPLICATE_API_KEY_NAME: 'DUPLICATE_API_KEY_NAME',
   DUPLICATE_CONNECTOR_ID: 'DUPLICATE_CONNECTOR_ID',
@@ -159,6 +161,7 @@ export const ERROR_CODES = {
   PAYMENT_TOP_UP_FAILED: 'PAYMENT_TOP_UP_FAILED',
   PERMISSIONS_EXCEED_OWN: 'PERMISSIONS_EXCEED_OWN',
   PNC_DISABLED: 'PNC_DISABLED',
+  PORTAL_ALREADY_ACTIVE: 'PORTAL_ALREADY_ACTIVE',
   PORTAL_REGISTRATION_DISABLED: 'PORTAL_REGISTRATION_DISABLED',
   PRE_AUTH_FAILED: 'PRE_AUTH_FAILED',
   PRICING_ASSIGNMENT_NOT_FOUND: 'PRICING_ASSIGNMENT_NOT_FOUND',
@@ -193,11 +196,11 @@ export const ERROR_CODES = {
   RESET_NOT_REQUIRED: 'RESET_NOT_REQUIRED',
   ROAMING_DISABLED: 'ROAMING_DISABLED',
   ROLE_NOT_FOUND: 'ROLE_NOT_FOUND',
-  ROTATION_FAILED: 'ROTATION_FAILED',
   ROTATION_NOT_APPLICABLE: 'ROTATION_NOT_APPLICABLE',
   RULE_NOT_FOUND: 'RULE_NOT_FOUND',
   SCHEDULE_NOT_FOUND: 'SCHEDULE_NOT_FOUND',
   SCHEMA_NOT_FOUND: 'SCHEMA_NOT_FOUND',
+  SECURITY_PROFILE_DOWNGRADE: 'SECURITY_PROFILE_DOWNGRADE',
   SELF_EDIT_FORBIDDEN: 'SELF_EDIT_FORBIDDEN',
   SESSION_ALREADY_ACTIVE: 'SESSION_ALREADY_ACTIVE',
   SESSION_CREATE_FAILED: 'SESSION_CREATE_FAILED',
@@ -216,7 +219,10 @@ export const ERROR_CODES = {
   STATION_NOT_FOUND: 'STATION_NOT_FOUND',
   STATION_OFFLINE: 'STATION_OFFLINE',
   STATION_REJECTED: 'STATION_REJECTED',
+  STATION_SECURITY_CHANGE_REJECTED: 'STATION_SECURITY_CHANGE_REJECTED',
   STATION_TIMEOUT: 'STATION_TIMEOUT',
+  STATION_TLS_URL_NOT_CONFIGURED: 'STATION_TLS_URL_NOT_CONFIGURED',
+  STATION_UNAVAILABLE: 'STATION_UNAVAILABLE',
   STATION_WATCH_NOT_FOUND: 'STATION_WATCH_NOT_FOUND',
   STATUS_CHECK_REJECTED: 'STATUS_CHECK_REJECTED',
   STATUS_CHECK_TIMEOUT: 'STATUS_CHECK_TIMEOUT',
@@ -270,6 +276,7 @@ export type ErrorCode =
   | 'COMMAND_FAILED'
   | 'COMMAND_QUEUED'
   | 'COMMAND_TIMEOUT'
+  | 'CONNECTOR_ID_MISMATCH'
   | 'CONNECTOR_NOT_AVAILABLE'
   | 'CONNECTOR_NOT_FOUND'
   | 'CONNECTOR_OCCUPIED'
@@ -282,6 +289,7 @@ export type ErrorCode =
   | 'DOWNTIME_NOT_FOUND'
   | 'DRIVER_ALREADY_IN_FLEET'
   | 'DRIVER_CREATE_FAILED'
+  | 'DRIVER_INACTIVE'
   | 'DRIVER_NOT_FOUND'
   | 'DUPLICATE_API_KEY_NAME'
   | 'DUPLICATE_CONNECTOR_ID'
@@ -397,6 +405,7 @@ export type ErrorCode =
   | 'PAYMENT_TOP_UP_FAILED'
   | 'PERMISSIONS_EXCEED_OWN'
   | 'PNC_DISABLED'
+  | 'PORTAL_ALREADY_ACTIVE'
   | 'PORTAL_REGISTRATION_DISABLED'
   | 'PRE_AUTH_FAILED'
   | 'PRICING_ASSIGNMENT_NOT_FOUND'
@@ -431,11 +440,11 @@ export type ErrorCode =
   | 'RESET_NOT_REQUIRED'
   | 'ROAMING_DISABLED'
   | 'ROLE_NOT_FOUND'
-  | 'ROTATION_FAILED'
   | 'ROTATION_NOT_APPLICABLE'
   | 'RULE_NOT_FOUND'
   | 'SCHEDULE_NOT_FOUND'
   | 'SCHEMA_NOT_FOUND'
+  | 'SECURITY_PROFILE_DOWNGRADE'
   | 'SELF_EDIT_FORBIDDEN'
   | 'SESSION_ALREADY_ACTIVE'
   | 'SESSION_CREATE_FAILED'
@@ -454,7 +463,10 @@ export type ErrorCode =
   | 'STATION_NOT_FOUND'
   | 'STATION_OFFLINE'
   | 'STATION_REJECTED'
+  | 'STATION_SECURITY_CHANGE_REJECTED'
   | 'STATION_TIMEOUT'
+  | 'STATION_TLS_URL_NOT_CONFIGURED'
+  | 'STATION_UNAVAILABLE'
   | 'STATION_WATCH_NOT_FOUND'
   | 'STATUS_CHECK_REJECTED'
   | 'STATUS_CHECK_TIMEOUT'
@@ -515,6 +527,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   COMMAND_FAILED: 'Command failed',
   COMMAND_QUEUED: 'Station offline, command queued',
   COMMAND_TIMEOUT: 'Command timed out',
+  CONNECTOR_ID_MISMATCH:
+    'An OCPP 1.6 EVSE has exactly one connector with the same number as the EVSE',
   CONNECTOR_NOT_AVAILABLE: 'Connector is not available for charging',
   CONNECTOR_NOT_FOUND: 'Connector not found',
   CONNECTOR_OCCUPIED: 'Cannot delete EVSE with occupied connectors',
@@ -527,6 +541,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   DOWNTIME_NOT_FOUND: 'Excluded downtime record not found',
   DRIVER_ALREADY_IN_FLEET: 'Driver is already in this fleet',
   DRIVER_CREATE_FAILED: 'Failed to create driver',
+  DRIVER_INACTIVE: 'Driver is inactive',
   DRIVER_NOT_FOUND: 'Driver not found',
   DUPLICATE_API_KEY_NAME: 'An API key with this name already exists',
   DUPLICATE_CONNECTOR_ID: 'Connector ID ... already exists on this EVSE',
@@ -621,7 +636,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   NOT_PENDING: 'Station is not pending approval',
   NOT_SUPPORTED: 'Not supported for OCPP 1.6',
   OCPP_COMMAND_FAILED: 'OCPP command failed',
-  OCPP_VERSION_MISMATCH: 'Action ... requires ..., station ... is ...',
+  OCPP_VERSION_MISMATCH: 'The command is for a different OCPP version than the station uses',
   OCTT_RUN_NOT_FOUND: 'Conformance run not found',
   OVERSUBSCRIPTION_EXCEEDED:
     'Total connected capacity (... kW) exceeds panel effective capacity (... kW)',
@@ -643,6 +658,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PAYMENT_TOP_UP_FAILED: 'Payment top-up rejected',
   PERMISSIONS_EXCEED_OWN: 'API key permissions must be a subset of your own permissions',
   PNC_DISABLED: 'Plug & Charge is disabled',
+  PORTAL_ALREADY_ACTIVE: 'Driver already has portal access',
   PORTAL_REGISTRATION_DISABLED:
     'Driver self-registration is disabled. Contact your operator to be invited.',
   PRE_AUTH_FAILED: 'Payment pre-authorization failed',
@@ -679,11 +695,11 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   RESET_NOT_REQUIRED: 'Password reset is not required',
   ROAMING_DISABLED: 'Roaming is disabled',
   ROLE_NOT_FOUND: 'Role does not exist',
-  ROTATION_FAILED: 'Credential rotation failed',
   ROTATION_NOT_APPLICABLE: 'Credential rotation only applies to security profiles 1 and 2',
   RULE_NOT_FOUND: 'Rule not found',
   SCHEDULE_NOT_FOUND: 'Schedule not found',
   SCHEMA_NOT_FOUND: 'Schema not found',
+  SECURITY_PROFILE_DOWNGRADE: 'A connected station cannot be moved to a lower security profile',
   SELF_EDIT_FORBIDDEN: 'Cannot edit your own role, status, or site access',
   SESSION_ALREADY_ACTIVE: 'You already have an active charging session',
   SESSION_CREATE_FAILED: 'Failed to create session',
@@ -702,7 +718,12 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   STATION_NOT_FOUND: 'Station not found',
   STATION_OFFLINE: 'Station is offline',
   STATION_REJECTED: 'Station rejected start: ...',
+  STATION_SECURITY_CHANGE_REJECTED:
+    'The station did not accept the security change; its current settings are unchanged',
   STATION_TIMEOUT: 'Station did not respond',
+  STATION_TLS_URL_NOT_CONFIGURED:
+    'The public TLS address for stations (OCPP_STATION_TLS_URL) is not configured',
+  STATION_UNAVAILABLE: 'Station is unavailable',
   STATION_WATCH_NOT_FOUND: 'Watch not found',
   STATUS_CHECK_REJECTED: 'Station rejected the status check',
   STATUS_CHECK_TIMEOUT: 'Status check timed out. Replug the connector and try again.',

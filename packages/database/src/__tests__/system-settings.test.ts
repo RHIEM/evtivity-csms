@@ -101,3 +101,134 @@ describe('getCompanyCurrency', () => {
     expect(await getCompanyCurrency()).toBe('USD');
   });
 });
+
+describe('getCompanyPriceDisplay', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('returns the configured price display', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyPriceDisplay } = await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('gross');
+  });
+
+  it('falls back to net when the setting is missing or invalid', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'brutto' }]));
+    const { getCompanyPriceDisplay, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('net');
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyPriceDisplay, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyPriceDisplay();
+    await getCompanyPriceDisplay();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'net' }]));
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+
+  it('returns net when the first query fails', async () => {
+    mockSelect.mockReturnValue(makeFailingChain());
+    const { getCompanyPriceDisplay } = await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+});
+
+describe('getCompanyTaxBasis', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('returns the configured tax basis', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyTaxBasis } = await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('gross');
+  });
+
+  it('falls back to net when the setting is missing or invalid', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'brutto' }]));
+    const { getCompanyTaxBasis, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('net');
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyTaxBasis, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyTaxBasis();
+    await getCompanyTaxBasis();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'net' }]));
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+
+  it('keeps the last value, or net, when the query fails', async () => {
+    mockSelect.mockReturnValue(makeFailingChain());
+    const { getCompanyTaxBasis } = await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+});
+
+describe('getCompanyCountry', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('returns the configured country, upper-cased', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: ' de ' }]));
+    const { getCompanyCountry } = await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBe('DE');
+  });
+
+  it('returns null when the setting is missing or not a two-letter code', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'Germany' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBeNull();
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyCountry()).toBeNull();
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'US' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyCountry();
+    await getCompanyCountry();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'FR' }]));
+    expect(await getCompanyCountry()).toBe('FR');
+  });
+
+  it('keeps the last value, or null, when the query fails', async () => {
+    vi.useFakeTimers();
+    mockSelect.mockReturnValue(makeChain([{ value: 'NL' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBe('NL');
+    vi.advanceTimersByTime(60_001);
+    mockSelect.mockReturnValue(makeFailingChain());
+    expect(await getCompanyCountry()).toBe('NL');
+    clearSystemSettingsCache();
+    expect(await getCompanyCountry()).toBeNull();
+    vi.useRealTimers();
+  });
+});

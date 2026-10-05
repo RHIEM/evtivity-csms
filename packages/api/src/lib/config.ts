@@ -23,8 +23,19 @@ const schema = z.object({
   SETTINGS_ENCRYPTION_KEY: z.string().min(1),
   CSMS_URL: z.string().default('http://localhost:7100'),
   PORTAL_URL: z.string().default('http://localhost:7101'),
-  STRIPE_WEBHOOK_SECRET: z.string().optional(),
   COOKIE_DOMAIN: z.string().optional(),
+  // Public wss:// address stations use for security profiles 2 and 3, without
+  // the station identity. Needed to move a connected 2.1 station from plain
+  // WebSocket to TLS (OCPP 2.1 A05); unset disables that upgrade.
+  OCPP_STATION_TLS_URL: z.string().url().optional(),
+  // Allows the simulated (test) payment provider in this process (D-T1). Default:
+  // on when NODE_ENV is development (or unset) or test, off otherwise.
+  PAYMENTS_ALLOW_SIMULATED: z
+    .enum(['true', 'false'])
+    .default(
+      ['development', 'test'].includes(process.env['NODE_ENV'] ?? 'development') ? 'true' : 'false',
+    )
+    .transform((v) => v === 'true'),
 });
 
 export type ApiConfig = z.infer<typeof schema>;

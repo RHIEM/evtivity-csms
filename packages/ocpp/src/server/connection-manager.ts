@@ -51,18 +51,24 @@ export class ConnectionManager {
     }
   }
 
-  remove(stationId: string): void {
+  // A replaced connection closes after its successor is stored. Only the socket
+  // that is still current may remove the entry, or the live station would look
+  // offline to every command until it reconnects again.
+  remove(stationId: string, ws?: WebSocket): boolean {
+    const current = this.connections.get(stationId);
+    if (ws != null && current != null && current.ws !== ws) return false;
     this.connections.delete(stationId);
     this.logger.info({ stationId, total: this.connections.size }, 'Station disconnected');
 
-    if (this.registry != null) {
-      void this.registry.unregister(stationId).catch((err: unknown) => {
+    if (this.registry != null && this.instanceId != null) {
+      void this.registry.unregister(stationId, this.instanceId).catch((err: unknown) => {
         this.logger.debug(
           { err, stationId },
           'Registry unregister failed on disconnect; continuing',
         );
       });
     }
+    return true;
   }
 
   get(stationId: string): StationConnection | undefined {

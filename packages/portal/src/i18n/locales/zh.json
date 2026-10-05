@@ -18,7 +18,9 @@
     "offline": "您已离线。部分功能可能无法使用。",
     "add": "添加",
     "deactivate": "停用",
-    "remove": "移除"
+    "remove": "移除",
+    "inclTax": "含税",
+    "amountInclTax": "{{amount}}（含税）"
   },
   "nav": {
     "home": "首页",
@@ -75,6 +77,12 @@
     "passwordsMustMatch": "两次输入的密码不一致",
     "invalidResetLink": "此重置链接无效或已过期。",
     "requestNewLink": "请求新链接",
+    "activateTitle": "设置您的账户",
+    "activateSubtitle": "选择一个密码以登录驾驶员门户。",
+    "activateSubmit": "设置密码",
+    "activateSuccess": "您的密码已设置，现在可以登录。",
+    "invalidActivateLink": "此邀请链接无效、已被使用或已过期。",
+    "activateAskOperator": "请联系您的充电服务提供商重新发送邀请。",
     "verifyEmailTitle": "验证您的邮箱",
     "verifyEmailSubtitle": "我们已向 {{email}} 发送了验证链接。请查看收件箱并点击链接验证您的账户。",
     "verifyEmailChecking": "正在验证您的邮箱...",
@@ -119,7 +127,14 @@
     "energy": "电量",
     "energyAdded": "已输送电量",
     "cost": "预估费用",
+    "costInclTax": "预估费用（含税）",
     "totalCost": "总费用",
+    "totalCostInclTax": "总费用（含税）",
+    "netCost": "净额（税前）",
+    "taxAdded": "税费（{{rate}}%）",
+    "taxAddedNoRate": "税费",
+    "taxContained": "其中税费（{{rate}}%）",
+    "taxContainedNoRate": "其中税费",
     "stopReason": "停止原因",
     "rfid": "RFID",
     "payment": "支付",
@@ -220,7 +235,12 @@
     "themeDark": "深色",
     "distanceUnit": "距离单位",
     "distanceMiles": "英里",
-    "distanceKm": "公里"
+    "distanceKm": "公里",
+    "priceDisplay": "价格显示",
+    "priceDisplayDefault": "运营商默认（{{value}}）",
+    "priceDisplayGross": "含税（总价）",
+    "priceDisplayNet": "不含税（净价）",
+    "priceDisplayHelper": "含税显示加上税费后的价格。不含税显示税前价格。两种方式下实际扣款金额相同，未选择时使用运营商的默认设置。"
   },
   "charger": {
     "loadingInfo": "加载充电桩信息...",
@@ -255,6 +275,8 @@
     "sessionFee": "会话费",
     "idleFee": "/分钟闲置费",
     "tax": "税",
+    "taxIncluded": "价格含 {{rate}}% 税",
+    "taxExcluded": "价格不含 {{rate}}% 税，税费计入实际扣款金额",
     "startCharging": "开始充电",
     "freeCharging": "免费充电",
     "siteContact": "站点联系方式",
@@ -321,7 +343,9 @@
     "duration": "时长",
     "energyDelivered": "已输送电量",
     "totalCost": "总费用",
+    "totalCostInclTax": "总费用（含税）",
     "estimatedCost": "预估费用",
+    "estimatedCostInclTax": "预估费用（含税）",
     "started": "开始时间",
     "ended": "结束时间",
     "stopCharging": "停止充电",
@@ -405,7 +429,7 @@
     "noShowFeeNote": "即使您未到场，仍可能收取预约保留费。",
     "maxHoursHint": "最长预约时长为 {{hours}} 小时。",
     "paymentMethodRequired": "创建预约需要支付方式。",
-    "cancellationFeeWarning": "将向您的默认支付方式收取 {{fee}} 取消费用。",
+    "cancellationFeeWarning": "将向您的默认支付方式收取 {{fee}} 取消费用及相应税费。",
     "cancellationPolicy": "取消政策",
     "cancellationPolicyText": "如果在开始时间前 {{minutes}} 分钟内取消，将收取 {{fee}} 取消费用。",
     "upcoming": "即将开始",
@@ -479,6 +503,7 @@
     "COMMAND_FAILED": "命令失败",
     "COMMAND_QUEUED": "充电站离线,命令已加入队列",
     "COMMAND_TIMEOUT": "命令超时",
+    "CONNECTOR_ID_MISMATCH": "在 OCPP 1.6 充电站上，每个 EVSE 只有一个编号相同的连接器。",
     "CONNECTOR_NOT_AVAILABLE": "连接器不可用于充电",
     "CONNECTOR_NOT_FOUND": "未找到连接器",
     "CONNECTOR_OCCUPIED": "无法删除存在被占用连接器的 EVSE",
@@ -492,6 +517,7 @@
     "DRIVER_ALREADY_IN_FLEET": "驾驶员已在此车队中",
     "DRIVER_CREATE_FAILED": "创建驾驶员失败",
     "DRIVER_NOT_FOUND": "未找到驾驶员",
+    "DRIVER_INACTIVE": "驾驶员已停用",
     "DUPLICATE_API_KEY_NAME": "已存在同名的 API 密钥",
     "DUPLICATE_CONNECTOR_ID": "连接器 ID ... 在该 EVSE 上已存在",
     "DUPLICATE_EMAIL": "邮箱已被使用",
@@ -579,7 +605,7 @@
     "NO_VALID_ENTRIES": "未找到有效条目",
     "NO_VALID_TOKENS": "未找到有效令牌",
     "OCPP_COMMAND_FAILED": "OCPP 命令失败",
-    "OCPP_VERSION_MISMATCH": "操作 ... 需要 ...，充电站 ... 为 ...",
+    "OCPP_VERSION_MISMATCH": "该命令适用的 OCPP 版本与充电站使用的版本不同",
     "OCTT_RUN_NOT_FOUND": "未找到合规运行",
     "OVERSUBSCRIPTION_EXCEEDED": "总连接容量（... kW）超过配电盘有效容量（... kW）",
     "PANEL_NOT_FOUND": "未找到配电盘",
@@ -634,7 +660,6 @@
     "RESET_NOT_REQUIRED": "无需重置密码",
     "ROAMING_DISABLED": "漫游已禁用",
     "ROLE_NOT_FOUND": "角色不存在",
-    "ROTATION_FAILED": "凭证轮换失败",
     "ROTATION_NOT_APPLICABLE": "凭证轮换仅适用于安全配置文件 1 和 2",
     "RULE_NOT_FOUND": "未找到规则",
     "SCHEDULE_NOT_FOUND": "未找到日程",
@@ -657,6 +682,7 @@
     "STATION_OFFLINE": "充电站离线",
     "STATION_REJECTED": "充电站拒绝启动：...",
     "STATION_TIMEOUT": "充电站未响应",
+    "STATION_UNAVAILABLE": "此充电站当前不可用。请尝试其他充电站。",
     "STORAGE_CONNECTION_FAILED": "存储连接测试失败",
     "STORAGE_NOT_CONFIGURED": "附件存储未配置",
     "SUPPORT_AI_NOT_CONFIGURED": "支持 AI 未配置",
@@ -696,7 +722,11 @@
     "TOO_MANY_WATCHES": "您关注的充电站过多",
     "STATION_WATCH_NOT_FOUND": "未找到关注",
     "STATUS_CHECK_REJECTED": "充电站拒绝了状态检查",
-    "STATUS_CHECK_TIMEOUT": "状态检查超时。请重新插入连接器后重试。"
+    "STATUS_CHECK_TIMEOUT": "状态检查超时。请重新插入连接器后重试。",
+    "SECURITY_PROFILE_DOWNGRADE": "已连接的充电站不能降级到更低的安全配置文件",
+    "STATION_TLS_URL_NOT_CONFIGURED": "未配置充电站的公共 TLS 地址 (OCPP_STATION_TLS_URL)",
+    "STATION_SECURITY_CHANGE_REJECTED": "充电站未接受安全更改，当前设置保持不变",
+    "PORTAL_ALREADY_ACTIVE": "驾驶员已拥有门户访问权限"
   },
   "validation": {
     "required": "此字段为必填项",
@@ -727,7 +757,9 @@
     "total": "合计",
     "co2Avoided": "减少的CO₂",
     "totalCo2Avoided": "减少的CO₂总量",
-    "noSessions": "此期间没有充电记录。"
+    "noSessions": "此期间没有充电记录。",
+    "cost": "费用",
+    "costInclTax": "费用（含税）"
   },
   "account": {
     "title": "账户",
@@ -847,6 +879,11 @@
     "scanPhoto": "从照片扫描",
     "noQrFound": "未在该照片中找到二维码。请重试。"
   },
+  "qr": {
+    "checking": "正在检查二维码",
+    "invalidTitle": "二维码无效",
+    "invalidMessage": "此二维码无效或已过期。请重新扫描充电站上显示的二维码。"
+  },
   "watch": {
     "notifyWhenFree": "空闲时通知我",
     "watching": "取消关注",
@@ -857,5 +894,13 @@
     "empty": "您还没有关注任何充电站。",
     "removeTitle": "取消关注",
     "removeMessage": "当该充电站空闲时，你将不再收到通知。"
+  },
+  "authFooter": {
+    "privacyPolicy": "隐私政策",
+    "termsOfService": "服务条款",
+    "allRightsReserved": "{{year}} {{name}} 版权所有",
+    "recaptchaProtected": "受 reCAPTCHA 保护。",
+    "recaptchaPrivacy": "隐私",
+    "recaptchaTerms": "条款"
   }
 }

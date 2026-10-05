@@ -8,6 +8,7 @@ import { createLogger } from './logger.js';
 import { decryptString } from './encryption.js';
 import { DEFAULT_CURRENCY } from './currency.js';
 import { formatDateTime } from './timezone.js';
+import { formatLocalizedVariables } from './notification-values.js';
 import { isPrivateUrl } from './url-validation.js';
 import { sendExpoPush } from './push-send.js';
 import { compileAllowedTemplate, type TemplateRenderer } from './template-safety.js';
@@ -71,7 +72,9 @@ const SENSITIVE_EVENT_TYPES = new Set([
   'driver.AccountVerification',
   'driver.Welcome',
   'driver.PasswordChanged',
+  'driver.PortalInvite',
   'operator.ForgotPassword',
+  'operator.UserCreated',
   'operator.AccountVerification',
   'operator.Welcome',
 ]);
@@ -79,12 +82,13 @@ const SENSITIVE_EVENT_TYPES = new Set([
 // Replace 6-digit codes (OTP/MFA) and known token-bearing URL parameters
 // with a fixed marker. Best-effort regex pass over an arbitrary HTML/text
 // body; over-redaction in a sensitive event is preferable to leaking the
-// real value into the audit-visible history table.
+// real value into the audit-visible history table. Handlebars HTML-escapes
+// `=` in links as `&#x3D;`, so the separators match escaped forms too.
 export function redactSensitiveNotificationContent(text: string, eventType: string): string {
   if (!SENSITIVE_EVENT_TYPES.has(eventType)) return text;
   return text
     .replace(
-      /([?&](?:token|code|verifyToken|verificationToken|magicToken|resetToken|otp)=)[^&\s"'<>]+/gi,
+      /((?:[?&]|&amp;)(?:token|code|verifyToken|verificationToken|magicToken|resetToken|otp)(?:=|&#x3D;|&#61;|%3D))[^&\s"'<>]+/gi,
       '$1<redacted>',
     )
     .replace(/\b\d{6}\b/g, '<redacted>');
@@ -408,6 +412,7 @@ const FRIENDLY_SUBJECTS: Record<string, string> = {
   'session.Faulted': '{{{companyName}}} - Charging session failed to start',
   'driver.Welcome': '{{{companyName}}} - Welcome',
   'driver.ForgotPassword': '{{{companyName}}} - Reset your password',
+  'driver.PortalInvite': '{{{companyName}}} - Set up your driver account',
   'driver.PasswordChanged': '{{{companyName}}} - Password changed',
   'driver.MfaDisabled': '{{{companyName}}} - Two-factor authentication disabled',
   'driver.AccountVerification': '{{{companyName}}} - Verify your account',
@@ -731,7 +736,11 @@ export async function dispatchDriverNotification(
       ...variables,
     };
 
-    const formattedVariables = formatDateVariables(enrichedVariables, timezone);
+    // Dates in the recipient's timezone, money and rates in their language.
+    const formattedVariables = formatLocalizedVariables(
+      formatDateVariables(enrichedVariables, timezone),
+      language,
+    );
 
     const prefs = prefRows[0];
     const emailEnabled = prefs != null ? (prefs.email_enabled as boolean) : true;
@@ -1008,7 +1017,11 @@ export async function dispatchSystemNotification(
       ...variables,
     };
 
-    const formattedVariables = formatDateVariables(enrichedVariables, timezone);
+    // Dates in the recipient's timezone, money and rates in their language.
+    const formattedVariables = formatLocalizedVariables(
+      formatDateVariables(enrichedVariables, timezone),
+      language,
+    );
 
     // Email path. Always records a history row so operators can answer
     // "did the system try to email this recipient?" without trawling logs.

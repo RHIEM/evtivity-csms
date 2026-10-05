@@ -10,6 +10,8 @@ import { LANGUAGES } from '@/components/ui/language-select';
 import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { TIMEZONE_OPTIONS } from '@/lib/timezone';
+import { useCompanyPriceDisplay } from '@/hooks/use-price-display';
+import { isPriceDisplay, type PriceDisplay } from '@evtivity/lib/price-display';
 
 export function AccountPersonalInfo(): React.JSX.Element {
   const { t } = useTranslation();
@@ -30,6 +32,11 @@ export function AccountPersonalInfo(): React.JSX.Element {
   const [selectedDistanceUnit, setSelectedDistanceUnit] = useState<'miles' | 'km'>(
     driver?.distanceUnit ?? 'miles',
   );
+  // Null follows the company setting.
+  const [selectedPriceDisplay, setSelectedPriceDisplay] = useState<PriceDisplay | null>(
+    driver?.priceDisplay ?? null,
+  );
+  const companyPriceDisplay = useCompanyPriceDisplay();
   const [profileMsg, setProfileMsg] = useState('');
   const [profileLoading, setProfileLoading] = useState(false);
 
@@ -50,6 +57,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
         timezone: selectedTimezone,
         themePreference: selectedTheme,
         distanceUnit: selectedDistanceUnit,
+        priceDisplay: selectedPriceDisplay,
       });
       if (selectedLanguage !== driver?.language) {
         await applyLanguageLocal(selectedLanguage);
@@ -76,14 +84,14 @@ export function AccountPersonalInfo(): React.JSX.Element {
     <form onSubmit={(e) => void handleProfileUpdate(e)} className="space-y-4">
       {profileMsg !== '' && <p className="text-sm text-muted-foreground">{profileMsg}</p>}
       <div className="space-y-2">
-        <label htmlFor="acctEmail" className="text-sm font-medium">
+        <label htmlFor="acctEmail" className="block text-sm font-medium leading-6">
           {t('profile.email')}
         </label>
         <Input id="acctEmail" value={driver?.email ?? ''} disabled />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-2">
-          <label htmlFor="acctFirst" className="text-sm font-medium">
+          <label htmlFor="acctFirst" className="block text-sm font-medium leading-6">
             {t('profile.firstName')}
           </label>
           <Input
@@ -95,7 +103,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
           />
         </div>
         <div className="space-y-2">
-          <label htmlFor="acctLast" className="text-sm font-medium">
+          <label htmlFor="acctLast" className="block text-sm font-medium leading-6">
             {t('profile.lastName')}
           </label>
           <Input
@@ -108,7 +116,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </div>
       </div>
       <div className="space-y-2">
-        <label htmlFor="acctPhone" className="text-sm font-medium">
+        <label htmlFor="acctPhone" className="block text-sm font-medium leading-6">
           {t('profile.phone')}
         </label>
         <Input
@@ -123,7 +131,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
       <hr className="border-border" />
 
       <div className="space-y-2">
-        <label htmlFor="acctLang" className="text-sm font-medium">
+        <label htmlFor="acctLang" className="block text-sm font-medium leading-6">
           {t('profile.language')}
         </label>
         <Select
@@ -141,7 +149,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <label htmlFor="acctTz" className="text-sm font-medium">
+        <label htmlFor="acctTz" className="block text-sm font-medium leading-6">
           {t('profile.timezone')}
         </label>
         <Select
@@ -159,7 +167,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <label htmlFor="acctTheme" className="text-sm font-medium">
+        <label htmlFor="acctTheme" className="block text-sm font-medium leading-6">
           {t('profile.theme')}
         </label>
         <Select
@@ -174,7 +182,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <label htmlFor="acctDistance" className="text-sm font-medium">
+        <label htmlFor="acctDistance" className="block text-sm font-medium leading-6">
           {t('profile.distanceUnit')}
         </label>
         <Select
@@ -187,6 +195,38 @@ export function AccountPersonalInfo(): React.JSX.Element {
           <option value="miles">{t('profile.distanceMiles')}</option>
           <option value="km">{t('profile.distanceKm')}</option>
         </Select>
+      </div>
+      <div className="space-y-2">
+        <label htmlFor="acctPriceDisplay" className="block text-sm font-medium leading-6">
+          {t('profile.priceDisplay')}
+        </label>
+        <Select
+          id="acctPriceDisplay"
+          aria-describedby="acctPriceDisplayHelp"
+          value={selectedPriceDisplay ?? ''}
+          onChange={(e) => {
+            setSelectedPriceDisplay(isPriceDisplay(e.target.value) ? e.target.value : null);
+          }}
+        >
+          <option value="">
+            {t('profile.priceDisplayDefault', {
+              // "..." until the company setting has loaded.
+              value:
+                companyPriceDisplay == null
+                  ? '...'
+                  : t(
+                      companyPriceDisplay === 'gross'
+                        ? 'profile.priceDisplayGross'
+                        : 'profile.priceDisplayNet',
+                    ),
+            })}
+          </option>
+          <option value="gross">{t('profile.priceDisplayGross')}</option>
+          <option value="net">{t('profile.priceDisplayNet')}</option>
+        </Select>
+        <p id="acctPriceDisplayHelp" className="text-xs text-muted-foreground">
+          {t('profile.priceDisplayHelper')}
+        </p>
       </div>
 
       <Button type="submit" className="w-full" disabled={profileLoading}>

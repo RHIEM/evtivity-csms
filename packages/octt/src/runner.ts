@@ -4,14 +4,23 @@
 import crypto from 'node:crypto';
 import pino from 'pino';
 import { db, chargingStations, drivers, driverTokens } from '@evtivity/database';
-import { refreshTokens, users, OCTT_API_KEY_NAME } from '@evtivity/database';
+import { refreshTokens, roles, users, OCTT_API_KEY_NAME } from '@evtivity/database';
 import { createId } from '@evtivity/database/src/lib/id.js';
-import { like, eq, sql } from 'drizzle-orm';
+import { and, asc, like, eq, sql } from 'drizzle-orm';
 
-import type { RunConfig, RunSummary, TestCaseResult, TestCase, TriggerCommandFn } from './types.js';
+import type {
+  RunConfig,
+  RunSummary,
+  TestCaseResult,
+  TestCase,
+  TriggerCommandFn,
+  CallApiFn,
+} from './types.js';
 import { getRegistry } from './registry.js';
 import { executeTest } from './executor.js';
 import { createApiClient } from './api-client.js';
+import { startOcspTestService, type OcspTestService } from './ocsp-test-service.js';
+import { getNotApplicable } from './pics/index.js';
 
 const DEFAULT_CONCURRENCY = 3;
 
@@ -30,14 +39,14 @@ export async function runTests(
     logger.info('Stations will be auto-provisioned per test');
   }
 
-  // Provision a test driver and tokens so Authorize requests return Accepted
+  // Provision the test driver that owns the per-test tokens (see executeTest)
   let testDriverId = createId('driver');
   let octtPricingGroupId: string | null = null;
   let octtTariffId: string | null = null;
   let pncBackup: { key: string; value: unknown }[] = [];
   if (provisionStations) {
-    testDriverId = await provisionTestDriverAndTokens(testDriverId);
-    logger.info('Test driver and tokens provisioned');
+    testDriverId = await provisionTestDriver(testDriverId);
+    logger.info('Test driver provisioned');
 
     // Provision a test pricing group and tariff for TC_I_109 (driver tariff in AuthorizeResponse)
     const ids = await provisionTestTariff(testDriverId);
@@ -65,6 +74,7 @@ export async function runTests(
 
   // Create a temporary API key for triggering CSMS-initiated commands
   let triggerCommand: TriggerCommandFn | undefined;
+  let callApi: CallApiFn | undefined;
   let apiKeyId: number | undefined;
   let adminUserId: string | undefined;
   let priorAdminAllSiteAccess = false;
@@ -74,7 +84,9 @@ export async function runTests(
       const [admin] = await db
         .select({ id: users.id, hasAllSiteAccess: users.hasAllSiteAccess })
         .from(users)
-        .where(eq(users.isActive, true))
+        .innerJoin(roles, eq(roles.id, users.roleId))
+        .where(and(eq(users.isActive, true), eq(roles.name, 'admin')))
+        .orderBy(asc(users.createdAt))
         .limit(1);
       if (admin != null) {
         // Grant all-site access for OCTT commands, remembering the prior value so
@@ -105,6 +117,7 @@ export async function runTests(
             throw new Error(`API key verification failed (${String(testRes.status)})`);
           }
           triggerCommand = apiClient.triggerCommand;
+          callApi = apiClient.callApi;
           logger.info(
             'API key created and verified - CSMS-initiated commands will be triggered via REST API',
           );
@@ -115,6 +128,17 @@ export async function runTests(
         { error: err instanceof Error ? err.message : String(err) },
         'API client setup failed - CSMS-initiated tests will timeout',
       );
+    }
+  }
+
+  // The Test System OCSP service: a test PKI whose certificates name this
+  // responder, for the OCSP-backed certificate tests (TC_C_50/51, TC_M_24).
+  let ocsp: OcspTestService | undefined;
+  if (config.ocspResponderUrl != null) {
+    ocsp = await startOcspTestService(config.ocspResponderUrl);
+    logger.info({ url: config.ocspResponderUrl }, 'OCSP test responder started');
+    if (callApi != null) {
+      ocsp.installedMoRootId = await installMoRoot(callApi, ocsp, logger);
     }
   }
 
@@ -132,6 +156,7 @@ export async function runTests(
     failed: 0,
     skipped: 0,
     errors: 0,
+    notApplicable: 0,
     durationMs: 0,
   };
 
@@ -145,12 +170,20 @@ export async function runTests(
     while (running.length < concurrency && queue.length > 0) {
       const testCase = queue.shift();
       if (testCase == null) break;
-      const promise = processTest(testCase, config, logger, summary, onResult, triggerCommand).then(
-        () => {
-          const idx = running.indexOf(promise);
-          if (idx !== -1) void running.splice(idx, 1);
-        },
-      );
+      const promise = processTest(
+        testCase,
+        config,
+        logger,
+        summary,
+        onResult,
+        triggerCommand,
+        callApi,
+        provisionStations ? testDriverId : undefined,
+        ocsp,
+      ).then(() => {
+        const idx = running.indexOf(promise);
+        if (idx !== -1) void running.splice(idx, 1);
+      });
       running.push(promise);
     }
     if (running.length > 0) {
@@ -159,6 +192,14 @@ export async function runTests(
   }
 
   summary.durationMs = Date.now() - start;
+
+  if (ocsp?.installedMoRootId != null && callApi != null) {
+    const res = await callApi('DELETE', `/pnc/ca-certificates/${String(ocsp.installedMoRootId)}`);
+    if (res.status >= 300) {
+      logger.warn({ status: res.status }, 'Failed to remove the OCTT MO root certificate');
+    }
+  }
+  await ocsp?.responder.stop();
 
   // Remove the temporary API key and restore the admin's prior site access.
   if (apiKeyId != null) {
@@ -193,6 +234,93 @@ export async function runTests(
   }
 
   return summary;
+}
+
+/** Subject CN of the Test System MO root (see OcttTestPki). */
+const OCTT_MO_ROOT_CN = 'CN=OCTT MO Root CA';
+
+type ApiResult = Awaited<ReturnType<CallApiFn>>;
+
+/**
+ * Calls a PnC certificate route. The API caches pnc.enabled for up to 60 s,
+ * so a PNC_DISABLED answer right after the runner enabled PnC is retried.
+ */
+async function callPncApi(
+  callApi: CallApiFn,
+  method: Parameters<CallApiFn>[0],
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<ApiResult> {
+  const deadline = Date.now() + 70_000;
+  for (;;) {
+    const res = await callApi(method, path, body);
+    if (res.body['code'] !== 'PNC_DISABLED' || Date.now() > deadline) return res;
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+}
+
+/**
+ * Deletes Test System MO roots a crashed run left in the CSMS, through the
+ * same product routes an operator uses.
+ */
+async function deleteLeftoverMoRoots(callApi: CallApiFn, logger: pino.Logger): Promise<void> {
+  const leftover: number[] = [];
+  for (let page = 1; ; page++) {
+    const res = await callPncApi(
+      callApi,
+      'GET',
+      `/pnc/ca-certificates?certificateType=MORootCertificate&limit=100&page=${String(page)}`,
+    );
+    const rows = Array.isArray(res.body['data'])
+      ? (res.body['data'] as Record<string, unknown>[])
+      : [];
+    if (res.status >= 300) {
+      logger.warn({ status: res.status }, 'Could not list CA certificates for OCTT cleanup');
+      return;
+    }
+    for (const row of rows) {
+      if (
+        typeof row['id'] === 'number' &&
+        typeof row['subject'] === 'string' &&
+        row['subject'].includes(OCTT_MO_ROOT_CN)
+      ) {
+        leftover.push(row['id']);
+      }
+    }
+    if (rows.length < 100) break;
+  }
+  for (const id of leftover) {
+    const res = await callPncApi(callApi, 'DELETE', `/pnc/ca-certificates/${String(id)}`);
+    if (res.status >= 300) {
+      logger.warn({ status: res.status, id }, 'Could not delete a leftover OCTT MO root');
+    }
+  }
+  if (leftover.length > 0) {
+    logger.info({ count: leftover.length }, 'Deleted leftover OCTT MO root certificates');
+  }
+}
+
+/**
+ * Configures the Test System MO root in the CSMS the way an operator does
+ * (Certificates > Upload CA certificate), so a contract chain sent in
+ * AuthorizeRequest.certificate chains to a configured root (TC_C_52).
+ */
+async function installMoRoot(
+  callApi: CallApiFn,
+  ocsp: OcspTestService,
+  logger: pino.Logger,
+): Promise<number | null> {
+  await deleteLeftoverMoRoots(callApi, logger);
+  const res = await callPncApi(callApi, 'POST', '/pnc/ca-certificates', {
+    certificateType: 'MORootCertificate',
+    certificate: ocsp.pki.moRoot.cert.toString('pem'),
+  });
+  if (res.status < 300 && typeof res.body['id'] === 'number') {
+    logger.info('OCTT MO root certificate installed in the CSMS');
+    return res.body['id'];
+  }
+  logger.warn({ status: res.status, body: res.body }, 'Could not install the OCTT MO root');
+  return null;
 }
 
 async function deleteOcttStationsAndArtifacts(): Promise<void> {
@@ -230,29 +358,7 @@ async function restorePncSettings(backup: { key: string; value: unknown }[]): Pr
   }
 }
 
-const OCTT_TEST_TOKENS = [
-  // Active tokens used by various OCTT test modules
-  { idToken: 'OCTT_TAG_001', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-001', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-002', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-01', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-V2X', tokenType: 'ISO14443', isActive: true },
-  // MasterPass tokens for stop-all-transactions tests (TC_C_47, TC_C_49)
-  { idToken: 'OCTT-MASTERPASS-001', tokenType: 'ISO14443', isActive: true },
-  // Prepaid tokens for payment terminal tests
-  { idToken: 'OCTT-PREPAID-001', tokenType: 'ISO14443', isActive: true },
-  // Blocked tokens (isActive=false causes authorize handler to return Blocked)
-  { idToken: 'BLOCKED_TAG_001', tokenType: 'ISO14443', isActive: false },
-  { idToken: 'BLOCKED-TOKEN-99999', tokenType: 'ISO14443', isActive: false },
-  // Prepaid no-credit token for TC_C_104
-  { idToken: 'OCTT-PREPAID-NOCREDIT', tokenType: 'ISO14443', isActive: true },
-  // Expired tokens: set isActive=false so authorize returns Blocked (which
-  // OCTT accepts as valid for expired-token test cases alongside Invalid/Expired)
-  { idToken: 'EXPIRED_TAG_001', tokenType: 'ISO14443', isActive: false },
-  { idToken: 'EXPIRED-TOKEN-99999', tokenType: 'ISO14443', isActive: false },
-];
-
-async function provisionTestDriverAndTokens(driverId: string): Promise<string> {
+async function provisionTestDriver(driverId: string): Promise<string> {
   // Check for an existing OCTT test driver (from a previous run) to avoid
   // the email partial-unique-index conflict that silently skips the insert
   // and leaves us with a driverId that doesn't exist.
@@ -262,31 +368,20 @@ async function provisionTestDriverAndTokens(driverId: string): Promise<string> {
     .where(eq(drivers.email, 'octt-test@evtivity.local'))
     .limit(1);
 
-  const resolvedDriverId = existing[0]?.id ?? driverId;
-
-  if (existing.length === 0) {
-    await db.insert(drivers).values({
-      id: resolvedDriverId,
-      firstName: 'OCTT',
-      lastName: 'Test Driver',
-      email: 'octt-test@evtivity.local',
-    });
+  const existingId = existing[0]?.id;
+  if (existingId != null) {
+    // Tokens left over from a crashed run are not used by any test.
+    await db.delete(driverTokens).where(eq(driverTokens.driverId, existingId));
+    return existingId;
   }
 
-  for (const token of OCTT_TEST_TOKENS) {
-    await db
-      .insert(driverTokens)
-      .values({
-        id: createId('driverToken'),
-        driverId: resolvedDriverId,
-        idToken: token.idToken,
-        tokenType: token.tokenType,
-        isActive: token.isActive,
-      })
-      .onConflictDoNothing();
-  }
-
-  return resolvedDriverId;
+  await db.insert(drivers).values({
+    id: driverId,
+    firstName: 'OCTT',
+    lastName: 'Test Driver',
+    email: 'octt-test@evtivity.local',
+  });
+  return driverId;
 }
 
 async function provisionTestTariff(
@@ -303,12 +398,12 @@ async function provisionTestTariff(
   `);
 
   // Create a tariff matching TC_I_109 expected values:
-  // energy: 0.25/kWh, idle: 0.10/min, fixed: 0.50, tax: 20% VAT
+  // energy: 0.25/kWh, idle: 0.10/min, fixed: 0.50, tax: 20% VAT (tax_rate is a fraction)
   await db.execute(sql`
     INSERT INTO tariffs (id, pricing_group_id, name, price_per_kwh, price_per_minute,
                          price_per_session, idle_fee_price_per_minute, tax_rate, is_active, priority, is_default)
     VALUES (${tariffId}, ${pricingGroupId}, 'OCTT Test Tariff', '0.25', '0.00',
-            '0.50', '0.10', '20', true, 0, true)
+            '0.50', '0.10', '0.20', true, 0, true)
     ON CONFLICT DO NOTHING
   `);
 
@@ -329,8 +424,23 @@ async function processTest(
   summary: RunSummary,
   onResult: (result: TestCaseResult) => void,
   triggerCommand?: TriggerCommandFn,
+  callApi?: CallApiFn,
+  testDriverId?: string,
+  ocsp?: OcspTestService,
 ): Promise<void> {
-  const result = await executeTest(testCase, config, logger, triggerCommand);
+  // Real OCTT runs only the tests the CSMS PICS makes applicable: report the
+  // others notApplicable without provisioning a station or executing them.
+  const notApplicable = getNotApplicable(testCase.id, testCase.version, 'csms');
+  const result: TestCaseResult =
+    notApplicable == null
+      ? await executeTest(testCase, config, logger, triggerCommand, callApi, testDriverId, ocsp)
+      : {
+          testId: testCase.id,
+          testName: testCase.name,
+          module: testCase.module,
+          version: testCase.version,
+          result: { status: 'notApplicable', durationMs: 0, steps: [], notApplicable },
+        };
 
   switch (result.result.status) {
     case 'passed':
@@ -344,6 +454,9 @@ async function processTest(
       break;
     case 'error':
       summary.errors++;
+      break;
+    case 'notApplicable':
+      summary.notApplicable++;
       break;
   }
 

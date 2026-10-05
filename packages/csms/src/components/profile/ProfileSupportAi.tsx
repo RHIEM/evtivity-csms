@@ -7,6 +7,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
@@ -100,7 +101,9 @@ export function ProfileSupportAi(): React.JSX.Element {
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="sai-profile-provider">{t('profile.supportAiProvider')}</Label>
+          <Label htmlFor="sai-profile-provider" className="leading-6">
+            {t('profile.supportAiProvider')}
+          </Label>
           <select
             id="sai-profile-provider"
             className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -115,7 +118,9 @@ export function ProfileSupportAi(): React.JSX.Element {
           </select>
         </div>
         <div className="space-y-2">
-          <Label htmlFor="sai-profile-api-key">{t('profile.supportAiApiKey')}</Label>
+          <Label htmlFor="sai-profile-api-key" className="leading-6">
+            {t('profile.supportAiApiKey')}
+          </Label>
           <PasswordInput
             id="sai-profile-api-key"
             value={saiApiKey}
@@ -126,7 +131,9 @@ export function ProfileSupportAi(): React.JSX.Element {
           />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="sai-profile-model">{t('profile.supportAiModel')}</Label>
+          <Label htmlFor="sai-profile-model" className="leading-6">
+            {t('profile.supportAiModel')}
+          </Label>
           <Input
             id="sai-profile-model"
             value={saiModelOverride}
@@ -138,37 +145,31 @@ export function ProfileSupportAi(): React.JSX.Element {
         </div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="space-y-2">
-            <Label htmlFor="sai-profile-temperature">{t('profile.supportAiTemperature')}</Label>
-            <Input
+            <Label htmlFor="sai-profile-temperature" className="leading-6">
+              {t('profile.supportAiTemperature')}
+            </Label>
+            <DecimalInput
               id="sai-profile-temperature"
-              type="number"
-              min={0}
-              max={2}
-              step={0.1}
               value={saiTemperature}
-              onChange={(e) => {
-                setSaiTemperature(e.target.value);
-              }}
+              onChange={setSaiTemperature}
               placeholder="0.3"
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="sai-profile-top-p">{t('profile.supportAiTopP')}</Label>
-            <Input
+            <Label htmlFor="sai-profile-top-p" className="leading-6">
+              {t('profile.supportAiTopP')}
+            </Label>
+            <DecimalInput
               id="sai-profile-top-p"
-              type="number"
-              min={0}
-              max={1}
-              step={0.05}
               value={saiTopP}
-              onChange={(e) => {
-                setSaiTopP(e.target.value);
-              }}
+              onChange={setSaiTopP}
               placeholder="0.9"
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="sai-profile-top-k">{t('profile.supportAiTopK')}</Label>
+            <Label htmlFor="sai-profile-top-k" className="leading-6">
+              {t('profile.supportAiTopK')}
+            </Label>
             <Input
               id="sai-profile-top-k"
               type="number"
@@ -184,7 +185,9 @@ export function ProfileSupportAi(): React.JSX.Element {
           </div>
         </div>
         <div className="space-y-2">
-          <Label htmlFor="sai-profile-tone">{t('profile.supportAiTone')}</Label>
+          <Label htmlFor="sai-profile-tone" className="leading-6">
+            {t('profile.supportAiTone')}
+          </Label>
           <select
             id="sai-profile-tone"
             className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -199,7 +202,9 @@ export function ProfileSupportAi(): React.JSX.Element {
           </select>
         </div>
         <div className="space-y-2">
-          <Label htmlFor="sai-profile-system-prompt">{t('profile.supportAiSystemPrompt')}</Label>
+          <Label htmlFor="sai-profile-system-prompt" className="leading-6">
+            {t('profile.supportAiSystemPrompt')}
+          </Label>
           <textarea
             id="sai-profile-system-prompt"
             rows={4}
