@@ -670,22 +670,176 @@
     {
       "idx": 95,
       "version": "7",
-      "when": 1790917217501,
-      "tag": "rhiem_0001_payment_mode",
+      "when": 1790923188308,
+      "tag": "0095_station_configuration_instances",
       "breakpoints": true
     },
     {
       "idx": 96,
       "version": "7",
-      "when": 1790917217502,
-      "tag": "rhiem_0002_signed_meter_data",
+      "when": 1790923903396,
+      "tag": "0096_seed_pnc_ocsp_allowed_private_hosts",
       "breakpoints": true
     },
     {
       "idx": 97,
       "version": "7",
-      "when": 1790917217503,
-      "tag": "rhiem_0003_driver_price_display",
+      "when": 1790928821181,
+      "tag": "0097_css_installed_certificate_pem",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1790930000000,
+      "tag": "0098_prepaid_balance_and_payment_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1790940000000,
+      "tag": "0099_station_web_payment_configs",
+      "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1790950000000,
+      "tag": "0100_firmware_campaign_signature",
+      "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1790966000000,
+      "tag": "0101_octt_test_status_not_applicable",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1790966100000,
+      "tag": "0102_octt_not_applicable_counts",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1790970000000,
+      "tag": "0103_drop_web_payment_and_qr_scan_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1790980000000,
+      "tag": "0104_driver_price_display",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1790980000001,
+      "tag": "0105_seed_company_price_display",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1790990000000,
+      "tag": "0106_invoice_line_item_tax_rate",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1791000000000,
+      "tag": "0107_station_message_template_language",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1791000000001,
+      "tag": "0108_seed_station_message_language",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1791000000002,
+      "tag": "0109_ocpi_tariff_mapping_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1791000000003,
+      "tag": "0110_payment_record_reservation_fees",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1791000010003,
+      "tag": "0111_session_cost_breakdown",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1791000010004,
+      "tag": "0112_seed_company_tax_basis",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1791000010005,
+      "tag": "0113_station_message_charging_power",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1791000010006,
+      "tag": "0114_collapse_queued_screen_and_cost_commands",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1791000010007,
+      "tag": "0115_seed_stripe_webhook_secret",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1791000010008,
+      "tag": "0116_seed_payment_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1791000010009,
+      "tag": "0117_seed_adyen_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1791000010010,
+      "tag": "rhiem_0001_payment_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1791000010011,
+      "tag": "rhiem_0002_signed_meter_data",
       "breakpoints": true
     }
   ]

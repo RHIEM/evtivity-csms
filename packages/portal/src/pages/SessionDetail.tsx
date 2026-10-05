@@ -28,7 +28,6 @@ import { useToast } from '@/components/ui/toast';
 import { SessionCharts } from '@/components/SessionCharts';
 import { ReportIssue } from '@/components/ReportIssue';
 import { api } from '@/lib/api';
-import { includedTaxCents } from '@evtivity/lib/price-display';
 import {
   formatCents,
   formatEnergy,
@@ -50,7 +49,12 @@ interface SessionDetailData {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   currentCostCents: number | null;
-  tariffTaxRate: string | null;
+  // Net amount and tax contained in the cost, split per tariff as billed.
+  // Null when the cost contains no tax or the split is not known.
+  netCents: number | null;
+  taxCents: number | null;
+  // Null when tariffs with different tax rates applied.
+  taxRate: string | null;
   finalCostCents: number | null;
   currency: string;
   meterStart: number | null;
@@ -248,12 +252,15 @@ export function SessionDetail(): React.JSX.Element {
     costCents != null && costCents === 0
       ? t('sessionDetail.free')
       : formatCents(costCents, session.currency);
-  // Costs include the tariff tax; show the tax it contains, or for net display
-  // the net amount and the tax added on top.
-  const taxRate = session.tariffTaxRate != null ? Number(session.tariffTaxRate) : 0;
-  const taxCents =
-    costCents != null && costCents > 0 && taxRate > 0 ? includedTaxCents(costCents, taxRate) : null;
-  const taxPercent = formatTaxPercent(taxRate);
+  // Costs include tax. The API splits out the tax they contain per tariff, as
+  // billed: shown below the total (gross display), or as the net amount plus
+  // the tax above it (net display).
+  const { netCents, taxCents } = session;
+  const hasTaxSplit = netCents != null && taxCents != null;
+  const taxPercent = session.taxRate != null ? formatTaxPercent(Number(session.taxRate)) : null;
+  const costLabel = hasTaxSplit
+    ? t(isActive ? 'sessionDetail.costInclTax' : 'sessionDetail.totalCostInclTax')
+    : t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost');
   const energy = formatEnergy(session.energyDeliveredWh);
   const efficiency = session.vehicle?.efficiencyMiPerKwh ?? 3.5;
   const miles = formatDistance(session.energyDeliveredWh, efficiency, distanceUnit);
@@ -324,7 +331,7 @@ export function SessionDetail(): React.JSX.Element {
               setPendingVehicleId(session.vehicle?.id ?? null);
               setShowVehicleDialog(true);
             }}
-            className="block w-full focus:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-md"
+            className="block w-full focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring rounded-md"
             aria-label={t('sessionDetail.changeVehicle')}
           >
             <p className="text-3xl font-bold hover:underline decoration-dotted underline-offset-4">
@@ -361,7 +368,7 @@ export function SessionDetail(): React.JSX.Element {
           <CardContent className="p-3 text-center">
             <DollarSign className="mx-auto h-5 w-5 text-muted-foreground mb-1" />
             <p className="text-xs text-muted-foreground h-8 flex items-center justify-center">
-              {t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost')}
+              {costLabel}
             </p>
             <p className="text-base font-bold">{cost}</p>
           </CardContent>
@@ -478,25 +485,30 @@ export function SessionDetail(): React.JSX.Element {
               value={`${formatNumber(session.batteryPercent, 0)}%`}
             />
           )}
-          {taxCents != null && costCents != null && priceDisplay === 'net' && (
+          {hasTaxSplit && priceDisplay === 'net' && (
             <>
               <Row
                 label={t('sessionDetail.netCost')}
-                value={formatCents(costCents - taxCents, session.currency)}
+                value={formatCents(netCents, session.currency)}
               />
               <Row
-                label={t('sessionDetail.taxAdded', { rate: taxPercent })}
+                label={
+                  taxPercent != null
+                    ? t('sessionDetail.taxAdded', { rate: taxPercent })
+                    : t('sessionDetail.taxAddedNoRate')
+                }
                 value={formatCents(taxCents, session.currency)}
               />
             </>
           )}
-          <Row
-            label={t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost')}
-            value={cost}
-          />
-          {taxCents != null && priceDisplay === 'gross' && (
+          <Row label={costLabel} value={cost} />
+          {hasTaxSplit && priceDisplay === 'gross' && (
             <Row
-              label={t('sessionDetail.taxContained', { rate: taxPercent })}
+              label={
+                taxPercent != null
+                  ? t('sessionDetail.taxContained', { rate: taxPercent })
+                  : t('sessionDetail.taxContainedNoRate')
+              }
               value={formatCents(taxCents, session.currency)}
             />
           )}

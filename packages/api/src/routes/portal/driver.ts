@@ -86,8 +86,13 @@ const updateProfileBody = z.object({
   timezone: z.string().max(50).optional(),
   themePreference: z.enum(['light', 'dark']).optional(),
   distanceUnit: z.enum(['miles', 'km']).optional(),
-  // Null follows the company setting company.priceDisplay.
-  priceDisplay: z.enum(['gross', 'net']).nullable().optional(),
+  priceDisplay: z
+    .enum(['gross', 'net'])
+    .nullable()
+    .optional()
+    .describe(
+      'Show prices including (gross) or excluding (net) tax. Null follows the company setting company.priceDisplay.',
+    ),
 });
 
 const changePasswordBody = z.object({

@@ -9,7 +9,6 @@ import type { EventBus, DomainEvent, PubSubClient, ConnectionRegistry } from '@e
 // the values are always JSON-serializable at runtime, so we widen via this helper.
 type JSONValue = Parameters<postgres.Sql['json']>[0];
 const asJson = (v: unknown): JSONValue => v as JSONValue;
-import { config } from '../lib/config.js';
 import {
   client,
   isRoamingEnabled,
@@ -36,35 +35,48 @@ import {
   setStationDisabled,
   setStationFirmwareState,
   setStationReportedStatus,
+  getCompanyTaxBasis,
+  snapshotSessionTariff,
+  resolveStationTariff,
+  priceSessionAt,
+  storeRunningCost,
+  storeFinalCost,
+  closeOpenSegment,
+  openSegmentTariffId,
+  switchTariffSegment,
+  sessionIdleMinutesAt,
+  zeroCostBreakdown,
 } from '@evtivity/database';
-import { getSecuritySeverity } from '../lib/security-severity.js';
+import type { TariffPriceSnapshot } from '@evtivity/database';
 import {
-  calculateSessionCost,
-  calculateSplitSessionCost,
-  resolveActiveTariff,
+  authorizeSessionHold,
+  classifySessionPayment,
+  recordTerminalSettlement,
+  settleSessionPayment,
+} from '@evtivity/payments';
+import { getSecuritySeverity } from '../lib/security-severity.js';
+import { paymentContext } from '../lib/payments.js';
+import { upsertStationConfiguration } from './station-configurations.js';
+import {
   generateId,
   createLogger,
   calculateCo2AvoidedKg,
-  isSimulatedCustomer,
-  shouldSimulatePaymentFailure,
   isTariffFree,
   dispatchOneShotStationMessage,
   FREE_VEND_OCPP_21_VARIABLES,
   FREE_VEND_OCPP_16_KEYS,
   resolveElectricityRate,
   calculateElectricityCostCents,
-  formatCurrencyAmount,
-  formatUnitPrice,
+  notificationMoney,
+  notificationUnitPrice,
+  notificationTaxRate,
+  costIncludesTax,
   priceForDisplay,
   resolvePriceDisplay,
+  reconcileCostBreakdown,
+  resolveTaxBasis,
 } from '@evtivity/lib';
-import type {
-  TariffInput,
-  TariffRestrictions,
-  TariffWithRestrictions,
-  TariffSegment,
-  StationMessageState,
-} from '@evtivity/lib';
+import type { StationMessageState } from '@evtivity/lib';
 import crypto from 'node:crypto';
 import {
   dispatchOcppNotification,
@@ -74,6 +86,7 @@ import {
 } from './notification-dispatcher.js';
 import { TransactionBuffer } from './transaction-buffer.js';
 import { isMeterConfiguration, parseMeterConfiguration } from '../lib/meter-configuration.js';
+import { projectionQueueFor, sessionPricedKey } from './projection-queue.js';
 import {
   DEFAULT_LOCATION,
   DEFAULT_MEASURAND,
@@ -302,29 +315,12 @@ export function registerProjections(
   // Fix: per-station sequential queue. Events from the same station are processed
   // one at a time in order. Different stations run in parallel. This bounds total
   // concurrency to the number of active stations and preserves event ordering.
-  // Each aggregate ID (station or transaction) gets a sequential promise chain.
-  // The Map stores the tail promise and last activity timestamp per station.
-  // A periodic cleanup removes entries for stations inactive for 10+ minutes.
-  const stationQueues = new Map<string, { promise: Promise<void>; lastActivity: number }>();
-
-  // Clean up stale station queue entries every 5 minutes
-  const QUEUE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
-  const QUEUE_STALE_THRESHOLD_MS = 10 * 60 * 1000;
-  const queueCleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of stationQueues) {
-      if (now - entry.lastActivity >= QUEUE_STALE_THRESHOLD_MS) {
-        stationQueues.delete(id);
-      }
-    }
-  }, QUEUE_CLEANUP_INTERVAL_MS);
-  queueCleanupTimer.unref();
+  // Each aggregate ID (station or transaction) gets a sequential promise chain
+  // (projection-queue.ts, shared with handlers that wait for projected state).
+  const projectionQueue = projectionQueueFor(eventBus);
 
   function enqueueForStation(id: string, work: () => Promise<void>): Promise<void> {
-    const prev = stationQueues.get(id)?.promise ?? Promise.resolve();
-    const next = prev.then(work, work); // run even if previous failed
-    stationQueues.set(id, { promise: next, lastActivity: Date.now() });
-    return next;
+    return projectionQueue.enqueue(id, work);
   }
 
   function safeSubscribe(eventType: string, handler: (event: DomainEvent) => Promise<void>): void {
@@ -372,13 +368,6 @@ export function registerProjections(
     return name;
   }
 
-  // A session's billing currency, or the company currency when the row is gone.
-  async function loadSessionCurrency(sessionId: string): Promise<string> {
-    const rows =
-      await sql`SELECT UPPER(currency) AS currency FROM charging_sessions WHERE id = ${sessionId} LIMIT 1`;
-    return (rows[0]?.currency as string | undefined) ?? getCompanyCurrency();
-  }
-
   // Dispatch IdlingStarted notification for both driver and guest sessions.
   // Used by TransactionEvent Updated (chargingState) and StatusNotification (1.6 fallback).
   async function dispatchIdlingNotification(
@@ -386,11 +375,24 @@ export function registerProjections(
     stationId: string,
     transactionId: string,
   ): Promise<void> {
+    // The idle fee and tax rate that apply now: the open tariff segment's
+    // snapshot (split billing), else the session's.
     const idleSession = await sql`
-      SELECT cs.driver_id, cs.idle_started_at, cs.tariff_idle_fee_price_per_minute,
-             cs.tariff_tax_rate, d.price_display, UPPER(cs.currency) AS currency
+      SELECT cs.driver_id, cs.idle_started_at,
+             CASE WHEN seg.price_snapshot THEN seg.idle_fee_price_per_minute
+                  ELSE cs.tariff_idle_fee_price_per_minute END AS idle_fee_price_per_minute,
+             CASE WHEN seg.price_snapshot THEN seg.tax_rate
+                  ELSE cs.tariff_tax_rate END AS tax_rate,
+             cs.tax_basis, d.price_display, UPPER(cs.currency) AS currency
       FROM charging_sessions cs
       LEFT JOIN drivers d ON d.id = cs.driver_id
+      LEFT JOIN LATERAL (
+        SELECT price_snapshot, idle_fee_price_per_minute, tax_rate
+        FROM session_tariff_segments
+        WHERE session_id = cs.id AND ended_at IS NULL
+        ORDER BY started_at DESC
+        LIMIT 1
+      ) seg ON true
       WHERE cs.id = ${sessionId} AND cs.idle_started_at IS NOT NULL
     `;
     const idleRow = idleSession[0];
@@ -398,17 +400,15 @@ export function registerProjections(
 
     const stationUuid = await resolveStationUuid(stationId);
     const gracePeriodMinutes = await getIdlingGracePeriodMinutes();
-    const idleFeeRate = idleRow.tariff_idle_fee_price_per_minute as string | null;
+    const idleFeeRate = idleRow.idle_fee_price_per_minute as string | null;
     const idleSiteName = stationUuid != null ? await resolveSiteName(stationUuid) : null;
 
-    // Drivers see the idle fee as chosen in the portal (or the company
-    // setting); guests always see it including tax.
-    const priceDisplay =
-      idleRow.driver_id != null
-        ? resolvePriceDisplay(idleRow.price_display, await getCompanyPriceDisplay())
-        : 'gross';
+    // The idle fee is shown as the driver chose in the portal, else as the
+    // company setting says. Guests have no choice and follow the setting.
+    const priceDisplay = resolvePriceDisplay(idleRow.price_display, await getCompanyPriceDisplay());
     const idleFee = idleFeeRate != null ? Number(idleFeeRate) : 0;
-    const taxRate = idleRow.tariff_tax_rate != null ? Number(idleRow.tariff_tax_rate) : 0;
+    const taxRate = idleRow.tax_rate != null ? Number(idleRow.tax_rate) : 0;
+    const taxBasis = resolveTaxBasis(idleRow.tax_basis);
 
     const templateVars = {
       siteName: idleSiteName ?? '',
@@ -416,17 +416,20 @@ export function registerProjections(
       transactionId,
       idleStartedAt: idleRow.idle_started_at as string,
       gracePeriodMinutes,
-      idleFeePricePerMinute: idleFeeRate ?? '0',
+      // The rate as stored, in the session's tax basis. Empty when there is no idle fee (null or 0), so
+      // templates that test {{#if idleFeePricePerMinute}} skip the fee text:
+      // the string '0' or '0.00' is truthy in Handlebars.
+      idleFeePricePerMinute: idleFee > 0 && idleFeeRate != null ? idleFeeRate : '',
       // Empty when there is no idle fee, so templates can test it with #if.
       idleFeeFormatted:
         idleFee > 0
-          ? formatUnitPrice(
-              priceForDisplay(idleFee, taxRate, priceDisplay),
+          ? notificationUnitPrice(
+              priceForDisplay(idleFee, taxRate, priceDisplay, taxBasis),
               idleRow.currency as string,
             )
           : '',
       idleFeeIncludesTax: priceDisplay === 'gross',
-      taxRatePercent: taxRate > 0 ? String(Number((taxRate * 100).toFixed(2))) : '',
+      taxRatePercent: taxRate > 0 ? notificationTaxRate(taxRate) : '',
       currency: idleRow.currency as string,
     };
 
@@ -480,6 +483,34 @@ export function registerProjections(
     }
   }
 
+  // Asks the api to re-render the station screen of an OCPP 2.x transaction.
+  async function publishStationMessageTransaction(
+    screen: { stationUuid: string; stationId: string; protocol: string | null },
+    sessionId: string,
+    kind: 'started' | 'updated' | 'ended',
+    chargingState: string | null,
+  ): Promise<void> {
+    if (screen.protocol == null || !screen.protocol.startsWith('ocpp2')) return;
+    try {
+      await pubsub.publish(
+        'station_message_transaction',
+        JSON.stringify({
+          sessionId,
+          internalStationId: screen.stationUuid,
+          stationOcppId: screen.stationId,
+          ocppProtocol: screen.protocol,
+          eventType: kind,
+          chargingState,
+        }),
+      );
+    } catch (err) {
+      logger.debug(
+        { err, sessionId, kind },
+        'Station-message transaction publish failed; continuing',
+      );
+    }
+  }
+
   async function notifyOcpiPush(
     type: 'location' | 'session' | 'cdr' | 'tariff',
     ids: { siteId?: string; sessionId?: string; cdrId?: string; tariffId?: string },
@@ -490,6 +521,35 @@ export function registerProjections(
       await pubsub.publish('ocpi_push', payload);
     } catch (err) {
       logger.debug({ err, type }, 'OCPI push publish failed; continuing');
+    }
+  }
+
+  // A session started with a partner's (eMSP's) token is our CPO session for
+  // that partner. The link row in ocpi_roaming_sessions is what the OCPI
+  // server serves on GET /cpo/sessions, pushes to the partner, and resolves
+  // STOP_SESSION and CDRs with. The OCPI Session id is the transaction id.
+  // Written here, before the push is published, so a lost push still leaves
+  // the session visible to the partner's next pull. ON CONFLICT keeps it to
+  // one link per session when Started is processed twice.
+  async function linkCpoRoamingSession(
+    sessionId: string,
+    transactionId: string,
+    idToken: string,
+  ): Promise<void> {
+    try {
+      await sql`
+        INSERT INTO ocpi_roaming_sessions
+          (partner_id, ocpi_session_id, charging_session_id, token_uid, status, currency)
+        SELECT t.partner_id, ${transactionId}, ${sessionId}, t.uid, 'ACTIVE', cs.currency
+        FROM ocpi_external_tokens t
+        JOIN charging_sessions cs ON cs.id = ${sessionId}
+        WHERE t.uid = ${idToken} AND t.is_valid = true
+        ORDER BY t.updated_at DESC
+        LIMIT 1
+        ON CONFLICT (charging_session_id) WHERE charging_session_id IS NOT NULL DO NOTHING
+      `;
+    } catch (err) {
+      logger.warn({ err, sessionId }, 'OCPI roaming session link failed; continuing');
     }
   }
 
@@ -653,296 +713,7 @@ export function registerProjections(
   }
 
   // Cached holiday loader (60s TTL)
-  let holidayCache: { dates: Date[]; loadedAt: number } | null = null;
-  const HOLIDAY_CACHE_TTL_MS = 60_000;
-
-  async function loadHolidays(): Promise<Date[]> {
-    const now = Date.now();
-    if (holidayCache != null && now - holidayCache.loadedAt < HOLIDAY_CACHE_TTL_MS) {
-      return holidayCache.dates;
-    }
-    const rows = await sql`SELECT date FROM pricing_holidays`;
-    const dates = rows.map((r) => new Date(r.date as string));
-    holidayCache = { dates, loadedAt: now };
-    return dates;
-  }
-
   // ---- Payment simulation helpers (used in Started/Ended handlers) ----
-
-  function isSimulatedIntent(stripePaymentIntentId: string): boolean {
-    return stripePaymentIntentId.startsWith('pi_sim_');
-  }
-
-  /**
-   * Checks if the active tariff for a station resolves to free (all price components zero/null).
-   * Uses the same group resolution priority as resolveTariffGroup() in tariff.service.ts:
-   * driver-specific > fleet > station > site > default.
-   * Returns true if free, false if not free or if no tariff is found (safe default = charge).
-   *
-   * See also: resolveTariff() in packages/api/src/services/tariff.service.ts which provides
-   * full tariff resolution with time-of-day support. This inline CTE is intentionally simpler
-   * to avoid an API package dependency from the OCPP package.
-   */
-  async function isTariffFreeForStation(
-    stationId: string,
-    driverId: string | null,
-  ): Promise<boolean> {
-    // Resolve the same pricing group the API would (driver > fleet > station >
-    // site > default), then load ALL active tariffs in that group plus the
-    // configured holidays, and let resolveActiveTariff pick the time-of-day +
-    // holiday-appropriate tariff. This matches the API's resolveTariff() so
-    // free off-peak windows on a paid default tariff don't get billed.
-    const groupRows = await sql`
-      WITH driver_group AS (
-        SELECT pgd.pricing_group_id AS id, 1 AS priority
-        FROM pricing_group_drivers pgd
-        WHERE pgd.driver_id = ${driverId ?? ''}
-        LIMIT 1
-      ),
-      fleet_group AS (
-        -- A driver can belong to multiple fleets (no unique constraint on
-        -- fleet_drivers.driver_id). Order by membership createdAt so the
-        -- oldest fleet wins deterministically; without ORDER BY Postgres
-        -- returns rows in undefined order and the same driver/station could
-        -- resolve to different tariffs across requests. Mirrors the API-side
-        -- tariff.service.ts resolveTariffGroup().
-        SELECT pgf.pricing_group_id AS id, 2 AS priority
-        FROM pricing_group_fleets pgf
-        JOIN fleet_drivers fd ON fd.fleet_id = pgf.fleet_id
-        WHERE fd.driver_id = ${driverId ?? ''}
-        ORDER BY fd.created_at ASC
-        LIMIT 1
-      ),
-      station_group AS (
-        SELECT pgs.pricing_group_id AS id, 3 AS priority
-        FROM pricing_group_stations pgs
-        WHERE pgs.station_id = ${stationId}
-        LIMIT 1
-      ),
-      site_group AS (
-        SELECT pgsit.pricing_group_id AS id, 4 AS priority
-        FROM pricing_group_sites pgsit
-        JOIN charging_stations cs ON cs.site_id = pgsit.site_id
-        WHERE cs.id = ${stationId}
-        LIMIT 1
-      ),
-      default_group AS (
-        SELECT pg.id, 5 AS priority
-        FROM pricing_groups pg
-        WHERE pg.is_default = true
-        LIMIT 1
-      )
-      SELECT id FROM (
-        SELECT id, priority FROM driver_group
-        UNION ALL SELECT id, priority FROM fleet_group
-        UNION ALL SELECT id, priority FROM station_group
-        UNION ALL SELECT id, priority FROM site_group
-        UNION ALL SELECT id, priority FROM default_group
-      ) groups
-      ORDER BY priority
-      LIMIT 1
-    `;
-    const groupId = groupRows[0]?.id as string | undefined;
-    if (groupId == null) return true;
-
-    const tariffRows = await sql`
-      SELECT id, price_per_kwh, price_per_minute, price_per_session,
-             idle_fee_price_per_minute, reservation_fee_per_minute, tax_rate,
-             restrictions, priority, is_default
-      FROM tariffs
-      WHERE pricing_group_id = ${groupId} AND is_active = true
-    `;
-    if (tariffRows.length === 0) return true;
-
-    const holidayRows = await sql`SELECT date FROM pricing_holidays`;
-    const holidays = holidayRows.map((r: Record<string, unknown>) => new Date(r.date as string));
-
-    const tariffsForResolver: TariffWithRestrictions[] = tariffRows.map(
-      (t: Record<string, unknown>) => ({
-        id: t.id as string,
-        restrictions: (t.restrictions as TariffRestrictions | null) ?? null,
-        priority: Number(t.priority ?? 0),
-        isDefault: t.is_default === true,
-        pricePerKwh: t.price_per_kwh as string | null,
-        pricePerMinute: t.price_per_minute as string | null,
-        pricePerSession: t.price_per_session as string | null,
-        idleFeePricePerMinute: t.idle_fee_price_per_minute as string | null,
-        reservationFeePerMinute: t.reservation_fee_per_minute as string | null,
-        taxRate: t.tax_rate as string | null,
-      }),
-    );
-
-    // Resolve in the station's site timezone so off-peak windows fire at the
-    // operator's local clock, not UTC.
-    const tzRows = await sql<Array<{ timezone: string | null }>>`
-      SELECT s.timezone
-      FROM charging_stations cs
-      LEFT JOIN sites s ON s.id = cs.site_id
-      WHERE cs.id = ${stationId}
-      LIMIT 1
-    `;
-    const timezone = tzRows[0]?.timezone ?? undefined;
-    const active = resolveActiveTariff(tariffsForResolver, new Date(), holidays, 0, timezone);
-    return isTariffFree(active);
-  }
-
-  /**
-   * Resolves how a driver pays (driver > fleet > 'card') and snapshots it on
-   * the session in one statement. Among the driver's fleets that set a mode
-   * the oldest membership wins. Mirrors resolvePaymentMode() in
-   * packages/api/src/services/driver.service.ts; inlined to avoid an API
-   * package dependency from the OCPP package. Falls back to 'card' when the
-   * session row is missing.
-   */
-  async function snapshotPaymentMode(
-    sessionId: string,
-    driverId: string,
-  ): Promise<'card' | 'invoice'> {
-    const rows = await sql`
-      WITH driver_mode AS (
-        SELECT d.payment_mode, 1 AS priority
-        FROM drivers d
-        WHERE d.id = ${driverId} AND d.payment_mode IS NOT NULL
-      ),
-      fleet_mode AS (
-        SELECT f.payment_mode, 2 AS priority
-        FROM fleet_drivers fd
-        JOIN fleets f ON f.id = fd.fleet_id
-        WHERE fd.driver_id = ${driverId} AND f.payment_mode IS NOT NULL
-        ORDER BY fd.created_at ASC
-        LIMIT 1
-      ),
-      resolved AS (
-        SELECT payment_mode FROM (
-          SELECT payment_mode, priority FROM driver_mode
-          UNION ALL SELECT payment_mode, priority FROM fleet_mode
-        ) modes
-        ORDER BY priority
-        LIMIT 1
-      )
-      UPDATE charging_sessions
-      SET payment_mode = COALESCE((SELECT payment_mode FROM resolved), 'card'),
-          updated_at = now()
-      WHERE id = ${sessionId}
-      RETURNING payment_mode
-    `;
-    return rows[0]?.payment_mode === 'invoice' ? 'invoice' : 'card';
-  }
-
-  async function resolvePricingGroupId(
-    stationUuid: string,
-    driverUuid: string | null,
-  ): Promise<string | null> {
-    // Single round-trip 5-tier resolution: driver > fleet > station > site >
-    // default. Each branch is a CTE that emits at most one row with its
-    // priority number; the final SELECT orders by priority and returns the
-    // winner. Mirrors the same shape used by isTariffFreeForStation() above
-    // so both call sites pay one RTT instead of up to five. Called per
-    // MeterValues batch per active session, so the savings compound under
-    // load (2000 sessions × ~10s cadence × 4 saved RTTs = ~800 fewer RTTs/s).
-    //
-    // fleet_drivers has no unique constraint on driver_id; a driver can
-    // belong to multiple fleets, and the oldest membership wins
-    // deterministically. Without ORDER BY the same driver could resolve to
-    // different tariffs across requests.
-    const rows = await sql`
-      WITH driver_group AS (
-        SELECT pgd.pricing_group_id AS id, 1 AS priority
-        FROM pricing_group_drivers pgd
-        WHERE pgd.driver_id = ${driverUuid ?? ''}
-        LIMIT 1
-      ),
-      fleet_group AS (
-        SELECT pgf.pricing_group_id AS id, 2 AS priority
-        FROM pricing_group_fleets pgf
-        JOIN fleet_drivers fd ON fd.fleet_id = pgf.fleet_id
-        WHERE fd.driver_id = ${driverUuid ?? ''}
-        ORDER BY fd.created_at ASC
-        LIMIT 1
-      ),
-      station_group AS (
-        SELECT pgs.pricing_group_id AS id, 3 AS priority
-        FROM pricing_group_stations pgs
-        WHERE pgs.station_id = ${stationUuid}
-        LIMIT 1
-      ),
-      site_group AS (
-        SELECT pgsit.pricing_group_id AS id, 4 AS priority
-        FROM pricing_group_sites pgsit
-        JOIN charging_stations cs ON cs.site_id = pgsit.site_id
-        WHERE cs.id = ${stationUuid}
-        LIMIT 1
-      ),
-      default_group AS (
-        SELECT pg.id, 5 AS priority
-        FROM pricing_groups pg
-        WHERE pg.is_default = true
-        LIMIT 1
-      )
-      SELECT id FROM (
-        SELECT id, priority FROM driver_group
-        UNION ALL SELECT id, priority FROM fleet_group
-        UNION ALL SELECT id, priority FROM station_group
-        UNION ALL SELECT id, priority FROM site_group
-        UNION ALL SELECT id, priority FROM default_group
-      ) groups
-      ORDER BY priority
-      LIMIT 1
-    `;
-    return (rows[0]?.id as string | undefined) ?? null;
-  }
-
-  async function resolveTariffForStation(
-    stationUuid: string,
-    driverUuid: string | null,
-  ): Promise<(TariffInput & { id: string }) | null> {
-    const groupId = await resolvePricingGroupId(stationUuid, driverUuid);
-    if (groupId == null) return null;
-
-    const rows = await sql`
-      SELECT id, price_per_kwh, price_per_minute, price_per_session,
-             idle_fee_price_per_minute, reservation_fee_per_minute, tax_rate,
-             restrictions, priority, is_default
-      FROM tariffs
-      WHERE pricing_group_id = ${groupId} AND is_active = true
-    `;
-    if (rows.length === 0) return null;
-
-    const tariffs: TariffWithRestrictions[] = rows.map((r) => ({
-      id: r.id as string,
-      pricePerKwh: r.price_per_kwh as string | null,
-      pricePerMinute: r.price_per_minute as string | null,
-      pricePerSession: r.price_per_session as string | null,
-      idleFeePricePerMinute: r.idle_fee_price_per_minute as string | null,
-      reservationFeePerMinute: r.reservation_fee_per_minute as string | null,
-      taxRate: r.tax_rate as string | null,
-      restrictions: r.restrictions as TariffRestrictions | null,
-      priority: r.priority as number,
-      isDefault: r.is_default as boolean,
-    }));
-
-    const holidays = await loadHolidays();
-    const tzRows = await sql<Array<{ timezone: string | null }>>`
-      SELECT s.timezone
-      FROM charging_stations cs
-      LEFT JOIN sites s ON s.id = cs.site_id
-      WHERE cs.id = ${stationUuid}
-      LIMIT 1
-    `;
-    const timezone = tzRows[0]?.timezone ?? undefined;
-    const resolved = resolveActiveTariff(tariffs, new Date(), holidays, 0, timezone);
-    if (resolved == null) return null;
-
-    return {
-      id: resolved.id,
-      pricePerKwh: resolved.pricePerKwh,
-      pricePerMinute: resolved.pricePerMinute,
-      pricePerSession: resolved.pricePerSession,
-      idleFeePricePerMinute: resolved.idleFeePricePerMinute,
-      reservationFeePerMinute: resolved.reservationFeePerMinute,
-      taxRate: resolved.taxRate,
-    };
-  }
 
   safeSubscribe('station.Connected', async (event: DomainEvent) => {
     const stationUuid = await getStationUuid(event);
@@ -981,10 +752,44 @@ export function registerProjections(
     if (siteId != null) {
       await notifyOcpiPush('location', { siteId });
     }
+  });
+
+  // The station may now receive CSMS calls (BootNotification Accepted, or its
+  // first message after a reconnect without a reboot).
+  safeSubscribe('station.Ready', async (event: DomainEvent) => {
+    const stationUuid = await getStationUuid(event);
+    if (stationUuid == null) return;
+    const ocppProtocol = (event.payload as { ocppProtocol?: string }).ocppProtocol ?? null;
 
     // Drain offline command queue for this station
     const stationOcppId = event.aggregateId;
     try {
+      // Only the newest queued screen message per display message id and cost
+      // update per transaction still matters; older ones would show stale content.
+      await sql`
+        WITH keyed AS (
+          SELECT id, action, created_at,
+            CASE action
+              WHEN 'SetDisplayMessage' THEN payload -> 'message' ->> 'id'
+              WHEN 'ClearDisplayMessage' THEN payload ->> 'id'
+              WHEN 'CostUpdated' THEN payload ->> 'transactionId'
+            END AS target
+          FROM offline_command_queue
+          WHERE station_id = ${stationOcppId} AND status = 'pending'
+            AND action IN ('SetDisplayMessage', 'ClearDisplayMessage', 'CostUpdated')
+        ),
+        ranked AS (
+          SELECT id, row_number() OVER (
+            PARTITION BY action, target ORDER BY created_at DESC, id DESC
+          ) AS rn
+          FROM keyed
+          WHERE target IS NOT NULL
+        )
+        UPDATE offline_command_queue q
+        SET status = 'expired', failed_reason = 'Superseded by a newer queued command'
+        FROM ranked
+        WHERE q.id = ranked.id AND ranked.rn > 1
+      `;
       const pendingCommands = await sql`
         SELECT id, command_id, action, payload, version
         FROM offline_command_queue
@@ -1085,6 +890,26 @@ export function registerProjections(
   safeSubscribe('station.Disconnected', async (event: DomainEvent) => {
     const stationUuid = await resolveStationUuid(event.aggregateId);
     if (stationUuid == null) return;
+
+    // A station that already reconnected to another OCPP instance (rolling
+    // deploy, load balancer) is still online: only the old connection closed.
+    if (registry != null && instanceId != null) {
+      try {
+        const owner = await registry.getInstanceId(event.aggregateId);
+        if (owner != null && owner !== instanceId) {
+          logger.info(
+            { stationId: event.aggregateId, instanceId, owner },
+            'Station is connected to another OCPP instance; not marking it offline',
+          );
+          return;
+        }
+      } catch (err) {
+        logger.warn(
+          { err, stationId: event.aggregateId },
+          'Connection registry lookup failed on disconnect; marking the station offline',
+        );
+      }
+    }
 
     await sql`
       UPDATE charging_stations
@@ -1711,33 +1536,25 @@ export function registerProjections(
     const timestamp = payload.timestamp as string;
     const payloadJson = JSON.stringify(payload);
 
-    async function publishStationMessageTransaction(
+    const screenStationUuid = stationUuid;
+    async function publishTransactionScreen(
       sessionId: string,
       kind: 'started' | 'updated' | 'ended',
       chargingState: string | null,
     ): Promise<void> {
       try {
         const [stationRow] = await sql`
-          SELECT ocpp_protocol FROM charging_stations WHERE id = ${stationUuid}
+          SELECT ocpp_protocol FROM charging_stations WHERE id = ${screenStationUuid}
         `;
-        const protocol = stationRow?.ocpp_protocol as string | null | undefined;
-        if (protocol == null || !protocol.startsWith('ocpp2')) return;
-        await pubsub.publish(
-          'station_message_transaction',
-          JSON.stringify({
-            sessionId,
-            internalStationId: stationUuid,
-            stationOcppId: stationId,
-            ocppProtocol: protocol,
-            eventType: kind,
-            chargingState,
-          }),
+        const protocol = (stationRow?.ocpp_protocol as string | null | undefined) ?? null;
+        await publishStationMessageTransaction(
+          { stationUuid: screenStationUuid, stationId, protocol },
+          sessionId,
+          kind,
+          chargingState,
         );
       } catch (err) {
-        logger.debug(
-          { err, sessionId, kind },
-          'Station-message transaction publish failed; continuing',
-        );
+        logger.debug({ err, sessionId, kind }, 'Station protocol lookup failed; continuing');
       }
     }
 
@@ -1932,6 +1749,13 @@ export function registerProjections(
         const isRoamingSession = initialRoamRows[0]?.is_roaming === true;
         let guestStatus: string | null = null;
         let guestEmail: string | null = null;
+        let tokenLookup: {
+          id: string;
+          driverId: string | null;
+          prepaidBalanceCents: number | null;
+        } | null = null;
+        // The tariff snapshotted on the session (null: no tariff applies).
+        let sessionTariff: TariffPriceSnapshot | null = null;
 
         if (isFreeVend) {
           // Mark session as free-vend and skip driver resolution + payment
@@ -1958,10 +1782,9 @@ export function registerProjections(
           // session gets linked to the matching driver_tokens entry even when
           // driver_id was pre-set by the API (e.g. portal-authenticated start).
           // The link is what powers the "Token" row on the session detail.
-          let tokenLookup: { id: string; driverId: string | null } | null = null;
           if (idTokenValue != null) {
             const tokenRows = await sql`
-              SELECT id, driver_id FROM driver_tokens
+              SELECT id, driver_id, prepaid_balance_cents FROM driver_tokens
               WHERE id_token = ${idTokenValue} AND is_active = true
               LIMIT 1
             `;
@@ -1970,6 +1793,8 @@ export function registerProjections(
               tokenLookup = {
                 id: r.id as string,
                 driverId: (r.driver_id as string | null) ?? null,
+                prepaidBalanceCents:
+                  r.prepaid_balance_cents != null ? Number(r.prepaid_balance_cents) : null,
               };
               await sql`
                 UPDATE charging_sessions
@@ -2030,30 +1855,24 @@ export function registerProjections(
             }
           }
 
-          // Resolve tariff for this station and snapshot rates
-          const tariff = await resolveTariffForStation(stationUuid, driverUuid);
-          if (tariff != null) {
-            await sql`
-              UPDATE charging_sessions
-              SET tariff_id = ${tariff.id},
-                  tariff_price_per_kwh = ${tariff.pricePerKwh},
-                  tariff_price_per_minute = ${tariff.pricePerMinute},
-                  tariff_price_per_session = ${tariff.pricePerSession},
-                  tariff_idle_fee_price_per_minute = ${tariff.idleFeePricePerMinute},
-                  tariff_tax_rate = ${tariff.taxRate},
-                  updated_at = now()
-              WHERE id = ${sessionId}
-            `;
-
-            // Insert initial tariff segment for split-billing tracking
-            await sql`
-              INSERT INTO session_tariff_segments (session_id, tariff_id, started_at, energy_wh_start)
-              VALUES (${sessionId}, ${tariff.id}, ${timestamp}, 0)
-            `;
+          // Resolve the tariff for this station and snapshot its prices and the
+          // company tax basis on the session, with the first tariff segment.
+          // The session is priced from these snapshots only (issue #33). The
+          // payment gate decides free or paid from this same tariff.
+          sessionTariff = await resolveStationTariff({ stationUuid, driverUuid }, sql);
+          if (sessionTariff != null) {
+            await snapshotSessionTariff(
+              sql,
+              sessionId,
+              sessionTariff,
+              await getCompanyTaxBasis(),
+              timestamp,
+            );
           }
         }
 
         // Link reservation to session if reservationId present
+        let linkedReservationId: string | null = null;
         const ocppReservationId = payload.reservationId as number | undefined;
         if (ocppReservationId != null) {
           try {
@@ -2071,6 +1890,7 @@ export function registerProjections(
                 UPDATE charging_sessions SET reservation_id = ${reservationUuid}, updated_at = now()
                 WHERE id = ${sessionId}
               `;
+              linkedReservationId = reservationUuid;
               // Conditional UPDATE -- only one writer flips active→in_use. Audit
               // the transition iff we won the race (RETURNING is empty when
               // the row was already in_use/cancelled/expired).
@@ -2136,8 +1956,16 @@ export function registerProjections(
           }
         }
 
+        // The session has its tariff snapshot and reservation: the 2.1 handler
+        // can answer the Started event with the running cost (OCTT TC_E_109).
+        projectionQueue.signal(sessionPricedKey(stationId, transactionId));
+
         const siteId = await resolveSiteId(stationUuid);
         await notifyChange('session.started', stationUuid, siteId, sessionId);
+        const roamingIdToken = payload.idToken as string | null | undefined;
+        if (isRoamingSession && roamingIdToken != null) {
+          await linkCpoRoamingSession(sessionId, transactionId, roamingIdToken);
+        }
         await notifyOcpiPush('session', { sessionId });
 
         // Notify guest session service for linking. Runs for both free-vend
@@ -2199,6 +2027,9 @@ export function registerProjections(
             idToken: payload.idToken as string | undefined,
             guestStatus,
             guestEmail,
+            prepaidBalanceCents: tokenLookup?.prepaidBalanceCents ?? null,
+            reserved: linkedReservationId != null,
+            sessionTariff,
           });
         }
 
@@ -2234,7 +2065,7 @@ export function registerProjections(
       );
       if (startedSessionId != null) {
         const startedChargingState = (payload.chargingState as string | undefined) ?? null;
-        await publishStationMessageTransaction(startedSessionId, 'started', startedChargingState);
+        await publishTransactionScreen(startedSessionId, 'started', startedChargingState);
       }
     } else if (eventType === 'Updated') {
       const updatedRows = await sql`
@@ -2310,7 +2141,7 @@ export function registerProjections(
             AND (last_update_notified_at IS NULL
               OR last_update_notified_at < now() - make_interval(secs => ${SESSION_UPDATE_THROTTLE_MS / 1000}))
           RETURNING driver_id, energy_delivered_wh, current_cost_cents, started_at,
-                    UPPER(currency) AS currency
+                    tariff_tax_rate, UPPER(currency) AS currency
         `;
         if (throttleResult.length > 0 && throttleResult[0] != null) {
           const updatedSession = throttleResult[0];
@@ -2327,9 +2158,14 @@ export function registerProjections(
               transactionId,
               energyDeliveredWh: updatedSession.energy_delivered_wh as number,
               currentCostCents: updatedSession.current_cost_cents as number,
-              costFormatted: formatCurrencyAmount(
+              costFormatted: notificationMoney(
                 (updatedSession.current_cost_cents as number | null) ?? 0,
                 updatedSession.currency as string,
+              ),
+              // Templates label the cost "incl. tax" only when it contains tax.
+              costIncludesTax: costIncludesTax(
+                updatedSession.current_cost_cents as number | null,
+                updatedSession.tariff_tax_rate as string | null,
               ),
               currency: updatedSession.currency as string,
               durationMinutes,
@@ -2340,7 +2176,7 @@ export function registerProjections(
         }
 
         const updatedChargingState = getString(payload, 'chargingState');
-        await publishStationMessageTransaction(sessionId, 'updated', updatedChargingState);
+        await publishTransactionScreen(sessionId, 'updated', updatedChargingState);
       } else {
         txBuffer.add(transactionId, event);
       }
@@ -2390,10 +2226,9 @@ export function registerProjections(
       `;
 
       const sessionRows = await sql`
-        SELECT id, evse_id, status, tariff_id, current_cost_cents, started_at, ended_at, energy_delivered_wh,
-               currency, tariff_price_per_kwh, tariff_price_per_minute, tariff_price_per_session,
-               tariff_idle_fee_price_per_minute, tariff_tax_rate,
-               idle_started_at, idle_minutes, reservation_id
+        SELECT id, evse_id, status, tariff_id, current_cost_cents, started_at, ended_at,
+               energy_delivered_wh, currency, tariff_tax_rate, idle_started_at, idle_minutes,
+               reservation_id
         FROM charging_sessions WHERE transaction_id = ${transactionId}
       `;
       const sessionRow = sessionRows[0];
@@ -2473,138 +2308,53 @@ export function registerProjections(
         if (hasTariffSnapshot && !skipCostCalc) {
           const endedAt = new Date(sessionRow.ended_at as string);
           const energyWh = Number(sessionRow.energy_delivered_wh ?? 0);
+          const idleMinutes = sessionIdleMinutesAt(
+            {
+              idleStartedAt:
+                sessionRow.idle_started_at != null
+                  ? new Date(sessionRow.idle_started_at as string)
+                  : null,
+              idleMinutes: Number(sessionRow.idle_minutes ?? 0),
+            },
+            endedAt,
+          );
 
-          // Calculate idle minutes: accumulated + any open idle period at session end
-          const accumulatedIdle = Number(sessionRow.idle_minutes ?? 0);
-          const idleStart = sessionRow.idle_started_at as string | null;
-          const idleMinutes =
-            idleStart != null
-              ? accumulatedIdle + (endedAt.getTime() - new Date(idleStart).getTime()) / 60000
-              : accumulatedIdle;
+          // Close the open tariff segment with the idle not yet attributed to
+          // closed segments.
+          await closeOpenSegment(sql, sessionId, endedAt, energyWh, idleMinutes);
 
-          const endGracePeriod = await getIdlingGracePeriodMinutes();
-
-          // Close the open tariff segment. idle_minutes is the WHOLE-session
-          // accumulator (plus any open idle period at session end). For
-          // multi-segment sessions, earlier segments were already closed by
-          // the boundary cron with per-segment deltas; assigning the full
-          // accumulated idle to the last segment here would double-count
-          // the portions already attributed earlier. Subtract what's already
-          // on closed segments so this last segment carries only the idle
-          // that occurred inside its own window. The final-cost path at line
-          // ~2479 overrides per-segment idle when computing total cost, so
-          // this fix protects per-segment audit data and any downstream
-          // line-item code that reads segments verbatim.
-          const closedIdleAggRows = await sql<Array<{ total: string }>>`
-            SELECT COALESCE(SUM(idle_minutes), 0)::text AS total
-            FROM session_tariff_segments
-            WHERE session_id = ${sessionId} AND ended_at IS NOT NULL
-          `;
-          const closedIdleSum = Number(closedIdleAggRows[0]?.total ?? 0);
-          const segmentIdleMinutes = Math.max(0, idleMinutes - closedIdleSum);
-          const endedAtIso = endedAt.toISOString();
-          await sql`
-            UPDATE session_tariff_segments
-            SET ended_at = ${endedAtIso},
-                energy_wh_end = ${energyWh},
-                duration_minutes = EXTRACT(EPOCH FROM (${endedAtIso}::timestamptz - started_at)) / 60,
-                idle_minutes = ${segmentIdleMinutes}
-            WHERE session_id = ${sessionId} AND ended_at IS NULL
-          `;
-
-          // Fetch reservation start time to compute holding minutes (time from reservation
-          // start until session start, charged as a holding fee).
-          const reservationUuid = sessionRow.reservation_id as string | null;
-          let reservationHoldingMinutes = 0;
-          if (reservationUuid != null) {
-            const reservationRows = await sql`
-              SELECT starts_at, created_at FROM reservations WHERE id = ${reservationUuid}
-            `;
-            const row = reservationRows[0];
-            if (row != null) {
-              const referenceTime = (row.starts_at ?? row.created_at) as string;
-              const sessionStartedAt = new Date(sessionRow.started_at as string);
-              const holdingMs = sessionStartedAt.getTime() - new Date(referenceTime).getTime();
-              reservationHoldingMinutes = Math.max(0, Math.ceil(holdingMs / 60_000));
+          // The one cost assembly prices the session from its snapshots. The
+          // OCPP 2.1 handler priced it the same way and returned the result to
+          // the station as totalCost (I03.FR.02); that amount is what is
+          // charged, so the session and the station display agree. Should the
+          // two ever differ, the breakdown is reconciled to the responded amount.
+          const breakdown = await priceSessionAt(sql, sessionId, endedAt, energyWh);
+          if (breakdown != null) {
+            const respondedCostCents = payload.finalCostCents;
+            const responded =
+              typeof respondedCostCents === 'number' &&
+              Number.isInteger(respondedCostCents) &&
+              respondedCostCents >= 0
+                ? respondedCostCents
+                : null;
+            if (responded != null && responded !== breakdown.grossCents) {
+              logger.warn(
+                { sessionId, respondedCostCents: responded, pricedCents: breakdown.grossCents },
+                'Final cost differs from the totalCost sent to the station; charging the sent amount',
+              );
             }
+            await storeFinalCost(
+              sql,
+              sessionId,
+              responded != null
+                ? reconcileCostBreakdown(
+                    breakdown,
+                    responded,
+                    Number(sessionRow.tariff_tax_rate ?? 0),
+                  )
+                : breakdown,
+            );
           }
-
-          // Fetch all segments to determine if split-billing applies
-          const splitEnabled = await isSplitBillingEnabled();
-          const finalSegments = splitEnabled
-            ? await sql`
-                SELECT sts.started_at, sts.ended_at, sts.energy_wh_start, sts.energy_wh_end,
-                       sts.idle_minutes AS seg_idle_minutes,
-                       t.price_per_kwh, t.price_per_minute, t.price_per_session,
-                       t.idle_fee_price_per_minute, t.reservation_fee_per_minute, t.tax_rate
-                FROM session_tariff_segments sts
-                JOIN tariffs t ON t.id = sts.tariff_id
-                WHERE sts.session_id = ${sessionId}
-                ORDER BY sts.started_at
-              `
-            : [];
-
-          let totalCents: number;
-          if (splitEnabled && finalSegments.length > 1) {
-            const tariffSegments: TariffSegment[] = finalSegments.map((seg, index) => {
-              const segStartMs = new Date(seg.started_at as string).getTime();
-              const segEndMs = new Date(seg.ended_at as string).getTime();
-              return {
-                tariff: {
-                  pricePerKwh: seg.price_per_kwh as string | null,
-                  pricePerMinute: seg.price_per_minute as string | null,
-                  pricePerSession: seg.price_per_session as string | null,
-                  idleFeePricePerMinute: seg.idle_fee_price_per_minute as string | null,
-                  reservationFeePerMinute: seg.reservation_fee_per_minute as string | null,
-                  taxRate: seg.tax_rate as string | null,
-                },
-                durationMinutes: (segEndMs - segStartMs) / 60000,
-                energyDeliveredWh:
-                  Number(seg.energy_wh_end ?? 0) - Number(seg.energy_wh_start ?? 0),
-                idleMinutes: Number(seg.seg_idle_minutes ?? 0),
-                isFirstSegment: index === 0,
-              };
-            });
-            totalCents = calculateSplitSessionCost(
-              tariffSegments,
-              endGracePeriod,
-              reservationHoldingMinutes,
-            ).totalCents;
-          } else {
-            // Fetch reservation_fee_per_minute from the tariff row (not snapshotted on session)
-            let tariffReservationFeePerMinute: string | null = null;
-            if (sessionRow.tariff_id != null) {
-              const tariffFeeRows = await sql`
-                SELECT reservation_fee_per_minute FROM tariffs WHERE id = ${sessionRow.tariff_id as string}
-              `;
-              tariffReservationFeePerMinute =
-                (tariffFeeRows[0]?.reservation_fee_per_minute as string | null) ?? null;
-            }
-
-            const startedAt = new Date(sessionRow.started_at as string);
-            const durationMinutes = (endedAt.getTime() - startedAt.getTime()) / 60000;
-            totalCents = calculateSessionCost(
-              {
-                pricePerKwh: sessionRow.tariff_price_per_kwh as string | null,
-                pricePerMinute: sessionRow.tariff_price_per_minute as string | null,
-                pricePerSession: sessionRow.tariff_price_per_session as string | null,
-                idleFeePricePerMinute: sessionRow.tariff_idle_fee_price_per_minute as string | null,
-                reservationFeePerMinute: tariffReservationFeePerMinute,
-                taxRate: sessionRow.tariff_tax_rate as string | null,
-              },
-              energyWh,
-              durationMinutes,
-              idleMinutes,
-              endGracePeriod,
-              reservationHoldingMinutes,
-            ).totalCents;
-          }
-
-          await sql`
-            UPDATE charging_sessions
-            SET final_cost_cents = ${totalCents}, current_cost_cents = ${totalCents}, updated_at = now()
-            WHERE id = ${sessionId}
-          `;
         }
 
         // Carbon footprint calculation. LEFT JOIN so we can distinguish
@@ -2728,7 +2478,7 @@ export function registerProjections(
         // alongside the correct payment-required notification.
         const endedDriverRows = await sql`
           SELECT driver_id, energy_delivered_wh, final_cost_cents, started_at, ended_at, status,
-                 UPPER(currency) AS currency
+                 tariff_tax_rate, UPPER(currency) AS currency
           FROM charging_sessions WHERE id = ${sessionId}`;
         const endedSession = endedDriverRows[0];
         const endedSessionStatus = endedSession?.status as string | undefined;
@@ -2756,9 +2506,13 @@ export function registerProjections(
               transactionId,
               energyDeliveredWh: endedSession.energy_delivered_wh as number,
               finalCostCents: endedSession.final_cost_cents as number,
-              costFormatted: formatCurrencyAmount(
+              costFormatted: notificationMoney(
                 (endedSession.final_cost_cents as number | null) ?? 0,
                 endedSession.currency as string,
+              ),
+              costIncludesTax: costIncludesTax(
+                endedSession.final_cost_cents as number | null,
+                endedSession.tariff_tax_rate as string | null,
               ),
               currency: endedSession.currency as string,
               durationMinutes,
@@ -2780,9 +2534,13 @@ export function registerProjections(
               transactionId,
               energyDeliveredWh: endedSession.energy_delivered_wh as number,
               finalCostCents: endedSession.final_cost_cents as number,
-              costFormatted: formatCurrencyAmount(
+              costFormatted: notificationMoney(
                 (endedSession.final_cost_cents as number | null) ?? 0,
                 endedSession.currency as string,
+              ),
+              costIncludesTax: costIncludesTax(
+                endedSession.final_cost_cents as number | null,
+                endedSession.tariff_tax_rate as string | null,
               ),
               currency: endedSession.currency as string,
               durationMinutes,
@@ -2794,7 +2552,7 @@ export function registerProjections(
           );
         }
 
-        await publishStationMessageTransaction(sessionRow.id as string, 'ended', null);
+        await publishTransactionScreen(sessionRow.id as string, 'ended', null);
 
         // Free the per-session CostUpdated throttle entry now that the
         // session is over. Without this the Map grows unbounded over the
@@ -3071,182 +2829,120 @@ export function registerProjections(
     // Notify for all MeterValues (both standalone and transaction-scoped).
     // Cost recalculation and session updates follow below when active sessions exist.
 
-    // Update real-time cost on active sessions for this station using snapshotted rates.
-    // JOIN to charging_stations so the CostUpdated dispatch path below has the
-    // transactionId and ocpp_protocol without a second SQL round-trip per
-    // cost-change event (previously ran on every throttled dispatch).
+    // Update the running cost of active sessions for this station from their
+    // price snapshots. JOIN to charging_stations so the CostUpdated dispatch
+    // path below has the transactionId and ocpp_protocol without a second SQL
+    // round-trip per cost-change event.
     const activeSessions = appliesToSession
       ? await sql`
-          SELECT cs.id, cs.transaction_id, cs.tariff_id, cs.driver_id, cs.started_at,
+          SELECT cs.id, cs.transaction_id, cs.tariff_id, cs.driver_id,
                  cs.energy_delivered_wh, cs.current_cost_cents,
-                 cs.currency, cs.tariff_price_per_kwh, cs.tariff_price_per_minute,
-                 cs.tariff_price_per_session, cs.tariff_idle_fee_price_per_minute, cs.tariff_tax_rate,
-                 cs.idle_started_at, cs.idle_minutes, st.ocpp_protocol
+                 cs.idle_started_at, cs.idle_minutes, st.ocpp_protocol,
+                 dt.prepaid_balance_cents
           FROM charging_sessions cs
           JOIN charging_stations st ON st.id = cs.station_id
+          LEFT JOIN driver_tokens dt ON dt.id = cs.token_id
           WHERE cs.station_id = ${stationUuid} AND cs.status = 'active' AND cs.tariff_id IS NOT NULL
             AND (cs.id = ${sessionId} OR (${sessionId}::text IS NULL AND cs.evse_id = ${evseUuid}))
         `
       : [];
 
-    const meterGracePeriod = await getIdlingGracePeriodMinutes();
     const splitBillingEnabled = await isSplitBillingEnabled();
     for (const session of activeSessions) {
       const sessionId = session.id as string;
-
-      const startedAt = new Date(session.started_at as string);
-      const durationMinutes = (Date.now() - startedAt.getTime()) / 60000;
+      const now = new Date();
       const energyWh = Number(session.energy_delivered_wh ?? 0);
 
-      // Calculate idle minutes: accumulated + current open idle period
-      const accumulatedIdle = Number(session.idle_minutes ?? 0);
-      const idleStart = session.idle_started_at as string | null;
-      const idleMinutes =
-        idleStart != null
-          ? accumulatedIdle + (Date.now() - new Date(idleStart).getTime()) / 60000
-          : accumulatedIdle;
-
-      // Split-billing: check if tariff has changed since session started
+      // Split billing: when the tariff that applies now differs from the one
+      // of the open segment, close that segment and open one priced from the
+      // new tariff. The session keeps the tariff snapshot it started with.
+      // The session's energy so far selects an energy-threshold tariff once
+      // the threshold is crossed.
       if (splitBillingEnabled) {
-        const currentTariff = await resolveTariffForStation(
-          stationUuid,
-          session.driver_id as string | null,
-        );
-        if (currentTariff != null && currentTariff.id !== (session.tariff_id as string)) {
-          const now = new Date().toISOString();
-          // Compute idle minutes for the closing segment:
-          // session total idle - sum of all previously closed segments' idle
-          const priorIdleRows = await sql`
-            SELECT COALESCE(SUM(idle_minutes), 0) AS total
-            FROM session_tariff_segments
-            WHERE session_id = ${sessionId} AND ended_at IS NOT NULL
-          `;
-          const priorIdleSum = Number(priorIdleRows[0]?.total ?? 0);
-          const segmentIdleMinutes = Math.max(0, idleMinutes - priorIdleSum);
-          // Close the current open segment
-          await sql`
-            UPDATE session_tariff_segments
-            SET ended_at = ${now},
-                energy_wh_end = ${energyWh},
-                duration_minutes = EXTRACT(EPOCH FROM (${now}::timestamptz - started_at)) / 60,
-                idle_minutes = ${segmentIdleMinutes}
-            WHERE session_id = ${sessionId} AND ended_at IS NULL
-          `;
-          // Open a new segment for the new tariff
-          await sql`
-            INSERT INTO session_tariff_segments (session_id, tariff_id, started_at, energy_wh_start)
-            VALUES (${sessionId}, ${currentTariff.id}, ${now}, ${energyWh})
-          `;
-          // Update session tariff snapshot to the new tariff
-          await sql`
-            UPDATE charging_sessions
-            SET tariff_id = ${currentTariff.id},
-                tariff_price_per_kwh = ${currentTariff.pricePerKwh},
-                tariff_price_per_minute = ${currentTariff.pricePerMinute},
-                tariff_price_per_session = ${currentTariff.pricePerSession},
-                tariff_idle_fee_price_per_minute = ${currentTariff.idleFeePricePerMinute},
-                tariff_tax_rate = ${currentTariff.taxRate},
-                updated_at = now()
-            WHERE id = ${sessionId}
-          `;
-        }
-      }
-
-      // Calculate cost (split-billing or single tariff)
-      let totalCents: number;
-      if (splitBillingEnabled) {
-        const segments = await sql`
-          SELECT sts.started_at, sts.ended_at, sts.energy_wh_start, sts.energy_wh_end,
-                 sts.idle_minutes,
-                 t.price_per_kwh, t.price_per_minute, t.price_per_session,
-                 t.idle_fee_price_per_minute, t.tax_rate
-          FROM session_tariff_segments sts
-          JOIN tariffs t ON t.id = sts.tariff_id
-          WHERE sts.session_id = ${sessionId}
-          ORDER BY sts.started_at
-        `;
-        if (segments.length > 1) {
-          const nowMs = Date.now();
-          // Closed segments' idle was already attributed at close time and is
-          // billed at the tariff rate active during their window. The still-
-          // open last segment gets the remainder (session idle minus the
-          // closed segments' stored idle).
-          const closedIdleSum = segments.reduce(
-            (sum, s) => (s.ended_at != null ? sum + Number(s.idle_minutes ?? 0) : sum),
-            0,
-          );
-          const openIdleMinutes = Math.max(0, idleMinutes - closedIdleSum);
-          const tariffSegments: TariffSegment[] = segments.map((seg, index) => {
-            const segStartMs = new Date(seg.started_at as string).getTime();
-            const segEndMs =
-              seg.ended_at != null ? new Date(seg.ended_at as string).getTime() : nowMs;
-            const segEnergyStart = Number(seg.energy_wh_start ?? 0);
-            const segEnergyEnd = seg.ended_at != null ? Number(seg.energy_wh_end ?? 0) : energyWh;
-            const isOpen = seg.ended_at == null;
-            return {
-              tariff: {
-                pricePerKwh: seg.price_per_kwh as string | null,
-                pricePerMinute: seg.price_per_minute as string | null,
-                pricePerSession: seg.price_per_session as string | null,
-                idleFeePricePerMinute: seg.idle_fee_price_per_minute as string | null,
-                reservationFeePerMinute: null, // holding fee applied at session end only
-                taxRate: seg.tax_rate as string | null,
-              },
-              durationMinutes: (segEndMs - segStartMs) / 60000,
-              energyDeliveredWh: segEnergyEnd - segEnergyStart,
-              idleMinutes: isOpen ? openIdleMinutes : Number(seg.idle_minutes ?? 0),
-              isFirstSegment: index === 0,
-            };
-          });
-          totalCents = calculateSplitSessionCost(tariffSegments, meterGracePeriod).totalCents;
-        } else {
-          totalCents = calculateSessionCost(
-            {
-              pricePerKwh: session.tariff_price_per_kwh as string | null,
-              pricePerMinute: session.tariff_price_per_minute as string | null,
-              pricePerSession: session.tariff_price_per_session as string | null,
-              idleFeePricePerMinute: session.tariff_idle_fee_price_per_minute as string | null,
-              reservationFeePerMinute: null, // holding fee applied at session end only
-              taxRate: session.tariff_tax_rate as string | null,
-            },
-            energyWh,
-            durationMinutes,
-            idleMinutes,
-            meterGracePeriod,
-          ).totalCents;
-        }
-      } else {
-        totalCents = calculateSessionCost(
+        const currentTariff = await resolveStationTariff(
           {
-            pricePerKwh: session.tariff_price_per_kwh as string | null,
-            pricePerMinute: session.tariff_price_per_minute as string | null,
-            pricePerSession: session.tariff_price_per_session as string | null,
-            idleFeePricePerMinute: session.tariff_idle_fee_price_per_minute as string | null,
-            reservationFeePerMinute: null, // holding fee applied at session end only
-            taxRate: session.tariff_tax_rate as string | null,
+            stationUuid,
+            driverUuid: session.driver_id as string | null,
+            at: now,
+            sessionEnergyKwh: energyWh / 1000,
           },
-          energyWh,
-          durationMinutes,
-          idleMinutes,
-          meterGracePeriod,
-        ).totalCents;
+          sql,
+        );
+        const openTariffId =
+          (await openSegmentTariffId(sql, sessionId)) ?? (session.tariff_id as string);
+        if (currentTariff != null && currentTariff.id !== openTariffId) {
+          await switchTariffSegment(sql, {
+            sessionId,
+            tariff: currentTariff,
+            at: now,
+            energyWh,
+            sessionIdleMinutes: sessionIdleMinutesAt(
+              {
+                idleStartedAt:
+                  session.idle_started_at != null
+                    ? new Date(session.idle_started_at as string)
+                    : null,
+                idleMinutes: Number(session.idle_minutes ?? 0),
+              },
+              now,
+            ),
+          });
+        }
       }
 
+      // The running cost, from the one cost assembly the final cost uses
+      // (segments, idle grace, and the reservation holding fee).
+      const breakdown = await priceSessionAt(sql, sessionId, now, energyWh);
+      if (breakdown == null) continue;
+      const totalCents = breakdown.grossCents;
       const previousCostCents = session.current_cost_cents as number | null;
 
-      await sql`
-        UPDATE charging_sessions
-        SET current_cost_cents = ${totalCents}, updated_at = now()
-        WHERE id = ${sessionId}
-      `;
+      if (!(await storeRunningCost(sql, sessionId, breakdown))) continue;
+
+      // The TransactionEvent projection renders the screen before this cost is
+      // stored, so render it again with the new energy and cost.
+      if (previousCostCents !== totalCents) {
+        await publishStationMessageTransaction(
+          { stationUuid, stationId, protocol: session.ocpp_protocol as string | null },
+          sessionId,
+          'updated',
+          null,
+        );
+      }
+
+      // Prepaid token on OCPP 1.6: the station gets no transactionLimit, so the
+      // CSMS stops the transaction once the running cost reaches the credit.
+      // OCPP 2.1 stations enforce transactionLimit.maxCost themselves (C17).
+      const prepaidBalance = session.prepaid_balance_cents as number | null | undefined;
+      const prepaidTxId = session.transaction_id as string | null;
+      if (
+        session.ocpp_protocol === 'ocpp1.6' &&
+        prepaidBalance != null &&
+        prepaidTxId != null &&
+        totalCents >= prepaidBalance
+      ) {
+        logger.info(
+          { sessionId, totalCents, prepaidBalanceCents: prepaidBalance },
+          'Prepaid credit used up, stopping the OCPP 1.6 transaction',
+        );
+        await stopSessionForPayment(
+          {
+            sessionId,
+            transactionId: prepaidTxId,
+            ocppStationId: stationId,
+            stationDbId: stationUuid,
+          },
+          'PrepaidCreditExhausted',
+        );
+      }
 
       // Send CostUpdated to station when cost changes (OCPP 2.1 only).
       // Throttled per session via lastCostUpdatedAt to keep dispatch volume
       // bounded under high MeterValues cadence.
       if (previousCostCents !== totalCents) {
-        const now = Date.now();
+        const nowMs = now.getTime();
         const lastSentAt = lastCostUpdatedAt.get(sessionId) ?? 0;
-        if (now - lastSentAt >= COST_UPDATED_THROTTLE_MS) {
+        if (nowMs - lastSentAt >= COST_UPDATED_THROTTLE_MS) {
           const txId = session.transaction_id as string | null;
           const protocol = session.ocpp_protocol as string | null;
           if (txId != null && protocol === 'ocpp2.1') {
@@ -3262,7 +2958,7 @@ export function registerProjections(
             });
             try {
               await pubsub.publish('ocpp_commands', costUpdatePayload);
-              lastCostUpdatedAt.set(sessionId, now);
+              lastCostUpdatedAt.set(sessionId, nowMs);
             } catch (err) {
               logger.debug(
                 { err, sessionId },
@@ -3640,22 +3336,14 @@ export function registerProjections(
     // Convert settlement amount to cents (OCPP sends in major currency units)
     const capturedAmountCents = Math.round(settlementAmount * 100);
 
-    const insertResult = await sql`
-      INSERT INTO payment_records (
-        session_id, driver_id, payment_source, currency, captured_amount_cents, status
-      )
-      VALUES (
-        ${session.id as string},
-        ${session.driver_id as string | null},
-        'ocpp_terminal',
-        ${session.currency as string},
-        ${capturedAmountCents},
-        'captured'
-      )
-      ON CONFLICT (session_id) DO NOTHING
-    `;
+    const recorded = await recordTerminalSettlement({
+      sessionId: session.id as string,
+      driverId: (session.driver_id as string | null) ?? null,
+      currency: session.currency as string,
+      capturedCents: capturedAmountCents,
+    });
 
-    if (insertResult.count === 0) {
+    if (!recorded) {
       logger.warn(
         { transactionId, sessionId: session.id },
         'Duplicate NotifySettlement ignored; payment already exists for session',
@@ -3678,6 +3366,7 @@ export function registerProjections(
           stationId: event.aggregateId,
           transactionId,
           amountCents: capturedAmountCents,
+          amountFormatted: notificationMoney(capturedAmountCents, session.currency as string),
           currency: session.currency as string,
         },
         ALL_TEMPLATES_DIRS,
@@ -3693,6 +3382,7 @@ export function registerProjections(
           stationId: event.aggregateId,
           transactionId,
           amountCents: capturedAmountCents,
+          amountFormatted: notificationMoney(capturedAmountCents, session.currency as string),
           currency: session.currency as string,
         },
         ALL_TEMPLATES_DIRS,
@@ -3714,71 +3404,99 @@ export function registerProjections(
     idToken: string | undefined;
     guestStatus: string | null;
     guestEmail: string | null;
+    /** Balance of the session's prepaid token; null when the token is not prepaid. */
+    prepaidBalanceCents: number | null;
+    /** True when the session started from a reservation (its holding fee is billed). */
+    reserved: boolean;
+    /** The tariff snapshotted on the session at Started (null: no tariff applies). */
+    sessionTariff: TariffPriceSnapshot | null;
   }
 
-  async function runPaymentGate(params: PaymentGateParams): Promise<void> {
-    const {
-      sessionId,
-      transactionId,
-      driverId,
-      stationDbId,
-      ocppStationId,
-      siteId,
-      isRoaming,
-      idToken,
-      guestStatus,
-      guestEmail,
-    } = params;
+  interface StopTarget {
+    sessionId: string;
+    transactionId: string;
+    ocppStationId: string;
+    stationDbId: string;
+  }
 
-    // Case 1: OCPI roaming session -- billing handled by eMSP via CDR
-    if (isRoaming) return;
+  type PaymentStopReason =
+    | 'PaymentFailed'
+    | 'MissingPaymentMethod'
+    | 'GuestPaymentNotAuthorized'
+    | 'AnonymousSession'
+    | 'PrepaidCreditExhausted';
 
-    /**
-     * Stops the session by publishing RequestStopTransaction. For
-     * payment-failure reasons (PaymentFailed, MissingPaymentMethod) we ALSO
-     * eagerly mark the DB row faulted so the operator UI clears the connector
-     * even if the station ignores the stop or the message is lost. This is
-     * the ghost-session prevention path: a card declined at the gate must not
-     * leave a stranded `active` session that no event can ever close.
-     *
-     * Anonymous and guest-not-authorized stops only publish the OCPP command;
-     * the natural TransactionEvent.Ended that follows handles the DB
-     * transition. Eager cleanup for those would race the legitimate Ended
-     * handler.
-     */
-    async function stopSession(
-      reason:
-        | 'PaymentFailed'
-        | 'MissingPaymentMethod'
-        | 'GuestPaymentNotAuthorized'
-        | 'AnonymousSession',
-    ): Promise<void> {
+  /**
+   * Stops the session by publishing RequestStopTransaction. For
+   * payment-failure reasons (PaymentFailed, MissingPaymentMethod) we ALSO
+   * eagerly mark the DB row faulted so the operator UI clears the connector
+   * even if the station ignores the stop or the message is lost. This is
+   * the ghost-session prevention path: a card declined at the gate must not
+   * leave a stranded `active` session that no event can ever close.
+   *
+   * Anonymous and guest-not-authorized stops only publish the OCPP command;
+   * the natural TransactionEvent.Ended that follows handles the DB
+   * transition. Eager cleanup for those would race the legitimate Ended
+   * handler.
+   *
+   * PrepaidCreditExhausted records stopped_reason first and publishes only
+   * when it claimed the session, so repeated MeterValues send one stop.
+   */
+  async function stopSessionForPayment(
+    target: StopTarget,
+    reason: PaymentStopReason,
+  ): Promise<void> {
+    const { sessionId, transactionId, ocppStationId, stationDbId } = target;
+
+    // A prepaid session out of credit (OCPP 1.6 has no transactionLimit): mark
+    // the stop request on the session before publishing, once. The session
+    // stays active until the station's StopTransaction, which keeps this
+    // stopped_reason (COALESCE) and settles the prepaid balance.
+    if (reason === 'PrepaidCreditExhausted') {
       try {
-        await pubsub.publish(
-          'ocpp_commands',
-          JSON.stringify({
-            commandId: crypto.randomUUID(),
-            stationId: ocppStationId,
-            action: 'RequestStopTransaction',
-            payload: { transactionId },
-          }),
-        );
+        const claimed = await sql`
+          UPDATE charging_sessions
+          SET stopped_reason = ${reason}, updated_at = now()
+          WHERE id = ${sessionId} AND status = 'active' AND stopped_reason IS NULL
+          RETURNING id
+        `;
+        if (claimed.length === 0) return;
       } catch (err) {
-        logger.error({ err }, 'Failed to publish RequestStopTransaction');
+        logger.error({ err, sessionId }, 'Failed to record the prepaid credit stop');
+        return;
       }
+    }
 
-      // Push a one-shot driver-facing message to the station screen so the
-      // physical UX matches the email/SMS notification fan-out. The template
-      // body is operator-editable in Settings -> Integration -> Station
-      // Messages, rendered with the standard StationMessageContext, and
-      // dispatched via dispatchOneShotStationMessage so any future
-      // event-driven station message can reuse the same path.
-      const stateByReason: Record<typeof reason, StationMessageState> = {
-        PaymentFailed: 'payment_failed',
-        MissingPaymentMethod: 'payment_required',
-        GuestPaymentNotAuthorized: 'guest_unauthorized',
-        AnonymousSession: 'unauthorized',
-      };
+    try {
+      await pubsub.publish(
+        'ocpp_commands',
+        JSON.stringify({
+          commandId: crypto.randomUUID(),
+          stationId: ocppStationId,
+          action: 'RequestStopTransaction',
+          payload: { transactionId },
+        }),
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to publish RequestStopTransaction');
+    }
+
+    // Push a one-shot driver-facing message to the station screen so the
+    // physical UX matches the email/SMS notification fan-out. The template
+    // body is operator-editable in Settings -> Integration -> Station
+    // Messages, rendered with the standard StationMessageContext, and
+    // dispatched via dispatchOneShotStationMessage so any future
+    // event-driven station message can reuse the same path.
+    const stateByReason: Record<PaymentStopReason, StationMessageState | null> = {
+      PaymentFailed: 'payment_failed',
+      MissingPaymentMethod: 'payment_required',
+      GuestPaymentNotAuthorized: 'guest_unauthorized',
+      AnonymousSession: 'unauthorized',
+      // No station message template exists for an exhausted prepaid credit.
+      PrepaidCreditExhausted: null,
+    };
+    const messageState = stateByReason[reason];
+    if (messageState != null) {
       try {
         const settingRows = await sql`
           SELECT key, value FROM settings
@@ -3798,7 +3516,7 @@ export function registerProjections(
           {
             stationOcppId: ocppStationId,
             stationDbId,
-            state: stateByReason[reason],
+            state: messageState,
             context: {
               companyName,
               stationOcppId: ocppStationId,
@@ -3816,48 +3534,143 @@ export function registerProjections(
       } catch (err) {
         logger.warn({ err, reason }, 'Failed to publish payment-failure display message');
       }
-
-      const eagerCleanup = reason === 'PaymentFailed' || reason === 'MissingPaymentMethod';
-      if (!eagerCleanup) return;
-
-      try {
-        // Zero out cost columns: the driver never authorized payment so we
-        // must not display or persist a session-fee charge. Without this,
-        // the cost calc on the Ended event (or MeterValues if a stray one
-        // arrives) applies pricePerSession + tax and the portal Recent
-        // Sessions list shows a phantom $0.81 next to a 0 kWh row.
-        const eager = await sql`
-          UPDATE charging_sessions
-          SET status = 'faulted',
-              stopped_reason = ${reason},
-              ended_at = now(),
-              final_cost_cents = 0,
-              current_cost_cents = 0,
-              updated_at = now()
-          WHERE id = ${sessionId} AND status = 'active'
-          RETURNING id
-        `;
-        await sql`
-          UPDATE session_tariff_segments
-          SET ended_at = now(),
-              duration_minutes = EXTRACT(EPOCH FROM (now() - started_at)) / 60
-          WHERE session_id = ${sessionId} AND ended_at IS NULL
-        `;
-        if (eager.length > 0) {
-          await auditLinkedReservationFault(sessionId, `faulted: ${reason}`);
-        }
-      } catch (err) {
-        logger.error({ err, sessionId, reason }, 'Failed to mark session faulted');
-      }
     }
 
-    async function notifyPreAuthFailed(reason: string): Promise<void> {
-      if (driverId == null) return;
+    const eagerCleanup = reason === 'PaymentFailed' || reason === 'MissingPaymentMethod';
+    if (!eagerCleanup) return;
+
+    try {
+      // Zero out cost columns: the driver never authorized payment so we
+      // must not display or persist a session-fee charge. Without this,
+      // the cost calc on the Ended event (or MeterValues if a stray one
+      // arrives) applies pricePerSession + tax and the portal Recent
+      // Sessions list shows a phantom $0.81 next to a 0 kWh row.
+      const eager = await sql`
+        UPDATE charging_sessions
+        SET status = 'faulted',
+            stopped_reason = ${reason},
+            ended_at = now(),
+            final_cost_cents = 0,
+            current_cost_cents = 0,
+            net_cents = 0,
+            tax_cents = 0,
+            cost_breakdown = jsonb_set(
+              ${sql.json(zeroCostBreakdown('net') as unknown as postgres.JSONValue)}::jsonb,
+              '{basis}',
+              to_jsonb(COALESCE(tax_basis, 'net'))
+            ),
+            updated_at = now()
+        WHERE id = ${sessionId} AND status = 'active'
+        RETURNING id
+      `;
+      await sql`
+        UPDATE session_tariff_segments
+        SET ended_at = now(),
+            duration_minutes = EXTRACT(EPOCH FROM (now() - started_at)) / 60
+        WHERE session_id = ${sessionId} AND ended_at IS NULL
+      `;
+      if (eager.length > 0) {
+        await auditLinkedReservationFault(sessionId, `faulted: ${reason}`);
+      }
+    } catch (err) {
+      logger.error({ err, sessionId, reason }, 'Failed to mark session faulted');
+    }
+  }
+
+  /**
+   * Resolves how a driver pays (driver > fleet > 'card') and snapshots it on
+   * the session in one statement. Among the driver's fleets that set a mode
+   * the oldest membership wins. Mirrors resolvePaymentMode() in
+   * packages/api/src/services/driver.service.ts; inlined to avoid an API
+   * package dependency from the OCPP package. Falls back to 'card' when the
+   * session row is missing.
+   */
+  async function snapshotPaymentMode(
+    sessionId: string,
+    driverId: string,
+  ): Promise<'card' | 'invoice'> {
+    const rows = await sql`
+      WITH driver_mode AS (
+        SELECT d.payment_mode, 1 AS priority
+        FROM drivers d
+        WHERE d.id = ${driverId} AND d.payment_mode IS NOT NULL
+      ),
+      fleet_mode AS (
+        SELECT f.payment_mode, 2 AS priority
+        FROM fleet_drivers fd
+        JOIN fleets f ON f.id = fd.fleet_id
+        WHERE fd.driver_id = ${driverId} AND f.payment_mode IS NOT NULL
+        ORDER BY fd.created_at ASC
+        LIMIT 1
+      ),
+      resolved AS (
+        SELECT payment_mode FROM (
+          SELECT payment_mode, priority FROM driver_mode
+          UNION ALL SELECT payment_mode, priority FROM fleet_mode
+        ) modes
+        ORDER BY priority
+        LIMIT 1
+      )
+      UPDATE charging_sessions
+      SET payment_mode = COALESCE((SELECT payment_mode FROM resolved), 'card'),
+          updated_at = now()
+      WHERE id = ${sessionId}
+      RETURNING payment_mode
+    `;
+    return rows[0]?.payment_mode === 'invoice' ? 'invoice' : 'card';
+  }
+
+  async function runPaymentGate(params: PaymentGateParams): Promise<void> {
+    const {
+      sessionId,
+      transactionId,
+      driverId,
+      stationDbId,
+      ocppStationId,
+      siteId,
+      isRoaming,
+      idToken,
+      guestStatus,
+      guestEmail,
+      prepaidBalanceCents,
+      reserved,
+      sessionTariff,
+    } = params;
+
+    // The session is billed at the tariff snapshotted on Started, so the gate
+    // decides from that same tariff (no tariff: free). The reservation holding
+    // fee makes the session paid only when it started from a reservation.
+    const tariffIsFree = isTariffFree(sessionTariff, { reserved });
+
+    // Snapshot the driver's payment mode so later fleet or driver changes do
+    // not rewrite history.
+    const paymentMode =
+      driverId != null && !isRoaming ? await snapshotPaymentMode(sessionId, driverId) : null;
+
+    // How the session is paid (one definition with the settlement on Ended).
+    // Free vend never reaches the gate (the Started handler skips it).
+    const mode = classifySessionPayment({
+      isRoaming,
+      freeVend: false,
+      prepaid: prepaidBalanceCents != null,
+      invoice: paymentMode === 'invoice',
+      driverId,
+      guestSession: guestStatus != null,
+    });
+
+    // Roaming: billing handled by the eMSP via the CDR. Invoice: billed
+    // afterwards through an aggregated invoice, no payment method or hold.
+    if (mode === 'roaming' || mode === 'free_vend' || mode === 'invoice') return;
+
+    const stopSession = (reason: PaymentStopReason): Promise<void> =>
+      stopSessionForPayment({ sessionId, transactionId, ocppStationId, stationDbId }, reason);
+
+    async function notifyPreAuthFailed(driver: string, reason: string): Promise<void> {
       try {
         void dispatchDriverNotification(
           sql,
           'payment.PreAuthFailed',
-          driverId,
+          driver,
           {
             stationId: ocppStationId,
             transactionId,
@@ -3868,7 +3681,7 @@ export function registerProjections(
         );
       } catch (err) {
         logger.debug(
-          { err, driverId, sessionId },
+          { err, driverId: driver, sessionId },
           'PreAuthFailed notification dispatch failed; continuing',
         );
       }
@@ -3887,376 +3700,133 @@ export function registerProjections(
       }
     }
 
-    if (driverId != null) {
-      // ---- Driver session ----
-      // Snapshot the payment mode so later fleet or driver changes do not
-      // rewrite history. Invoice drivers are billed afterwards through an
-      // aggregated invoice: no payment method, no pre-authorization.
-      const paymentMode = await snapshotPaymentMode(sessionId, driverId);
-      if (paymentMode === 'invoice') return;
-
-      const pmRows = await sql`
-          SELECT id, stripe_customer_id, stripe_payment_method_id
-          FROM driver_payment_methods
-          WHERE driver_id = ${driverId} AND is_default = true
-          LIMIT 1
-        `;
-
-      if (pmRows.length === 0) {
-        // No payment method -- allow only if tariff is free
-        const isFree = await isTariffFreeForStation(stationDbId, driverId);
-        if (isFree) return;
-        logger.warn(
-          `Driver ${driverId} has no payment method for non-free session ${transactionId}, stopping`,
-        );
-        await stopSession('MissingPaymentMethod');
-        try {
-          void dispatchDriverNotification(
-            sql,
-            'payment.MissingPaymentMethod',
-            driverId,
-            {
-              stationId: ocppStationId,
-              transactionId,
-            },
-            ALL_TEMPLATES_DIRS,
-            pubsub,
-          );
-        } catch (notifyErr) {
-          logger.error({ err: notifyErr }, 'Failed to notify driver of missing payment method');
-        }
-        try {
-          await pubsub.publish(
-            'csms_events',
-            JSON.stringify({
-              type: 'payment.missingPaymentMethod',
-              sessionId,
-              transactionId,
-            }),
-          );
-        } catch (err) {
-          logger.debug({ err, sessionId }, 'MissingPaymentMethod SSE publish failed; continuing');
-        }
-        return;
-      }
-
-      const pm = pmRows[0];
-      if (pm == null) return;
-
-      // Skip payment gate entirely if the station tariff is free
-      const isFree = await isTariffFreeForStation(stationDbId, driverId);
-      if (isFree) return;
-
-      const stripeCustomerId = pm.stripe_customer_id as string;
-
-      // Platform settings and site-level overrides are independent reads -
-      // fetch them in parallel so the pre-auth gate doesn't pay both round-trips
-      // serially on every charging start.
-      const [platformSettingsRows, siteConfigRows] = await Promise.all([
-        sql`
-          SELECT key, value FROM settings WHERE key IN ('stripe.preAuthAmountCents')
-        `,
-        siteId != null
-          ? sql`
-              SELECT id, pre_auth_amount_cents, stripe_connected_account_id
-              FROM site_payment_configs
-              WHERE site_id = ${siteId} AND is_enabled = true
-            `
-          : Promise.resolve([] as Array<Record<string, unknown>>),
-      ]);
-      const platformMap = new Map<string, unknown>();
-      for (const row of platformSettingsRows) {
-        platformMap.set(row.key as string, row.value);
-      }
-      let platformPreAuthCents =
-        (platformMap.get('stripe.preAuthAmountCents') as number | undefined) ?? 5000;
-
-      let connectedAccountId: string | null = null;
-      let siteConfigId: string | null = null;
-      const sc = siteConfigRows[0];
-      if (sc != null) {
-        platformPreAuthCents = sc.pre_auth_amount_cents as number;
-        connectedAccountId = (sc.stripe_connected_account_id as string | null) ?? null;
-        siteConfigId = sc.id as string;
-      }
-
-      // Pre-authorize in the currency the session is billed in.
-      const platformCurrency = await loadSessionCurrency(sessionId);
-
-      // Guard: skip if a payment record already exists (prevents duplicate pre-auth on race)
-      const existingPayment = await sql`
-          SELECT id FROM payment_records WHERE session_id = ${sessionId} LIMIT 1
-        `;
-      if (existingPayment.length > 0) return;
-
-      // Case 2: Simulated payment method -- bypass Stripe
-      if (isSimulatedCustomer(stripeCustomerId)) {
-        const intentId = `pi_sim_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        const failed = shouldSimulatePaymentFailure();
-
-        try {
-          if (failed) {
-            await sql`
-                INSERT INTO payment_records (
-                  session_id, driver_id,
-                  stripe_payment_intent_id, stripe_customer_id, stripe_payment_method_id,
-                  payment_source, currency, pre_auth_amount_cents, status,
-                  failure_reason
-                )
-                VALUES (
-                  ${sessionId},
-                  ${driverId},
-                  ${intentId},
-                  ${stripeCustomerId},
-                  ${pm.stripe_payment_method_id as string},
-                  'web_portal',
-                  ${platformCurrency},
-                  ${platformPreAuthCents},
-                  'failed',
-                  'Simulated pre-auth failure'
-                )
-                ON CONFLICT (session_id) DO NOTHING
-              `;
-          } else {
-            await sql`
-                INSERT INTO payment_records (
-                  session_id, driver_id,
-                  stripe_payment_intent_id, stripe_customer_id, stripe_payment_method_id,
-                  payment_source, currency, pre_auth_amount_cents, status
-                )
-                VALUES (
-                  ${sessionId},
-                  ${driverId},
-                  ${intentId},
-                  ${stripeCustomerId},
-                  ${pm.stripe_payment_method_id as string},
-                  'web_portal',
-                  ${platformCurrency},
-                  ${platformPreAuthCents},
-                  'pre_authorized'
-                )
-                ON CONFLICT (session_id) DO NOTHING
-              `;
-          }
-        } catch (dbErr) {
-          logger.error({ err: dbErr }, 'Failed to insert simulated payment record');
-          return;
-        }
-
-        if (failed) {
-          logger.warn(`Simulated pre-auth failure for session ${transactionId}`);
-          await stopSession('PaymentFailed');
-          try {
-            void dispatchDriverNotification(
-              sql,
-              'payment.PreAuthFailed',
-              driverId,
-              {
-                stationId: ocppStationId,
-                transactionId,
-                reason: 'Simulated payment failure',
-              },
-              ALL_TEMPLATES_DIRS,
-              pubsub,
-            );
-          } catch (notifyErr) {
-            logger.error(
-              { err: notifyErr },
-              'Failed to notify driver of simulated pre-auth failure',
-            );
-          }
-          try {
-            await pubsub.publish(
-              'csms_events',
-              JSON.stringify({
-                type: 'payment.preAuthFailed',
-                sessionId,
-                transactionId,
-                reason: 'Simulated payment failure',
-              }),
-            );
-          } catch (err) {
-            logger.debug(
-              { err, sessionId },
-              'Simulated pre-auth failure SSE publish failed; continuing',
-            );
-          }
-        }
-        return;
-      }
-
-      // Case 3: Real Stripe pre-auth.
-      // Stripe call and payment_records INSERT are intentionally in separate
-      // try/catch: a Stripe decline must fault the session, while a DB hiccup
-      // after a successful pre-auth must REVERSE the Stripe hold (otherwise
-      // the driver's card stays held but no internal record exists).
-      const encryptionKey = config.SETTINGS_ENCRYPTION_KEY;
-      let stripeClient: import('stripe').default | null = null;
-      let paymentIntentId: string | null = null;
-
+    async function notifyMissingPaymentMethod(driver: string): Promise<void> {
       try {
-        // Get Stripe secret key and platform fee (currency/amount already resolved above)
-        const stripeSettingsRows = await sql`
-            SELECT key, value FROM settings WHERE key IN (
-              'stripe.secretKeyEnc',
-              'stripe.platformFeePercent'
-            )
-          `;
-        const stripeMap = new Map<string, unknown>();
-        for (const row of stripeSettingsRows) {
-          stripeMap.set(row.key as string, row.value);
-        }
-        const secretKeyEnc = stripeMap.get('stripe.secretKeyEnc') as string | null;
-        if (secretKeyEnc == null) return;
-
-        const platformFeePercent = Number(stripeMap.get('stripe.platformFeePercent') ?? 0);
-
-        const { decryptString } = await import('@evtivity/lib');
-        const secretKey = decryptString(secretKeyEnc, encryptionKey);
-
-        const Stripe = (await import('stripe')).default;
-        stripeClient = new Stripe(secretKey);
-
-        const piParams: import('stripe').default.PaymentIntentCreateParams = {
-          amount: platformPreAuthCents,
-          currency: platformCurrency.toLowerCase(),
-          customer: pm.stripe_customer_id as string,
-          payment_method: pm.stripe_payment_method_id as string,
-          capture_method: 'manual',
-          confirm: true,
-          off_session: true,
-        };
-
-        if (connectedAccountId != null) {
-          piParams.on_behalf_of = connectedAccountId;
-          piParams.transfer_data = { destination: connectedAccountId };
-          if (platformFeePercent > 0) {
-            piParams.application_fee_amount = Math.round(
-              (platformPreAuthCents * platformFeePercent) / 100,
-            );
-          }
-        }
-
-        const paymentIntent = await stripeClient.paymentIntents.create(piParams, {
-          idempotencyKey: `preauth_${sessionId}`,
-        });
-        paymentIntentId = paymentIntent.id;
+        void dispatchDriverNotification(
+          sql,
+          'payment.MissingPaymentMethod',
+          driver,
+          {
+            stationId: ocppStationId,
+            transactionId,
+          },
+          ALL_TEMPLATES_DIRS,
+          pubsub,
+        );
+      } catch (notifyErr) {
+        logger.error({ err: notifyErr }, 'Failed to notify driver of missing payment method');
+      }
+      try {
+        await pubsub.publish(
+          'csms_events',
+          JSON.stringify({
+            type: 'payment.missingPaymentMethod',
+            sessionId,
+            transactionId,
+          }),
+        );
       } catch (err) {
-        logger.error({ err }, 'Auto pre-auth failed, stopping session');
-        const reason = err instanceof Error ? err.message.slice(0, 500) : 'Unknown pre-auth error';
-        try {
-          await sql`
-              INSERT INTO payment_records (
-                session_id, driver_id,
-                stripe_customer_id, stripe_payment_method_id,
-                payment_source, currency, status, failure_reason
-              )
-              VALUES (
-                ${sessionId},
-                ${driverId},
-                ${pm.stripe_customer_id as string},
-                ${pm.stripe_payment_method_id as string},
-                'web_portal',
-                ${platformCurrency},
-                'failed',
-                ${reason}
-              )
-              ON CONFLICT (session_id) DO NOTHING
-            `;
-        } catch (dbErr) {
-          logger.error({ err: dbErr }, 'Failed to record pre-auth failure');
-        }
-
-        await stopSession('PaymentFailed');
-        await notifyPreAuthFailed(reason);
-        return;
+        logger.debug({ err, sessionId }, 'MissingPaymentMethod SSE publish failed; continuing');
       }
+    }
 
-      // Stripe pre-auth succeeded -- record it. If the INSERT fails we must
-      // cancel the Stripe hold so the driver's card isn't held with no internal
-      // mirror; otherwise a retry would create a second hold under a new session.
-      // Reaching here means the try block completed without throwing, so both
-      // paymentIntentId and stripeClient are non-null (the catch block returned).
-      try {
-        await sql`
-          INSERT INTO payment_records (
-            session_id, driver_id, site_payment_config_id,
-            stripe_payment_intent_id, stripe_customer_id, stripe_payment_method_id,
-            payment_source, currency, pre_auth_amount_cents, status
-          )
-          VALUES (
-            ${sessionId},
-            ${driverId},
-            ${siteConfigId},
-            ${paymentIntentId},
-            ${pm.stripe_customer_id as string},
-            ${pm.stripe_payment_method_id as string},
-            'web_portal',
-            ${platformCurrency},
-            ${platformPreAuthCents},
-            'pre_authorized'
-          )
-          ON CONFLICT (session_id) DO NOTHING
-        `;
-      } catch (insertErr) {
-        logger.error(
-          { err: insertErr, sessionId, paymentIntentId },
-          'Failed to record successful pre-auth; reversing Stripe hold',
-        );
-        try {
-          await stripeClient.paymentIntents.cancel(paymentIntentId);
-        } catch (cancelErr) {
-          logger.error(
-            { err: cancelErr, paymentIntentId, sessionId },
-            'Failed to cancel Stripe pre-auth after DB INSERT failure; manual reconciliation required',
+    // Prepaid token (OCPP 2.1 C17): the station enforces the remaining credit
+    // (transactionLimit.maxCost) and the settlement debits the final cost when
+    // the session ends, so no card pre-authorization. A prepaid token without
+    // credit is stopped (a station started it without asking first).
+    if (mode === 'prepaid') {
+      if (prepaidBalanceCents != null && prepaidBalanceCents > 0) return;
+      logger.warn(`Prepaid token without credit started session ${transactionId}, stopping`);
+      await stopSession('PaymentFailed');
+      return;
+    }
+
+    if (mode === 'card' && driverId != null) {
+      // ---- Driver session ----
+      // A free session needs no payment method and no hold.
+      if (tariffIsFree) return;
+
+      // The hold on the driver's default card, through the provider the card
+      // is saved with (key preauth_<sessionId>, shared with the portal start:
+      // an existing record means the portal start already placed it).
+      const hold = await authorizeSessionHold(
+        { sessionId, driverId, methodRowId: null, siteId, trigger: 'projection_gate' },
+        paymentContext(logger),
+      );
+      switch (hold.outcome) {
+        case 'authorized':
+        case 'exists':
+          return;
+        case 'no_method':
+          logger.warn(
+            `Driver ${driverId} has no payment method for non-free session ${transactionId}, stopping`,
           );
-        }
-        await stopSession('PaymentFailed');
-        await notifyPreAuthFailed('Payment recording failed. Please contact support.');
+          await stopSession('MissingPaymentMethod');
+          await notifyMissingPaymentMethod(driverId);
+          return;
+        case 'not_configured':
+          // As the portal start without a provider: the session is not held.
+          logger.warn(
+            { sessionId, providerId: hold.providerId },
+            'Payment provider not configured; session not pre-authorized',
+          );
+          return;
+        case 'declined':
+          logger.error(
+            { sessionId, reason: hold.reason },
+            'Auto pre-auth failed, stopping session',
+          );
+          await stopSession('PaymentFailed');
+          await notifyPreAuthFailed(driverId, hold.reason);
+          return;
+        case 'record_failed':
+          // The service cancelled the hold it could not record.
+          await stopSession('PaymentFailed');
+          await notifyPreAuthFailed(driverId, 'Payment recording failed. Please contact support.');
+          return;
       }
-    } else {
-      // ---- Guest or anonymous session ----
-      // Token resolution already happened in the first subscriber:
-      //   driver_tokens -> ocpi_external_tokens -> guest_sessions
-      // guestStatus/guestEmail are pre-resolved from that chain.
+    }
 
+    // ---- Guest or anonymous session ----
+    // Token resolution already happened in the first subscriber:
+    //   driver_tokens -> ocpi_external_tokens -> guest_sessions
+    // guestStatus/guestEmail are pre-resolved from that chain.
+    if (mode === 'guest') {
       if (guestStatus === 'payment_authorized') {
         // Valid guest session -- pre-auth done at checkout, allow
         return;
       }
 
-      if (guestStatus != null) {
-        // Guest session exists but not authorized
-        logger.warn(
-          `No valid guest session for idToken ${String(idToken).slice(0, 8)}..., stopping session ${transactionId}`,
-        );
-        await stopSession('GuestPaymentNotAuthorized');
-        if (guestEmail != null) {
-          try {
-            void dispatchSystemNotification(
-              sql,
-              'payment.PreAuthFailed',
-              { email: guestEmail },
-              {
-                stationId: ocppStationId,
-                transactionId,
-                reason: 'Payment authorization not found',
-              },
-              ALL_TEMPLATES_DIRS,
-            );
-          } catch (notifyErr) {
-            logger.error({ err: notifyErr }, 'Failed to notify guest of session stop');
-          }
-        }
-        return;
-      }
-
-      // No driver, no roaming, no guest session -- stop unconditionally
+      // Guest session exists but not authorized
       logger.warn(
-        `Anonymous session ${transactionId} has no driver, no roaming token, and no guest session, stopping`,
+        `No valid guest session for idToken ${String(idToken).slice(0, 8)}..., stopping session ${transactionId}`,
       );
-      await stopSession('AnonymousSession');
+      await stopSession('GuestPaymentNotAuthorized');
+      if (guestEmail != null) {
+        try {
+          void dispatchSystemNotification(
+            sql,
+            'payment.PreAuthFailed',
+            { email: guestEmail },
+            {
+              stationId: ocppStationId,
+              transactionId,
+              reason: 'Payment authorization not found',
+            },
+            ALL_TEMPLATES_DIRS,
+          );
+        } catch (notifyErr) {
+          logger.error({ err: notifyErr }, 'Failed to notify guest of session stop');
+        }
+      }
+      return;
     }
+
+    // No driver, no roaming, no guest session -- stop unconditionally
+    logger.warn(
+      `Anonymous session ${transactionId} has no driver, no roaming token, and no guest session, stopping`,
+    );
+    await stopSession('AnonymousSession');
   }
 
   // Payment auto-capture on session end (separate subscriber, no race with session creation)
@@ -4266,7 +3836,7 @@ export function registerProjections(
     const transactionId = payload.transactionId as string;
 
     if (eventType === 'Ended') {
-      // Auto-capture on session end
+      // Settlement on session end
       const sessionRows = await sql`
         SELECT cs.id, cs.final_cost_cents, cs.station_id AS station_uuid,
                UPPER(cs.currency) AS currency,
@@ -4278,313 +3848,85 @@ export function registerProjections(
       const session = sessionRows[0];
       if (session == null) return;
 
-      const prRows = await sql`
-        SELECT id, stripe_payment_intent_id, driver_id, pre_auth_amount_cents
-        FROM payment_records
-        WHERE session_id = ${session.id as string} AND status = 'pre_authorized'
-        LIMIT 1
-      `;
-      if (prRows.length === 0) return;
-
-      const pr = prRows[0];
-      if (pr == null) return;
-      const paymentIntentId = pr.stripe_payment_intent_id as string | null;
-      if (paymentIntentId == null) return;
-
-      const prDriverId = pr.driver_id as string | null;
-      const finalCostCents = session.final_cost_cents as number | null;
+      // Prepaid debit, or capture/cancel of the driver's hold, through the
+      // provider the payment is pinned to. Guest holds are left to the
+      // guest-session worker. Idempotent: the record moves only from its
+      // open state, and the provider calls carry keys derived from it.
+      const outcome = await settleSessionPayment(session.id as string, paymentContext(logger));
       const sessionCurrency = session.currency as string;
+      const finalCostCents = session.final_cost_cents as number | null;
 
-      // Guest sessions: driver_id is null on the payment record.
-      // The guest-session-worker handles capture for guest sessions via finalizeGuestPayment().
-      // Skip here to avoid double-capture.
-      if (prDriverId == null) return;
-
-      // Simulated payment: bypass Stripe
-      if (isSimulatedIntent(paymentIntentId)) {
-        if (shouldSimulatePaymentFailure()) {
-          logger.warn(`Simulated capture failure for session ${transactionId}`);
-          try {
-            await sql`
-              UPDATE payment_records
-              SET status = 'failed',
-                  failure_reason = 'Simulated capture failure',
-                  updated_at = now()
-              WHERE id = ${pr.id as string}
-            `;
-          } catch (dbErr) {
-            logger.error({ err: dbErr }, 'Failed to mark simulated capture as failed');
-          }
-          try {
-            const amountFormatted = formatCurrencyAmount(finalCostCents ?? 0, sessionCurrency);
-            void dispatchDriverNotification(
-              sql,
-              'payment.CaptureFailed',
-              prDriverId,
-              {
-                stationId: event.aggregateId,
-                transactionId,
-                amountFormatted,
-                reason: 'Simulated capture failure',
-              },
-              ALL_TEMPLATES_DIRS,
-              pubsub,
-            );
-          } catch (notifyErr) {
-            logger.error(
-              { err: notifyErr },
-              'Failed to notify driver of simulated capture failure',
-            );
-          }
-          return;
-        }
-
-        // Simulated success
+      if (outcome.mode === 'prepaid') {
+        logger.info(
+          {
+            sessionId: session.id,
+            tokenId: outcome.tokenId,
+            debitedCents: outcome.debitedCents,
+          },
+          'Prepaid balance debited',
+        );
+        await notifyChange(
+          'payment.settled',
+          session.station_uuid as string,
+          (session.site_id as string | null) ?? null,
+          session.id as string,
+        );
         try {
-          if (finalCostCents != null && finalCostCents > 0) {
-            await sql`
-              UPDATE payment_records
-              SET status = 'captured',
-                  captured_amount_cents = ${finalCostCents},
-                  updated_at = now()
-              WHERE id = ${pr.id as string}
-            `;
-            // Notify driver of successful payment, in the session's currency.
-            void dispatchDriverNotification(
-              sql,
-              'session.PaymentReceived',
-              prDriverId,
-              {
-                stationId: event.aggregateId,
-                transactionId,
-                amountCents: finalCostCents,
-                currency: sessionCurrency,
-              },
-              ALL_TEMPLATES_DIRS,
-              pubsub,
-            );
-          } else {
-            await sql`
-              UPDATE payment_records
-              SET status = 'cancelled',
-                  captured_amount_cents = 0,
-                  updated_at = now()
-              WHERE id = ${pr.id as string}
-            `;
-          }
+          await pubsub.publish(
+            'csms_events',
+            JSON.stringify({ eventType: 'token.changed', tokenId: outcome.tokenId }),
+          );
         } catch (err) {
-          logger.error({ err }, 'Failed to update simulated payment record on session end');
+          logger.debug({ err }, 'token.changed SSE publish failed; continuing');
         }
         return;
       }
+      if (outcome.mode !== 'card') return;
 
-      // Real Stripe capture.
-      // Stripe operations (capture/cancel/top-up) are in their own try. The
-      // subsequent payment_records UPDATE runs in a separate try so that a DB
-      // hiccup after a successful Stripe call does NOT cause us to mark the
-      // record 'failed' and dispatch CaptureFailed to the driver -- Stripe
-      // already took the money.
-      const encryptionKey = config.SETTINGS_ENCRYPTION_KEY;
-
-      let captureAmount = 0;
-      let totalCaptured = 0;
-      let topUpFailureReason: string | null = null;
-      let topUpIntentId: string | null = null;
-      let captureSucceeded = false;
-      let cancelSucceeded = false;
-
-      try {
-        const settingsRows = await sql`
-          SELECT value FROM settings WHERE key = 'stripe.secretKeyEnc'
-        `;
-        const settingsRow = settingsRows[0];
-        const secretKeyEnc = (settingsRow?.value as string | null) ?? null;
-        if (secretKeyEnc == null) return;
-
-        const { decryptString } = await import('@evtivity/lib');
-        const secretKey = decryptString(secretKeyEnc, encryptionKey);
-        const Stripe = (await import('stripe')).default;
-        const stripe = new Stripe(secretKey);
-
-        if (finalCostCents != null && finalCostCents > 0) {
-          const preAuthAmount = (pr.pre_auth_amount_cents as number | null) ?? finalCostCents;
-          captureAmount = Math.min(finalCostCents, preAuthAmount);
-
-          // Always capture the pre-auth fully (or finalCost if smaller). When
-          // finalCost > preauth we then create a second PaymentIntent for the
-          // delta and confirm+capture it off-session. Stripe rejects
-          // amount_to_capture > original_amount, so we cannot just expand the
-          // first intent.
-          await stripe.paymentIntents.capture(
-            paymentIntentId,
-            { amount_to_capture: captureAmount },
-            { idempotencyKey: `capture_${pr.id as string}` },
-          );
-
-          totalCaptured = captureAmount;
-
-          if (finalCostCents > preAuthAmount) {
-            const deltaCents = finalCostCents - preAuthAmount;
-            try {
-              // Retrieve the original intent to learn the customer + payment
-              // method so we can charge the delta against the same card.
-              const origIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-              const customerId =
-                typeof origIntent.customer === 'string'
-                  ? origIntent.customer
-                  : origIntent.customer?.id;
-              const pmId =
-                typeof origIntent.payment_method === 'string'
-                  ? origIntent.payment_method
-                  : origIntent.payment_method?.id;
-              if (customerId == null || pmId == null) {
-                throw new Error('Original PaymentIntent missing customer or payment_method');
-              }
-
-              const topUpParams: Record<string, unknown> = {
-                amount: deltaCents,
-                currency: sessionCurrency.toLowerCase(),
-                customer: customerId,
-                payment_method: pmId,
-                confirm: true,
-                off_session: true,
-                capture_method: 'automatic',
-                description: `Top-up for session ${session.id as string}`,
-              };
-              if (origIntent.on_behalf_of != null) {
-                topUpParams['on_behalf_of'] = origIntent.on_behalf_of;
-                topUpParams['transfer_data'] = {
-                  destination:
-                    typeof origIntent.on_behalf_of === 'string'
-                      ? origIntent.on_behalf_of
-                      : origIntent.on_behalf_of.id,
-                };
-                // Carry the same platform-fee rate onto the top-up. Without
-                // this the entire delta flows to the connected account and
-                // the platform earns nothing on the overage portion.
-                if (
-                  origIntent.application_fee_amount != null &&
-                  origIntent.application_fee_amount > 0 &&
-                  origIntent.amount > 0
-                ) {
-                  const feeRate = origIntent.application_fee_amount / origIntent.amount;
-                  topUpParams['application_fee_amount'] = Math.round(deltaCents * feeRate);
-                }
-              }
-              const topUp = await stripe.paymentIntents.create(
-                topUpParams as unknown as import('stripe').default.PaymentIntentCreateParams,
-                { idempotencyKey: `topup_${pr.id as string}` },
-              );
-              topUpIntentId = topUp.id;
-              totalCaptured = preAuthAmount + deltaCents;
-            } catch (topUpErr) {
-              topUpFailureReason =
-                topUpErr instanceof Error
-                  ? `Top-up declined: ${topUpErr.message.slice(0, 350)}; shortfall ${String(deltaCents)}c`
-                  : `Top-up failed; shortfall ${String(deltaCents)}c`;
-              logger.warn(
-                { err: topUpErr, paymentRecordId: pr.id, deltaCents },
-                'Top-up PaymentIntent failed; pre-auth was captured but delta uncollected',
-              );
-            }
-          }
-
-          captureSucceeded = true;
-        } else {
-          await stripe.paymentIntents.cancel(paymentIntentId);
-          cancelSucceeded = true;
-        }
-      } catch (err) {
-        logger.error({ err }, 'Auto capture/cancel failed');
-        const captureReason =
-          err instanceof Error ? err.message.slice(0, 500) : 'Unknown capture error';
+      if (outcome.status === 'failed') {
         try {
-          await sql`
-            UPDATE payment_records
-            SET status = 'failed', failure_reason = ${captureReason}, updated_at = now()
-            WHERE id = ${pr.id as string}
-          `;
-        } catch (dbErr) {
-          logger.error({ err: dbErr }, 'Failed to record capture failure');
-        }
-
-        try {
-          const amountFormatted = formatCurrencyAmount(finalCostCents ?? 0, sessionCurrency);
           void dispatchDriverNotification(
             sql,
             'payment.CaptureFailed',
-            prDriverId,
+            outcome.driverId,
             {
               stationId: event.aggregateId,
               transactionId,
-              amountFormatted,
-              reason: captureReason.slice(0, 200),
+              amountFormatted: notificationMoney(finalCostCents ?? 0, sessionCurrency),
+              reason: outcome.reason.slice(0, 200),
             },
             ALL_TEMPLATES_DIRS,
             pubsub,
           );
         } catch (err) {
           logger.debug(
-            { err, prDriverId, transactionId },
+            { err, driverId: outcome.driverId, transactionId },
             'CaptureFailed notification dispatch failed; continuing',
           );
         }
         return;
       }
 
-      // Stripe succeeded -- record the result. If the UPDATE fails, log loudly
-      // (Stripe already took the money) and do NOT dispatch CaptureFailed.
-      if (captureSucceeded) {
-        try {
-          await sql`
-            UPDATE payment_records
-            SET status = 'captured',
-                captured_amount_cents = ${totalCaptured},
-                failure_reason = ${topUpFailureReason},
-                metadata = CASE
-                  WHEN ${topUpIntentId}::text IS NULL THEN metadata
-                  ELSE jsonb_set(COALESCE(metadata, '{}'::jsonb), '{topUpIntentId}', to_jsonb(${topUpIntentId}::text))
-                END,
-                updated_at = now()
-            WHERE id = ${pr.id as string}
-          `;
-        } catch (dbErr) {
-          logger.error(
-            { err: dbErr, paymentRecordId: pr.id, paymentIntentId, totalCaptured },
-            'Stripe capture succeeded but payment_records UPDATE failed; manual reconciliation required',
-          );
-          return;
-        }
-
+      // Notify on capture only when it was recorded (a capture whose record
+      // update failed is logged for manual reconciliation instead).
+      if (outcome.status === 'captured' && outcome.recorded) {
         const stationUuid = session.station_uuid as string | null;
         const captureSiteName = stationUuid != null ? await resolveSiteName(stationUuid) : null;
         void dispatchDriverNotification(
           sql,
           'session.PaymentReceived',
-          prDriverId,
+          outcome.driverId,
           {
             siteName: captureSiteName ?? '',
             stationId: session.station_ocpp_id as string,
             transactionId,
-            amountCents: totalCaptured,
+            amountCents: outcome.capturedCents,
+            amountFormatted: notificationMoney(outcome.capturedCents, sessionCurrency),
             currency: sessionCurrency,
           },
           ALL_TEMPLATES_DIRS,
           pubsub,
         );
-      } else if (cancelSucceeded) {
-        try {
-          await sql`
-            UPDATE payment_records
-            SET status = 'cancelled', captured_amount_cents = 0, updated_at = now()
-            WHERE id = ${pr.id as string}
-          `;
-        } catch (dbErr) {
-          logger.error(
-            { err: dbErr, paymentRecordId: pr.id, paymentIntentId },
-            'Stripe cancel succeeded but payment_records UPDATE failed; manual reconciliation required',
-          );
-        }
       }
     }
   });
@@ -4619,18 +3961,28 @@ export function registerProjections(
       return;
     }
 
-    // Any inbound message proves liveness (OCPP 2.1 G02.FR.04, OCPP 1.6 §4.6).
-    // Bump last_heartbeat so the UI's freshness signal tracks reality rather
-    // than only counting actual Heartbeat OCPP messages.
+    // Any inbound message proves liveness (OCPP 2.1 G02.FR.04, OCPP 1.6 §4.6), so it
+    // bumps last_heartbeat and marks online a station a late disconnect marked offline.
+    let cameOnline = false;
     if (direction === 'inbound') {
-      await sql`
+      const [row] = await sql`
+        WITH prev AS (SELECT is_online FROM charging_stations WHERE id = ${stationUuid})
         UPDATE charging_stations
-        SET last_heartbeat = now()
+        SET last_heartbeat = now(), is_online = true
         WHERE id = ${stationUuid}
+        RETURNING (SELECT is_online FROM prev) AS was_online
       `;
+      cameOnline = row?.was_online === false;
     }
 
     const siteId = await resolveSiteId(stationUuid);
+    if (cameOnline) {
+      logger.info({ stationId }, 'Station marked online again by an inbound message');
+      await notifyChange('station.status', stationUuid, siteId);
+      if (siteId != null) {
+        await notifyOcpiPush('location', { siteId });
+      }
+    }
     await notifyChange('ocpp.message', stationUuid, siteId);
   });
 
@@ -4935,12 +4287,18 @@ export function registerProjections(
             ? String(attr.value)
             : null;
 
-        await sql`
-          INSERT INTO station_configurations (station_id, component, instance, evse_id, connector_id, variable, variable_instance, value, attribute_type, source)
-          VALUES (${stationUuid}, ${componentName}, ${componentInstance}, ${evseId}, ${connectorId}, ${variableName}, ${variableInstance}, ${value}, ${attrType}, 'NotifyReport')
-          ON CONFLICT (station_id, component, variable, (COALESCE(evse_id, -1)), (COALESCE(connector_id, -1)), attribute_type)
-          DO UPDATE SET value = EXCLUDED.value, source = 'NotifyReport', updated_at = now()
-        `;
+        await upsertStationConfiguration(sql, {
+          stationUuid,
+          component: componentName,
+          componentInstance,
+          evseId,
+          connectorId,
+          variable: variableName,
+          variableInstance,
+          value,
+          attributeType: attrType,
+          source: 'NotifyReport',
+        });
 
         // Spec-defined path for learning a connector's plug shape: the
         // Connector component reports a ConnectorType variable. OCPP 2.1
@@ -5155,12 +4513,18 @@ export function registerProjections(
           ? String(result.attributeValue)
           : null;
 
-      await sql`
-        INSERT INTO station_configurations (station_id, component, instance, evse_id, connector_id, variable, variable_instance, value, attribute_type, source)
-        VALUES (${stationUuid}, ${componentName}, ${componentInstance}, ${evseId}, ${connectorId}, ${variableName}, ${variableInstance}, ${value}, ${attrType}, 'GetVariables')
-        ON CONFLICT (station_id, component, variable, (COALESCE(evse_id, -1)), (COALESCE(connector_id, -1)), attribute_type)
-        DO UPDATE SET value = EXCLUDED.value, source = 'GetVariables', updated_at = now()
-      `;
+      await upsertStationConfiguration(sql, {
+        stationUuid,
+        component: componentName,
+        componentInstance,
+        evseId,
+        connectorId,
+        variable: variableName,
+        variableInstance,
+        value,
+        attributeType: attrType,
+        source: 'GetVariables',
+      });
     }
   });
 
@@ -5182,12 +4546,18 @@ export function registerProjections(
           : null;
       if (key === '') continue;
 
-      await sql`
-        INSERT INTO station_configurations (station_id, component, variable, value, attribute_type, source)
-        VALUES (${stationUuid}, 'OCPP', ${key}, ${value}, 'Actual', 'GetConfiguration')
-        ON CONFLICT (station_id, component, variable, (COALESCE(evse_id, -1)), (COALESCE(connector_id, -1)), attribute_type)
-        DO UPDATE SET value = EXCLUDED.value, source = 'GetConfiguration', updated_at = now()
-      `;
+      await upsertStationConfiguration(sql, {
+        stationUuid,
+        component: 'OCPP',
+        componentInstance: null,
+        evseId: null,
+        connectorId: null,
+        variable: key,
+        variableInstance: null,
+        value,
+        attributeType: 'Actual',
+        source: 'GetConfiguration',
+      });
     }
   });
 
@@ -5455,20 +4825,6 @@ export function registerProjections(
     `;
   });
 
-  safeSubscribe('ocpp.NotifyQRCodeScanned', async (event: DomainEvent) => {
-    const stationUuid = await resolveStationUuid(event.aggregateId);
-    if (stationUuid == null) return;
-
-    const payload = event.payload;
-    const evseId = (payload.evseId as number | undefined) ?? null;
-    const timeout = (payload.timeout as number | undefined) ?? null;
-
-    await sql`
-      INSERT INTO qr_scan_events (station_id, evse_id, timeout)
-      VALUES (${stationUuid}, ${evseId}, ${timeout})
-    `;
-  });
-
   safeSubscribe('ocpp.VatNumberValidation', async (event: DomainEvent) => {
     const stationUuid = await resolveStationUuid(event.aggregateId);
     if (stationUuid == null) return;
@@ -5480,20 +4836,6 @@ export function registerProjections(
     await sql`
       INSERT INTO vat_number_validations (station_id, vat_number, evse_id)
       VALUES (${stationUuid}, ${vatNumber}, ${evseId})
-    `;
-  });
-
-  safeSubscribe('ocpp.NotifyWebPaymentStarted', async (event: DomainEvent) => {
-    const stationUuid = await resolveStationUuid(event.aggregateId);
-    if (stationUuid == null) return;
-
-    const payload = event.payload;
-    const evseId = (payload.evseId as number | undefined) ?? null;
-    const timeout = (payload.timeout as number | undefined) ?? null;
-
-    await sql`
-      INSERT INTO web_payment_events (station_id, evse_id, timeout)
-      VALUES (${stationUuid}, ${evseId}, ${timeout})
     `;
   });
 
@@ -5519,10 +4861,14 @@ export function registerProjections(
     const controlType = (payload.controlType as string | undefined) ?? null;
     const ts = (payload.timestamp as string | undefined) ?? null;
     const gridEventFault = payload.gridEventFault ?? null;
+    // gridEventFault is a string enum, and the jsonb serializer sends a string as
+    // JSON text unchanged, so it is encoded first.
+    const gridEventFaultJson =
+      gridEventFault != null ? sql.json(asJson(JSON.stringify(gridEventFault))) : null;
 
     await sql`
       INSERT INTO der_alarm_events (station_id, control_type, timestamp, grid_event_fault)
-      VALUES (${stationUuid}, ${controlType}, ${ts}, ${gridEventFault != null ? sql.json(asJson(gridEventFault)) : null})
+      VALUES (${stationUuid}, ${controlType}, ${ts}, ${gridEventFaultJson})
     `;
   });
 
@@ -5547,13 +4893,13 @@ export function registerProjections(
 
     const payload = event.payload;
     const requestId = (payload.requestId as number | undefined) ?? null;
-    const seqNo = (payload.seqNo as number | undefined) ?? null;
     const tbc = (payload.tbc as boolean | undefined) ?? false;
     const derControl = payload.derControl ?? null;
 
+    // ReportDERControlRequest has no seqNo (2.1 schema), so seq_no stays null.
     await sql`
-      INSERT INTO der_control_reports (station_id, request_id, seq_no, tbc, der_control)
-      VALUES (${stationUuid}, ${requestId}, ${seqNo}, ${tbc}, ${derControl != null ? sql.json(asJson(derControl)) : null})
+      INSERT INTO der_control_reports (station_id, request_id, tbc, der_control)
+      VALUES (${stationUuid}, ${requestId}, ${tbc}, ${derControl != null ? sql.json(asJson(derControl)) : null})
     `;
   });
 }

@@ -5,10 +5,12 @@ import { type ClassValue, clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import {
   formatCurrencyAmount,
+  formatFlatPrice as formatLocaleFlatPrice,
   formatUnitPrice as formatLocaleUnitPrice,
 } from '@evtivity/lib/currency';
 import { formatNumber as formatLocaleNumber } from '@evtivity/lib/number';
 import { formatDateTime } from '@evtivity/lib/timezone';
+import { formatTaxRatePercent } from '@evtivity/lib/price-display';
 import i18next from 'i18next';
 
 export function cn(...inputs: ClassValue[]): string {
@@ -42,9 +44,14 @@ export function formatUnitPrice(amount: number, currency: string): string {
   return formatLocaleUnitPrice(amount, currency, uiLocale());
 }
 
-/** Format a tax rate (0.19) as a percentage number without trailing zeros (19). */
+/** Format a flat amount in major units (a session fee) as money, rounded to the cent. */
+export function formatFlatPrice(amount: number, currency: string): string {
+  return formatLocaleFlatPrice(amount, currency, uiLocale());
+}
+
+/** Format a tax rate (0.19) as a percentage number in the UI language without trailing zeros (19). */
 export function formatTaxPercent(taxRate: number): string {
-  return new Intl.NumberFormat(uiLocale(), { maximumFractionDigits: 2 }).format(taxRate * 100);
+  return formatTaxRatePercent(taxRate, uiLocale());
 }
 
 export function formatEnergy(wh: string | number | null | undefined): string {

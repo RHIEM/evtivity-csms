@@ -149,7 +149,9 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
           {editing ? (
             <form onSubmit={handleSave} noValidate className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-name">{t('common.name')}</Label>
+                <Label htmlFor="edit-name" className="leading-6">
+                  {t('common.name')}
+                </Label>
                 <Input
                   id="edit-name"
                   value={name}
@@ -163,7 +165,9 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-desc">{t('common.description')}</Label>
+                <Label htmlFor="edit-desc" className="leading-6">
+                  {t('common.description')}
+                </Label>
                 <textarea
                   id="edit-desc"
                   value={description}

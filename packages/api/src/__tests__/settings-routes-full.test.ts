@@ -53,7 +53,10 @@ function makeChain() {
 
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('USD')),
+  getCompanyTaxBasis: vi.fn(() => Promise.resolve('net')),
+  getCompanyPriceDisplay: vi.fn(() => Promise.resolve('net')),
   clearSystemSettingsCache: vi.fn(),
+  clearStationMessageSettingsCache: vi.fn(),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -113,6 +116,11 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
     SUPPORTED_CURRENCIES: actual.SUPPORTED_CURRENCIES,
     isPriceDisplay: actual.isPriceDisplay,
     PRICE_DISPLAYS: actual.PRICE_DISPLAYS,
+    isStationMessageLanguage: actual.isStationMessageLanguage,
+    STATION_MESSAGE_LANGUAGES: actual.STATION_MESSAGE_LANGUAGES,
+    isTaxBasis: actual.isTaxBasis,
+    TAX_BASES: actual.TAX_BASES,
+    UI_LANGUAGES: actual.UI_LANGUAGES,
   };
 });
 
@@ -154,8 +162,14 @@ vi.mock('../middleware/rbac.js', () => ({
     },
 }));
 
+vi.mock('../lib/payments.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/payments.js')>()),
+  clearPaymentCaches: vi.fn(),
+}));
+
 import { registerAuth } from '../plugins/auth.js';
 import { settingsRoutes } from '../routes/settings.js';
+import { clearPaymentCaches } from '../lib/payments.js';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -187,6 +201,56 @@ describe('Settings routes - full coverage', () => {
   });
 
   // ----------------------------------------------------------------
+  // GET /v1/portal/content/:type (public legal content)
+  // ----------------------------------------------------------------
+  describe('GET /v1/portal/content/:type', () => {
+    it('returns stored content for a Korean request', async () => {
+      setupDbResults([{ key: 'content.privacyPolicy.ko', value: '<h1>Custom KO</h1>' }]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=ko',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toBe('<h1>Custom KO</h1>');
+    });
+
+    it('falls back to the Korean default when nothing is stored', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/terms-of-service?lang=ko',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>서비스 이용약관</h1>');
+    });
+
+    it('falls back to the Traditional Chinese default for zh-TW', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=zh-TW',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>隱私權政策</h1>');
+    });
+
+    it('defaults to English without a lang parameter', async () => {
+      setupDbResults([]);
+      const res = await app.inject({ method: 'GET', url: '/portal/content/privacy-policy' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>Privacy Policy</h1>');
+    });
+
+    it('rejects an unsupported language', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=fr',
+      });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  // ----------------------------------------------------------------
   // GET /v1/portal/branding (public, no auth required)
   // ----------------------------------------------------------------
   describe('GET /v1/portal/branding', () => {
@@ -202,11 +266,11 @@ describe('Settings routes - full coverage', () => {
       expect(body.logo).toBe('https://example.com/logo.png');
     });
 
-    it('returns only the default company currency when no company settings exist', async () => {
+    it('returns only the default currency, price display, and tax basis when no company settings exist', async () => {
       setupDbResults([]);
       const res = await app.inject({ method: 'GET', url: '/portal/branding' });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ currency: 'USD' });
+      expect(res.json()).toEqual({ currency: 'USD', priceDisplay: 'net', taxBasis: 'net' });
     });
 
     it('converts non-string values to empty string', async () => {
@@ -386,6 +450,31 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.key).toBe('new.key');
+      expect(clearPaymentCaches).not.toHaveBeenCalled();
+    });
+
+    it('clears the payment caches after writing a payment setting', async () => {
+      setupDbResults([], [{ key: 'payments.provider', value: 'adyen' }]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/payments.provider',
+        headers: { authorization: `Bearer ${operatorToken}` },
+        payload: { value: 'adyen' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not clear the payment caches when the write fails', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/stripe.publishableKey',
+        headers: { authorization: `Bearer ${operatorToken}` },
+        payload: { value: 'pk_test_1' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(clearPaymentCaches).not.toHaveBeenCalled();
     });
 
     it('throws when insert returns no rows', async () => {
@@ -422,6 +511,17 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.key).toBe('old.key');
+    });
+
+    it('clears the payment caches after deleting a payment setting', async () => {
+      setupDbResults([{ key: 'simulated.resultMode', value: 'approve' }]);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: '/settings/simulated.resultMode',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
     });
 
     it('returns 404 when deleting a nonexistent setting', async () => {

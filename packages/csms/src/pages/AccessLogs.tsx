@@ -303,7 +303,7 @@ function ApiLogTab(): React.JSX.Element {
   const filters = (
     <>
       <div className="space-y-2">
-        <Label>{t('logs.method')}</Label>
+        <Label className="leading-6">{t('logs.method')}</Label>
         <Select
           aria-label={t('logs.method')}
           className="h-10"
@@ -322,7 +322,7 @@ function ApiLogTab(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('logs.status')}</Label>
+        <Label className="leading-6">{t('logs.status')}</Label>
         <Select
           aria-label={t('logs.status')}
           className="h-10"
@@ -361,7 +361,7 @@ function ApiLogTab(): React.JSX.Element {
           <div className="hidden items-end gap-4 md:flex">
             <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <Label>{t('logs.search')}</Label>
+                <Label className="leading-6">{t('logs.search')}</Label>
                 {searchInput}
               </div>
               {filters}
@@ -490,7 +490,7 @@ function WorkerLogTab(): React.JSX.Element {
   const filters = (
     <>
       <div className="space-y-2">
-        <Label>{t('logs.queue')}</Label>
+        <Label className="leading-6">{t('logs.queue')}</Label>
         <Select
           aria-label={t('logs.queue')}
           className="h-10"
@@ -507,7 +507,7 @@ function WorkerLogTab(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('logs.status')}</Label>
+        <Label className="leading-6">{t('logs.status')}</Label>
         <Select
           aria-label={t('logs.status')}
           className="h-10"
@@ -548,7 +548,7 @@ function WorkerLogTab(): React.JSX.Element {
           <div className="hidden items-end gap-4 md:flex">
             <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <Label>{t('logs.search')}</Label>
+                <Label className="leading-6">{t('logs.search')}</Label>
                 {searchInput}
               </div>
               {filters}

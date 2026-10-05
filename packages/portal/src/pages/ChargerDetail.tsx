@@ -563,7 +563,9 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
       )}
 
       {/* Pricing */}
-      {pricing != null && <PricingDisplay pricing={pricing} priceDisplay={priceDisplay} />}
+      {pricing != null && priceDisplay != null && (
+        <PricingDisplay pricing={pricing} priceDisplay={priceDisplay} />
+      )}
 
       {/* EVSE selection instruction */}
       {station.evses.length > 0 && !hasActiveSession && (

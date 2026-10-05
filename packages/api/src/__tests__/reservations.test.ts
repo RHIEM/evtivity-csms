@@ -141,10 +141,15 @@ vi.mock('../lib/site-access.js', () => ({
   invalidateSiteAccessCache: vi.fn(),
 }));
 
-const mockChargeReservationCancellationFee = vi.fn().mockResolvedValue(undefined);
-vi.mock('../lib/reservation-fees.js', () => ({
-  chargeReservationCancellationFee: (...args: unknown[]) =>
-    mockChargeReservationCancellationFee(...args),
+const mockChargeReservationCancellationFee = vi
+  .fn()
+  .mockResolvedValue({ status: 'skipped', reason: 'no_payment_method' });
+vi.mock('@evtivity/payments', () => ({
+  chargeReservationFee: (...args: unknown[]) => mockChargeReservationCancellationFee(...args),
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  paymentContext: vi.fn((logger: unknown) => ({ registry: 'registry', logger })),
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => {
@@ -232,7 +237,10 @@ describe('Reservation routes', () => {
     mockSubscribe.mockClear();
     mockUnsubscribe.mockClear();
     mockChargeReservationCancellationFee.mockClear();
-    mockChargeReservationCancellationFee.mockResolvedValue(undefined);
+    mockChargeReservationCancellationFee.mockResolvedValue({
+      status: 'skipped',
+      reason: 'no_payment_method',
+    });
     vi.mocked(getReservationSettings).mockResolvedValue({
       enabled: true,
       bufferMinutes: 0,
@@ -1135,11 +1143,17 @@ describe('Reservation routes', () => {
           payload: { chargeCancellationFee: true },
         });
         expect(res.statusCode).toBe(200);
+        // The fee setting is net; chargeReservationFee adds the tariff tax.
+        // (stationId comes from the conditional UPDATE, covered in reservation-cancel.test.ts.)
         expect(mockChargeReservationCancellationFee).toHaveBeenCalledWith(
-          VALID_DRIVER_ID,
-          null,
-          500,
-          VALID_RESERVATION_ID,
+          expect.objectContaining({
+            type: 'reservation_cancellation',
+            reservationId: VALID_RESERVATION_ID,
+            driverId: VALID_DRIVER_ID,
+            siteId: null,
+            netCents: 500,
+          }),
+          expect.objectContaining({ registry: 'registry' }),
         );
       });
 
@@ -1266,7 +1280,7 @@ describe('Reservation routes', () => {
         expect(mockChargeReservationCancellationFee).not.toHaveBeenCalled();
       });
 
-      it('proceeds with cancellation even if Stripe charge fails', async () => {
+      it('proceeds with cancellation even if the fee charge fails', async () => {
         const startsAt = new Date(Date.now() + 30 * 60 * 1000);
         setupDbResults(
           [
@@ -1281,7 +1295,7 @@ describe('Reservation routes', () => {
             },
           ],
           // Helper conditional UPDATE+RETURNING wins the race; the post-charge
-          // UPDATE is skipped because Stripe throws.
+          // UPDATE is skipped because the fee charge throws.
           [{ id: VALID_RESERVATION_ID }],
         );
         vi.mocked(getReservationSettings).mockResolvedValue({
@@ -1292,9 +1306,7 @@ describe('Reservation routes', () => {
           maxHours: 0,
           activeSessionCheckHours: 3,
         });
-        mockChargeReservationCancellationFee.mockRejectedValueOnce(
-          new Error('Stripe card declined'),
-        );
+        mockChargeReservationCancellationFee.mockRejectedValueOnce(new Error('card declined'));
 
         triggerCancelAccepted();
 

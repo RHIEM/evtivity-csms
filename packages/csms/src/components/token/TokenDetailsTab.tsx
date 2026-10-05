@@ -11,6 +11,7 @@ import { RemoveButton } from '@/components/remove-button';
 import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
@@ -19,6 +20,9 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { DriverCombobox } from '@/components/driver-combobox';
 import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
+import { formatCents } from '@/lib/formatting';
+import { useCompanyCurrency } from '@/hooks/use-company-currency';
+import { centsToMajorInput } from '@evtivity/lib/currency';
 
 const TOKEN_TYPES = [
   'DirectPayment',
@@ -37,6 +41,7 @@ interface TokenData {
   idToken: string;
   tokenType: string;
   isActive: boolean;
+  prepaidBalanceCents: number | null;
   createdAt: string;
   updatedAt: string;
   driverFirstName: string | null;
@@ -53,11 +58,14 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
   const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { currency } = useCompanyCurrency();
 
   const [editing, setEditing] = useState(false);
   const [idToken, setIdToken] = useState('');
   const [tokenType, setTokenType] = useState('');
   const [isActive, setIsActive] = useState(true);
+  const [isPrepaid, setIsPrepaid] = useState(false);
+  const [prepaidBalance, setPrepaidBalance] = useState('');
   const [selectedDriver, setSelectedDriver] = useState<{ id: string; name: string } | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
@@ -68,6 +76,7 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
       tokenType?: string;
       driverId?: string | null;
       isActive?: boolean;
+      prepaidBalanceCents?: number | null;
     }) => api.patch<TokenData>(`/v1/tokens/${token.id}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['tokens', token.id] });
@@ -89,6 +98,10 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
     setIdToken(token.idToken);
     setTokenType(token.tokenType);
     setIsActive(token.isActive);
+    setIsPrepaid(token.prepaidBalanceCents != null);
+    setPrepaidBalance(
+      token.prepaidBalanceCents != null ? centsToMajorInput(token.prepaidBalanceCents) : '',
+    );
     setSelectedDriver(
       token.driverId && token.driverFirstName
         ? {
@@ -105,6 +118,13 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
     if (idToken.trim() === '') {
       errors.idToken = t('validation.required');
     }
+    if (isPrepaid) {
+      if (prepaidBalance.trim() === '') {
+        errors.prepaidBalance = t('validation.required');
+      } else if (!Number.isFinite(Number(prepaidBalance))) {
+        errors.prepaidBalance = t('validation.invalidNumber');
+      }
+    }
     return errors;
   }
 
@@ -119,6 +139,7 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
       tokenType,
       driverId: selectedDriver?.id ?? null,
       isActive,
+      prepaidBalanceCents: isPrepaid ? Math.round(Number(prepaidBalance) * 100) : null,
     });
   }
 
@@ -145,7 +166,9 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
           {editing ? (
             <form onSubmit={handleSave} noValidate className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-idToken">{t('tokens.tokenValue')}</Label>
+                <Label htmlFor="edit-idToken" className="leading-6">
+                  {t('tokens.tokenValue')}
+                </Label>
                 <Input
                   id="edit-idToken"
                   value={idToken}
@@ -159,7 +182,9 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-tokenType">{t('tokens.tokenType')}</Label>
+                <Label htmlFor="edit-tokenType" className="leading-6">
+                  {t('tokens.tokenType')}
+                </Label>
                 <Select
                   id="edit-tokenType"
                   value={tokenType}
@@ -175,7 +200,7 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label>{t('tokens.driver')}</Label>
+                <Label className="leading-6">{t('tokens.driver')}</Label>
                 <DriverCombobox value={selectedDriver} onSelect={setSelectedDriver} />
               </div>
               <div className="flex items-center gap-2">
@@ -190,6 +215,42 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
                 />
                 <Label htmlFor="edit-active">{t('common.active')}</Label>
               </div>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <input
+                    id="edit-prepaid"
+                    type="checkbox"
+                    checked={isPrepaid}
+                    onChange={(e) => {
+                      setIsPrepaid(e.target.checked);
+                    }}
+                    className="h-4 w-4 rounded border-input"
+                  />
+                  <Label htmlFor="edit-prepaid">{t('tokens.prepaid')}</Label>
+                </div>
+                <p className="text-sm text-muted-foreground">{t('tokens.prepaidHint')}</p>
+              </div>
+              {isPrepaid && (
+                <div className="space-y-2">
+                  <Label htmlFor="edit-prepaidBalance" className="leading-6">
+                    {t('tokens.prepaidBalance')}
+                    {currency != null ? ` (${currency})` : ''}
+                  </Label>
+                  <DecimalInput
+                    id="edit-prepaidBalance"
+                    value={prepaidBalance}
+                    onChange={setPrepaidBalance}
+                    allowNegative
+                    decimalScale={2}
+                    className={
+                      hasSubmitted && validationErrors.prepaidBalance ? 'border-destructive' : ''
+                    }
+                  />
+                  {hasSubmitted && validationErrors.prepaidBalance && (
+                    <p className="text-sm text-destructive">{validationErrors.prepaidBalance}</p>
+                  )}
+                </div>
+              )}
               <div className="flex justify-end gap-2">
                 <CancelButton
                   onClick={() => {
@@ -228,6 +289,19 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
                   <Badge variant={token.isActive ? 'default' : 'outline'}>
                     {token.isActive ? t('common.active') : t('common.inactive')}
                   </Badge>
+                </dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('tokens.prepaidBalance')}</dt>
+                <dd className="font-medium">
+                  {token.prepaidBalanceCents == null ? (
+                    <span className="text-muted-foreground">{t('tokens.notPrepaid')}</span>
+                  ) : currency != null ? (
+                    formatCents(token.prepaidBalanceCents, currency)
+                  ) : (
+                    // Never an amount without its currency.
+                    <span className="text-muted-foreground">{t('common.loading')}</span>
+                  )}
                 </dd>
               </div>
               <div>

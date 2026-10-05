@@ -5,8 +5,13 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { Plus, Minus, Clock } from 'lucide-react';
-import { priceForDisplay, type PriceDisplay } from '@evtivity/lib/price-display';
-import { formatTaxPercent, formatUnitPrice } from '@/lib/utils';
+import {
+  priceForDisplay,
+  resolveTaxBasis,
+  type PriceDisplay,
+  type TaxBasis,
+} from '@evtivity/lib/price-display';
+import { formatFlatPrice, formatTaxPercent, formatUnitPrice } from '@/lib/utils';
 
 export interface TariffRestrictionsLite {
   timeRange?: { startTime: string; endTime: string };
@@ -23,6 +28,8 @@ export interface PricingInfo {
   pricePerSession: string | null;
   idleFeePricePerMinute: string | null;
   taxRate: string | null;
+  /** How the prices are entered: excluding ('net') or including ('gross') tax. */
+  taxBasis?: TaxBasis;
   isFreeVend?: boolean;
   restrictions?: TariffRestrictionsLite | null;
 }
@@ -60,8 +67,9 @@ function formatRestrictions(
   return parts.length > 0 ? parts.join(' ') : null;
 }
 
-// Tariff prices are net. With priceDisplay 'gross' every price is shown with
-// the tax rate added; the note below the price says which one it is.
+// Tariff prices are entered in the company tax basis (net by default). Every
+// price is shown as the driver's price display asks, with the tax rate added
+// or taken out; the note below the price says which one it is.
 export function PricingDisplay({
   pricing,
   priceDisplay,
@@ -76,8 +84,12 @@ export function PricingDisplay({
   const perSession = pricing.pricePerSession != null ? Number(pricing.pricePerSession) : 0;
   const idleFee = pricing.idleFeePricePerMinute != null ? Number(pricing.idleFeePricePerMinute) : 0;
   const taxRate = pricing.taxRate != null ? Number(pricing.taxRate) : 0;
+  const displayed = (price: number): number =>
+    priceForDisplay(price, taxRate, priceDisplay, resolveTaxBasis(pricing.taxBasis));
   const formatPrice = (price: number): string =>
-    formatUnitPrice(priceForDisplay(price, taxRate, priceDisplay), pricing.currency);
+    formatUnitPrice(displayed(price), pricing.currency);
+  // A session fee is a flat amount, shown rounded to the cent as it is billed.
+  const formatFee = (price: number): string => formatFlatPrice(displayed(price), pricing.currency);
   const restrictionLabel = formatRestrictions(pricing.restrictions, t);
 
   if (pricing.isFreeVend === true) {
@@ -100,12 +112,12 @@ export function PricingDisplay({
       ? `${formatPrice(perKwh)}/${t('charger.unitKwh')}`
       : perMin > 0
         ? `${formatPrice(perMin)}/${t('charger.unitMin')}`
-        : formatPrice(perSession);
+        : formatFee(perSession);
 
   const breakdownLines: string[] = [];
   if (perKwh > 0) breakdownLines.push(`${formatPrice(perKwh)} ${t('charger.perKwh')}`);
   if (perMin > 0) breakdownLines.push(`${formatPrice(perMin)} ${t('charger.perMin')}`);
-  if (perSession > 0) breakdownLines.push(`${formatPrice(perSession)} ${t('charger.sessionFee')}`);
+  if (perSession > 0) breakdownLines.push(`${formatFee(perSession)} ${t('charger.sessionFee')}`);
   if (idleFee > 0) breakdownLines.push(`${formatPrice(idleFee)} ${t('charger.idleFee')}`);
 
   const taxNote =

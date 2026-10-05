@@ -4,7 +4,6 @@
 import { useState, useCallback, useEffect, useImperativeHandle, useRef, forwardRef } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
-import Link from '@tiptap/extension-link';
 import TextAlign from '@tiptap/extension-text-align';
 import Color from '@tiptap/extension-color';
 import { TextStyle } from '@tiptap/extension-text-style';
@@ -144,8 +143,8 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
 
     const editor = useEditor({
       extensions: [
-        StarterKit,
-        Link.configure({ openOnClick: false }),
+        // StarterKit includes the Link extension; configure it here instead of adding it twice.
+        StarterKit.configure({ link: { openOnClick: false } }),
         TextAlign.configure({ types: ['heading', 'paragraph'] }),
         Color,
         TextStyle,
@@ -436,7 +435,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
         {showSource ? (
           <textarea
             ref={sourceRef}
-            className="w-full min-h-[200px] p-3 font-mono text-sm bg-background resize-y focus:outline-none"
+            className="w-full min-h-[200px] p-3 font-mono text-sm bg-background resize-y focus:outline-hidden"
             value={sourceValue}
             onChange={(e) => {
               setSourceValue(e.target.value);

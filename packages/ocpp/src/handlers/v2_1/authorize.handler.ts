@@ -1,21 +1,30 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, sql } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import {
   db,
+  client,
   driverTokens,
   ocpiExternalTokens,
   chargingSessions,
   isRoamingEnabled,
   isSiteFreeVendEnabledByStation,
   getCompanyCurrency,
+  getCompanyTaxBasis,
+  resolveStationTariff,
 } from '@evtivity/database';
 import type { HandlerContext } from '../../server/middleware/pipeline.js';
 import type { AuthorizeRequest } from '../../generated/v2_1/types/messages/AuthorizeRequest.js';
 import type { AuthorizeResponse } from '../../generated/v2_1/types/messages/AuthorizeResponse.js';
-import type { Logger } from '@evtivity/lib';
+import { netUnitPrice, vatPercentFromFraction, type Logger } from '@evtivity/lib';
 import { logAuthorizeAttempt, parseOcpiValidThru } from '../authorize-log.js';
+import {
+  applyContractCertificateVerdict,
+  validateContractCertificate,
+  type ContractCertificateVerdict,
+} from '../../services/pki/contract-certificate-validation.js';
+import { prepaidCredit, rememberPrepaidAuthorization } from '../prepaid.js';
 
 // Tokens of these types may be generated on the fly (portal remote start) and
 // are accepted when not present in driver_tokens. Inactive matches still block.
@@ -23,9 +32,10 @@ const ACCEPT_WHEN_NOT_FOUND = new Set(['Central', 'Local', 'NoAuthorization']);
 
 // Token types accepted unconditionally without DB lookup.
 // MasterPass: stop-any-transaction admin token (OCPP 2.1 spec).
-// eMAID: ISO 15118 contract certificate identifier validated externally.
 // DirectPayment: payment terminal handles authorization.
-const ACCEPT_WITHOUT_LOOKUP = new Set(['MasterPass', 'eMAID', 'DirectPayment']);
+// An eMAID is looked up like any other token: C07 checks both the contract
+// certificate (below) and the eMAID itself (C07.FR.13).
+const ACCEPT_WITHOUT_LOOKUP = new Set(['MasterPass', 'DirectPayment']);
 
 export async function handleAuthorize(ctx: HandlerContext): Promise<Record<string, unknown>> {
   const request = ctx.payload as unknown as AuthorizeRequest;
@@ -87,6 +97,7 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
     | 'invalid'
     | 'blocked'
     | 'expired'
+    | 'no_credit'
     | 'concurrent_tx'
     | 'unknown'
     | 'db_error' = 'accepted';
@@ -97,6 +108,7 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
   let groupIdToken: AuthorizeResponse['idTokenInfo']['groupIdToken'] | undefined;
   let certificateStatus: AuthorizeResponse['certificateStatus'] | undefined;
   let matchedExpiresAt: Date | null = null;
+  let matchedPrepaidBalanceCents: number | null = null;
 
   if (ACCEPT_WITHOUT_LOOKUP.has(tokenType)) {
     ctx.logger.info(
@@ -114,6 +126,7 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
           isActive: driverTokens.isActive,
           expiresAt: driverTokens.expiresAt,
           revokedAt: driverTokens.revokedAt,
+          prepaidBalanceCents: driverTokens.prepaidBalanceCents,
         })
         .from(driverTokens)
         .where(and(eq(driverTokens.idToken, idToken), eq(driverTokens.tokenType, tokenType)));
@@ -196,6 +209,7 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
           matchedTokenId = token.id;
           matchedDriverId = token.driverId;
           matchedExpiresAt = token.expiresAt;
+          matchedPrepaidBalanceCents = token.prepaidBalanceCents ?? null;
           groupIdToken = { idToken, type: tokenType };
           logReason = 'active';
         }
@@ -244,19 +258,67 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
     }
   }
 
-  if (tokenType === 'eMAID') {
-    const hasHashData =
-      request.iso15118CertificateHashData != null && request.iso15118CertificateHashData.length > 0;
-    const hasCertificate = request.certificate != null;
-    if (hasHashData || hasCertificate) {
-      certificateStatus = 'Accepted';
+  // Prepaid token (C17.FR.01/02): NoCredit when the balance is not positive,
+  // and cacheExpiryDateTime = now either way so the station does not cache it.
+  let prepaidExpiry: string | undefined;
+  const credit = status === 'Accepted' ? prepaidCredit(matchedPrepaidBalanceCents) : 'not_prepaid';
+  if (credit !== 'not_prepaid') {
+    prepaidExpiry = rememberPrepaidAuthorization(ctx.stationId, idToken);
+    if (credit === 'no_credit') {
+      status = 'NoCredit';
+      outcome = 'no_credit';
+      logReason = 'no_credit';
+      groupIdToken = undefined;
     }
+  }
+
+  // C07: a contract certificate chain (hash data or PEM chain) is checked via
+  // OCSP whatever the token type, and a bad chain overrides the token status
+  // (C07.FR.05, FR.13 to FR.17). An unverifiable chain fails closed.
+  const hasHashData =
+    request.iso15118CertificateHashData != null && request.iso15118CertificateHashData.length > 0;
+  if (hasHashData || request.certificate != null) {
+    let verdict: ContractCertificateVerdict;
+    try {
+      verdict = await validateContractCertificate(
+        {
+          ...(request.iso15118CertificateHashData != null
+            ? { iso15118CertificateHashData: request.iso15118CertificateHashData }
+            : {}),
+          ...(request.certificate != null ? { certificate: request.certificate } : {}),
+        },
+        ctx.logger,
+      );
+    } catch (err) {
+      ctx.logger.error(
+        { err, stationId: ctx.stationId, idToken },
+        'Contract certificate validation failed',
+      );
+      verdict = 'CertChainError';
+    }
+    const applied = applyContractCertificateVerdict(status, verdict);
+    certificateStatus = applied.certificateStatus;
+    if (applied.status !== status) {
+      status = applied.status;
+      outcome = status === 'Expired' ? 'expired' : 'invalid';
+      logReason = `contract_certificate_${verdict}`;
+      groupIdToken = undefined;
+    }
+    ctx.logger.info(
+      { stationId: ctx.stationId, idToken, tokenType, verdict, status },
+      'Contract certificate validated',
+    );
   }
 
   let tariff: Record<string, unknown> | undefined;
   if (status === 'Accepted' && tokenType !== 'NoAuthorization') {
     try {
-      tariff = await resolveDriverTariff(matchedDriverId, ctx.stationId, ctx.logger);
+      tariff = await resolveDriverTariff(
+        matchedDriverId,
+        ctx.stationId,
+        ctx.stationDbId,
+        ctx.logger,
+      );
     } catch (err) {
       ctx.logger.warn(
         { err, stationId: ctx.stationId, idToken },
@@ -283,9 +345,11 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
     idTokenInfo: {
       status,
       ...(groupIdToken != null ? { groupIdToken } : {}),
-      ...(status === 'Accepted' && matchedExpiresAt != null
-        ? { cacheExpiryDateTime: matchedExpiresAt.toISOString() }
-        : {}),
+      ...(prepaidExpiry != null
+        ? { cacheExpiryDateTime: prepaidExpiry }
+        : status === 'Accepted' && matchedExpiresAt != null
+          ? { cacheExpiryDateTime: matchedExpiresAt.toISOString() }
+          : {}),
     },
     ...(certificateStatus != null ? { certificateStatus } : {}),
   };
@@ -297,72 +361,63 @@ export async function handleAuthorize(ctx: HandlerContext): Promise<Record<strin
   return result;
 }
 
+// The tariff the session would be priced with now (the same resolution as
+// session pricing: pricing group, then the tariff whose restrictions match in
+// the site's timezone), so the station shows the price the driver is billed.
 async function resolveDriverTariff(
   driverId: string | null,
   stationId: string,
+  stationDbId: string | null,
   logger: Logger,
 ): Promise<Record<string, unknown> | undefined> {
-  const rows = await db.execute<{
-    id: string;
-    price_per_kwh: string | null;
-    price_per_minute: string | null;
-    price_per_session: string | null;
-    idle_fee_price_per_minute: string | null;
-    tax_rate: string | null;
-    pricing_group_id: string;
-  }>(sql`
-    WITH resolved_group AS (
-      ${
-        driverId != null
-          ? sql`
-      SELECT pg.id AS group_id, 1 AS group_priority FROM pricing_groups pg
-      JOIN pricing_group_drivers pgd ON pgd.pricing_group_id = pg.id
-      WHERE pgd.driver_id = ${driverId}
-      UNION ALL
-      `
-          : sql``
-      }
-      SELECT pg.id AS group_id, 2 AS group_priority FROM pricing_groups pg
-      JOIN pricing_group_stations pgs ON pgs.pricing_group_id = pg.id
-      JOIN charging_stations cs ON cs.id = pgs.station_id
-      WHERE cs.station_id = ${stationId}
-      UNION ALL
-      SELECT pg.id AS group_id, 3 AS group_priority FROM pricing_groups pg
-      JOIN pricing_group_sites pgsi ON pgsi.pricing_group_id = pg.id
-      JOIN charging_stations cs ON cs.site_id = pgsi.site_id
-      WHERE cs.station_id = ${stationId}
-      UNION ALL
-      SELECT pg.id AS group_id, 4 AS group_priority FROM pricing_groups pg
-      WHERE pg.is_default = true
-    )
-    SELECT t.id, t.price_per_kwh, t.price_per_minute, t.price_per_session,
-           t.idle_fee_price_per_minute, t.tax_rate, t.pricing_group_id
-    FROM tariffs t
-    JOIN resolved_group rg ON rg.group_id = t.pricing_group_id
-    WHERE t.is_active = true
-    ORDER BY rg.group_priority ASC, t.priority DESC, t.is_default DESC
-    LIMIT 1
-  `);
+  let stationUuid = stationDbId;
+  if (stationUuid == null) {
+    const [station] = await client`
+      SELECT id FROM charging_stations WHERE station_id = ${stationId} LIMIT 1
+    `;
+    stationUuid = (station?.id as string | undefined) ?? null;
+  }
+  if (stationUuid == null) return undefined;
 
-  const rawRow = (rows as unknown as Array<Record<string, unknown>>)[0];
-  if (rawRow == null) {
+  const resolved = await resolveStationTariff({ stationUuid, driverUuid: driverId }, client);
+  if (resolved == null) {
     logger.debug({ stationId, driverId }, 'No tariff found for driver');
     return undefined;
   }
+  const rawRow: Record<string, unknown> = {
+    id: resolved.id,
+    price_per_kwh: resolved.pricePerKwh,
+    price_per_minute: resolved.pricePerMinute,
+    price_per_session: resolved.pricePerSession,
+    idle_fee_price_per_minute: resolved.idleFeePricePerMinute,
+    tax_rate: resolved.taxRate,
+  };
 
   const toNum = (v: unknown): number | null => (v != null ? Number(v) : null);
-  const pricePerKwh = toNum(rawRow['price_per_kwh']);
-  const pricePerMinute = toNum(rawRow['price_per_minute']);
-  const pricePerSession = toNum(rawRow['price_per_session']);
-  const idleFeePerMinute = toNum(rawRow['idle_fee_price_per_minute']);
   const taxRate = toNum(rawRow['tax_rate']);
+  // TariffType prices are excluding tax: prices entered on the gross tax
+  // basis are sent with the tax rate taken out, in 4 decimals.
+  const taxBasis = await getCompanyTaxBasis();
+  const netPrice = (v: unknown): number | null => {
+    const price = toNum(v);
+    if (price == null || taxBasis === 'net') return price;
+    return Math.round(netUnitPrice(price, taxRate ?? 0, taxBasis) * 10_000) / 10_000;
+  };
+  const pricePerKwh = netPrice(rawRow['price_per_kwh']);
+  const pricePerMinute = netPrice(rawRow['price_per_minute']);
+  const pricePerSession = netPrice(rawRow['price_per_session']);
+  const idleFeePerMinute = netPrice(rawRow['idle_fee_price_per_minute']);
 
   const tariff: Record<string, unknown> = {
     tariffId: rawRow['id'],
     currency: await getCompanyCurrency(),
   };
 
-  const taxRates = taxRate != null && taxRate > 0 ? [{ type: 'VAT', tax: taxRate }] : undefined;
+  // TaxRateType.tax is a percentage (19 for a stored rate of 0.19).
+  const taxRates =
+    taxRate != null && taxRate > 0
+      ? [{ type: 'VAT', tax: vatPercentFromFraction(taxRate) }]
+      : undefined;
 
   if (pricePerKwh != null && pricePerKwh > 0) {
     tariff['energy'] = {

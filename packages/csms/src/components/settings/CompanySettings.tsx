@@ -14,11 +14,16 @@ import {
 } from '@evtivity/lib/currency';
 import {
   DEFAULT_PRICE_DISPLAY,
+  DEFAULT_TAX_BASIS,
   isPriceDisplay,
+  isTaxBasis,
+  resolveTaxBasis,
   type PriceDisplay,
+  type TaxBasis,
 } from '@evtivity/lib/price-display';
 import { SaveButton } from '@/components/save-button';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -97,6 +102,9 @@ export function CompanySettings({
   const [companyCurrency, setCompanyCurrency] = useState(DEFAULT_CURRENCY);
   const [companyPriceDisplay, setCompanyPriceDisplay] =
     useState<PriceDisplay>(DEFAULT_PRICE_DISPLAY);
+  const [companyTaxBasis, setCompanyTaxBasis] = useState<TaxBasis>(DEFAULT_TAX_BASIS);
+  const [taxBasisConfirmOpen, setTaxBasisConfirmOpen] = useState(false);
+  const savedTaxBasis = resolveTaxBasis(settings?.['company.taxBasis']);
   const [companyContactEmail, setCompanyContactEmail] = useState('');
   const [companySupportEmail, setCompanySupportEmail] = useState('');
   const [companySupportPhone, setCompanySupportPhone] = useState('');
@@ -120,6 +128,7 @@ export function CompanySettings({
     setCompanyCurrency(s('company.currency').trim().toUpperCase() || DEFAULT_CURRENCY);
     const priceDisplay = s('company.priceDisplay');
     setCompanyPriceDisplay(isPriceDisplay(priceDisplay) ? priceDisplay : DEFAULT_PRICE_DISPLAY);
+    setCompanyTaxBasis(resolveTaxBasis(settings['company.taxBasis']));
     setCompanyContactEmail(s('company.contactEmail'));
     setCompanySupportEmail(s('company.supportEmail'));
     setCompanySupportPhone(s('company.supportPhone'));
@@ -139,6 +148,7 @@ export function CompanySettings({
       name: string;
       currency: string;
       priceDisplay: PriceDisplay;
+      taxBasis: TaxBasis;
       contactEmail: string;
       supportEmail: string;
       supportPhone: string;
@@ -156,6 +166,7 @@ export function CompanySettings({
         api.put('/v1/settings/company.name', { value: vals.name }),
         api.put('/v1/settings/company.currency', { value: vals.currency }),
         api.put('/v1/settings/company.priceDisplay', { value: vals.priceDisplay }),
+        api.put('/v1/settings/company.taxBasis', { value: vals.taxBasis }),
         api.put('/v1/settings/company.contactEmail', { value: vals.contactEmail }),
         api.put('/v1/settings/company.supportEmail', { value: vals.supportEmail }),
         api.put('/v1/settings/company.supportPhone', { value: vals.supportPhone }),
@@ -173,6 +184,27 @@ export function CompanySettings({
       void invalidateSettings();
     },
   });
+
+  const saveCompany = (): void => {
+    companyMutation.mutate({
+      name: companyName,
+      currency: companyCurrency,
+      priceDisplay: companyPriceDisplay,
+      taxBasis: companyTaxBasis,
+      contactEmail: companyContactEmail,
+      supportEmail: companySupportEmail,
+      supportPhone: companySupportPhone,
+      street: companyStreet,
+      city: companyCity,
+      state: companyState,
+      zip: companyZip,
+      country: companyCountry,
+      portalUrl: companyPortalUrl,
+      themeColor: companyThemeColor,
+      metaDescription,
+      metaKeywords,
+    });
+  };
 
   const logoUploadMutation = useMutation({
     mutationFn: (dataUri: string) => api.put('/v1/settings/company.logo', { value: dataUri }),
@@ -304,7 +336,7 @@ export function CompanySettings({
 
         <div className="grid gap-6 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label>{t('settings.companyLogo')}</Label>
+            <Label className="leading-6">{t('settings.companyLogo')}</Label>
             <input
               ref={logoInputRef}
               type="file"
@@ -352,7 +384,7 @@ export function CompanySettings({
           </div>
 
           <div className="space-y-2">
-            <Label>{t('settings.qrCodeIcon')}</Label>
+            <Label className="leading-6">{t('settings.qrCodeIcon')}</Label>
             <p className="text-xs text-muted-foreground">{t('settings.qrCodeIconDescription')}</p>
             <input
               ref={fileInputRef}
@@ -419,7 +451,7 @@ export function CompanySettings({
 
         <div className="grid gap-6 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label>{t('settings.favicon')}</Label>
+            <Label className="leading-6">{t('settings.favicon')}</Label>
             <p className="text-xs text-muted-foreground">{t('settings.faviconDescription')}</p>
             <input
               ref={faviconInputRef}
@@ -472,7 +504,7 @@ export function CompanySettings({
           </div>
 
           <div className="space-y-2">
-            <Label>{t('settings.ogImage')}</Label>
+            <Label className="leading-6">{t('settings.ogImage')}</Label>
             <p className="text-xs text-muted-foreground">{t('settings.ogImageDescription')}</p>
             <input
               ref={ogImageInputRef}
@@ -529,7 +561,9 @@ export function CompanySettings({
           <h3 className="text-lg font-semibold">{t('settings.seoSettings')}</h3>
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="meta-description">{t('settings.metaDescription')}</Label>
+              <Label htmlFor="meta-description" className="leading-6">
+                {t('settings.metaDescription')}
+              </Label>
               <Input
                 id="meta-description"
                 value={metaDescription}
@@ -540,7 +574,9 @@ export function CompanySettings({
               <p className="text-xs text-muted-foreground">{t('settings.metaDescriptionHelper')}</p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="meta-keywords">{t('settings.metaKeywords')}</Label>
+              <Label htmlFor="meta-keywords" className="leading-6">
+                {t('settings.metaKeywords')}
+              </Label>
               <Input
                 id="meta-keywords"
                 value={metaKeywords}
@@ -554,7 +590,7 @@ export function CompanySettings({
         </div>
 
         <div className="space-y-2">
-          <Label>{t('settings.themeColor')}</Label>
+          <Label className="leading-6">{t('settings.themeColor')}</Label>
           <div className="flex items-center gap-3">
             <input
               type="color"
@@ -578,33 +614,44 @@ export function CompanySettings({
           <p className="text-xs text-muted-foreground">{t('settings.themeColorDescription')}</p>
         </div>
 
+        <ConfirmDialog
+          open={taxBasisConfirmOpen}
+          onOpenChange={setTaxBasisConfirmOpen}
+          title={t('settings.companyTaxBasisConfirmTitle')}
+          description={t('settings.companyTaxBasisConfirmDescription', {
+            basis:
+              companyTaxBasis === 'gross'
+                ? t('settings.companyTaxBasisGross')
+                : t('settings.companyTaxBasisNet'),
+          })}
+          confirmLabel={t('settings.companyTaxBasisConfirm')}
+          variant="default"
+          isPending={companyMutation.isPending}
+          onConfirm={() => {
+            setTaxBasisConfirmOpen(false);
+            saveCompany();
+          }}
+        />
+
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            companyMutation.mutate({
-              name: companyName,
-              currency: companyCurrency,
-              priceDisplay: companyPriceDisplay,
-              contactEmail: companyContactEmail,
-              supportEmail: companySupportEmail,
-              supportPhone: companySupportPhone,
-              street: companyStreet,
-              city: companyCity,
-              state: companyState,
-              zip: companyZip,
-              country: companyCountry,
-              portalUrl: companyPortalUrl,
-              themeColor: companyThemeColor,
-              metaDescription,
-              metaKeywords,
-            });
+            // A different tax basis reinterprets every stored tariff price:
+            // confirm before saving it.
+            if (companyTaxBasis !== savedTaxBasis) {
+              setTaxBasisConfirmOpen(true);
+              return;
+            }
+            saveCompany();
           }}
           noValidate
           className="space-y-4"
         >
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="company-name">{t('settings.companyName')}</Label>
+              <Label htmlFor="company-name" className="leading-6">
+                {t('settings.companyName')}
+              </Label>
               <Input
                 id="company-name"
                 value={companyName}
@@ -615,7 +662,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-currency">{t('settings.companyCurrency')}</Label>
+              <Label htmlFor="company-currency" className="leading-6">
+                {t('settings.companyCurrency')}
+              </Label>
               <Select
                 id="company-currency"
                 value={companyCurrency}
@@ -643,7 +692,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-price-display">{t('settings.companyPriceDisplay')}</Label>
+              <Label htmlFor="company-price-display" className="leading-6">
+                {t('settings.companyPriceDisplay')}
+              </Label>
               <Select
                 id="company-price-display"
                 value={companyPriceDisplay}
@@ -661,7 +712,27 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-contact-email">{t('settings.companyContactEmail')}</Label>
+              <Label htmlFor="company-tax-basis" className="leading-6">
+                {t('settings.companyTaxBasis')}
+              </Label>
+              <Select
+                id="company-tax-basis"
+                value={companyTaxBasis}
+                onChange={(e) => {
+                  if (isTaxBasis(e.target.value)) setCompanyTaxBasis(e.target.value);
+                }}
+                className="h-9"
+              >
+                <option value="net">{t('settings.companyTaxBasisNet')}</option>
+                <option value="gross">{t('settings.companyTaxBasisGross')}</option>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t('settings.companyTaxBasisHelper')}</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="company-contact-email" className="leading-6">
+                {t('settings.companyContactEmail')}
+              </Label>
               <Input
                 id="company-contact-email"
                 type="email"
@@ -673,7 +744,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-support-email">{t('settings.companySupportEmail')}</Label>
+              <Label htmlFor="company-support-email" className="leading-6">
+                {t('settings.companySupportEmail')}
+              </Label>
               <Input
                 id="company-support-email"
                 type="email"
@@ -685,7 +758,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-support-phone">{t('settings.companySupportPhone')}</Label>
+              <Label htmlFor="company-support-phone" className="leading-6">
+                {t('settings.companySupportPhone')}
+              </Label>
               <Input
                 id="company-support-phone"
                 type="tel"
@@ -697,7 +772,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-street">{t('settings.companyStreet')}</Label>
+              <Label htmlFor="company-street" className="leading-6">
+                {t('settings.companyStreet')}
+              </Label>
               <Input
                 id="company-street"
                 value={companyStreet}
@@ -708,7 +785,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-city">{t('settings.companyCity')}</Label>
+              <Label htmlFor="company-city" className="leading-6">
+                {t('settings.companyCity')}
+              </Label>
               <Input
                 id="company-city"
                 value={companyCity}
@@ -719,7 +798,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-state">{t('settings.companyState')}</Label>
+              <Label htmlFor="company-state" className="leading-6">
+                {t('settings.companyState')}
+              </Label>
               <Input
                 id="company-state"
                 value={companyState}
@@ -730,7 +811,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-zip">{t('settings.companyZip')}</Label>
+              <Label htmlFor="company-zip" className="leading-6">
+                {t('settings.companyZip')}
+              </Label>
               <Input
                 id="company-zip"
                 value={companyZip}
@@ -741,7 +824,9 @@ export function CompanySettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="company-country">{t('settings.companyCountry')}</Label>
+              <Label htmlFor="company-country" className="leading-6">
+                {t('settings.companyCountry')}
+              </Label>
               <Input
                 id="company-country"
                 value={companyCountry}
@@ -753,7 +838,9 @@ export function CompanySettings({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="company-portal-url">{t('settings.companyPortalUrl')}</Label>
+            <Label htmlFor="company-portal-url" className="leading-6">
+              {t('settings.companyPortalUrl')}
+            </Label>
             <Input
               id="company-portal-url"
               type="url"

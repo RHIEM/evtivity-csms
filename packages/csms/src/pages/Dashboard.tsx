@@ -84,6 +84,10 @@ interface UptimeStats {
 interface FinancialStats {
   totalRevenueCents: number;
   todayRevenueCents: number;
+  totalNetRevenueCents: number;
+  todayNetRevenueCents: number;
+  totalTaxCents: number;
+  todayTaxCents: number;
   avgRevenueCentsPerSession: number;
   totalTransactions: number;
   totalElectricityCostCents: number;
@@ -184,7 +188,7 @@ function ScrollSnapRow({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [-ms-overflow-style:none] scrollbar-none [&::-webkit-scrollbar]:hidden"
       >
         {pages.map((page) => (
           <div key={page.id} className="w-full shrink-0 snap-start">
@@ -365,9 +369,9 @@ function NoDataOverlay({
 }): React.JSX.Element {
   return (
     <div className="relative">
-      <div className="pointer-events-none select-none blur-sm opacity-50">{children}</div>
+      <div className="pointer-events-none select-none blur-xs opacity-50">{children}</div>
       <div className="absolute inset-0 flex items-center justify-center">
-        <div className="rounded-lg bg-card border border-border px-6 py-3 shadow-sm text-sm text-muted-foreground">
+        <div className="rounded-lg bg-card border border-border px-6 py-3 shadow-xs text-sm text-muted-foreground">
           {message}
         </div>
       </div>
@@ -642,6 +646,31 @@ function AdminDashboard({
       </div>
     );
 
+    const taxGrid = (
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          title={t('dashboard.netRevenue')}
+          value={formatMoney(financialStats.data?.totalNetRevenueCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.netRevenue')}
+        />
+        <StatCard
+          title={t('dashboard.todayNetRevenue')}
+          value={formatMoney(financialStats.data?.todayNetRevenueCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.todayNetRevenue')}
+        />
+        <StatCard
+          title={t('dashboard.taxCollected')}
+          value={formatMoney(financialStats.data?.totalTaxCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.taxCollected')}
+        />
+        <StatCard
+          title={t('dashboard.todayTaxCollected')}
+          value={formatMoney(financialStats.data?.todayTaxCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.todayTaxCollected')}
+        />
+      </div>
+    );
+
     const costGrid = (
       <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
         <StatCard
@@ -770,6 +799,7 @@ function AdminDashboard({
         <ScrollSnapRow
           pages={[
             { id: 'revenue', content: revenueGrid },
+            { id: 'tax', content: taxGrid },
             { id: 'cost', content: costGrid },
           ]}
         />

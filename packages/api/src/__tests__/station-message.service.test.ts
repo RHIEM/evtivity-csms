@@ -57,7 +57,8 @@ const {
   mockGetStationMessagePricingFormat,
   mockRenderStationMessage,
   mockResolveTariff,
-  mockFormatPricingDisplay,
+  mockGetStationMessageLanguage,
+  mockGetCompanyPriceDisplay,
   mockPublish,
   mockSubscribe,
 } = vi.hoisted(() => ({
@@ -65,7 +66,8 @@ const {
   mockGetStationMessagePricingFormat: vi.fn(),
   mockRenderStationMessage: vi.fn(),
   mockResolveTariff: vi.fn(),
-  mockFormatPricingDisplay: vi.fn(),
+  mockGetStationMessageLanguage: vi.fn(),
+  mockGetCompanyPriceDisplay: vi.fn(),
   mockPublish: vi.fn().mockResolvedValue(undefined),
   mockSubscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
 }));
@@ -75,6 +77,9 @@ const {
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   getSystemTimezone: vi.fn(() => Promise.resolve('America/New_York')),
+  getCompanyPriceDisplay: mockGetCompanyPriceDisplay,
+  getCompanyTaxBasis: vi.fn().mockResolvedValue('net'),
+  getStationMessageLanguage: mockGetStationMessageLanguage,
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -114,6 +119,8 @@ vi.mock('@evtivity/database', () => ({
     currentCostCents: 'currentCostCents',
     currency: 'currency',
     tariffIdleFeePricePerMinute: 'tariffIdleFeePricePerMinute',
+    tariffTaxRate: 'tariffTaxRate',
+    taxBasis: 'taxBasis',
   },
   meterValues: {
     sessionId: 'sessionId',
@@ -131,6 +138,7 @@ vi.mock('@evtivity/database', () => ({
   },
   isStationMessageEnabled: mockIsStationMessageEnabled,
   getStationMessagePricingFormat: mockGetStationMessagePricingFormat,
+  resolveStationTariff: mockResolveTariff,
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -143,14 +151,8 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => ({
-  formatCurrencyAmount: (await importOriginal<typeof import('@evtivity/lib')>())
-    .formatCurrencyAmount,
-  formatPricingDisplay: mockFormatPricingDisplay,
+  ...(await importOriginal<typeof import('@evtivity/lib')>()),
   renderStationMessage: mockRenderStationMessage,
-}));
-
-vi.mock('../services/tariff.service.js', () => ({
-  resolveTariff: mockResolveTariff,
 }));
 
 vi.mock('../lib/pubsub.js', () => ({
@@ -168,6 +170,7 @@ import {
   pushAllMessagesToAllStations,
   startStationMessageRefreshListener,
   startStationMessageTransactionListener,
+  runStationRender,
   STATION_MESSAGE_SLOT_IDLE,
   STATION_MESSAGE_SLOT_CHARGING,
   STATION_MESSAGE_SLOT_SUSPENDED,
@@ -214,7 +217,8 @@ describe('station-message.service', () => {
     mockIsStationMessageEnabled.mockResolvedValue(true);
     mockGetStationMessagePricingFormat.mockResolvedValue('compact');
     mockResolveTariff.mockResolvedValue(TARIFF);
-    mockFormatPricingDisplay.mockReturnValue('$0.30/kWh + $0.02/min');
+    mockGetStationMessageLanguage.mockResolvedValue('en');
+    mockGetCompanyPriceDisplay.mockResolvedValue('net');
     mockRenderStationMessage.mockImplementation((state: string) =>
       Promise.resolve(`rendered:${state}`),
     );
@@ -267,11 +271,19 @@ describe('station-message.service', () => {
         mockLogger as never,
       );
 
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('available', expect.any(Object));
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('faulted', expect.any(Object));
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('unavailable', expect.any(Object));
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('available', expect.any(Object), 'en');
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('faulted', expect.any(Object), 'en');
+      expect(mockRenderStationMessage).toHaveBeenCalledWith(
+        'unavailable',
+        expect.any(Object),
+        'en',
+      );
       expect(mockPublish).toHaveBeenCalledTimes(3);
-      expect(mockFormatPricingDisplay).toHaveBeenCalledWith(TARIFF, 'compact', 'EUR');
+      expect(mockRenderStationMessage).toHaveBeenCalledWith(
+        'available',
+        expect.objectContaining({ pricingDisplay: '€0.30/kWh + €0.02/min' }),
+        'en',
+      );
 
       const publishedSlots = mockPublish.mock.calls.map((call) => {
         const body = JSON.parse(call[1] as string) as {
@@ -283,6 +295,37 @@ describe('station-message.service', () => {
       expect(slotIds).toContain(STATION_MESSAGE_SLOT_IDLE);
       expect(slotIds).toContain(STATION_MESSAGE_SLOT_FAULTED);
       expect(slotIds).toContain(STATION_MESSAGE_SLOT_UNAVAILABLE);
+    });
+
+    it('shows gross prices with the tax note in the display language', async () => {
+      mockGetStationMessageLanguage.mockResolvedValue('de');
+      mockGetCompanyPriceDisplay.mockResolvedValue('gross');
+      mockResolveTariff.mockResolvedValue({ ...TARIFF, taxRate: '0.19' });
+      setupDbResults([STATION_ROW], [], [], [], [], [], [], []);
+
+      await pushAllStationMessages(
+        STATION_OCPP_ID,
+        INTERNAL_STATION_ID,
+        'ocpp2.1',
+        mockLogger as never,
+      );
+
+      expect(mockRenderStationMessage).toHaveBeenCalledWith(
+        'available',
+        expect.objectContaining({
+          pricingDisplay: '0,357 €/kWh + 0,0238 €/Min.',
+          energyPrice: '0,357 €',
+          taxRatePercent: '19',
+          pricesIncludeTax: true,
+        }),
+        'de',
+      );
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('faulted', expect.any(Object), 'de');
+      // The station screen shows the walk-up price: no driver.
+      expect(mockResolveTariff).toHaveBeenCalledWith(
+        { stationUuid: INTERNAL_STATION_ID, driverUuid: null },
+        expect.anything(),
+      );
     });
 
     it('skips dispatch when contentHash matches existing push (no-op)', async () => {
@@ -344,6 +387,7 @@ describe('station-message.service', () => {
           driverFirstName: 'Alex',
           reservationExpiresAt: expect.stringMatching(/^11:45\sAM$/),
         }),
+        'en',
       );
     });
 
@@ -378,6 +422,7 @@ describe('station-message.service', () => {
         expect.objectContaining({
           reservationExpiresAt: expect.stringMatching(/^5:45\sPM$/),
         }),
+        'en',
       );
     });
 
@@ -391,7 +436,7 @@ describe('station-message.service', () => {
         mockLogger as never,
       );
 
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('occupied', expect.any(Object));
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('occupied', expect.any(Object), 'en');
     });
   });
 
@@ -439,6 +484,8 @@ describe('station-message.service', () => {
         currency: 'USD',
         chargingState: null,
         tariffIdleFeePricePerMinute: '0.10',
+        tariffTaxRate: null,
+        taxBasis: 'net',
         ...overrides,
       };
     }
@@ -492,6 +539,7 @@ describe('station-message.service', () => {
           powerKw: '7.0',
           driverFirstName: 'Alex',
         }),
+        'en',
       );
       expect(mockPublish).toHaveBeenCalledTimes(1);
       const body = JSON.parse(mockPublish.mock.calls[0]![1] as string) as {
@@ -528,6 +576,7 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'suspended',
         expect.objectContaining({ idleFeeRate: expect.stringContaining('/min') }),
+        'en',
       );
 
       const actions = mockPublish.mock.calls.map((c) => {
@@ -829,10 +878,10 @@ describe('station-message.service', () => {
         mockLogger as never,
       );
 
-      expect(mockFormatPricingDisplay).not.toHaveBeenCalled();
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'available',
-        expect.objectContaining({ pricingDisplay: '' }),
+        expect.objectContaining({ pricingDisplay: '', taxRatePercent: '' }),
+        'en',
       );
     });
 
@@ -919,6 +968,8 @@ describe('station-message.service', () => {
         currency: 'USD',
         chargingState: 'Charging',
         tariffIdleFeePricePerMinute: null,
+        tariffTaxRate: null,
+        taxBasis: 'net',
         ...overrides,
       };
     }
@@ -938,6 +989,7 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'charging',
         expect.objectContaining({ energyKwh: '0.0', powerKw: '', elapsedFormatted: '' }),
+        'en',
       );
     });
 
@@ -955,6 +1007,7 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'charging',
         expect.objectContaining({ elapsedFormatted: '1h 35m', powerKw: '7.0' }),
+        'en',
       );
     });
 
@@ -972,6 +1025,7 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'charging',
         expect.objectContaining({ elapsedFormatted: '', powerKw: '' }),
+        'en',
       );
     });
 
@@ -996,6 +1050,42 @@ describe('station-message.service', () => {
           costFormatted: '$5.00',
           idleFeeRate: expect.stringContaining('/min'),
         }),
+        'en',
+      );
+    });
+
+    it('shows the idle fee gross and numbers in the display language', async () => {
+      mockGetStationMessageLanguage.mockResolvedValue('de');
+      mockGetCompanyPriceDisplay.mockResolvedValue('gross');
+      setupDbResults([], [{ value: '7000', unit: 'W' }], []);
+
+      await pushTransactionMessage(
+        INTERNAL_STATION_ID,
+        STATION_OCPP_ID,
+        'ocpp2.1',
+        makeSession({
+          chargingState: 'SuspendedEV',
+          energyDeliveredWh: '12400',
+          currentCostCents: 500,
+          currency: 'EUR',
+          tariffIdleFeePricePerMinute: '0.10',
+          tariffTaxRate: '0.19',
+          taxBasis: 'net',
+        }),
+        mockLogger as never,
+      );
+
+      expect(mockRenderStationMessage).toHaveBeenCalledWith(
+        'suspended',
+        expect.objectContaining({
+          costFormatted: '5,00 €',
+          idleFeeRate: '0,119 €/Min.',
+          energyKwh: '12,4',
+          powerKw: '7,0',
+          taxRatePercent: '19',
+          pricesIncludeTax: true,
+        }),
+        'de',
       );
     });
 
@@ -1016,7 +1106,7 @@ describe('station-message.service', () => {
 
       const ctx = mockRenderStationMessage.mock.calls[0]![1] as Record<string, string>;
       expect(ctx['costFormatted']).toBe('NOTACURRENCY 5.00');
-      expect(ctx['idleFeeRate']).toBe('0.15 NOTACURRENCY/min');
+      expect(ctx['idleFeeRate']).toBe('NOTACURRENCY 0.15/min');
     });
 
     it('omits the idle-fee rate when the rate is zero or negative', async () => {
@@ -1048,6 +1138,7 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'charging',
         expect.objectContaining({ powerKw: '11.2' }),
+        'en',
       );
     });
 
@@ -1065,7 +1156,46 @@ describe('station-message.service', () => {
       expect(mockRenderStationMessage).toHaveBeenCalledWith(
         'charging',
         expect.objectContaining({ driverFirstName: 'Sam' }),
+        'en',
       );
+    });
+  });
+
+  describe('runStationRender', () => {
+    it('runs renders for one station one after the other', async () => {
+      const order: string[] = [];
+      let releaseFirst: () => void = () => {};
+      const first = runStationRender('sta_q', async () => {
+        order.push('first:start');
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        order.push('first:end');
+      });
+      const second = runStationRender('sta_q', async () => {
+        order.push('second');
+        await Promise.resolve();
+      });
+      const other = runStationRender('sta_other', async () => {
+        order.push('other');
+        await Promise.resolve();
+      });
+
+      await other;
+      expect(order).toEqual(['first:start', 'other']);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(order).toEqual(['first:start', 'other', 'first:end', 'second']);
+    });
+
+    it('runs the next render after a failed one', async () => {
+      const failed = runStationRender('sta_fail', () => Promise.reject(new Error('boom')));
+      const next = vi.fn(() => Promise.resolve());
+      const after = runStationRender('sta_fail', next);
+
+      await expect(failed).rejects.toThrow('boom');
+      await after;
+      expect(next).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1099,7 +1229,7 @@ describe('station-message.service', () => {
         }),
       );
       await new Promise((r) => setTimeout(r, 20));
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('available', expect.any(Object));
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('available', expect.any(Object), 'en');
     });
 
     it('logs a warning when the payload is not valid JSON', async () => {
@@ -1131,6 +1261,8 @@ describe('station-message.service', () => {
       currentCostCents: 100,
       currency: 'USD',
       tariffIdleFeePricePerMinute: null,
+      tariffTaxRate: null,
+      taxBasis: 'net',
     };
 
     it('ignores payloads missing required fields', async () => {
@@ -1192,7 +1324,51 @@ describe('station-message.service', () => {
         }),
       );
       await new Promise((r) => setTimeout(r, 20));
-      expect(mockRenderStationMessage).toHaveBeenCalledWith('charging', expect.any(Object));
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('charging', expect.any(Object), 'en');
+    });
+
+    it.each([
+      ['SuspendedEV', 'suspended'],
+      ['Charging', 'charging'],
+      ['Discharging', 'discharging'],
+    ])(
+      'keeps the last reported state (%s) when the event has no chargingState',
+      async (chargingState, templateState) => {
+        setupDbResults([{ ...SESSION_DB_ROW, chargingState }], [], [], []);
+        const handler = await getHandler();
+        handler(
+          JSON.stringify({
+            sessionId: 'ses_1',
+            internalStationId: INTERNAL_STATION_ID,
+            stationOcppId: STATION_OCPP_ID,
+            ocppProtocol: 'ocpp2.1',
+            eventType: 'updated',
+          }),
+        );
+        await new Promise((r) => setTimeout(r, 20));
+        expect(mockRenderStationMessage).toHaveBeenCalledWith(
+          templateState,
+          expect.any(Object),
+          'en',
+        );
+      },
+    );
+
+    it('lets the chargingState in the event win over the stored state', async () => {
+      setupDbResults([{ ...SESSION_DB_ROW, chargingState: 'Charging' }], [], [], []);
+      const handler = await getHandler();
+      handler(
+        JSON.stringify({
+          sessionId: 'ses_1',
+          internalStationId: INTERNAL_STATION_ID,
+          stationOcppId: STATION_OCPP_ID,
+          ocppProtocol: 'ocpp2.1',
+          eventType: 'updated',
+          chargingState: 'SuspendedEVSE',
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mockRenderStationMessage).toHaveBeenCalledWith('suspended', expect.any(Object), 'en');
     });
 
     it('logs a warning on malformed JSON', async () => {

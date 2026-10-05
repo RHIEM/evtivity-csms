@@ -13,7 +13,7 @@ vi.mock('@/lib/api', () => ({
 }));
 
 const { useAuth } = await import('@/lib/auth');
-const { usePriceDisplay } = await import('../use-price-display');
+const { usePriceDisplay, useCompanyPriceDisplay } = await import('../use-price-display');
 
 function wrapper({ children }: { children: ReactNode }): React.JSX.Element {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -63,12 +63,40 @@ describe('usePriceDisplay', () => {
     expect(result.current).toBe('net');
   });
 
-  it('shows guests prices including tax', async () => {
+  it('shows guests the company setting', async () => {
     mockGet.mockResolvedValue({ priceDisplay: 'net' });
     const { result } = renderHook(() => usePriceDisplay(), { wrapper });
     await waitFor(() => {
-      expect(mockGet).toHaveBeenCalled();
+      expect(result.current).toBe('net');
     });
+  });
+
+  it('shows guests gross prices when the company setting is gross', async () => {
+    const { result } = renderHook(() => usePriceDisplay(), { wrapper });
+    await waitFor(() => {
+      expect(result.current).toBe('gross');
+    });
+  });
+
+  it('is null while the company setting loads and the driver has not chosen', () => {
+    mockGet.mockReturnValue(new Promise(() => {}));
+    signIn(null);
+    const { result } = renderHook(() => usePriceDisplay(), { wrapper });
+    expect(result.current).toBeNull();
+  });
+
+  it('uses the driver choice without waiting for the company setting', () => {
+    mockGet.mockReturnValue(new Promise(() => {}));
+    signIn('gross');
+    const { result } = renderHook(() => usePriceDisplay(), { wrapper });
     expect(result.current).toBe('gross');
+  });
+
+  it('falls back to the default when the company setting fails to load', async () => {
+    mockGet.mockRejectedValue(new Error('offline'));
+    const { result } = renderHook(() => useCompanyPriceDisplay(), { wrapper });
+    await waitFor(() => {
+      expect(result.current).toBe('net');
+    });
   });
 });

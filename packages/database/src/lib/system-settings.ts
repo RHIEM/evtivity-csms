@@ -5,9 +5,12 @@ import { eq } from 'drizzle-orm';
 import {
   DEFAULT_CURRENCY,
   DEFAULT_PRICE_DISPLAY,
+  DEFAULT_TAX_BASIS,
   isPriceDisplay,
   isSupportedCurrency,
+  isTaxBasis,
   type PriceDisplay,
+  type TaxBasis,
 } from '@evtivity/lib';
 import { db } from '../config.js';
 import { settings } from '../schema/settings.js';
@@ -23,6 +26,12 @@ let cachedCurrencyAt = 0;
 
 let cachedPriceDisplay: PriceDisplay | undefined;
 let cachedPriceDisplayAt = 0;
+
+let cachedTaxBasis: TaxBasis | undefined;
+let cachedTaxBasisAt = 0;
+
+let cachedCountry: string | null | undefined;
+let cachedCountryAt = 0;
 
 /**
  * Cached reader for the `system.timezone` setting. Used by dashboard
@@ -101,6 +110,58 @@ export async function getCompanyPriceDisplay(): Promise<PriceDisplay> {
   }
 }
 
+/**
+ * Cached reader for the `company.taxBasis` setting: whether tariff prices are
+ * entered excluding ('net') or including ('gross') tax. A session stamps it
+ * with its tariff snapshot and is priced in it. Falls back to
+ * DEFAULT_TAX_BASIS when unset or invalid, and on error.
+ */
+export async function getCompanyTaxBasis(): Promise<TaxBasis> {
+  const now = Date.now();
+  if (cachedTaxBasis !== undefined && now - cachedTaxBasisAt < TTL_MS) {
+    return cachedTaxBasis;
+  }
+
+  try {
+    const [row] = await db
+      .select({ value: settings.value })
+      .from(settings)
+      .where(eq(settings.key, 'company.taxBasis'));
+
+    cachedTaxBasis = isTaxBasis(row?.value) ? row.value : DEFAULT_TAX_BASIS;
+    cachedTaxBasisAt = now;
+    return cachedTaxBasis;
+  } catch {
+    return cachedTaxBasis ?? DEFAULT_TAX_BASIS;
+  }
+}
+
+/**
+ * Cached reader for the `company.country` setting (ISO 3166-1 alpha-2, such
+ * as `US`), the country payment providers use for the methods they offer.
+ * Null when unset or not a two-letter code, and on error without a cached value.
+ */
+export async function getCompanyCountry(): Promise<string | null> {
+  const now = Date.now();
+  if (cachedCountry !== undefined && now - cachedCountryAt < TTL_MS) {
+    return cachedCountry;
+  }
+
+  try {
+    const [row] = await db
+      .select({ value: settings.value })
+      .from(settings)
+      .where(eq(settings.key, 'company.country'));
+
+    const code = typeof row?.value === 'string' ? row.value.trim().toUpperCase() : '';
+    cachedCountry = /^[A-Z]{2}$/.test(code) ? code : null;
+    cachedCountryAt = now;
+    return cachedCountry;
+  } catch {
+    return cachedCountry ?? null;
+  }
+}
+
 export function clearSystemSettingsCache(): void {
   cachedTimezone = undefined;
   cachedAt = 0;
@@ -108,4 +169,8 @@ export function clearSystemSettingsCache(): void {
   cachedCurrencyAt = 0;
   cachedPriceDisplay = undefined;
   cachedPriceDisplayAt = 0;
+  cachedTaxBasis = undefined;
+  cachedTaxBasisAt = 0;
+  cachedCountry = undefined;
+  cachedCountryAt = 0;
 }

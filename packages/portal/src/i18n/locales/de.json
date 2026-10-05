@@ -19,7 +19,8 @@
     "add": "Hinzufügen",
     "deactivate": "Deaktivieren",
     "remove": "Entfernen",
-    "inclTax": "inkl. Steuer"
+    "inclTax": "inkl. Steuer",
+    "amountInclTax": "{{amount}} inkl. Steuer"
   },
   "nav": {
     "home": "Startseite",
@@ -125,11 +126,15 @@
     "ended": "Beendet",
     "energy": "Energie",
     "energyAdded": "Gelieferte Energie",
-    "cost": "Geschätzte Kosten (inkl. Steuer)",
-    "totalCost": "Gesamtkosten (inkl. Steuer)",
-    "netCost": "Nettobetrag",
-    "taxAdded": "zzgl. {{rate}} % Steuer",
-    "taxContained": "darin enthalten {{rate}} % Steuer",
+    "cost": "Geschätzte Kosten",
+    "costInclTax": "Geschätzte Kosten (inkl. Steuer)",
+    "totalCost": "Gesamtkosten",
+    "totalCostInclTax": "Gesamtkosten (inkl. Steuer)",
+    "netCost": "Nettobetrag (vor Steuer)",
+    "taxAdded": "Steuer ({{rate}} %)",
+    "taxAddedNoRate": "Steuer",
+    "taxContained": "Enthaltene Steuer ({{rate}} %)",
+    "taxContainedNoRate": "Enthaltene Steuer",
     "stopReason": "Stoppgrund",
     "rfid": "RFID",
     "payment": "Zahlung",
@@ -231,10 +236,11 @@
     "distanceUnit": "Entfernungseinheit",
     "distanceMiles": "Meilen",
     "distanceKm": "Kilometer",
-    "priceDisplay": "Preisangabe",
+    "priceDisplay": "Preise anzeigen",
     "priceDisplayDefault": "Vorgabe des Betreibers ({{value}})",
     "priceDisplayGross": "Inklusive Steuer (brutto)",
-    "priceDisplayNet": "Exklusive Steuer (netto)"
+    "priceDisplayNet": "Exklusive Steuer (netto)",
+    "priceDisplayHelper": "Inklusive Steuer zeigt Preise mit Steuer. Exklusive Steuer zeigt Preise vor Steuer. Der abgerechnete Betrag ist in beiden Fällen gleich, und solange Sie nichts wählen, gilt die Vorgabe des Betreibers."
   },
   "charger": {
     "loadingInfo": "Ladestationsinfos werden geladen...",
@@ -269,8 +275,8 @@
     "sessionFee": "Sitzungsgebühr",
     "idleFee": "/Min. Standgebühr",
     "tax": "Steuer",
-    "taxIncluded": "inkl. {{rate}} % Steuer",
-    "taxExcluded": "zzgl. {{rate}} % Steuer",
+    "taxIncluded": "Preise inkl. {{rate}} % Steuer",
+    "taxExcluded": "Preise zzgl. {{rate}} % Steuer, die zum abgerechneten Betrag hinzukommt",
     "startCharging": "Ladevorgang starten",
     "freeCharging": "Kostenloses Laden",
     "siteContact": "Standortkontakt",
@@ -336,8 +342,10 @@
     "notFound": "Vorgang nicht gefunden.",
     "duration": "Dauer",
     "energyDelivered": "Gelieferte Energie",
-    "totalCost": "Gesamtkosten (inkl. Steuer)",
-    "estimatedCost": "Geschätzte Kosten (inkl. Steuer)",
+    "totalCost": "Gesamtkosten",
+    "totalCostInclTax": "Gesamtkosten (inkl. Steuer)",
+    "estimatedCost": "Geschätzte Kosten",
+    "estimatedCostInclTax": "Geschätzte Kosten (inkl. Steuer)",
     "started": "Gestartet",
     "ended": "Beendet",
     "stopCharging": "Ladevorgang beenden",
@@ -421,7 +429,7 @@
     "noShowFeeNote": "Eine Reservierungsgebühr kann auch dann anfallen, wenn Sie nicht erscheinen.",
     "maxHoursHint": "Die maximale Reservierungsdauer beträgt {{hours}} Stunden.",
     "paymentMethodRequired": "Eine Zahlungsmethode ist erforderlich, um eine Reservierung zu erstellen.",
-    "cancellationFeeWarning": "Eine Stornogebühr von {{fee}} wird Ihrer Standard-Zahlungsmethode belastet.",
+    "cancellationFeeWarning": "Eine Stornogebühr von {{fee}} zuzüglich anfallender Steuer wird Ihrer Standard-Zahlungsmethode belastet.",
     "cancellationPolicy": "Stornierungsbedingungen",
     "cancellationPolicyText": "Bei Stornierung innerhalb von {{minutes}} Minuten vor der Startzeit wird eine Stornogebühr von {{fee}} erhoben.",
     "upcoming": "Anstehend",
@@ -750,6 +758,7 @@
     "co2Avoided": "CO₂ eingespart",
     "totalCo2Avoided": "Gesamt CO₂ eingespart",
     "noSessions": "Keine Ladevorgänge in diesem Zeitraum.",
+    "cost": "Kosten",
     "costInclTax": "Kosten (inkl. Steuer)"
   },
   "account": {
@@ -870,6 +879,11 @@
     "scanPhoto": "Aus einem Foto scannen",
     "noQrFound": "In diesem Foto wurde kein QR-Code gefunden. Versuche es erneut."
   },
+  "qr": {
+    "checking": "QR-Code wird geprüft",
+    "invalidTitle": "QR-Code ungültig",
+    "invalidMessage": "Dieser QR-Code ist ungültig oder abgelaufen. Scannen Sie den QR-Code an der Ladestation erneut."
+  },
   "watch": {
     "notifyWhenFree": "Benachrichtigen wenn frei",
     "watching": "Nicht mehr beobachten",
@@ -880,5 +894,13 @@
     "empty": "Sie beobachten keine Ladestationen.",
     "removeTitle": "Nicht mehr beobachten",
     "removeMessage": "Du wirst nicht mehr benachrichtigt, wenn diese Station frei ist."
+  },
+  "authFooter": {
+    "privacyPolicy": "Datenschutzerklärung",
+    "termsOfService": "Nutzungsbedingungen",
+    "allRightsReserved": "Alle Rechte vorbehalten, {{year}} {{name}}",
+    "recaptchaProtected": "Geschützt durch reCAPTCHA.",
+    "recaptchaPrivacy": "Datenschutz",
+    "recaptchaTerms": "Bedingungen"
   }
 }

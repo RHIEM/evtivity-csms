@@ -8,6 +8,7 @@ import { createLogger } from './logger.js';
 import { decryptString } from './encryption.js';
 import { DEFAULT_CURRENCY } from './currency.js';
 import { formatDateTime } from './timezone.js';
+import { formatLocalizedVariables } from './notification-values.js';
 import { isPrivateUrl } from './url-validation.js';
 import { sendExpoPush } from './push-send.js';
 import { compileAllowedTemplate, type TemplateRenderer } from './template-safety.js';
@@ -742,7 +743,11 @@ export async function dispatchDriverNotification(
       ...variables,
     };
 
-    const formattedVariables = formatDateVariables(enrichedVariables, timezone, language);
+    // Dates in the recipient's timezone; dates, money and rates in their language.
+    const formattedVariables = formatLocalizedVariables(
+      formatDateVariables(enrichedVariables, timezone, language),
+      language,
+    );
 
     const prefs = prefRows[0];
     const emailEnabled = prefs != null ? (prefs.email_enabled as boolean) : true;
@@ -1019,7 +1024,11 @@ export async function dispatchSystemNotification(
       ...variables,
     };
 
-    const formattedVariables = formatDateVariables(enrichedVariables, timezone, language);
+    // Dates in the recipient's timezone; dates, money and rates in their language.
+    const formattedVariables = formatLocalizedVariables(
+      formatDateVariables(enrichedVariables, timezone, language),
+      language,
+    );
 
     // Email path. Always records a history row so operators can answer
     // "did the system try to email this recipient?" without trawling logs.

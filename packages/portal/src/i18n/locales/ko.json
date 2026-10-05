@@ -19,7 +19,8 @@
     "add": "추가",
     "deactivate": "비활성화",
     "remove": "제거",
-    "inclTax": "세금 포함"
+    "inclTax": "세금 포함",
+    "amountInclTax": "{{amount}} (세금 포함)"
   },
   "nav": {
     "home": "홈",
@@ -125,11 +126,15 @@
     "ended": "종료",
     "energy": "에너지",
     "energyAdded": "공급 전력량",
-    "cost": "예상 비용 (세금 포함)",
-    "totalCost": "총 비용 (세금 포함)",
-    "netCost": "순액",
-    "taxAdded": "+ {{rate}}% 세금",
-    "taxContained": "포함된 {{rate}}% 세금",
+    "cost": "예상 비용",
+    "costInclTax": "예상 비용 (세금 포함)",
+    "totalCost": "총 비용",
+    "totalCostInclTax": "총 비용 (세금 포함)",
+    "netCost": "순액 (세전)",
+    "taxAdded": "세금 ({{rate}}%)",
+    "taxAddedNoRate": "세금",
+    "taxContained": "포함된 세금 ({{rate}}%)",
+    "taxContainedNoRate": "포함된 세금",
     "stopReason": "중지 사유",
     "rfid": "RFID",
     "payment": "결제",
@@ -234,7 +239,8 @@
     "priceDisplay": "가격 표시",
     "priceDisplayDefault": "운영자 기본값 ({{value}})",
     "priceDisplayGross": "세금 포함 (총액)",
-    "priceDisplayNet": "세금 별도 (순액)"
+    "priceDisplayNet": "세금 별도 (순액)",
+    "priceDisplayHelper": "세금 포함은 세금이 더해진 가격을 표시합니다. 세금 별도는 세전 가격을 표시합니다. 청구 금액은 어느 쪽이든 같으며, 직접 선택하기 전에는 운영자 기본값이 적용됩니다."
   },
   "charger": {
     "loadingInfo": "충전기 정보 로딩 중...",
@@ -269,8 +275,8 @@
     "sessionFee": "세션 요금",
     "idleFee": "/분 유휴 요금",
     "tax": "세금",
-    "taxIncluded": "{{rate}}% 세금 포함",
-    "taxExcluded": "{{rate}}% 세금 별도",
+    "taxIncluded": "가격에 {{rate}}% 세금 포함",
+    "taxExcluded": "가격에 {{rate}}% 세금 별도, 청구 금액에 세금이 추가됩니다",
     "startCharging": "충전 시작",
     "freeCharging": "무료 충전",
     "siteContact": "현장 연락처",
@@ -336,8 +342,10 @@
     "notFound": "세션을 찾을 수 없습니다.",
     "duration": "소요 시간",
     "energyDelivered": "공급 전력량",
-    "totalCost": "총 비용 (세금 포함)",
-    "estimatedCost": "예상 비용 (세금 포함)",
+    "totalCost": "총 비용",
+    "totalCostInclTax": "총 비용 (세금 포함)",
+    "estimatedCost": "예상 비용",
+    "estimatedCostInclTax": "예상 비용 (세금 포함)",
     "started": "시작",
     "ended": "종료",
     "stopCharging": "충전 중지",
@@ -421,7 +429,7 @@
     "noShowFeeNote": "방문하지 않아도 보유 요금이 부과될 수 있습니다.",
     "maxHoursHint": "최대 예약 시간은 {{hours}}시간입니다.",
     "paymentMethodRequired": "예약을 생성하려면 결제 수단이 필요합니다.",
-    "cancellationFeeWarning": "{{fee}} 취소 수수료가 기본 결제 수단으로 청구됩니다.",
+    "cancellationFeeWarning": "{{fee}} 취소 수수료와 해당 세금이 기본 결제 수단으로 청구됩니다.",
     "cancellationPolicy": "취소 정책",
     "cancellationPolicyText": "시작 시간 {{minutes}}분 이내에 취소하면 {{fee}} 취소 수수료가 부과됩니다.",
     "upcoming": "예정",
@@ -750,6 +758,7 @@
     "co2Avoided": "CO₂ 절감량",
     "totalCo2Avoided": "총 CO₂ 절감량",
     "noSessions": "이 기간에 충전 세션이 없습니다.",
+    "cost": "비용",
     "costInclTax": "비용 (세금 포함)"
   },
   "account": {
@@ -870,6 +879,11 @@
     "scanPhoto": "사진에서 스캔",
     "noQrFound": "사진에서 QR 코드를 찾을 수 없습니다. 다시 시도하세요."
   },
+  "qr": {
+    "checking": "QR 코드 확인 중",
+    "invalidTitle": "유효하지 않은 QR 코드",
+    "invalidMessage": "이 QR 코드는 유효하지 않거나 만료되었습니다. 충전소에 표시된 QR 코드를 다시 스캔하세요."
+  },
   "watch": {
     "notifyWhenFree": "사용 가능 시 알림",
     "watching": "알림 해제",
@@ -880,5 +894,13 @@
     "empty": "알림을 설정한 충전소가 없습니다.",
     "removeTitle": "알림 해제",
     "removeMessage": "이 충전소가 비어도 더 이상 알림을 받지 않습니다."
+  },
+  "authFooter": {
+    "privacyPolicy": "개인정보처리방침",
+    "termsOfService": "이용약관",
+    "allRightsReserved": "{{year}} {{name}}. 모든 권리 보유.",
+    "recaptchaProtected": "reCAPTCHA로 보호됩니다.",
+    "recaptchaPrivacy": "개인정보",
+    "recaptchaTerms": "약관"
   }
 }

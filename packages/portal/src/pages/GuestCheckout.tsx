@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router';
+import { useParams, useNavigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { loadStripe } from '@stripe/stripe-js/pure';
 import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
@@ -18,7 +18,7 @@ import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBran
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatCents } from '@/lib/utils';
-import { checkGuestConnectorStatus } from '@/lib/charger-utils';
+import { checkGuestConnectorStatus, qrTransactionLimits } from '@/lib/charger-utils';
 import { useCableCheck } from '@/hooks/use-cable-check';
 
 interface ChargerConfig {
@@ -40,6 +40,7 @@ function FreeStartForm({
 }): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const { isCheckingStatus, showEvWarning, setShowEvWarning, runWithCableCheck } = useCableCheck();
@@ -50,7 +51,7 @@ function FreeStartForm({
     try {
       const result = await api.post<{ sessionToken: string }>(
         `/v1/portal/guest/start/${stationId}/${evseId}`,
-        {},
+        qrTransactionLimits(searchParams),
       );
       void navigate(`/guest-session/${result.sessionToken}`);
     } catch (err: unknown) {
@@ -116,6 +117,7 @@ function CheckoutForm({
   const stripe = useStripe();
   const elements = useElements();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [email, setEmail] = useState('');
   const [emailError, setEmailError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -156,6 +158,7 @@ function CheckoutForm({
         {
           paymentMethodId: paymentMethod.id,
           guestEmail: email,
+          ...qrTransactionLimits(searchParams),
         },
       );
 
@@ -194,7 +197,7 @@ function CheckoutForm({
     <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4">
       {error !== '' && <p className="text-sm text-destructive">{error}</p>}
       <div className="space-y-2">
-        <label htmlFor="guestEmail" className="text-sm font-medium">
+        <label htmlFor="guestEmail" className="block text-sm font-medium leading-6">
           {t('guest.emailForReceipt')}
         </label>
         <Input
@@ -219,7 +222,7 @@ function CheckoutForm({
         )}
       </div>
       <div className="space-y-2">
-        <label className="text-sm font-medium">{t('guest.card')}</label>
+        <label className="block text-sm font-medium leading-6">{t('guest.card')}</label>
         <div className="rounded-lg border border-input p-3">
           <CardElement
             options={{

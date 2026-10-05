@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { FastifyInstance } from 'fastify';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 import { inArray } from 'drizzle-orm';
 import {
@@ -33,7 +34,24 @@ const PNC_KEYS = [
   'pnc.hubject.tokenUrl',
   'pnc.expirationWarningDays',
   'pnc.expirationCriticalDays',
+  'pnc.ocsp.allowedPrivateHosts',
 ];
+
+// A DNS hostname (RFC 1123 labels) or an IP literal, without scheme or port.
+const HOSTNAME =
+  /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+// Checked in the handler (normalizeOcspHosts): zod-to-json-schema strips
+// .refine(), .trim(), and .toLowerCase(), and Fastify validates the body with
+// the JSON Schema only.
+const ocspAllowedHost = z.string().max(253);
+
+/** Trimmed, lowercased, de-duplicated hosts, or null when one is not a hostname or IP. */
+function normalizeOcspHosts(hosts: string[]): string[] | null {
+  const normalized = hosts.map((host) => host.trim().toLowerCase());
+  if (normalized.some((host) => !HOSTNAME.test(host) && isIP(host) === 0)) return null;
+  return [...new Set(normalized)];
+}
 
 const updatePncSettingsBody = z.object({
   enabled: z.boolean().optional().describe('Enable or disable Plug and Charge'),
@@ -59,6 +77,13 @@ const updatePncSettingsBody = z.object({
     .max(90)
     .optional()
     .describe('Days before certificate expiry to trigger auto-renewal'),
+  ocspAllowedPrivateHosts: z
+    .array(ocspAllowedHost)
+    .max(20)
+    .optional()
+    .describe(
+      'Private or internal hosts the CSMS may send OCSP requests to (hostname or IP, no scheme or port)',
+    ),
 });
 
 function getEncryptionKey(): string {
@@ -109,7 +134,10 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
         body: zodSchema(updatePncSettingsBody),
         response: {
           200: successResponse,
-          400: errorWith('Private url', [ERROR_CODES.PRIVATE_URL]),
+          400: errorWith('Private url or invalid OCSP host', [
+            ERROR_CODES.PRIVATE_URL,
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
         },
       },
     },
@@ -124,6 +152,18 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
         await reply.status(400).send({
           error: 'Hubject base URL must not point to a private or internal address',
           code: 'PRIVATE_URL',
+        });
+        return;
+      }
+
+      const ocspHosts =
+        body.ocspAllowedPrivateHosts !== undefined
+          ? normalizeOcspHosts(body.ocspAllowedPrivateHosts)
+          : undefined;
+      if (ocspHosts === null) {
+        await reply.status(400).send({
+          error: 'OCSP allowed hosts must be hostnames or IP addresses without scheme or port',
+          code: 'VALIDATION_ERROR',
         });
         return;
       }
@@ -155,6 +195,9 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
       if (body.expirationCriticalDays !== undefined) {
         updates.push({ key: 'pnc.expirationCriticalDays', value: body.expirationCriticalDays });
       }
+      if (ocspHosts !== undefined) {
+        updates.push({ key: 'pnc.ocsp.allowedPrivateHosts', value: ocspHosts });
+      }
 
       // Snapshot prior values so the audit entries can carry an honest
       // before/after. Settings page changes for PnC are operator-visible
@@ -185,7 +228,9 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
       const actor = getAuditActor(request);
       await Promise.allSettled(
         updates
-          .filter((update) => beforeMap.get(update.key) !== update.value)
+          .filter(
+            (update) => JSON.stringify(beforeMap.get(update.key)) !== JSON.stringify(update.value),
+          )
           .map((update) =>
             writeAudit(
               { table: settingAuditLog, idColumn: 'setting_key' },

@@ -13,7 +13,16 @@ import {
   writeAudit,
   settingAuditLog,
 } from '@evtivity/database';
-import { settings, getCompanyCurrency, clearSystemSettingsCache } from '@evtivity/database';
+import {
+  settings,
+  getCompanyCurrency,
+  getCompanyPriceDisplay,
+  getCompanyTaxBasis,
+  clearSystemSettingsCache,
+  clearStationMessageSettingsCache,
+  invalidateReservationSettingsCache,
+} from '@evtivity/database';
+import { clearPaymentCaches, isPaymentSettingKey } from '../lib/payments.js';
 import {
   encryptString,
   clearNotificationSettingsCache,
@@ -21,6 +30,11 @@ import {
   SUPPORTED_CURRENCIES,
   isPriceDisplay,
   PRICE_DISPLAYS,
+  isStationMessageLanguage,
+  STATION_MESSAGE_LANGUAGES,
+  isTaxBasis,
+  TAX_BASES,
+  UI_LANGUAGES,
 } from '@evtivity/lib';
 import { getPubSub } from '../lib/pubsub.js';
 
@@ -63,10 +77,16 @@ const updateSettingBody = z.object({
 
 const COMPANY_CURRENCY_KEY = 'company.currency';
 const COMPANY_PRICE_DISPLAY_KEY = 'company.priceDisplay';
+const STATION_MESSAGE_LANGUAGE_KEY = 'stationMessage.language';
+const COMPANY_TAX_BASIS_KEY = 'company.taxBasis';
 
 // Keys read through the cached getters in @evtivity/database system-settings.
 function isCachedSystemSetting(key: string): boolean {
-  return key === COMPANY_CURRENCY_KEY || key === COMPANY_PRICE_DISPLAY_KEY;
+  return (
+    key === COMPANY_CURRENCY_KEY ||
+    key === COMPANY_PRICE_DISPLAY_KEY ||
+    key === COMPANY_TAX_BASIS_KEY
+  );
 }
 
 /**
@@ -75,6 +95,10 @@ function isCachedSystemSetting(key: string): boolean {
  */
 function normalizeSettingValue(key: string, value: unknown): { value: unknown } | null {
   if (key === COMPANY_PRICE_DISPLAY_KEY) return isPriceDisplay(value) ? { value } : null;
+  if (key === STATION_MESSAGE_LANGUAGE_KEY) {
+    return isStationMessageLanguage(value) ? { value } : null;
+  }
+  if (key === COMPANY_TAX_BASIS_KEY) return isTaxBasis(value) ? { value } : null;
   if (key !== COMPANY_CURRENCY_KEY) return { value };
   const code = typeof value === 'string' ? value.trim().toUpperCase() : value;
   return isSupportedCurrency(code) ? { value: code } : null;
@@ -90,8 +114,29 @@ const invalidPriceDisplayError = {
   code: 'VALIDATION_ERROR',
 };
 
+const invalidStationMessageLanguageError = {
+  error: `stationMessage.language must be one of: ${STATION_MESSAGE_LANGUAGES.join(', ')}`,
+  code: 'VALIDATION_ERROR',
+};
+
+const invalidTaxBasisError = {
+  error: `company.taxBasis must be one of: ${TAX_BASES.join(', ')}`,
+  code: 'VALIDATION_ERROR',
+};
+
 function invalidSettingError(key: string): { error: string; code: string } {
-  return key === COMPANY_PRICE_DISPLAY_KEY ? invalidPriceDisplayError : invalidCurrencyError;
+  if (key === COMPANY_PRICE_DISPLAY_KEY) return invalidPriceDisplayError;
+  if (key === COMPANY_TAX_BASIS_KEY) return invalidTaxBasisError;
+  if (key === STATION_MESSAGE_LANGUAGE_KEY) return invalidStationMessageLanguageError;
+  return invalidCurrencyError;
+}
+
+// Keys read through cached getters in @evtivity/database clear their cache on change.
+function clearCachesForKey(key: string): void {
+  if (isCachedSystemSetting(key)) clearSystemSettingsCache();
+  if (key.startsWith('stationMessage.')) clearStationMessageSettingsCache();
+  if (key.startsWith('reservation.')) invalidateReservationSettingsCache();
+  if (isPaymentSettingKey(key)) clearPaymentCaches();
 }
 
 const settingItem = z
@@ -132,7 +177,13 @@ export function settingsRoutes(app: FastifyInstance): void {
         const shortKey = row.key.replace(/^(company|marketing)\./, '');
         result[shortKey] = typeof row.value === 'string' ? row.value : '';
       }
+      // Normalized like the server reads them: an unset or invalid stored
+      // value resolves to the default.
       result['currency'] = await getCompanyCurrency();
+      result['priceDisplay'] = await getCompanyPriceDisplay();
+      // Whether tariff prices are entered excluding ('net') or including
+      // ('gross') tax, so clients show a price in the display the driver chose.
+      result['taxBasis'] = await getCompanyTaxBasis();
       return result;
     },
   );
@@ -163,7 +214,7 @@ export function settingsRoutes(app: FastifyInstance): void {
                   .int()
                   .min(0)
                   .describe(
-                    'Cancellation fee in cents charged when a reservation is cancelled inside the cancellation window',
+                    "Cancellation fee in cents before tax, charged when a reservation is cancelled inside the cancellation window. The tax rate of the station's tariff is added to the amount charged",
                   ),
                 reservationCancellationWindowMinutes: z
                   .number()
@@ -210,7 +261,7 @@ export function settingsRoutes(app: FastifyInstance): void {
     type: z.enum(['privacy-policy', 'terms-of-service']).describe('Content type'),
   });
   const contentQuery = z.object({
-    lang: z.enum(['en', 'de', 'es', 'zh']).default('en').describe('Language code'),
+    lang: z.enum(UI_LANGUAGES).default('en').describe('Language code'),
   });
   const contentItem = z
     .object({ html: z.string().describe('Rendered HTML content for the requested legal document') })
@@ -347,7 +398,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         db,
         request.log,
       );
-      if (isCachedSystemSetting(row.key)) clearSystemSettingsCache();
+      clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
@@ -408,7 +459,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         db,
         request.log,
       );
-      if (isCachedSystemSetting(row.key)) clearSystemSettingsCache();
+      clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
@@ -451,7 +502,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         db,
         request.log,
       );
-      if (isCachedSystemSetting(row.key)) clearSystemSettingsCache();
+      clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
