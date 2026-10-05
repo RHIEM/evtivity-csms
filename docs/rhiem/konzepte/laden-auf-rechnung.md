@@ -123,4 +123,12 @@ Umsetzung auf `feature/invoice-payment-mode` (Merge von `v0.1.37`, `3f51627`):
 - Migration als `rhiem_0001_payment_mode` (Inhalt unverändert) am Ende des Journals.
 - Das Rechnungs-PDF ist seit `v0.1.36` übersetzt (u. a. Deutsch) und weist Steuern je Steuersatz aus (`v0.1.34`).
 
+Rangfolge beim Start (OCPP und Portal):
+
+- Zahlungsart: Fahrer > älteste Flottenmitgliedschaft mit gesetztem Wert > `card`. Sie wird bei jedem Start neu ermittelt und am Vorgang festgehalten; eine Änderung während des Ladens gilt erst für den nächsten Vorgang.
+- Einordnung des Vorgangs: `roaming` > `free_vend` > `prepaid` > `invoice` > `card`. Bei `invoice` kehrt die OCPP-Schranke zurück, bevor `authorizeSessionHold()` die Zahlungsmethode prüft; eine fehlende Karte stoppt den Vorgang also nicht. Wer mit einem Prepaid-Token lädt, zahlt über das Guthaben.
+- Zahlungsanbieter: `payments.provider` hat in `v0.1.37` noch keine Oberfläche. Migration `0116` belegt ihn mit `stripe` vor, wenn ein Stripe-Schlüssel hinterlegt ist, sonst mit `none`; das Speichern eines Stripe-Schlüssels setzt `none` auf `stripe`. Bei `none` verlangt der Portal-Start von niemandem eine Zahlungsmethode, der OCPP-Pfad stoppt Kartenfahrer ohne Karte aber weiterhin (`no_method` wird vor dem Anbieter geprüft). Ein Test im Pilot ist deshalb nur per RFID aussagekräftig, solange kein Anbieter aktiv ist.
+
 Bekannte Einschränkung: Storno- und No-Show-Gebühren einer Reservierung werden per Karte bezahlt und stehen zusätzlich auf der Sammelrechnung (Upstream-Verhalten). Reservierungen verlangen weiterhin eine Karte; im Feldversuch wird nicht reserviert.
+
+Upstream: EVtivity hat am 03.10.2026 Interesse bekundet und will den Vorschlag prüfen. Antwort mit dem Stand auf `v0.1.37` am 05.10.2026 ([Kommentar](https://github.com/EVtivity/evtivity-csms/discussions/12#discussioncomment-18760460)): Rechnung als Zahlungsart in `classifySessionPayment()`, Ausschluss von Kartenzahlungen aus der Sammelrechnung entfällt (angeboten: auf `payment_mode = 'invoice'` beschränkt, falls gewünscht).
