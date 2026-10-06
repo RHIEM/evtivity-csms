@@ -15,7 +15,7 @@ Für den Feldversuch Mitarbeiterladen brauchen wir Erweiterungen an EVtivity (zu
 - Für einen PR an EVtivity wird der Feature-Zweig auf `upstream/main` rebased und nach den Regeln aus `CONTRIBUTING.md` eingereicht.
 - Beiträge an EVtivity (Issues und PRs) unterliegen dem [CLA](../../../CLA.md): Übertragung des Urheberrechts an EVtivity, Patentlizenz, Zusicherung der Urheberschaft und der Arbeitgeberfreigabe. Die Freigabe durch RHIEM liegt vor (29.09.2026). Unterschrieben wird per PR-Kommentar mit exakt `I have read the CLA Document and I hereby sign the CLA` (die Checkbox im PR-Template wertet der Bot nicht aus). Der CLA-Workflow bei EVtivity speichert Unterschriften nicht dauerhaft; der Kommentar ist in jedem neuen PR nötig. Die Korrektur `ce9fef9` (in `v0.1.27`) hat daran nichts geändert (Stand 01.10.2026).
 - Neue EVtivity-Releases werden per Merge des Tags in `rhiem/main` übernommen.
-  - Ausnahme 29.09.2026: `upstream/main` (`4de16e7`, noch ohne Release) wurde gemergt. v0.1.25 lässt sich ohne diesen Fix nicht als Docker-Image bauen: Das Portal-Image kopiert `packages/lib` nicht, obwohl das Portal seit v0.1.25 `@evtivity/lib/currency` importiert. Mit `v0.1.27` (30.09.2026) wieder regulär übernommen, zuletzt `v0.1.37` (05.10.2026).
+  - Ausnahme 29.09.2026: `upstream/main` (`4de16e7`, noch ohne Release) wurde gemergt. v0.1.25 lässt sich ohne diesen Fix nicht als Docker-Image bauen: Das Portal-Image kopiert `packages/lib` nicht, obwohl das Portal seit v0.1.25 `@evtivity/lib/currency` importiert. Mit `v0.1.27` (30.09.2026) wieder regulär übernommen, zuletzt `v0.1.38` (06.10.2026).
 
 ## Konsequenzen
 

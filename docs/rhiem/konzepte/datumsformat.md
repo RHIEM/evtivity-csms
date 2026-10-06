@@ -22,3 +22,4 @@ Fahrerportal, CSMS und Benachrichtigungen formatieren Datum und Uhrzeit fest mit
 
 - Rechnungs-PDF: seit `v0.1.36` von EVtivity übersetzt (Texte, Datum, Beträge in der Sprache des Fahrers).
 - Sprache des Säulendisplays: seit `v0.1.37` von EVtivity umgesetzt.
+- Neue Upstream-Tests mit festem US-Datumsformat an das Format des Forks anpassen (`v0.1.38`: `StationSimulatorConflict.test.tsx`).
