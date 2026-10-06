@@ -6,7 +6,7 @@ Lokale Entwicklung für den Feldversuch auf NixOS (WSL2). Ergänzt die offiziell
 
 - Docker nativ in NixOS (`virtualisation.docker.enable = true;`, User in Gruppe `docker`)
 - `direnv` mit Shell-Hook
-- Alles Weitere (Node 24, `psql`/`pg_restore`, `gh`, `jq`) liefert [shell.nix](shell.nix) – `direnv` lädt es beim Betreten des Ordners über `.envrc`.
+- Alles Weitere (Node 24, `psql`/`pg_restore`, `gh`, `jq`, `openssl`) liefert [shell.nix](shell.nix) – `direnv` lädt es beim Betreten des Ordners über `.envrc`.
 
 ## Einrichtung (einmalig)
 

@@ -7,5 +7,6 @@ pkgs.mkShell {
     postgresql_17 # psql, pg_dump, pg_restore für die Pilot-Dumps
     gh
     jq
+    openssl # TLS-Test in packages/ocpp erzeugt ein Testzertifikat
   ];
 }
