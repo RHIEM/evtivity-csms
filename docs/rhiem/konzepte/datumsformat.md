@@ -2,7 +2,7 @@
 
 - **Status:** Freigegeben (02.10.2026), umgesetzt, im Pilot seit 02.10.2026
 - **Zweig:** `fix/locale-date-display` (Basis `v0.1.32`), in `rhiem/main` mit `9718bba`
-- **Upstream:** PR folgt (Anzeige und Benachrichtigungen ggf. getrennt)
+- **Upstream:** [PR #35](https://github.com/EVtivity/evtivity-csms/pull/35) (06.10.2026), ein PR für alles; Zweig dafür auf `upstream/main` (`v0.1.39-beta.1`) rebased
 
 ## Ausgangslage
 
@@ -17,6 +17,17 @@ Fahrerportal, CSMS und Benachrichtigungen formatieren Datum und Uhrzeit fest mit
 - **Relative Zeit** im CSMS („5s ago“) über `Intl.RelativeTimeFormat` (`style: 'narrow'`).
 - **Benachrichtigungen:** `formatDateVariables` bekommt die Sprache des Empfängers; im OCPP-Dispatcher wird je Empfänger formatiert.
 - **Säulendisplay:** Reservierungsende in der Zeitzone des Standorts (bisher Serverzeit). Seit `v0.1.37` hat das Display eine eigene Sprache (`formatStationTime`); beim Merge hat `formatStationTime` einen optionalen Parameter für die Zeitzone erhalten, das Format folgt der Display-Sprache.
+
+## Abwägung vor dem PR (06.10.2026)
+
+Geprüft wurde, ob statt der Kopplung an die Sprache eine eigene Formatauswahl besser passt:
+
+- **Format folgt der Sprache (gewählt):** Seit `v0.1.38` ist die Sprache von Benutzern (`users.language`) und Fahrern (`drivers.language`) gespeichert und wird beim Login in i18next übernommen. `uiLocale()` liest damit die gespeicherte Sprache. Zahlen folgen upstream bereits derselben Quelle, Datum und Zahl passen so immer zusammen.
+- **Eigene Datumsformatauswahl:** verworfen, Datum und Zahlen könnten auseinanderlaufen; Migration in zwei Tabellen.
+- **Optionales Regionalformat für Datum und Zahlen** (Standard „wie Sprache“, z. B. `en-GB` bei englischer Oberfläche): möglicher Folge-PR, im PR #35 nur erwähnt. Im Pilot ohne Bedarf.
+- **Browsersprache:** verworfen, der Server (E-Mail, SMS) kennt sie nicht.
+
+Beim Rebase ergänzt (noch nicht in `rhiem/main`, kommt mit dem nächsten Release): Reservierungs-Benachrichtigungen übergeben `expiresAt` als ISO-Zeitstempel statt vorformatiert in Serversprache und -zeitzone; die Monatsachse im Nachhaltigkeitsbericht folgt der UI-Sprache (bisher Browsersprache).
 
 ## Nicht umgesetzt
 
