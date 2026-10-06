@@ -2303,6 +2303,14 @@ describe('Event projections', () => {
       expect(evidence[0]!.strings.join('')).toContain(
         'ON CONFLICT (station_identity, signed_data_sha256)',
       );
+      // The End sample's timestamp is passed and replaces the Begin sample's
+      // together with the context.
+      expect(evidence[0]!.values).toContain('2026-09-30T14:46:12.175Z');
+      expect(evidence[1]!.values).toContain('2026-09-30T14:53:42.516Z');
+      expect(evidence[1]!.values).toContain('Transaction.End');
+      expect(evidence[0]!.strings.join('')).toMatch(
+        /timestamp = CASE\s+WHEN EXCLUDED\.context = 'Transaction\.End' THEN EXCLUDED\.timestamp/,
+      );
       // The record references the latest meter key of the connector.
       expect(evidence[0]!.strings.join('')).toContain('FROM meter_public_keys k');
 
