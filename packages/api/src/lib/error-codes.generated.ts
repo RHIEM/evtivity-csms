@@ -56,6 +56,7 @@ export const ERROR_CODES = {
   DUPLICATE_SITE_NAME: 'DUPLICATE_SITE_NAME',
   DUPLICATE_STATION_ID: 'DUPLICATE_STATION_ID',
   ELECTRICITY_RATE_NOT_FOUND: 'ELECTRICITY_RATE_NOT_FOUND',
+  EMAID_PREFIX_NOT_CONFIGURED: 'EMAID_PREFIX_NOT_CONFIGURED',
   EMAIL_EXISTS: 'EMAIL_EXISTS',
   EMAIL_NOT_CONFIGURED: 'EMAIL_NOT_CONFIGURED',
   EMAIL_NOT_VERIFIED: 'EMAIL_NOT_VERIFIED',
@@ -96,6 +97,8 @@ export const ERROR_CODES = {
   INVOICE_NO_SESSIONS: 'INVOICE_NO_SESSIONS',
   INVOICE_NOT_FOUND: 'INVOICE_NOT_FOUND',
   LOAD_NOT_FOUND: 'LOAD_NOT_FOUND',
+  LOCAL_CA_EXISTS: 'LOCAL_CA_EXISTS',
+  LOCAL_CA_NOT_CONFIGURED: 'LOCAL_CA_NOT_CONFIGURED',
   LOCATION_NOT_FOUND: 'LOCATION_NOT_FOUND',
   MAINTENANCE_ACTIVE: 'MAINTENANCE_ACTIVE',
   MAINTENANCE_ALREADY_ACTIVE: 'MAINTENANCE_ALREADY_ACTIVE',
@@ -154,12 +157,20 @@ export const ERROR_CODES = {
   PAYMENT_METHOD_REQUIRED: 'PAYMENT_METHOD_REQUIRED',
   PAYMENT_NOT_CONFIGURED: 'PAYMENT_NOT_CONFIGURED',
   PAYMENT_NOT_FOUND: 'PAYMENT_NOT_FOUND',
+  PAYMENT_OPERATION_PENDING: 'PAYMENT_OPERATION_PENDING',
   PAYMENT_PREAUTH_FAILED: 'PAYMENT_PREAUTH_FAILED',
   PAYMENT_PROVIDER_CONNECTION_FAILED: 'PAYMENT_PROVIDER_CONNECTION_FAILED',
   PAYMENT_PROVIDER_NOT_CONFIGURED: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+  PAYMENT_PROVIDER_PERMISSION_MISSING: 'PAYMENT_PROVIDER_PERMISSION_MISSING',
+  PAYMENT_PROVIDER_UPGRADE_PENDING: 'PAYMENT_PROVIDER_UPGRADE_PENDING',
   PAYMENT_RECORD_NOT_RECOVERABLE: 'PAYMENT_RECORD_NOT_RECOVERABLE',
   PAYMENT_TOP_UP_FAILED: 'PAYMENT_TOP_UP_FAILED',
+  PAYMENT_WEBHOOK_EXISTS: 'PAYMENT_WEBHOOK_EXISTS',
+  PAYOUT_ACCOUNT_EXISTS: 'PAYOUT_ACCOUNT_EXISTS',
+  PAYOUT_ACCOUNT_NOT_READY: 'PAYOUT_ACCOUNT_NOT_READY',
   PERMISSIONS_EXCEED_OWN: 'PERMISSIONS_EXCEED_OWN',
+  PKI_ROOT_REFRESH_FAILED: 'PKI_ROOT_REFRESH_FAILED',
+  PNC_CONTRACT_NOT_FOUND: 'PNC_CONTRACT_NOT_FOUND',
   PNC_DISABLED: 'PNC_DISABLED',
   PORTAL_ALREADY_ACTIVE: 'PORTAL_ALREADY_ACTIVE',
   PORTAL_REGISTRATION_DISABLED: 'PORTAL_REGISTRATION_DISABLED',
@@ -178,6 +189,7 @@ export const ERROR_CODES = {
   RECAPTCHA_FAILED: 'RECAPTCHA_FAILED',
   RECAPTCHA_REQUIRED: 'RECAPTCHA_REQUIRED',
   REFUND_EXCEEDS_REMAINING: 'REFUND_EXCEEDS_REMAINING',
+  REFUND_TOP_UP_UNKNOWN: 'REFUND_TOP_UP_UNKNOWN',
   REGION_NOT_FOUND: 'REGION_NOT_FOUND',
   REPORT_NOT_FOUND: 'REPORT_NOT_FOUND',
   RESERVATION_BUFFER_ACTIVE: 'RESERVATION_BUFFER_ACTIVE',
@@ -209,6 +221,7 @@ export const ERROR_CODES = {
   SETTING_NOT_FOUND: 'SETTING_NOT_FOUND',
   SITE_HAS_STATIONS: 'SITE_HAS_STATIONS',
   SITE_NOT_FOUND: 'SITE_NOT_FOUND',
+  SITE_PAYMENT_CONFIG_IN_USE: 'SITE_PAYMENT_CONFIG_IN_USE',
   SMS_NOT_CONFIGURED: 'SMS_NOT_CONFIGURED',
   SMS_SEND_FAILED: 'SMS_SEND_FAILED',
   SSO_DISABLED: 'SSO_DISABLED',
@@ -300,6 +313,7 @@ export type ErrorCode =
   | 'DUPLICATE_SITE_NAME'
   | 'DUPLICATE_STATION_ID'
   | 'ELECTRICITY_RATE_NOT_FOUND'
+  | 'EMAID_PREFIX_NOT_CONFIGURED'
   | 'EMAIL_EXISTS'
   | 'EMAIL_NOT_CONFIGURED'
   | 'EMAIL_NOT_VERIFIED'
@@ -340,6 +354,8 @@ export type ErrorCode =
   | 'INVOICE_NO_SESSIONS'
   | 'INVOICE_NOT_FOUND'
   | 'LOAD_NOT_FOUND'
+  | 'LOCAL_CA_EXISTS'
+  | 'LOCAL_CA_NOT_CONFIGURED'
   | 'LOCATION_NOT_FOUND'
   | 'MAINTENANCE_ACTIVE'
   | 'MAINTENANCE_ALREADY_ACTIVE'
@@ -398,12 +414,20 @@ export type ErrorCode =
   | 'PAYMENT_METHOD_REQUIRED'
   | 'PAYMENT_NOT_CONFIGURED'
   | 'PAYMENT_NOT_FOUND'
+  | 'PAYMENT_OPERATION_PENDING'
   | 'PAYMENT_PREAUTH_FAILED'
   | 'PAYMENT_PROVIDER_CONNECTION_FAILED'
   | 'PAYMENT_PROVIDER_NOT_CONFIGURED'
+  | 'PAYMENT_PROVIDER_PERMISSION_MISSING'
+  | 'PAYMENT_PROVIDER_UPGRADE_PENDING'
   | 'PAYMENT_RECORD_NOT_RECOVERABLE'
   | 'PAYMENT_TOP_UP_FAILED'
+  | 'PAYMENT_WEBHOOK_EXISTS'
+  | 'PAYOUT_ACCOUNT_EXISTS'
+  | 'PAYOUT_ACCOUNT_NOT_READY'
   | 'PERMISSIONS_EXCEED_OWN'
+  | 'PKI_ROOT_REFRESH_FAILED'
+  | 'PNC_CONTRACT_NOT_FOUND'
   | 'PNC_DISABLED'
   | 'PORTAL_ALREADY_ACTIVE'
   | 'PORTAL_REGISTRATION_DISABLED'
@@ -422,6 +446,7 @@ export type ErrorCode =
   | 'RECAPTCHA_FAILED'
   | 'RECAPTCHA_REQUIRED'
   | 'REFUND_EXCEEDS_REMAINING'
+  | 'REFUND_TOP_UP_UNKNOWN'
   | 'REGION_NOT_FOUND'
   | 'REPORT_NOT_FOUND'
   | 'RESERVATION_BUFFER_ACTIVE'
@@ -453,6 +478,7 @@ export type ErrorCode =
   | 'SETTING_NOT_FOUND'
   | 'SITE_HAS_STATIONS'
   | 'SITE_NOT_FOUND'
+  | 'SITE_PAYMENT_CONFIG_IN_USE'
   | 'SMS_NOT_CONFIGURED'
   | 'SMS_SEND_FAILED'
   | 'SSO_DISABLED'
@@ -536,7 +562,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   CREATE_FAILED: 'Failed to create circuit',
   CSR_NOT_FOUND: 'Pending CSR not found',
   CSRF_INVALID: 'Invalid CSRF token',
-  CSS_ACTION_REJECTED: 'Charging station simulator rejected the action',
+  CSS_ACTION_REJECTED: 'Charging Station Simulator rejected the action',
   CSS_ACTION_TIMEOUT: 'Simulator did not respond within 5s',
   DOWNTIME_NOT_FOUND: 'Excluded downtime record not found',
   DRIVER_ALREADY_IN_FLEET: 'Driver is already in this fleet',
@@ -552,6 +578,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   DUPLICATE_SITE_NAME: 'A site with this name already exists',
   DUPLICATE_STATION_ID: 'Station ID already exists',
   ELECTRICITY_RATE_NOT_FOUND: 'Electricity rate not found',
+  EMAID_PREFIX_NOT_CONFIGURED: 'Set the eMAID country code and provider ID first',
   EMAIL_EXISTS: 'Email already registered',
   EMAIL_NOT_CONFIGURED: 'Email provider not configured',
   EMAIL_NOT_VERIFIED: 'Email not verified',
@@ -592,6 +619,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVOICE_NO_SESSIONS: 'No uninvoiced sessions found for this driver in the selected date range',
   INVOICE_NOT_FOUND: 'Invoice not found',
   LOAD_NOT_FOUND: 'Load not found',
+  LOCAL_CA_EXISTS: 'A local contract CA already exists',
+  LOCAL_CA_NOT_CONFIGURED: 'Create the local contract CA first',
   LOCATION_NOT_FOUND: 'Location not found',
   MAINTENANCE_ACTIVE: 'Site is currently under maintenance',
   MAINTENANCE_ALREADY_ACTIVE: 'Maintenance event is already active',
@@ -651,12 +680,23 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PAYMENT_METHOD_REQUIRED: 'Payment method required',
   PAYMENT_NOT_CONFIGURED: 'Payment not configured for this station',
   PAYMENT_NOT_FOUND: 'No payment record for this session',
+  PAYMENT_OPERATION_PENDING:
+    "The payment has an operation waiting for the provider's confirmation. Try again later.",
   PAYMENT_PREAUTH_FAILED: 'Payment authorization declined',
   PAYMENT_PROVIDER_CONNECTION_FAILED: 'Payment provider connection test failed',
   PAYMENT_PROVIDER_NOT_CONFIGURED: 'Payment provider is not configured',
+  PAYMENT_PROVIDER_PERMISSION_MISSING:
+    'The payment provider credential lacks a required permission',
+  PAYMENT_PROVIDER_UPGRADE_PENDING:
+    'A process older than v0.1.38 is still connected. Finish the upgrade, then select Adyen.',
   PAYMENT_RECORD_NOT_RECOVERABLE: 'Payment record is not in a recoverable state',
   PAYMENT_TOP_UP_FAILED: 'Payment top-up rejected',
+  PAYMENT_WEBHOOK_EXISTS: 'An EVtivity webhook already exists for this provider',
+  PAYOUT_ACCOUNT_EXISTS: 'The site already has a payout account',
+  PAYOUT_ACCOUNT_NOT_READY: "The site's payout account cannot receive payments yet",
   PERMISSIONS_EXCEED_OWN: 'API key permissions must be a subset of your own permissions',
+  PKI_ROOT_REFRESH_FAILED: 'Root certificate refresh from the PKI provider failed',
+  PNC_CONTRACT_NOT_FOUND: 'Plug & Charge contract not found',
   PNC_DISABLED: 'Plug & Charge is disabled',
   PORTAL_ALREADY_ACTIVE: 'Driver already has portal access',
   PORTAL_REGISTRATION_DISABLED:
@@ -676,6 +716,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   RECAPTCHA_FAILED: 'reCAPTCHA verification failed',
   RECAPTCHA_REQUIRED: 'reCAPTCHA token is required',
   REFUND_EXCEEDS_REMAINING: 'Refund amount exceeds remaining ...',
+  REFUND_TOP_UP_UNKNOWN:
+    "This payment includes a top-up charge with no recorded payment id. Refund the top-up in the payment provider's dashboard.",
   REGION_NOT_FOUND: 'Region not found',
   REPORT_NOT_FOUND: 'Report not found',
   RESERVATION_BUFFER_ACTIVE:
@@ -708,6 +750,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   SETTING_NOT_FOUND: 'Setting not found',
   SITE_HAS_STATIONS: 'Cannot delete site with stations. Remove or reassign stations first.',
   SITE_NOT_FOUND: 'Site not found',
+  SITE_PAYMENT_CONFIG_IN_USE:
+    "This site's payment configuration has payments and cannot be deleted. Disable it instead.",
   SMS_NOT_CONFIGURED: 'SMS provider not configured',
   SMS_SEND_FAILED: 'Failed to send SMS',
   SSO_DISABLED: 'SSO is not configured',
@@ -745,11 +789,11 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   UNAUTHORIZED: 'Unauthorized',
   UNKNOWN_ACTION: 'Unknown OCPP action',
   USER_NOT_FOUND: 'User not found',
-  VALIDATION_ERROR: 'Voltage must be one of: 120, 208, 240, 277, 480',
+  VALIDATION_ERROR: 'Validation error',
   VEHICLE_NOT_FOUND: 'Vehicle not found',
   VENDOR_NOT_FOUND: 'Vendor not found',
   WEAK_PASSWORD: 'Password does not meet complexity requirements',
   WEBHOOK_NOT_CONFIGURED: 'Webhook not configured',
   WEBHOOK_SIGNATURE_INVALID: 'Invalid signature',
-  WEBHOOK_SIGNATURE_MISSING: 'Missing stripe-signature header',
+  WEBHOOK_SIGNATURE_MISSING: 'Missing webhook signature or credentials',
 };

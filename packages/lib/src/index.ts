@@ -1,13 +1,19 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-export { createBullMQConnection } from './bullmq.js';
+export { createBullMQConnection, logBullMQErrors } from './bullmq.js';
+
+export {
+  connectionName,
+  CONNECTION_NAME_PREFIX,
+  LEGACY_CONNECTION_NAME,
+} from './connection-name.js';
 
 export { withLock } from './redis-lock.js';
 export type { WithLockOptions, WithLockResult } from './redis-lock.js';
 
-export { createLogger } from './logger.js';
-export type { Logger } from './logger.js';
+export { createLogger, logFormatOptions } from './logger.js';
+export type { Logger, ServiceLogger } from './logger.js';
 
 export {
   AppError,
@@ -19,6 +25,8 @@ export {
 } from './errors.js';
 
 export { InMemoryEventBus } from './events.js';
+export { createInFlightTracker } from './in-flight.js';
+export type { InFlightTracker } from './in-flight.js';
 export type { DomainEvent, EventHandler, EventPersistence, EventBus } from './events.js';
 
 export { generateId, ID_PREFIXES } from './id.js';
@@ -49,7 +57,19 @@ export { createMfaChallenge, verifyMfaChallenge } from './mfa.js';
 export type { CreateChallengeResult } from './mfa.js';
 
 export type { PubSubClient, Subscription } from './pubsub.js';
+export {
+  publishOcppCommand,
+  OCPP_COMMANDS_CHANNEL,
+  OCPP_COMMAND_RESULTS_CHANNEL,
+} from './ocpp-command-publish.js';
+export type { OcppCommand } from './ocpp-command-publish.js';
+export { awaitPubSubReply } from './pubsub-reply.js';
+export type { AwaitReplyOptions } from './pubsub-reply.js';
+export { PNC_COMMANDS_CHANNEL, PNC_COMMAND_RESULTS_CHANNEL } from './pnc-commands.js';
+export type { PncCommand, PncCommandResult } from './pnc-commands.js';
 export { RedisPubSubClient } from './pubsub-redis.js';
+export { logRedisErrors } from './redis-errors.js';
+export { createRedisClient, redisTlsOptions } from './redis-client.js';
 
 export { RedisConnectionRegistry } from './connection-registry.js';
 export type { ConnectionRegistry } from './connection-registry.js';
@@ -84,6 +104,7 @@ export {
   tariffPriceView,
   formatTaxRatePercent,
   costIncludesTax,
+  costContainsTax,
   sessionCostTax,
   taxOnNet,
   taxLineFromNet,
@@ -101,6 +122,7 @@ export {
   splitDimensionByTaxLines,
   dimensionAmounts,
   taxLineForAmount,
+  taxPerRate,
   chargedCostBreakdown,
   reconcileCostBreakdown,
   componentTaxLines,
@@ -119,6 +141,7 @@ export type {
   CostDimension,
   TaxTotals,
   GrossAmountGroup,
+  RatedAmount,
 } from './price-display.js';
 export {
   STATION_PASSWORD_CHARSET,
@@ -196,6 +219,7 @@ export {
   getSystemTimezoneCached,
   resolveRecipients,
   loadTemplateFile,
+  loadSubjectTemplate,
   loadDbTemplate,
   compileTemplate,
   renderTemplate,
@@ -221,7 +245,21 @@ export type {
   EmailAttachment,
 } from './notification-dispatch.js';
 
-export { isPrivateUrl } from './url-validation.js';
+export {
+  isPrivateUrl,
+  parseAllowedPrivateHosts,
+  MAX_ALLOWED_PRIVATE_HOSTS,
+} from './url-validation.js';
+export {
+  safeFetch,
+  isNonPublicAddress,
+  isUnroutableAddress,
+  BlockedDestinationError,
+  blockedDestinationOf,
+  createGuardedLookup,
+  createGuardedAgent,
+} from './safe-fetch.js';
+export type { GuardOptions, SafeFetchInit, SafeFetchResponse } from './safe-fetch.js';
 
 export { sendExpoPush, isExpoPushToken } from './push-send.js';
 export type { ExpoPushMessage, ExpoPushResult } from './push-send.js';
@@ -241,6 +279,7 @@ export {
   stationTaxNoteContext,
   formatStationIdleFeeRate,
   formatStationTime,
+  formatStationElapsed,
   formatStationQuantity,
 } from './station-message.js';
 export type {
@@ -294,6 +333,8 @@ export type { CssConnectorType } from './css-connector-types.js';
 
 export {
   buildCssConfigDefaults,
+  CSS_RECONNECT_SPREAD_S,
+  CSS_RETRY_BACK_OFF_DEFAULTS,
   CSS_STATUS_REPORTING_KEY,
   CSS_STATUS_REPORTING_VALUES,
   CSS_STATUS_REPORTING_DEFAULT,
@@ -316,3 +357,22 @@ export type {
   ElectricityRatePeriod,
   ElectricityRatePeriodRestrictions,
 } from './electricity-rate.js';
+export {
+  MOBILE_APP_URL_SCHEMES_KEY,
+  MOBILE_APP_ANDROID_PACKAGES_KEY,
+  isAppUrlScheme,
+  isAndroidPackageName,
+  isMobileAppSettingKey,
+  parseMobileAppList,
+} from './mobile-app.js';
+export type { MobileAppConfig } from './mobile-app.js';
+
+export { findTemplateTargetConfiguration } from './config-drift.js';
+export type { ReportedConfiguration } from './config-drift.js';
+
+export { storedCostBreakdown, storedSessionCostTax } from './session-tax.js';
+
+export {
+  SIMULATOR_CONNECTION_HEADER,
+  SIMULATOR_CONNECTION_HEADER_VALUE,
+} from './simulator-connection.js';

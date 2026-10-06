@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_K_37_CSMS: Remote start transaction with charging profile - Success
@@ -44,7 +45,7 @@ export const TC_K_37_CSMS: TestCase = {
           remoteStartId = (payload['remoteStartId'] as number) ?? 1;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -88,7 +89,7 @@ export const TC_K_37_CSMS: TestCase = {
 
     // Send TransactionEvent Started with RemoteStart
     if (receivedRemoteStart) {
-      const txId = `OCTT-TX-${String(Date.now())}`;
+      const txId = newTransactionId('OCTT-TX');
       const res = await ctx.client.sendCall('TransactionEvent', {
         eventType: 'Started',
         timestamp: new Date().toISOString(),

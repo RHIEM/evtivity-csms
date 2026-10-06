@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { Queue } from 'bullmq';
-import { createBullMQConnection } from '@evtivity/lib';
+import { createBullMQConnection, logBullMQErrors } from '@evtivity/lib';
 
 export const QUEUE_NAMES = {
   CRON_JOBS: 'cron-jobs',
@@ -12,16 +12,14 @@ export const QUEUE_NAMES = {
   OCTT: 'octt',
   MAINTENANCE_FANOUT: 'maintenance-fanout',
   STATION_WATCH: 'station-watch',
+  PAYMENT_WEBHOOKS: 'payment-webhooks',
+  REMOTE_START_TIMEOUTS: 'remote-start-timeouts',
+  STATION_MESSAGES: 'station-messages',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
-/**
- * Creates all BullMQ queues, each with its own Redis connection.
- * BullMQ blocking commands require dedicated connections per queue.
- * Call once at startup.
- */
-export function createQueues(redisUrl: string): {
+export interface WorkerQueues {
   cronQueue: Queue;
   loadQueue: Queue;
   guestSessionQueue: Queue;
@@ -29,9 +27,20 @@ export function createQueues(redisUrl: string): {
   octtQueue: Queue;
   maintenanceFanoutQueue: Queue;
   stationWatchQueue: Queue;
-} {
+  paymentWebhookQueue: Queue;
+  remoteStartTimeoutQueue: Queue;
+  stationMessageQueue: Queue;
+}
+
+/**
+ * Creates all BullMQ queues, each with its own Redis connection.
+ * BullMQ blocking commands require dedicated connections per queue.
+ * Every queue logs its errors: BullMQ re-emits Redis errors on each Queue and,
+ * unheard, prints every one as a raw stack trace. Call once at startup.
+ */
+export function createQueues(redisUrl: string): WorkerQueues {
   // Each queue needs its own connection for BullMQ blocking commands
-  return {
+  const queues: WorkerQueues = {
     cronQueue: new Queue(QUEUE_NAMES.CRON_JOBS, {
       connection: createBullMQConnection(redisUrl),
       defaultJobOptions: {
@@ -95,5 +104,44 @@ export function createQueues(redisUrl: string): {
         attempts: 1,
       },
     }),
+    // Delayed simulated provider events into the webhook pipeline. Retrying is
+    // safe: the pipeline dedupes each event on its id (webhook_events, P7).
+    paymentWebhookQueue: new Queue(QUEUE_NAMES.PAYMENT_WEBHOOKS, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: {
+        removeOnComplete: 200,
+        removeOnFail: { count: 500 },
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+      },
+    }),
+    // Delayed close-out of accepted remote starts that never became a
+    // transaction. Retrying is safe: the session update is status-guarded and
+    // the hold cancel carries its cancel key.
+    remoteStartTimeoutQueue: new Queue(QUEUE_NAMES.REMOTE_START_TIMEOUTS, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: {
+        removeOnComplete: 200,
+        removeOnFail: { count: 500 },
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+      },
+    }),
+    // Station screen renders: station events, session events, and debounced
+    // repushes after a config change. Retrying is safe: the content hash skips
+    // screens already sent.
+    stationMessageQueue: new Queue(QUEUE_NAMES.STATION_MESSAGES, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: {
+        removeOnComplete: 50,
+        removeOnFail: { count: 100 },
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 5000 },
+      },
+    }),
   };
+  for (const [name, queue] of Object.entries(queues)) {
+    logBullMQErrors(queue, name);
+  }
+  return queues;
 }

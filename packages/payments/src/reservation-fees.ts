@@ -15,6 +15,7 @@ import { taxLineFromNet } from '@evtivity/lib';
 import type { PaymentContext } from './context.js';
 import { errorMessage } from './context.js';
 import { PaymentProviderNotConfiguredError } from './errors.js';
+import { reservationFeeKey } from './idempotency-keys.js';
 import { pinnedProvider } from './pinning.js';
 import {
   findReservationCharge,
@@ -22,6 +23,7 @@ import {
   markChargeFailed,
   recordPendingCharge,
 } from './payment-records.js';
+import { PAYOUT_NOT_READY_FAILURE, sitePayoutReadiness } from './payout-accounts.js';
 import { getSitePaymentConfig } from './settings.js';
 import type { PaymentProvider } from './types.js';
 
@@ -66,11 +68,6 @@ export type ReservationFeeResult =
   | { status: 'duplicate'; paymentRecordId: number }
   | { status: 'failed'; paymentRecordId: number; reason: string };
 
-const IDEMPOTENCY_PREFIX: Record<ReservationFeeType, string> = {
-  reservation_cancellation: 'cancellation-fee',
-  reservation_no_show: 'no-show-fee',
-};
-
 const DESCRIPTION: Record<ReservationFeeType, string> = {
   reservation_cancellation: 'Reservation cancellation fee',
   reservation_no_show: 'Reservation no-show fee',
@@ -92,8 +89,9 @@ export async function chargeReservationFee(
 
   const [method] = await db
     .select({
-      customerId: driverPaymentMethods.stripeCustomerId,
-      methodId: driverPaymentMethods.stripePaymentMethodId,
+      provider: driverPaymentMethods.provider,
+      customerId: driverPaymentMethods.providerCustomerId,
+      methodId: driverPaymentMethods.providerPaymentMethodId,
     })
     .from(driverPaymentMethods)
     .where(
@@ -103,11 +101,15 @@ export async function chargeReservationFee(
       ),
     )
     .limit(1);
-  if (method == null) return { status: 'skipped', reason: 'no_payment_method' };
+  if (method?.customerId == null || method.methodId == null) {
+    return { status: 'skipped', reason: 'no_payment_method' };
+  }
+  const customerId = method.customerId;
+  const methodId = method.methodId;
 
   let provider: PaymentProvider;
   try {
-    provider = await pinnedProvider(ctx.registry, method);
+    provider = await pinnedProvider(ctx.registry, method.provider);
   } catch (err) {
     if (err instanceof PaymentProviderNotConfiguredError) {
       return { status: 'skipped', reason: 'payments_not_configured' };
@@ -128,8 +130,9 @@ export async function chargeReservationFee(
     reservationId: input.reservationId,
     driverId: input.driverId,
     sitePaymentConfigId: site?.configId ?? null,
-    customerId: method.customerId,
-    methodId: method.methodId,
+    provider: provider.id,
+    customerId,
+    methodId,
     currency,
     taxRate,
   });
@@ -138,11 +141,26 @@ export async function chargeReservationFee(
     return { status: 'duplicate', paymentRecordId: existing ?? 0 };
   }
 
+  // O5, fail closed: a payout account that is not ready gets no charge, and
+  // the charge is not moved to the platform either.
+  const readiness =
+    input.siteId != null && site?.payoutAccountId != null
+      ? await sitePayoutReadiness(input.siteId, ctx)
+      : 'none';
+  if (readiness === 'not_ready') {
+    await markChargeFailed(recordId, PAYOUT_NOT_READY_FAILURE);
+    ctx.logger.warn(
+      { paymentRecordId: recordId, reservationId: input.reservationId, siteId: input.siteId },
+      'Reservation fee not charged: the payout account of the site is not ready',
+    );
+    return { status: 'failed', paymentRecordId: recordId, reason: PAYOUT_NOT_READY_FAILURE };
+  }
+
   let paymentId: string;
   try {
     const result = await provider.chargeSavedMethod({
-      customerId: method.customerId,
-      methodId: method.methodId,
+      customerId,
+      methodId,
       grossCents: charge.grossCents,
       currency,
       feeTaxRate: taxRate,
@@ -150,7 +168,7 @@ export async function chargeReservationFee(
       payoutAccountId: site?.payoutAccountId ?? null,
       description: DESCRIPTION[input.type],
       metadata: { reservationId: input.reservationId, type: `${input.type}_fee` },
-      idempotencyKey: `${IDEMPOTENCY_PREFIX[input.type]}-${input.reservationId}`,
+      idempotencyKey: reservationFeeKey(input.type, input.reservationId),
     });
     paymentId = result.paymentId;
   } catch (err) {
@@ -159,7 +177,13 @@ export async function chargeReservationFee(
     return { status: 'failed', paymentRecordId: recordId, reason };
   }
 
-  if (!(await markChargeCaptured(recordId, { paymentId, amountCents: charge.grossCents }))) {
+  if (
+    !(await markChargeCaptured(recordId, {
+      provider: provider.id,
+      paymentId,
+      amountCents: charge.grossCents,
+    }))
+  ) {
     ctx.logger.error(
       { paymentRecordId: recordId, paymentId },
       'Reservation fee charged but its record had moved on; manual reconciliation required',

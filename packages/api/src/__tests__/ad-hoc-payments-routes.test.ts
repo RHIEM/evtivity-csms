@@ -47,7 +47,9 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  // The real SQLSTATE readers, so the mocked errors map as in production.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -65,7 +67,7 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 const sendOcppCommandAndWait = vi.fn();
-vi.mock('../lib/ocpp-command.js', () => ({
+vi.mock('@evtivity/services/ocpp-command', () => ({
   sendOcppCommandAndWait: (...args: unknown[]) => sendOcppCommandAndWait(...args),
 }));
 
@@ -75,7 +77,7 @@ vi.mock('../lib/site-access.js', () => ({
 }));
 
 const getActiveMaintenanceForStation = vi.fn();
-vi.mock('../services/maintenance.service.js', () => ({
+vi.mock('@evtivity/services/maintenance.service', () => ({
   getActiveMaintenanceForStation: (...args: unknown[]) => getActiveMaintenanceForStation(...args),
 }));
 

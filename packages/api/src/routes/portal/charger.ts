@@ -14,7 +14,7 @@ import {
   isStationChargingFree,
   resolveStationTariff,
 } from '@evtivity/database';
-import { decryptString, notificationMoney, TAX_BASES } from '@evtivity/lib';
+import { decryptString, notificationMoney, publishOcppCommand, TAX_BASES } from '@evtivity/lib';
 import { config as apiConfig } from '../../lib/config.js';
 import {
   chargingStations,
@@ -32,9 +32,11 @@ import {
 } from '@evtivity/database';
 import { checkStationOnboarded } from '../../lib/onboarding-gate.js';
 import { zodSchema } from '../../lib/zod-schema.js';
-import { sessionCurrencySql } from '../../lib/company-currency.js';
+import { requestGhostSessionEnd } from '../../lib/ghost-session-end.js';
+import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { ID_PARAMS } from '../../lib/id-validation.js';
-import { getPubSub } from '../../lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { scheduleRemoteStartTimeout } from '../../lib/remote-start-timeout.js';
 import {
   errorResponse,
   itemResponse,
@@ -43,18 +45,15 @@ import {
 } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { getS3Config, generateDownloadUrl } from '../../services/s3.service.js';
-import {
-  sendOcppCommandAndWait,
-  sendStatusCheckError,
-  triggerAndWaitForStatus,
-} from '../../lib/ocpp-command.js';
-import { applyReservationCancellation } from '../../lib/reservation-cancel.js';
+import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
+import { sendStatusCheckError, triggerAndWaitForStatus } from '../../lib/station-status-check.js';
+import { applyReservationCancellation } from '@evtivity/services/reservation-cancel';
 import { assertReservationsAllowed } from '../../lib/reservation-eligibility.js';
 import {
   assertNoMaintenanceConflict,
   MaintenanceConflictError,
-} from '../../lib/maintenance-check.js';
-import { getActiveMaintenanceForStation } from '../../services/maintenance.service.js';
+} from '@evtivity/services/maintenance-check';
+import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
 import { renderMaintenanceMessage } from '@evtivity/lib';
 import {
   isStationCheckRateLimited,
@@ -62,11 +61,11 @@ import {
   setCachedConnectorStatus,
 } from '../../lib/rate-limiters.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
-import { authorizeSessionHold } from '@evtivity/payments';
+import { authorizeSessionHold, cancelOpenSessionHold } from '@evtivity/payments';
 import { activePaymentProvider, paymentContext } from '../../lib/payments.js';
 import { resolvePaymentMode } from '../../services/driver.service.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
-import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import { isEvseInReservationBuffer } from '../../lib/reservation-buffer.js';
 
 const portalConnectorItem = z
@@ -1596,7 +1595,10 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             ERROR_CODES.MAINTENANCE_ACTIVE,
             ERROR_CODES.STATION_UNAVAILABLE,
           ]),
-          500: errorWith('Internal server error', [ERROR_CODES.INTERNAL_ERROR]),
+          500: errorWith('Internal server error', [
+            ERROR_CODES.INTERNAL_ERROR,
+            ERROR_CODES.SESSION_CREATE_FAILED,
+          ]),
           502: errorWith('Start rejected', [ERROR_CODES.START_REJECTED]),
           504: errorWith('Station timeout', [ERROR_CODES.STATION_TIMEOUT]),
         },
@@ -1829,14 +1831,29 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       const remoteStartId = Math.floor(Math.random() * 2_147_483_647);
       let transactionId: string;
       if (station.ocppProtocol === 'ocpp1.6') {
+        // The sequence is the only source of 1.6 transaction ids: a made-up id
+        // could collide with another session, so a failed read fails the start
+        // before any session or hold exists.
+        let nextval: string | undefined;
         try {
           const [row] = await db.execute<{ nextval: string }>(
             sql`SELECT nextval('ocpp16_transaction_id_seq')`,
           );
-          transactionId = row?.nextval ?? String(Math.floor(Date.now() / 1000) % 2_147_483_647);
-        } catch {
-          transactionId = String(Math.floor(Date.now() / 1000) % 2_147_483_647);
+          nextval = row?.nextval;
+          if (nextval == null) throw new Error('ocpp16_transaction_id_seq returned no value');
+        } catch (err) {
+          request.log.error(
+            { err, stationId: station.stationId },
+            'Portal start: could not allocate an OCPP 1.6 transaction id',
+          );
         }
+        if (nextval == null) {
+          await reply
+            .status(500)
+            .send({ error: 'Failed to create session', code: 'SESSION_CREATE_FAILED' });
+          return;
+        }
+        transactionId = nextval;
       } else {
         transactionId = crypto.randomUUID();
       }
@@ -1999,6 +2016,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
                 { stationId: station.stationId },
                 'TxInProgress recovery: retry succeeded',
               );
+              await scheduleRemoteStartTimeout(
+                { kind: 'session', sessionId: session.id },
+                station,
+                request.log,
+              );
               return { chargingSessionId: session.id };
             }
             // Retry failed, fall through to fault the session
@@ -2009,6 +2031,21 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           .update(chargingSessions)
           .set({ status: 'faulted', updatedAt: new Date() })
           .where(eq(chargingSessions.id, session.id));
+        // The station will not start: the hold placed above is released now
+        // instead of staying open until the provider expires it (P4).
+        // Best effort (P9): the start already failed for the driver.
+        try {
+          await cancelOpenSessionHold(
+            session.id,
+            `Station rejected the start: ${cmdStatus ?? 'Unknown'}`,
+            paymentContext(request.log),
+          );
+        } catch (err) {
+          request.log.warn(
+            { err, sessionId: session.id },
+            'Failed to cancel the hold of a rejected start',
+          );
+        }
         const reason = `Station rejected: ${cmdStatus ?? 'Unknown'}`;
         void dispatchDriverNotification(
           client,
@@ -2025,6 +2062,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         return;
       }
 
+      await scheduleRemoteStartTimeout(
+        { kind: 'session', sessionId: session.id },
+        station,
+        request.log,
+      );
       return { chargingSessionId: session.id };
     },
   );
@@ -2081,7 +2123,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         tags: ['Portal Chargers'],
         summary: 'Stop an active charging session',
         description:
-          'Sends RequestStopTransaction (OCPP 2.1) or RemoteStopTransaction (OCPP 1.6) for the supplied sessionId and waits up to 35s for the station response. If the station rejects with reasonCode=TxNotFound (a "ghost session"), the API automatically marks the session faulted in the database and returns status=ghostRecovered. Returns 404 if the session does not exist or is not owned by the driver, 504 if the station does not respond within the timeout window.',
+          'Sends RequestStopTransaction (OCPP 2.1) or RemoteStopTransaction (OCPP 1.6) for the supplied sessionId and waits up to 35s for the station response. If the station rejects with reasonCode=TxNotFound (a "ghost session"), the API asks the OCPP server to end the session as completed and billed at its last metered energy, and returns status=ghostRecovered. Returns 404 if the session does not exist or is not owned by the driver, 504 if the station does not respond within the timeout window.',
         operationId: 'portalStopSession',
         security: [{ bearerAuth: [] }],
         params: zodSchema(sessionIdParams),
@@ -2137,24 +2179,12 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       const isGhost = status === 'Rejected' && statusInfo?.reasonCode === 'TxNotFound';
 
       if (isGhost) {
-        await db.execute(sql`
-          UPDATE charging_sessions
-          SET status = 'faulted',
-              stopped_reason = 'TxNotFound',
-              ended_at = now(),
-              final_cost_cents = COALESCE(final_cost_cents, current_cost_cents),
-              updated_at = now()
-          WHERE id = ${session.id} AND status = 'active'
-        `);
-        await db.execute(sql`
-          UPDATE session_tariff_segments
-          SET ended_at = now(),
-              duration_minutes = EXTRACT(EPOCH FROM (now() - started_at)) / 60
-          WHERE session_id = ${session.id} AND ended_at IS NULL
-        `);
+        // Ghost session: ended completed and billed by the OCPP server, as on the
+        // operator stop (the station has no record of the transaction).
+        await requestGhostSessionEnd(session.id, request.log);
         request.log.info(
           { sessionId: session.id, transactionId: session.transactionId },
-          'Ghost session recovered: station returned TxNotFound, marked DB faulted',
+          'Ghost session recovered: station returned TxNotFound, session end requested',
         );
         return { status: 'ghostRecovered', chargingSessionId: session.id };
       }
@@ -2636,7 +2666,6 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         );
       } else {
         // Send ReserveNow to station immediately
-        const commandId = crypto.randomUUID();
         const ocppPayload: Record<string, unknown> = {
           id: reservationId,
           expiryDateTime: body.expiresAt,
@@ -2646,14 +2675,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           ocppPayload['evseId'] = body.evseId;
         }
 
-        const notification = JSON.stringify({
-          commandId,
+        await publishOcppCommand(getPubSub(), {
           stationId: body.stationId,
           action: 'ReserveNow',
           payload: ocppPayload,
         });
-
-        await getPubSub().publish('ocpp_commands', notification);
       }
 
       // Notify driver of reservation
@@ -2727,15 +2753,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
 
       // Skip OCPP CancelReservation for scheduled reservations (not yet sent to station)
       if (reservation.status === 'active') {
-        const commandId = crypto.randomUUID();
-        const notification = JSON.stringify({
-          commandId,
+        await publishOcppCommand(getPubSub(), {
           stationId: reservation.stationOcppId,
           action: 'CancelReservation',
           payload: { reservationId: reservation.reservationId },
         });
-
-        await getPubSub().publish('ocpp_commands', notification);
       }
 
       // Driver-initiated: chargeFee=true. The helper still gates on the
@@ -2752,6 +2774,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           actorDriverId: driverId,
           reason: 'driver_initiated',
           chargeFee: true,
+          payments: paymentContext(request.log),
           logger: request.log,
         });
 

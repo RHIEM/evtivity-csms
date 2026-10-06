@@ -4,7 +4,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, ne, and, or, ilike, sql, desc, asc } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import { db, pgErrorCode, PG_UNIQUE_VIOLATION, PG_FOREIGN_KEY_VIOLATION } from '@evtivity/database';
 import {
   drivers,
   driverTokens,
@@ -25,7 +25,7 @@ import { getAuditActor } from '../lib/audit-actor.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import { zodSchema } from '../lib/zod-schema.js';
-import { sessionCurrencySql } from '../lib/company-currency.js';
+import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
@@ -34,7 +34,7 @@ import * as tokenService from '../services/token.service.js';
 import { getPortalAccess, inviteDriverToPortal } from '../services/driver-portal-access.service.js';
 import { OCPP_TOKEN_TYPES } from './tokens.js';
 import type { JwtPayload } from '../plugins/auth.js';
-import { isValidTimezone } from '@evtivity/lib';
+import { isValidTimezone, UI_LANGUAGES } from '@evtivity/lib';
 import {
   paginatedResponse,
   itemResponse,
@@ -50,6 +50,9 @@ const driverItem = z
     lastName: z.string().max(100).nullable().describe('Driver last name'),
     email: z.string().email().max(255).nullable().describe('Driver email address'),
     phone: z.string().max(50).nullable().describe('Driver phone number in E.164 format'),
+    language: z
+      .string()
+      .describe('Preferred language of the portal, notifications and invoices (e.g. en, de)'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
     paymentMode: z
       .enum(['card', 'invoice'])
@@ -173,6 +176,9 @@ const paymentModeField = z
   .describe(
     'Payment mode override: card (payment method + pre-authorization) or invoice (billed later through an aggregated invoice). Null inherits the fleet payment mode.',
   );
+const driverLanguage = z
+  .enum(UI_LANGUAGES)
+  .describe('Preferred language of the portal, notifications and invoices');
 
 const createDriverBody = z.object({
   firstName: z.string().max(100),
@@ -180,6 +186,7 @@ const createDriverBody = z.object({
   email: z.string().email().optional(),
   phone: z.string().max(50).optional(),
   paymentMode: paymentModeField,
+  language: driverLanguage.optional().describe('Preferred language (default en)'),
 });
 
 const updateDriverBody = z.object({
@@ -187,6 +194,7 @@ const updateDriverBody = z.object({
   lastName: z.string().max(100).optional(),
   email: z.string().email().optional(),
   phone: z.string().max(50).optional(),
+  language: driverLanguage.optional(),
   isActive: z.boolean().optional().describe('Whether the driver account is active'),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
   paymentMode: paymentModeField,
@@ -470,11 +478,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // The pre-check above is non-transactional, so two concurrent POSTs with the
         // same lowercased email can both pass it and race here. The partial unique
         // index uq_drivers_email_lower (migration 0052) raises 23505 on the loser.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
         }
@@ -544,6 +548,7 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.lastName !== undefined) fields['lastName'] = body.lastName;
       if (body.email !== undefined) fields['email'] = body.email;
       if (body.phone !== undefined) fields['phone'] = body.phone;
+      if (body.language !== undefined) fields['language'] = body.language;
       if (body.isActive !== undefined) fields['isActive'] = body.isActive;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
       if (body.paymentMode !== undefined) fields['paymentMode'] = body.paymentMode;
@@ -564,11 +569,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // Same race as POST: the eq() collision pre-check is non-transactional,
         // so a concurrent INSERT/UPDATE with the same lowercased email can
         // happen between the check and this UPDATE.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
         }
@@ -762,11 +763,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // Pre-check is non-transactional, so the driver can be deleted
         // between the check and this INSERT. Map the FK violation back
         // to the same 404 the pre-check would have produced.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
+        if (pgErrorCode(err) === PG_FOREIGN_KEY_VIOLATION) {
           await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
           return;
         }
@@ -1255,11 +1252,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // The pre-check is non-transactional, so the pricing group can be
         // deleted between the lookup and this INSERT. Map the FK violation
         // back to 404 — same pattern as sites/stations/fleets.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
+        if (pgErrorCode(err) === PG_FOREIGN_KEY_VIOLATION) {
           await reply
             .status(404)
             .send({ error: 'Pricing group not found', code: 'PRICING_GROUP_NOT_FOUND' });

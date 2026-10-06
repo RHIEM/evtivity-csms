@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station and send StatusNotification
 async function bootAndStatus(ctx: {
@@ -63,7 +64,7 @@ export const TC_G_03_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -168,7 +169,7 @@ export const TC_G_04_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -261,7 +262,7 @@ export const TC_G_07_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -362,7 +363,7 @@ export const TC_G_08_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -439,7 +440,7 @@ export const TC_G_11_CSMS: TestCase = {
     await bootAndStatus(ctx);
 
     // Start a transaction
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -460,7 +461,7 @@ export const TC_G_11_CSMS: TestCase = {
           operationalStatus = String(payload['operationalStatus'] ?? '');
           return { status: 'Scheduled' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -554,7 +555,7 @@ export const TC_G_17_CSMS: TestCase = {
     await bootAndStatus(ctx);
 
     // Start a transaction
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -575,7 +576,7 @@ export const TC_G_17_CSMS: TestCase = {
           operationalStatus = String(payload['operationalStatus'] ?? '');
           return { status: 'Scheduled' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

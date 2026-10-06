@@ -33,6 +33,8 @@ function createMockContext(stationId: string): HandlerContext {
     eventBus: {
       publish: () => Promise.resolve(),
       subscribe: () => {},
+      drain: () => Promise.resolve(true),
+      track: <T>(work: Promise<T>) => work,
     },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],

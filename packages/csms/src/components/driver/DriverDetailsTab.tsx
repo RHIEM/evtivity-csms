@@ -10,12 +10,14 @@ import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
+import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TabsContent } from '@/components/ui/tabs';
 import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
 import { DriverPortalAccessCard, type PortalAccess } from './DriverPortalAccessCard';
+import { DriverPncContractsCard } from './DriverPncContractsCard';
 
 interface Driver {
   id: string;
@@ -23,6 +25,7 @@ interface Driver {
   lastName: string;
   email: string | null;
   phone: string | null;
+  language: string;
   isActive: boolean;
   paymentMode: PaymentMode | null;
   createdAt: string;
@@ -46,6 +49,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  const [language, setLanguage] = useState('en');
   const [isActive, setIsActive] = useState(true);
   const [paymentMode, setPaymentMode] = useState<PaymentMode | ''>('');
   const [hasSubmittedEdit, setHasSubmittedEdit] = useState(false);
@@ -56,6 +60,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       lastName?: string;
       email?: string;
       phone?: string;
+      language?: string;
       isActive?: boolean;
       paymentMode?: PaymentMode | null;
     }) => api.patch<Driver>(`/v1/drivers/${driver.id}`, body),
@@ -72,6 +77,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setLastName(driver.lastName);
     setEmail(driver.email ?? '');
     setPhone(driver.phone ?? '');
+    setLanguage(driver.language);
     setIsActive(driver.isActive);
     setPaymentMode(driver.paymentMode ?? '');
     setEditing(true);
@@ -99,6 +105,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       lastName,
       ...(email !== '' ? { email } : {}),
       ...(phone !== '' ? { phone } : {}),
+      language,
       isActive,
       paymentMode: paymentMode === '' ? null : paymentMode,
     });
@@ -174,6 +181,13 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 />
               </div>
               <div className="space-y-2">
+                <Label htmlFor="edit-language" className="leading-6">
+                  {t('drivers.language')}
+                </Label>
+                <LanguageSelect id="edit-language" value={language} onChange={setLanguage} />
+                <p className="text-sm text-muted-foreground">{t('drivers.languageHelp')}</p>
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="edit-payment-mode">{t('payments.paymentMode')}</Label>
                 <Select
                   id="edit-payment-mode"
@@ -231,6 +245,13 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 <dd className="font-medium">{driver.phone ?? t('common.na')}</dd>
               </div>
               <div>
+                <dt className="text-muted-foreground">{t('drivers.language')}</dt>
+                <dd className="font-medium">
+                  {LANGUAGES.find((lang) => lang.code === driver.language)?.label ??
+                    driver.language}
+                </dd>
+              </div>
+              <div>
                 <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
                 <dd className="font-medium">
                   {driver.paymentMode === 'invoice'
@@ -261,6 +282,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
         </CardContent>
       </Card>
       <DriverPortalAccessCard driver={driver} timezone={timezone} />
+      <DriverPncContractsCard driverId={driver.id} timezone={timezone} />
     </TabsContent>
   );
 }

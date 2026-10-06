@@ -5,7 +5,13 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and, isNull, isNotNull, ilike } from 'drizzle-orm';
 import argon2 from 'argon2';
-import { db, client, isPortalRegistrationEnabled } from '@evtivity/database';
+import {
+  db,
+  client,
+  isPortalRegistrationEnabled,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+} from '@evtivity/database';
 import { drivers, userTokens } from '@evtivity/database';
 import {
   dispatchDriverNotification,
@@ -19,8 +25,8 @@ import { setAuthCookies, clearAuthCookies, isSecureRequest } from '../../lib/aut
 import { zodSchema } from '../../lib/zod-schema.js';
 import { generateUserToken, hashUserToken } from '../../lib/user-token.js';
 import { validatePasswordComplexity } from '../../lib/password-validation.js';
-import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
-import { getPubSub } from '../../lib/pubsub.js';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { itemResponse, successResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { checkRecaptcha } from '../../lib/recaptcha-check.js';
@@ -295,11 +301,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         // concurrent registrations with the same email both reach this INSERT.
         // The partial unique index on LOWER(email) (migration 0052) makes the
         // loser 23505; map it back to 409 EMAIL_EXISTS instead of leaking 500.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({ error: 'Email already registered', code: 'EMAIL_EXISTS' });
           return;
         }

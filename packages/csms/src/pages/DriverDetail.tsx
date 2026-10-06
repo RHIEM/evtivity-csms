@@ -36,6 +36,7 @@ interface Driver {
   lastName: string;
   email: string | null;
   phone: string | null;
+  language: string;
   isActive: boolean;
   paymentMode: 'card' | 'invoice' | null;
   createdAt: string;

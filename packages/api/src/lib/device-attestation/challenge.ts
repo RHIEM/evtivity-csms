@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { randomBytes } from 'node:crypto';
-import { Redis } from 'ioredis';
+import type { Redis } from 'ioredis';
+import { createRedisClient } from '@evtivity/lib';
 import { config } from '../config.js';
 
 // Single-use nonces back the attestation challenge. Stored in Redis with a short
@@ -13,7 +14,7 @@ const TTL_SECONDS = 300;
 let redis: Redis | null = null;
 function client(): Redis {
   if (redis == null) {
-    redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: 2 });
+    redis = createRedisClient(config.REDIS_URL, 'attestation-nonces', { maxRetriesPerRequest: 2 });
   }
   return redis;
 }

@@ -3,6 +3,7 @@
 
 import postgres from 'postgres';
 import nodemailer from 'nodemailer';
+import { convert as htmlToText } from 'html-to-text';
 import { readFile } from 'node:fs/promises';
 import { createLogger } from './logger.js';
 import { decryptString } from './encryption.js';
@@ -10,6 +11,7 @@ import { DEFAULT_CURRENCY } from './currency.js';
 import { formatDateTime } from './timezone.js';
 import { formatLocalizedVariables } from './notification-values.js';
 import { isPrivateUrl } from './url-validation.js';
+import { blockedDestinationOf, safeFetch } from './safe-fetch.js';
 import { sendExpoPush } from './push-send.js';
 import { compileAllowedTemplate, type TemplateRenderer } from './template-safety.js';
 import type { PubSubClient } from './pubsub.js';
@@ -77,6 +79,7 @@ const SENSITIVE_EVENT_TYPES = new Set([
   'operator.UserCreated',
   'operator.AccountVerification',
   'operator.Welcome',
+  'site.PayoutOnboarding',
 ]);
 
 // Replace 6-digit codes (OTP/MFA) and known token-bearing URL parameters
@@ -103,6 +106,7 @@ export const DATE_VARIABLE_NAMES = [
   'occurredAt',
   'issuedAt',
   'dueAt',
+  'refundedAt',
 ];
 
 /** Date and time without seconds, e.g. "Mar 5, 2026, 9:04 AM" (en) or "05.03.2026, 09:04" (de). */
@@ -411,53 +415,45 @@ export function compileTemplate(source: string, variables: Record<string, unknow
   return compiled(variables);
 }
 
-const FRIENDLY_SUBJECTS: Record<string, string> = {
-  'session.Started': '{{{companyName}}} - Your charging session has started',
-  'session.Updated': '{{{companyName}}} - Charging session update',
-  'session.Completed': '{{{companyName}}} - Your charging session is complete',
-  'session.PaymentReceived': '{{{companyName}}} - Payment received',
-  'session.Faulted': '{{{companyName}}} - Charging session failed to start',
-  'driver.Welcome': '{{{companyName}}} - Welcome',
-  'driver.ForgotPassword': '{{{companyName}}} - Reset your password',
-  'driver.PortalInvite': '{{{companyName}}} - Set up your driver account',
-  'driver.PasswordChanged': '{{{companyName}}} - Password changed',
-  'driver.MfaDisabled': '{{{companyName}}} - Two-factor authentication disabled',
-  'driver.AccountVerification': '{{{companyName}}} - Verify your account',
-  'payment.Complete': '{{{companyName}}} - Payment confirmation',
-  'payment.Refunded': '{{{companyName}}} - Refund processed',
-  'payment.PreAuthFailed': '{{{companyName}}} - Payment authorization failed',
-  'payment.CaptureFailed': '{{{companyName}}} - Payment capture failed',
-  'payment.MissingPaymentMethod': '{{{companyName}}} - Payment method required',
-  'reservation.Created': '{{{companyName}}} - Reservation confirmed',
-  'reservation.Cancelled': '{{{companyName}}} - Reservation cancelled',
-  'reservation.Expiring': '{{{companyName}}} - Your reservation is expiring soon',
-  'reservation.Expired': '{{{companyName}}} - Your reservation has expired',
-  'reservation.StationFaulted': '{{{companyName}}} - Reserved station is unavailable',
-  'invoice.Sent': '{{{companyName}}} - Invoice {{invoiceNumber}}',
-  'watch.StationAvailable': '{{{companyName}}} - {{stationName}} is now available',
-  'token.Added': '{{{companyName}}} - New RFID card added to your account',
-  'token.Removed': '{{{companyName}}} - RFID card removed from your account',
-  'token.Deactivated': '{{{companyName}}} - RFID card deactivated',
-  'token.Reactivated': '{{{companyName}}} - RFID card reactivated',
-  'session.Receipt': '{{{companyName}}} - Charging session receipt',
-  'session.IdlingStarted': '{{{companyName}}} - Your vehicle has stopped charging',
-  'supportCase.Created': '{{{companyName}}} - Your support case has been opened',
-  'supportCase.OperatorReply': '{{{companyName}}} - New reply on your support case',
-  'supportCase.Resolved': '{{{companyName}}} - Your support case has been resolved',
-  'mfa.VerificationCode': '{{{companyName}}} - Your verification code',
-  'operator.ForgotPassword': '{{{companyName}}} - Reset your password',
-  'operator.UserCreated': '{{{companyName}}} - Set your password to get started',
-  'operator.PasswordChanged': '{{{companyName}}} - Password changed',
-  'report.Scheduled': '{{{companyName}}} - Scheduled report',
-};
+// Default subjects live next to the bodies as `subject.hbs` in each
+// template folder ({language}/{eventDir}/subject.hbs), so they follow the
+// recipient's language. This generic subject is only for an event with no
+// template folder, whose body is the JSON fallback.
+const GENERIC_SUBJECT = '{{{companyName}}} - {{{eventType}}} Notification';
 
-function defaultSubject(eventType: string, variables: Record<string, unknown>): string {
-  const friendly = FRIENDLY_SUBJECTS[eventType];
-  if (friendly != null) return compileTemplate(friendly, variables);
-  return compileTemplate('{{companyName}} - {{eventType}} Notification', {
-    ...variables,
-    eventType,
-  });
+/**
+ * Finds the default subject template source for an event: the first template
+ * directory that has the event, in the requested language, else `en`. Returns
+ * null when no directory has a `subject.hbs` for the event.
+ */
+export async function loadSubjectTemplate(
+  eventType: string,
+  language: string,
+  templatesDir?: string | string[],
+): Promise<string | null> {
+  if (templatesDir == null) return null;
+  const { resolve } = await import('node:path');
+  const dirs = Array.isArray(templatesDir) ? templatesDir : [templatesDir];
+  const eventDir = eventType.replace(/\./g, '/');
+  for (const dir of dirs) {
+    let content = await loadTemplateFile(resolve(dir, language, eventDir, 'subject.hbs'));
+    if (content == null && language !== 'en') {
+      content = await loadTemplateFile(resolve(dir, 'en', eventDir, 'subject.hbs'));
+    }
+    if (content != null) return content.trim();
+  }
+  return null;
+}
+
+async function defaultSubject(
+  eventType: string,
+  language: string,
+  variables: Record<string, unknown>,
+  templatesDir?: string | string[],
+): Promise<string> {
+  const source = await loadSubjectTemplate(eventType, language, templatesDir);
+  if (source != null) return compileTemplate(source, variables).trim();
+  return compileTemplate(GENERIC_SUBJECT, { ...variables, eventType });
 }
 
 export async function renderTemplate(
@@ -473,7 +469,7 @@ export async function renderTemplate(
   if (templateHtmlOverride != null && templateHtmlOverride !== '') {
     const rendered = compileTemplate(templateHtmlOverride, variables);
     const result: RenderedTemplate = {
-      subject: defaultSubject(eventType, variables),
+      subject: await defaultSubject(eventType, language, variables, templatesDir),
       body: rendered,
     };
     if (channel === 'email') result.html = rendered;
@@ -490,7 +486,7 @@ export async function renderTemplate(
       const subject =
         dbTemplate.subject != null
           ? compileTemplate(dbTemplate.subject, variables)
-          : defaultSubject(eventType, variables);
+          : await defaultSubject(eventType, language, variables, templatesDir);
       const rendered = compileTemplate(dbTemplate.bodyHtml, variables);
       const result: RenderedTemplate = { subject, body: rendered };
       if (channel === 'email') result.html = rendered;
@@ -514,7 +510,7 @@ export async function renderTemplate(
       if (content != null) {
         const rendered = compileTemplate(content, variables);
         const result: RenderedTemplate = {
-          subject: defaultSubject(eventType, variables),
+          subject: await defaultSubject(eventType, language, variables, templatesDir),
           body: rendered.trim(),
         };
         if (channel === 'email') result.html = rendered;
@@ -525,7 +521,7 @@ export async function renderTemplate(
 
   // Fallback: JSON dump
   return {
-    subject: defaultSubject(eventType, variables),
+    subject: await defaultSubject(eventType, language, variables, templatesDir),
     body: JSON.stringify(variables, null, 2),
   };
 }
@@ -538,6 +534,27 @@ export interface EmailAttachment {
   contentType?: string;
 }
 
+/**
+ * The plain-text alternative of an HTML email: readable text with links as
+ * "label [url]" and images left out. Mail clients that show the text/plain
+ * part (text-only clients, previews, screen readers in plain mode) would
+ * otherwise show the raw HTML template.
+ */
+export function emailTextFromHtml(html: string): string {
+  return htmlToText(html, {
+    wordwrap: 100,
+    selectors: [
+      { selector: 'img', format: 'skip' },
+      { selector: 'a', options: { hideLinkHrefIfSameAsText: true } },
+    ],
+  }).trim();
+}
+
+/**
+ * Sends one email. With `html`, the text/plain part is derived from it
+ * (`emailTextFromHtml`), because the rendered email `body` is the HTML
+ * template; without `html`, `body` is the plain text.
+ */
 export async function sendEmail(
   config: SmtpConfig,
   to: string,
@@ -564,7 +581,7 @@ export async function sendEmail(
       from: config.from,
       to,
       subject,
-      text: body,
+      text: html != null ? emailTextFromHtml(html) : body,
       html: html ?? undefined,
       attachments: attachments?.map((a) => ({
         filename: a.filename,
@@ -628,6 +645,18 @@ export async function sendSms(config: TwilioConfig, to: string, body: string): P
   }
 }
 
+function isAllowedHost(url: string, allowedPrivateHosts: readonly string[]): boolean {
+  if (allowedPrivateHosts.length === 0) return false;
+  try {
+    const { protocol, hostname } = new URL(url);
+    if (protocol !== 'http:' && protocol !== 'https:') return false;
+    const host = hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+    return allowedPrivateHosts.some((h) => h.toLowerCase() === host);
+  } catch {
+    return false;
+  }
+}
+
 export type WebhookResult =
   | 'ok'
   | 'blocked_private_url'
@@ -635,13 +664,19 @@ export type WebhookResult =
   | 'network_error'
   | 'timeout';
 
+/**
+ * POSTs the notification as JSON. A URL that is, or resolves to, a private
+ * address is refused (`blocked_private_url`) unless its host is in
+ * `allowedPrivateHosts` (`notifications.webhookAllowedPrivateHosts`).
+ */
 export async function sendWebhook(
   url: string,
   subject: string,
   body: string,
   variables: Record<string, unknown>,
+  allowedPrivateHosts: readonly string[] = [],
 ): Promise<WebhookResult> {
-  if (isPrivateUrl(url)) {
+  if (isPrivateUrl(url) && !isAllowedHost(url, allowedPrivateHosts)) {
     logger.warn({ url }, 'Blocked webhook to private/internal URL');
     return 'blocked_private_url';
   }
@@ -653,7 +688,10 @@ export async function sendWebhook(
     controller.abort();
   }, 10_000);
   try {
-    const response = await fetch(url, {
+    // safeFetch resolves the host and refuses any private address at connect
+    // time (redirects included), which the URL check above cannot see.
+    const response = await safeFetch(url, {
+      allowedPrivateHosts,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ subject, body, ...variables }),
@@ -666,6 +704,14 @@ export async function sendWebhook(
     }
     return 'ok';
   } catch (err) {
+    const blocked = blockedDestinationOf(err);
+    if (blocked != null) {
+      logger.warn(
+        { url, address: blocked.address },
+        'Blocked webhook to a host that resolves to a private address',
+      );
+      return 'blocked_private_url';
+    }
     const isAbort =
       err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'));
     logger.error({ err, url }, isAbort ? 'Webhook timed out' : 'Failed to send webhook');

@@ -10,6 +10,7 @@ import {
   formatStationIdleFeeRate,
   formatStationQuantity,
   formatStationTime,
+  formatStationElapsed,
   type StationMessageContext,
   type StationMessageState,
 } from '../station-message.js';
@@ -264,6 +265,17 @@ describe('renderStationMessage', () => {
       expect(result).toBe('Reserved\n\nuntil 3:45 PM');
     });
 
+    it('renders the brand line, or the company name when it is empty', async () => {
+      await setBody('{{brandLine}}\n{{stationOcppId}}');
+      expect(await renderStationMessage('available', { ...baseContext, brandLine: 'ACME' })).toBe(
+        'ACME\nCS-1234',
+      );
+      expect(await renderStationMessage('available', { ...baseContext, brandLine: '  ' })).toBe(
+        'EVtivity\nCS-1234',
+      );
+      expect(await renderStationMessage('available', baseContext)).toBe('EVtivity\nCS-1234');
+    });
+
     it('returns empty string when the template row does not exist', async () => {
       const mod = (await import('@evtivity/database')) as unknown as {
         __mocks: { whereFn: ReturnType<typeof vi.fn> };
@@ -513,5 +525,35 @@ describe('station formatters', () => {
     const time = new Date('2026-05-06T15:45:00Z');
     expect(formatStationTime(time, 'de', 'Europe/Berlin')).toBe('17:45');
     expect(formatStationTime(time, 'en', 'America/New_York')).toMatch(/^11:45\sAM$/);
+  });
+
+  it('formats the elapsed time in the display language', () => {
+    const start = new Date(0);
+    const minutes = (n: number): number => n * 60_000;
+    expect(formatStationElapsed(start, 'en', minutes(12))).toBe('12m');
+    expect(formatStationElapsed(start, 'en', minutes(65))).toBe('1h 5m');
+    expect(formatStationElapsed(start, 'en', minutes(120))).toBe('2h 0m');
+    expect(formatStationElapsed(start, 'en', 0)).toBe('0m');
+    // Other languages use the narrow unit names of the runtime's CLDR data, which
+    // change between Node releases (German narrow hours: "1 Std." in CLDR 47,
+    // "1h" in CLDR 48). Compare with Intl itself, not a fixed string.
+    const narrow = (locale: string, duration: { hours?: number; minutes: number }): string =>
+      new Intl.DurationFormat(locale, { style: 'narrow', minutesDisplay: 'always' }).format(
+        duration,
+      );
+    for (const language of ['de', 'es', 'ko', 'zh', 'zh-TW'] as const) {
+      const elapsed = formatStationElapsed(start, language, minutes(65));
+      expect(elapsed).toBe(narrow(language, { hours: 1, minutes: 5 }));
+      expect(elapsed).not.toBe('1h 5m');
+    }
+    expect(formatStationElapsed(start.toISOString(), 'es', minutes(12))).toBe(
+      narrow('es', { minutes: 12 }),
+    );
+  });
+
+  it('formats no elapsed time without a start or for a future start', () => {
+    expect(formatStationElapsed(null, 'en')).toBe('');
+    expect(formatStationElapsed(new Date(60_000), 'en', 0)).toBe('');
+    expect(formatStationElapsed('not a date', 'en')).toBe('');
   });
 });

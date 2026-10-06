@@ -3,10 +3,11 @@
 
 import { createServer } from 'node:http';
 import postgres from 'postgres';
-import { RedisPubSubClient } from '@evtivity/lib';
+import { RedisPubSubClient, connectionName, createInFlightTracker } from '@evtivity/lib';
 import { SimulatorManager } from './simulator-manager.js';
 import { ChaosOrchestrator } from './chaos-orchestrator.js';
 import { config } from './lib/config.js';
+import { createCssShutdown } from './lib/shutdown.js';
 
 const databaseUrl = config.DATABASE_URL;
 const redisUrl = config.REDIS_URL;
@@ -15,7 +16,10 @@ const healthPort = config.CSS_HEALTH_PORT;
 const actionIntervalMs = config.CSS_ACTION_INTERVAL_MS;
 const stationLimit = config.CSS_STATION_LIMIT;
 
-const sql = postgres(databaseUrl);
+const sql = postgres(databaseUrl, {
+  max: config.DB_POOL_MAX,
+  connection: { application_name: connectionName() },
+});
 const pubsub = new RedisPubSubClient(redisUrl);
 const manager = new SimulatorManager(sql, pubsub);
 
@@ -43,9 +47,15 @@ async function waitForSchema(): Promise<void> {
 async function main(): Promise<void> {
   await waitForSchema();
 
-  // Subscribe to css_commands channel
-  await pubsub.subscribe('css_commands', (raw: string) => {
-    void manager.handleCommand(raw);
+  // Subscribe to css_commands channel. Running commands are tracked so
+  // shutdown waits for them before closing pub/sub and the database.
+  const commands = createInFlightTracker();
+  const commandSubscription = await pubsub.subscribe('css_commands', (raw: string) => {
+    void commands.track(
+      manager.handleCommand(raw).catch((err: unknown) => {
+        console.error('[css] css_commands handling failed:', err);
+      }),
+    );
   });
 
   // Start the simulator manager (watches css_stations table, syncs simulators)
@@ -73,20 +83,24 @@ async function main(): Promise<void> {
     console.log(`[health] Listening on port ${String(healthPort)}`);
   });
 
-  function shutdown(): void {
-    console.log('\nShutting down CSS...');
-    healthServer.close();
-    if (chaos != null) chaos.stop();
-    void manager
-      .stop()
-      .then(() => pubsub.close())
-      .then(() => sql.end())
-      .then(() => process.exit(0))
-      .catch(() => process.exit(1));
-  }
+  const shutdown = createCssShutdown({
+    stopIntake: () => {
+      healthServer.close();
+      if (chaos != null) chaos.stop();
+    },
+    unsubscribeCommands: () => commandSubscription.unsubscribe(),
+    commands,
+    stopSimulators: () => manager.stop(),
+    closePubSub: () => pubsub.close(),
+    closeDatabase: () => sql.end({ timeout: 5 }),
+    exit: (code) => process.exit(code),
+    log: (message) => {
+      console.log(`[css] ${message}`);
+    },
+  });
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
 }
 
 main().catch((err: unknown) => {

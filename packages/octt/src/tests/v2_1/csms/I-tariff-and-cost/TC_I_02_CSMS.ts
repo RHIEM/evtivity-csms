@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_I_02_CSMS: Show EV Driver Final Total Cost After Charging
@@ -45,7 +47,7 @@ export const TC_I_02_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
 
     // Step 1: EVConnectedPreSession with MeterValue
     await ctx.client.sendCall('TransactionEvent', {
@@ -174,12 +176,12 @@ export const TC_I_02_CSMS: TestCase = {
     // Wait for optional CostUpdatedRequest from CSMS
     let receivedCostUpdated = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'CostUpdated') {
           receivedCostUpdated = true;
           return {};
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {

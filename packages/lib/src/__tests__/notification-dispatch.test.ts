@@ -18,6 +18,12 @@ vi.mock('node:fs/promises', () => ({
 const mockFetch = vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve('') });
 vi.stubGlobal('fetch', mockFetch);
 
+// The connect-time DNS guard of safeFetch has its own tests (safe-fetch.test.ts).
+vi.mock('../safe-fetch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../safe-fetch.js')>()),
+  safeFetch: (...args: unknown[]) => (globalThis.fetch as (...a: unknown[]) => unknown)(...args),
+}));
+
 // SQL mock
 const sqlCalls: Array<{ values: unknown[] }> = [];
 let sqlResults: unknown[][] = [];
@@ -106,15 +112,16 @@ describe('notification-dispatch', () => {
       expect(result['startedAt']).toContain('2026');
     });
 
-    it('formats issuedAt and dueAt the same way as startedAt', async () => {
+    it('formats issuedAt, dueAt and refundedAt the same way as startedAt', async () => {
       const { formatDateVariables } = await import('../notification-dispatch.js');
       const iso = '2026-07-05T00:00:00.000Z';
       const result = formatDateVariables(
-        { startedAt: iso, issuedAt: iso, dueAt: iso },
+        { startedAt: iso, issuedAt: iso, dueAt: iso, refundedAt: iso },
         'America/New_York',
       );
       expect(result['issuedAt']).toBe(result['startedAt']);
       expect(result['dueAt']).toBe(result['startedAt']);
+      expect(result['refundedAt']).toBe(result['startedAt']);
       expect(result['issuedAt']).not.toContain('T');
       expect(result['issuedAt']).not.toContain('Z');
     });
@@ -232,13 +239,12 @@ describe('notification-dispatch', () => {
       expect(result.subject).toBe('EN Subject');
     });
 
-    it('uses friendly subject for known event types', async () => {
+    it('uses the generic subject when no subject template exists', async () => {
       const { renderTemplate } = await import('../notification-dispatch.js');
       const result = await renderTemplate('email', 'session.Started', 'en', {
         companyName: 'TestCo',
       });
-      expect(result.subject).toContain('TestCo');
-      expect(result.subject).toContain('started');
+      expect(result.subject).toBe('TestCo - session.Started Notification');
     });
   });
 
@@ -263,10 +269,45 @@ describe('notification-dispatch', () => {
         expect.objectContaining({
           to: 'to@test.com',
           subject: 'Subject',
-          text: 'Body',
+          text: 'HTML',
           html: '<p>HTML</p>',
         }),
       );
+    });
+
+    it('derives the text part from the HTML, not the HTML template', async () => {
+      const { sendEmail } = await import('../notification-dispatch.js');
+      const html =
+        '<img src="https://x.test/logo.png" alt="Logo"><h2 style="color:#111">Set up your account</h2>' +
+        "<p>Hi Nightly,</p><a href='https://portal.test/activate?token&#x3D;abc'>Set Your Password</a>";
+      await sendEmail(
+        { host: 'smtp.test.com', port: 587, username: '', password: '', from: 'f@test.com' },
+        'to@test.com',
+        'Subject',
+        html,
+        html,
+      );
+      const text = (mockSendMail.mock.calls.at(-1)?.[0] as { text: string }).text;
+      expect(text).not.toContain('<');
+      expect(text).not.toContain('style=');
+      expect(text).not.toContain('logo.png');
+      expect(text).toContain('SET UP YOUR ACCOUNT');
+      expect(text).toContain('Hi Nightly,');
+      expect(text).toContain('Set Your Password [https://portal.test/activate?token=abc]');
+    });
+
+    it('sends the body as the text part without HTML', async () => {
+      const { sendEmail } = await import('../notification-dispatch.js');
+      await sendEmail(
+        { host: 'smtp.test.com', port: 587, username: '', password: '', from: 'f@test.com' },
+        'to@test.com',
+        'Subject',
+        'Plain body',
+      );
+      expect(mockSendMail.mock.calls.at(-1)?.[0]).toMatchObject({
+        text: 'Plain body',
+        html: undefined,
+      });
     });
 
     it('returns false on send failure', async () => {

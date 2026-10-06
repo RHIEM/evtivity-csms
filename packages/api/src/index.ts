@@ -2,29 +2,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { FastifyServerOptions } from 'fastify';
-import { RedisPubSubClient, initSentry } from '@evtivity/lib';
-import { getSentryConfig } from '@evtivity/database';
+import { RedisPubSubClient, initSentry, logFormatOptions } from '@evtivity/lib';
+import { client, getSentryConfig } from '@evtivity/database';
+import { createShutdownHandler } from './lib/process-shutdown.js';
 import { buildApp } from './app.js';
 import { config } from './lib/config.js';
-import { setPubSub } from './lib/pubsub.js';
-import { setReportLogger, registerGenerator } from './services/report.service.js';
-import { generateNeviReport } from './services/report-generators/nevi-report.js';
-import { generateRevenueReport } from './services/report-generators/revenue-report.js';
-import { generateEnergyReport } from './services/report-generators/energy-report.js';
-import { generateSessionsReport } from './services/report-generators/sessions-report.js';
-import { generateUtilizationReport } from './services/report-generators/utilization-report.js';
-import { generateStationHealthReport } from './services/report-generators/station-health-report.js';
-import { generateSustainabilityReport } from './services/report-generators/sustainability-report.js';
-import { generateDriverActivityReport } from './services/report-generators/driver-activity-report.js';
+import { setPubSub } from '@evtivity/lib/pubsub-instance';
 import { startMetricsServer, stopMetricsServer, registerHttpMetrics } from './plugins/metrics.js';
 import {
   startMetricsCollector,
   stopMetricsCollector,
 } from './services/metrics-collector.service.js';
-import {
-  startStationMessageRefreshListener,
-  startStationMessageTransactionListener,
-} from './services/station-message.service.js';
 import { startCacheInvalidateListener } from './services/cache-invalidate-listener.js';
 
 async function start(): Promise<void> {
@@ -34,6 +22,7 @@ async function start(): Promise<void> {
   const opts: FastifyServerOptions = {
     logger: {
       level: config.LOG_LEVEL,
+      ...logFormatOptions,
       serializers: {
         req(request) {
           return {
@@ -68,33 +57,31 @@ async function start(): Promise<void> {
   // same TransactionStarted event and create duplicate payment_records.
   // dev:worker is required for guest charging in dev mode.
 
-  const stationMessageSubscription = await startStationMessageRefreshListener(app.log);
-  const stationMessageTransactionSubscription = await startStationMessageTransactionListener(
-    app.log,
-  );
+  // Station screen renders (station_message_refresh / station_message_transaction)
+  // run in the worker through the station-messages queue, once per event across
+  // replicas (station-message-worker.ts), not in every API pod.
   const cacheInvalidateSubscription = await startCacheInvalidateListener(app.log);
 
   app.addHook('onClose', async () => {
     stopMetricsCollector();
     await stopMetricsServer();
-    await stationMessageSubscription.unsubscribe();
-    await stationMessageTransactionSubscription.unsubscribe();
     await cacheInvalidateSubscription.unsubscribe();
     await pubsub.close();
   });
 
+  // Without handlers SIGTERM kills the process at once: in-flight requests
+  // are cut and the onClose hooks above never run.
+  const shutdown = createShutdownHandler({
+    closeApp: () => app.close(),
+    closeDatabase: () => client.end({ timeout: 5 }),
+    exit: (code) => process.exit(code),
+    logger: app.log,
+  });
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+
   await app.listen({ port: config.API_PORT, host: config.API_HOST });
   app.log.info(`API server listening on ${config.API_HOST}:${String(config.API_PORT)}`);
-
-  setReportLogger(app.log);
-  registerGenerator('nevi', generateNeviReport);
-  registerGenerator('revenue', generateRevenueReport);
-  registerGenerator('energy', generateEnergyReport);
-  registerGenerator('sessions', generateSessionsReport);
-  registerGenerator('utilization', generateUtilizationReport);
-  registerGenerator('stationHealth', generateStationHealthReport);
-  registerGenerator('sustainability', generateSustainabilityReport);
-  registerGenerator('driverActivity', generateDriverActivityReport);
 }
 
 start().catch((err: unknown) => {

@@ -1,6 +1,6 @@
 {
   "name": "evtivity",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -10,7 +10,7 @@
     "esbuild": "^0.28.1",
     "uuid": "^11.1.1",
     "ioredis": "^5.11.0",
-    "undici": "^7.30.0"
+    "undici": "^8.11.2"
   },
   "scripts": {
     "codegen:2.1": "npm run build --workspace=@evtivity/codegen && node packages/codegen/dist/index.js --version 2.1",
@@ -28,7 +28,7 @@
     "dev:infra:down": "docker compose down",
     "db:generate": "npm run generate --workspace=@evtivity/database",
     "db:migrate": "npm run migrate --workspace=@evtivity/database",
-    "db:seed": "npm run seed --workspace=@evtivity/database",
+    "db:seed": "npm run seed --workspace=@evtivity/database --",
     "db:seed:dev": "npm run seed:dev --workspace=@evtivity/database",
     "generate:openapi": "npm run generate:openapi --workspace=@evtivity/api",
     "octt": "node --env-file-if-exists=.env --import tsx packages/octt/src/cli.ts --server ws://localhost:7103",
@@ -39,8 +39,9 @@
     "octt:cs:1.6": "node --env-file-if-exists=.env --import tsx packages/octt/src/cs-cli.ts --version ocpp1.6",
     "test": "vitest run --config vitest.workspace.ts",
     "test:integration": "vitest run --config vitest.integration.ts",
+    "test:release": "bash scripts/release-version.test.sh",
     "lint": "node --max-old-space-size=8192 node_modules/eslint/bin/eslint.js .",
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b && node scripts/typecheck-e2e.mjs",
     "build:prod": "node scripts/build.mjs all",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -79,6 +80,7 @@
     "lint-staged": "^16.2.7",
     "prettier": "^3.8.1",
     "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
     "typescript-eslint": "^8.55.0"
   },
   "dependencies": {

@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import {
+  newTransactionId,
+  startStationSequence,
+  waitForStationSequence,
+  type StationSequence,
+} from '../../../../csms-test-helpers.js';
+import { waitFor } from '../../../../security-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 export const TC_B_27_CSMS: TestCase = {
   id: 'TC_B_27_CSMS',
@@ -22,7 +30,7 @@ export const TC_B_27_CSMS: TestCase = {
     });
 
     // Start a transaction
-    const txId = `TX-${Date.now()}`;
+    const txId = newTransactionId('TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -35,6 +43,7 @@ export const TC_B_27_CSMS: TestCase = {
 
     let receivedReset = false;
     let resetType: string | null = null;
+    let resetSequence: StationSequence | null = null;
     let evseIdPresent = false;
     let evseIdValue: number | null = null;
 
@@ -48,26 +57,22 @@ export const TC_B_27_CSMS: TestCase = {
             evseIdValue = payload['evseId'] as number;
           }
           // Respond Accepted, immediately end transaction
-          setTimeout(async () => {
-            try {
-              await ctx.client.sendCall('TransactionEvent', {
-                eventType: 'Ended',
-                timestamp: new Date().toISOString(),
-                triggerReason: 'ResetCommand',
-                seqNo: 1,
-                transactionInfo: {
-                  transactionId: txId,
-                  chargingState: 'EVConnected',
-                  stoppedReason: 'ImmediateReset',
-                },
-              });
-            } catch {
-              // Ignore errors
-            }
-          }, 500);
+          resetSequence = startStationSequence(async () => {
+            await ctx.client.sendCall('TransactionEvent', {
+              eventType: 'Ended',
+              timestamp: new Date().toISOString(),
+              triggerReason: 'ResetCommand',
+              seqNo: 1,
+              transactionInfo: {
+                transactionId: txId,
+                chargingState: 'EVConnected',
+                stoppedReason: 'ImmediateReset',
+              },
+            });
+          });
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -78,8 +83,13 @@ export const TC_B_27_CSMS: TestCase = {
         evseId: 1,
       });
     } else {
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+      // Without the API, wait for a ResetRequest the CSMS sends on its own.
+      await waitFor(() => resetSequence != null, 10_000);
     }
+    // Let the station finish what it sends after the ResetRequest before the
+    // test ends (the executor then stops open transactions and disconnects).
+    const sequenceError = await waitForStationSequence(resetSequence);
+    if (sequenceError != null) ctx.logger.warn({ sequenceError }, 'Reset sequence incomplete');
 
     steps.push({
       step: 1,

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_K_57_CSMS: Renegotiating a Charging Schedule ISO 15118-20 - Initiated by EV
@@ -31,7 +32,7 @@ export const TC_K_57_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -73,12 +74,12 @@ export const TC_K_57_CSMS: TestCase = {
     // Step 3-4: Wait for SetChargingProfile
     let receivedProfile = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           receivedProfile = true;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {
@@ -165,7 +166,7 @@ export const TC_K_114_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -197,12 +198,12 @@ export const TC_K_114_CSMS: TestCase = {
 
     let receivedProfile = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           receivedProfile = true;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {
@@ -269,7 +270,7 @@ export const TC_K_115_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -306,12 +307,12 @@ export const TC_K_115_CSMS: TestCase = {
 
     let receivedProfile = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           receivedProfile = true;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {

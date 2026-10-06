@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase, TestContext } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 import { setTokenCostLimit } from '../../../../payment-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /** TC_E_109: the cost limit the CSMS is configured with for the token (10.00). */
 const COST_LIMIT_CENTS = 1000;
@@ -24,7 +25,7 @@ async function bootAndStatus(ctx: TestContext) {
 
 // Helper: start a charging transaction and return the txId
 async function startChargingTransaction(ctx: TestContext) {
-  const txId = `OCTT-TX-${String(Date.now())}`;
+  const txId = newTransactionId('OCTT-TX');
   await ctx.client.sendCall('TransactionEvent', {
     eventType: 'Started',
     timestamp: new Date().toISOString(),
@@ -339,13 +340,15 @@ export const TC_E_108_CSMS: TestCase = {
     // Set up handler for SetDefaultTariff from CSMS
     let receivedSetTariff = false;
 
-    ctx.client.setIncomingCallHandler(async (_messageId: string, action: string) => {
-      if (action === 'SetDefaultTariff') {
-        receivedSetTariff = true;
-        return { status: 'Accepted' };
-      }
-      return { status: 'NotSupported' };
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'SetDefaultTariff') {
+          receivedSetTariff = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
 
     // Wait for CSMS to send SetDefaultTariff (manual action)
     if (ctx.triggerCommand != null) {
@@ -375,7 +378,9 @@ export const TC_E_108_CSMS: TestCase = {
     });
 
     // Clear handler before continuing
-    ctx.client.setIncomingCallHandler(async () => ({ status: 'NotSupported' }));
+    ctx.client.setIncomingCallHandler(async (_messageId, action, payload) =>
+      defaultReply('ocpp2.1', action, payload),
+    );
 
     // EnergyTransferStarted
     const txId = await startChargingTransaction(ctx);
@@ -525,7 +530,7 @@ export const TC_E_109_CSMS: TestCase = {
           costUpdated = payload;
           return {};
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -543,7 +548,7 @@ export const TC_E_109_CSMS: TestCase = {
     });
 
     // Step 3-4: TransactionEvent Started
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const startRes = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -638,7 +643,7 @@ export const TC_E_110_CSMS: TestCase = {
     await bootAndStatus(ctx);
 
     // Step 1: TransactionEvent Started
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const startRes = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -735,7 +740,7 @@ export const TC_E_111_CSMS: TestCase = {
     await bootAndStatus(ctx);
 
     // Step 1: TransactionEvent Started
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const startRes = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),

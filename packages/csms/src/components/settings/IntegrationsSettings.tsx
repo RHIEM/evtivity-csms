@@ -21,6 +21,7 @@ import { api } from '@/lib/api';
 import { ReservationSettings } from '@/components/settings/ReservationSettings';
 import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { StationMessageSettings } from '@/components/settings/StationMessageSettings';
+import { PncLocalCaSection } from '@/components/settings/PncLocalCaSection';
 
 interface IntegrationsSettingsProps {
   settings: Record<string, unknown> | undefined;
@@ -56,6 +57,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   // Idling and session
   const [idlingGracePeriod, setIdlingGracePeriod] = useState('30');
   const [staleSessionTimeout, setStaleSessionTimeout] = useState('24');
+  const [evConnectionTimeout, setEvConnectionTimeout] = useState('180');
 
   // Pricing
   const [splitBillingEnabled, setSplitBillingEnabled] = useState(true);
@@ -103,6 +105,8 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const [pncWarningDays, setPncWarningDays] = useState('30');
   const [pncCriticalDays, setPncCriticalDays] = useState('7');
   const [pncOcspAllowedHosts, setPncOcspAllowedHosts] = useState('');
+  const [pncEmaidCountry, setPncEmaidCountry] = useState('');
+  const [pncEmaidProviderId, setPncEmaidProviderId] = useState('');
 
   const roamingEnabled = settings != null && settings['roaming.enabled'] === true;
 
@@ -119,6 +123,8 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setPncHubjectTokenUrl(s('pnc.hubject.tokenUrl'));
     setPncWarningDays(s('pnc.expirationWarningDays') || '30');
     setPncCriticalDays(s('pnc.expirationCriticalDays') || '7');
+    setPncEmaidCountry(s('pnc.local.emaidCountry'));
+    setPncEmaidProviderId(s('pnc.local.emaidProviderId'));
     const hosts = pncSettings['pnc.ocsp.allowedPrivateHosts'];
     setPncOcspAllowedHosts(
       Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string').join('\n') : '',
@@ -148,6 +154,8 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setIdlingGracePeriod(gp != null ? Number(gp).toString() : '30');
     const sst = settings['session.staleTimeoutHours'];
     setStaleSessionTimeout(sst != null ? Number(sst).toString() : '24');
+    const ect = settings['session.evConnectionTimeoutSeconds'];
+    setEvConnectionTimeout(ect != null ? Number(ect).toString() : '180');
     setSplitBillingEnabled(settings['pricing.splitBillingEnabled'] !== false);
     const mapsKey = settings['googleMaps.apiKeyEnc'];
     setGoogleMapsApiKey(typeof mapsKey === 'string' ? mapsKey : '');
@@ -316,6 +324,14 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     },
   });
 
+  const evConnectionTimeoutMutation = useMutation({
+    mutationFn: (seconds: number) =>
+      api.put('/v1/settings/session.evConnectionTimeoutSeconds', { value: seconds }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   const googleMapsMutation = useMutation({
     mutationFn: (vals: {
       apiKey: string;
@@ -364,6 +380,8 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
       expirationWarningDays: number;
       expirationCriticalDays: number;
       ocspAllowedPrivateHosts: string[];
+      localEmaidCountry?: string;
+      localEmaidProviderId?: string;
     }) => api.put('/v1/pnc/settings', vals),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['pnc-settings'] });
@@ -695,6 +713,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     >
                       <option value="manual">{t('settings.pncProviderManual')}</option>
                       <option value="hubject">{t('settings.pncProviderHubject')}</option>
+                      <option value="local">{t('settings.pncProviderLocal')}</option>
                     </Select>
                   </div>
 
@@ -748,6 +767,15 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     {t('settings.pncOcspAllowedPrivateHostsHint')}
                   </p>
                 </div>
+
+                {pncProvider === 'local' && (
+                  <PncLocalCaSection
+                    emaidCountry={pncEmaidCountry}
+                    emaidProviderId={pncEmaidProviderId}
+                    onEmaidCountryChange={setPncEmaidCountry}
+                    onEmaidProviderIdChange={setPncEmaidProviderId}
+                  />
+                )}
 
                 {pncProvider === 'hubject' && (
                   <div className="grid gap-4 sm:grid-cols-2">
@@ -830,6 +858,12 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                           .split(/[\s,]+/)
                           .map((h) => h.trim())
                           .filter((h) => h !== ''),
+                        ...(pncProvider === 'local'
+                          ? {
+                              localEmaidCountry: pncEmaidCountry,
+                              localEmaidProviderId: pncEmaidProviderId,
+                            }
+                          : {}),
                       });
                     }}
                   />
@@ -1061,6 +1095,37 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               }}
             />
             {staleSessionTimeoutMutation.isSuccess && (
+              <p className="text-sm text-success">{t('common.saved')}</p>
+            )}
+            <div className="grid gap-2 max-w-xs">
+              <Label htmlFor="ev-connection-timeout">
+                {t('settings.evConnectionTimeoutSeconds')}
+              </Label>
+              <Input
+                id="ev-connection-timeout"
+                type="number"
+                min={1}
+                step={1}
+                value={evConnectionTimeout}
+                onChange={(e) => {
+                  setEvConnectionTimeout(e.target.value);
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.evConnectionTimeoutHelp')}
+              </p>
+            </div>
+            <SaveButton
+              isPending={evConnectionTimeoutMutation.isPending}
+              type="button"
+              onClick={() => {
+                const seconds = parseInt(evConnectionTimeout, 10);
+                if (!isNaN(seconds) && seconds >= 1) {
+                  evConnectionTimeoutMutation.mutate(seconds);
+                }
+              }}
+            />
+            {evConnectionTimeoutMutation.isSuccess && (
               <p className="text-sm text-success">{t('common.saved')}</p>
             )}
           </CardContent>

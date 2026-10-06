@@ -23,12 +23,18 @@ import {
   db,
   client,
   writeAudit,
+  recordRemovedOcpiEvses,
   stationAuditLog,
   getCompanyCurrency,
   setStationDisabled,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+  PG_FOREIGN_KEY_VIOLATION,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { requestGhostSessionEnd } from '../lib/ghost-session-end.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
+import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import {
   chargingStations,
@@ -62,7 +68,7 @@ import {
 } from '@evtivity/database';
 import { assertZodRefinements, zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
-import { getPubSub } from '../lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import {
@@ -73,31 +79,30 @@ import {
   arrayResponse,
   errorWith,
 } from '../lib/response-schemas.js';
-import { inCompanyCurrency, sessionCurrencySql } from '../lib/company-currency.js';
-import { queryRevenue, queryRevenueTotal, revenueItem } from '../lib/session-revenue.js';
+import { inCompanyCurrency, sessionCurrencySql } from '@evtivity/services/company-currency';
+import { queryRevenue, queryRevenueTotal, revenueItem } from '@evtivity/services/session-revenue';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds, checkStationSiteAccess, userCanAccessSite } from '../lib/site-access.js';
 import { dateRangeQuery, parseDateRange } from '../lib/date-range.js';
 import { enumerateLocalDays, zeroFillDays } from '../lib/daily-series.js';
-import {
-  sendOcppCommandAndWait,
-  sendStatusCheckError,
-  triggerAndWaitForStatus,
-} from '../lib/ocpp-command.js';
+import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
+import { sendStatusCheckError, triggerAndWaitForStatus } from '../lib/station-status-check.js';
 import {
   buildDerivedStatusSubquery,
   buildStatusReasonSubquery,
-} from '../lib/station-derived-status.js';
+} from '@evtivity/services/station-derived-status';
 import { buildUnderMaintenanceSubquery } from '../lib/station-maintenance-flag.js';
 import { enableCssPair, disableCssPair } from '../lib/css-pairing.js';
-import { sendAvailabilityCommand } from '../lib/availability-command.js';
+import { sendAvailabilityCommand } from '@evtivity/services/availability-command';
 import { publishStationStatusChanged } from '../lib/station-status-events.js';
+import { publishOcpiLocationPush, publishOcpiStationSiteMove } from '../lib/ocpi-location-push.js';
 import {
   changeSecurityProfile,
   changeStationPassword,
   rotateStationPassword,
 } from '../services/station-security.service.js';
-import { mapConnectorTypeToCss, validateStationPassword } from '@evtivity/lib';
+import { confirmRealStation } from '../services/station-simulator.service.js';
+import { mapConnectorTypeToCss, publishOcppCommand, validateStationPassword } from '@evtivity/lib';
 import { authorize } from '../middleware/rbac.js';
 import type { JwtPayload } from '../plugins/auth.js';
 
@@ -257,6 +262,14 @@ const updateStationBody = z.object({
     .optional()
     .describe('Whether reservations are allowed at this station'),
 });
+
+const confirmRealStationResponse = z
+  .object({
+    changed: z
+      .boolean()
+      .describe('Whether the station was flagged as a simulator before this call'),
+  })
+  .passthrough();
 
 const setCredentialsBody = z.object({
   password: stationPassword,
@@ -440,6 +453,12 @@ const stationDetail = z
     isSimulator: z
       .boolean()
       .describe('Whether this station is backed by the built-in CSS simulator'),
+    simulatorConflictAt: z.coerce
+      .date()
+      .nullable()
+      .describe(
+        'Last connection to this simulator-flagged station that did not come from the simulator and could not clear the flag on its own (security profile 0, or a simulator that never sent its marker). Confirm a real station with POST /v1/stations/{id}/confirm-real-station. Null when there is none.',
+      ),
     loadPriority: z
       .number()
       .int()
@@ -1020,6 +1039,7 @@ export function stationRoutes(app: FastifyInstance): void {
           lastHeartbeat: chargingStations.lastHeartbeat,
           isOnline: chargingStations.isOnline,
           isSimulator: chargingStations.isSimulator,
+          simulatorConflictAt: chargingStations.simulatorConflictAt,
           loadPriority: chargingStations.loadPriority,
           securityProfile: chargingStations.securityProfile,
           pendingSecurityProfile: chargingStations.pendingSecurityProfile,
@@ -1272,12 +1292,7 @@ export function stationRoutes(app: FastifyInstance): void {
           return created;
         });
       } catch (err) {
-        if (
-          err != null &&
-          typeof err === 'object' &&
-          'code' in err &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({
             error: 'A station with this ID already exists',
             code: 'STATION_ID_EXISTS',
@@ -1376,6 +1391,8 @@ export function stationRoutes(app: FastifyInstance): void {
       }
 
       const updates: Record<string, unknown> = { ...body, updatedAt: new Date() };
+      // Setting the simulator flag either way settles a recorded conflict.
+      if (body.isSimulator !== undefined) updates.simulatorConflictAt = null;
 
       // When enabling simulator, ensure ocpp_protocol is set so the simulator can negotiate
       // a WebSocket subprotocol. Stations created without an explicit protocol default to 1.6.
@@ -1516,6 +1533,14 @@ export function stationRoutes(app: FastifyInstance): void {
       if (availabilityChanged || disableStateChanged) {
         await publishStationStatusChanged({ id, siteId: station.siteId }, request.log);
       }
+      if (beforeStation != null && beforeStation.siteId !== station.siteId) {
+        await publishOcpiStationSiteMove(id, beforeStation.siteId, station.siteId, request.log);
+      }
+
+      // The site sets the station's display language and can change its tariff.
+      if (beforeStation != null && beforeStation.siteId !== station.siteId) {
+        await requestStationMessageRepush(request.log, { stationId: station.id });
+      }
 
       return station;
     },
@@ -1557,15 +1582,24 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const [station] = await db
-        .update(chargingStations)
-        .set({ onboardingStatus: 'blocked', updatedAt: new Date() })
-        .where(eq(chargingStations.id, id))
-        .returning();
+      const station = await db.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(chargingStations)
+          .set({ onboardingStatus: 'blocked', updatedAt: new Date() })
+          .where(eq(chargingStations.id, id))
+          .returning();
+        // A removed station's paired simulator stops: the CSMS refuses a blocked
+        // station, so an enabled pairing would reconnect and be refused forever.
+        if (updated != null) await disableCssPair(updated.stationId, tx);
+        return updated;
+      });
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
+      // Roaming partners get the station's EVSEs as REMOVED (OCPI 8.1): the
+      // location push renders a blocked station's EVSEs that way.
+      await publishStationStatusChanged({ id: station.id, siteId: station.siteId }, request.log);
       const actor = getAuditActor(request);
       await writeAudit(
         { table: stationAuditLog, idColumn: 'station_id' },
@@ -1788,12 +1822,7 @@ export function stationRoutes(app: FastifyInstance): void {
       try {
         [evse] = await db.insert(evses).values({ stationId: id, evseId: body.evseId }).returning();
       } catch (err) {
-        if (
-          err != null &&
-          typeof err === 'object' &&
-          'code' in err &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({
             error: `EVSE ID ${String(body.evseId)} already exists on this station`,
             code: 'DUPLICATE_EVSE_ID',
@@ -2086,7 +2115,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Force-stop the active charging session on this EVSE',
         description:
-          'Sends RequestStopTransaction (OCPP 2.1) or RemoteStopTransaction (OCPP 1.6) and waits up to 35s for the station response. If the station rejects with reasonCode=TxNotFound (a "ghost session" where the CSMS thinks a transaction is active but the station has no record), the API automatically marks the session faulted in the database and returns ghostRecovered=true. Returns 404 if no active session exists on the EVSE, 504 if the station does not respond within the timeout window.',
+          'Sends RequestStopTransaction (OCPP 2.1) or RemoteStopTransaction (OCPP 1.6) and waits up to 35s for the station response. If the station rejects with reasonCode=TxNotFound (a "ghost session" where the CSMS thinks a transaction is active but the station has no record), the API asks the OCPP server to end the session the normal way (completed at its last metered energy, final cost, settlement, receipt) and returns ghostRecovered=true. Returns 404 if no active session exists on the EVSE, 504 if the station does not respond within the timeout window.',
         operationId: 'stopActiveEvseSession',
         security: [{ bearerAuth: [] }],
         params: zodSchema(evseParams),
@@ -2103,7 +2132,7 @@ export function stationRoutes(app: FastifyInstance): void {
                 ghostRecovered: z
                   .boolean()
                   .describe(
-                    'True when the station rejected with TxNotFound and the session was force-cleaned in the database',
+                    'True when the station rejected with TxNotFound and the session end was requested',
                   ),
               })
               .passthrough(),
@@ -2171,27 +2200,11 @@ export function stationRoutes(app: FastifyInstance): void {
       const isGhost = status === 'Rejected' && statusInfo?.reasonCode === 'TxNotFound';
 
       if (isGhost) {
-        // Ghost session: station has no record of this transaction. Force-clean
-        // the DB so the connector tile clears immediately rather than waiting
-        // for the stale-session worker.
-        await db.execute(sql`
-          UPDATE charging_sessions
-          SET status = 'faulted',
-              stopped_reason = 'TxNotFound',
-              ended_at = now(),
-              final_cost_cents = COALESCE(final_cost_cents, current_cost_cents),
-              updated_at = now()
-          WHERE id = ${activeSession.id} AND status = 'active'
-        `);
-        await db.execute(sql`
-          UPDATE session_tariff_segments
-          SET ended_at = now(),
-              duration_minutes = EXTRACT(EPOCH FROM (now() - started_at)) / 60
-          WHERE session_id = ${activeSession.id} AND ended_at IS NULL
-        `);
+        // Ghost session: ended completed and billed by the OCPP server.
+        await requestGhostSessionEnd(activeSession.id, request.log);
         request.log.info(
           { sessionId: activeSession.id, transactionId: activeSession.transactionId },
-          'Ghost session recovered: station returned TxNotFound, marked DB faulted',
+          'Ghost session recovered: station returned TxNotFound, session end requested',
         );
         return {
           sessionId: activeSession.id,
@@ -2299,12 +2312,7 @@ export function stationRoutes(app: FastifyInstance): void {
           })
           .returning();
       } catch (err) {
-        if (
-          err != null &&
-          typeof err === 'object' &&
-          'code' in err &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({
             error: `Connector ID ${String(body.connectorId)} already exists on this EVSE`,
             code: 'DUPLICATE_CONNECTOR_ID',
@@ -2420,7 +2428,19 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      await db.delete(evses).where(eq(evses.id, evse.id));
+      // OCPI 8.1: an EVSE is never deleted for roaming partners. Its site
+      // keeps serving it as REMOVED (ocpi_removed_evses), recorded with the
+      // delete, and the location is pushed.
+      const [owner] = await db
+        .select({ siteId: chargingStations.siteId })
+        .from(chargingStations)
+        .where(eq(chargingStations.id, id));
+      const siteId = owner?.siteId ?? null;
+      await db.transaction(async (tx) => {
+        if (siteId != null) await recordRemovedOcpiEvses(siteId, [evse.id], tx);
+        await tx.delete(evses).where(eq(evses.id, evse.id));
+      });
+      if (siteId != null) await publishOcpiLocationPush(siteId, null, request.log);
       return { status: 'deleted' };
     },
   );
@@ -3338,6 +3358,35 @@ export function stationRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.post(
+    '/stations/:id/confirm-real-station',
+    {
+      onRequest: [authorize('stations:write')],
+      schema: {
+        tags: ['Stations'],
+        summary: 'Confirm that a real station uses a simulator-flagged station identity',
+        description:
+          'Clears the simulator flag and any recorded simulator conflict (simulatorConflictAt) and disables the paired simulator, so it stops connecting as this station. Use it when a real charging station connects with the identity of a simulator-flagged station on security profile 0, where the CSMS cannot tell it from the simulator. Idempotent: changed is false when the station was not flagged.',
+        operationId: 'confirmRealStation',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(stationParams),
+        response: {
+          200: zodSchema(confirmRealStationResponse),
+          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof stationParams>;
+      const { userId } = request.user as JwtPayload;
+      if (!(await checkStationSiteAccess(id, userId))) {
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+      return confirmRealStation(id, { actor: getAuditActor(request), log: request.log });
+    },
+  );
+
   // Security event logs — unified feed of CSMS-side auth/credential events
   // (from `connection_logs`) plus OCPP-reported security events (from
   // `security_events`). Operators see one chronological list per station so
@@ -3348,6 +3397,8 @@ export function stationRoutes(app: FastifyInstance): void {
     'credentials_rotated',
     'security_profile_change_sent',
     'security_profile_upgraded',
+    'simulator_self_healed',
+    'simulator_conflict',
     'connected',
     'disconnected',
   ] as const;
@@ -3629,8 +3680,7 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const commandPayload = JSON.stringify({
-        commandId: randomUUID(),
+      await publishOcppCommand(getPubSub(), {
         stationId: stationRow.station_id as string,
         action: 'InstallCertificate',
         payload: {
@@ -3638,8 +3688,6 @@ export function stationRoutes(app: FastifyInstance): void {
           certificate: body.certificate,
         },
       });
-
-      await getPubSub().publish('ocpp_commands', commandPayload);
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -3696,16 +3744,13 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const commandPayload = JSON.stringify({
-        commandId: randomUUID(),
+      await publishOcppCommand(getPubSub(), {
         stationId: stationRow.station_id as string,
         action: 'DeleteCertificate',
         payload: {
           certificateHashData: body.certificateHashData,
         },
       });
-
-      await getPubSub().publish('ocpp_commands', commandPayload);
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -3772,15 +3817,11 @@ export function stationRoutes(app: FastifyInstance): void {
           : [body.certificateType];
 
       for (const certificateType of certificateTypeBatches) {
-        await getPubSub().publish(
-          'ocpp_commands',
-          JSON.stringify({
-            commandId: randomUUID(),
-            stationId: stationRow.station_id as string,
-            action: 'GetInstalledCertificateIds',
-            payload: { certificateType },
-          }),
-        );
+        await publishOcppCommand(getPubSub(), {
+          stationId: stationRow.station_id as string,
+          action: 'GetInstalledCertificateIds',
+          payload: { certificateType },
+        });
       }
 
       const actor = getAuditActor(request);
@@ -3894,11 +3935,7 @@ export function stationRoutes(app: FastifyInstance): void {
         // The pre-check is non-transactional, so the pricing group can be
         // deleted between the lookup and this INSERT. Map the FK violation
         // back to 404 instead of leaking a 500.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
+        if (pgErrorCode(err) === PG_FOREIGN_KEY_VIOLATION) {
           await reply
             .status(404)
             .send({ error: 'Pricing group not found', code: 'PRICING_GROUP_NOT_FOUND' });
@@ -4083,9 +4120,10 @@ export function stationRoutes(app: FastifyInstance): void {
               params: {},
             }),
           );
-        } catch {
+        } catch (err) {
           // Pub/sub failure is non-fatal: the simulator's own retry timer
           // will eventually re-boot. Log and continue.
+          request.log.warn({ err, stationId: station.stationId }, 'Simulator reboot nudge failed');
         }
       }
 
@@ -5624,26 +5662,22 @@ export function stationRoutes(app: FastifyInstance): void {
         .returning();
 
       // Dispatch SetVariableMonitoring OCPP command
-      const commandPayload = {
-        commandId: randomUUID(),
-        stationId: station.stationId,
-        action: 'SetVariableMonitoring',
-        payload: {
-          setMonitoringData: [
-            {
-              component: { name: body.component },
-              variable: { name: body.variable },
-              type: body.type,
-              value: body.value,
-              severity: body.severity,
-            },
-          ],
-        },
-      };
-
       try {
-        const pubsub = (await import('../lib/pubsub.js')).getPubSub();
-        await pubsub.publish('ocpp_commands', JSON.stringify(commandPayload));
+        await publishOcppCommand(getPubSub(), {
+          stationId: station.stationId,
+          action: 'SetVariableMonitoring',
+          payload: {
+            setMonitoringData: [
+              {
+                component: { name: body.component },
+                variable: { name: body.variable },
+                type: body.type,
+                value: body.value,
+                severity: body.severity,
+              },
+            ],
+          },
+        });
       } catch (err) {
         // The DB row is already inserted in 'pending' state and there is no
         // retry-on-startup mechanism, so a silent dispatch failure means
@@ -5717,16 +5751,12 @@ export function stationRoutes(app: FastifyInstance): void {
           .where(eq(chargingStations.id, id));
 
         if (station != null) {
-          const commandPayload = {
-            commandId: randomUUID(),
-            stationId: station.stationId,
-            action: 'ClearVariableMonitoring',
-            payload: { id: [rule.monitoringId] },
-          };
-
           try {
-            const pubsub = (await import('../lib/pubsub.js')).getPubSub();
-            await pubsub.publish('ocpp_commands', JSON.stringify(commandPayload));
+            await publishOcppCommand(getPubSub(), {
+              stationId: station.stationId,
+              action: 'ClearVariableMonitoring',
+              payload: { id: [rule.monitoringId] },
+            });
           } catch (err) {
             // Best-effort dispatch — the local row still flips to 'cleared'
             // below so the operator's view is consistent. Log so the

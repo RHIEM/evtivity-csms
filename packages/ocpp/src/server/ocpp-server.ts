@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { createServer as createHttpsServer } from 'node:https';
+import type { Server as HttpsServer } from 'node:https';
 import { WebSocketServer } from 'ws';
 import type WebSocket from 'ws';
 import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
@@ -14,7 +15,7 @@ import { createSessionState } from './session-state.js';
 import type { SessionState } from './session-state.js';
 import { MessageCorrelator } from './message-correlator.js';
 import { MessageRouter } from './message-router.js';
-import { GracefulShutdown } from './graceful-shutdown.js';
+import { GracefulShutdown, SERVER_SHUTDOWN_DISCONNECT_REASON } from './graceful-shutdown.js';
 import { PingMonitor } from './ping-monitor.js';
 import { isTlsConnection, parseTrustedProxies, resolveClientIp } from './client-ip.js';
 import { MiddlewarePipeline } from './middleware/pipeline.js';
@@ -24,8 +25,20 @@ import { validateMiddleware } from './middleware/validate.js';
 import { createRateLimitMiddleware } from './middleware/rate-limit.js';
 import { createDedupMiddleware } from './middleware/dedup.js';
 import { createBootGuardMiddleware } from './middleware/boot-guard.js';
-import { authenticateConnection, rejectionFor } from './middleware/authenticate.js';
+import {
+  authenticateConnection,
+  rejectionFor,
+  serviceUnavailable,
+} from './middleware/authenticate.js';
 import type { AuthResult } from './middleware/authenticate.js';
+import {
+  ConnectionAuthBusyError,
+  ConnectionAuthLimiter,
+  DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
+  DEFAULT_CONNECTION_AUTH_MAX_WAIT_MS,
+  defaultConnectionAuthConcurrency,
+} from './connection-auth-limiter.js';
+import type { ConnectionAuthLimits, ConnectionAuthStats } from './connection-auth-limiter.js';
 import { MessageLifecycle } from './message-lifecycle.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { registerHandlers } from '../handlers/handler-registry.js';
@@ -100,7 +113,13 @@ export interface OcppServerOptions {
   tls?: TlsOptions | undefined;
   // Fixed idle timeout (tests). By default it follows the heartbeat setting.
   idleTimeoutMs?: number | undefined;
+  // Bounds on concurrent connection authentications. By default half the
+  // database pool, 1000 queued, 10 s wait (see connection-auth-limiter.ts).
+  connectionAuthLimits?: Partial<ConnectionAuthLimits> | undefined;
 }
+
+// Refused connection authentications are logged at most this often.
+const AUTH_BUSY_LOG_INTERVAL_MS = 5_000;
 
 // A connection with no OCPP message and no WebSocket ping or pong for this long
 // is closed. The default is twice the heartbeat interval handed out at boot,
@@ -108,6 +127,13 @@ export interface OcppServerOptions {
 // and does not answer pings is not closed as its heartbeat arrives.
 const MIN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const IDLE_TIMEOUT_REFRESH_MS = 60_000;
+
+// How long stop() waits, after the station sockets close, for event-bus
+// handlers to finish (station.Disconnected projections, notifications). The
+// caller closes pub/sub, Redis and the database after stop() returns. Socket
+// close (10 s) plus this stays inside the 30 s ECS stop timeout and the
+// Kubernetes termination grace period.
+export const EVENT_DRAIN_TIMEOUT_MS = 10_000;
 
 export function idleTimeoutForHeartbeat(heartbeatSeconds: number): number {
   return Math.max(MIN_IDLE_TIMEOUT_MS, heartbeatSeconds * 2 * 1000);
@@ -126,10 +152,14 @@ export class OcppServer {
   private readonly sql: postgres.Sql | null;
   private readonly trustedProxies: ReturnType<typeof parseTrustedProxies>;
   private readonly fixedIdleTimeoutMs: number | null;
+  private readonly authLimiter: ConnectionAuthLimiter;
+  private authBusyLoggedAt = 0;
+  private authBusySinceLog = 0;
   private idleTimeoutMs = MIN_IDLE_TIMEOUT_MS;
   private idleTimeoutRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private wss: WebSocketServer | null = null;
   private wssSecure: WebSocketServer | null = null;
+  private httpsServer: HttpsServer | null = null;
   // Auth results from verifyClient, handed to handleConnection for the same
   // upgrade request.
   private readonly verifiedRequests = new WeakMap<IncomingMessage, AuthResult>();
@@ -155,6 +185,13 @@ export class OcppServer {
     this.trustedProxies = parseTrustedProxies(options?.trustedProxyCidrs ?? '');
     this.fixedIdleTimeoutMs = options?.idleTimeoutMs ?? null;
     if (this.fixedIdleTimeoutMs != null) this.idleTimeoutMs = this.fixedIdleTimeoutMs;
+    const limits = options?.connectionAuthLimits;
+    this.authLimiter = new ConnectionAuthLimiter({
+      maxConcurrent:
+        limits?.maxConcurrent ?? defaultConnectionAuthConcurrency(this.sql?.options.max ?? 10),
+      maxQueued: limits?.maxQueued ?? DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
+      maxWaitMs: limits?.maxWaitMs ?? DEFAULT_CONNECTION_AUTH_MAX_WAIT_MS,
+    });
 
     // Set up middleware pipeline
     this.pipeline = new MiddlewarePipeline();
@@ -222,6 +259,7 @@ export class OcppServer {
         // SP3 client cert validation is handled by the auth middleware.
         rejectUnauthorized: false,
       });
+      this.httpsServer = httpsServer;
 
       this.wssSecure = new WebSocketServer({
         server: httpsServer,
@@ -318,13 +356,27 @@ export class OcppServer {
       }
     };
 
-    authenticateConnection(
-      req,
-      this.logger,
-      this.sql,
-      remoteIp === 'unknown' ? null : remoteIp,
-      isTlsConnection(req, this.trustedProxies),
-    )
+    // A reconnect wave queues here instead of filling the database pool.
+    this.authLimiter
+      .run(() => {
+        // The station gave up while the request waited: skip the lookup.
+        if (req.socket.destroyed) {
+          return Promise.resolve<AuthResult>({
+            authenticated: false,
+            stationId: null,
+            stationDbId: null,
+            error: 'Connection closed while waiting for authentication',
+            failure: 'unavailable',
+          });
+        }
+        return authenticateConnection(
+          req,
+          this.logger,
+          this.sql,
+          remoteIp === 'unknown' ? null : remoteIp,
+          isTlsConnection(req, this.trustedProxies),
+        );
+      })
       .then((auth) => {
         releasePending();
         if (auth.authenticated && auth.stationId != null) {
@@ -341,12 +393,36 @@ export class OcppServer {
       })
       .catch((err: unknown) => {
         releasePending();
-        this.logger.error(
-          { error: err instanceof Error ? err.message : String(err) },
-          'Connection authentication failed',
-        );
-        callback(false, 503, 'Service Unavailable');
+        const unavailable = serviceUnavailable();
+        if (err instanceof ConnectionAuthBusyError) {
+          this.logAuthBusy(err);
+        } else {
+          this.logger.error(
+            { error: err instanceof Error ? err.message : String(err) },
+            'Connection authentication failed',
+          );
+        }
+        callback(false, unavailable.status, unavailable.message, unavailable.headers);
       });
+  }
+
+  // One warning per interval with the number refused since the last one, so a
+  // reconnect wave does not log a line per station.
+  private logAuthBusy(err: ConnectionAuthBusyError): void {
+    this.authBusySinceLog++;
+    const now = Date.now();
+    if (now - this.authBusyLoggedAt < AUTH_BUSY_LOG_INTERVAL_MS) return;
+    this.logger.warn(
+      { ...this.authLimiter.stats(), reason: err.reason, refused: this.authBusySinceLog },
+      'Connection authentication busy: refused station connections with 503',
+    );
+    this.authBusyLoggedAt = now;
+    this.authBusySinceLog = 0;
+  }
+
+  /** Connection authentications running, queued, and refused (health endpoint). */
+  getConnectionAuthStats(): ConnectionAuthStats {
+    return this.authLimiter.stats();
   }
 
   // The CSMS sends a station queued commands and screen messages only once it
@@ -474,11 +550,18 @@ export class OcppServer {
       this.correlator.clearPending(session);
       // A connection replaced by a newer one is not a disconnect.
       if (!this.connectionManager.remove(stationId, ws)) return;
+      // A socket closed by stop() is not a station failure: the projection
+      // still records the disconnect but sends no fault notices.
+      const serverShutdown = this.shutdown?.isShuttingDown() === true;
       void this.eventBus.publish({
         eventType: 'station.Disconnected',
         aggregateType: 'ChargingStation',
         aggregateId: stationId,
-        payload: { stationId, remoteAddress: remoteIp },
+        payload: {
+          stationId,
+          remoteAddress: remoteIp,
+          ...(serverShutdown ? { reason: SERVER_SHUTDOWN_DISCONNECT_REASON } : {}),
+        },
       });
 
       this.pingMonitor.writeNow();
@@ -755,16 +838,50 @@ export class OcppServer {
       this.idleTimeoutRefreshTimer = null;
     }
     await this.pingMonitor.stop();
-    if (this.wssSecure != null) {
-      const secure = this.wssSecure;
-      await new Promise<void>((resolve) => {
-        secure.close(() => {
-          resolve();
-        });
-      });
-    }
+    // Stop accepting TLS connections now, but await the close only after the
+    // station sockets are closed: ws emits 'close' for a server built on an
+    // external HTTPS server only once its last client is gone, so awaiting it
+    // first waited for as long as any TLS station stayed connected.
+    const secure = this.wssSecure;
+    const https = this.httpsServer;
+    const secureClosed =
+      secure == null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            secure.close(() => {
+              resolve();
+            });
+          });
+    const httpsClosed =
+      https == null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            https.close(() => {
+              resolve();
+            });
+          });
     if (this.shutdown != null) {
       await this.shutdown.shutdown();
+    }
+    // GracefulShutdown closed (or terminated) every station socket. A TLS
+    // socket never registered as a station, and plain HTTPS connections, would
+    // still hold the servers open.
+    if (secure != null) {
+      for (const client of secure.clients) {
+        client.terminate();
+      }
+    }
+    https?.closeAllConnections();
+    await Promise.all([secureClosed, httpsClosed]);
+    // Closing the sockets published station.Disconnected for each station.
+    // Wait for those projections (and anything still queued) before the
+    // caller ends the database client they write through.
+    const drained = await this.eventBus.drain(EVENT_DRAIN_TIMEOUT_MS);
+    if (!drained) {
+      this.logger.warn(
+        { timeoutMs: EVENT_DRAIN_TIMEOUT_MS },
+        'Event handlers still running at shutdown; closing anyway',
+      );
     }
   }
 }

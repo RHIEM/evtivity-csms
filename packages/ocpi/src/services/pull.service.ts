@@ -12,8 +12,9 @@ import {
   ocpiCdrs,
   ocpiSyncLog,
 } from '@evtivity/database';
-import { createLogger, withLock } from '@evtivity/lib';
+import { createInFlightTracker, createLogger, withLock } from '@evtivity/lib';
 import type { PubSubClient, Subscription } from '@evtivity/lib';
+import { drainListener, trackListenerWork } from '../lib/listener-drain.js';
 import { OcpiClient } from '../lib/ocpi-client.js';
 import { getOutboundToken } from '../lib/outbound-token.js';
 import { config } from '../lib/config.js';
@@ -56,14 +57,18 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-async function getPartnerInfo(
-  partnerId: string,
-): Promise<{ countryCode: string; partyId: string; version: string | null } | null> {
+async function getPartnerInfo(partnerId: string): Promise<{
+  countryCode: string;
+  partyId: string;
+  version: string | null;
+  allowPrivateNetwork: boolean;
+} | null> {
   const [partner] = await db
     .select({
       countryCode: ocpiPartners.countryCode,
       partyId: ocpiPartners.partyId,
       version: ocpiPartners.version,
+      allowPrivateNetwork: ocpiPartners.allowPrivateNetwork,
     })
     .from(ocpiPartners)
     .where(eq(ocpiPartners.id, partnerId))
@@ -94,13 +99,17 @@ async function getPartnerToken(partnerId: string): Promise<string | null> {
   return getOutboundToken(partnerId);
 }
 
-function createOcpiClient(token: string, toCountryCode: string, toPartyId: string): OcpiClient {
+function createOcpiClient(
+  token: string,
+  partner: { countryCode: string; partyId: string; allowPrivateNetwork: boolean },
+): OcpiClient {
   return new OcpiClient({
     token,
     fromCountryCode: getCountryCode(),
     fromPartyId: getPartyId(),
-    toCountryCode,
-    toPartyId,
+    toCountryCode: partner.countryCode,
+    toPartyId: partner.partyId,
+    allowPrivateNetwork: partner.allowPrivateNetwork,
   });
 }
 
@@ -218,7 +227,7 @@ async function pullLocationsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
 
     // Stream page-by-page and flush each page as batched upserts so memory is
     // bounded by one page, not the whole catalog.
@@ -339,7 +348,7 @@ async function pullTariffsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
 
     let count = 0;
     let skipped = 0;
@@ -428,7 +437,7 @@ async function pullCdrsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
     // total_cost is a Price of the partner's version: excl_vat in 2.2.1,
     // before_taxes in 2.3.0. ocpi_cdrs.total_cost holds that amount.
     const version = resolvePartnerVersion(partner.version);
@@ -538,6 +547,7 @@ export class OcpiPullListener {
   private readonly pubsub: PubSubClient;
   private readonly lockRedis: Redis | undefined;
   private subscription: Subscription | null = null;
+  private readonly inFlight = createInFlightTracker();
 
   constructor(pubsub: PubSubClient, lockRedis?: Redis) {
     this.pubsub = pubsub;
@@ -546,7 +556,9 @@ export class OcpiPullListener {
 
   async start(): Promise<void> {
     this.subscription = await this.pubsub.subscribe(CHANNEL, (payload: string) => {
-      void handleSyncNotification(payload, this.lockRedis);
+      trackListenerWork(this.inFlight, logger, () =>
+        handleSyncNotification(payload, this.lockRedis),
+      );
     });
     logger.info({ channel: CHANNEL }, 'Listening for OCPI sync notifications');
   }
@@ -556,6 +568,7 @@ export class OcpiPullListener {
       await this.subscription.unsubscribe();
       this.subscription = null;
     }
+    await drainListener(this.inFlight, logger);
     logger.info('OCPI pull listener stopped');
   }
 }

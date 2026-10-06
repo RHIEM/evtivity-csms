@@ -49,7 +49,13 @@ function makeChain() {
   return chain;
 }
 
+const { mockRecordSessionEndRequest } = vi.hoisted(() => ({
+  mockRecordSessionEndRequest: vi.fn().mockResolvedValue(true),
+}));
+
 vi.mock('@evtivity/database', async () => ({
+  SESSION_END_REQUEST_CHANNEL: 'session_end_requests',
+  recordSessionEndRequest: mockRecordSessionEndRequest,
   isStationLevelUnavailable: (
     await vi.importActual<typeof import('../../../database/src/lib/station-status.js')>(
       '../../../database/src/lib/station-status.js',
@@ -122,14 +128,26 @@ vi.mock('postgres', () => ({
   }),
 }));
 
-const { mockActivePaymentProvider, mockAuthorizeSessionHold } = vi.hoisted(() => ({
+const {
+  mockActivePaymentProvider,
+  mockAuthorizeSessionHold,
+  mockCancelOpenSessionHold,
+  mockScheduleRemoteStartTimeout,
+} = vi.hoisted(() => ({
   mockActivePaymentProvider: vi.fn(),
   mockAuthorizeSessionHold: vi.fn(),
+  mockCancelOpenSessionHold: vi.fn(),
+  mockScheduleRemoteStartTimeout: vi.fn(),
 }));
 
 vi.mock('@evtivity/payments', () => ({
   authorizeSessionHold: mockAuthorizeSessionHold,
+  cancelOpenSessionHold: mockCancelOpenSessionHold,
   chargeReservationFee: vi.fn(),
+}));
+
+vi.mock('../lib/remote-start-timeout.js', () => ({
+  scheduleRemoteStartTimeout: mockScheduleRemoteStartTimeout,
 }));
 
 vi.mock('../lib/payments.js', () => ({
@@ -137,9 +155,13 @@ vi.mock('../lib/payments.js', () => ({
   paymentContext: vi.fn((logger: unknown) => ({ registry: 'registry', logger })),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+const { mockPublish } = vi.hoisted(() => ({
+  mockPublish: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
-    publish: vi.fn().mockResolvedValue(undefined),
+    publish: mockPublish,
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
     close: vi.fn().mockResolvedValue(undefined),
   })),
@@ -150,7 +172,7 @@ vi.mock('../services/driver.service.js', () => ({
   resolvePaymentMode: vi.fn().mockResolvedValue('card'),
 }));
 
-vi.mock('../lib/ocpp-command.js', () => ({
+vi.mock('@evtivity/services/ocpp-command', () => ({
   sendOcppCommandAndWait: vi.fn().mockResolvedValue({
     response: { status: 'Accepted' },
     error: null,
@@ -169,15 +191,15 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/template-dirs.js', () => ({
+vi.mock('@evtivity/services/template-dirs', () => ({
   ALL_TEMPLATES_DIRS: [],
 }));
 
-vi.mock('../services/maintenance.service.js', () => ({
+vi.mock('@evtivity/services/maintenance.service', () => ({
   getActiveMaintenanceForStation: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('../lib/maintenance-check.js', () => ({
+vi.mock('@evtivity/services/maintenance-check', () => ({
   assertNoMaintenanceConflict: vi.fn().mockResolvedValue(undefined),
   MaintenanceConflictError: class MaintenanceConflictError extends Error {
     statusCode = 409;
@@ -189,11 +211,11 @@ vi.mock('../lib/maintenance-check.js', () => ({
 import { registerAuth } from '../plugins/auth.js';
 import { portalChargerRoutes } from '../routes/portal/charger.js';
 import { db, resolveStationTariff, isStationChargingFree } from '@evtivity/database';
-import { sendOcppCommandAndWait } from '../lib/ocpp-command.js';
+import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
 import { resolvePaymentMode } from '../services/driver.service.js';
 import { isEvseInReservationBuffer } from '../lib/reservation-buffer.js';
-import { getActiveMaintenanceForStation } from '../services/maintenance.service.js';
-import { assertNoMaintenanceConflict } from '../lib/maintenance-check.js';
+import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
+import { assertNoMaintenanceConflict } from '@evtivity/services/maintenance-check';
 
 const VALID_STATION_ID = 'sta_000000000001';
 const VALID_USER_ID = 'usr_000000000001';
@@ -756,6 +778,83 @@ describe('Portal charger routes - handler logic', () => {
       expect(isStationChargingFree).not.toHaveBeenCalled();
       expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
     });
+
+    describe('OCPP 1.6 transaction id', () => {
+      const station16 = {
+        id: VALID_STATION_ID,
+        stationId: 'CS-016',
+        siteId: null,
+        isOnline: true,
+        onboardingStatus: 'accepted',
+        ocppProtocol: 'ocpp1.6',
+      };
+
+      function setupStart16(): void {
+        setupDbResults(
+          [station16],
+          [{ id: 'evs_000000000001' }],
+          [{ status: 'available' }],
+          [], // active reservation gate
+          [], // EVSE active-session check
+          [], // driver active-session check
+          [{ id: VALID_SESSION_ID }],
+        );
+      }
+
+      function insertedValues(): unknown[] {
+        return vi
+          .mocked(db.insert)
+          .mock.results.flatMap(
+            (res) =>
+              (res.value as { values: ReturnType<typeof vi.fn> }).values.mock.calls as unknown[][],
+          )
+          .map(([values]) => values);
+      }
+
+      async function start16() {
+        return app.inject({
+          method: 'POST',
+          url: '/portal/chargers/CS-016/evse/1/start',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload: {},
+        });
+      }
+
+      it('stamps the session with the next value of the 1.6 sequence', async () => {
+        vi.mocked(db.insert).mockClear();
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(200);
+        expect(insertedValues()).toContainEqual(expect.objectContaining({ transactionId: '42' }));
+      });
+
+      it('answers 500 SESSION_CREATE_FAILED and creates nothing when the sequence read fails', async () => {
+        vi.mocked(db.insert).mockClear();
+        vi.mocked(db.execute).mockRejectedValueOnce(new Error('db down'));
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(500);
+        expect(response.json().code).toBe('SESSION_CREATE_FAILED');
+        expect(db.insert).not.toHaveBeenCalled();
+        expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+      });
+
+      it('answers 500 SESSION_CREATE_FAILED when the sequence returns no row', async () => {
+        vi.mocked(db.insert).mockClear();
+        vi.mocked(db.execute).mockResolvedValueOnce([] as never);
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(500);
+        expect(response.json().code).toBe('SESSION_CREATE_FAILED');
+        expect(db.insert).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('POST /v1/portal/chargers/:stationId/evse/:evseId/start - pre-authorization', () => {
@@ -841,6 +940,58 @@ describe('Portal charger routes - handler logic', () => {
         'RequestStartTransaction',
         expect.objectContaining({ evseId: 1 }),
       );
+      // The accepted start is closed by the worker if no transaction follows.
+      expect(mockScheduleRemoteStartTimeout).toHaveBeenCalledWith(
+        { kind: 'session', sessionId: VALID_SESSION_ID },
+        expect.objectContaining({ id: stationRow.id }),
+        expect.anything(),
+      );
+      expect(mockCancelOpenSessionHold).not.toHaveBeenCalled();
+    });
+
+    it('cancels the hold and schedules nothing when the station rejects the start', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockCancelOpenSessionHold.mockResolvedValueOnce({ status: 'cancelled', paymentRecordId: 3 });
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        response: { status: 'Rejected' },
+        error: null,
+      } as never);
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(502);
+      expect(response.json().code).toBe('START_REJECTED');
+      expect(sessionUpdateSets()).toContainEqual(expect.objectContaining({ status: 'faulted' }));
+      expect(mockCancelOpenSessionHold).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'Station rejected the start: Rejected',
+        { registry: 'registry', logger: expect.anything() },
+      );
+      expect(mockScheduleRemoteStartTimeout).not.toHaveBeenCalled();
+    });
+
+    it('still answers the rejection when the hold cancel fails (fail-open)', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockCancelOpenSessionHold.mockRejectedValueOnce(new Error('provider down'));
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        response: { status: 'Rejected' },
+        error: null,
+      } as never);
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(502);
+      expect(response.json().code).toBe('START_REJECTED');
     });
 
     it('returns 402 and fails the session without starting the station when the card is declined', async () => {
@@ -978,7 +1129,7 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('lets the OCPP server translate the stop for an OCPP 1.6 station', async () => {
-      const { sendOcppCommandAndWait } = await import('../lib/ocpp-command.js');
+      const { sendOcppCommandAndWait } = await import('@evtivity/services/ocpp-command');
       const sendMock = vi.mocked(sendOcppCommandAndWait);
       sendMock.mockClear();
       setupDbResults([
@@ -1004,6 +1155,65 @@ describe('Portal charger routes - handler logic', () => {
         transactionId: '4',
       });
       expect(sendMock.mock.calls[0]).toHaveLength(3);
+    });
+
+    it('ends a ghost session (TxNotFound) through the OCPP server, completed and billed', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        response: { status: 'Rejected', statusInfo: { reasonCode: 'TxNotFound' } },
+      });
+      mockRecordSessionEndRequest.mockClear();
+      mockPublish.mockClear();
+      const { db } = await import('@evtivity/database');
+      vi.mocked(db.execute).mockClear();
+      setupDbResults([
+        { id: VALID_SESSION_ID, transactionId: 'tx-ghost', stationOcppId: 'CS-001' },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        status: 'ghostRecovered',
+        chargingSessionId: VALID_SESSION_ID,
+      });
+      // Recorded durably first (P4), then the OCPP server ends it the normal way.
+      expect(mockRecordSessionEndRequest).toHaveBeenCalledWith(
+        {},
+        VALID_SESSION_ID,
+        'GhostRecovered',
+      );
+      expect(mockPublish).toHaveBeenCalledWith(
+        'session_end_requests',
+        JSON.stringify({ sessionId: VALID_SESSION_ID, reason: 'GhostRecovered' }),
+      );
+      // The route never faults the session itself.
+      expect(db.execute).not.toHaveBeenCalled();
+    });
+
+    it('publishes no end request when the ghost session ended meanwhile (P5)', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        response: { status: 'Rejected', statusInfo: { reasonCode: 'TxNotFound' } },
+      });
+      mockRecordSessionEndRequest.mockResolvedValueOnce(false);
+      mockPublish.mockClear();
+      setupDbResults([
+        { id: VALID_SESSION_ID, transactionId: 'tx-ghost', stationOcppId: 'CS-001' },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockPublish).not.toHaveBeenCalledWith('session_end_requests', expect.anything());
     });
   });
 
@@ -1171,6 +1381,14 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().id).toBe(VALID_RESERVATION_ID);
+      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
+      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
+      expect(Object.keys(message)).toEqual(['commandId', 'stationId', 'action', 'payload']);
+      expect(message).toMatchObject({
+        stationId: 'CS-001',
+        action: 'ReserveNow',
+        payload: { id: expect.any(Number), idToken: { idToken: DRIVER_ID, type: 'Central' } },
+      });
     });
   });
 
@@ -1225,6 +1443,14 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().status).toBe('cancelled');
+      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
+      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
+      expect(Object.keys(message)).toEqual(['commandId', 'stationId', 'action', 'payload']);
+      expect(message).toMatchObject({
+        stationId: 'CS-001',
+        action: 'CancelReservation',
+        payload: { reservationId: 1 },
+      });
     });
   });
 

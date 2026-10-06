@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station and send initial StatusNotification
 async function bootAndStatus(ctx: {
@@ -64,7 +66,7 @@ export const TC_I_01_CSMS: TestCase = {
     });
 
     // Step 3-4: TransactionEvent Updated (Authorized)
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Updated',
       timestamp: new Date().toISOString(),
@@ -134,7 +136,7 @@ export const TC_I_01_CSMS: TestCase = {
           costValue = payload['totalCost'];
           return {};
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

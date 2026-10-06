@@ -1,4 +1,6 @@
-FROM node:24-slim AS build
+# The build output is static files, so build once on the native platform instead of
+# again under emulation for each target architecture.
+FROM --platform=$BUILDPLATFORM node:24-slim AS build
 
 WORKDIR /app
 
@@ -27,7 +29,7 @@ COPY --chmod=755 packages/csms/docker-runtime-config.sh /docker-entrypoint.d/40-
 VOLUME ["/tmp"]
 
 LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
-LABEL org.opencontainers.image.license="LicenseRef-EVtivity-EULA"
+LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 
 EXPOSE 8080

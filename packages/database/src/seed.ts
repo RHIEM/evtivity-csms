@@ -1,10 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Local dev seed (npm run db:seed). Always upserts settings, roles, admin user,
-// and permissions. When SEED_DEMO=true also generates the full demo dataset
-// (sites, 2000 stations, sessions, drivers, etc.) into an empty inventory.
-// Idempotent and non-destructive: never truncates or deletes existing rows.
+// Local dev seed (npm run db:seed). Adds missing settings, roles, the admin
+// user, and permissions. When SEED_DEMO=true also generates the full demo
+// dataset (sites, 2000 stations, sessions, drivers, etc.) into an empty
+// inventory. Idempotent and non-destructive: never truncates or deletes, and
+// never overwrites an existing setting, role, or user. The one exception is
+// `--apply-config`, which writes the values of seed.config.json (and
+// REGISTRATION_POLICY) over existing settings on purpose.
 // Demo generation is skipped when sites or stations already exist; for a clean
 // slate, drop and recreate the database (or the docker volume), run
 // db:migrate, then re-run this seed. For production initial setup see
@@ -57,6 +60,7 @@ import {
   pkiCaCertificates,
   stationCertificates,
   driverPaymentMethods,
+  driverPaymentCustomers,
   notifications,
   firmwareCampaigns,
   firmwareCampaignStations,
@@ -87,6 +91,7 @@ import {
   invoices,
   invoiceLineItems,
 } from './schema/index.js';
+import { acceptPendingFixtureStations } from './lib/fixture-stations.js';
 import argon2 from 'argon2';
 import {
   encryptString,
@@ -408,10 +413,42 @@ function padNum(n: number, digits: number): string {
 }
 
 const seedDemo = process.env['SEED_DEMO'] === 'true';
+// Opt-in: write the explicit configuration (seed.config.json, REGISTRATION_POLICY)
+// over existing settings. Migrations insert every settings key before the seed
+// runs, so without it a fresh database keeps the migration defaults.
+// scripts/docker-build.sh passes it only when it has just wiped the database.
+const applyConfig = process.argv.includes('--apply-config');
 // Same env vars seed-admin.ts honors, so all entry points agree on the admin
 // account. Defaults match the historical dev credentials.
 const initialAdminEmail = process.env['INITIAL_ADMIN_EMAIL'] ?? 'admin@evtivity.local';
 const initialAdminPassword = process.env['INITIAL_ADMIN_PASSWORD'] ?? 'admin123';
+
+// Built-in roles are inserted when missing and never updated. RBAC reads
+// user_permissions and the role defaults in @evtivity/lib by role name, not
+// roles.permissions, so an existing row needs no refresh (migration 0001
+// inserts the three roles with an empty list on every install).
+async function ensureRole(
+  name: string,
+  description: string,
+  permissions: readonly string[],
+): Promise<string> {
+  await db
+    .insert(roles)
+    .values({ name, description, permissions: [...permissions] })
+    .onConflictDoNothing({ target: roles.name });
+  const [row] = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, name));
+  if (row == null) throw new Error(`Role ${name} lookup failed after insert`);
+  return row.id;
+}
+
+// Users are inserted when missing. An existing user keeps every column,
+// including the password an operator may have changed.
+async function ensureUser(values: typeof users.$inferInsert): Promise<string> {
+  await db.insert(users).values(values).onConflictDoNothing({ target: users.email });
+  const [row] = await db.select({ id: users.id }).from(users).where(eq(users.email, values.email));
+  if (row == null) throw new Error(`User ${values.email} lookup failed after insert`);
+  return row.id;
+}
 
 async function seed(): Promise<void> {
   console.log(`Seeding database...${seedDemo ? '' : ' (demo data disabled)'}`);
@@ -438,14 +475,11 @@ async function seed(): Promise<void> {
     );
   }
 
-  // Allow first-install env override for the registration policy. After seed
-  // runs, the value lives in the settings table and is edited via dashboard,
-  // API, or Helm appSettings -- not via this env var.
+  // Explicit env override for the registration policy. It fills a missing key
+  // and, with --apply-config, replaces the stored value. Otherwise the value
+  // lives in the settings table and is edited via dashboard, API, or Helm
+  // appSettings -- not via this env var.
   const envRegistrationPolicy = process.env['REGISTRATION_POLICY'];
-  const registrationPolicy =
-    envRegistrationPolicy === 'open' || envRegistrationPolicy === 'approval-required'
-      ? envRegistrationPolicy
-      : 'approval-required';
 
   const defaultSettings: Record<string, unknown> = {
     'system.name': 'EVtivity CSMS',
@@ -461,7 +495,7 @@ async function seed(): Promise<void> {
     'ocpp.connectionTimeout': 120,
     'ocpp.resetRetries': 3,
     'ocpp.offlineCommandTtlHours': 24,
-    'ocpp.registrationPolicy': registrationPolicy,
+    'ocpp.registrationPolicy': 'approval-required',
     'security.autoDisableOnCritical': true,
     'pricing.splitBillingEnabled': true,
     'stationMessage.enabled': false,
@@ -473,6 +507,7 @@ async function seed(): Promise<void> {
     'maintenance.defaultMessageTemplate':
       'This site is temporarily unavailable for maintenance. {{reason}}',
     'notifications.emailEnabled': true,
+    'notifications.webhookAllowedPrivateHosts': [],
     'ftp.host': 'ftp',
     'ftp.port': 21,
     'ftp.username': 'evtivity',
@@ -492,11 +527,13 @@ async function seed(): Promise<void> {
     's3.secretAccessKeyEnc': '',
     // Provider for new payments; 'none' turns payments off (migration 0116).
     'payments.provider': 'none',
+    // Default hold amount and platform fee, any provider (migration 0125).
+    'payments.preAuthAmountCents': 5000,
+    'payments.platformFeePercent': 0,
     'stripe.secretKeyEnc': '',
     'stripe.publishableKey': '',
     'stripe.webhookSecretEnc': '',
-    'stripe.preAuthAmountCents': 5000,
-    'stripe.platformFeePercent': 0,
+    'stripe.connectWebhookSecretEnc': '',
     // Adyen payment provider (migration 0117).
     'adyen.apiKeyEnc': '',
     'adyen.merchantAccount': '',
@@ -509,6 +546,10 @@ async function seed(): Promise<void> {
     'adyen.webhookUsername': '',
     'adyen.webhookPasswordEnc': '',
     'adyen.authorisationAdjustment': false,
+    // Test (simulated) provider, where PAYMENTS_ALLOW_SIMULATED is true (migration 0125).
+    'simulated.resultMode': 'sync',
+    'simulated.asyncDelaySeconds': 3,
+    'simulated.randomFailureRate': 0.2,
     'roaming.enabled': false,
     'pnc.enabled': false,
     'pnc.provider': 'manual',
@@ -519,6 +560,9 @@ async function seed(): Promise<void> {
     'pnc.expirationWarningDays': 30,
     'pnc.expirationCriticalDays': 7,
     'pnc.ocsp.allowedPrivateHosts': [],
+    'pnc.local.emaidCountry': '',
+    'pnc.local.emaidProviderId': '',
+    'pnc.local.caEnc': '',
     'company.name': 'EVtivity',
     'company.currency': DEFAULT_CURRENCY,
     'company.priceDisplay': DEFAULT_PRICE_DISPLAY,
@@ -545,6 +589,9 @@ async function seed(): Promise<void> {
     'sustainability.avgMpg': '25.4',
     'idling.gracePeriodMinutes': 30,
     'session.staleTimeoutHours': 24,
+    // Connection timeout (s) assumed for a station that has not reported its own,
+    // when the CSMS closes a remote start the driver never plugged in for.
+    'session.evConnectionTimeoutSeconds': 180,
     'security.recaptcha.enabled': false,
     'security.recaptcha.siteKey': '',
     'security.recaptcha.secretKeyEnc': '',
@@ -568,6 +615,11 @@ async function seed(): Promise<void> {
     'mobile.attestation.android.cloudProjectNumber': '',
     'mobile.attestation.android.packageName': '',
     'mobile.attestation.android.serviceAccountEnc': '',
+    // The operator's mobile app builds, so the API accepts a 3D Secure return
+    // URL from the app only when it leads back to one of them. Defaults match
+    // the default brand in the mobile repo (brands/index.js).
+    'mobile.app.urlSchemes': ['evtivity'],
+    'mobile.app.androidPackageNames': ['com.evtivity.driver'],
     'audit.retentionDays': 1095,
     'refreshTokens.retentionDays': 30,
     // Per-log retention. Worker prunes each table on the daily cron; set 0 to
@@ -639,12 +691,14 @@ async function seed(): Promise<void> {
     's3.secretAccessKey': 's3.secretAccessKeyEnc',
     'stripe.secretKey': 'stripe.secretKeyEnc',
     'stripe.webhookSecret': 'stripe.webhookSecretEnc',
+    'stripe.connectWebhookSecret': 'stripe.connectWebhookSecretEnc',
     'adyen.apiKey': 'adyen.apiKeyEnc',
     'adyen.hmacKey': 'adyen.hmacKeyEnc',
     'adyen.hmacKeyPrevious': 'adyen.hmacKeyPreviousEnc',
     'adyen.webhookPassword': 'adyen.webhookPasswordEnc',
     'security.recaptcha.secretKey': 'security.recaptcha.secretKeyEnc',
     'pnc.hubject.clientSecret': 'pnc.hubject.clientSecretEnc',
+    'pnc.local.ca': 'pnc.local.caEnc',
     'chatbotAi.apiKey': 'chatbotAi.apiKeyEnc',
     'supportAi.apiKey': 'supportAi.apiKeyEnc',
     'sso.cert': 'sso.certEnc',
@@ -658,15 +712,20 @@ async function seed(): Promise<void> {
     'mobile.attestation.android.serviceAccount': 'mobile.attestation.android.serviceAccountEnc',
   };
 
-  // Remap config file keys to their Enc DB counterparts
-  const remappedOverrides: Record<string, unknown> = {};
+  // Remap config file keys to their Enc DB counterparts. The explicit
+  // configuration is the env registration policy (when set) plus the config
+  // file, which wins.
+  const explicitSettings: Record<string, unknown> = {};
+  if (envRegistrationPolicy === 'open' || envRegistrationPolicy === 'approval-required') {
+    explicitSettings['ocpp.registrationPolicy'] = envRegistrationPolicy;
+  }
   for (const [key, value] of Object.entries(seedOverrides)) {
     const dbKey = encryptedKeyMap[key] ?? key;
-    remappedOverrides[dbKey] = value;
+    explicitSettings[dbKey] = value;
   }
 
-  // Merge: config file overrides win over defaults
-  const mergedSettings = { ...defaultSettings, ...remappedOverrides };
+  // Merge: explicit configuration wins over built-in defaults for missing keys
+  const mergedSettings = { ...defaultSettings, ...explicitSettings };
 
   // Auto-encrypt keys ending in "Enc" when they have a non-empty plaintext value.
   // Fail loud if any Enc key has a non-empty value but SETTINGS_ENCRYPTION_KEY is
@@ -687,14 +746,49 @@ async function seed(): Promise<void> {
     return { key, value };
   });
 
-  await db
+  // Only missing keys are added. An existing value is the operator's (or the
+  // migration default) and a rerun must not reset it (P7).
+  const addedSettings = await db
     .insert(settings)
     .values(settingsRows)
-    .onConflictDoUpdate({
-      target: settings.key,
-      set: { value: sql`EXCLUDED.value`, updatedAt: new Date() },
-    });
-  console.log(`  ${String(settingsRows.length)} settings created.`);
+    .onConflictDoNothing({ target: settings.key })
+    .returning({ key: settings.key });
+  console.log(
+    `  ${String(addedSettings.length)} settings added, ${String(settingsRows.length - addedSettings.length)} existing kept.`,
+  );
+  const explicitRows = settingsRows.filter((row) => row.key in explicitSettings);
+  if (applyConfig && explicitRows.length > 0) {
+    await db
+      .insert(settings)
+      .values(explicitRows)
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: sql`EXCLUDED.value`, updatedAt: new Date() },
+      });
+    console.log(`  ${String(explicitRows.length)} settings applied from seed.config.json and env.`);
+  } else if (explicitRows.length > 0) {
+    console.log(
+      '  seed.config.json and env values only filled missing settings; pass --apply-config to overwrite existing ones.',
+    );
+  }
+  if (applyConfig) {
+    // Migrations insert some connection settings as blank placeholders
+    // (smtp.host, smtp.port, smtp.from, ftp.*). On the freshly wiped database
+    // the built-in defaults fill those, so a checkout without seed.config.json
+    // still sends mail to Mailpit and uploads logs to the compose FTP server.
+    // A non-blank value (migration or operator) is never replaced here.
+    let filled = 0;
+    for (const row of settingsRows) {
+      if (row.key in explicitSettings || row.value === '' || row.value == null) continue;
+      const updated = await db
+        .update(settings)
+        .set({ value: row.value, updatedAt: new Date() })
+        .where(and(eq(settings.key, row.key), sql`${settings.value} = '""'::jsonb`))
+        .returning({ key: settings.key });
+      filled += updated.length;
+    }
+    console.log(`  ${String(filled)} blank settings filled with built-in defaults.`);
+  }
   // Demo money uses the operator's currency, whatever the config set it to.
   clearSystemSettingsCache();
   const companyCurrency = await getCompanyCurrency();
@@ -768,53 +862,23 @@ async function seed(): Promise<void> {
     const argon2 = await import('argon2');
     const passwordHash = await argon2.hash(initialAdminPassword);
 
-    const [adminRole] = await db
-      .insert(roles)
-      .values({
-        name: 'admin',
-        description: 'Full system access',
-        permissions: JSON.stringify(['*']),
-      })
-      .onConflictDoUpdate({
-        target: roles.name,
-        set: { permissions: JSON.stringify(['*']), updatedAt: new Date() },
-      })
-      .returning({ id: roles.id });
-    await db
-      .insert(roles)
-      .values({
-        name: 'operator',
-        description: 'Operational access',
-        permissions: JSON.stringify(OPERATOR_DEFAULT_PERMISSIONS),
-      })
-      .onConflictDoUpdate({
-        target: roles.name,
-        set: { permissions: JSON.stringify(OPERATOR_DEFAULT_PERMISSIONS), updatedAt: new Date() },
-      });
-    console.log('  2 roles created.');
+    const adminRoleId = await ensureRole('admin', 'Full system access', ['*']);
+    await ensureRole('operator', 'Operational access', OPERATOR_DEFAULT_PERMISSIONS);
+    console.log('  2 roles ensured.');
 
-    const [adminUser] = await db
-      .insert(users)
-
-      .values({
-        email: initialAdminEmail,
-        passwordHash,
-        firstName: 'Admin',
-        lastName: 'User',
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        roleId: adminRole!.id,
-        hasAllSiteAccess: true,
-      })
-      .onConflictDoUpdate({
-        target: users.email,
-        set: { passwordHash: sql`EXCLUDED.password_hash`, updatedAt: new Date() },
-      })
-      .returning({ id: users.id });
-    console.log(`  1 admin user created (${initialAdminEmail}).`);
+    // An existing admin keeps its password: a rerun must never reset it.
+    const adminUserId = await ensureUser({
+      email: initialAdminEmail,
+      passwordHash,
+      firstName: 'Admin',
+      lastName: 'User',
+      roleId: adminRoleId,
+      hasAllSiteAccess: true,
+    });
+    console.log(`  Admin user ensured (${initialAdminEmail}).`);
 
     const permRows = ADMIN_DEFAULT_PERMISSIONS.map((perm) => ({
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      userId: adminUser!.id,
+      userId: adminUserId,
       permission: perm,
     }));
     await db.insert(userPermissions).values(permRows).onConflictDoNothing();
@@ -823,6 +887,14 @@ async function seed(): Promise<void> {
     console.log('Seed complete (SEED_DEMO=false).');
     await client.end();
     return;
+  }
+
+  // Demo installs run the CS-0001/CS-0002 simulators (fixtures of migration
+  // 0001, inserted pending) like the compose dev fixture does. Before the demo
+  // marker check, so a rerun also fixes a demo install seeded before this.
+  const acceptedFixtures = await acceptPendingFixtureStations();
+  if (acceptedFixtures.length > 0) {
+    console.log(`  Accepted pending fixture stations: ${acceptedFixtures.join(', ')}.`);
   }
 
   // The demo rows have no natural keys (random sessions, generated IDs), so
@@ -1317,22 +1389,9 @@ async function seed(): Promise<void> {
   }
 
   // ------ Roles ------
-  // Upsert by name: the migrate container's seed:admin step may have already
-  // created the admin role before this script runs.
-  const [adminRole] = await db
-    .insert(roles)
-    .values({
-      name: 'admin',
-      description: 'Full system access',
-      permissions: JSON.stringify(['*']),
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { permissions: JSON.stringify(['*']), updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  const operatorPermissions = JSON.stringify([
+  // Insert when missing: migration 0001 and the migrate container's
+  // seed:admin step create these roles before this script runs.
+  const operatorPermissions = [
     'stations:*',
     'sessions:*',
     'drivers:*',
@@ -1349,36 +1408,15 @@ async function seed(): Promise<void> {
     'payments:*',
     'load-management:*',
     'logs:*',
-  ]);
-  const [operatorRole] = await db
-    .insert(roles)
-    .values({
-      name: 'operator',
-      description: 'Day-to-day operations access',
-      permissions: operatorPermissions,
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { permissions: operatorPermissions, updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  const [viewerRole] = await db
-    .insert(roles)
-    .values({
-      name: 'viewer',
-      description: 'Read-only access',
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  if (adminRole == null || operatorRole == null || viewerRole == null) {
-    throw new Error('Failed to create roles');
-  }
-  console.log('  3 roles created.');
+  ];
+  const adminRoleId = await ensureRole('admin', 'Full system access', ['*']);
+  const operatorRoleId = await ensureRole(
+    'operator',
+    'Day-to-day operations access',
+    operatorPermissions,
+  );
+  await ensureRole('viewer', 'Read-only access', []);
+  console.log('  3 roles ensured.');
 
   // ------ Users (20) ------
   const passwordHash = await argon2.hash('admin123');
@@ -1389,7 +1427,7 @@ async function seed(): Promise<void> {
       passwordHash: adminPasswordHash,
       firstName: 'Admin',
       lastName: 'User',
-      roleId: adminRole.id,
+      roleId: adminRoleId,
       hasAllSiteAccess: true,
     },
     // Operators 1-3: all-site access
@@ -1398,7 +1436,7 @@ async function seed(): Promise<void> {
       passwordHash,
       firstName: at(FIRST_NAMES, i),
       lastName: at(LAST_NAMES, i),
-      roleId: operatorRole.id,
+      roleId: operatorRoleId,
       hasAllSiteAccess: true,
     })),
     // Operators 4-9: specific site assignments (added below)
@@ -1407,17 +1445,16 @@ async function seed(): Promise<void> {
       passwordHash,
       firstName: at(FIRST_NAMES, i + 3),
       lastName: at(LAST_NAMES, i + 3),
-      roleId: operatorRole.id,
+      roleId: operatorRoleId,
     })),
   ];
-  await db
+  // Existing users (the admin from seed:admin) keep their password.
+  const createdUserRows = await db
     .insert(users)
     .values(userRows)
-    .onConflictDoUpdate({
-      target: users.email,
-      set: { passwordHash: sql`EXCLUDED.password_hash`, updatedAt: new Date() },
-    });
-  console.log('  10 users created.');
+    .onConflictDoNothing({ target: users.email })
+    .returning({ id: users.id });
+  console.log(`  ${String(createdUserRows.length)} users created.`);
 
   // ------ User Permissions ------
   const createdUsers = await db.select({ id: users.id, roleId: users.roleId }).from(users);
@@ -1425,7 +1462,7 @@ async function seed(): Promise<void> {
   const permRows: { userId: string; permission: string }[] = [];
   for (const u of createdUsers) {
     const defaults =
-      u.roleId === adminRole.id ? ADMIN_DEFAULT_PERMISSIONS : OPERATOR_DEFAULT_PERMISSIONS;
+      u.roleId === adminRoleId ? ADMIN_DEFAULT_PERMISSIONS : OPERATOR_DEFAULT_PERMISSIONS;
     for (const perm of defaults) {
       permRows.push({ userId: u.id, permission: perm });
     }
@@ -1538,15 +1575,29 @@ async function seed(): Promise<void> {
 
   // ------ Driver Payment Methods (all drivers) ------
   const cardBrands = ['visa', 'mastercard', 'amex'];
+  // Both forms of the ids until P8 drops the stripe_* columns.
   const paymentMethodRows = createdDrivers.map((driver, i) => ({
     driverId: driver.id,
     stripeCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
     stripePaymentMethodId: `pm_sim_${padNum(i + 1, 6)}`,
+    provider: 'simulated',
+    providerCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
+    providerPaymentMethodId: `pm_sim_${padNum(i + 1, 6)}`,
     cardBrand: cardBrands[i % cardBrands.length] ?? 'visa',
     cardLast4: '4242',
     isDefault: true,
   }));
   await db.insert(driverPaymentMethods).values(paymentMethodRows);
+  await db
+    .insert(driverPaymentCustomers)
+    .values(
+      paymentMethodRows.map((row) => ({
+        driverId: row.driverId,
+        provider: row.provider,
+        providerCustomerId: row.providerCustomerId,
+      })),
+    )
+    .onConflictDoNothing();
   console.log(`  ${String(paymentMethodRows.length)} driver payment methods created.`);
 
   // ------ Vehicles (120) ------
@@ -1832,6 +1883,9 @@ async function seed(): Promise<void> {
           driverId,
           stripePaymentIntentId: intentId,
           stripeCustomerId: customerId,
+          provider: 'simulated',
+          providerPaymentId: intentId,
+          providerCustomerId: customerId,
           paymentSource: 'web_portal' as const,
           currency: companyCurrency,
           preAuthAmountCents: 5000,
@@ -1848,6 +1902,9 @@ async function seed(): Promise<void> {
           driverId,
           stripePaymentIntentId: intentId,
           stripeCustomerId: customerId,
+          provider: 'simulated',
+          providerPaymentId: intentId,
+          providerCustomerId: customerId,
           paymentSource: 'web_portal' as const,
           currency: companyCurrency,
           preAuthAmountCents: 5000,
@@ -2238,6 +2295,8 @@ async function seed(): Promise<void> {
       status: 'pending',
       version: '2.2.1',
       versionUrl: 'http://localhost:7105/ocpi/versions',
+      // Local simulator on localhost or a Docker name: a private address.
+      allowPrivateNetwork: true,
     })
     .returning({ id: ocpiPartners.id });
 
@@ -2312,6 +2371,8 @@ async function seed(): Promise<void> {
       status: 'pending',
       version: '2.2.1',
       versionUrl: 'http://localhost:7106/ocpi/versions',
+      // Local simulator on localhost or a Docker name: a private address.
+      allowPrivateNetwork: true,
     })
     .returning({ id: ocpiPartners.id });
 
@@ -2505,7 +2566,10 @@ async function seed(): Promise<void> {
     driverId: portalDriverId,
     stripePaymentIntentId: `pi_portal_${padNum(i + 1, 4)}`,
     stripeCustomerId: 'cus_U443UCZOsb72EL',
-    paymentSource: 'stripe' as const,
+    provider: 'stripe',
+    providerPaymentId: `pi_portal_${padNum(i + 1, 4)}`,
+    providerCustomerId: 'cus_U443UCZOsb72EL',
+    paymentSource: 'web_portal' as const,
     currency: companyCurrency,
     preAuthAmountCents: 5000,
     capturedAmountCents: portalSessionRows[i]?.finalCostCents ?? 200,
@@ -2519,10 +2583,21 @@ async function seed(): Promise<void> {
     driverId: portalDriverId,
     stripeCustomerId: 'cus_U443UCZOsb72EL',
     stripePaymentMethodId: 'pm_portal_test',
+    provider: 'stripe',
+    providerCustomerId: 'cus_U443UCZOsb72EL',
+    providerPaymentMethodId: 'pm_portal_test',
     cardBrand: 'visa',
     cardLast4: '4242',
     isDefault: true,
   });
+  await db
+    .insert(driverPaymentCustomers)
+    .values({
+      driverId: portalDriverId,
+      provider: 'stripe',
+      providerCustomerId: 'cus_U443UCZOsb72EL',
+    })
+    .onConflictDoNothing();
   console.log('  Portal test driver payment method created.');
 
   // Portal driver support cases (the portal Support page should show data)
@@ -2781,7 +2856,9 @@ async function seed(): Promise<void> {
   // Roaming demo data so the OCPI sessions, CDRs, and tariff-mapping pages
   // have rows. Linked to the simulator partners seeded above. The demo
   // dataset ships roaming rows, so enable the feature toggle for demo
-  // installs (the production default stays false).
+  // installs (the production default stays false). The one setting the seed
+  // writes over an existing value: migration 0001 always inserts it as false,
+  // and this demo block runs once per inventory (CS-0003 marker above).
   await db
     .insert(settings)
     .values({ key: 'roaming.enabled', value: true })

@@ -17,8 +17,9 @@ import {
   vehicleEfficiencyLookup,
 } from '@evtivity/database';
 import { zodSchema } from '../../lib/zod-schema.js';
-import { inCompanyCurrency, sessionCurrencySql } from '../../lib/company-currency.js';
-import { storedSessionCostTax } from '../../lib/session-tax.js';
+import { inCompanyCurrency, sessionCurrencySql } from '@evtivity/services/company-currency';
+import { storedSessionCostTax } from '@evtivity/lib';
+import { sessionLimitReached } from '../../lib/session-limit.js';
 import { ID_PARAMS } from '../../lib/id-validation.js';
 import { paginatedResponse, itemResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
@@ -53,6 +54,14 @@ const portalSessionListItem = z
       .nullable()
       .describe(
         'Tax rate of the session tariff as a decimal (e.g. 0.19), null without tax. Costs include it',
+      ),
+    taxCents: z
+      .number()
+      .int()
+      .min(0)
+      .nullable()
+      .describe(
+        'Tax contained in the cost, in cents, as stored with it (exact per tariff segment). Above 0 when the cost includes tax; null for a session without a stored split',
       ),
     currency: z.string().length(3).describe('ISO 4217 currency code the session was billed in'),
     stationName: z.string().max(255).nullable().describe('OCPP station identity (display name)'),
@@ -116,7 +125,7 @@ const portalSessionDetail = portalSessionListItem
       .min(1)
       .nullable()
       .describe(
-        'Tax contained in the cost (finalCostCents, else currentCostCents) in cents, split per tariff segment as billed. Null when the cost contains no tax, or when tariffs with different tax rates applied and the split is not known yet',
+        'Tax contained in the cost (finalCostCents, else currentCostCents) in cents, split per tax rate as billed. Null when the cost contains no tax, or when tariffs with different tax rates applied and the split is not known yet',
       ),
     taxRate: z
       .string()
@@ -137,6 +146,13 @@ const portalSessionDetail = portalSessionListItem
       .date()
       .nullable()
       .describe('Timestamp the EV stopped drawing power, used to bill idle fees'),
+    limitReached: z
+      .enum(['cost', 'energy', 'time'])
+      .nullable()
+      .optional()
+      .describe(
+        'Transaction limit the station reported reaching (cost: the hold or prepaid amount, energy, time); it then suspends charging. Null when none',
+      ),
     currentPowerW: z
       .number()
       .min(0)
@@ -238,6 +254,14 @@ const monthlyStatementSessionItem = z
       .describe(
         'Tax rate of the session tariff as a decimal (e.g. 0.19), null without tax. Costs include it',
       ),
+    taxCents: z
+      .number()
+      .int()
+      .min(0)
+      .nullable()
+      .describe(
+        'Tax contained in finalCostCents, in cents, as stored with it. Above 0 when the cost includes tax',
+      ),
     currency: z.string().length(3).describe('Currency code (ISO 4217) the session was billed in'),
     siteName: z.string().max(255).nullable().describe('Site name for the station'),
     siteCity: z.string().max(100).nullable().describe('Site city'),
@@ -316,6 +340,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
             co2AvoidedKg: chargingSessions.co2AvoidedKg,
             finalCostCents: chargingSessions.finalCostCents,
             tariffTaxRate: chargingSessions.tariffTaxRate,
+            taxCents: chargingSessions.taxCents,
             currency: sessionCurrencySql(),
             stationName: chargingStations.stationId,
             siteName: sites.name,
@@ -417,6 +442,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           co2AvoidedKg: chargingSessions.co2AvoidedKg,
           finalCostCents: chargingSessions.finalCostCents,
           tariffTaxRate: chargingSessions.tariffTaxRate,
+          taxCents: chargingSessions.taxCents,
           currency: sessionCurrencySql(),
           siteName: sites.name,
           siteCity: sites.city,
@@ -526,10 +552,10 @@ export function portalSessionRoutes(app: FastifyInstance): void {
 
       const [payment, latestPower, latestSoc, vehicleEfficiency] = await Promise.all([
         // Only return display-safe fields. The full payment_records row
-        // contains stripe_customer_id, stripe_payment_method_id, and
-        // stripe_payment_intent_id which the portal does not need; surfacing
-        // them is the same defense-in-depth issue the payment-methods list
-        // was just fixed for.
+        // contains the provider ids (provider_payment_id, provider_customer_id,
+        // provider_payment_method_id and their stripe_* copies until P8)
+        // which the portal does not need; surfacing them is the same
+        // defense-in-depth issue the payment-methods list was just fixed for.
         db
           .select({
             id: paymentRecords.id,
@@ -594,6 +620,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       });
       return {
         ...sessionRest,
+        limitReached: await sessionLimitReached(id),
         currentPowerW: latestPower != null ? parseFloat(latestPower.value) : null,
         batteryPercent: latestSoc != null ? parseFloat(latestSoc.value) : null,
         payment: payment ?? null,

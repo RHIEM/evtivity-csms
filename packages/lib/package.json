@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/lib",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -34,6 +34,12 @@
     },
     "./languages": {
       "import": "./src/languages.ts"
+    },
+    "./report-labels": {
+      "import": "./src/report-labels.ts"
+    },
+    "./pubsub-instance": {
+      "import": "./src/pubsub-instance.ts"
     }
   },
   "scripts": {
@@ -42,8 +48,8 @@
   },
   "dependencies": {
     "@sentry/node": "^10.42.0",
-    "bullmq": "^5.0.0",
     "handlebars": "^4.7.8",
+    "html-to-text": "^10.0.1",
     "ioredis": "^5.9.3",
     "nanoid": "^6.0.1",
     "nodemailer": "^10.0.11",
@@ -51,11 +57,13 @@
     "pino": "^9.6.0",
     "postgres": "^3.4.8",
     "reflect-metadata": "^0.2.2",
-    "tsyringe": "^4.8.0"
+    "tsyringe": "^4.8.0",
+    "undici": "^8.11.2"
   },
   "devDependencies": {
+    "@types/html-to-text": "^9.0.4",
     "@types/node": "^25.2.3",
-    "typescript": "^5.7.0",
+    "typescript": "^6.0.3",
     "vitest": "^5.0.2"
   }
 }

@@ -23,7 +23,7 @@ import { useToast } from '@/components/ui/toast';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { SessionCharts } from '@/components/SessionCharts';
 import { api } from '@/lib/api';
-import { costIncludesTax } from '@evtivity/lib/price-display';
+import { costContainsTax } from '@evtivity/lib/price-display';
 import { formatCents, formatEnergy, formatDate } from '@/lib/utils';
 
 interface GuestSessionStatus {
@@ -34,12 +34,14 @@ interface GuestSessionStatus {
   energyDeliveredWh?: string | null;
   currentCostCents?: number | null;
   finalCostCents?: number | null;
-  tariffTaxRate?: string | null;
+  taxCents?: number | null;
   currency?: string;
   failureReason?: string | null;
   startedAt?: string | null;
   endedAt?: string | null;
   idleStartedAt?: string | null;
+  /** Transaction limit the station reported reaching (cost: the hold amount). */
+  limitReached?: 'cost' | 'energy' | 'time' | null;
 }
 
 function statusLabel(status: string, t: (key: string) => string): string {
@@ -277,6 +279,11 @@ export function GuestSession(): React.JSX.Element {
           <p className="text-sm text-muted-foreground">
             {t('guest.stationPort', { stationId: session.stationOcppId, evseId: session.evseId })}
           </p>
+          {session.limitReached != null && (
+            <p role="status" className="text-sm text-muted-foreground">
+              {t(`sessionDetail.limitReached.${session.limitReached}`)}
+            </p>
+          )}
         </div>
 
         {/* Stats grid */}
@@ -296,7 +303,7 @@ export function GuestSession(): React.JSX.Element {
             <CardContent className="p-3 text-center">
               <DollarSign className="mx-auto h-5 w-5 text-muted-foreground mb-1" />
               <p className="text-xs text-muted-foreground h-8 flex items-center justify-center">
-                {costIncludesTax(costCents, session.tariffTaxRate)
+                {costContainsTax(costCents, session.taxCents)
                   ? t(
                       isDone
                         ? 'guestSession.totalCostInclTax'

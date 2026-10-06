@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase, TestContext } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 async function boot(ctx: TestContext) {
   await ctx.client.sendCall('BootNotification', {
@@ -18,7 +19,7 @@ async function boot(ctx: TestContext) {
 }
 
 async function startTx(ctx: TestContext) {
-  const txId = `OCTT-TX-${String(Date.now())}`;
+  const txId = newTransactionId('OCTT-TX');
   await ctx.client.sendCall('TransactionEvent', {
     eventType: 'Started',
     timestamp: new Date().toISOString(),
@@ -71,7 +72,7 @@ export const TC_K_04_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -168,7 +169,7 @@ export const TC_K_70_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -266,7 +267,7 @@ export const TC_K_118_CSMS: TestCase = {
           activateValue = payload['activate'] as boolean;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -363,7 +364,7 @@ export const TC_K_121_CSMS: TestCase = {
           dynamicProfileId = profile?.['id'] as number | null;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

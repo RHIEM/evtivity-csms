@@ -11,11 +11,22 @@ import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { formatDateTime } from '@/lib/timezone';
 import { paymentStatusVariant } from '@/lib/status-variants';
 
-interface PaymentRecord {
+/** One entry of the refund ledger (payment_records.provider_refunds). */
+export interface ProviderRefund {
+  refundId: string;
+  amountCents: number;
+  state: 'pending' | 'succeeded' | 'failed';
+  requestedAt: string;
+  settledAt?: string;
+}
+
+export interface PaymentRecord {
   id: number;
   status: string;
   paymentSource: string;
@@ -24,7 +35,28 @@ interface PaymentRecord {
   capturedAmountCents: number | null;
   refundedAmountCents: number;
   failureReason: string | null;
+  /** Operation an asynchronous provider (Adyen) has not confirmed yet. */
+  pendingOperation?: 'capture' | 'cancel' | 'adjust' | null;
+  providerRefunds?: ProviderRefund[];
 }
+
+const PENDING_OPERATION_I18N = {
+  capture: 'sessions.pendingOperation.capture',
+  cancel: 'sessions.pendingOperation.cancel',
+  adjust: 'sessions.pendingOperation.adjust',
+} as const;
+
+const REFUND_STATE_I18N = {
+  pending: 'sessions.refundState.pending',
+  succeeded: 'sessions.refundState.succeeded',
+  failed: 'sessions.refundState.failed',
+} as const;
+
+const REFUND_STATE_VARIANT = {
+  pending: 'warning',
+  succeeded: 'success',
+  failed: 'destructive',
+} as const;
 
 const PAYMENT_STATUS_I18N: Record<string, string> = {
   pending: 'payments.statuses.pending',
@@ -35,6 +67,14 @@ const PAYMENT_STATUS_I18N: Record<string, string> = {
   refunded: 'payments.statuses.refunded',
   partially_refunded: 'payments.statuses.partially_refunded',
 };
+
+/** Captured minus refunded, counting refunds still pending at the provider (as the API does). */
+function refundableCents(payment: PaymentRecord): number {
+  const pending = (payment.providerRefunds ?? [])
+    .filter((r) => r.state === 'pending')
+    .reduce((sum, r) => sum + r.amountCents, 0);
+  return (payment.capturedAmountCents ?? 0) - payment.refundedAmountCents - pending;
+}
 
 function Row({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
   return (
@@ -50,6 +90,16 @@ export interface SessionPaymentTabProps {
   payment: PaymentRecord | null;
   canRefund: boolean;
   formatCents: (cents: number | null | undefined, currency: string) => string;
+  timezone: string;
+  /**
+   * Reuse for another payment record (a reservation fee): the card title,
+   * the refund endpoint, the query to refresh after a refund, and whether the
+   * pre-authorization row applies. Defaults are the session's.
+   */
+  title?: string;
+  refundPath?: string;
+  invalidateKey?: readonly unknown[];
+  showPreAuth?: boolean;
 }
 
 export function SessionPaymentTab({
@@ -57,9 +107,15 @@ export function SessionPaymentTab({
   payment,
   canRefund,
   formatCents,
+  timezone,
+  title,
+  refundPath,
+  invalidateKey,
+  showPreAuth = true,
 }: SessionPaymentTabProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { toast } = useToast();
 
   const [showRefund, setShowRefund] = useState(false);
   const [refundAmount, setRefundAmount] = useState('');
@@ -67,9 +123,16 @@ export function SessionPaymentTab({
 
   const refundMutation = useMutation({
     mutationFn: (data: { amountCents?: number }) =>
-      api.post(`/v1/sessions/${sessionId}/refund`, data),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['sessions'] });
+      api.post<{ refundStatus?: 'succeeded' | 'pending' }>(
+        refundPath ?? `/v1/sessions/${sessionId}/refund`,
+        data,
+      ),
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: invalidateKey ?? ['sessions'] });
+      // An asynchronous provider (Adyen) confirms the refund later by webhook.
+      if (result.refundStatus === 'pending') {
+        toast({ title: t('sessions.refundPending'), variant: 'success' });
+      }
       setShowRefund(false);
       setRefundAmount('');
     },
@@ -77,7 +140,7 @@ export function SessionPaymentTab({
 
   function handleRefundConfirm(): boolean {
     if (payment == null) return false;
-    const remaining = (payment.capturedAmountCents ?? 0) - payment.refundedAmountCents;
+    const remaining = refundableCents(payment);
 
     if (refundAmount.trim() === '') {
       refundMutation.mutate({});
@@ -102,7 +165,7 @@ export function SessionPaymentTab({
     <>
       <Card>
         <CardHeader>
-          <CardTitle>{t('sessions.payment')}</CardTitle>
+          <CardTitle>{title ?? t('sessions.payment')}</CardTitle>
         </CardHeader>
         <CardContent>
           {payment == null ? (
@@ -120,27 +183,64 @@ export function SessionPaymentTab({
                   </Badge>
                 </Row>
                 <Row label={t('sessions.paymentSource')}>{payment.paymentSource}</Row>
-                <Row label={t('sessions.preAuthAmount')}>
-                  {formatCents(payment.preAuthAmountCents, payment.currency)}
-                </Row>
+                {showPreAuth && (
+                  <Row label={t('sessions.preAuthAmount')}>
+                    {formatCents(payment.preAuthAmountCents, payment.currency)}
+                  </Row>
+                )}
                 <Row label={t('sessions.capturedAmount')}>
                   {formatCents(payment.capturedAmountCents, payment.currency)}
                 </Row>
                 <Row label={t('sessions.refundedAmount')}>
                   {formatCents(payment.refundedAmountCents, payment.currency)}
                 </Row>
+                {payment.pendingOperation != null && (
+                  <Row label={t('sessions.providerConfirmation')}>
+                    <Badge variant="warning">
+                      {t(PENDING_OPERATION_I18N[payment.pendingOperation])}
+                    </Badge>
+                  </Row>
+                )}
                 {payment.failureReason != null && (
                   <Row label={t('sessions.failureReason')}>
                     <span className="text-destructive">{payment.failureReason}</span>
                   </Row>
                 )}
               </div>
+              {payment.providerRefunds != null && payment.providerRefunds.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">{t('sessions.providerRefunds')}</p>
+                  <ul className="space-y-1">
+                    {payment.providerRefunds.map((refund) => (
+                      <li
+                        key={refund.refundId}
+                        className="flex flex-wrap items-center gap-2 text-sm"
+                      >
+                        <span>{formatCents(refund.amountCents, payment.currency)}</span>
+                        <Badge variant={REFUND_STATE_VARIANT[refund.state]}>
+                          {t(REFUND_STATE_I18N[refund.state])}
+                        </Badge>
+                        <span className="text-muted-foreground">
+                          {formatDateTime(refund.settledAt ?? refund.requestedAt, timezone)}
+                        </span>
+                        <span className="font-mono text-xs text-muted-foreground">
+                          {refund.refundId}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {payment.pendingOperation === 'capture' && (
+                <p className="text-sm text-muted-foreground">
+                  {t('sessions.refundAfterConfirmation')}
+                </p>
+              )}
               {canRefund && (
                 <RefundButton
                   label={t('sessions.refund')}
                   onClick={() => {
-                    const remaining =
-                      (payment.capturedAmountCents ?? 0) - payment.refundedAmountCents;
+                    const remaining = refundableCents(payment);
                     setRefundAmount((remaining / 100).toFixed(2));
                     setShowRefund(true);
                   }}

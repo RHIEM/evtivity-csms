@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase, TestContext } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station and send initial StatusNotification
 async function bootAndStatus(ctx: TestContext) {
@@ -20,7 +21,7 @@ async function bootAndStatus(ctx: TestContext) {
 
 // Helper: start a charging transaction and return the txId
 async function startChargingTransaction(ctx: TestContext) {
-  const txId = `OCTT-TX-${String(Date.now())}`;
+  const txId = newTransactionId('OCTT-TX');
   await ctx.client.sendCall('TransactionEvent', {
     eventType: 'Started',
     timestamp: new Date().toISOString(),
@@ -246,13 +247,15 @@ export const TC_E_117_CSMS: TestCase = {
     // Track incoming SetChargingProfile calls
     let setProfileCount = 0;
 
-    ctx.client.setIncomingCallHandler(async (_messageId: string, action: string) => {
-      if (action === 'SetChargingProfile') {
-        setProfileCount++;
-        return { status: 'Accepted' };
-      }
-      return { status: 'NotSupported' };
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'SetChargingProfile') {
+          setProfileCount++;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
 
     // Wait for CSMS to send initial SetChargingProfile (manual action)
     if (ctx.triggerCommand != null) {

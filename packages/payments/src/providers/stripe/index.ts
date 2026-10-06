@@ -4,6 +4,7 @@
 import Stripe from 'stripe';
 import { platformFeeCents } from '@evtivity/lib';
 import { captureHoldWithFee, chargeShortfallTopUp } from './charges.js';
+import { stripeMinimumChargeCents } from './minimum-charge.js';
 import type { StripeChargeClient } from './charges.js';
 import {
   PaymentDeclinedError,
@@ -20,6 +21,7 @@ import type {
   CaptureInput,
   CaptureResult,
   ChargeResult,
+  CreatePayoutAccountInput,
   HoldResult,
   Idempotent,
   ImmediateChargeInput,
@@ -28,6 +30,7 @@ import type {
   ModificationResult,
   NormalizedPaymentEvent,
   PaymentProvider,
+  PayoutAccountStatus,
   PaymentProviderClientConfig,
   ProviderCapabilities,
   ProviderPaymentState,
@@ -37,9 +40,21 @@ import type {
   ShortfallInput,
   StartMethodSetupInput,
   WebhookAck,
+  WebhookEndpointInfo,
+  WebhookRegistration,
+  WebhookRegistrationInput,
 } from '../../types.js';
 import { acceptableLocalStatuses } from './status-map.js';
 import { normalizeStripeEvent } from './webhooks.js';
+import {
+  listEvtivityWebhookEndpoints,
+  registerStripeWebhookEndpoints,
+} from './webhook-endpoints.js';
+import {
+  createStripeOnboardingLink,
+  createStripePayoutAccount,
+  getStripePayoutAccountStatus,
+} from './payout-accounts.js';
 
 export const STRIPE_PROVIDER_ID = 'stripe';
 
@@ -57,13 +72,17 @@ export const STRIPE_CAPABILITIES: ProviderCapabilities = {
   stateLookup: true,
   marketplaceSplit: 'destination_charge',
   currencies: 'all',
+  payoutOnboarding: 'hosted_link',
+  webhookRegistration: true,
 };
 
 export interface StripeProviderOptions {
   client: Stripe;
   publishableKey: string;
-  /** `stripe.webhookSecretEnc`, decrypted. Null until the operator enters it. */
+  /** `stripe.webhookSecretEnc`, decrypted: the platform endpoint. Null until set. */
   webhookSecret: string | null;
+  /** `stripe.connectWebhookSecretEnc`, decrypted: the Connect endpoint. Null until set. */
+  connectWebhookSecret: string | null;
 }
 
 /** Stripe error types that mean Stripe or the network failed, not the card. */
@@ -131,12 +150,15 @@ export class StripePaymentProvider implements PaymentProvider {
 
   private readonly stripe: Stripe;
   private readonly publishableKey: string;
-  private readonly webhookSecret: string | null;
+  private readonly webhookSecrets: string[];
 
   constructor(options: StripeProviderOptions) {
     this.stripe = options.client;
     this.publishableKey = options.publishableKey;
-    this.webhookSecret = options.webhookSecret;
+    // Platform first: most events come from the platform endpoint.
+    this.webhookSecrets = [options.webhookSecret, options.connectWebhookSecret].filter(
+      (secret): secret is string => secret != null && secret !== '',
+    );
   }
 
   clientConfig(): PaymentProviderClientConfig {
@@ -320,6 +342,11 @@ export class StripePaymentProvider implements PaymentProvider {
     return { state: 'succeeded', capturedCents: input.amountCents, applicationFeeCents };
   }
 
+  /** Stripe refuses a charge below its per-currency minimum (amount_too_small). */
+  minimumChargeCents(currency: string): number | null {
+    return stripeMinimumChargeCents(currency);
+  }
+
   /** chargeShortfallTopUp: final minus captured on the original card and destination. */
   async chargeShortfall(input: ShortfallInput): Promise<ChargeResult> {
     const topUp = await call(() =>
@@ -393,7 +420,7 @@ export class StripePaymentProvider implements PaymentProvider {
    * A refund on a destination charge reverses the transfer and refunds the
    * application fee (Stripe prorates both on a partial refund), so the
    * platform does not carry the connected account's share. The caller's
-   * idempotency key is used as is (today: `refund_<intentId>_<requestId>`).
+   * idempotency key is used as is (`refundKey` in `idempotency-keys.ts`).
    */
   async refund(input: RefundInput): Promise<ModificationResult<RefundResult>> {
     const intent = await call(() => this.stripe.paymentIntents.retrieve(input.paymentId));
@@ -407,30 +434,72 @@ export class StripePaymentProvider implements PaymentProvider {
     return { state: 'succeeded', refundId: refund.id, amountCents: refund.amount };
   }
 
+  /**
+   * Events of the platform endpoint are signed with `stripe.webhookSecretEnc`
+   * and those of the Connect endpoint with `stripe.connectWebhookSecretEnc`;
+   * both arrive at the same route, so the signature is checked against each
+   * secret. When none matches, the first failure is reported.
+   */
   verifyWebhook(
     rawBody: string,
     headers: Record<string, string | undefined>,
   ): NormalizedPaymentEvent[] {
-    if (this.webhookSecret == null) throw new WebhookNotConfiguredError(this.id);
+    if (this.webhookSecrets.length === 0) throw new WebhookNotConfiguredError(this.id);
     const signature = headers['stripe-signature'];
     if (signature == null || signature === '') {
       throw new WebhookSignatureError('missing', 'Missing stripe-signature header');
     }
-    let event: Stripe.Event;
-    try {
-      event = this.stripe.webhooks.constructEvent(rawBody, signature, this.webhookSecret);
-    } catch (err) {
-      throw new WebhookSignatureError(
-        'invalid',
-        err instanceof Error ? err.message : 'Invalid signature',
-        { cause: err },
-      );
+    let firstError: unknown = null;
+    for (const secret of this.webhookSecrets) {
+      let event: Stripe.Event;
+      try {
+        event = this.stripe.webhooks.constructEvent(rawBody, signature, secret);
+      } catch (err) {
+        firstError ??= err;
+        // Only a signature mismatch is worth the next secret; a malformed
+        // header or body fails the same way with every secret.
+        if ((err as { type?: unknown }).type === 'StripeSignatureVerificationError') continue;
+        break;
+      }
+      return [normalizeStripeEvent(event)];
     }
-    return [normalizeStripeEvent(event)];
+    throw new WebhookSignatureError(
+      'invalid',
+      firstError instanceof Error ? firstError.message : 'Invalid signature',
+      { cause: firstError },
+    );
   }
 
   webhookAck(): WebhookAck {
     return { status: 200, contentType: 'application/json', body: '{"received":true}' };
+  }
+
+  /** The webhook endpoints EVtivity created in this Stripe account. */
+  async listWebhooks(): Promise<WebhookEndpointInfo[]> {
+    return call(() => listEvtivityWebhookEndpoints(this.stripe));
+  }
+
+  /** Creates (or with `replace`, replaces) the platform and Connect endpoints. */
+  async registerWebhook(input: WebhookRegistrationInput): Promise<WebhookRegistration> {
+    return call(() => registerStripeWebhookEndpoints(this.stripe, input));
+  }
+
+  /** A site host's connected account (Accounts v2, destination charges). */
+  async createPayoutAccount(input: CreatePayoutAccountInput): Promise<{ accountId: string }> {
+    return call(() => createStripePayoutAccount(this.stripe, input));
+  }
+
+  /** A Stripe-hosted onboarding link (single use, expires after minutes; never emailed). */
+  async createPayoutOnboardingLink(input: {
+    accountId: string;
+    refreshUrl: string;
+    returnUrl: string;
+  }): Promise<{ url: string; expiresAt: Date }> {
+    return call(() => createStripeOnboardingLink(this.stripe, input));
+  }
+
+  async getPayoutAccountStatus(accountId: string): Promise<PayoutAccountStatus> {
+    return call(() => getStripePayoutAccountStatus(this.stripe, accountId));
   }
 
   async getPaymentState(paymentId: string): Promise<ProviderPaymentState> {
@@ -452,13 +521,14 @@ export class StripePaymentProvider implements PaymentProvider {
 export const stripeProviderFactory: PaymentProviderFactory = {
   id: STRIPE_PROVIDER_ID,
   create(settings) {
-    const { secretKey, publishableKey, webhookSecret } = settings.stripe;
+    const { secretKey, publishableKey, webhookSecret, connectWebhookSecret } = settings.stripe;
     if (secretKey == null || publishableKey == null) return Promise.resolve(null);
     return Promise.resolve(
       new StripePaymentProvider({
         client: new Stripe(secretKey, { maxNetworkRetries: 3 }),
         publishableKey,
         webhookSecret,
+        connectWebhookSecret,
       }),
     );
   },

@@ -7,8 +7,8 @@ import { createLogger } from '@evtivity/lib';
 import { db } from '@evtivity/database';
 import { chargingStations } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
-import { getPubSub } from '../../lib/pubsub.js';
-import { writeSseClient } from '../../lib/sse-broadcast.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { endSseClients, writeSseClient } from '../../lib/sse-broadcast.js';
 
 const logger = createLogger('portal-station-events-sse');
 
@@ -128,6 +128,11 @@ export function portalStationEventRoutes(app: FastifyInstance): void {
       await reply;
     },
   );
+
+  app.addHook('preClose', (done) => {
+    endSseClients(clients, logger);
+    done();
+  });
 
   app.addHook('onClose', async () => {
     if (keepaliveTimer != null) {
