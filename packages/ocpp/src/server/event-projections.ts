@@ -721,6 +721,12 @@ export function registerProjections(
           signed_meter_values.meter_public_key_id,
           EXCLUDED.meter_public_key_id
         ),
+        -- A record repeated as Transaction.End sample takes over that sample's
+        -- timestamp too, so timestamp and context describe the same sample.
+        timestamp = CASE
+          WHEN EXCLUDED.context = 'Transaction.End' THEN EXCLUDED.timestamp
+          ELSE signed_meter_values.timestamp
+        END,
         context = CASE
           WHEN EXCLUDED.context = 'Transaction.End' THEN EXCLUDED.context
           ELSE signed_meter_values.context
