@@ -20,7 +20,9 @@
     "deactivate": "停用",
     "remove": "移除",
     "inclTax": "含稅",
-    "amountInclTax": "{{amount}}（含稅）"
+    "amountInclTax": "{{amount}}（含稅）",
+    "close": "關閉",
+    "toggleSuggestions": "顯示或隱藏建議"
   },
   "nav": {
     "home": "首頁",
@@ -52,6 +54,7 @@
     "registrationFailed": "註冊失敗",
     "mfaTitle": "需要驗證",
     "mfaSubtitle": "請輸入來自{{method}}的6位驗證碼",
+    "mfaCodeLabel": "驗證碼",
     "mfaVerify": "驗證",
     "mfaResend": "重新傳送驗證碼",
     "mfaResending": "傳送中...",
@@ -144,7 +147,7 @@
     "charging": "充電中",
     "idle": "閒置",
     "limitReached": {
-      "cost": "充電已暫停：工作階段已達到費用上限（您卡上預授權的金額）。",
+      "cost": "充電已暫停：工作階段已達到費用上限。",
       "energy": "充電已暫停：工作階段已達到電量上限。",
       "time": "充電已暫停：工作階段已達到時間上限。"
     },
@@ -245,7 +248,8 @@
     "priceDisplayDefault": "營運商預設（{{value}}）",
     "priceDisplayGross": "含稅（總價）",
     "priceDisplayNet": "未稅（淨價）",
-    "priceDisplayHelper": "含稅顯示加上稅額後的價格。未稅顯示稅前價格。兩種方式下實際扣款金額相同，未選擇時使用營運商的預設設定。"
+    "priceDisplayHelper": "含稅顯示加上稅額後的價格。未稅顯示稅前價格。兩種方式下實際扣款金額相同，未選擇時使用營運商的預設設定。",
+    "mfaQrCode": "驗證器應用程式 QR Code"
   },
   "charger": {
     "loadingInfo": "載入充電站資訊...",
@@ -540,7 +544,13 @@
     "EVSE_IN_USE": "此連接器上已有另一個工作階段在進行中",
     "EVSE_NOT_FOUND": "找不到 EVSE",
     "FAVORITE_NOT_FOUND": "找不到最愛項目",
+    "FLEET_CREDIT_LIMIT_REACHED": "為您的工作階段付費的車隊已達到信用額度。請聯絡您的車隊管理員。",
     "FLEET_DISABLED": "車隊已停用",
+    "FLEET_BILLING_OLD_PODS_CONNECTED": "仍有早於 v0.1.41 的處理程序處於連線狀態。請完成升級後再開啟記帳計費。",
+    "FLEET_BILLING_CONTACT_REQUIRED": "自動開立發票和寄送發票電子郵件需要車隊至少有一個帳單聯絡人。",
+    "FLEET_INVOICE_PERIOD_EXISTS": "該車隊在此帳期已有發票。請先開立貸項通知單，再重新為該帳期開立發票。",
+    "FLEET_INVOICE_NOTHING_TO_BILL": "該車隊在此帳期沒有可開立發票的未計費且有費用的工作階段。",
+    "FLEET_HAS_OPEN_BILLING": "此車隊有記帳到其帳戶的工作階段，無法刪除。請改為關閉記帳計費。",
     "FLEET_NOT_FOUND": "找不到車隊",
     "FLEET_RESERVATION_ALREADY_CANCELLED": "車隊預約已取消",
     "FLEET_RESERVATION_CREATE_FAILED": "建立車隊預約失敗",
@@ -566,7 +576,12 @@
     "INVALID_RESTRICTIONS": "費率限制無效",
     "INVALID_SITE_IDS": "一個或多個 siteId 不存在",
     "INVALID_TOKEN": "重設連結無效或已過期",
+    "INVOICE_ALREADY_PAID": "該發票已付款",
     "INVOICE_CREATION_FAILED": "建立發票失敗",
+    "INVOICE_NOT_ISSUED": "此操作僅適用於已開立的發票",
+    "INVOICE_IS_CREDIT_NOTE": "貸項通知單不能標記為已付款或貸記",
+    "INVOICE_ALREADY_CREDITED": "該發票已由貸項通知單貸記",
+    "INVOICE_NOT_VOIDABLE": "只有草稿發票可以作廢。已開立的發票透過貸項通知單更正",
     "INVOICE_NO_SESSIONS": "所選日期範圍內沒有未開立發票的充電記錄",
     "INVOICE_NO_DRIVER": "此發票沒有可傳送的駕駛員",
     "INVOICE_NOT_FOUND": "找不到發票",
@@ -592,6 +607,7 @@
     "MFA_TOTP_NO_RESEND": "無法重新傳送 TOTP 驗證碼",
     "MISSING_PAYMENT_INTENT": "缺少 payment intent",
     "MISSING_VERSION_URL": "註冊時必須提供合作夥伴 version URL",
+    "NOTIFICATION_EVENT_REQUIRED": "此通知是存取帳戶所必需的，無法關閉",
     "NOT_BLOCKED": "充電站未被封鎖",
     "NOT_CHARGING": "工作階段目前並未充電中",
     "NOT_DRAFT": "僅能更新草稿狀態的行銷活動",
@@ -651,9 +667,10 @@
     "PROVIDER_TEST_FAILED": "服務供應商回應：...",
     "PUSH_NOT_FOUND": "找不到推送設定",
     "PUSH_REJECTED": "充電站拒絕推送：...",
-    "RATE_LIMITED": "此充電站的狀態查詢次數過多",
+    "RATE_LIMITED": "請求過多。請稍候再試。",
     "RECAPTCHA_FAILED": "reCAPTCHA 驗證失敗",
     "RECAPTCHA_REQUIRED": "需要 reCAPTCHA 權杖",
+    "RECAPTCHA_SECRET_REQUIRED": "啟用 reCAPTCHA 需要 reCAPTCHA 密鑰",
     "REFUND_EXCEEDS_REMAINING": "退款金額超過剩餘可退款金額 ...",
     "REFUND_TOP_UP_UNKNOWN": "此付款包含一筆未記錄付款 ID 的補充扣款。請在支付服務商後台退還該筆扣款。",
     "REGION_NOT_FOUND": "找不到區域",
@@ -682,6 +699,9 @@
     "SESSION_CREATE_FAILED": "建立工作階段失敗",
     "SESSION_NOT_FOUND": "找不到工作階段",
     "SESSION_NOT_LINKED": "工作階段未關聯至此案件",
+    "SESSION_REBILL_IN_PROGRESS": "此工作階段正在計費。請幾分鐘後再試。",
+    "SESSION_REBILL_NOT_ELIGIBLE": "無法對此工作階段計費",
+    "SESSION_REBILL_PAYMENT_PENDING": "此工作階段有一筆支付服務商尚未結算的付款。請稍後再試。",
     "SETTING_NOT_FOUND": "找不到設定",
     "SITE_HAS_STATIONS": "無法刪除仍有充電站的站點。請先移除或重新指派充電站。",
     "SITE_NOT_FOUND": "找不到站點",
@@ -744,12 +764,24 @@
     "EMAID_PREFIX_NOT_CONFIGURED": "請先設定 eMAID 國家代碼和供應商 ID",
     "LOCAL_CA_EXISTS": "本機合約 CA 已存在",
     "LOCAL_CA_NOT_CONFIGURED": "請先建立本機合約 CA",
-    "PNC_CONTRACT_NOT_FOUND": "找不到 Plug & Charge 合約"
+    "PNC_CONTRACT_NOT_FOUND": "找不到 Plug & Charge 合約",
+    "PHONE_REGISTRATION_LIMITED": "使用此電話號碼註冊的帳號過多。請稍後再試。",
+    "VERIFICATION_RESEND_LIMITED": "驗證電子郵件請求過多。請稍後再請求。"
   },
   "validation": {
     "required": "此欄位為必填項",
     "email": "請輸入有效的電子郵件",
-    "minLength": "至少需要 {{min}} 個字元"
+    "minLength": "至少需要 {{min}} 個字元",
+    "passwordNeeds": "密碼要求：",
+    "passwordMissing": "密碼不符合以下要求：{{rules}}",
+    "passwordRuleMet": "已符合",
+    "passwordRuleNotMet": "未符合",
+    "passwordRule": {
+      "minLength": "至少 {{min}} 個字元",
+      "uppercase": "至少一個大寫字母",
+      "lowercase": "至少一個小寫字母",
+      "number": "至少一個數字"
+    }
   },
   "activity": {
     "title": "動態",
@@ -763,7 +795,9 @@
     "co2Avoided": "減少的 CO₂",
     "co2AvoidedMessage": "本月您減少了 {{amount}} 公斤 CO₂排放",
     "miles": "英里",
-    "km": "公里"
+    "km": "公里",
+    "previousMonth": "上個月",
+    "nextMonth": "下個月"
   },
   "statement": {
     "title": "月度帳單",
@@ -981,5 +1015,27 @@
         "home": "前往首頁"
       }
     }
+  },
+  "sessionStatus": {
+    "active": "進行中",
+    "completed": "已完成",
+    "invalid": "無效",
+    "faulted": "故障",
+    "failed": "失敗"
+  },
+  "fleetBilling": {
+    "billedTo": "記帳到 {{fleet}}",
+    "startHint": "此充電工作階段由您的車隊支付，無需支付方式。",
+    "title": "車隊記帳",
+    "fleet": "記帳到",
+    "status": "狀態",
+    "state": {
+      "unbilled": "尚未開立發票",
+      "invoiced": "已向車隊開立發票",
+      "paid": "車隊已付款"
+    },
+    "sessionLine": "{{fleet}}：{{state}}",
+    "paymentMethodsNote": "您的充電費用記帳到 {{fleet}}，充電無需支付方式。",
+    "noMethods": "尚無支付方式。"
   }
 }

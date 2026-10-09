@@ -7,11 +7,12 @@ import { WebSocketServer } from 'ws';
 import type WebSocket from 'ws';
 import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
 import type postgres from 'postgres';
-import { createLogger, InMemoryEventBus, OcppError } from '@evtivity/lib';
+import { createLogger, InMemoryEventBus, OcppError, tryParseJson } from '@evtivity/lib';
 import { getHeartbeatIntervalSeconds } from '@evtivity/database';
 import type { Logger, EventBus, EventPersistence } from '@evtivity/lib';
 import { ConnectionManager } from './connection-manager.js';
 import { createSessionState } from './session-state.js';
+import { selectOcppSubprotocol } from './subprotocol.js';
 import type { SessionState } from './session-state.js';
 import { MessageCorrelator } from './message-correlator.js';
 import { MessageRouter } from './message-router.js';
@@ -218,11 +219,7 @@ export class OcppServer {
       verifyClient: (info, callback) => {
         this.verifyClient(info.req, callback);
       },
-      handleProtocols: (protocols) => {
-        if (protocols.has('ocpp2.1')) return 'ocpp2.1';
-        if (protocols.has('ocpp1.6')) return 'ocpp1.6';
-        return false;
-      },
+      handleProtocols: (protocols) => selectOcppSubprotocol(protocols) ?? false,
     });
 
     // Wait for the WebSocket server to bind the port
@@ -255,8 +252,11 @@ export class OcppServer {
         key: options.tls.key,
         ...(options.tls.ca != null ? { ca: options.tls.ca } : {}),
         requestCert: true,
-        // Must be false: SP2 stations connect without client certs on the same port.
-        // SP3 client cert validation is handled by the auth middleware.
+        // Must be false: SP2 stations connect without a client certificate on the
+        // same port, and true would drop them during the handshake. Node still
+        // verifies any client certificate against `ca` and records the result in
+        // socket.authorized; the auth middleware (authenticate.ts) rejects an SP3
+        // station whose certificate is missing or not authorized.
         rejectUnauthorized: false,
       });
       this.httpsServer = httpsServer;
@@ -267,11 +267,7 @@ export class OcppServer {
         verifyClient: (info, callback) => {
           this.verifyClient(info.req, callback);
         },
-        handleProtocols: (protocols) => {
-          if (protocols.has('ocpp2.1')) return 'ocpp2.1';
-          if (protocols.has('ocpp1.6')) return 'ocpp1.6';
-          return false;
-        },
+        handleProtocols: (protocols) => selectOcppSubprotocol(protocols) ?? false,
       });
 
       this.wssSecure.on('connection', (ws: WebSocket, req: IncomingMessage) => {
@@ -600,13 +596,12 @@ export class OcppServer {
   }
 
   private async handleMessage(ws: WebSocket, session: SessionState, raw: string): Promise<void> {
-    let parsed: OcppMessage;
-    try {
-      parsed = JSON.parse(raw) as OcppMessage;
-    } catch {
+    const json = tryParseJson(raw);
+    if (json === undefined) {
       this.logger.warn({ stationId: session.stationId }, 'Invalid JSON received');
       return;
     }
+    const parsed = json as OcppMessage;
 
     if (!Array.isArray(parsed) || parsed.length < 3) {
       this.logger.warn({ stationId: session.stationId }, 'Invalid OCPP message format');

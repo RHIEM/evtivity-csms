@@ -20,7 +20,9 @@
     "deactivate": "비활성화",
     "remove": "제거",
     "inclTax": "세금 포함",
-    "amountInclTax": "{{amount}} (세금 포함)"
+    "amountInclTax": "{{amount}} (세금 포함)",
+    "close": "닫기",
+    "toggleSuggestions": "제안 표시/숨기기"
   },
   "nav": {
     "home": "홈",
@@ -52,6 +54,7 @@
     "registrationFailed": "가입에 실패했습니다",
     "mfaTitle": "인증 필요",
     "mfaSubtitle": "{{method}}에서 받은 6자리 코드를 입력하세요",
+    "mfaCodeLabel": "인증 코드",
     "mfaVerify": "인증",
     "mfaResend": "코드 재전송",
     "mfaResending": "전송 중...",
@@ -144,7 +147,7 @@
     "charging": "충전 중",
     "idle": "유휴",
     "limitReached": {
-      "cost": "충전 일시 중지: 세션이 비용 한도(카드에 보류된 금액)에 도달했습니다.",
+      "cost": "충전 일시 중지: 세션이 비용 한도에 도달했습니다.",
       "energy": "충전 일시 중지: 세션이 에너지 한도에 도달했습니다.",
       "time": "충전 일시 중지: 세션이 시간 한도에 도달했습니다."
     },
@@ -245,7 +248,8 @@
     "priceDisplayDefault": "운영자 기본값 ({{value}})",
     "priceDisplayGross": "세금 포함 (총액)",
     "priceDisplayNet": "세금 별도 (순액)",
-    "priceDisplayHelper": "세금 포함은 세금이 더해진 가격을 표시합니다. 세금 별도는 세전 가격을 표시합니다. 청구 금액은 어느 쪽이든 같으며, 직접 선택하기 전에는 운영자 기본값이 적용됩니다."
+    "priceDisplayHelper": "세금 포함은 세금이 더해진 가격을 표시합니다. 세금 별도는 세전 가격을 표시합니다. 청구 금액은 어느 쪽이든 같으며, 직접 선택하기 전에는 운영자 기본값이 적용됩니다.",
+    "mfaQrCode": "인증 앱 QR 코드"
   },
   "charger": {
     "loadingInfo": "충전기 정보 로딩 중...",
@@ -540,7 +544,13 @@
     "EVSE_IN_USE": "이 커넥터에서 다른 세션이 이미 활성 상태입니다",
     "EVSE_NOT_FOUND": "EVSE를 찾을 수 없습니다",
     "FAVORITE_NOT_FOUND": "즐겨찾기를 찾을 수 없습니다",
+    "FLEET_CREDIT_LIMIT_REACHED": "세션 요금이 청구되는 차량대의 신용 한도에 도달했습니다. 차량대 관리자에게 문의하십시오.",
     "FLEET_DISABLED": "차량대가 사용 중지되었습니다",
+    "FLEET_BILLING_OLD_PODS_CONNECTED": "v0.1.41 이전 프로세스가 아직 연결되어 있습니다. 업그레이드를 마친 후 계정 청구를 켜십시오.",
+    "FLEET_BILLING_CONTACT_REQUIRED": "자동 청구서 발행과 청구서 이메일 발송에는 차량대 청구 담당자가 한 명 이상 필요합니다.",
+    "FLEET_INVOICE_PERIOD_EXISTS": "이 기간에 대한 차량대 청구서가 이미 있습니다. 기간을 다시 청구하려면 크레딧 노트를 발행하십시오.",
+    "FLEET_INVOICE_NOTHING_TO_BILL": "이 기간에 청구할 비용이 있는 미청구 세션이 차량대에 없습니다.",
+    "FLEET_HAS_OPEN_BILLING": "플릿 계정으로 청구된 세션이 있어 플릿을 삭제할 수 없습니다. 대신 계정 청구를 끄십시오.",
     "FLEET_NOT_FOUND": "차량대를 찾을 수 없습니다",
     "FLEET_RESERVATION_ALREADY_CANCELLED": "차량대 예약이 이미 취소되었습니다",
     "FLEET_RESERVATION_CREATE_FAILED": "차량대 예약 생성에 실패했습니다",
@@ -566,7 +576,12 @@
     "INVALID_RESTRICTIONS": "유효하지 않은 요금 제한입니다",
     "INVALID_SITE_IDS": "하나 이상의 siteId가 존재하지 않습니다",
     "INVALID_TOKEN": "유효하지 않거나 만료된 재설정 링크입니다",
+    "INVOICE_ALREADY_PAID": "이미 결제된 청구서입니다",
     "INVOICE_CREATION_FAILED": "청구서 생성에 실패했습니다",
+    "INVOICE_NOT_ISSUED": "이 작업은 발행된 청구서에만 가능합니다",
+    "INVOICE_IS_CREDIT_NOTE": "크레딧 노트는 결제 완료로 표시하거나 크레딧 처리할 수 없습니다",
+    "INVOICE_ALREADY_CREDITED": "이미 크레딧 노트로 크레딧 처리된 청구서입니다",
+    "INVOICE_NOT_VOIDABLE": "초안 청구서만 무효 처리할 수 있습니다. 발행된 청구서는 크레딧 노트로 정정합니다",
     "INVOICE_NO_SESSIONS": "선택한 기간에 미청구 세션이 없습니다",
     "INVOICE_NO_DRIVER": "이 청구서에는 보낼 드라이버가 없습니다",
     "INVOICE_NOT_FOUND": "청구서를 찾을 수 없습니다",
@@ -592,6 +607,7 @@
     "MFA_TOTP_NO_RESEND": "TOTP 코드는 재전송할 수 없습니다",
     "MISSING_PAYMENT_INTENT": "결제 인텐트가 누락되었습니다",
     "MISSING_VERSION_URL": "등록을 위해 파트너 버전 URL이 필요합니다",
+    "NOTIFICATION_EVENT_REQUIRED": "계정 접근에 필요한 알림이므로 끌 수 없습니다",
     "NOT_BLOCKED": "충전소가 차단되어 있지 않습니다",
     "NOT_CHARGING": "세션이 현재 충전 중이 아닙니다",
     "NOT_DRAFT": "초안 캠페인만 업데이트할 수 있습니다",
@@ -651,9 +667,10 @@
     "PROVIDER_TEST_FAILED": "공급자가 ...을(를) 반환했습니다",
     "PUSH_NOT_FOUND": "푸시를 찾을 수 없습니다",
     "PUSH_REJECTED": "충전소가 푸시를 거부했습니다: ...",
-    "RATE_LIMITED": "이 충전소에 대한 상태 확인이 너무 많습니다",
+    "RATE_LIMITED": "요청이 너무 많습니다. 잠시 후 다시 시도하세요.",
     "RECAPTCHA_FAILED": "reCAPTCHA 인증에 실패했습니다",
     "RECAPTCHA_REQUIRED": "reCAPTCHA 토큰이 필요합니다",
+    "RECAPTCHA_SECRET_REQUIRED": "reCAPTCHA를 활성화하려면 reCAPTCHA 비밀 키가 필요합니다",
     "REFUND_EXCEEDS_REMAINING": "환불 금액이 남은 ...을(를) 초과합니다",
     "REFUND_TOP_UP_UNKNOWN": "이 결제에는 결제 ID가 기록되지 않은 추가 청구가 포함되어 있습니다. 해당 청구는 결제 제공업체 대시보드에서 환불하세요.",
     "REGION_NOT_FOUND": "지역을 찾을 수 없습니다",
@@ -682,6 +699,9 @@
     "SESSION_CREATE_FAILED": "세션 생성에 실패했습니다",
     "SESSION_NOT_FOUND": "세션을 찾을 수 없습니다",
     "SESSION_NOT_LINKED": "세션이 이 문의에 연결되어 있지 않습니다",
+    "SESSION_REBILL_IN_PROGRESS": "세션 청구가 진행 중입니다. 몇 분 후에 다시 시도하세요.",
+    "SESSION_REBILL_NOT_ELIGIBLE": "이 세션은 청구할 수 없습니다",
+    "SESSION_REBILL_PAYMENT_PENDING": "세션에 결제 제공업체가 아직 정산하지 않은 결제가 있습니다. 나중에 다시 시도하세요.",
     "SETTING_NOT_FOUND": "설정을 찾을 수 없습니다",
     "SITE_HAS_STATIONS": "충전소가 있는 사이트는 삭제할 수 없습니다. 먼저 충전소를 제거하거나 재할당하세요.",
     "SITE_NOT_FOUND": "사이트를 찾을 수 없습니다",
@@ -744,12 +764,24 @@
     "EMAID_PREFIX_NOT_CONFIGURED": "먼저 eMAID 국가 코드와 공급자 ID를 설정하세요",
     "LOCAL_CA_EXISTS": "로컬 계약 CA가 이미 있습니다",
     "LOCAL_CA_NOT_CONFIGURED": "먼저 로컬 계약 CA를 만드세요",
-    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge 계약을 찾을 수 없습니다"
+    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge 계약을 찾을 수 없습니다",
+    "PHONE_REGISTRATION_LIMITED": "이 전화번호로 등록된 계정이 너무 많습니다. 나중에 다시 시도하세요.",
+    "VERIFICATION_RESEND_LIMITED": "인증 이메일 요청이 너무 많습니다. 잠시 후 다시 요청하세요."
   },
   "validation": {
     "required": "필수 항목입니다",
     "email": "유효한 이메일 주소를 입력하세요",
-    "minLength": "최소 {{min}}자 이상이어야 합니다"
+    "minLength": "최소 {{min}}자 이상이어야 합니다",
+    "passwordNeeds": "비밀번호 요구 사항:",
+    "passwordMissing": "비밀번호가 요구 사항을 충족하지 않습니다: {{rules}}",
+    "passwordRuleMet": "충족",
+    "passwordRuleNotMet": "미충족",
+    "passwordRule": {
+      "minLength": "{{min}}자 이상",
+      "uppercase": "영문 대문자 1개 이상",
+      "lowercase": "영문 소문자 1개 이상",
+      "number": "숫자 1개 이상"
+    }
   },
   "activity": {
     "title": "활동",
@@ -763,7 +795,9 @@
     "co2Avoided": "CO₂ 절감량",
     "co2AvoidedMessage": "이번 달 {{amount}} kg CO₂를 절감했습니다",
     "miles": "마일",
-    "km": "km"
+    "km": "km",
+    "previousMonth": "이전 달",
+    "nextMonth": "다음 달"
   },
   "statement": {
     "title": "월간 명세서",
@@ -981,5 +1015,27 @@
         "home": "홈으로 이동"
       }
     }
+  },
+  "sessionStatus": {
+    "active": "진행 중",
+    "completed": "완료",
+    "invalid": "유효하지 않음",
+    "faulted": "결함",
+    "failed": "실패"
+  },
+  "fleetBilling": {
+    "billedTo": "{{fleet}}(으)로 청구",
+    "startHint": "차량대가 이 충전 세션 요금을 지불합니다. 결제 수단이 필요하지 않습니다.",
+    "title": "차량대 청구",
+    "fleet": "청구 대상",
+    "status": "상태",
+    "state": {
+      "unbilled": "아직 청구되지 않음",
+      "invoiced": "차량대에 청구됨",
+      "paid": "차량대가 결제함"
+    },
+    "sessionLine": "{{fleet}}: {{state}}",
+    "paymentMethodsNote": "충전 요금은 {{fleet}}(으)로 청구됩니다. 충전에 결제 수단이 필요하지 않습니다.",
+    "noMethods": "등록된 결제 수단이 없습니다."
   }
 }

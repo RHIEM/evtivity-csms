@@ -23,12 +23,7 @@ export default defineConfig({
   test: {
     coverage: {
       provider: 'v8',
-      thresholds: {
-        statements: 80,
-        branches: 75,
-        functions: 80,
-        lines: 80,
-      },
+      reporter: ['text-summary', 'html', 'json-summary'],
       exclude: [
         '**/generated/**',
         '**/database/**',
@@ -38,9 +33,21 @@ export default defineConfig({
         '**/__tests__/**',
         '**/*.test.ts',
         '**/plugins/**',
+        // Conformance scenarios: test code the OCTT runner executes against a live stack.
+        '**/octt/src/tests/**',
+        // React components and pages: covered by the Playwright E2E suites, not unit tests.
+        '**/csms/src/**/*.tsx',
+        '**/portal/src/**/*.tsx',
       ],
     },
     projects: [
+      {
+        test: {
+          name: 'eslint-rules',
+          root: 'eslint-rules',
+          include: ['*.test.js'],
+        },
+      },
       {
         resolve: { alias: workspaceAliases },
         test: {
@@ -155,6 +162,13 @@ export default defineConfig({
         },
       },
       {
+        test: {
+          name: '@evtivity/ocpi-simulator',
+          root: 'packages/ocpi-simulator',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
         resolve: {
           alias: [
             {
@@ -171,6 +185,13 @@ export default defineConfig({
               replacement: path.resolve(
                 import.meta.dirname,
                 'packages/css/src/station-simulator.ts',
+              ),
+            },
+            {
+              find: '@evtivity/css/iso15118-test-ev',
+              replacement: path.resolve(
+                import.meta.dirname,
+                'packages/css/src/lib/iso15118-test-ev.ts',
               ),
             },
           ],

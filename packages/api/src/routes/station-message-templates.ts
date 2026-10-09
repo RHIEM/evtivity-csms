@@ -59,6 +59,8 @@ const STATION_MESSAGE_STATES = [
   'payment_required',
   'guest_unauthorized',
   'unauthorized',
+  'prepaid_exhausted',
+  'account_credit_limit',
 ] as const satisfies readonly StationMessageState[];
 
 const stateEnum = z.enum(STATION_MESSAGE_STATES);
@@ -308,7 +310,11 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
       try {
         const template = Handlebars.compile(body, { noEscape: true });
         rendered = template(ctx);
-      } catch {
+      } catch (err) {
+        request.log.debug(
+          { err },
+          'Station message template preview did not render, returning empty',
+        );
         rendered = '';
       }
 

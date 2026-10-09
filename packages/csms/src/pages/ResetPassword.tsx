@@ -10,9 +10,12 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { api, ApiError } from '@/lib/api';
+import { passwordRulesMessage } from '@/lib/password-rules';
+import { PasswordRequirements } from '@/components/PasswordRequirements';
+import { rateLimitedMessage } from '@/lib/error-message';
 
 export function ResetPassword(): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [searchParams] = useSearchParams();
   const token = searchParams.get('token');
 
@@ -22,12 +25,16 @@ export function ResetPassword(): React.JSX.Element {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  // The API refused the password (WEAK_PASSWORD). Translated at render, cleared on edit.
+  const [serverWeakPassword, setServerWeakPassword] = useState(false);
 
   const { companyName, companyLogo } = useAuthBranding();
 
   function getValidationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
-    if (password.length < 8) errors.password = t('validation.minLength', { min: 8 });
+    const rulesError = passwordRulesMessage(password, t, i18n.language);
+    if (rulesError != null) errors.password = rulesError;
+    else if (serverWeakPassword) errors.password = t('errors.WEAK_PASSWORD');
     if (confirmPassword !== password) errors.confirmPassword = t('auth.passwordsMustMatch');
     return errors;
   }
@@ -45,10 +52,15 @@ export function ResetPassword(): React.JSX.Element {
       await api.post('/v1/auth/reset-password', { token, password });
       setSuccess(true);
     } catch (err) {
-      if (err instanceof ApiError) {
+      const limited = rateLimitedMessage(err, t);
+      if (limited != null) {
+        setError(limited);
+      } else if (err instanceof ApiError) {
         const body = err.body as { code?: string } | null;
         if (body?.code === 'INVALID_TOKEN') {
           setError(t('auth.invalidResetLink'));
+        } else if (body?.code === 'WEAK_PASSWORD') {
+          setServerWeakPassword(true);
         } else {
           setError(t('errors.unknown'));
         }
@@ -101,14 +113,21 @@ export function ResetPassword(): React.JSX.Element {
                 <PasswordInput
                   id="password"
                   value={password}
+                  aria-describedby="password-requirements"
                   onChange={(e) => {
                     setPassword(e.target.value);
+                    setServerWeakPassword(false);
                   }}
                   className={hasSubmitted && validationErrors.password ? 'border-destructive' : ''}
                 />
                 {hasSubmitted && validationErrors.password && (
                   <p className="text-sm text-destructive">{validationErrors.password}</p>
                 )}
+                <PasswordRequirements
+                  id="password-requirements"
+                  password={password}
+                  showUnmet={hasSubmitted}
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="confirmPassword" className="leading-6">

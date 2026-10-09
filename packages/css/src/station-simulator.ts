@@ -16,11 +16,22 @@ import {
 import { validateStationPassword } from '@evtivity/lib/station-password';
 import { OcppClient } from './ocpp-client.js';
 import { config as cssConfig } from './lib/config.js';
+import { logger } from './lib/logger.js';
 import { MeterValueGenerator } from './meter-value-generator.js';
 import { OcmfMeterSigner } from './signed-meter-values.js';
 import { computeCompositeSchedule } from './composite-schedule.js';
 import { CSS_MANUFACTURER_ROOT_CA_PEM, parseFirmwareImage } from './lib/manufacturer-root.js';
 import { PersistedCache } from './lib/persisted-cache.js';
+import { endedTriggerFor21, faultStopReason, isStopReasonFor } from './lib/stop-reasons.js';
+import {
+  checkIso2Response,
+  checkIso20Response,
+  contractCertificateHashData,
+  randomPcid,
+  TestEv,
+  type Edition,
+  type InstalledContract,
+} from './lib/iso15118-test-ev.js';
 import type { CachePersistor, CacheLogger } from './lib/persisted-cache.js';
 import {
   certificateHashData,
@@ -223,6 +234,8 @@ export class StationSimulator {
   // Per-EVSE charging state
   private readonly evsePowerLimits = new Map<number, number | null>();
   private readonly evseIdle = new Map<number, boolean>();
+  /** Plug and Charge EV per EVSE and its installed contract (in memory, like the EV). */
+  private readonly pncEvs = new Map<number, { ev: TestEv; contract: InstalledContract | null }>();
   private readonly evseChargingState = new Map<number, string | null>();
   private readonly evseSeqNo = new Map<number, number>();
   private readonly evseMeterTick = new Map<number, number>();
@@ -310,6 +323,8 @@ export class StationSimulator {
     id: string;
     action: string;
     payload: Record<string, unknown>;
+    /** 1.6 StartTransaction queued offline: the temporary local transaction id it started. */
+    localTransactionId?: string;
   }> = [];
   private localAuthListVersion = 0;
   private localAuthEntries!: PersistedCache<string, Record<string, unknown>>;
@@ -1141,8 +1156,11 @@ export class StationSimulator {
     if (currentStatus !== status || isPostStopRePlug) {
       try {
         await this.sendStatusNotification(evseId, connectorId, status);
-      } catch {
-        // Offline - status will be reported on reconnect
+      } catch (err) {
+        logger.debug(
+          { err, stationId: this.config.stationId, evseId, connectorId, status },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
       }
     }
     await this.updateEvseStatus(evseId, status);
@@ -1184,8 +1202,11 @@ export class StationSimulator {
           ctx.authorizedTokenType ?? 'ISO14443',
           ctx.remoteStartId ?? undefined,
         );
-      } catch {
-        // May fail if transaction already active
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, evseId },
+          'Auto-start of the transaction failed',
+        );
       }
     } else {
       ctx.state = 'Preparing';
@@ -1338,15 +1359,21 @@ export class StationSimulator {
     if (this.is16 && ctx.state === 'Preparing') {
       try {
         await this.beginTransaction(evseId, idToken, tokenType);
-      } catch {
-        // May fail if transaction already active
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, evseId },
+          'Auto-start of the transaction failed',
+        );
       }
     } else if (!this.is16 && ctx.cablePlugged && ctx.transactionId == null) {
       // 2.1: auto-start when cable is connected and no active transaction
       try {
         await this.beginTransaction(evseId, idToken, tokenType);
-      } catch {
-        // May fail if transaction already active
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, evseId },
+          'Auto-start of the transaction failed',
+        );
       }
     } else if (ctx.state !== 'Charging') {
       // Transition to Preparing on auth (station indicates user is identified)
@@ -1491,8 +1518,11 @@ export class StationSimulator {
     this.evseConnectorStatus.set(evseId, chargingStatus);
     try {
       await this.sendStatusNotification(evseId, connectorId, chargingStatus);
-    } catch {
-      // Offline - status reported on reconnect
+    } catch (err) {
+      logger.debug(
+        { err, stationId: this.config.stationId, evseId, connectorId, status: chargingStatus },
+        'StatusNotification not delivered, the status is reported on reconnect',
+      );
     }
     await this.updateEvseStatus(evseId, chargingStatus).catch(() => {});
 
@@ -1517,7 +1547,7 @@ export class StationSimulator {
         if (consumedReservationId != null) {
           startPayload['reservationId'] = consumedReservationId;
         }
-        this.queueOfflineMessage('StartTransaction', startPayload);
+        this.queueOfflineMessage('StartTransaction', startPayload, txId);
       }
     } else {
       txId = randomUUID();
@@ -1666,7 +1696,21 @@ export class StationSimulator {
     });
   }
 
-  async stopCharging(evseId: number, reason: string = 'Local'): Promise<void> {
+  /**
+   * Ends the transaction on the EVSE. The reason must be a stop reason of the station's
+   * OCPP version (1.6 StopTransaction reason, 2.1 ReasonEnumType). On 2.1 the
+   * triggerReason follows the reason (`endedTriggerFor21`) unless `triggerReason` is given.
+   */
+  async stopCharging(
+    evseId: number,
+    reason: string = 'Local',
+    triggerReasonOverride?: string,
+  ): Promise<void> {
+    if (!isStopReasonFor(this.is16 ? 'ocpp1.6' : 'ocpp2.1', reason)) {
+      throw new Error(
+        `Stop reason ${reason} is not an OCPP ${this.is16 ? '1.6' : '2.1'} stop reason`,
+      );
+    }
     const tx = await this.getActiveTransaction(evseId);
     if (tx == null) {
       console.log(`[${this.config.stationId}] No active transaction on EVSE ${String(evseId)}`);
@@ -1686,35 +1730,14 @@ export class StationSimulator {
         reason,
       };
       stopPayload['idTag'] = tx.idToken;
-      if (this.client.isConnected) {
-        await this.client.sendCall('StopTransaction', stopPayload);
-      } else {
-        this.queueOfflineMessage('StopTransaction', stopPayload);
-      }
+      await this.sendTransactionMessage16('StopTransaction', stopPayload);
     } else {
       const seqNo = (this.evseSeqNo.get(evseId) ?? 0) + 1;
       this.evseSeqNo.set(evseId, seqNo);
       // Map stop reason to OCPP 2.1 triggerReason and chargingState
-      let triggerReason = 'StopAuthorized';
-      let endChargingState = 'EVConnected';
-      if (reason === 'Remote') {
-        triggerReason = 'RemoteStop';
-      } else if (reason === 'EVDisconnected') {
-        triggerReason = 'EVCommunicationLost';
-        endChargingState = 'Idle';
-      } else if (reason === 'DeAuthorized') {
-        triggerReason = 'Deauthorized';
-      } else if (reason === 'MasterPass') {
-        triggerReason = 'StopAuthorized';
-      } else if (reason === 'StoppedByEV') {
-        triggerReason = 'ChargingStateChanged';
-      } else if (reason === 'EVDeparted') {
-        triggerReason = 'EVDeparted';
-      } else if (reason === 'PowerLoss') {
-        triggerReason = 'AbnormalCondition';
-      } else if (reason === 'Other') {
-        triggerReason = 'AbnormalCondition';
-      }
+      const mapped = endedTriggerFor21(reason);
+      const triggerReason = triggerReasonOverride ?? mapped.triggerReason;
+      const endChargingState = mapped.chargingState;
       // Generate Transaction.End meter values for Ended event
       const endMeasurands = this.getTxEndedMeasurands();
       const endSampledValues =
@@ -1805,8 +1828,11 @@ export class StationSimulator {
       this.evseChargingState.set(evseId, 'Idle');
       try {
         await this.sendStatusNotification(evseId, connectorId, 'Unavailable');
-      } catch {
-        // Offline - status will be reported on reconnect
+      } catch (err) {
+        logger.debug(
+          { err, stationId: this.config.stationId, evseId, connectorId, status: 'Unavailable' },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
       }
       await this.updateEvseStatus(evseId, 'Unavailable').catch(() => {});
     } else if (this.is16) {
@@ -1815,8 +1841,11 @@ export class StationSimulator {
       this.evseConnectorStatus.set(evseId, 'Finishing');
       try {
         await this.sendStatusNotification(evseId, connectorId, 'Finishing');
-      } catch {
-        // Offline - status will be reported on reconnect
+      } catch (err) {
+        logger.debug(
+          { err, stationId: this.config.stationId, evseId, connectorId, status: 'Finishing' },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
       }
       await this.updateEvseStatus(evseId, 'Finishing').catch(() => {});
     } else {
@@ -1896,8 +1925,17 @@ export class StationSimulator {
         this.evseConnectorStatus.set(evseId, disconnectedStatus);
         try {
           await this.sendStatusNotification(evseId, connectorId, disconnectedStatus);
-        } catch {
-          // Offline
+        } catch (err) {
+          logger.debug(
+            {
+              err,
+              stationId: this.config.stationId,
+              evseId,
+              connectorId,
+              status: disconnectedStatus,
+            },
+            'StatusNotification not delivered, the status is reported on reconnect',
+          );
         }
         await this.updateEvseStatus(evseId, disconnectedStatus).catch(() => {});
 
@@ -1915,8 +1953,11 @@ export class StationSimulator {
         this.evseConnectorStatus.set(evseId, suspendStatus);
         try {
           await this.sendStatusNotification(evseId, connectorId, suspendStatus);
-        } catch {
-          // Offline - status will be reported on reconnect
+        } catch (err) {
+          logger.debug(
+            { err, stationId: this.config.stationId, evseId, connectorId, status: suspendStatus },
+            'StatusNotification not delivered, the status is reported on reconnect',
+          );
         }
         await this.updateEvseStatus(evseId, suspendStatus).catch(() => {});
       }
@@ -1930,27 +1971,15 @@ export class StationSimulator {
   }
 
   /**
-   * OCPP 2.1: Simulate the EV stopping energy transfer while cable stays connected.
-   * Sends TransactionEvent Ended with triggerReason ChargingStateChanged,
-   * chargingState EVConnected, stoppedReason StoppedByEV.
-   */
-  async suspendEV(evseId: number): Promise<void> {
-    if (this.is16) return;
-    const ctx = this.evseContexts.get(evseId) as EvseContext;
-    if (ctx.transactionId == null) return;
-    await this.stopCharging(evseId, 'StoppedByEV');
-  }
-
-  /**
-   * OCPP 2.1: Simulate the EV departing the parking bay.
-   * Sends TransactionEvent Ended with triggerReason EVDeparted,
-   * stoppedReason Local.
+   * OCPP 2.1: Simulate the EV departing the parking bay. Sends TransactionEvent Ended
+   * with triggerReason EVDeparted and stoppedReason Local (EVDeparted is a trigger
+   * reason, not a ReasonEnumType value).
    */
   async departParkingBay(evseId: number): Promise<void> {
     if (this.is16) return;
     const ctx = this.evseContexts.get(evseId) as EvseContext;
     if (ctx.transactionId == null) return;
-    await this.stopCharging(evseId, 'EVDeparted');
+    await this.stopCharging(evseId, 'Local', 'EVDeparted');
   }
 
   /**
@@ -1969,30 +1998,119 @@ export class StationSimulator {
     );
   }
 
+  /** The suspended state of the EVSE's transaction, or null while it charges. */
+  private suspendedState(evseId: number): 'SuspendedEV' | 'SuspendedEVSE' | null {
+    const state = this.is16
+      ? this.evseConnectorStatus.get(evseId)
+      : this.evseChargingState.get(evseId);
+    return state === 'SuspendedEV' || state === 'SuspendedEVSE' ? state : null;
+  }
+
   /**
-   * OCPP 2.1: Simulate EV not ready for charging (SuspendedEV state).
-   * The transaction starts but the EV doesn't accept energy.
+   * The EV (`by: 'EV'`) or the EVSE (`by: 'EVSE'`) stops the energy transfer while the
+   * transaction and the cable stay. The meter loop keeps running at power 0 with flat
+   * energy. 2.1: TransactionEvent Updated, ChargingStateChanged, chargingState
+   * SuspendedEV or SuspendedEVSE. 1.6: StatusNotification SuspendedEV or SuspendedEVSE.
+   * A no-op without a transaction or when it is already suspended by the same party.
    */
-  async setEvNotReady(evseId: number): Promise<void> {
-    if (this.is16) return;
-    const ctx = this.evseContexts.get(evseId) as EvseContext;
-    if (ctx.transactionId == null) return;
+  async suspendCharging(evseId: number, by: 'EV' | 'EVSE'): Promise<void> {
+    const ctx = this.evseContexts.get(evseId);
+    if (ctx?.transactionId == null) return;
+    if (this.evseConnectorStatus.get(evseId) === 'Faulted') {
+      throw new Error('Cannot suspend charging while the connector is faulted');
+    }
+    const target = by === 'EV' ? 'SuspendedEV' : 'SuspendedEVSE';
+    if (this.suspendedState(evseId) === target) return;
+    // State first, so a send that fails offline leaves the meter consistent
+    this.evseIdle.set(evseId, true);
+    await this.reportChargingState(evseId, ctx.transactionId, target);
+  }
+
+  /**
+   * The energy transfer starts again after suspendCharging (or a cleared fault, or a
+   * transaction resumed as SuspendedEVSE). Refused while the connector is faulted, a
+   * transaction limit is reached, or the cable is out. A no-op without a transaction
+   * or while it charges.
+   */
+  async resumeCharging(evseId: number): Promise<void> {
+    const ctx = this.evseContexts.get(evseId);
+    if (ctx?.transactionId == null) return;
+    if (this.evseConnectorStatus.get(evseId) === 'Faulted') {
+      throw new Error('Cannot resume charging while the connector is faulted');
+    }
+    if (this.evseLimitReached.get(evseId) ?? false) {
+      throw new Error('Cannot resume charging after a transaction limit was reached');
+    }
+    if (!ctx.cablePlugged) {
+      throw new Error('Cannot resume charging without the cable plugged in');
+    }
+    const meterRunning = this.meterTimers.has(evseId);
+    if (this.suspendedState(evseId) == null && meterRunning) return;
+    this.evseIdle.set(evseId, false);
+    if (this.suspendedState(evseId) != null) {
+      await this.reportChargingState(evseId, ctx.transactionId, 'Charging');
+    }
+    if (!this.meterTimers.has(evseId)) this.startMeterLoop(evseId);
+  }
+
+  /** Reports a charging state change of a running transaction (1.6 as connector status). */
+  private async reportChargingState(evseId: number, txId: string, state: string): Promise<void> {
+    if (this.is16) {
+      const connectorId = this.getConnectorId(evseId);
+      this.evseConnectorStatus.set(evseId, state);
+      try {
+        await this.sendStatusNotification(evseId, connectorId, state);
+      } catch (err) {
+        logger.debug(
+          { err, stationId: this.config.stationId, evseId, connectorId, status: state },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
+      }
+      await this.updateEvseStatus(evseId, state).catch(() => {});
+      return;
+    }
+    this.evseChargingState.set(evseId, state);
     const seqNo = (this.evseSeqNo.get(evseId) ?? 0) + 1;
     this.evseSeqNo.set(evseId, seqNo);
-    this.evseChargingState.set(evseId, 'SuspendedEV');
     await this.sendTransactionEvent(evseId, 'Updated', {
       triggerReason: 'ChargingStateChanged',
-      transactionId: ctx.transactionId,
-      chargingState: 'SuspendedEV',
+      transactionId: txId,
+      chargingState: state,
       seqNo,
     });
+  }
+
+  /**
+   * The EV battery is full. 2.1: SuspendedEV, then TransactionEvent Ended with
+   * stoppedReason SOCLimitReached (triggerReason SoCLimitReached). 1.6: SuspendedEV, then
+   * the EV unplugs. A no-op without a transaction.
+   */
+  async evFull(evseId: number): Promise<void> {
+    const ctx = this.evseContexts.get(evseId);
+    if (ctx?.transactionId == null) return;
+    await this.suspendCharging(evseId, 'EV');
+    if (this.is16) {
+      await this.unplug(evseId);
+    } else {
+      await this.stopCharging(evseId, 'SOCLimitReached');
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Group 2: Fault injection
   // ---------------------------------------------------------------------------
 
-  async injectFault(evseId: number, errorCode: string): Promise<void> {
+  /**
+   * The connector reports Faulted. With a transaction, `mode: 'end'` (default) ends it
+   * with the fault's stop reason (`faultStopReason`; 2.1 triggerReason
+   * AbnormalCondition), `mode: 'suspend'` keeps it suspended by the EVSE with no
+   * energy (2.1: chargingState SuspendedEVSE) until clearFault and resumeCharging.
+   */
+  async injectFault(
+    evseId: number,
+    errorCode: string,
+    mode: 'end' | 'suspend' = 'end',
+  ): Promise<void> {
     const faultCtx = this.evseContexts.get(evseId) as EvseContext;
 
     // No-op if connector is already Faulted. Re-firing would duplicate the
@@ -2001,13 +2119,21 @@ export class StationSimulator {
       return;
     }
 
-    // Stop active transaction if any
-    if (faultCtx.transactionId != null) {
-      await this.stopCharging(evseId, 'Other');
+    const keepTransaction = mode === 'suspend' && faultCtx.transactionId != null;
+    if (keepTransaction) {
+      this.evseIdle.set(evseId, true);
+      if (!this.is16 && this.evseChargingState.get(evseId) !== 'SuspendedEVSE') {
+        await this.reportChargingState(evseId, faultCtx.transactionId as string, 'SuspendedEVSE');
+      }
+    } else if (faultCtx.transactionId != null) {
+      await this.stopCharging(
+        evseId,
+        faultStopReason(this.is16 ? 'ocpp1.6' : 'ocpp2.1', errorCode),
+      );
     }
     const connectorId = this.getConnectorId(evseId);
     this.evseConnectorStatus.set(evseId, 'Faulted');
-    faultCtx.state = 'Faulted';
+    if (!keepTransaction) faultCtx.state = 'Faulted';
     await this.sendStatusNotification(evseId, connectorId, 'Faulted', errorCode);
     await this.updateEvseStatus(evseId, 'Faulted');
   }
@@ -2042,17 +2168,125 @@ export class StationSimulator {
     }
 
     const connectorId = this.getConnectorId(evseId);
-    this.evseConnectorStatus.set(evseId, 'Available');
     const clearCtx = this.evseContexts.get(evseId) as EvseContext;
-    clearCtx.state = 'Available';
-    await this.sendStatusNotification(evseId, connectorId, 'Available');
-    await this.updateEvseStatus(evseId, 'Available');
+    // A transaction kept through the fault stays suspended by the EVSE: the connector
+    // is occupied again (1.6 SuspendedEVSE) and resumeCharging restarts the energy.
+    const status = clampStatusForAdminAvailability(
+      clearCtx.transactionId != null ? (this.is16 ? 'SuspendedEVSE' : 'Occupied') : 'Available',
+      this.isEvseAdminUnavailable(evseId),
+    );
+    this.evseConnectorStatus.set(evseId, status);
+    if (clearCtx.transactionId == null) clearCtx.state = 'Available';
+    await this.sendStatusNotification(evseId, connectorId, status);
+    await this.updateEvseStatus(evseId, status);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Plug and Charge (ISO 15118, OCPP 2.1 M01 and C07)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The EV plugged into the EVSE gets an OEM provisioning certificate (CN = PCID).
+   * Returns the PCID and the OEM root PEM, which the CSMS needs as an OEMRootCertificate
+   * to accept the EV's CertificateInstallationReq. A new EV replaces the previous one
+   * and its contract. Held in memory: a simulator restart forgets it.
+   */
+  async createPncEv(
+    evseId: number,
+    edition: Edition = 2,
+  ): Promise<{ pcid: string; oemRootCertificate: string; edition: Edition }> {
+    this.requirePnc(evseId);
+    const ev = await TestEv.create(edition, randomPcid('EVSIM'), 'EVtivity Simulator');
+    this.pncEvs.set(evseId, { ev, contract: null });
+    return { pcid: ev.pcid, oemRootCertificate: ev.oemRoot.toString('pem'), edition };
+  }
+
+  /**
+   * The EV installs a contract (M01): Get15118EVCertificate with action Install and the
+   * EV's signed CertificateInstallationReq. The station accepts the contract only when the
+   * response is Accepted and the EV's checks pass (response code, CPS signature, contract
+   * certificate, decrypted private key). Returns the eMAID.
+   */
+  async installPncContract(
+    evseId: number,
+  ): Promise<{ emaid: string; remainingContracts: number | null }> {
+    this.requirePnc(evseId);
+    const entry = this.pncEvs.get(evseId);
+    if (entry == null) throw new Error('No Plug and Charge EV on this EVSE, create one first');
+    const response = await this.sendGet15118EVCertificate(
+      entry.ev.namespace,
+      'Install',
+      entry.ev.installationRequest(),
+    );
+    const exi = response['exiResponse'];
+    if (response['status'] !== 'Accepted' || typeof exi !== 'string' || exi === '') {
+      throw new Error(
+        `Get15118EVCertificate was not accepted (status ${String(response['status'])})`,
+      );
+    }
+    const check =
+      entry.ev.edition === 2
+        ? checkIso2Response(exi, 'CertificateInstallationRes', entry.ev.oemKey)
+        : checkIso20Response(exi, entry.ev);
+    if (!check.ok) throw new Error(`The EV refused the contract: ${check.reason}`);
+    this.pncEvs.set(evseId, { ev: entry.ev, contract: check.contract });
+    const remaining =
+      typeof response['remainingContracts'] === 'number'
+        ? response['remainingContracts']
+        : check.remaining;
+    return { emaid: check.contract.emaid, remainingContracts: remaining };
+  }
+
+  /**
+   * Plug and Charge start (C07): Authorize with the contract's eMAID (type eMAID) and the
+   * iso15118CertificateHashData of its certificate chain, then the transaction starts with
+   * the eMAID. Needs the cable plugged in and the station online (the CSMS validates the
+   * contract certificate). Returns the transaction id.
+   */
+  async startPncCharging(evseId: number): Promise<string> {
+    this.requirePnc(evseId);
+    const contract = this.pncEvs.get(evseId)?.contract;
+    if (contract == null) throw new Error('No contract installed, install one first');
+    const ctx = this.evseContexts.get(evseId) as EvseContext;
+    if (!ctx.cablePlugged) throw new Error('Plug and Charge needs the cable plugged in');
+    if (ctx.transactionId != null) {
+      if (ctx.authorizedToken === contract.emaid) return ctx.transactionId;
+      throw new Error('Transaction already active on this EVSE');
+    }
+    if (!this.client.isConnected) {
+      throw new Error('Plug and Charge needs the station online');
+    }
+    const response = await this.client.sendCall('Authorize', {
+      idToken: { idToken: contract.emaid, type: 'eMAID' },
+      iso15118CertificateHashData: contractCertificateHashData(contract),
+    });
+    const info = response['idTokenInfo'] as Record<string, unknown> | undefined;
+    if (info != null) this.cacheIdTokenInfo(contract.emaid, info);
+    if (info?.['status'] !== 'Accepted') {
+      throw new Error(`Authorization rejected: ${String(info?.['status'])}`);
+    }
+    ctx.authorizedToken = contract.emaid;
+    ctx.authorizedTokenType = 'eMAID';
+    return this.beginTransaction(evseId, contract.emaid, 'eMAID');
+  }
+
+  /** Plug and Charge is OCPP 2.1 only and needs a known EVSE. */
+  private requirePnc(evseId: number): void {
+    if (this.is16) throw new Error('Plug and Charge needs an OCPP 2.1 station');
+    if (!this.evseContexts.has(evseId)) throw new Error(`Unknown EVSE ${String(evseId)}`);
   }
 
   // ---------------------------------------------------------------------------
   // Group 3: Network
   // ---------------------------------------------------------------------------
 
+  /**
+   * Lose the connection without losing power. Transactions, cable and EVSE
+   * state stay; the meter loops keep running, and the transaction messages
+   * generated while offline queue in order (2.1 E11.FR.01 TransactionEvent
+   * with offline true; 1.6 StartTransaction, MeterValues with a transactionId,
+   * StopTransaction). comeOnline replays them.
+   */
   async goOffline(): Promise<void> {
     // No-op if already offline. Avoids redundant DB writes and disconnect
     // calls when chaos repeatedly picks goOffline on the same station.
@@ -2060,6 +2294,12 @@ export class StationSimulator {
       return;
     }
     this.offlineFlag = true;
+    // The offline period starts now, not when the socket's close event arrives,
+    // so the reconnect reports the statuses that changed since (B04.FR.02).
+    if (this.offlineSince == null) {
+      this.offlineSince = Date.now();
+      this.statusesAtDisconnect = new Map(this.deliveredConnectorStatus);
+    }
     this.client.disconnect();
     await this.updateStationStatus('disconnected');
   }
@@ -2077,7 +2317,11 @@ export class StationSimulator {
     }
     try {
       await this.sendBootNotification('RemoteReset');
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId },
+        'BootNotification for the remote reset failed, reboot stopped',
+      );
       return;
     }
     if (this.bootStatus !== 'Accepted') return;
@@ -2097,23 +2341,47 @@ export class StationSimulator {
       this.evseConnectorStatus.set(evse.evseId, 'Available');
       try {
         await this.sendStatusNotification(evse.evseId, evse.connectorId, 'Available');
-      } catch {
-        // Connection dropped mid-flight; SimulatorManager will retry on reconnect.
+      } catch (err) {
+        logger.debug(
+          {
+            err,
+            stationId: this.config.stationId,
+            evseId: evse.evseId,
+            connectorId: evse.connectorId,
+            status: 'Available',
+          },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
       }
       await this.updateEvseStatus(evse.evseId, 'Available').catch(() => {});
     }
     await this.updateStationStatus('available');
   }
 
+  /**
+   * Restore the connection after goOffline. The station did not lose power, so
+   * it does not boot again (1.6 4.2, 2.1 B01.FR.01 and B04): it reports its
+   * actual connector statuses and replays the queued messages in order with
+   * their original timestamps (resumeAfterConnectionLoss). A station that never
+   * finished its first boot, or was stopped, starts from power-up instead.
+   */
   async comeOnline(): Promise<void> {
-    // No-op if already online. Re-running start() would resend
-    // BootNotification and reset connector state on a healthy station.
+    // No-op if already online: a healthy station has nothing to resume.
     if (!this.offlineFlag && this.client.isConnected) {
       return;
     }
     this.offlineFlag = false;
-    this.destroyed = false;
-    await this.start();
+    // The self-heal watchdog skips a deliberately offline station, but the
+    // not-ready clock kept running through the offline period, so the station
+    // counted as stuck the moment it came back and was restarted in the middle
+    // of its queue replay (finding JB-5). The grace period starts again now.
+    if (!this.ready) this.notReadySince = Date.now();
+    if (this.destroyed || !this.initialBootDone) {
+      await this.start();
+      return;
+    }
+    await this.client.connect();
+    await this.onReconnect();
   }
 
   // ---------------------------------------------------------------------------
@@ -2189,8 +2457,11 @@ export class StationSimulator {
               try {
                 await this.sendBootNotification(reason);
                 if (this.bootStatus === 'Accepted') await this.reportConnectorsAfterAccept();
-              } catch {
-                // Retry failed
+              } catch (err) {
+                logger.warn(
+                  { err, stationId: this.config.stationId, reason },
+                  'BootNotification retry failed',
+                );
               }
             })();
           }
@@ -2345,8 +2616,11 @@ export class StationSimulator {
     this.evseConnectorStatus.set(evseId, applied);
     try {
       await this.sendStatusNotification(evseId, connectorId, applied);
-    } catch {
-      // Offline - status will be reported on reconnect
+    } catch (err) {
+      logger.debug(
+        { err, stationId: this.config.stationId, evseId, connectorId, status: applied },
+        'StatusNotification not delivered, the status is reported on reconnect',
+      );
     }
     await this.updateEvseStatus(evseId, applied).catch(() => {});
     return applied;
@@ -2397,6 +2671,9 @@ export class StationSimulator {
       };
       if (transactionId != null) {
         mv['transactionId'] = Number(transactionId);
+        // Transaction-related: queued offline and delivered in order.
+        await this.sendTransactionMessage16('MeterValues', mv);
+        return;
       }
       await this.client.sendCall('MeterValues', mv);
     } else {
@@ -3166,8 +3443,8 @@ export class StationSimulator {
         generatedAt: new Date().toISOString(),
         reportData,
       });
-    } catch {
-      // Ignore
+    } catch (err) {
+      logger.warn({ err, stationId: this.config.stationId, requestId }, 'NotifyReport failed');
     }
   }
 
@@ -3583,8 +3860,14 @@ export class StationSimulator {
     const gen = this.meterGens.get(firstEvse.evseId);
     if (gen == null) return Promise.resolve();
 
-    // Tick with idle=true for ambient readings
-    gen.tick(true, this.evsePowerLimits.get(firstEvse.evseId) ?? null);
+    // Without a transaction the reading is ambient (no power). During a
+    // transaction it reports the EVSE's real state, which the periodic
+    // readings keep current: the power a charging EV draws, 0 while it is
+    // suspended. An idle tick here reported 0 W with chargingState Charging
+    // (finding JB-1), and a charging tick would add energy between samples.
+    if (this.getActiveTransactionSync(firstEvse.evseId) == null) {
+      gen.tick(true, this.evsePowerLimits.get(firstEvse.evseId) ?? null);
+    }
 
     const sampledValues = gen
       .generate(measurands, this.is16)
@@ -6228,8 +6511,9 @@ export class StationSimulator {
       }
 
       default:
+        // OCPP-J: an action the station does not implement is answered with CALLERROR NotImplemented.
         console.log(`[${this.config.stationId}] Unhandled action: ${action}`);
-        return { status: 'NotSupported' };
+        throw new Error('NotImplemented');
     }
   }
 
@@ -6536,20 +6820,19 @@ export class StationSimulator {
     retries: number,
     retryIntervalSec: number,
   ): Promise<Buffer | null> {
-    let url: URL;
-    try {
-      url = new URL(location);
-    } catch {
-      return null;
-    }
+    const url = URL.parse(location);
+    if (url == null) return null;
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, retryIntervalSec * 1000));
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
         if (response.ok) return Buffer.from(await response.arrayBuffer());
-      } catch {
-        // Retry below
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, location, attempt },
+          'Firmware download failed',
+        );
       }
     }
     return null;
@@ -6947,8 +7230,11 @@ export class StationSimulator {
           break;
         }
       }
-    } catch {
-      // Ignore errors from triggered messages
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, requestedMessage },
+        'Triggered message failed',
+      );
     }
   }
 
@@ -6962,7 +7248,8 @@ export class StationSimulator {
     if (this.is16) {
       reason = resetType === 'Immediate' ? 'HardReset' : 'SoftReset';
     } else {
-      reason = resetType === 'Immediate' ? 'ImmediateReset' : 'SoftReset';
+      // 2.1 has no SoftReset stop reason (ReasonEnumType)
+      reason = resetType === 'Immediate' ? 'ImmediateReset' : 'Reboot';
     }
     const bootReason = resetType === 'Immediate' ? 'RemoteReset' : 'ScheduledReset';
 
@@ -6978,8 +7265,17 @@ export class StationSimulator {
     for (const evse of this.config.evses) {
       try {
         await this.sendStatusNotification(evse.evseId, evse.connectorId, 'Unavailable');
-      } catch {
-        // May fail if connection is closing
+      } catch (err) {
+        logger.debug(
+          {
+            err,
+            stationId: this.config.stationId,
+            evseId: evse.evseId,
+            connectorId: evse.connectorId,
+            status: 'Unavailable',
+          },
+          'StatusNotification not delivered, the status is reported on reconnect',
+        );
       }
     }
 
@@ -7024,8 +7320,8 @@ export class StationSimulator {
         ctx.transactionId = null;
         await this.sendStatusNotification(evse.evseId, evse.connectorId, 'Available');
       }
-    } catch {
-      // Ignore errors during reset
+    } catch (err) {
+      logger.warn({ err, stationId: this.config.stationId, resetType }, 'Boot after reset failed');
     }
   }
 
@@ -7284,8 +7580,11 @@ export class StationSimulator {
           this.evseConnectorStatus.set(evseId, 'Available');
           const connectorId = this.getConnectorId(evseId);
           await this.sendStatusNotification(evseId, connectorId, 'Available');
-        } catch {
-          // Best effort
+        } catch (err) {
+          logger.warn(
+            { err, stationId: this.config.stationId, evseId, transactionId },
+            'Ending the transaction after the EV connect timeout failed',
+          );
         }
       })();
     }, timeoutSec * 1000);
@@ -7404,8 +7703,11 @@ export class StationSimulator {
 
       if (!(await send('Installed'))) return;
       this.firmwareUpdateStatus = 'Idle';
-    } catch {
-      // Connection lost during firmware update
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, location, requestId },
+        'Firmware update stopped, status set to Idle',
+      );
       this.firmwareUpdateStatus = 'Idle';
     }
   }
@@ -7420,8 +7722,11 @@ export class StationSimulator {
       this.logUploadStatus = 'UploadFailure';
       try {
         await this.sendLogStatusNotification('UploadFailure', requestId);
-      } catch {
-        // ignore
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, requestId },
+          'LogStatusNotification UploadFailure failed',
+        );
       }
       this.logUploadStatus = 'Idle';
       this.activeLogUploadRequestId = null;
@@ -7437,7 +7742,11 @@ export class StationSimulator {
       try {
         this.logUploadStatus = statuses[i] as string;
         await this.sendLogStatusNotification(statuses[i] as string, requestId);
-      } catch {
+      } catch (err) {
+        logger.warn(
+          { err, stationId: this.config.stationId, requestId },
+          'LogStatusNotification failed, log upload stopped',
+        );
         return;
       }
     }
@@ -7657,7 +7966,11 @@ export class StationSimulator {
         constantStreamData: { id: stream.id, variableMonitoringId: monitorId, params },
       });
       accepted = resp['status'] === 'Accepted';
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, monitorId },
+        'OpenPeriodicEventStream failed, stream not opened',
+      );
       accepted = false;
     }
     if (this.periodicStreams.get(monitorId) !== stream) return; // cleared or replaced meanwhile
@@ -7767,8 +8080,11 @@ export class StationSimulator {
     this.periodicStreams.delete(stream.monitorId);
     try {
       await this.client.sendCall('ClosePeriodicEventStream', { id: stream.id });
-    } catch {
-      // Connection lost: the CSMS drops the streams of a disconnected station.
+    } catch (err) {
+      logger.debug(
+        { err, stationId: this.config.stationId, streamId: stream.id },
+        'ClosePeriodicEventStream failed, the CSMS drops the streams of a disconnected station',
+      );
     }
   }
 
@@ -7925,8 +8241,11 @@ export class StationSimulator {
       await delay();
       if (this.isDestroyed()) return;
       await this.sendDiagnosticsStatusNotification('Uploaded');
-    } catch {
-      // Connection lost during upload
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, location },
+        'Diagnostics upload stopped',
+      );
     }
   }
 
@@ -8363,6 +8682,15 @@ export class StationSimulator {
         if (msg.action === 'StartTransaction' && this.is16) {
           const idTagInfo = response['idTagInfo'] as Record<string, unknown> | undefined;
           const txId = response['transactionId'] as number | undefined;
+          // The Central System assigned the transaction id: the session's queued
+          // messages and the station's state move from the temporary id to it.
+          if (msg.localTransactionId != null && txId != null) {
+            await this.adoptCsmsTransactionId16(
+              msg.localTransactionId,
+              txId,
+              msg.payload['connectorId'] as number,
+            );
+          }
           if (idTagInfo != null && idTagInfo['status'] !== 'Accepted' && txId != null) {
             const evseId = msg.payload['connectorId'] as number;
             const stopOnInvalid = this.getConfigValue('StopTransactionOnInvalidId') === 'true';
@@ -8405,22 +8733,116 @@ export class StationSimulator {
   }
 
   /**
+   * OCPP 1.6: a StartTransaction sent while offline started the transaction under
+   * a temporary local id. When the Central System answers the replayed
+   * StartTransaction with its transactionId, the queued MeterValues and
+   * StopTransaction of that session and the station's own state switch to it
+   * before they are sent, as a real station does. The temporary id is kept in
+   * memory only: after a simulator restart the queued messages keep it.
+   */
+  private async adoptCsmsTransactionId16(
+    localTxId: string,
+    csmsTxId: number,
+    evseId: number,
+  ): Promise<void> {
+    const realTxId = String(csmsTxId);
+    if (realTxId === localTxId) return;
+    for (const m of this.offlineMessageQueue) {
+      if (m.action !== 'MeterValues' && m.action !== 'StopTransaction') continue;
+      if (String(m.payload['transactionId']) !== localTxId) continue;
+      m.payload['transactionId'] = csmsTxId;
+      await this.sql`
+        UPDATE css_offline_messages
+        SET payload = ${this.sql.json(m.payload as Parameters<postgres.Sql['json']>[0])}
+        WHERE css_station_id = ${this.config.id} AND id = ${m.id}
+      `.catch((err: unknown) => {
+        console.warn(
+          `[${this.config.stationId}] offline queue transaction id update failed`,
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+    }
+    const ctx = this.evseContexts.get(evseId);
+    if (ctx?.transactionId === localTxId) ctx.transactionId = realTxId;
+    if (this.activeTransactionIds.get(evseId) === localTxId) {
+      this.activeTransactionIds.set(evseId, realTxId);
+    }
+    const startToken = this.transactionStartTokens.get(localTxId);
+    if (startToken != null) {
+      this.transactionStartTokens.delete(localTxId);
+      this.transactionStartTokens.set(realTxId, startToken);
+    }
+    await this.sql`
+      UPDATE css_transactions SET transaction_id = ${realTxId}
+      WHERE css_station_id = ${this.config.id} AND transaction_id = ${localTxId}
+    `.catch((err: unknown) => {
+      console.warn(
+        `[${this.config.stationId}] transaction id update failed`,
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+    console.log(
+      `[${this.config.stationId}] Transaction ${localTxId} is ${realTxId} at the Central System`,
+    );
+  }
+
+  /**
    * True when the offline queue holds a transaction-related message that is not
    * delivered yet (OCPP 2.1 E14): for the given transaction, or any when omitted.
    * A message stays queued until the CSMS acknowledges it (replayOfflineQueue).
    */
   private hasQueuedTransactionMessages(transactionId?: string): boolean {
     return this.offlineMessageQueue.some((m) => {
-      if (m.action !== 'TransactionEvent') return false;
-      if (transactionId == null) return true;
-      const info = m.payload['transactionInfo'] as Record<string, unknown> | undefined;
-      return info?.['transactionId'] === transactionId;
+      if (m.action === 'TransactionEvent') {
+        if (transactionId == null) return true;
+        const info = m.payload['transactionInfo'] as Record<string, unknown> | undefined;
+        return info?.['transactionId'] === transactionId;
+      }
+      // OCPP 1.6 transaction-related messages (3.7): StartTransaction,
+      // StopTransaction, and MeterValues that carry a transactionId.
+      const tx16 =
+        m.action === 'StartTransaction' ||
+        m.action === 'StopTransaction' ||
+        (m.action === 'MeterValues' && m.payload['transactionId'] != null);
+      if (!tx16) return false;
+      return transactionId == null || String(m.payload['transactionId']) === transactionId;
     });
   }
 
+  /**
+   * OCPP 1.6 (3.7): send a transaction-related message (StopTransaction, or MeterValues
+   * with a transactionId). Offline, or while older ones wait in the queue, it
+   * joins the queue so the Central System receives them in order; a connection
+   * lost while it is in flight keeps it for the reconnect.
+   */
+  private async sendTransactionMessage16(
+    action: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.client.isConnected || this.hasQueuedTransactionMessages()) {
+      this.queueOfflineMessage(action, payload);
+      return;
+    }
+    try {
+      await this.client.sendCall(action, payload);
+    } catch (err) {
+      // isConnected is a getter that changed during the await.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if (!this.client.isConnected) {
+        this.queueOfflineMessage(action, payload);
+        return;
+      }
+      throw err;
+    }
+  }
+
   /** Queue a message for later replay when back online. */
-  private queueOfflineMessage(action: string, payload: Record<string, unknown>): void {
-    this.enqueueOfflineMessage(action, payload);
+  private queueOfflineMessage(
+    action: string,
+    payload: Record<string, unknown>,
+    localTransactionId?: string,
+  ): void {
+    this.enqueueOfflineMessage(action, payload, localTransactionId);
     console.log(
       `[${this.config.stationId}] Queued ${action} (${String(this.offlineMessageQueue.length)} in queue)`,
     );
@@ -8437,8 +8859,11 @@ export class StationSimulator {
       if (ctx?.transactionId != null) {
         try {
           await this.stopCharging(evse.evseId, reason);
-        } catch {
-          // May fail if already stopped or offline
+        } catch (err) {
+          logger.warn(
+            { err, stationId: this.config.stationId, evseId: evse.evseId, reason },
+            'Stopping the transaction before the power cycle failed',
+          );
         }
       }
     }
@@ -9380,9 +9805,18 @@ export class StationSimulator {
     }
   }
 
-  private enqueueOfflineMessage(action: string, payload: Record<string, unknown>): void {
+  private enqueueOfflineMessage(
+    action: string,
+    payload: Record<string, unknown>,
+    localTransactionId?: string,
+  ): void {
     const id = 'com_' + randomUUID().replace(/-/g, '').slice(0, 12);
-    this.offlineMessageQueue.push({ id, action, payload });
+    this.offlineMessageQueue.push({
+      id,
+      action,
+      payload,
+      ...(localTransactionId != null ? { localTransactionId } : {}),
+    });
     void this.sql`
       INSERT INTO css_offline_messages (id, css_station_id, action, payload)
       VALUES (${id}, ${this.config.id}, ${action}, ${this.sql.json(payload as Parameters<postgres.Sql['json']>[0])})
@@ -9525,7 +9959,11 @@ export class StationSimulator {
         meterStartWh: row.meter_start_wh as number,
         idToken: (row.id_token as string | null) ?? '',
       };
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, evseId },
+        'Load active transaction failed, none assumed',
+      );
       return null;
     }
   }
@@ -9547,7 +9985,11 @@ export class StationSimulator {
       const row = rows[0];
       if (row == null) return null;
       return row.evse_id as number;
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, transactionId },
+        'Load EVSE of the transaction failed, none assumed',
+      );
       return null;
     }
   }
@@ -9564,7 +10006,11 @@ export class StationSimulator {
         LIMIT 1
       `;
       return rows.length > 0;
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId },
+        'Check for an active transaction failed, none assumed',
+      );
       return false;
     }
   }
@@ -9624,8 +10070,11 @@ export class StationSimulator {
             seq_no = ${updates.seqNo}
         WHERE css_station_id = ${this.config.id} AND transaction_id = ${txId} AND status = 'active'
       `;
-    } catch {
-      // Ignore update failures
+    } catch (err) {
+      logger.warn(
+        { err, stationId: this.config.stationId, transactionId: txId },
+        'Update of the stored transaction state failed',
+      );
     }
   }
 

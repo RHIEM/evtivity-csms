@@ -49,10 +49,32 @@ function makeChain() {
   return chain;
 }
 
+const rebill = vi.hoisted(() => ({
+  authorizeCalls: [] as string[][],
+  rebillSession: vi.fn(),
+  getSessionRebillState: vi.fn(),
+}));
+
+vi.mock('../services/session-rebill.service.js', async () => {
+  const { AppError } = await import('@evtivity/lib');
+  class SessionRebillRefusedError extends AppError {
+    readonly reason: string;
+    constructor(reason: string) {
+      super('Session cannot be re-billed', 409, 'SESSION_REBILL_NOT_ELIGIBLE');
+      this.reason = reason;
+    }
+  }
+  return {
+    rebillSession: rebill.rebillSession,
+    getSessionRebillState: rebill.getSessionRebillState,
+    SessionRebillRefusedError,
+  };
+});
+
 vi.mock('../middleware/rbac.js', () => ({
-  authorize:
-    () =>
-    async (
+  authorize: (...permissions: string[]) => {
+    rebill.authorizeCalls.push(permissions);
+    return async (
       request: { jwtVerify: () => Promise<void> },
       reply: { status: (code: number) => { send: (body: unknown) => Promise<void> } },
     ) => {
@@ -61,7 +83,8 @@ vi.mock('../middleware/rbac.js', () => ({
       } catch {
         await reply.status(401).send({ error: 'Unauthorized' });
       }
-    },
+    };
+  },
   invalidatePermissionCache: vi.fn(),
 }));
 
@@ -102,6 +125,8 @@ vi.mock('@evtivity/database', () => ({
   sessionStatusEnum: {
     enumValues: ['active', 'completed', 'invalid', 'faulted', 'failed'] as const,
   },
+  SESSION_REBILL_STATUSES: ['in_progress', 'billed', 'manual'] as const,
+  SESSION_END_FAILED_REASON: 'EndRequestFailed',
 }));
 
 vi.mock('drizzle-orm', () => {
@@ -128,6 +153,7 @@ vi.mock('../lib/site-access.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { sessionRoutes } from '../routes/sessions.js';
+import * as drizzleOrmModule from 'drizzle-orm';
 
 const VALID_STATION_ID = 'sta_000000000001';
 const VALID_SESSION_ID = 'ses_000000000001';
@@ -187,6 +213,13 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: 'USD',
           freeVend: false,
+          billingMode: null,
+          billingFleetId: null,
+          billingFleetName: null,
+          invoiceId: null,
+          invoiceStatus: null,
+          rebillStatus: null,
+          rebillClaimedAt: null,
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
@@ -258,7 +291,7 @@ describe('Session routes', () => {
     });
 
     it('applies search filter via ilike on transactionId', async () => {
-      const { ilike } = await import('drizzle-orm');
+      const { ilike } = drizzleOrmModule;
 
       setupDbResults([]);
 
@@ -291,6 +324,13 @@ describe('Session routes', () => {
           finalCostCents: 750,
           currency: 'USD',
           freeVend: false,
+          billingMode: null,
+          billingFleetId: null,
+          billingFleetName: null,
+          invoiceId: null,
+          invoiceStatus: null,
+          rebillStatus: null,
+          rebillClaimedAt: null,
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
@@ -313,6 +353,13 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: null,
           freeVend: false,
+          billingMode: null,
+          billingFleetId: null,
+          billingFleetName: null,
+          invoiceId: null,
+          invoiceStatus: null,
+          rebillStatus: null,
+          rebillClaimedAt: null,
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-02T08:00:00Z',
@@ -389,6 +436,13 @@ describe('Session routes', () => {
           finalCostCents: 500,
           currency: 'EUR',
           freeVend: false,
+          billingMode: null,
+          billingFleetId: null,
+          billingFleetName: null,
+          invoiceId: null,
+          invoiceStatus: null,
+          rebillStatus: null,
+          rebillClaimedAt: null,
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
@@ -410,7 +464,7 @@ describe('Session routes', () => {
     });
 
     it('accepts idling status filter', async () => {
-      const { eq, isNotNull } = await import('drizzle-orm');
+      const { eq, isNotNull } = drizzleOrmModule;
 
       const sessions = [
         {
@@ -430,6 +484,13 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: 'USD',
           freeVend: false,
+          billingMode: null,
+          billingFleetId: null,
+          billingFleetName: null,
+          invoiceId: null,
+          invoiceStatus: null,
+          rebillStatus: null,
+          rebillClaimedAt: null,
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
@@ -483,6 +544,13 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        billingMode: null,
+        billingFleetId: null,
+        billingFleetName: null,
+        invoiceId: null,
+        invoiceStatus: null,
+        rebillStatus: null,
+        rebillClaimedAt: null,
         co2AvoidedKg: null,
         electricityCostCents: null,
         metadata: null,
@@ -507,7 +575,6 @@ describe('Session routes', () => {
         guestPreAuthAmountCents: null,
         guestProvider: null,
         guestProviderPaymentId: null,
-        guestStripePaymentIntentId: null,
         guestExpiresAt: null,
         guestCreatedAt: null,
       };
@@ -528,6 +595,164 @@ describe('Session routes', () => {
       expect(body.finalCostCents).toBe(1000);
       expect(body.currency).toBe('USD');
       expect(body.paymentRecord).toBeNull();
+      expect(body.rebillable).toBe(false);
+      expect(body.rebillBlockedReason).toBe('status');
+      expect(rebill.getSessionRebillState).not.toHaveBeenCalled();
+    });
+
+    it('returns the billing stamp, billing fleet and invoice of an account session', async () => {
+      const session = {
+        id: VALID_SESSION_ID,
+        stationId: VALID_STATION_ID,
+        stationName: 'Station-01',
+        siteName: 'Site A',
+        siteId: null,
+        driverId: null,
+        driverName: null,
+        transactionId: 'txn-001',
+        status: 'completed',
+        startedAt: '2024-06-01T10:00:00Z',
+        endedAt: '2024-06-01T11:00:00Z',
+        idleStartedAt: null,
+        energyDeliveredWh: '20000',
+        currentCostCents: null,
+        finalCostCents: 1000,
+        currency: 'USD',
+        stoppedReason: null,
+        reservationId: null,
+        freeVend: false,
+        billingMode: 'account',
+        billingFleetId: 'flt_000000000001',
+        billingFleetName: 'Acme',
+        invoiceId: 'inv_000000000001',
+        invoiceStatus: 'issued',
+        rebillStatus: null,
+        rebillClaimedAt: null,
+        co2AvoidedKg: null,
+        electricityCostCents: null,
+        metadata: null,
+        tokenId: null,
+        tokenIdToken: null,
+        tokenType: null,
+        vehicleId: null,
+        vehicleMake: null,
+        vehicleModel: null,
+        vehicleYear: null,
+        paymentId: null,
+        paymentStatus: null,
+        paymentSource: null,
+        paymentCurrency: null,
+        preAuthAmountCents: null,
+        capturedAmountCents: null,
+        refundedAmountCents: null,
+        failureReason: null,
+        guestSessionToken: null,
+        guestEmail: null,
+        guestStatus: null,
+        guestPreAuthAmountCents: null,
+        guestProvider: null,
+        guestProviderPaymentId: null,
+        guestExpiresAt: null,
+        guestCreatedAt: null,
+      };
+      // session query, transaction events query, payment records query
+      setupDbResults([session], [], []);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        billingMode: 'account',
+        billingFleetId: 'flt_000000000001',
+        billingFleetName: 'Acme',
+        invoiceId: 'inv_000000000001',
+        invoiceStatus: 'issued',
+      });
+    });
+
+    it('reports whether a session the CSMS gave up ending can be re-billed now', async () => {
+      const session: Record<string, unknown> = {
+        id: VALID_SESSION_ID,
+        stationId: VALID_STATION_ID,
+        stationName: 'Station-01',
+        siteName: 'Site A',
+        siteId: null,
+        driverId: null,
+        driverName: null,
+        transactionId: 'txn-001',
+        status: 'completed',
+        startedAt: '2024-06-01T10:00:00Z',
+        endedAt: '2024-06-01T11:00:00Z',
+        idleStartedAt: null,
+        energyDeliveredWh: '20000',
+        currentCostCents: null,
+        finalCostCents: 1000,
+        currency: 'USD',
+        stoppedReason: null,
+        reservationId: null,
+        freeVend: false,
+        billingMode: null,
+        billingFleetId: null,
+        billingFleetName: null,
+        invoiceId: null,
+        invoiceStatus: null,
+        rebillStatus: null,
+        rebillClaimedAt: null,
+        co2AvoidedKg: null,
+        electricityCostCents: null,
+        metadata: null,
+        tokenId: null,
+        tokenIdToken: null,
+        tokenType: null,
+        vehicleId: null,
+        vehicleMake: null,
+        vehicleModel: null,
+        vehicleYear: null,
+        paymentId: null,
+        paymentStatus: null,
+        paymentSource: null,
+        paymentCurrency: null,
+        preAuthAmountCents: null,
+        capturedAmountCents: null,
+        refundedAmountCents: null,
+        failureReason: null,
+        guestSessionToken: null,
+        guestEmail: null,
+        guestStatus: null,
+        guestPreAuthAmountCents: null,
+        guestProvider: null,
+        guestProviderPaymentId: null,
+        guestExpiresAt: null,
+        guestCreatedAt: null,
+      };
+      Object.assign(session, {
+        status: 'faulted',
+        stoppedReason: 'EndRequestFailed',
+        rebillStatus: 'in_progress',
+        rebillClaimedAt: '2026-10-01T10:00:00.000Z',
+      });
+      rebill.getSessionRebillState.mockResolvedValueOnce({
+        rebillable: true,
+        blockedReason: null,
+      });
+      setupDbResults([session], [], []);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(rebill.getSessionRebillState).toHaveBeenCalledWith(VALID_SESSION_ID);
+      expect(body.rebillable).toBe(true);
+      expect(body.rebillBlockedReason).toBeNull();
+      expect(body.rebillClaimedAt).toBe('2026-10-01T10:00:00.000Z');
     });
 
     it('returns the pending operation and refund ledger of the payment', async () => {
@@ -551,6 +776,13 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        billingMode: null,
+        billingFleetId: null,
+        billingFleetName: null,
+        invoiceId: null,
+        invoiceStatus: null,
+        rebillStatus: null,
+        rebillClaimedAt: null,
         co2AvoidedKg: null,
         electricityCostCents: null,
         metadata: null,
@@ -575,7 +807,6 @@ describe('Session routes', () => {
         guestPreAuthAmountCents: null,
         guestProvider: null,
         guestProviderPaymentId: null,
-        guestStripePaymentIntentId: null,
         guestExpiresAt: null,
         guestCreatedAt: null,
       };
@@ -660,6 +891,13 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        billingMode: null,
+        billingFleetId: null,
+        billingFleetName: null,
+        invoiceId: null,
+        invoiceStatus: null,
+        rebillStatus: null,
+        rebillClaimedAt: null,
         co2AvoidedKg: null,
         electricityCostCents: null,
         metadata: null,
@@ -684,7 +922,6 @@ describe('Session routes', () => {
         guestPreAuthAmountCents: null,
         guestProvider: null,
         guestProviderPaymentId: null,
-        guestStripePaymentIntentId: null,
         guestExpiresAt: null,
         guestCreatedAt: null,
       };
@@ -729,6 +966,13 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        billingMode: null,
+        billingFleetId: null,
+        billingFleetName: null,
+        invoiceId: null,
+        invoiceStatus: null,
+        rebillStatus: null,
+        rebillClaimedAt: null,
         co2AvoidedKg: null,
         electricityCostCents: null,
         metadata: null,
@@ -753,7 +997,6 @@ describe('Session routes', () => {
         guestPreAuthAmountCents: 2000,
         guestProvider: 'stripe',
         guestProviderPaymentId: 'pi_guest',
-        guestStripePaymentIntentId: 'pi_guest',
         guestExpiresAt: '2024-06-02T10:00:00Z',
         guestCreatedAt: '2024-06-01T09:55:00Z',
       };
@@ -770,8 +1013,8 @@ describe('Session routes', () => {
         sessionToken: 'tok_guest',
         provider: 'stripe',
         providerPaymentId: 'pi_guest',
-        stripePaymentIntentId: 'pi_guest',
       });
+      expect(response.json().guestSession).not.toHaveProperty('stripePaymentIntentId');
     });
   });
 
@@ -829,7 +1072,7 @@ describe('Session routes', () => {
     });
 
     it('accepts measurand filter', async () => {
-      const { eq } = await import('drizzle-orm');
+      const { eq } = drizzleOrmModule;
 
       setupDbResults([{ id: VALID_SESSION_ID }], [], [{ count: 0 }]);
 
@@ -903,6 +1146,93 @@ describe('Session routes', () => {
       expect(body.data[0].encodingMethod).toBe('OCMF');
       expect(body.data[0].context).toBe('Transaction.End');
       expect(body.data[0].meterPublicKeyId).toBe(7);
+    });
+  });
+
+  describe('POST /v1/sessions/:id/rebill', () => {
+    const result = {
+      sessionId: VALID_SESSION_ID,
+      rebillStatus: 'billed',
+      result: 'charged',
+      manualReason: null,
+      finalCostCents: 1190,
+      currency: 'EUR',
+      endedAt: new Date('2026-06-04T01:00:00Z'),
+      paymentRecordId: 9,
+      failureReason: null,
+    };
+
+    beforeEach(() => {
+      rebill.rebillSession.mockReset();
+    });
+
+    it('requires both sessions:write and payments:write', () => {
+      expect(rebill.authorizeCalls).toContainEqual(['sessions:write', 'payments:write']);
+    });
+
+    it('returns 401 without token', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/rebill`,
+      });
+      expect(response.statusCode).toBe(401);
+      expect(rebill.rebillSession).not.toHaveBeenCalled();
+    });
+
+    it('bills the session through the service with the actor and site scope', async () => {
+      rebill.rebillSession.mockResolvedValueOnce(result);
+      const response = await app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/rebill`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ ...result, endedAt: '2026-06-04T01:00:00.000Z' });
+      expect(rebill.rebillSession).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        expect.objectContaining({
+          siteIds: null,
+          actor: expect.objectContaining({ actor: 'operator', actorUserId: 'test-id' }) as unknown,
+        }),
+      );
+    });
+
+    it('answers 409 with the refusal reason', async () => {
+      const { SessionRebillRefusedError } = await import('../services/session-rebill.service.js');
+      rebill.rebillSession.mockRejectedValueOnce(new SessionRebillRefusedError('paid'));
+      const response = await app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/rebill`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({
+        error: 'Session cannot be re-billed',
+        code: 'SESSION_REBILL_NOT_ELIGIBLE',
+        details: { reason: 'paid' },
+      });
+    });
+
+    it('answers 400 when the payment provider cannot be reached', async () => {
+      const { PaymentProviderUnavailableError } = await import('@evtivity/payments');
+      rebill.rebillSession.mockRejectedValueOnce(new PaymentProviderUnavailableError('timeout'));
+      const response = await app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/rebill`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: 'PAYMENT_PROVIDER_CONNECTION_FAILED' });
+    });
+
+    it('rejects an invalid session id', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/sessions/not-a-session/rebill',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(rebill.rebillSession).not.toHaveBeenCalled();
     });
   });
 });

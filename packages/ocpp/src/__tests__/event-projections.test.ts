@@ -1,8 +1,9 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import type { EventBus, DomainEvent, PubSubClient } from '@evtivity/lib';
+import { OCPP_NOTIFICATION_EVENT_TYPES } from '@evtivity/lib';
 
 // SQL mock: a function that handles tagged template calls and returns configurable results
 const sqlCalls: Array<{ strings: string[]; values: unknown[] }> = [];
@@ -22,6 +23,9 @@ function createSqlMock() {
     sqlCalls.push({ strings: [...strings], values });
     const routed = sqlRoute?.(strings.join('?'));
     if (routed !== undefined) return Promise.resolve(routed);
+    // The resend check (TransactionProjector.isResentEvent) answers by text,
+    // outside the queued results: no event is a resend unless a test says so.
+    if (strings.join('?').includes('AND te.seq_no = ?')) return Promise.resolve([]);
     const result = sqlResults[sqlCallIndex] ?? [];
     sqlCallIndex++;
     const failure = sqlFailOn?.(strings.join(''));
@@ -87,6 +91,12 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/station-status.js',
   )),
+  // The real driver availability rule (station-watch alert).
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/driver-availability.js',
+  )),
+  // The real station-watch check, running on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/station-watch.js')),
   // The real session pricing writes (tariff snapshot, segments, final cost),
   // running on the mocked client. The cost itself comes from mockPriceSessionAt.
   ...(await vi.importActual<Record<string, unknown>>(
@@ -107,6 +117,7 @@ vi.mock('@evtivity/database', async () => ({
   isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
   getCompanyPriceDisplay: vi.fn().mockResolvedValue('net'),
+  writeReservationAudit: vi.fn().mockResolvedValue(undefined),
   // The real Postgres error readers.
   ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
 }));
@@ -138,6 +149,7 @@ const mockPaymentContext = { registry: {}, logger: {} };
 vi.mock('../lib/payments.js', () => ({
   paymentRegistry: {},
   paymentContext: () => mockPaymentContext,
+  activePaymentProvider: () => Promise.resolve({ id: 'stripe' }),
 }));
 
 function createMockEventBus() {
@@ -201,6 +213,12 @@ function makeDomainEvent(
 describe('Event projections', () => {
   let eventBus: ReturnType<typeof createMockEventBus>;
   let timerCallback: (() => void) | null = null;
+
+  // Importing the projections module cold is slow on a loaded machine; do it
+  // once here so no single test pays for it against its own timeout.
+  beforeAll(async () => {
+    await import('../server/event-projections.js');
+  }, 60_000);
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -423,9 +441,7 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // UPDATE charging_stations
         [], // INSERT connection_logs
-        [{ evse_id: 1 }, { evse_id: 2 }], // SELECT evse_id FROM evses
-        [], // INSERT port_status_log #1
-        [], // INSERT port_status_log #2
+        [], // INSERT port_status_log ... SELECT FROM evses
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -435,7 +451,12 @@ describe('Event projections', () => {
         makeDomainEvent('station.Connected', 'CS-001', { ocppProtocol: 'ocpp2.1' }),
       );
 
-      expect(sqlCalls.length).toBeGreaterThanOrEqual(6);
+      // One statement logs every EVSE of the station, so a retry cannot log a part twice.
+      const portLogs = sqlCalls.filter((c) => c.strings.join('?').includes('port_status_log'));
+      expect(portLogs).toHaveLength(1);
+      expect(portLogs[0]?.strings.join('?')).toMatch(
+        /SELECT \?, evse_id, 'unavailable', 'available', now\(\)\s+FROM evses WHERE station_id = \?/,
+      );
     });
   });
 
@@ -594,6 +615,156 @@ describe('Event projections', () => {
     });
   });
 
+  // A station becomes free for a watching driver through many inputs, not only
+  // a connector status. Every projection that can free a station checks the
+  // watches with the shared driver availability rule (findDueStationWatch) and
+  // publishes the signal; the worker claim makes repeated signals one alert.
+  describe('station watch alerts', () => {
+    let watchDue = true;
+    let availabilityChanges = true;
+
+    function routeWatch(): void {
+      sqlRoute = (text) => {
+        if (text.includes('FROM charging_stations WHERE station_id')) {
+          return [{ id: 'sta_000000000001' }];
+        }
+        if (text.includes('SELECT id FROM evses WHERE station_id')) {
+          return [{ id: 'evs_000000000001' }];
+        }
+        if (text.includes('AS previous_status')) {
+          return [{ previous_status: 'unavailable', applied: true }];
+        }
+        if (text.includes('SET availability')) {
+          return availabilityChanges ? [{ id: 'sta_000000000001' }] : [];
+        }
+        if (text.includes('FROM station_watches w')) {
+          return watchDue ? [{ station_id: 'CS-001' }] : [];
+        }
+        if (text.includes('SELECT onboarding_status')) return [{ onboarding_status: 'accepted' }];
+        if (text.includes('UPDATE reservations')) {
+          return [{ id: 'res_1', driver_id: null, station_id: 'sta_000000000001' }];
+        }
+        return [];
+      };
+    }
+
+    function watchSignals(): unknown[][] {
+      return (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c: unknown[]) => c[0] === 'station_watch_available',
+      );
+    }
+
+    beforeEach(() => {
+      watchDue = true;
+      availabilityChanges = true;
+    });
+
+    it('checks the watches with the shared rule when a connector becomes available', async () => {
+      await setup();
+      routeWatch();
+      const { availableEvseCountSql } = await vi.importActual<
+        typeof import('../../../database/src/lib/driver-availability.js')
+      >('../../../database/src/lib/driver-availability.js');
+      const available = (): DomainEvent =>
+        makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
+          evseId: 1,
+          connectorId: 1,
+          connectorStatus: 'Available',
+        });
+
+      // Not free by the rule (for example disabled): no signal.
+      watchDue = false;
+      await eventBus.emit('ocpp.StatusNotification', available());
+      const check = sqlCalls.find((c) => c.strings.join('?').includes('FROM station_watches w'));
+      expect(check?.values).toContain(availableEvseCountSql('cs'));
+      expect(watchSignals()).toHaveLength(0);
+
+      watchDue = true;
+      await eventBus.emit('ocpp.StatusNotification', available());
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'station_watch_available',
+        JSON.stringify({ stationId: 'CS-001' }),
+      );
+    });
+
+    it('checks the watches when the station reports itself available (EVSE 0)', async () => {
+      await setup();
+      routeWatch();
+      await eventBus.emit(
+        'ocpp.StatusNotification',
+        makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
+          evseId: 0,
+          connectorId: 0,
+          connectorStatus: 'Available',
+        }),
+      );
+      expect(watchSignals()).toHaveLength(1);
+    });
+
+    it('checks the watches when the station comes back online', async () => {
+      await setup();
+      routeWatch();
+      await eventBus.emit(
+        'station.Connected',
+        makeDomainEvent('station.Connected', 'CS-001', { ocppProtocol: 'ocpp2.1' }),
+      );
+      expect(watchSignals()).toHaveLength(1);
+    });
+
+    it('checks the watches when a firmware install finishes', async () => {
+      await setup();
+      routeWatch();
+      await eventBus.emit(
+        'ocpp.FirmwareStatusNotification',
+        makeDomainEvent('ocpp.FirmwareStatusNotification', 'CS-001', { status: 'Installed' }),
+      );
+      expect(watchSignals()).toHaveLength(1);
+    });
+
+    it('does not check the watches when a firmware status changes no availability', async () => {
+      await setup();
+      routeWatch();
+      availabilityChanges = false;
+      await eventBus.emit(
+        'ocpp.FirmwareStatusNotification',
+        makeDomainEvent('ocpp.FirmwareStatusNotification', 'CS-001', { status: 'Installed' }),
+      );
+      expect(sqlCalls.some((c) => c.strings.join('?').includes('FROM station_watches w'))).toBe(
+        false,
+      );
+    });
+
+    it('checks the watches when a reboot ends a firmware install', async () => {
+      await setup();
+      routeWatch();
+      await eventBus.emit(
+        'ocpp.BootNotification',
+        makeDomainEvent('ocpp.BootNotification', 'CS-001', {
+          status: 'Accepted',
+          firmwareVersion: '1.0',
+          model: 'M',
+          serialNumber: 'S',
+        }),
+      );
+      expect(watchSignals()).toHaveLength(1);
+    });
+
+    it('checks the watches when the station expires or removes a reservation', async () => {
+      await setup();
+      routeWatch();
+      for (const reservationUpdateStatus of ['Expired', 'Removed']) {
+        await eventBus.emit(
+          'ocpp.ReservationStatusUpdate',
+          makeDomainEvent('ocpp.ReservationStatusUpdate', 'CS-001', {
+            reservationId: 7,
+            reservationUpdateStatus,
+          }),
+        );
+      }
+      expect(watchSignals()).toHaveLength(2);
+    });
+  });
+
   describe('ocpp.StatusNotification', () => {
     it('auto-creates EVSE when not found', async () => {
       await setup();
@@ -733,8 +904,7 @@ describe('Event projections', () => {
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
-        [], // UPDATE charging_sessions SET idle_started_at
-        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT active session
+        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT the active session with an open idle period
         [
           {
             driver_id: 'drv-1',
@@ -743,18 +913,21 @@ describe('Event projections', () => {
             tax_rate: '0.19',
             price_display: 'gross',
             currency: 'USD',
+            site_name: 'Test Site',
           },
-        ], // dispatchIdlingNotification: SELECT from charging_sessions
-        [{ name: 'Test Site' }], // dispatchIdlingNotification: resolveSiteName
+        ], // dispatchDueIdlingNotification: the claim (period open for 60 s)
+        [], // UPDATE charging_sessions SET idle_started_at (already set)
       );
 
+      // The station repeats SuspendedEV a minute into the period it opened at
+      // 01:00: the due claim sends the notice (JB-2).
       await eventBus.emit(
         'ocpp.StatusNotification',
         makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
           evseId: 1,
           connectorId: 1,
           connectorStatus: 'SuspendedEV',
-          timestamp: '2024-01-01T01:00:00Z',
+          timestamp: '2024-01-01T01:01:00Z',
         }),
       );
 
@@ -787,9 +960,8 @@ describe('Event projections', () => {
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
+        [], // SELECT the active session with an open, unclaimed idle period: none (claimed)
         [], // UPDATE charging_sessions SET idle_started_at (already set)
-        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT active session
-        [], // dispatchIdlingNotification: claim found idle_notified_at = idle_started_at
       );
 
       await eventBus.emit(
@@ -802,12 +974,13 @@ describe('Event projections', () => {
         }),
       );
 
-      const claim = sqlCalls.find((c) =>
-        c.strings.join('').includes('idle_notified_at = COALESCE'),
+      const openPeriod = sqlCalls.find((c) =>
+        c.strings.join('').includes('idle_started_at IS NOT NULL AND idle_notified_at'),
       );
-      expect(claim?.strings.join('')).toContain(
-        'idle_notified_at IS DISTINCT FROM COALESCE(idle_started_at',
+      expect(openPeriod?.strings.join('')).toContain(
+        'idle_notified_at IS DISTINCT FROM idle_started_at',
       );
+      expect(sqlCalls.some((c) => c.strings.join('').includes('WITH claimed AS'))).toBe(false);
       expect(mockDispatchDriver).not.toHaveBeenCalledWith(
         expect.anything(),
         'session.IdlingStarted',
@@ -829,8 +1002,7 @@ describe('Event projections', () => {
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
-        [], // UPDATE charging_sessions SET idle_started_at
-        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT active session
+        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT the active session with an open idle period
         [
           {
             driver_id: 'drv-1',
@@ -839,18 +1011,21 @@ describe('Event projections', () => {
             tax_rate: '0.19',
             price_display: null,
             currency: 'USD',
+            site_name: 'Test Site',
           },
-        ], // dispatchIdlingNotification: SELECT from charging_sessions
-        [{ name: 'Test Site' }], // dispatchIdlingNotification: resolveSiteName
+        ], // dispatchDueIdlingNotification: the claim (period open for 60 s)
+        [], // UPDATE charging_sessions SET idle_started_at (already set)
       );
 
+      // The station repeats SuspendedEV a minute into the period it opened at
+      // 01:00: the due claim sends the notice (JB-2).
       await eventBus.emit(
         'ocpp.StatusNotification',
         makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
           evseId: 1,
           connectorId: 1,
           connectorStatus: 'SuspendedEV',
-          timestamp: '2024-01-01T01:00:00Z',
+          timestamp: '2024-01-01T01:01:00Z',
         }),
       );
 
@@ -886,8 +1061,7 @@ describe('Event projections', () => {
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
-        [], // UPDATE charging_sessions SET idle_started_at
-        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT active session
+        [{ id: 'session-1', transaction_id: 'tx-1' }], // SELECT the active session with an open idle period
         [
           {
             driver_id: 'drv-1',
@@ -896,18 +1070,21 @@ describe('Event projections', () => {
             tax_rate: '0.19',
             price_display: 'gross',
             currency: 'USD',
+            site_name: 'Test Site',
           },
-        ], // dispatchIdlingNotification: SELECT from charging_sessions
-        [{ name: 'Test Site' }], // dispatchIdlingNotification: resolveSiteName
+        ], // dispatchDueIdlingNotification: the claim (period open for 60 s)
+        [], // UPDATE charging_sessions SET idle_started_at (already set)
       );
 
+      // The station repeats SuspendedEV a minute into the period it opened at
+      // 01:00: the due claim sends the notice (JB-2).
       await eventBus.emit(
         'ocpp.StatusNotification',
         makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
           evseId: 1,
           connectorId: 1,
           connectorStatus: 'SuspendedEV',
-          timestamp: '2024-01-01T01:00:00Z',
+          timestamp: '2024-01-01T01:01:00Z',
         }),
       );
 
@@ -1100,6 +1277,47 @@ describe('Event projections', () => {
       );
       expect(refreshCalls.length).toBe(1);
     });
+
+    for (const [connectorStatus, expected] of [
+      ['SuspendedEV', 'open'],
+      ['SuspendedEVSE', 'close'],
+      ['Faulted', 'close'],
+      ['Finishing', 'close'],
+      ['Charging', 'close'],
+      ['Occupied', 'none'],
+    ] as const) {
+      it(`idle detection on StatusNotification ${connectorStatus}: ${expected}`, async () => {
+        await setup();
+
+        setupSqlResults(
+          [{ id: 'sta_000000000001' }], // resolveStationUuid
+          [{ id: 'evse_000000000001' }], // SELECT evses (found)
+          [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prev)
+        );
+
+        await eventBus.emit(
+          'ocpp.StatusNotification',
+          makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
+            evseId: 1,
+            connectorId: 1,
+            connectorStatus,
+            timestamp: '2024-01-01T01:00:00Z',
+          }),
+        );
+
+        const joined = sqlCalls.map((c) => c.strings.join(''));
+        const opened = joined.some(
+          (t) => t.includes('SET idle_started_at =') && t.includes('idle_started_at IS NULL'),
+        );
+        const closed = joined.some(
+          (t) => t.includes('SET idle_minutes') && t.includes('idle_started_at IS NOT NULL'),
+        );
+        expect({ opened, closed }).toEqual({
+          opened: expected === 'open',
+          closed: expected === 'close',
+        });
+      });
+    }
 
     it('publishes station_message_refresh on auto-create EVSE branch for OCPP 2.1', async () => {
       await setup();
@@ -1619,6 +1837,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [
           {
@@ -1685,6 +1904,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [
           {
@@ -1751,6 +1971,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [
           {
@@ -1793,6 +2014,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed, energy from meterStop
         [
           {
@@ -1852,6 +2074,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
       );
 
@@ -1884,6 +2107,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions
         [
           {
@@ -1946,17 +2170,15 @@ describe('Event projections', () => {
       expect(sqlCalls.length).toBeGreaterThanOrEqual(1);
     });
 
-    it('sets idle_started_at when chargingState is EVConnected on Updated', async () => {
+    it('sets idle_started_at on an active session when chargingState is SuspendedEV', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
-        [{ id: 'session-1' }], // SELECT id FROM charging_sessions
+        [{ id: 'session-1', status: 'active' }], // SELECT id FROM charging_sessions
         [], // INSERT transaction_events
-        [], // UPDATE idle_started_at (chargingState = EVConnected)
-        [{ driver_id: null }], // dispatchIdlingNotification: SELECT from charging_sessions (no driver)
-        [{ name: null }], // dispatchIdlingNotification: resolveSiteName
-        [], // dispatchIdlingNotification: SELECT guest_email FROM guest_sessions (no guest)
+        [], // UPDATE idle_started_at (chargingState = SuspendedEV)
+        [{ driver_id: null, site_name: null, guest_email: null }], // dispatchIdlingNotification: the claim (no driver, no guest)
         [{ site_id: null }], // resolveSiteId
         [{ driver_id: null }], // SELECT driver_id (no driver)
       );
@@ -1970,17 +2192,49 @@ describe('Event projections', () => {
           seqNo: 1,
           triggerReason: 'ChargingStateChanged',
           timestamp: '2024-01-01T01:00:00Z',
-          chargingState: 'EVConnected',
+          chargingState: 'SuspendedEV',
         }),
       );
 
-      // Verify the idle_started_at UPDATE was issued
       const idleUpdateCall = sqlCalls.find((c) => {
         const joined = c.strings.join('');
-        return joined.includes('idle_started_at') && joined.includes('idle_started_at IS NULL');
+        return joined.includes('SET idle_started_at') && joined.includes('idle_started_at IS NULL');
       });
       expect(idleUpdateCall).toBeDefined();
+      expect(idleUpdateCall!.strings.join('')).toContain("status = 'active'");
     });
+
+    for (const chargingState of ['EVConnected', 'SuspendedEVSE', 'Idle', 'Charging']) {
+      it(`closes an open idle period and opens none when chargingState is ${chargingState}`, async () => {
+        await setup();
+
+        setupSqlResults(
+          [{ id: 'sta_000000000001' }], // resolveStationId
+          [{ id: 'session-1', status: 'active' }], // SELECT id FROM charging_sessions
+          [], // INSERT transaction_events
+          [], // UPDATE idle_minutes (close the open period)
+        );
+
+        await eventBus.emit(
+          'ocpp.TransactionEvent',
+          makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+            eventType: 'Updated',
+            stationId: 'CS-001',
+            transactionId: 'tx-1',
+            seqNo: 1,
+            triggerReason: 'ChargingStateChanged',
+            timestamp: '2024-01-01T01:00:00Z',
+            chargingState,
+          }),
+        );
+
+        const joined = sqlCalls.map((c) => c.strings.join(''));
+        expect(joined.some((t) => t.includes('SET idle_started_at ='))).toBe(false);
+        const close = joined.find((t) => t.includes('idle_started_at IS NOT NULL'));
+        expect(close).toBeDefined();
+        expect(close).toContain("status = 'active'");
+      });
+    }
 
     it('dispatches guest idling notification when guest email is present', async () => {
       await setup();
@@ -1990,9 +2244,8 @@ describe('Event projections', () => {
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
-        [{ id: 'session-1' }], // SELECT id FROM charging_sessions
+        [{ id: 'session-1', status: 'active' }], // SELECT id FROM charging_sessions
         [], // INSERT transaction_events
-        [], // UPDATE idle_started_at (chargingState = EVConnected)
         [
           {
             driver_id: null,
@@ -2001,10 +2254,11 @@ describe('Event projections', () => {
             tax_rate: '0.19',
             price_display: null,
             currency: 'USD',
+            site_name: 'Test Site',
+            guest_email: 'guest@example.com',
           },
-        ], // dispatchIdlingNotification: SELECT from charging_sessions (no driver)
-        [{ name: 'Test Site' }], // dispatchIdlingNotification: resolveSiteName
-        [{ guest_email: 'guest@example.com' }], // dispatchIdlingNotification: SELECT guest_email
+        ], // dispatchDueIdlingNotification: the claim (no driver, period open for 60 s)
+        [], // UPDATE idle_started_at (chargingState = SuspendedEV, already set)
         [{ site_id: null }], // resolveSiteId
         [{ driver_id: null }], // SELECT driver_id (no driver)
       );
@@ -2016,9 +2270,10 @@ describe('Event projections', () => {
           stationId: 'CS-001',
           transactionId: 'tx-1',
           seqNo: 1,
-          triggerReason: 'ChargingStateChanged',
-          timestamp: '2024-01-01T01:00:00Z',
-          chargingState: 'EVConnected',
+          // A periodic event a minute into the SuspendedEV period opened at 01:00 (JB-2).
+          triggerReason: 'MeterValuePeriodic',
+          timestamp: '2024-01-01T01:01:00Z',
+          chargingState: 'SuspendedEV',
         }),
       );
 
@@ -2044,9 +2299,8 @@ describe('Event projections', () => {
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
-        [{ id: 'session-1' }], // SELECT id FROM charging_sessions
+        [{ id: 'session-1', status: 'active' }], // SELECT id FROM charging_sessions
         [], // INSERT transaction_events
-        [], // UPDATE idle_started_at (chargingState = EVConnected)
         [
           {
             driver_id: null,
@@ -2055,10 +2309,11 @@ describe('Event projections', () => {
             tax_rate: '0.19',
             price_display: null,
             currency: 'USD',
+            site_name: 'Test Site',
+            guest_email: 'guest@example.com',
           },
-        ], // dispatchIdlingNotification: SELECT from charging_sessions (no driver)
-        [{ name: 'Test Site' }], // dispatchIdlingNotification: resolveSiteName
-        [{ guest_email: 'guest@example.com' }], // dispatchIdlingNotification: SELECT guest_email
+        ], // dispatchDueIdlingNotification: the claim (no driver, period open for 60 s)
+        [], // UPDATE idle_started_at (chargingState = SuspendedEV, already set)
         [{ site_id: null }], // resolveSiteId
         [{ driver_id: null }], // SELECT driver_id (no driver)
       );
@@ -2070,9 +2325,10 @@ describe('Event projections', () => {
           stationId: 'CS-001',
           transactionId: 'tx-1',
           seqNo: 1,
-          triggerReason: 'ChargingStateChanged',
-          timestamp: '2024-01-01T01:00:00Z',
-          chargingState: 'EVConnected',
+          // A periodic event a minute into the SuspendedEV period opened at 01:00 (JB-2).
+          triggerReason: 'MeterValuePeriodic',
+          timestamp: '2024-01-01T01:01:00Z',
+          chargingState: 'SuspendedEV',
         }),
       );
 
@@ -2167,6 +2423,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [
           {
@@ -2281,6 +2538,7 @@ describe('Event projections', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [
           {
@@ -2862,22 +3120,117 @@ describe('Event projections', () => {
         );
       });
       expect(accumulateCall).toBeDefined();
-      // The meter fallback never ends an idle period the station reported (claimed).
-      expect(accumulateCall?.strings.join('')).toContain(
-        'idle_notified_at IS DISTINCT FROM idle_started_at',
+      const text = accumulateCall?.strings.join('') ?? '';
+      // The meter fallback never ends an idle period the station reports: not
+      // while the session's connector is suspended_ev (1.6 SuspendedEV status),
+      // and never for a session whose events carried a chargingState (JB-1).
+      expect(text).toContain("c.status = 'suspended_ev'");
+      expect(text).toContain("te.payload->>'chargingState' IS NOT NULL");
+      expect(text).not.toContain('idle_notified_at');
+    });
+
+    it('the meter fallback opens carry the transaction_events chargingState guard (JB-1)', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationUuid
+        [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
+        [], // INSERT meter_values (energy)
+        [], // INSERT meter_values (power)
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
+        [], // UPDATE meter_start (no-op, already set)
+        [], // UPDATE energy_delivered_wh
+        [], // UPDATE idle_started_at (flat energy)
+        [], // UPDATE idle_started_at (power = 0)
+        [], // SELECT active sessions
       );
+
+      await eventBus.emit(
+        'ocpp.MeterValues',
+        makeDomainEvent('ocpp.MeterValues', 'CS-001', {
+          stationId: 'CS-001',
+          transactionId: 'TX-MV',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2024-01-01T01:00:00Z',
+              sampledValue: [
+                {
+                  measurand: 'Energy.Active.Import.Register',
+                  value: 6000,
+                  unitOfMeasure: { unit: 'Wh' },
+                },
+                { measurand: 'Power.Active.Import', value: 0, unitOfMeasure: { unit: 'W' } },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const opens = sqlCalls
+        .map((c) => c.strings.join(''))
+        .filter((t) => t.includes('SET idle_started_at') && t.includes('idle_started_at IS NULL'));
+      expect(opens).toHaveLength(2);
+      for (const open of opens) {
+        expect(open).toContain("te.payload->>'chargingState' IS NOT NULL");
+      }
+    });
+
+    it('skips both meter fallbacks for readings whose event carried a chargingState (JB-1)', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationUuid
+        [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
+        [], // INSERT meter_values (energy)
+        [], // INSERT meter_values (power)
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
+        [], // UPDATE meter_start (no-op, already set)
+        [], // UPDATE energy_delivered_wh
+        [], // SELECT active sessions
+      );
+
+      await eventBus.emit(
+        'ocpp.MeterValues',
+        makeDomainEvent('ocpp.MeterValues', 'CS-001', {
+          stationId: 'CS-001',
+          transactionId: 'TX-MV',
+          source: 'TransactionEvent',
+          chargingState: 'Charging',
+          meterValues: [
+            {
+              timestamp: '2024-01-01T01:00:00Z',
+              sampledValue: [
+                {
+                  measurand: 'Energy.Active.Import.Register',
+                  value: 6000,
+                  unitOfMeasure: { unit: 'Wh' },
+                },
+                { measurand: 'Power.Active.Import', value: 0, unitOfMeasure: { unit: 'W' } },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const joined = sqlCalls.map((c) => c.strings.join(''));
+      // The energy is still stored, but no idle period opens or closes.
+      expect(joined.some((t) => t.includes('SET energy_delivered_wh'))).toBe(true);
+      expect(joined.some((t) => t.includes('SET idle_started_at'))).toBe(false);
+      expect(joined.some((t) => t.includes('idle_started_at = NULL'))).toBe(false);
     });
 
     it('sets idle_started_at when energy reading unchanged from previous', async () => {
       await setup();
 
       // Session has meter_start=1000 and energy_delivered_wh=5000 (meter was at 6000).
-      // New reading is also 6000 (same as before), so energy is flat.
+      // New reading is also 6000 (same as before), so energy is flat. It last
+      // rose one sample interval earlier.
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 5000, meter_start: 1000 }], // SELECT prev energy
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
         [], // UPDATE meter_start (no-op, already set)
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle_started_at (flat energy)
@@ -2912,6 +3265,57 @@ describe('Event projections', () => {
         return joined.includes('SET idle_started_at') && joined.includes('idle_started_at IS NULL');
       });
       expect(idleSetCall).toBeDefined();
+    });
+
+    // Finding J3: a clock-aligned or transaction-end sample a moment after the
+    // periodic one that raised the energy is flat too, but no proof the EV
+    // stopped drawing power.
+    it('opens no idle period for a flat reading moments after the energy rose', async () => {
+      await setup();
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationUuid
+        [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
+        [], // INSERT meter_values
+        [
+          {
+            energy_delivered_wh: 5000,
+            meter_start: 1000,
+            last_rise_at: '2024-01-01T00:59:59.600Z',
+          },
+        ], // SELECT prev energy (rose 0.4 s earlier)
+        [], // UPDATE meter_start (no-op, already set)
+        [], // UPDATE energy_delivered_wh
+        [], // SELECT active sessions
+        [{ site_id: null }], // resolveSiteId
+        [], // pg_notify
+      );
+
+      await eventBus.emit(
+        'ocpp.MeterValues',
+        makeDomainEvent('ocpp.MeterValues', 'CS-001', {
+          stationId: 'CS-001',
+          transactionId: 'TX-MV',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2024-01-01T01:00:00Z',
+              sampledValue: [
+                {
+                  measurand: 'Energy.Active.Import.Register',
+                  value: 6000.3,
+                  unitOfMeasure: { unit: 'Wh' },
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const idleSetCall = sqlCalls.find((c) => {
+        const joined = c.strings.join('');
+        return joined.includes('SET idle_started_at') && joined.includes('idle_started_at IS NULL');
+      });
+      expect(idleSetCall).toBeUndefined();
     });
 
     it('clears idle_started_at when energy reading increases from previous', async () => {
@@ -3874,6 +4278,254 @@ describe('Event projections', () => {
     });
   });
 
+  describe('retry on a lost database connection', () => {
+    // A postgres.js connection error (Errors.connection) or Node socket error.
+    function connectionError(code: string): Error {
+      return Object.assign(new Error(`write ${code} localhost:5433`), { code });
+    }
+
+    // Rejects the next `times` unrouted statements whose text includes `match`.
+    function failNext(match: string, code: string, times = 1): void {
+      let left = times;
+      sqlFailOn = (text) => {
+        if (left > 0 && text.includes(match)) {
+          left--;
+          return connectionError(code);
+        }
+        return null;
+      };
+    }
+
+    function countCalls(fragment: string): number {
+      return sqlCalls.filter((c) => c.strings.join('?').includes(fragment)).length;
+    }
+
+    async function emitAndSettle(eventType: string, event: DomainEvent): Promise<void> {
+      const done = eventBus.emit(eventType, event);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await done;
+    }
+
+    function messageLogEvent(messageId: string): DomainEvent {
+      return makeDomainEvent('ocpp.MessageLog', 'CS-001', {
+        stationId: 'CS-001',
+        stationDbId: 'sta_000000000001',
+        direction: 'inbound',
+        messageType: 2,
+        messageId,
+        action: 'Heartbeat',
+        payload: {},
+      });
+    }
+
+    it('writes a message log whose INSERT timed out connecting, once', async () => {
+      await setup();
+      sqlRoute = (text) => (text.includes('INSERT INTO ocpp_message_logs') ? undefined : []);
+      failNext('INSERT INTO ocpp_message_logs', 'CONNECT_TIMEOUT');
+
+      await emitAndSettle('ocpp.MessageLog', messageLogEvent('msg-1'));
+
+      // The failed attempt and the retry; the retry went on to the liveness bump.
+      expect(countCalls('INSERT INTO ocpp_message_logs')).toBe(2);
+      expect(countCalls('last_heartbeat = now(), is_online = true')).toBe(1);
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('"eventType":"ocpp.message"'),
+      );
+    });
+
+    it('does not insert the message log again when a later statement failed', async () => {
+      await setup();
+      sqlRoute = (text) =>
+        text.includes('last_heartbeat = now(), is_online = true') ? undefined : [];
+      setupSqlResults([], [{ was_online: false }]);
+      failNext('last_heartbeat = now(), is_online = true', 'ECONNRESET');
+
+      await emitAndSettle('ocpp.MessageLog', messageLogEvent('msg-2'));
+
+      expect(countCalls('INSERT INTO ocpp_message_logs')).toBe(1);
+      expect(countCalls('last_heartbeat = now(), is_online = true')).toBe(2);
+      // The station came online: the retry kept the result of its liveness bump.
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('"eventType":"station.status"'),
+      );
+    });
+
+    it('never retries an error that is not a lost connection', async () => {
+      await setup();
+      sqlRoute = (text) => (text.includes('INSERT INTO ocpp_message_logs') ? undefined : []);
+      sqlFailOn = (text) =>
+        text.includes('INSERT INTO ocpp_message_logs')
+          ? Object.assign(new Error('value too long'), { code: '22001' })
+          : null;
+
+      await emitAndSettle('ocpp.MessageLog', messageLogEvent('msg-3'));
+
+      expect(countCalls('INSERT INTO ocpp_message_logs')).toBe(1);
+      expect(countCalls('last_heartbeat')).toBe(0);
+    });
+
+    it('stops when a log INSERT lost its connection mid-statement (it may have committed)', async () => {
+      await setup();
+      sqlRoute = (text) => (text.includes('INSERT INTO connection_logs') ? undefined : []);
+      failNext('INSERT INTO connection_logs', 'CONNECTION_CLOSED', 3);
+
+      await emitAndSettle(
+        'station.Connected',
+        makeDomainEvent('station.Connected', 'CS-001', {
+          ocppProtocol: 'ocpp2.1',
+          stationDbId: 'sta_000000000001',
+        }),
+      );
+
+      expect(countCalls('INSERT INTO connection_logs')).toBe(1);
+      expect(countCalls('SET is_online = true')).toBe(1);
+    });
+
+    it('runs the idempotent steps again and the log INSERTs once', async () => {
+      await setup();
+      sqlRoute = (text) =>
+        text.includes('SELECT site_id FROM charging_stations') ? undefined : [];
+      setupSqlResults([], [{ site_id: null }]);
+      failNext('SELECT site_id FROM charging_stations', 'CONNECT_TIMEOUT');
+
+      await emitAndSettle(
+        'station.Connected',
+        makeDomainEvent('station.Connected', 'CS-001', {
+          ocppProtocol: 'ocpp2.1',
+          stationDbId: 'sta_000000000001',
+        }),
+      );
+
+      expect(countCalls('SET is_online = true')).toBe(2);
+      expect(countCalls('INSERT INTO connection_logs')).toBe(1);
+      expect(countCalls('INSERT INTO port_status_log')).toBe(1);
+      expect(countCalls('SELECT site_id FROM charging_stations')).toBe(2);
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('"eventType":"station.status"'),
+      );
+    });
+
+    it('gives up after three attempts', async () => {
+      await setup();
+      sqlRoute = (text) =>
+        text.includes('SET last_heartbeat = now(), updated_at') ? undefined : [];
+      failNext('SET last_heartbeat = now(), updated_at', 'CONNECT_TIMEOUT', 10);
+
+      await emitAndSettle(
+        'ocpp.Heartbeat',
+        makeDomainEvent('ocpp.Heartbeat', 'CS-001', { stationDbId: 'sta_000000000001' }),
+      );
+
+      expect(countCalls('SET last_heartbeat = now(), updated_at')).toBe(3);
+    });
+
+    it('does not retry a projection that is not marked retryable', async () => {
+      await setup();
+      sqlRoute = (text) => (text.includes('display_messages') ? undefined : [{ id: 'sta_1' }]);
+      failNext('display_messages', 'CONNECT_TIMEOUT', 10);
+
+      await emitAndSettle(
+        'ocpp.NotifyDisplayMessages',
+        makeDomainEvent('ocpp.NotifyDisplayMessages', 'CS-001', {
+          requestId: 1,
+          messageInfo: [
+            {
+              id: 1,
+              priority: 'AlwaysFront',
+              message: { content: 'Hello', format: 'UTF8', language: 'en' },
+            },
+          ],
+        }),
+      );
+
+      expect(countCalls('display_messages')).toBe(1);
+    });
+
+    describe('ocpp.StatusNotification', () => {
+      const CONNECTOR_WRITE = 'SELECT id, status FROM connectors';
+
+      function routeStatusNotification(): void {
+        sqlRoute = (text) => {
+          if (text.includes(CONNECTOR_WRITE)) return undefined;
+          if (text.includes('SELECT site_id FROM charging_stations')) return undefined;
+          if (text.includes('SELECT id FROM charging_stations WHERE station_id')) {
+            return [{ id: 'sta_000000000001' }];
+          }
+          if (text.includes('SELECT id FROM evses')) return [{ id: 'evs_1' }];
+          if (text.includes('SELECT ocpp_protocol')) return [{ ocpp_protocol: 'ocpp2.1' }];
+          return [];
+        };
+      }
+
+      function statusEvent(connectorStatus: string, timestamp: string): DomainEvent {
+        return makeDomainEvent('ocpp.StatusNotification', 'CS-001', {
+          evseId: 1,
+          connectorId: 1,
+          connectorStatus,
+          timestamp,
+        });
+      }
+
+      // The statuses each connector write set, in the order they ran.
+      function connectorWrites(): unknown[] {
+        return sqlCalls
+          .filter((c) => c.strings.join('?').includes(CONNECTOR_WRITE))
+          .map((c) => c.values[2]);
+      }
+
+      it('keeps the order of a station lane: a retried report is written before the next one', async () => {
+        await setup();
+        routeStatusNotification();
+        // Unrouted, in order: connector write (fails), site id, connector write
+        // (retry), site id, then the second report's connector write and site id.
+        setupSqlResults(
+          [],
+          [{ previous_status: 'available', applied: true }],
+          [{ site_id: null }],
+          [{ previous_status: 'occupied', applied: true }],
+          [{ site_id: null }],
+        );
+        failNext(CONNECTOR_WRITE, 'CONNECT_TIMEOUT');
+
+        const first = eventBus.emit(
+          'ocpp.StatusNotification',
+          statusEvent('Occupied', '2026-10-05T10:00:00Z'),
+        );
+        const second = eventBus.emit(
+          'ocpp.StatusNotification',
+          statusEvent('Available', '2026-10-05T10:00:01Z'),
+        );
+        await vi.advanceTimersByTimeAsync(10_000);
+        await Promise.all([first, second]);
+
+        expect(connectorWrites()).toEqual(['occupied', 'occupied', 'available']);
+      });
+
+      it('keeps the first status write and its transition when a later step failed', async () => {
+        await setup();
+        routeStatusNotification();
+        // Connector write, site id (fails), site id (retry).
+        setupSqlResults([{ previous_status: 'available', applied: true }], [], [{ site_id: null }]);
+        failNext('SELECT site_id FROM charging_stations', 'CONNECT_TIMEOUT');
+
+        await emitAndSettle(
+          'ocpp.StatusNotification',
+          statusEvent('Occupied', '2026-10-05T10:00:00Z'),
+        );
+
+        expect(connectorWrites()).toEqual(['occupied']);
+        // The station screen refresh follows the real transition, once.
+        const refreshes = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c: unknown[]) => c[0] === 'station_message_refresh',
+        );
+        expect(refreshes).toHaveLength(1);
+      });
+    });
+  });
+
   describe('ocpp.NotifyDisplayMessages', () => {
     it('upserts display messages', async () => {
       await setup();
@@ -3937,27 +4589,19 @@ describe('Event projections', () => {
   });
 
   describe('Notification dispatch loop', () => {
-    it('registers subscribers for all notifiable events', async () => {
+    it('dispatches a notification for every event in the shared OCPP event list', async () => {
       await setup();
 
-      const notifiableEvents = [
-        'station.Connected',
-        'station.Disconnected',
-        'ocpp.Authorize',
-        'ocpp.BootNotification',
-        'ocpp.DataTransfer',
-        'ocpp.FirmwareStatusNotification',
-        'ocpp.Heartbeat',
-        'ocpp.MeterValues',
-        'ocpp.SecurityEventNotification',
-        'ocpp.StatusNotification',
-        'ocpp.TransactionEvent',
-      ];
-
-      for (const eventType of notifiableEvents) {
-        const handlers = eventBus.subscribers.get(eventType);
-        expect(handlers, `Missing subscriber for ${eventType}`).toBeDefined();
-        expect(handlers!.length).toBeGreaterThanOrEqual(1);
+      for (const eventType of OCPP_NOTIFICATION_EVENT_TYPES) {
+        mockDispatchOcpp.mockClear();
+        setupSqlResults();
+        await eventBus.emit(eventType, makeDomainEvent(eventType, 'CS-001', {}));
+        expect(
+          mockDispatchOcpp.mock.calls.filter(
+            (call) => (call[1] as DomainEvent).eventType === eventType,
+          ),
+          `${eventType} is not dispatched`,
+        ).toHaveLength(1);
       }
     });
   });
@@ -4090,7 +4734,7 @@ describe('Event projections', () => {
     });
   });
 
-  describe('transactionId used by another station (N4 step 1)', () => {
+  describe('transactionId another station already used (N4)', () => {
     function uniqueViolation(constraint: string): Error {
       return Object.assign(new Error('duplicate key value violates unique constraint'), {
         code: '23505',
@@ -4109,60 +4753,101 @@ describe('Event projections', () => {
       });
     }
 
-    it('stops the Started projection when the global unique index holds the id', async () => {
+    it('records the Started session keyed by station and transactionId', async () => {
       await setup();
-      sqlFailOn = (text) =>
-        text.includes('INSERT INTO charging_sessions')
-          ? uniqueViolation('charging_sessions_transaction_id_unique')
-          : null;
       setupSqlResults(
         [{ id: 'sta_000000000002' }], // resolveStationUuid
-        [], // INSERT (rejected)
-        [{ station_id: 'CS-001' }], // the station that holds the id
+        [{ id: 'ses_000000000002' }], // INSERT ... RETURNING id
       );
 
       await eventBus.emit('ocpp.TransactionEvent', startedFrom('CS-002'));
 
       const texts = sqlCalls.map((c) => c.strings.join(''));
-      expect(texts).toHaveLength(3);
-      expect(texts[1]).toContain('INSERT INTO charging_sessions');
-      expect(texts[2]).toContain('cs.station_id !=');
-      expect(sqlCalls[2]!.values).toEqual(['tx-shared', 'sta_000000000002']);
-      // Nothing touches another session: no stale-session fault, no event row.
-      expect(texts.some((t) => t.includes("stopped_reason = 'StaleSession'"))).toBe(false);
-      expect(texts.some((t) => t.includes('INSERT INTO transaction_events'))).toBe(false);
+      const insertIdx = texts.findIndex((t) => t.includes('INSERT INTO charging_sessions'));
+      expect(insertIdx).toBe(1);
+      expect(texts[insertIdx]).toContain('ON CONFLICT (station_id, transaction_id)');
+      expect(sqlCalls[insertIdx]!.values).toContain('sta_000000000002');
+      expect(sqlCalls[insertIdx]!.values).toContain('tx-shared');
+      // The projection goes on with the new session: the stale-session check
+      // on its EVSE runs, and nothing looks for another station's session.
+      expect(texts.some((t) => t.includes('AND id != '))).toBe(true);
+      expect(texts.some((t) => t.includes('cs.station_id !='))).toBe(false);
     });
 
-    it('stops a remote-start link that would take the id of another station', async () => {
+    it('links a remote start only within its own station', async () => {
       await setup();
-      sqlFailOn = (text) =>
-        text.includes('UPDATE charging_sessions cs')
-          ? uniqueViolation('charging_sessions_transaction_id_unique')
-          : null;
       setupSqlResults(
         [{ id: 'sta_000000000002' }], // resolveStationUuid
-        [], // remote-start link (rejected)
-        [{ station_id: 'CS-001' }], // the station that holds the id
+        [{ id: 'ses_000000000002' }], // remote-start link
       );
 
       await eventBus.emit('ocpp.TransactionEvent', startedFrom('CS-002', 'RemoteStart'));
 
       const texts = sqlCalls.map((c) => c.strings.join(''));
-      expect(texts).toHaveLength(3);
+      expect(texts[1]).toContain('UPDATE charging_sessions cs');
+      expect(texts[1]).toContain('WHERE pending.station_id = ');
+      expect(sqlCalls[1]!.values[0]).toBe('sta_000000000002');
       expect(texts.some((t) => t.includes('INSERT INTO charging_sessions'))).toBe(false);
     });
 
-    it('does not treat another unique violation as a foreign transactionId', async () => {
+    it('links only a waiting remote start, and only for a transactionId new on the station', async () => {
+      await setup();
+      setupSqlResults(
+        [{ id: 'sta_000000000002' }], // resolveStationUuid
+        [{ id: 'ses_000000000002' }], // remote-start link
+      );
+
+      await eventBus.emit('ocpp.TransactionEvent', startedFrom('CS-002', 'RemoteStart'));
+
+      const link = sqlCalls[1]!;
+      const text = link.strings.join('?');
+      // A session that already has its transaction (a transaction_events row) is never moved.
+      expect(text).toContain(
+        'NOT EXISTS (\n                SELECT 1 FROM transaction_events te WHERE te.session_id = pending.id',
+      );
+      // A transactionId the station already holds links nothing.
+      expect(text).toContain('holder.station_id = ?');
+      expect(text).toContain('holder.transaction_id = ?');
+      expect(link.values.slice(0, 3)).toEqual([
+        'sta_000000000002',
+        'sta_000000000002',
+        'tx-shared',
+      ]);
+    });
+
+    it('records a repeated remote-start Started on the session holding its transactionId', async () => {
+      await setup();
+      setupSqlResults(
+        [{ id: 'sta_000000000002' }], // resolveStationUuid
+        [], // remote-start link: the station already holds tx-shared
+        [{ id: 'ses_000000000002' }], // INSERT ... ON CONFLICT returns the holder
+      );
+
+      await eventBus.emit('ocpp.TransactionEvent', startedFrom('CS-002', 'RemoteStart'));
+
+      const texts = sqlCalls.map((c) => c.strings.join(''));
+      expect(texts[1]).toContain('UPDATE charging_sessions cs');
+      expect(texts[2]).toContain('INSERT INTO charging_sessions');
+      expect(texts[2]).toContain('ON CONFLICT (station_id, transaction_id)');
+      // No other statement writes a transactionId: no other pending session is claimed.
+      expect(texts.filter((t) => t.includes('SET transaction_id'))).toHaveLength(1);
+      // The projection goes on with the holder.
+      const staleIdx = texts.findIndex((t) => t.includes('AND id != '));
+      expect(staleIdx).toBeGreaterThan(2);
+      expect(sqlCalls[staleIdx]!.values).toContain('ses_000000000002');
+    });
+
+    it('lets a unique violation on the Started insert reach safeSubscribe', async () => {
       await setup();
       sqlFailOn = (text) =>
         text.includes('INSERT INTO charging_sessions')
-          ? uniqueViolation('some_other_unique')
+          ? uniqueViolation('uq_charging_sessions_station_transaction')
           : null;
       setupSqlResults([{ id: 'sta_000000000002' }]);
 
       await eventBus.emit('ocpp.TransactionEvent', startedFrom('CS-002'));
 
-      // The error propagates to safeSubscribe: no holder lookup.
+      // No holder lookup and no further statement after the failed insert.
       const texts = sqlCalls.map((c) => c.strings.join(''));
       expect(texts).toHaveLength(2);
     });
@@ -4274,10 +4959,12 @@ describe('Event projections', () => {
     it('buffers TransactionEvent Ended when session not found', async () => {
       await setup();
 
-      // SQL calls: resolveStationUuid, SELECT payment_records, UPDATE status=completed, SELECT session (returns empty)
+      // SQL calls: resolveStationUuid, SELECT payment_records, SELECT open idle period,
+      // UPDATE status=completed, SELECT session (returns empty)
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status=completed
         [], // SELECT session (no rows)
       );
@@ -4305,15 +4992,73 @@ describe('Event projections', () => {
       expect(mockPriceSessionAt).not.toHaveBeenCalled();
 
       // Every Ended statement that names the transaction also names the station
-      // (the projection by its id, the settlement subscriber by its OCPP id).
+      // (the projection by its id, the settlement subscriber by its OCPP id,
+      // the resend check by its id).
       const byTransaction = sqlCalls.filter((c) => c.values.includes('tx-ooo-3'));
-      expect(byTransaction).toHaveLength(4);
+      expect(byTransaction).toHaveLength(6);
       for (const call of byTransaction) {
         expect(call.strings.join('')).toContain('station_id');
         expect(call.values.includes('sta_000000000001') || call.values.includes('CS-001')).toBe(
           true,
         );
       }
+    });
+
+    it('notifies an idle period due at the end before the Ended UPDATE folds it (JB-2)', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationUuid
+        [], // SELECT payment_records (no failed payment)
+        [{ id: 'session-1' }], // SELECT the active session with an open idle period
+        [
+          {
+            driver_id: 'drv-1',
+            idle_started_at: '2024-01-01T00:58:00Z',
+            idle_fee_price_per_minute: '0.10',
+            tax_rate: null,
+            price_display: null,
+            currency: 'USD',
+            site_name: 'Test Site',
+          },
+        ], // dispatchDueIdlingNotification: the claim (period open for 2 min)
+        [], // UPDATE charging_sessions SET status=completed (folds the period)
+        [], // SELECT session (no rows)
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+          eventType: 'Ended',
+          stationId: 'CS-001',
+          transactionId: 'tx-idle-end',
+          seqNo: 2,
+          triggerReason: 'EVDeparted',
+          timestamp: '2024-01-01T01:00:00Z',
+          stoppedReason: 'Local',
+        }),
+      );
+
+      const texts = sqlCalls.map((c) => c.strings.join('?'));
+      const openPeriod = texts.findIndex(
+        (t) =>
+          t.includes("status = 'active' AND idle_started_at IS NOT NULL") &&
+          t.includes('SELECT id'),
+      );
+      const claim = texts.findIndex((t) => t.includes('WITH claimed AS'));
+      const endUpdate = texts.findIndex((t) => t.includes('ended_at = ?'));
+      expect(openPeriod).toBeGreaterThan(-1);
+      expect(claim).toBeGreaterThan(openPeriod);
+      expect(endUpdate).toBeGreaterThan(claim);
+      expect(sqlCalls[claim]?.values).toContain('2024-01-01T01:00:00Z');
+      expect(mockDispatchDriver).toHaveBeenCalledWith(
+        expect.anything(),
+        'session.IdlingStarted',
+        'drv-1',
+        expect.objectContaining({ transactionId: 'tx-idle-end', stationId: 'CS-001' }),
+        ['/mock/templates'],
+        expect.anything(),
+      );
     });
   });
 });

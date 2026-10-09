@@ -136,7 +136,6 @@ function mockGets(
         id: 1,
         siteId: 'sit_1',
         payoutAccountId: 'acct_site_1',
-        stripeConnectedAccountId: 'acct_site_1',
         preAuthAmountCents: 5000,
         platformFeePercent: null,
         isEnabled: true,
@@ -229,6 +228,21 @@ describe('PaymentSettings Stripe tab', () => {
     expect(await screen.findByText('settings.webhookScopes.connect')).toBeTruthy();
     expect(screen.getByText('account.updated')).toBeTruthy();
     expect(screen.queryByTestId('other-webhook-endpoints')).toBeNull();
+  });
+
+  it('does not query the webhook setup before the Stripe secret key is configured', async () => {
+    // A fresh install: the API would answer 400 PAYMENT_PROVIDER_NOT_CONFIGURED.
+    stripeSettings = {
+      ...STRIPE_SETTINGS_WITH_SECRETS,
+      secretKey: null,
+      secretKeyConfigured: false,
+    };
+    mockGets();
+    renderSettings();
+    expect(await screen.findByText('settings.stripeWebhookNotConfigured')).toBeTruthy();
+    expect(getMock.mock.calls.some(([url]) => String(url).startsWith(WEBHOOK_GET_PREFIX))).toBe(
+      false,
+    );
   });
 
   it("lists other EVtivity deployments' endpoints apart", async () => {

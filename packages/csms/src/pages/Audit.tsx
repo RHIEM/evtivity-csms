@@ -54,6 +54,8 @@ const ENTITY_TYPES = [
   'holiday',
   'pricing_assignment',
   'maintenance_event',
+  'session',
+  'invoice',
 ] as const;
 
 const ACTORS = ['operator', 'driver', 'api_key', 'system', 'ocpp'] as const;
@@ -89,9 +91,13 @@ const ACTIONS = [
   'fleet_assignment_changed',
   'free_vend_toggled',
   'imported',
+  'invoice_credited',
+  'invoice_generated',
   'location_published_changed',
   'login_failed',
   'login_succeeded',
+  'manual_billing',
+  'marked_paid',
   'member_added',
   'member_removed',
   'message_added',
@@ -107,6 +113,7 @@ const ACTIONS = [
   'priority_changed',
   'pulled',
   'pushed',
+  'rebilled',
   'refund_issued',
   'registered',
   'reservations_cancelled',
@@ -134,6 +141,7 @@ const ACTIONS = [
   'updated',
   'uploaded',
   'used',
+  'voided',
 ] as const;
 
 function formatTimestamp(iso: string, timezone: string): string {

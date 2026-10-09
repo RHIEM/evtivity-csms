@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { eq } from 'drizzle-orm';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { db, client, users, roles, isSupportEnabled } from '@evtivity/database';
-import { dispatchSystemNotification } from '@evtivity/lib';
+import { createLogger, dispatchSystemNotification } from '@evtivity/lib';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 
-const currentDir = dirname(fileURLToPath(import.meta.url));
-const TEMPLATES_DIR = resolve(currentDir, '..', 'templates');
+const logger = createLogger('support-notification');
 
 async function resolveOperatorRecipient(
   assignedTo: string | null,
@@ -74,9 +72,12 @@ export async function dispatchOperatorNotification(
         subject,
         type,
       },
-      TEMPLATES_DIR,
+      ALL_TEMPLATES_DIRS,
     );
-  } catch {
-    // Non-critical: do not block the request
+  } catch (err) {
+    logger.warn(
+      { err, caseId, type },
+      'Support case operator notification failed, the request continues',
+    );
   }
 }

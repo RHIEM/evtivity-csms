@@ -17,7 +17,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, client } from './config.js';
-import { sql, eq, and, isNotNull, isNull } from 'drizzle-orm';
+import { sql, eq, and, inArray, isNotNull, isNull } from 'drizzle-orm';
 import { createId } from './lib/id.js';
 import { getCompanyCurrency, clearSystemSettingsCache } from './lib/system-settings.js';
 import {
@@ -92,12 +92,12 @@ import {
   invoiceLineItems,
 } from './schema/index.js';
 import { acceptPendingFixtureStations } from './lib/fixture-stations.js';
+import { REBILL_DEMO_METHOD_ID } from './seed-demo-cards.js';
 import argon2 from 'argon2';
 import {
   encryptString,
   calculateCo2AvoidedKg,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
+  permissionCatalog,
   STATION_MESSAGE_DEFAULTS,
   STATION_MESSAGE_LANGUAGES,
   DEFAULT_STATION_MESSAGE_LANGUAGE,
@@ -108,6 +108,7 @@ import {
   splitGrossByTaxRate,
   taxTotals,
   chargedCostBreakdown,
+  LOAD_ALLOCATION_STRATEGIES,
 } from '@evtivity/lib';
 import type { SessionCostBreakdown } from '@evtivity/lib';
 
@@ -394,6 +395,8 @@ function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)] as T;
 }
 
+const DEMO_ACTIVE_SESSION_COUNT = 20;
+
 function at<T>(arr: T[], index: number): T {
   return arr[index % arr.length] as T;
 }
@@ -588,6 +591,9 @@ async function seed(): Promise<void> {
     'sustainability.gasolineEmissionFactor': '8.887',
     'sustainability.avgMpg': '25.4',
     'idling.gracePeriodMinutes': 30,
+    'prepaid.lowCreditThresholdCents': 500,
+    'invoice.paymentTermsDays': 30,
+    'fleet.invoiceRunDay': 1,
     'session.staleTimeoutHours': 24,
     // Connection timeout (s) assumed for a station that has not reported its own,
     // when the CSMS closes a remote start the driver never plugged in for.
@@ -644,6 +650,7 @@ async function seed(): Promise<void> {
     'reservation.maxHours': 3,
     'reservation.activeSessionCheckHours': 3,
     'fleet.enabled': true,
+    'fleet.creditReservationCents': 5000,
     'support.enabled': true,
     'guest.enabled': true,
     'ocpp.commandRetryMaxAttempts': 3,
@@ -863,7 +870,7 @@ async function seed(): Promise<void> {
     const passwordHash = await argon2.hash(initialAdminPassword);
 
     const adminRoleId = await ensureRole('admin', 'Full system access', ['*']);
-    await ensureRole('operator', 'Operational access', OPERATOR_DEFAULT_PERMISSIONS);
+    await ensureRole('operator', 'Operational access', permissionCatalog.defaultsFor('operator'));
     console.log('  2 roles ensured.');
 
     // An existing admin keeps its password: a rerun must never reset it.
@@ -877,7 +884,7 @@ async function seed(): Promise<void> {
     });
     console.log(`  Admin user ensured (${initialAdminEmail}).`);
 
-    const permRows = ADMIN_DEFAULT_PERMISSIONS.map((perm) => ({
+    const permRows = permissionCatalog.defaultsFor('admin').map((perm) => ({
       userId: adminUserId,
       permission: perm,
     }));
@@ -1115,7 +1122,6 @@ async function seed(): Promise<void> {
   }
 
   // ------ Site Power Limits (first 8 sites) ------
-  const strategies: Array<'equal_share' | 'priority_based'> = ['equal_share', 'priority_based'];
   const powerLimitRows = createdSites.slice(0, 8).map((site, i) => {
     // Count stations assigned to this site
     const stationCount = stationRows.filter((s) => s.siteId === site.id).length;
@@ -1126,7 +1132,7 @@ async function seed(): Promise<void> {
       siteId: site.id,
       maxPowerKw: String(maxPowerKw),
       safetyMarginKw: String(randomInt(5, 15)),
-      strategy: strategies[i % 2] as 'equal_share' | 'priority_based',
+      strategy: LOAD_ALLOCATION_STRATEGIES[i % LOAD_ALLOCATION_STRATEGIES.length] ?? 'equal_share',
       isEnabled: i < 5,
     };
   });
@@ -1138,7 +1144,7 @@ async function seed(): Promise<void> {
   // ------ Site Load Management (hierarchical model, mirrors sitePowerLimits) ------
   const loadMgmtRows = createdSites.slice(0, 8).map((site, i) => ({
     siteId: site.id,
-    strategy: strategies[i % 2] as 'equal_share' | 'priority_based',
+    strategy: LOAD_ALLOCATION_STRATEGIES[i % LOAD_ALLOCATION_STRATEGIES.length] ?? 'equal_share',
     isEnabled: i < 5,
   }));
   await db.insert(siteLoadManagement).values(loadMgmtRows);
@@ -1461,8 +1467,7 @@ async function seed(): Promise<void> {
 
   const permRows: { userId: string; permission: string }[] = [];
   for (const u of createdUsers) {
-    const defaults =
-      u.roleId === adminRoleId ? ADMIN_DEFAULT_PERMISSIONS : OPERATOR_DEFAULT_PERMISSIONS;
+    const defaults = permissionCatalog.defaultsFor(u.roleId === adminRoleId ? 'admin' : 'operator');
     for (const perm of defaults) {
       permRows.push({ userId: u.id, permission: perm });
     }
@@ -1575,14 +1580,11 @@ async function seed(): Promise<void> {
 
   // ------ Driver Payment Methods (all drivers) ------
   const cardBrands = ['visa', 'mastercard', 'amex'];
-  // Both forms of the ids until P8 drops the stripe_* columns.
   const paymentMethodRows = createdDrivers.map((driver, i) => ({
     driverId: driver.id,
-    stripeCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
-    stripePaymentMethodId: `pm_sim_${padNum(i + 1, 6)}`,
     provider: 'simulated',
     providerCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
-    providerPaymentMethodId: `pm_sim_${padNum(i + 1, 6)}`,
+    providerPaymentMethodId: i === 0 ? REBILL_DEMO_METHOD_ID : `pm_sim_${padNum(i + 1, 6)}`,
     cardBrand: cardBrands[i % cardBrands.length] ?? 'visa',
     cardLast4: '4242',
     isDefault: true,
@@ -1746,8 +1748,8 @@ async function seed(): Promise<void> {
   });
   console.log('  VIP pricing group assigned to driver@evtivity.local.');
 
-  // ------ Charging Sessions (10000) ------
-  const sessionStatuses: Array<'active' | 'completed' | 'faulted'> = [
+  // ------ Charging Sessions (10000 ended, plus a few active) ------
+  const sessionStatuses: Array<'completed' | 'faulted'> = [
     'completed',
     'completed',
     'completed',
@@ -1756,8 +1758,29 @@ async function seed(): Promise<void> {
     'completed',
     'completed',
     'completed',
-    'active',
+    'completed',
     'faulted',
+  ];
+  // Active sessions go only on security profile 3 stations: their simulators are disabled,
+  // so a seeded session never holds an EVSE that a simulator or a portal driver starts on.
+  const activeSessionStationIdxs = stationRows
+    .flatMap((s, idx) => (s.securityProfile === 3 ? [idx] : []))
+    .slice(0, DEMO_ACTIVE_SESSION_COUNT);
+  const sessionPlans: Array<{
+    status: 'active' | 'completed' | 'faulted';
+    stationIdx: number;
+    startedAt: Date;
+  }> = [
+    ...Array.from({ length: 10000 }, (_, i) => ({
+      status: pick(sessionStatuses),
+      stationIdx: i % createdStations.length,
+      startedAt: randomDate(90),
+    })),
+    ...activeSessionStationIdxs.map((stationIdx) => ({
+      status: 'active' as const,
+      stationIdx,
+      startedAt: new Date(Date.now() - randomInt(5, 60) * 60 * 1000),
+    })),
   ];
   const stopReasons = [
     'EVDisconnected',
@@ -1790,15 +1813,13 @@ async function seed(): Promise<void> {
     electricityCostCents: number | null;
   }> = [];
 
-  for (let i = 0; i < 10000; i++) {
-    const status = pick(sessionStatuses);
-    const stationIdx = i % createdStations.length;
+  for (let i = 0; i < sessionPlans.length; i++) {
+    const { status, stationIdx, startedAt } = at(sessionPlans, i);
     const stationEvses = createdEvses.filter(
       (e) => e.stationId === at(createdStations, stationIdx).id,
     );
     const evse = stationEvses.length > 0 ? pick(stationEvses) : at(createdEvses, i);
     const driver = pick(createdDrivers);
-    const startedAt = randomDate(90);
     const durationMinutes = randomInt(5, 240);
     const endedAt =
       status !== 'active' ? new Date(startedAt.getTime() + durationMinutes * 60 * 1000) : null;
@@ -1881,8 +1902,6 @@ async function seed(): Promise<void> {
         return {
           sessionId: session.id,
           driverId,
-          stripePaymentIntentId: intentId,
-          stripeCustomerId: customerId,
           provider: 'simulated',
           providerPaymentId: intentId,
           providerCustomerId: customerId,
@@ -1900,8 +1919,6 @@ async function seed(): Promise<void> {
         return {
           sessionId: session.id,
           driverId,
-          stripePaymentIntentId: intentId,
-          stripeCustomerId: customerId,
           provider: 'simulated',
           providerPaymentId: intentId,
           providerCustomerId: customerId,
@@ -2435,8 +2452,8 @@ async function seed(): Promise<void> {
   let caCertPem: string;
   try {
     caCertPem = readFileSync(resolve(testCertsDir, 'ca.pem'), 'utf-8');
-  } catch {
-    console.log('  Skipping SP3 cert seeding: test-certs/ca.pem not found.');
+  } catch (err) {
+    console.log(`  Skipping SP3 cert seeding: cannot read test-certs/ca.pem (${String(err)}).`);
     caCertPem = '';
   }
 
@@ -2458,7 +2475,10 @@ async function seed(): Promise<void> {
     let clientCertPem: string;
     try {
       clientCertPem = readFileSync(resolve(testCertsDir, 'client.pem'), 'utf-8');
-    } catch {
+    } catch (err) {
+      console.log(
+        `  Skipping SP3 station certificates: cannot read test-certs/client.pem (${String(err)}).`,
+      );
       clientCertPem = '';
     }
 
@@ -2564,8 +2584,6 @@ async function seed(): Promise<void> {
   const portalPaymentRows = portalCreatedSessions.map((session, i) => ({
     sessionId: session.id,
     driverId: portalDriverId,
-    stripePaymentIntentId: `pi_portal_${padNum(i + 1, 4)}`,
-    stripeCustomerId: 'cus_U443UCZOsb72EL',
     provider: 'stripe',
     providerPaymentId: `pi_portal_${padNum(i + 1, 4)}`,
     providerCustomerId: 'cus_U443UCZOsb72EL',
@@ -2581,8 +2599,6 @@ async function seed(): Promise<void> {
   // Portal driver payment method
   await db.insert(driverPaymentMethods).values({
     driverId: portalDriverId,
-    stripeCustomerId: 'cus_U443UCZOsb72EL',
-    stripePaymentMethodId: 'pm_portal_test',
     provider: 'stripe',
     providerCustomerId: 'cus_U443UCZOsb72EL',
     providerPaymentMethodId: 'pm_portal_test',
@@ -2599,6 +2615,64 @@ async function seed(): Promise<void> {
     })
     .onConflictDoNothing();
   console.log('  Portal test driver payment method created.');
+
+  // ------ Re-bill sessions (session detail Billing card) ------
+  // One session the CSMS gave up ending (an operator can bill it) and one left
+  // to manual billing after a declined re-bill, for the first demo driver
+  // (simulated saved card REBILL_DEMO_METHOD_ID, always approved) on the first
+  // demo station.
+  const [rebillTariff] = await db
+    .select({
+      id: tariffs.id,
+      pricePerKwh: tariffs.pricePerKwh,
+      pricePerMinute: tariffs.pricePerMinute,
+      pricePerSession: tariffs.pricePerSession,
+      idleFeePricePerMinute: tariffs.idleFeePricePerMinute,
+      reservationFeePerMinute: tariffs.reservationFeePerMinute,
+      taxRate: tariffs.taxRate,
+    })
+    .from(tariffs)
+    .where(isNotNull(tariffs.pricePerKwh))
+    .orderBy(tariffs.name)
+    .limit(1);
+  const rebillStation = at(createdStations, 0);
+  const rebillEvse = createdEvses.find((e) => e.stationId === rebillStation.id);
+  if (rebillTariff != null && rebillEvse != null) {
+    const [rebillActor] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, initialAdminEmail));
+    const { seedRebillSessions } = await import('./seed-rebill-sessions.js');
+    const rebillSessionIds = await seedRebillSessions(client, {
+      stationId: rebillStation.id,
+      evseId: rebillEvse.id,
+      driverId: at(createdDrivers, 0).id,
+      customerId: `cus_sim_${padNum(1, 6)}`,
+      methodId: REBILL_DEMO_METHOD_ID,
+      currency: companyCurrency,
+      tariff: rebillTariff,
+      actorUserId: rebillActor?.id ?? null,
+      now: seedNow,
+    });
+    console.log(`  ${String(rebillSessionIds.length)} re-bill sessions created.`);
+  }
+
+  // ------ Fleet account billing (charge on account) ------
+  // One fleet billed on account with a billing profile and a credit limit, its
+  // unbilled sessions this month, last month's issued fleet invoice, and a
+  // credited earlier invoice with its credit note (seed-fleet-billing.ts).
+  {
+    const accountStation = at(createdStations, 0);
+    const accountEvse = createdEvses.find((e) => e.stationId === accountStation.id);
+    const { seedFleetBillingDemo } = await import('./seed-fleet-billing.js');
+    const accountSessions = await seedFleetBillingDemo(client, {
+      stationId: accountStation.id,
+      evseId: accountEvse?.id ?? null,
+      currency: companyCurrency,
+      now: seedNow,
+    });
+    console.log(`  Fleet billing demo created (${String(accountSessions)} account sessions).`);
+  }
 
   // Portal driver support cases (the portal Support page should show data)
   const portalCaseRows = [
@@ -2687,7 +2761,7 @@ async function seed(): Promise<void> {
 
   // Invoices for the portal test driver (the driver detail Invoices tab and
   // the invoice detail page should show data). Numbers use a 9xxx suffix so
-  // they never collide with app-generated invoice_number_seq values.
+  // they never collide with numbers from invoice_number_counters.
   const invoiceMonth = (offset: number): string => {
     const d = new Date(Date.UTC(curYear, curMonth - offset, 1));
     return `${String(d.getUTCFullYear())}${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
@@ -2719,6 +2793,7 @@ async function seed(): Promise<void> {
         status: 'paid' as const,
         issuedAt: new Date(Date.UTC(curYear, curMonth - 1, 1)),
         dueAt: new Date(Date.UTC(curYear, curMonth - 1, 1) + 30 * 86400000),
+        paidAt: new Date(Date.UTC(curYear, curMonth - 1, 1)),
         currency: companyCurrency,
         subtotalCents: 3185,
         taxCents: 255,
@@ -2743,6 +2818,19 @@ async function seed(): Promise<void> {
         };
       }),
     );
+    // Claim the billed sessions, as the invoice service does.
+    await db
+      .update(chargingSessions)
+      .set({ invoiceId: issuedInvoice.id })
+      .where(
+        and(
+          inArray(
+            chargingSessions.id,
+            invoiceSessions.map((session) => session.id),
+          ),
+          isNull(chargingSessions.invoiceId),
+        ),
+      );
   }
   console.log('  Portal test driver invoices created.');
 

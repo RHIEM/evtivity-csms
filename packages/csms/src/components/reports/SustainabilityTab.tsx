@@ -54,7 +54,7 @@ interface SiteOption {
 }
 
 export function SustainabilityTab(): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
 
   const today = new Date();
@@ -120,9 +120,12 @@ export function SustainabilityTab(): React.JSX.Element {
           formatter: (val: number) => `${formatNumber(val, 1)} kg`,
         },
       },
+      dataLabels: {
+        formatter: (val: number) => formatNumber(val, 1),
+      },
       colors: [CHART_COLORS.success],
     }),
-    [isDark, report?.monthlySummary],
+    [isDark, report?.monthlySummary, i18n.language],
   );
 
   const chartSeries = useMemo(
@@ -161,7 +164,7 @@ export function SustainabilityTab(): React.JSX.Element {
         <CardContent className="flex flex-wrap items-center gap-2 pt-6">
           <input
             type="date"
-            aria-label="Start date"
+            aria-label={t('common.startDate')}
             value={fromDate}
             onChange={(e) => {
               setFromDate(e.target.value);
@@ -172,7 +175,7 @@ export function SustainabilityTab(): React.JSX.Element {
           <span className="text-sm text-muted-foreground">to</span>
           <input
             type="date"
-            aria-label="End date"
+            aria-label={t('common.endDate')}
             value={toDate}
             onChange={(e) => {
               setToDate(e.target.value);

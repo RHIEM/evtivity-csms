@@ -8,10 +8,17 @@ import { eq, and, or, ilike, desc, asc, sql, gte, gt, isNull, count, inArray } f
 import {
   db,
   client,
+  availableEvseCountSql,
+  evseAvailableSql,
+  evseOpenToDriversSql,
+  STARTABLE_CONNECTOR_STATUSES,
   getCompanyCurrency,
   getCompanyTaxBasis,
   isStationLevelUnavailable,
   isStationChargingFree,
+  resolveAccountBilling,
+  sessionBillingColumns,
+  checkFleetCreditLimit,
   resolveStationTariff,
 } from '@evtivity/database';
 import { decryptString, notificationMoney, publishOcppCommand, TAX_BASES } from '@evtivity/lib';
@@ -37,12 +44,7 @@ import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { ID_PARAMS } from '../../lib/id-validation.js';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { scheduleRemoteStartTimeout } from '../../lib/remote-start-timeout.js';
-import {
-  errorResponse,
-  itemResponse,
-  arrayResponse,
-  errorWith,
-} from '../../lib/response-schemas.js';
+import { itemResponse, arrayResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { getS3Config, generateDownloadUrl } from '../../services/s3.service.js';
 import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
@@ -55,17 +57,35 @@ import {
 } from '@evtivity/services/maintenance-check';
 import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
 import { renderMaintenanceMessage } from '@evtivity/lib';
+import type { ServiceLogger } from '@evtivity/lib';
 import {
   isStationCheckRateLimited,
   getCachedConnectorStatus,
   setCachedConnectorStatus,
 } from '../../lib/rate-limiters.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
-import { authorizeSessionHold, cancelOpenSessionHold } from '@evtivity/payments';
+import {
+  authorizeSessionHold,
+  cancelOpenSessionHold,
+  dispatchFleetCreditLimitNotices,
+} from '@evtivity/payments';
 import { activePaymentProvider, paymentContext } from '../../lib/payments.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
 import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import { isEvseInReservationBuffer } from '../../lib/reservation-buffer.js';
+import { driverBillingSchema, toDriverBilling } from '../../lib/portal-billing.js';
+
+// The seeded default map view (`googleMaps.default*` in seed.ts and migration
+// 0001): the center of the contiguous United States. Used when a row is missing
+// or does not hold a number.
+const DEFAULT_MAP_VIEW = { lat: 39.8283, lng: -98.5795, zoom: 4 } as const;
+
+function mapViewNumber(stored: unknown, fallback: number): number {
+  if (typeof stored !== 'string' && typeof stored !== 'number') return fallback;
+  if (typeof stored === 'string' && stored.trim() === '') return fallback;
+  const value = Number(stored);
+  return Number.isFinite(value) ? value : fallback;
+}
 
 const portalConnectorItem = z
   .object({
@@ -219,7 +239,13 @@ const portalChargerSearch = z
     siteAddress: z.string().max(500).nullable().describe('Site street address'),
     siteCity: z.string().max(255).nullable().describe('Site city'),
     evseCount: z.number().int().min(0).describe('Total EVSEs at this station'),
-    availableCount: z.number().int().min(0).describe('Number of available EVSEs at this station'),
+    availableCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Number of EVSEs a driver can use now: 0 when the station is offline, disabled, installing firmware, faulted at station level, or under maintenance; a reserved EVSE is not counted',
+      ),
     connectors: z
       .array(portalConnectorSummary)
       .describe('Summary of all connectors on the station for filtering and display'),
@@ -404,6 +430,11 @@ const portalPricingInfo = z
       .describe(
         'When present, identifies the conditions under which the resolved tariff applies (time-of-day, days-of-week, seasonal date range, holiday-only, or energy threshold). Drivers should see this so they understand why a non-default rate is showing -- otherwise a "Peak rate $0.50/kWh" reads like the always-on price when it actually only applies 09:00-17:00.',
       ),
+    billing: driverBillingSchema
+      .nullable()
+      .describe(
+        'How the driver pays a session started at this charger: account (billed to a fleet, no payment method needed, no hold) or card. Null at a free vend site, where nothing is billed',
+      ),
   })
   .passthrough();
 
@@ -428,7 +459,13 @@ const portalNearbyStation = z
     siteCity: z.string().max(100).nullable().describe('City'),
     distanceKm: z.number().min(0).describe('Great-circle distance from the search point in km'),
     evseCount: z.number().int().min(0).describe('Total EVSEs at this station'),
-    availableCount: z.number().int().min(0).describe('Number of available EVSEs at this station'),
+    availableCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Number of EVSEs a driver can use now: 0 when the station is offline, disabled, installing firmware, faulted at station level, or under maintenance; a reserved EVSE is not counted',
+      ),
     connectors: z
       .array(portalConnectorSummary)
       .describe('Summary of all connectors on the station for filtering and display'),
@@ -446,6 +483,7 @@ const startChargingBody = z.object({
 
 async function getMaintenancePayloadForStation(
   stationDbId: string,
+  log: ServiceLogger,
 ): Promise<{ active: boolean; plannedEndAt: Date | null; message: string | null } | null> {
   const event = await getActiveMaintenanceForStation(stationDbId);
   if (event == null) return null;
@@ -456,12 +494,48 @@ async function getMaintenancePayloadForStation(
       .from(sites)
       .where(eq(sites.id, event.siteId));
     message = await renderMaintenanceMessage(client, event, siteRow?.name ?? '');
-  } catch {
+  } catch (err) {
+    log.warn(
+      { err, stationDbId, maintenanceId: event.id },
+      'Rendering the maintenance message failed, sending none',
+    );
     message = null;
   }
   return { active: true, plannedEndAt: event.plannedEndAt, message };
 }
 
+/**
+ * An OCPP 2.1 session the station started at plug-in (cable first,
+ * TxStartPoint EVConnected) that still waits for its authorization: active,
+ * started by the station (a Started event, no remote start), with no driver,
+ * token, guest, roaming flag, free vend, billing stamp or stop claim, and no
+ * event that carried an idToken. The payment gate waits for it
+ * (`linkFirstPresentedToken` in the OCPP projection), so a portal start may
+ * take it over.
+ */
+function awaitingAuthorization() {
+  return and(
+    eq(chargingSessions.status, 'active'),
+    isNull(chargingSessions.stoppedReason),
+    isNull(chargingSessions.driverId),
+    isNull(chargingSessions.tokenId),
+    isNull(chargingSessions.remoteStartId),
+    isNull(chargingSessions.billingMode),
+    eq(chargingSessions.isRoaming, false),
+    eq(chargingSessions.freeVend, false),
+    sql`EXISTS (
+      SELECT 1 FROM transaction_events te
+      WHERE te.session_id = ${chargingSessions.id} AND te.event_type = 'started'
+    )`,
+    sql`NOT EXISTS (
+      SELECT 1 FROM transaction_events te
+      WHERE te.session_id = ${chargingSessions.id} AND te.payload->>'idToken' IS NOT NULL
+    )`,
+    sql`NOT EXISTS (
+      SELECT 1 FROM guest_sessions g WHERE g.charging_session_id = ${chargingSessions.id}
+    )`,
+  );
+}
 export function portalChargerRoutes(app: FastifyInstance): void {
   app.get(
     '/portal/chargers/:stationId/evse/:evseId',
@@ -572,7 +646,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       }
 
       const paymentProvider = await activePaymentProvider(request.log);
-      const maintenance = await getMaintenancePayloadForStation(station.id);
+      const maintenance = await getMaintenancePayloadForStation(station.id, request.log);
 
       return {
         stationId: station.stationId,
@@ -649,6 +723,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           taxBasis: await getCompanyTaxBasis(),
           isFreeVend: true,
           restrictions: null,
+          billing: null,
         };
       }
 
@@ -671,6 +746,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         taxBasis: await getCompanyTaxBasis(),
         isFreeVend: false,
         restrictions: tariff.restrictions ?? null,
+        billing: toDriverBilling(await resolveAccountBilling(client, driverId)),
       };
     },
   );
@@ -728,7 +804,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           siteAddress: sites.address,
           siteCity: sites.city,
           evseCount: sql<number>`(SELECT count(*)::int FROM evses WHERE evses.station_id = ${chargingStations.id})`,
-          availableCount: sql<number>`(SELECT count(*)::int FROM connectors c JOIN evses e ON c.evse_id = e.id WHERE e.station_id = ${chargingStations.id} AND c.status = 'available')`,
+          availableCount: sql<number>`${sql.raw(availableEvseCountSql('charging_stations'))}`,
         })
         .from(chargingStations)
         .leftJoin(sites, eq(chargingStations.siteId, sites.id))
@@ -818,7 +894,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           siteCity: sites.city,
           distanceKm: distanceExpr,
           evseCount: sql<number>`(SELECT count(*)::int FROM evses WHERE evses.station_id = ${chargingStations.id})`,
-          availableCount: sql<number>`(SELECT count(*)::int FROM connectors c JOIN evses e ON c.evse_id = e.id WHERE e.station_id = ${chargingStations.id} AND c.status = 'available')`,
+          availableCount: sql<number>`${sql.raw(availableEvseCountSql('charging_stations'))}`,
         })
         .from(chargingStations)
         .innerJoin(sites, eq(chargingStations.siteId, sites.id))
@@ -903,7 +979,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         response: { 200: itemResponse(mapConfigResponse) },
       },
     },
-    async () => {
+    async (request) => {
       const rows = await db
         .select({ key: settings.key, value: settings.value })
         .from(settings)
@@ -924,16 +1000,20 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       if (rawApiKey !== '' && encryptionKey !== '') {
         try {
           apiKey = decryptString(rawApiKey, encryptionKey);
-        } catch {
+        } catch (err) {
           // Empty apiKey makes the frontend render "Maps not configured".
+          request.log.error(
+            { err, key: 'googleMaps.apiKeyEnc' },
+            'Decrypting the Google Maps API key failed, maps stay off',
+          );
         }
       }
 
       return {
         apiKey,
-        defaultLat: Number(map.get('googleMaps.defaultLat') ?? '37.7749'),
-        defaultLng: Number(map.get('googleMaps.defaultLng') ?? '-122.4194'),
-        defaultZoom: Number(map.get('googleMaps.defaultZoom') ?? '12'),
+        defaultLat: mapViewNumber(map.get('googleMaps.defaultLat'), DEFAULT_MAP_VIEW.lat),
+        defaultLng: mapViewNumber(map.get('googleMaps.defaultLng'), DEFAULT_MAP_VIEW.lng),
+        defaultZoom: mapViewNumber(map.get('googleMaps.defaultZoom'), DEFAULT_MAP_VIEW.zoom),
       };
     },
   );
@@ -969,7 +1049,30 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         .describe('Public contact phone (null when contact is private)'),
       stationCount: z.number().describe('Number of stations at this site'),
       evseCount: z.number().describe('Total EVSEs across all stations at this site'),
-      availableCount: z.number().describe('Number of available connectors across the site'),
+      availableCount: z
+        .number()
+        .describe(
+          'Number of EVSEs across the site a driver can use now (same rule as the charger search)',
+        ),
+      chargers: z
+        .array(
+          z
+            .object({
+              stationId: z.string().describe('OCPP station identity'),
+              stationName: z.string().describe('Station display name'),
+              evseId: z.number().int().describe('OCPP EVSE ID'),
+              connectorType: z.string().nullable().describe('Physical connector type'),
+              maxPowerKw: z.string().nullable().describe('Maximum power in kW (decimal string)'),
+              status: z.string().describe('Live connector status'),
+              available: z
+                .boolean()
+                .describe(
+                  'Whether a driver can start here now: the station is online, enabled and not under maintenance, the EVSE is not reserved, and the connector status is startable',
+                ),
+            })
+            .passthrough(),
+        )
+        .describe('One row per EVSE connector at the site, ordered by station and EVSE'),
     })
     .passthrough();
 
@@ -1059,7 +1162,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         .select({
           stationCount: sql<number>`count(DISTINCT ${chargingStations.id})::int`,
           evseCount: sql<number>`count(DISTINCT ${evses.id})::int`,
-          availableCount: sql<number>`count(DISTINCT CASE WHEN ${connectors.status} = 'available' THEN ${connectors.id} END)::int`,
+          availableCount: sql<number>`count(DISTINCT ${evses.id}) FILTER (WHERE ${sql.raw(evseAvailableSql('evses', 'charging_stations'))})::int`,
         })
         .from(chargingStations)
         .leftJoin(evses, eq(evses.stationId, chargingStations.id))
@@ -1077,6 +1180,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           connectorType: connectors.connectorType,
           maxPowerKw: connectors.maxPowerKw,
           status: connectors.status,
+          available: sql<boolean>`(${sql.raw(evseOpenToDriversSql('evses', 'charging_stations'))} AND ${inArray(connectors.status, [...STARTABLE_CONNECTOR_STATUSES])})`,
         })
         .from(chargingStations)
         .innerJoin(evses, eq(evses.stationId, chargingStations.id))
@@ -1419,7 +1523,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       const paymentProvider = await activePaymentProvider(request.log);
 
       const isContactPublic = station.siteContactIsPublic === true;
-      const maintenance = await getMaintenancePayloadForStation(station.id);
+      const maintenance = await getMaintenancePayloadForStation(station.id, request.log);
 
       return {
         stationId: station.stationId,
@@ -1565,7 +1669,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         tags: ['Portal Chargers'],
         summary: 'Start a charging session on a charger EVSE',
         description:
-          'Validates connector availability, performs a fail-fast Stripe pre-authorization on the supplied payment method (skipped for free tariffs and simulated customers), then dispatches RequestStartTransaction (OCPP 2.1) or RemoteStartTransaction (OCPP 1.6) to the station. On TxInProgress rejection, attempts ghost-transaction recovery (RequestStop + retry). Returns 402 PAYMENT_PREAUTH_FAILED if the card is declined, 400 if the connector is not in a startable state, 502/504 on station rejection or timeout.',
+          'Validates connector availability, performs a fail-fast pre-authorization with the active payment provider on the supplied payment method (skipped for free tariffs and for drivers whose fleet bills on account, who need no payment method), then dispatches RequestStartTransaction (OCPP 2.1) or RemoteStartTransaction (OCPP 1.6) to the station. On TxInProgress rejection, attempts ghost-transaction recovery (RequestStop + retry). Returns 402 PAYMENT_PREAUTH_FAILED if the card is declined, 402 FLEET_CREDIT_LIMIT_REACHED when the billing fleet of the driver is at its credit limit, 400 if the connector is not in a startable state, 502/504 on station rejection or timeout.',
         operationId: 'portalStartCharging',
         security: [{ bearerAuth: [] }],
         params: zodSchema(chargerParams),
@@ -1578,7 +1682,10 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             ERROR_CODES.SESSION_ALREADY_ACTIVE,
             ERROR_CODES.STATION_OFFLINE,
           ]),
-          402: errorResponse,
+          402: errorWith('Payment required', [
+            ERROR_CODES.FLEET_CREDIT_LIMIT_REACHED,
+            ERROR_CODES.PAYMENT_PREAUTH_FAILED,
+          ]),
           403: errorWith('Forbidden', [
             ERROR_CODES.CONNECTOR_RESERVED,
             ERROR_CODES.STATION_OFFLINE,
@@ -1727,12 +1834,24 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       // can be momentarily out of sync with the chargingState (e.g. after a manual
       // StatusNotification refresh during a transaction), and we must never allow two
       // concurrent sessions on the same EVSE.
+      // One exception: an OCPP 2.1 transaction the station started at plug-in
+      // (cable first, TxStartPoint EVConnected) that still waits for its
+      // authorization. This start takes it over (F01: the station answers
+      // with that transaction and links it by the remoteStartId).
       const [evseActiveSession] = await db
         .select({ id: chargingSessions.id })
         .from(chargingSessions)
         .where(and(eq(chargingSessions.evseId, evse.id), eq(chargingSessions.status, 'active')))
         .limit(1);
-      if (evseActiveSession != null) {
+      let waitingSessionId: string | null = null;
+      if (evseActiveSession != null && station.ocppProtocol !== 'ocpp1.6') {
+        const [waiting] = await db
+          .select({ id: chargingSessions.id })
+          .from(chargingSessions)
+          .where(and(eq(chargingSessions.id, evseActiveSession.id), awaitingAuthorization()));
+        waitingSessionId = waiting?.id ?? null;
+      }
+      if (evseActiveSession != null && waitingSessionId == null) {
         await reply.status(409).send({
           error: 'Another session is already active on this connector',
           code: 'EVSE_IN_USE',
@@ -1771,9 +1890,41 @@ export function portalChargerRoutes(app: FastifyInstance): void {
       // asynchronously.
       const paymentProvider = await activePaymentProvider(request.log);
 
+      // Charge on account: a driver whose fleet bills on account needs no card
+      // and gets no hold, with or without a payment provider. Free vend comes
+      // first (nothing is billed, no stamp); the session is stamped below.
+      const freeVend = station.freeVendEnabled === true;
+      const accountBilling = freeVend ? null : await resolveAccountBilling(client, driverId);
+
+      // Fleet credit limit: an account start is refused while the fleet has
+      // no credit left (its exposure at or above the limit, or its running
+      // sessions reserving the rest, plan S8), read under the fleet row lock.
+      // The payment gate checks again at Started and reserves the session's
+      // ceiling (P11).
+      // The fleet's warning and reached notices go out once per month,
+      // fail-open (P9).
+      if (accountBilling != null) {
+        const credit = await checkFleetCreditLimit(client, accountBilling.fleetId);
+        if (credit != null && credit.level !== 'ok') {
+          void dispatchFleetCreditLimitNotices(
+            credit,
+            { templatesDirs: ALL_TEMPLATES_DIRS },
+            request.log,
+          );
+        }
+        if (credit != null && (credit.level === 'reached' || credit.remainingCents <= 0)) {
+          await reply.status(402).send({
+            error:
+              'The credit limit of the fleet your sessions are billed to is reached. Contact your fleet manager.',
+            code: 'FLEET_CREDIT_LIMIT_REACHED',
+          });
+          return;
+        }
+      }
+
       let pmForPreAuth: { id: number } | null = null;
 
-      if (paymentProvider != null) {
+      if (paymentProvider != null && accountBilling == null) {
         // Check if pricing is free for this driver. Free-vend wins over the
         // tariff lookup: event-projections skips the payment gate for
         // free-vend sites, so demanding a payment method here would block
@@ -1786,7 +1937,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
             stationUuid: station.id,
             driverUuid: driverId,
             reserved: activeReservation?.driverId === driverId,
-            freeVend: station.freeVendEnabled === true,
+            freeVend,
           },
           client,
         );
@@ -1825,8 +1976,9 @@ export function portalChargerRoutes(app: FastifyInstance): void {
 
       // Create session first so event projection can match via remote_start_id
       const remoteStartId = Math.floor(Math.random() * 2_147_483_647);
-      let transactionId: string;
-      if (station.ocppProtocol === 'ocpp1.6') {
+      // A taken-over transaction keeps its id (see the takeover below).
+      let transactionId = '';
+      if (waitingSessionId == null && station.ocppProtocol === 'ocpp1.6') {
         // The sequence is the only source of 1.6 transaction ids: a made-up id
         // could collide with another session, so a failed read fails the start
         // before any session or hold exists.
@@ -1850,33 +2002,87 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           return;
         }
         transactionId = nextval;
-      } else {
+      } else if (waitingSessionId == null) {
         transactionId = crypto.randomUUID();
       }
 
       // One currency for the session row, the pre-auth, and its payment record.
       const sessionCurrency = await getCompanyCurrency();
-      const sessionRows = await db
-        .insert(chargingSessions)
-        .values({
-          stationId: station.id,
-          evseId: evse.id,
-          driverId,
-          transactionId,
-          status: 'active',
-          startedAt: new Date(),
-          remoteStartId,
-          currency: sessionCurrency,
-        })
-        .returning({ id: chargingSessions.id });
+      // A waiting cable-first transaction is taken over: the driver, the
+      // remote start id and the billing stamp go on its session, only while
+      // it still waits (a concurrent start or an idToken presented at the
+      // station wins), so the hold and the link land on the session that
+      // charges. Its transaction, currency and tariff snapshot stay; the
+      // projection links the driver and reprices it for the driver when the
+      // station reports the remote start (linkFirstPresentedToken).
+      const sessionRows =
+        waitingSessionId != null
+          ? await db
+              .update(chargingSessions)
+              .set({
+                driverId,
+                remoteStartId,
+                ...(freeVend ? {} : sessionBillingColumns(accountBilling)),
+                updatedAt: new Date(),
+              })
+              .where(and(eq(chargingSessions.id, waitingSessionId), awaitingAuthorization()))
+              .returning({ id: chargingSessions.id, transactionId: chargingSessions.transactionId })
+          : await db
+              .insert(chargingSessions)
+              .values({
+                stationId: station.id,
+                evseId: evse.id,
+                driverId,
+                transactionId,
+                status: 'active',
+                startedAt: new Date(),
+                remoteStartId,
+                currency: sessionCurrency,
+                // Write-once billing stamp (the gate keeps it): card or account.
+                ...(freeVend ? {} : sessionBillingColumns(accountBilling)),
+              })
+              .returning({
+                id: chargingSessions.id,
+                transactionId: chargingSessions.transactionId,
+              });
 
       const session = sessionRows[0];
+      if (session == null && waitingSessionId != null) {
+        await reply.status(409).send({
+          error: 'Another session is already active on this connector',
+          code: 'EVSE_IN_USE',
+        });
+        return;
+      }
       if (session == null) {
         await reply
           .status(500)
           .send({ error: 'Failed to create session', code: 'SESSION_CREATE_FAILED' });
         return;
       }
+
+      // A start that fails after taking over a waiting transaction ends it the
+      // way the payment gate ends a session it stops: the session row is
+      // closed first (above each call, P4), then the station is asked to stop
+      // the transaction (fire-and-forget, a lost publish is logged, P9). The
+      // session's payment record keys to it, so it cannot wait for another
+      // driver.
+      const tookOver = waitingSessionId != null;
+      const stopTakenOverTransaction = async (): Promise<void> => {
+        if (!tookOver) return;
+        try {
+          await publishOcppCommand(getPubSub(), {
+            stationId: station.stationId,
+            action: 'RequestStopTransaction',
+            payload: { transactionId: session.transactionId },
+          });
+        } catch (err) {
+          request.log.warn(
+            { err, sessionId: session.id },
+            'Failed to request the stop of a taken-over transaction',
+          );
+        }
+      };
 
       // Fail-fast pre-auth: hold the card BEFORE telling the station to start
       // so a decline shortcuts to 402 without leaving a ghost session. Skipped
@@ -1905,6 +2111,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
               updatedAt: new Date(),
             })
             .where(eq(chargingSessions.id, session.id));
+          await stopTakenOverTransaction();
           if (declined) {
             await reply.status(402).send({
               error: `Payment authorization declined: ${hold.reason}`,
@@ -1940,6 +2147,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           .update(chargingSessions)
           .set({ status: 'faulted', updatedAt: new Date() })
           .where(eq(chargingSessions.id, session.id));
+        await stopTakenOverTransaction();
         void dispatchDriverNotification(
           client,
           'session.Faulted',
@@ -1958,7 +2166,8 @@ export function portalChargerRoutes(app: FastifyInstance): void {
         const statusInfo = cmdResult.response?.['statusInfo'] as
           | { reasonCode?: string; additionalInfo?: string }
           | undefined;
-        const isTxInProgress = statusInfo?.reasonCode === 'TxInProgress';
+        // A taken-over transaction is the one in progress, never a ghost.
+        const isTxInProgress = !tookOver && statusInfo?.reasonCode === 'TxInProgress';
 
         if (isTxInProgress) {
           const ghostTxId =
@@ -2026,6 +2235,7 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           .update(chargingSessions)
           .set({ status: 'faulted', updatedAt: new Date() })
           .where(eq(chargingSessions.id, session.id));
+        await stopTakenOverTransaction();
         // The station will not start: the hold placed above is released now
         // instead of staying open until the provider expires it (P4).
         // Best effort (P9): the start already failed for the driver.
@@ -2595,8 +2805,11 @@ export function portalChargerRoutes(app: FastifyInstance): void {
           .orderBy(desc(driverTokens.updatedAt))
           .limit(1);
         preferredTokenId = lastToken?.id ?? null;
-      } catch {
-        // Non-critical
+      } catch (err) {
+        request.log.warn(
+          { err, driverId },
+          'Looking up the driver token for the reservation failed, reserving without one',
+        );
       }
 
       const [reservation] = await db

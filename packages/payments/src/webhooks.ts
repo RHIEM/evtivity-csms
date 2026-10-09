@@ -57,6 +57,12 @@ export type PaymentWebhookNotice =
    * hears about the payment (`session.PaymentReceived`), as on session end.
    */
   | { kind: 'session_paid'; record: PaymentRecord; amountCents: number }
+  /**
+   * The provider confirmed a capture (an async capture recorded at session
+   * end, or one it reports before the capture was recorded): the session
+   * receipt is due now (finding JB-3).
+   */
+  | { kind: 'capture_confirmed'; record: PaymentRecord }
   /** A capture the provider accepted failed: the record is `failed`. */
   | { kind: 'capture_failed'; record: PaymentRecord; reason: string | null }
   /** A pending refund the provider confirmed. */
@@ -71,9 +77,9 @@ export type PaymentWebhookNotice =
 /**
  * The inbound webhook pipeline: verify the provider's signature, deduplicate
  * each event on its provider and id (`webhook_events`, insert-or-skip, P7),
- * then apply it with status guards (P5). The conflict target stays the
- * `event_id` primary key until P8 makes `(provider, event_id)` the key. Throws WebhookNotConfiguredError when the provider
- * has no signing secret or credentials in this process, and
+ * then apply it with status guards (P5); `(provider, event_id)` is the
+ * primary key. Throws WebhookNotConfiguredError when the provider has no
+ * signing secret or credentials in this process, and
  * WebhookSignatureError for a missing or wrong signature.
  */
 export async function ingestPaymentWebhook(
@@ -301,7 +307,7 @@ export async function applyPaymentEvent(
           { paymentRecordId: record.id, operationRef: ref },
           'Capture confirmed via webhook',
         );
-        return changed(record.id);
+        return captureConfirmed(record.id);
       }
       if (record.status === 'pre_authorized' && record.providerPaymentId === event.paymentId) {
         // The confirmation came before the capture was recorded (or the
@@ -313,7 +319,7 @@ export async function applyPaymentEvent(
             { paymentRecordId: record.id, amountCents: event.amountCents },
             'Hold captured via webhook',
           );
-          return changed(record.id);
+          return captureConfirmed(record.id);
         }
       }
       ctx.logger.info(
@@ -609,6 +615,12 @@ async function applyAdjustment(
     case 'adjusting':
       return { kind: 'record_changed', record: now };
   }
+}
+
+/** The record as it is now, after the provider confirmed its capture. */
+async function captureConfirmed(recordId: number): Promise<PaymentWebhookNotice | null> {
+  const record = await findRecord(recordId);
+  return record != null ? { kind: 'capture_confirmed', record } : null;
 }
 
 /** The record as it is now, for the operator UI refresh. */

@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { and, eq, inArray, lte, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import {
   chargingSessions,
@@ -9,6 +9,7 @@ import {
   driverTokens,
   getCompanyCurrency,
   paymentRecords,
+  SESSION_END_FAILED_REASON,
   tokenAuditLog,
   writeAudit,
 } from '@evtivity/database';
@@ -18,7 +19,6 @@ import type {
   ProviderRefundEntry,
 } from '@evtivity/database';
 import type { PaymentLogger } from './context.js';
-import { stripeColumnValue } from './legacy-columns.js';
 import { topUpCharges } from './top-ups.js';
 import type { TopUpCharge } from './top-ups.js';
 import type { PaymentProviderId, PaymentStatus, ProviderState } from './types.js';
@@ -33,6 +33,9 @@ import type { PaymentProviderId, PaymentStatus, ProviderState } from './types.js
  * - `captured` | `partially_refunded` -> `partially_refunded` | `refunded`
  * - `captured` -> `failed` only by a capture failure webhook of the pending
  *   (or last confirmed) capture, before anything was refunded
+ * - `cancelled` | `failed` -> `pending` only by the operator re-bill of a
+ *   session the CSMS gave up ending (`claimRebillRecord`), for a hold that
+ *   took no money, marked `metadata.rebill`
  *
  * Async providers (Adyen, the simulated provider in async mode) confirm
  * captures, cancels and refunds by webhook. A capture or cancel is written
@@ -46,10 +49,6 @@ import type { PaymentProviderId, PaymentStatus, ProviderState } from './types.js
  *
  * Each update returns whether it applied; a false means the record had
  * already moved on (or does not exist), and the caller logs it.
- *
- * Provider ids go into the `provider*` columns and, for Stripe and simulated
- * payments, into the matching `stripe_*` column too (P4 dual write, see
- * `legacy-columns.ts`). Reads use only the `provider*` columns.
  */
 
 export type PaymentRecord = typeof paymentRecords.$inferSelect;
@@ -61,34 +60,26 @@ const FROM_HOLD: PaymentStatus[] = ['pre_authorized'];
 const REFUNDABLE: PaymentStatus[] = ['captured', 'partially_refunded'];
 /** A webhook failure moves only an open payment (F8). */
 const FAILABLE: PaymentStatus[] = ['pending', 'pre_authorized'];
+/** A hold given up on that the session re-bill may take over (`claimRebillRecord`). */
+const FROM_GIVEN_UP: PaymentStatus[] = ['cancelled', 'failed'];
 
-export type PaymentSource = 'web_portal' | 'guest' | 'prepaid' | 'ocpp_terminal';
+/**
+ * Who started the payment. `operator`: an off-session charge the CSMS starts
+ * for an operator, not the driver (the session re-bill and the reservation
+ * cancellation and no-show fees).
+ */
+export type PaymentSource = 'web_portal' | 'guest' | 'prepaid' | 'ocpp_terminal' | 'operator';
 
-/** The provider columns of a record and their `stripe_*` copies. */
+/** The provider columns of a record. */
 function providerIds(
   provider: PaymentProviderId,
   ids: { paymentId?: string | null; customerId?: string | null; methodId?: string | null },
 ): Partial<typeof paymentRecords.$inferInsert> {
   return {
     provider,
-    ...(ids.paymentId !== undefined
-      ? {
-          providerPaymentId: ids.paymentId,
-          stripePaymentIntentId: stripeColumnValue(provider, ids.paymentId),
-        }
-      : {}),
-    ...(ids.customerId !== undefined
-      ? {
-          providerCustomerId: ids.customerId,
-          stripeCustomerId: stripeColumnValue(provider, ids.customerId),
-        }
-      : {}),
-    ...(ids.methodId !== undefined
-      ? {
-          providerPaymentMethodId: ids.methodId,
-          stripePaymentMethodId: stripeColumnValue(provider, ids.methodId),
-        }
-      : {}),
+    ...(ids.paymentId !== undefined ? { providerPaymentId: ids.paymentId } : {}),
+    ...(ids.customerId !== undefined ? { providerCustomerId: ids.customerId } : {}),
+    ...(ids.methodId !== undefined ? { providerPaymentMethodId: ids.methodId } : {}),
   };
 }
 
@@ -275,6 +266,7 @@ function pendingFields(
 export async function markCancelled(
   id: number,
   pendingRef: string | null = null,
+  failureReason: string | null = null,
 ): Promise<boolean> {
   return updated(
     await db
@@ -282,6 +274,7 @@ export async function markCancelled(
       .set({
         status: 'cancelled',
         capturedAmountCents: 0,
+        ...(failureReason != null ? { failureReason: failureReason.slice(0, 500) } : {}),
         ...pendingFields('cancel', pendingRef),
         updatedAt: new Date(),
       })
@@ -707,6 +700,59 @@ export async function recordsAwaitingConfirmation(
 }
 
 /**
+ * Open holds whose authorisation adjustment was claimed before `olderThan`
+ * and never got a provider reference: the settlement that claimed it lost
+ * its connection before the provider answered or before the reference was
+ * stored. `resumeStaleAdjustments` asks the provider again with the same key.
+ */
+export async function staleAdjustmentClaims(
+  olderThan: Date,
+  limit = 200,
+): Promise<PaymentRecord[]> {
+  return db
+    .select()
+    .from(paymentRecords)
+    .where(
+      and(
+        eq(paymentRecords.status, 'pre_authorized'),
+        eq(paymentRecords.pendingOperation, 'adjust'),
+        sql`${paymentRecords.pendingOperationRef} IS NULL`,
+        sql`${paymentRecords.pendingOperationAt} < ${olderThan}`,
+      ),
+    )
+    .orderBy(paymentRecords.id)
+    .limit(limit);
+}
+
+/**
+ * Takes over an adjustment claim without a provider reference, atomically:
+ * only when the hold is still open, the claim still has no reference (a
+ * webhook or another settlement did not store one meanwhile) and it was made
+ * before `olderThan`. Moves `pending_operation_at` to now, so a concurrent
+ * re-drive of the same claim finds it fresh and skips it. Returns the record,
+ * or null when the claim is not there to take.
+ */
+export async function reclaimStaleAdjustment(
+  id: number,
+  olderThan: Date,
+): Promise<PaymentRecord | null> {
+  const [row] = await db
+    .update(paymentRecords)
+    .set({ pendingOperationAt: new Date(), updatedAt: new Date() })
+    .where(
+      and(
+        eq(paymentRecords.id, id),
+        inArray(paymentRecords.status, FROM_HOLD),
+        eq(paymentRecords.pendingOperation, 'adjust'),
+        sql`${paymentRecords.pendingOperationRef} IS NULL`,
+        sql`${paymentRecords.pendingOperationAt} < ${olderThan}`,
+      ),
+    )
+    .returning();
+  return row ?? null;
+}
+
+/**
  * A recovered shortfall: the captured total reaches the final cost, and the
  * retry top-up is appended to `metadata.topUps`.
  */
@@ -770,7 +816,7 @@ export async function recordPendingCharge(input: PendingChargeInput): Promise<nu
       driverId: input.driverId,
       sitePaymentConfigId: input.sitePaymentConfigId,
       ...providerIds(input.provider, { customerId: input.customerId, methodId: input.methodId }),
-      paymentSource: 'web_portal',
+      paymentSource: 'operator',
       currency: input.currency,
       taxRate: String(input.taxRate),
       status: 'pending',
@@ -827,6 +873,308 @@ export async function markChargeFailed(id: number, reason: string): Promise<bool
       .where(and(eq(paymentRecords.id, id), inArray(paymentRecords.status, FROM_PENDING)))
       .returning({ id: paymentRecords.id }),
   );
+}
+
+/**
+ * Claims reservation fee charges for an invoice, inside the invoice
+ * transaction: invoice_id is set only while it is null, so a fee is never on
+ * two invoices. Returns the ids it claimed; fewer than asked means another
+ * invoice claimed one first and the caller rolls back.
+ */
+export async function claimFeeRecordsForInvoice(
+  tx: Tx,
+  ids: number[],
+  invoiceId: string,
+): Promise<number[]> {
+  if (ids.length === 0) return [];
+  const rows = await tx
+    .update(paymentRecords)
+    .set({ invoiceId, updatedAt: new Date() })
+    .where(and(inArray(paymentRecords.id, ids), isNull(paymentRecords.invoiceId)))
+    .returning({ id: paymentRecords.id });
+  return rows.map((row) => row.id);
+}
+
+/**
+ * Releases the reservation fee charges a voided invoice claimed, inside the
+ * void transaction, so they can be invoiced again. Returns their ids.
+ */
+export async function releaseInvoiceFeeRecords(tx: Tx, invoiceId: string): Promise<number[]> {
+  const rows = await tx
+    .update(paymentRecords)
+    .set({ invoiceId: null, updatedAt: new Date() })
+    .where(eq(paymentRecords.invoiceId, invoiceId))
+    .returning({ id: paymentRecords.id });
+  return rows.map((row) => row.id);
+}
+
+/**
+ * How long after its first claim a re-bill charge whose outcome is unknown
+ * (`pending`, no provider payment id) may be resumed with the same
+ * `rebill_<sessionId>` key. Providers replay the first answer of a key only
+ * while they keep it: Stripe 24 hours, Adyen at least 7 days. After 23 hours
+ * (inside the shorter, Stripe's) a retry could be a new charge, so the claim
+ * refuses it and reconciliation reports the record for an operator to check
+ * at the provider.
+ */
+export const REBILL_RESUME_MAX_HOURS = 23;
+
+/**
+ * The provider request of a re-bill charge, stored in `metadata.rebill.request`
+ * on the first claim. A resume sends exactly this request again (same key,
+ * same parameters), never a recomputed one.
+ */
+export interface RebillChargeRequest {
+  provider: PaymentProviderId;
+  customerId: string;
+  methodId: string;
+  /** The amount charged, tax included, in cents of `currency`. */
+  grossCents: number;
+  currency: string;
+  /** The tax rate (fraction) the platform fee is taken on the net amount with. */
+  feeTaxRate: number;
+  platformFeePercent: number;
+  payoutAccountId: string | null;
+}
+
+/**
+ * The re-bill of a session the CSMS gave up ending (`session-rebill.ts`):
+ * `metadata.rebill` marks a record the re-bill wrote or took over.
+ */
+export interface RebillRecordInput {
+  sessionId: string;
+  driverId: string;
+  sitePaymentConfigId: number | null;
+  /** The charge to send when the record has none stored yet. */
+  request: RebillChargeRequest;
+}
+
+export type RebillRecordClaim =
+  /**
+   * The record is `pending` for the re-bill charge (new, taken over, or a
+   * retry of it), with the request to send: the stored one when `resumed`.
+   */
+  | { state: 'claimed'; id: number; request: RebillChargeRequest; resumed: boolean }
+  /** An earlier attempt of this re-bill charged (a retry after the charge). */
+  | { state: 'charged'; id: number; amountCents: number }
+  /** An earlier attempt of this re-bill was declined: manual billing, no second charge. */
+  | { state: 'failed'; id: number; reason: string; amountCents: number | null }
+  /**
+   * The record holds another payment (open, paid, or with a pending
+   * operation), or a re-bill charge with an unknown outcome older than
+   * REBILL_RESUME_MAX_HOURS.
+   */
+  | { state: 'refused'; status: PaymentStatus }
+  /** The session is no longer faulted with its re-bill claim held: nothing written. */
+  | { state: 'session_not_claimed' };
+
+/** Whether the re-bill wrote or took over this record (`metadata.rebill`). */
+export function isRebillRecord(record: { metadata: unknown }): boolean {
+  const metadata = record.metadata;
+  return typeof metadata === 'object' && metadata != null && 'rebill' in metadata;
+}
+
+function rebillMetadata(record: { metadata: unknown }): Record<string, unknown> | null {
+  if (!isRebillRecord(record)) return null;
+  const rebill = (record.metadata as { rebill: unknown }).rebill;
+  return typeof rebill === 'object' && rebill != null ? (rebill as Record<string, unknown>) : null;
+}
+
+/** The stored request of a re-bill record (`metadata.rebill.request`), null when it has none. */
+export function rebillChargeRequest(record: { metadata: unknown }): RebillChargeRequest | null {
+  const request = rebillMetadata(record)?.['request'];
+  if (typeof request !== 'object' || request == null) return null;
+  const r = request as Record<string, unknown>;
+  if (
+    typeof r['provider'] !== 'string' ||
+    typeof r['customerId'] !== 'string' ||
+    typeof r['methodId'] !== 'string' ||
+    typeof r['grossCents'] !== 'number' ||
+    typeof r['currency'] !== 'string' ||
+    typeof r['feeTaxRate'] !== 'number' ||
+    typeof r['platformFeePercent'] !== 'number'
+  ) {
+    return null;
+  }
+  return {
+    provider: r['provider'],
+    customerId: r['customerId'],
+    methodId: r['methodId'],
+    grossCents: r['grossCents'],
+    currency: r['currency'],
+    feeTaxRate: r['feeTaxRate'],
+    platformFeePercent: r['platformFeePercent'],
+    payoutAccountId: typeof r['payoutAccountId'] === 'string' ? r['payoutAccountId'] : null,
+  };
+}
+
+/** When the re-bill first claimed the record (`metadata.rebill.requestedAt`). */
+export function rebillRequestedAt(record: { metadata: unknown }): Date | null {
+  const requestedAt = rebillMetadata(record)?.['requestedAt'];
+  if (typeof requestedAt !== 'string') return null;
+  const date = new Date(requestedAt);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Whether a re-bill charge has an unknown outcome (`pending`, no provider
+ * payment id) for longer than REBILL_RESUME_MAX_HOURS: a retry is refused
+ * (the provider may no longer replay the key) and reconciliation reports it.
+ */
+export function isStaleRebillCharge(
+  record: { status: string; providerPaymentId: string | null; metadata: unknown },
+  now: number = Date.now(),
+): boolean {
+  if (!isRebillRecord(record) || record.status !== 'pending' || record.providerPaymentId != null) {
+    return false;
+  }
+  const requestedAt = rebillRequestedAt(record);
+  return requestedAt != null && now - requestedAt.getTime() >= REBILL_RESUME_MAX_HOURS * 3_600_000;
+}
+
+/**
+ * Re-bill charges with an unknown outcome older than REBILL_RESUME_MAX_HOURS
+ * (`isStaleRebillCharge`), for reconciliation.
+ */
+export async function staleRebillCharges(limit: number): Promise<PaymentRecord[]> {
+  const olderThan = new Date(Date.now() - REBILL_RESUME_MAX_HOURS * 3_600_000);
+  return db
+    .select()
+    .from(paymentRecords)
+    .where(
+      sql`${paymentRecords.status} = 'pending'
+        AND ${paymentRecords.providerPaymentId} IS NULL
+        AND ${paymentRecords.metadata} ? 'rebill'
+        AND (${paymentRecords.metadata} -> 'rebill' ->> 'requestedAt')::timestamptz < ${olderThan}`,
+    )
+    .orderBy(paymentRecords.id)
+    .limit(limit);
+}
+
+/**
+ * Claims the session's record for its re-bill charge, under a row lock, only
+ * while the session is faulted with stopped reason EndRequestFailed and its
+ * re-bill claim is held (`session_not_claimed` otherwise, P11). No record: a
+ * new `pending` one. A `cancelled` or `failed` record (the hold the CSMS
+ * cancelled when it gave up ending the session) with nothing captured,
+ * refunded or pending goes back to `pending` with the re-bill's provider ids,
+ * keeping the hold's ids in `metadata.rebill` (the one exception to sticky
+ * terminal records, matched by that marker: the hold took no money). Both
+ * store the request and `requestedAt` in `metadata.rebill`. A record the
+ * re-bill already wrote reports its state, so a retry charges once: a
+ * `pending` one is resumed with its stored request (the same
+ * `rebill_<sessionId>` key and parameters), unless it is older than
+ * REBILL_RESUME_MAX_HOURS (refused). Any other record is refused.
+ */
+export async function claimRebillRecord(input: RebillRecordInput): Promise<RebillRecordClaim> {
+  return db.transaction(async (tx): Promise<RebillRecordClaim> => {
+    const held = await tx
+      .select({ id: chargingSessions.id })
+      .from(chargingSessions)
+      .where(
+        and(
+          eq(chargingSessions.id, input.sessionId),
+          eq(chargingSessions.status, 'faulted'),
+          eq(chargingSessions.stoppedReason, SESSION_END_FAILED_REASON),
+          eq(chargingSessions.rebillStatus, 'in_progress'),
+        ),
+      )
+      .for('share');
+    if (held.length === 0) return { state: 'session_not_claimed' };
+    const record = await lockSessionRecord(tx, input.sessionId);
+    const { request } = input;
+    const ids = providerIds(request.provider, {
+      paymentId: null,
+      customerId: request.customerId,
+      methodId: request.methodId,
+    });
+    const requestedAt = new Date().toISOString();
+    if (record == null) {
+      const [row] = await tx
+        .insert(paymentRecords)
+        .values({
+          sessionId: input.sessionId,
+          driverId: input.driverId,
+          sitePaymentConfigId: input.sitePaymentConfigId,
+          ...ids,
+          paymentSource: 'operator',
+          currency: request.currency,
+          status: 'pending',
+          metadata: { rebill: { requestedAt, request } },
+        })
+        .onConflictDoNothing({ target: paymentRecords.sessionId })
+        .returning({ id: paymentRecords.id });
+      return row != null
+        ? { state: 'claimed', id: row.id, request, resumed: false }
+        : { state: 'refused', status: 'pending' };
+    }
+    if (isRebillRecord(record)) {
+      const stored = rebillChargeRequest(record);
+      if (record.status === 'pending') {
+        if (isStaleRebillCharge(record)) return { state: 'refused', status: record.status };
+        if (stored != null)
+          return { state: 'claimed', id: record.id, request: stored, resumed: true };
+        // A pending record without a stored request: store this one, as the first claim does.
+        await tx
+          .update(paymentRecords)
+          .set({
+            metadata: sql`jsonb_set(${paymentRecords.metadata}, '{rebill,request}', ${JSON.stringify(request)}::jsonb)`,
+            updatedAt: new Date(),
+          })
+          .where(eq(paymentRecords.id, record.id));
+        return { state: 'claimed', id: record.id, request, resumed: false };
+      }
+      if (record.status === 'captured') {
+        return { state: 'charged', id: record.id, amountCents: record.capturedAmountCents ?? 0 };
+      }
+      if (record.status === 'failed') {
+        return {
+          state: 'failed',
+          id: record.id,
+          reason: record.failureReason ?? '',
+          amountCents: stored?.grossCents ?? null,
+        };
+      }
+      return { state: 'refused', status: record.status };
+    }
+    const untouched =
+      (record.status === 'cancelled' || record.status === 'failed') &&
+      (record.capturedAmountCents ?? 0) === 0 &&
+      record.refundedAmountCents === 0 &&
+      record.pendingOperation == null &&
+      record.providerRefunds.length === 0;
+    if (!untouched) return { state: 'refused', status: record.status };
+    const rebill = {
+      requestedAt,
+      request,
+      previousStatus: record.status,
+      previousProvider: record.provider,
+      previousPaymentId: record.providerPaymentId,
+      previousFailureReason: record.failureReason,
+    };
+    const [row] = await tx
+      .update(paymentRecords)
+      .set({
+        status: 'pending',
+        driverId: input.driverId,
+        sitePaymentConfigId: input.sitePaymentConfigId,
+        ...ids,
+        paymentSource: 'operator',
+        currency: request.currency,
+        preAuthAmountCents: null,
+        capturedAmountCents: null,
+        failureReason: null,
+        providerState: null,
+        ...NO_PENDING_OPERATION,
+        metadata: sql`COALESCE(${paymentRecords.metadata}, '{}'::jsonb) || ${JSON.stringify({ rebill })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(paymentRecords.id, record.id), inArray(paymentRecords.status, FROM_GIVEN_UP)))
+      .returning({ id: paymentRecords.id });
+    return row != null
+      ? { state: 'claimed', id: row.id, request, resumed: false }
+      : { state: 'refused', status: record.status };
+  });
 }
 
 /** The record of a provider's payment (`payment_records_provider_payment_id_key`). */
@@ -957,10 +1305,23 @@ export async function recordTerminalSettlement(input: {
   return rows.length > 0;
 }
 
+export interface PrepaidSettlementOptions {
+  /**
+   * The cost to debit instead of the session's stored final cost: the re-bill
+   * of a session the CSMS gave up ending debits the recomputed cost before it
+   * stores it on the session.
+   */
+  costCents?: number;
+  /** Marks the record as the re-bill's (`metadata.rebill`). */
+  rebill?: boolean;
+}
+
 export interface PrepaidSettlement {
   tokenId: string;
   debitedCents: number;
   balanceCents: number;
+  /** Set when the debit was already recorded (a repeated settlement). */
+  repeated?: true;
 }
 
 /**
@@ -971,13 +1332,18 @@ export interface PrepaidSettlement {
  * the final cost exceeds the remaining credit; the next Authorize then answers
  * NoCredit.
  *
+ * When the session was already debited (a rerun after a lost connection, or a
+ * replayed Ended), returns that debit from its record and the token's current
+ * balance without debiting again, so the caller still reports it.
+ *
  * Returns null when the session has no prepaid token, no cost, a currency other
  * than the company currency (the balance is held in the company currency), or
- * was already settled.
+ * was already settled another way.
  */
 export async function settlePrepaidSession(
   sessionId: string,
   logger?: PaymentLogger,
+  options: PrepaidSettlementOptions = {},
 ): Promise<PrepaidSettlement | null> {
   const [row] = await db
     .select({
@@ -993,7 +1359,7 @@ export async function settlePrepaidSession(
     .where(eq(chargingSessions.id, sessionId));
 
   if (row?.balanceCents == null) return null;
-  const costCents = row.finalCostCents ?? 0;
+  const costCents = options.costCents ?? row.finalCostCents ?? 0;
   if (costCents <= 0) return null;
 
   const companyCurrency = await getCompanyCurrency();
@@ -1015,11 +1381,43 @@ export async function settlePrepaidSession(
         currency: row.currency,
         capturedAmountCents: costCents,
         status: 'captured',
-        metadata: { tokenId: row.tokenId },
+        metadata: {
+          tokenId: row.tokenId,
+          ...(options.rebill === true ? { rebill: { requestedAt: new Date().toISOString() } } : {}),
+        },
       })
       .onConflictDoNothing({ target: paymentRecords.sessionId })
       .returning({ id: paymentRecords.id });
-    if (inserted.length === 0) return null;
+    if (inserted.length === 0) {
+      // Already settled: report the prepaid debit already recorded.
+      const [existing] = await tx
+        .select({
+          capturedCents: paymentRecords.capturedAmountCents,
+          source: paymentRecords.paymentSource,
+          status: paymentRecords.status,
+        })
+        .from(paymentRecords)
+        .where(eq(paymentRecords.sessionId, sessionId));
+      // Only a debit still standing is reported; a refunded or partially
+      // refunded one is not.
+      if (
+        existing?.source !== 'prepaid' ||
+        existing.status !== 'captured' ||
+        existing.capturedCents == null
+      ) {
+        return null;
+      }
+      const [token] = await tx
+        .select({ balanceCents: driverTokens.prepaidBalanceCents })
+        .from(driverTokens)
+        .where(eq(driverTokens.id, row.tokenId));
+      if (token?.balanceCents == null) return null;
+      return {
+        kind: 'existing' as const,
+        debitedCents: existing.capturedCents,
+        after: token.balanceCents,
+      };
+    }
 
     const [updated] = await tx
       .update(driverTokens)
@@ -1030,9 +1428,21 @@ export async function settlePrepaidSession(
       .where(eq(driverTokens.id, row.tokenId))
       .returning({ balanceCents: driverTokens.prepaidBalanceCents });
     if (updated?.balanceCents == null) return null;
-    return { before: updated.balanceCents + costCents, after: updated.balanceCents };
+    return {
+      kind: 'debited' as const,
+      before: updated.balanceCents + costCents,
+      after: updated.balanceCents,
+    };
   });
   if (result == null) return null;
+  if (result.kind === 'existing') {
+    return {
+      tokenId: row.tokenId,
+      debitedCents: result.debitedCents,
+      balanceCents: result.after,
+      repeated: true,
+    };
+  }
 
   await writeAudit(
     { table: tokenAuditLog, idColumn: 'token_id' },

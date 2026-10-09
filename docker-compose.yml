@@ -10,8 +10,12 @@ services:
     # connections use a few MB each, so 200 fits the 1g limit with the default
     # shared_buffers (128MB).
     command: ['postgres', '-c', 'max_connections=200']
+    # Infrastructure and tool ports (postgres, pgadmin, mailpit, ftp,
+    # prometheus, grafana, loki) bind to 127.0.0.1 so the default logins are
+    # not reachable from the network. INFRA_BIND_IP widens them. Redis and the
+    # Node inspector (9229) stay on 127.0.0.1. User-facing ports use BIND_IP.
     ports:
-      - '5433:5432'
+      - '${INFRA_BIND_IP:-127.0.0.1}:5433:5432'
     environment:
       POSTGRES_USER: evtivity
       POSTGRES_PASSWORD: evtivity
@@ -97,6 +101,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-in-production!!}
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
+      # Off by default. scripts/docker-build.sh turns it on with the tools profile:
+      # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
+      NOTIFICATIONS_ALLOW_TEST_SINK: ${NOTIFICATIONS_ALLOW_TEST_SINK:-false}
+      NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
       CORS_ORIGIN: local
       LOG_LEVEL: info
       NODE_ENV: development
@@ -134,16 +142,21 @@ services:
     ports:
       - '${BIND_IP:-0.0.0.0}:${OCPP_PORT:-7103}:${OCPP_PORT:-7103}'
       - '${BIND_IP:-0.0.0.0}:8443:8443'
-      - '${BIND_IP:-0.0.0.0}:9229:9229'
+      - '127.0.0.1:9229:9229'
     mem_limit: 4g
     cpus: 2.0
     environment:
       NODE_OPTIONS: --max-old-space-size=3072
+      NODE_ENV: development
       DATABASE_URL: postgres://evtivity:evtivity@postgres:5432/evtivity
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
       REDIS_URL: redis://ocpp:${REDIS_OCPP_PASSWORD:-ocpp-dev-password}@redis:6379
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
+      # Off by default. scripts/docker-build.sh turns it on with the tools profile:
+      # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
+      NOTIFICATIONS_ALLOW_TEST_SINK: ${NOTIFICATIONS_ALLOW_TEST_SINK:-false}
+      NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
       NODE_INSPECT: ${NODE_INSPECT:-}
       OCPP_PORT: ${OCPP_PORT:-7103}
       OCPP_HEALTH_PORT: 8081
@@ -298,6 +311,9 @@ services:
       OCPI_SIM_PORT: ${OCPI_SIM_PORT:-7105}
       OCPI_SIM_ROLE: emsp
       OCPI_SIM_BASE_URL: http://ocpi-simulator:${OCPI_SIM_PORT:-7105}
+      # The CSMS advertises OCPI_BASE_URL (localhost), which is this container:
+      # call the ocpi service instead.
+      OCPI_SIM_TARGET_ORIGIN: http://ocpi:${OCPI_PORT:-7104}
       OCPI_SIM_COUNTRY_CODE: NL
       OCPI_SIM_PARTY_ID: SIM
       OCPI_SIM_NAME: OCPI Simulator
@@ -318,6 +334,9 @@ services:
       OCPI_SIM_PORT: ${OCPI_SIM_CPO_PORT:-7106}
       OCPI_SIM_ROLE: cpo
       OCPI_SIM_BASE_URL: http://ocpi-cpo-sim:${OCPI_SIM_CPO_PORT:-7106}
+      # The CSMS advertises OCPI_BASE_URL (localhost), which is this container:
+      # call the ocpi service instead.
+      OCPI_SIM_TARGET_ORIGIN: http://ocpi:${OCPI_PORT:-7104}
       OCPI_SIM_COUNTRY_CODE: DE
       OCPI_SIM_PARTY_ID: CPO
       OCPI_SIM_NAME: OCPI CPO Simulator
@@ -344,6 +363,10 @@ services:
       REDIS_URL: redis://worker:${REDIS_WORKER_PASSWORD:-worker-dev-password}@redis:6379
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
+      # Off by default. scripts/docker-build.sh turns it on with the tools profile:
+      # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
+      NOTIFICATIONS_ALLOW_TEST_SINK: ${NOTIFICATIONS_ALLOW_TEST_SINK:-false}
+      NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
       API_PORT: ${API_PORT:-7102}
       OCPP_PORT: ${OCPP_PORT:-7103}
       OCPP_SERVER_URL: ws://ocpp:${OCPP_PORT:-7103}
@@ -363,7 +386,7 @@ services:
     image: dpage/pgadmin4:latest
     restart: unless-stopped
     ports:
-      - '${BIND_IP:-0.0.0.0}:${PGADMIN_PORT:-7109}:80'
+      - '${INFRA_BIND_IP:-127.0.0.1}:${PGADMIN_PORT:-7109}:80'
     mem_limit: 1g
     cpus: 0.5
     environment:
@@ -383,10 +406,38 @@ services:
     image: axllent/mailpit:latest
     restart: unless-stopped
     ports:
-      - '${BIND_IP:-0.0.0.0}:${MAILPIT_PORT:-7108}:8025'
-      - '1025:1025'
+      - '${INFRA_BIND_IP:-127.0.0.1}:${MAILPIT_PORT:-7108}:8025'
+      - '${INFRA_BIND_IP:-127.0.0.1}:1025:1025'
     mem_limit: 1g
     cpus: 0.25
+    profiles:
+      - tools
+
+  # Notification test sink: receives the driver SMS and push the api, ocpp and
+  # worker would send to Twilio and Expo (NOTIFICATIONS_ALLOW_TEST_SINK). Read
+  # them with GET /messages (docker/notify-sink/server.mjs). Local dev only.
+  notify-sink:
+    image: node:24-alpine
+    restart: unless-stopped
+    command: ['node', '/app/server.mjs']
+    working_dir: /app
+    volumes:
+      - ./docker/notify-sink:/app:ro
+    ports:
+      - '${INFRA_BIND_IP:-127.0.0.1}:${NOTIFY_SINK_PORT:-7111}:8080'
+    mem_limit: 256m
+    cpus: 0.25
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:8080/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     profiles:
       - tools
 
@@ -397,8 +448,8 @@ services:
     mem_limit: 1g
     cpus: 0.25
     ports:
-      - '21:21'
-      - '30000-30009:30000-30009'
+      - '${INFRA_BIND_IP:-127.0.0.1}:21:21'
+      - '${INFRA_BIND_IP:-127.0.0.1}:30000-30009:30000-30009'
     environment:
       PUBLICHOST: localhost
       FTP_USER_NAME: evtivity
@@ -414,7 +465,7 @@ services:
     image: prom/prometheus:v3.2.1
     restart: unless-stopped
     ports:
-      - '${BIND_IP:-0.0.0.0}:9090:9090'
+      - '${INFRA_BIND_IP:-127.0.0.1}:9090:9090'
     mem_limit: 1g
     cpus: 0.5
     volumes:
@@ -427,7 +478,7 @@ services:
     image: grafana/grafana:11.5.2
     restart: unless-stopped
     ports:
-      - '${BIND_IP:-0.0.0.0}:${GRAFANA_PORT:-7107}:3000'
+      - '${INFRA_BIND_IP:-127.0.0.1}:${GRAFANA_PORT:-7107}:3000'
     mem_limit: 1g
     cpus: 0.5
     environment:
@@ -452,7 +503,7 @@ services:
     image: grafana/loki:3.4.2
     restart: unless-stopped
     ports:
-      - '${BIND_IP:-0.0.0.0}:3100:3100'
+      - '${INFRA_BIND_IP:-127.0.0.1}:3100:3100'
     mem_limit: 1g
     cpus: 0.5
     command: -config.file=/etc/loki/local-config.yaml

@@ -12,13 +12,21 @@ import { MeterValuesTable } from '@/components/MeterValuesTable';
 import { SessionDetailsTab } from '@/components/session/SessionDetailsTab';
 import { SessionGuestTab } from '@/components/session/SessionGuestTab';
 import { SessionPaymentTab, type PaymentRecord } from '@/components/session/SessionPaymentTab';
+import {
+  SessionRebillCard,
+  type RebillBlockedReason,
+  type RebillStatus,
+} from '@/components/session/SessionRebillCard';
 import { Badge } from '@/components/ui/badge';
+import { accountBillingState, isBilledOnAccount } from '@/lib/account-billing';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { api } from '@/lib/api';
 import { formatCents, formatDuration } from '@/lib/formatting';
 import { useUserTimezone } from '@/lib/timezone';
 import { sessionStatusVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
+import { EntityHistoryTab } from '@/components/EntityHistoryTab';
+import { useHasPermission } from '@/lib/auth';
 
 interface GuestSessionInfo {
   sessionToken: string;
@@ -50,6 +58,13 @@ interface SessionDetailData {
   stoppedReason: string | null;
   reservationId: string | null;
   freeVend: boolean | null;
+  billingMode?: 'card' | 'account' | null;
+  billingFleetName?: string | null;
+  invoiceStatus?: string | null;
+  rebillStatus?: RebillStatus | null;
+  rebillClaimedAt?: string | null;
+  rebillable: boolean;
+  rebillBlockedReason: RebillBlockedReason | null;
   co2AvoidedKg: number | null;
   paymentRecord: PaymentRecord | null;
   guestSession: GuestSessionInfo | null;
@@ -69,6 +84,7 @@ export function SessionDetail(): React.JSX.Element {
   const timezone = useUserTimezone();
 
   const [tab, setTab] = useTab('details');
+  const canReadAudit = useHasPermission('audit:read');
 
   const {
     data: session,
@@ -139,6 +155,16 @@ export function SessionDetail(): React.JSX.Element {
             ? t('status.idle')
             : t(`status.${session.status}`, { defaultValue: session.status })}
         </Badge>
+        {session.rebillStatus === 'manual' && (
+          <Badge variant="warning">{t('sessions.manualBilling')}</Badge>
+        )}
+        {isBilledOnAccount(session) && (
+          <Badge variant="info" data-testid="session-billing-badge">
+            {t('sessions.billedTo', { fleet: session.billingFleetName ?? '' })}
+            {' · '}
+            {t(`sessions.billingState.${accountBillingState(session.invoiceStatus)}`)}
+          </Badge>
+        )}
         {tokenMismatch != null && (
           <Badge variant="warning" title={t('sessions.reservationTokenMismatchTooltip')}>
             {t('sessions.reservationTokenMismatch')}
@@ -155,9 +181,11 @@ export function SessionDetail(): React.JSX.Element {
           {session.guestSession != null && (
             <TabsTrigger value="guest">{t('sessions.guestSessionTab')}</TabsTrigger>
           )}
+          {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="details" className="space-y-6">
+          <SessionRebillCard session={session} />
           <SessionDetailsTab
             session={session}
             sessionId={id ?? ''}
@@ -196,6 +224,10 @@ export function SessionDetail(): React.JSX.Element {
             />
           </TabsContent>
         )}
+
+        <TabsContent value="history">
+          <EntityHistoryTab entityType="session" entityId={id ?? ''} />
+        </TabsContent>
       </Tabs>
     </div>
   );

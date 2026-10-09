@@ -3,11 +3,12 @@
 
 import { readFileSync } from 'node:fs';
 import type postgres from 'postgres';
-import { CSS_RECONNECT_SPREAD_S, type PubSubClient } from '@evtivity/lib';
+import { CSS_RECONNECT_SPREAD_S, tryParseJson, type PubSubClient } from '@evtivity/lib';
 import { StationSimulator, type StationConfig } from './station-simulator.js';
 import { ClockAlignedScheduler } from './clock-aligned-scheduler.js';
 import { isTlsReachable } from './tls-probe.js';
 import { config as cssConfig } from './lib/config.js';
+import { logger } from './lib/logger.js';
 import { isStationStuck, MAX_HEAL_ATTEMPTS, MAX_HEAL_PER_TICK } from './simulator-heal.js';
 
 // Resolve the SP3 PEM bundle from env: prefer the inlined *_PEM variants
@@ -124,13 +125,12 @@ export class SimulatorManager {
   }
 
   async handleCommand(raw: string): Promise<void> {
-    let cmd: CssCommand;
-    try {
-      cmd = JSON.parse(raw) as CssCommand;
-    } catch {
+    const parsed = tryParseJson(raw);
+    if (parsed === undefined) {
       console.log('[simulator-manager] Failed to parse command JSON');
       return;
     }
+    const cmd = parsed as CssCommand;
 
     const sim = this.simulators.get(cmd.stationId);
     if (!sim) {
@@ -159,8 +159,8 @@ export class SimulatorManager {
           ...(data != null ? { data } : {}),
         }),
       );
-    } catch {
-      // Best-effort: a missed result message just falls back to the API timeout.
+    } catch (err) {
+      logger.warn({ err, commandId }, 'Publish of the command result failed, the API times out');
     }
   }
 
@@ -446,8 +446,44 @@ export class SimulatorManager {
         case 'unplug':
           await sim.unplug(params.evseId as number);
           break;
+        case 'suspendCharging':
+          await sim.suspendCharging(params.evseId as number, params.by as 'EV' | 'EVSE');
+          break;
+        case 'resumeCharging':
+          await sim.resumeCharging(params.evseId as number);
+          break;
+        case 'evFull':
+          await sim.evFull(params.evseId as number);
+          break;
+        case 'powerCycle': {
+          const powerOffMs = (params.powerOffMs as number | undefined) ?? 0;
+          if (params.preserveTransactions === false) {
+            await sim.simulatePowerCycle('PowerLoss', powerOffMs);
+          } else {
+            await sim.simulatePowerCyclePreserveTransactions(powerOffMs);
+          }
+          break;
+        }
+        case 'createPncEv':
+          resultData = await sim.createPncEv(
+            params.evseId as number,
+            (params.edition as 2 | 20 | undefined) ?? 2,
+          );
+          break;
+        case 'installPncContract':
+          resultData = await sim.installPncContract(params.evseId as number);
+          break;
+        case 'startPncCharging': {
+          const txId = await sim.startPncCharging(params.evseId as number);
+          resultData = { transactionId: txId };
+          break;
+        }
         case 'injectFault':
-          await sim.injectFault(params.evseId as number, params.errorCode as string);
+          await sim.injectFault(
+            params.evseId as number,
+            params.errorCode as string,
+            (params.mode as 'end' | 'suspend' | undefined) ?? 'end',
+          );
           break;
         case 'clearFault':
           await sim.clearFault(params.evseId as number);

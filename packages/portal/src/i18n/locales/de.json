@@ -20,7 +20,9 @@
     "deactivate": "Deaktivieren",
     "remove": "Entfernen",
     "inclTax": "inkl. Steuer",
-    "amountInclTax": "{{amount}} inkl. Steuer"
+    "amountInclTax": "{{amount}} inkl. Steuer",
+    "close": "Schließen",
+    "toggleSuggestions": "Vorschläge ein- oder ausblenden"
   },
   "nav": {
     "home": "Startseite",
@@ -52,6 +54,7 @@
     "registrationFailed": "Registrierung fehlgeschlagen",
     "mfaTitle": "Bestätigung erforderlich",
     "mfaSubtitle": "Gib den 6-stelligen Code aus deiner {{method}} ein",
+    "mfaCodeLabel": "Bestätigungscode",
     "mfaVerify": "Bestätigen",
     "mfaResend": "Code erneut senden",
     "mfaResending": "Wird gesendet...",
@@ -144,7 +147,7 @@
     "charging": "Lädt",
     "idle": "Leerlauf",
     "limitReached": {
-      "cost": "Laden pausiert: Der Ladevorgang hat sein Kostenlimit erreicht (den auf deiner Karte reservierten Betrag).",
+      "cost": "Laden pausiert: Der Ladevorgang hat sein Kostenlimit erreicht.",
       "energy": "Laden pausiert: Der Ladevorgang hat sein Energielimit erreicht.",
       "time": "Laden pausiert: Der Ladevorgang hat sein Zeitlimit erreicht."
     },
@@ -245,7 +248,8 @@
     "priceDisplayDefault": "Vorgabe des Betreibers ({{value}})",
     "priceDisplayGross": "Inklusive Steuer (brutto)",
     "priceDisplayNet": "Exklusive Steuer (netto)",
-    "priceDisplayHelper": "Inklusive Steuer zeigt Preise mit Steuer. Exklusive Steuer zeigt Preise vor Steuer. Der abgerechnete Betrag ist in beiden Fällen gleich, und solange du nichts wählst, gilt die Vorgabe des Betreibers."
+    "priceDisplayHelper": "Inklusive Steuer zeigt Preise mit Steuer. Exklusive Steuer zeigt Preise vor Steuer. Der abgerechnete Betrag ist in beiden Fällen gleich, und solange du nichts wählst, gilt die Vorgabe des Betreibers.",
+    "mfaQrCode": "QR-Code für die Authenticator-App"
   },
   "charger": {
     "loadingInfo": "Ladestationsinfos werden geladen...",
@@ -540,7 +544,13 @@
     "EVSE_IN_USE": "An diesem Anschluss ist bereits ein anderer Ladevorgang aktiv",
     "EVSE_NOT_FOUND": "EVSE nicht gefunden",
     "FAVORITE_NOT_FOUND": "Favorit nicht gefunden",
+    "FLEET_CREDIT_LIMIT_REACHED": "Das Kreditlimit der Flotte, über die deine Ladevorgänge abgerechnet werden, ist erreicht. Wende dich an deinen Flottenverwalter.",
     "FLEET_DISABLED": "Flotte ist deaktiviert",
+    "FLEET_BILLING_OLD_PODS_CONNECTED": "Ein Prozess älter als v0.1.41 ist noch verbunden. Schließe das Upgrade ab und schalte dann die Abrechnung auf Rechnung ein.",
+    "FLEET_BILLING_CONTACT_REQUIRED": "Die Flotte benötigt mindestens einen Rechnungskontakt für die automatische Rechnungsstellung und den Rechnungsversand per E-Mail.",
+    "FLEET_INVOICE_PERIOD_EXISTS": "Für diesen Zeitraum besteht bereits eine Rechnung der Flotte. Stornieren Sie sie mit einer Stornorechnung, um den Zeitraum neu abzurechnen.",
+    "FLEET_INVOICE_NOTHING_TO_BILL": "Die Flotte hat für diesen Zeitraum keine noch nicht abgerechneten Ladevorgänge mit Kosten.",
+    "FLEET_HAS_OPEN_BILLING": "Die Flotte hat Ladevorgänge, die auf ihre Rechnung abgerechnet werden, und kann nicht gelöscht werden. Schalte stattdessen die Abrechnung auf Rechnung aus.",
     "FLEET_NOT_FOUND": "Flotte nicht gefunden",
     "FLEET_RESERVATION_ALREADY_CANCELLED": "Flottenreservierung wurde bereits storniert",
     "FLEET_RESERVATION_CREATE_FAILED": "Flottenreservierung konnte nicht erstellt werden",
@@ -566,7 +576,12 @@
     "INVALID_RESTRICTIONS": "Ungültige Tarifbeschränkungen",
     "INVALID_SITE_IDS": "Eine oder mehrere siteIds existieren nicht",
     "INVALID_TOKEN": "Ungültiger oder abgelaufener Zurücksetzungslink",
+    "INVOICE_ALREADY_PAID": "Die Rechnung ist bereits bezahlt",
     "INVOICE_CREATION_FAILED": "Rechnung konnte nicht erstellt werden",
+    "INVOICE_NOT_ISSUED": "Für diese Aktion muss die Rechnung ausgestellt sein",
+    "INVOICE_IS_CREDIT_NOTE": "Eine Stornorechnung kann nicht als bezahlt markiert oder storniert werden",
+    "INVOICE_ALREADY_CREDITED": "Die Rechnung ist bereits durch eine Stornorechnung storniert",
+    "INVOICE_NOT_VOIDABLE": "Nur ein Rechnungsentwurf kann storniert werden. Eine ausgestellte Rechnung wird mit einer Stornorechnung korrigiert",
     "INVOICE_NO_SESSIONS": "Keine nicht abgerechneten Ladevorgänge im ausgewählten Zeitraum",
     "INVOICE_NO_DRIVER": "Diese Rechnung hat keinen Fahrer, an den sie gesendet werden kann",
     "INVOICE_NOT_FOUND": "Rechnung nicht gefunden",
@@ -592,6 +607,7 @@
     "MFA_TOTP_NO_RESEND": "TOTP-Codes können nicht erneut gesendet werden",
     "MISSING_PAYMENT_INTENT": "Payment Intent fehlt",
     "MISSING_VERSION_URL": "Partner-Versions-URL ist für die Registrierung erforderlich",
+    "NOTIFICATION_EVENT_REQUIRED": "Diese Benachrichtigung wird für den Kontozugang benötigt und kann nicht deaktiviert werden",
     "NOT_BLOCKED": "Station ist nicht blockiert",
     "NOT_CHARGING": "Der Ladevorgang lädt derzeit nicht",
     "NOT_DRAFT": "Nur Entwurfskampagnen können aktualisiert werden",
@@ -651,9 +667,10 @@
     "PROVIDER_TEST_FAILED": "Anbieter hat zurückgegeben: ...",
     "PUSH_NOT_FOUND": "Push nicht gefunden",
     "PUSH_REJECTED": "Station hat Push abgelehnt: ...",
-    "RATE_LIMITED": "Zu viele Statusprüfungen für diese Station",
+    "RATE_LIMITED": "Zu viele Anfragen. Warten Sie einen Moment und versuchen Sie es erneut.",
     "RECAPTCHA_FAILED": "reCAPTCHA-Verifizierung fehlgeschlagen",
     "RECAPTCHA_REQUIRED": "reCAPTCHA-Token ist erforderlich",
+    "RECAPTCHA_SECRET_REQUIRED": "Zum Aktivieren von reCAPTCHA ist ein reCAPTCHA-Geheimschlüssel erforderlich",
     "REFUND_EXCEEDS_REMAINING": "Erstattungsbetrag überschreitet den verbleibenden Betrag ...",
     "REFUND_TOP_UP_UNKNOWN": "Diese Zahlung enthält eine Nachbelastung ohne gespeicherte Zahlungs-ID. Erstatte diese im Dashboard des Zahlungsanbieters.",
     "REGION_NOT_FOUND": "Region nicht gefunden",
@@ -682,6 +699,9 @@
     "SESSION_CREATE_FAILED": "Ladevorgang konnte nicht erstellt werden",
     "SESSION_NOT_FOUND": "Ladevorgang nicht gefunden",
     "SESSION_NOT_LINKED": "Ladevorgang ist nicht mit diesem Fall verknüpft",
+    "SESSION_REBILL_IN_PROGRESS": "Der Ladevorgang wird gerade abgerechnet. Versuchen Sie es in einigen Minuten erneut.",
+    "SESSION_REBILL_NOT_ELIGIBLE": "Dieser Ladevorgang kann nicht abgerechnet werden",
+    "SESSION_REBILL_PAYMENT_PENDING": "Für den Ladevorgang gibt es eine Zahlung, die der Zahlungsanbieter noch nicht abgeschlossen hat. Versuchen Sie es später erneut.",
     "SETTING_NOT_FOUND": "Einstellung nicht gefunden",
     "SITE_HAS_STATIONS": "Standort mit Stationen kann nicht gelöscht werden. Entferne oder verschiebe zunächst die Stationen.",
     "SITE_NOT_FOUND": "Standort nicht gefunden",
@@ -744,12 +764,24 @@
     "EMAID_PREFIX_NOT_CONFIGURED": "Legen Sie zuerst Ländercode und Provider-ID der eMAID fest",
     "LOCAL_CA_EXISTS": "Eine lokale Vertrags-CA ist bereits vorhanden",
     "LOCAL_CA_NOT_CONFIGURED": "Erstellen Sie zuerst die lokale Vertrags-CA",
-    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge-Vertrag nicht gefunden"
+    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge-Vertrag nicht gefunden",
+    "PHONE_REGISTRATION_LIMITED": "Mit dieser Telefonnummer wurden zu viele Konten registriert. Versuchen Sie es später erneut.",
+    "VERIFICATION_RESEND_LIMITED": "Zu viele Bestätigungs-E-Mails. Warten Sie, bevor Sie eine weitere anfordern."
   },
   "validation": {
     "required": "Dieses Feld ist erforderlich",
     "email": "Gib eine gültige E-Mail-Adresse ein",
-    "minLength": "Muss mindestens {{min}} Zeichen lang sein"
+    "minLength": "Muss mindestens {{min}} Zeichen lang sein",
+    "passwordNeeds": "Das Passwort braucht:",
+    "passwordMissing": "Das Passwort braucht {{rules}}.",
+    "passwordRuleMet": "erfüllt",
+    "passwordRuleNotMet": "nicht erfüllt",
+    "passwordRule": {
+      "minLength": "mindestens {{min}} Zeichen",
+      "uppercase": "einen Großbuchstaben",
+      "lowercase": "einen Kleinbuchstaben",
+      "number": "eine Ziffer"
+    }
   },
   "activity": {
     "title": "Aktivität",
@@ -763,7 +795,9 @@
     "co2Avoided": "Vermiedenes CO₂",
     "co2AvoidedMessage": "Du hast in diesem Monat {{amount}} kg CO₂ vermieden",
     "miles": "Meilen",
-    "km": "km"
+    "km": "km",
+    "previousMonth": "Vorheriger Monat",
+    "nextMonth": "Nächster Monat"
   },
   "statement": {
     "title": "Monatsabrechnung",
@@ -981,5 +1015,27 @@
         "home": "Zur Startseite"
       }
     }
+  },
+  "sessionStatus": {
+    "active": "Aktiv",
+    "completed": "Abgeschlossen",
+    "invalid": "Ungültig",
+    "faulted": "Fehlerhaft",
+    "failed": "Fehlgeschlagen"
+  },
+  "fleetBilling": {
+    "billedTo": "Abgerechnet über {{fleet}}",
+    "startHint": "Deine Flotte zahlt diesen Ladevorgang. Du brauchst keine Zahlungsmethode.",
+    "title": "Flottenabrechnung",
+    "fleet": "Abgerechnet über",
+    "status": "Status",
+    "state": {
+      "unbilled": "Noch nicht abgerechnet",
+      "invoiced": "Der Flotte in Rechnung gestellt",
+      "paid": "Von der Flotte bezahlt"
+    },
+    "sessionLine": "{{fleet}}: {{state}}",
+    "paymentMethodsNote": "Dein Laden wird über {{fleet}} abgerechnet. Zum Laden brauchst du keine Zahlungsmethode.",
+    "noMethods": "Noch keine Zahlungsmethoden."
   }
 }

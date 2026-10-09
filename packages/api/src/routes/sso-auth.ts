@@ -3,13 +3,14 @@
 
 import type { FastifyInstance } from 'fastify';
 import { SAML } from '@node-saml/node-saml';
-import { eq, ilike } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db, getSsoConfig, users, roles, writeAudit, userAuditLog } from '@evtivity/database';
 import { generateId } from '@evtivity/lib';
 import { setAuthCookies, isSecureRequest } from '../lib/auth-cookies.js';
 import { createRefreshToken } from '../services/refresh-token.service.js';
 import { config as apiConfig } from '../lib/config.js';
 import { errorWith } from '../lib/response-schemas.js';
+import { emailEquals } from '../lib/email-match.js';
 
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 
@@ -91,7 +92,8 @@ export function ssoAuthRoutes(app: FastifyInstance): void {
           return;
         }
         profile = result.profile;
-      } catch {
+      } catch (err) {
+        request.log.warn({ err }, 'SAML response did not validate, redirecting to login');
         await reply.redirect('/login?error=sso_config_error');
         return;
       }
@@ -119,7 +121,7 @@ export function ssoAuthRoutes(app: FastifyInstance): void {
           isActive: users.isActive,
         })
         .from(users)
-        .where(ilike(users.email, email))
+        .where(emailEquals(users.email, email))
         .limit(1);
 
       if (existingUser != null) {

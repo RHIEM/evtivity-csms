@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useState, useCallback, useEffect, useImperativeHandle, useRef, forwardRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import TextAlign from '@tiptap/extension-text-align';
@@ -137,9 +138,16 @@ interface WysiwygEditorProps {
 
 export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>(
   function WysiwygEditor({ value, onChange, placeholder }, ref) {
+    const { t } = useTranslation();
     const [showSource, setShowSource] = useState(false);
     const [sourceValue, setSourceValue] = useState('');
     const sourceRef = useRef<HTMLTextAreaElement>(null);
+    // The value last loaded from outside and the editor's HTML for it. The editor normalizes
+    // HTML, so when an edit (or an undo) brings the document back to that HTML, onChange
+    // reports the loaded value: a parent comparing it with the saved template sees no change.
+    const loadedRef = useRef<{ value: string; html: string } | null>(null);
+    // The source text when the HTML source view opened, and the value at that moment.
+    const sourceOpenRef = useRef<{ text: string; value: string } | null>(null);
 
     const editor = useEditor({
       extensions: [
@@ -172,7 +180,9 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
       ],
       content: value,
       onUpdate: ({ editor: ed }) => {
-        onChange(cleanCellParagraphs(ed.getHTML()));
+        const html = cleanCellParagraphs(ed.getHTML());
+        const loaded = loadedRef.current;
+        onChange(loaded != null && html === loaded.html ? loaded.value : html);
       },
       editorProps: {
         handleDrop: (_view, event) => {
@@ -213,13 +223,18 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
       [editor, showSource, sourceValue, onChange],
     );
 
-    // Sync external value changes into the editor (e.g. after reset to default).
+    // Sync external value changes into the editor (e.g. after reset to default). A value this
+    // editor emitted (an edit, or the loaded value reported back after an undo) is not reloaded.
     useEffect(() => {
       if (editor.isDestroyed) return;
       const current = cleanCellParagraphs(editor.getHTML());
-      if (current !== value) {
-        editor.commands.setContent(value, { emitUpdate: false });
+      const loaded = loadedRef.current;
+      if (current === value || (loaded?.value === value && loaded.html === current)) {
+        loadedRef.current ??= { value, html: current };
+        return;
       }
+      editor.commands.setContent(value, { emitUpdate: false });
+      loadedRef.current = { value, html: cleanCellParagraphs(editor.getHTML()) };
     }, [editor, value]);
 
     // Native DOM listeners for drag-and-drop variable insertion.
@@ -228,7 +243,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
       try {
         dom = editor.view.dom;
       } catch {
-        // Editor view not mounted yet (e.g. inside a hidden tab)
+        // fail-open: the editor view is not mounted yet (e.g. inside a hidden tab)
         return;
       }
 
@@ -258,14 +273,20 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
 
     const toggleSource = useCallback(() => {
       if (showSource) {
-        editor.commands.setContent(sourceValue, { emitUpdate: false });
-        onChange(sourceValue);
+        // Unedited source changes nothing: viewing the HTML is not an edit.
+        if (sourceValue !== sourceOpenRef.current?.text) {
+          editor.commands.setContent(sourceValue, { emitUpdate: false });
+          onChange(sourceValue);
+        }
+        sourceOpenRef.current = null;
         setShowSource(false);
       } else {
-        setSourceValue(formatHtml(cleanCellParagraphs(editor.getHTML())));
+        const text = formatHtml(cleanCellParagraphs(editor.getHTML()));
+        sourceOpenRef.current = { text, value };
+        setSourceValue(text);
         setShowSource(true);
       }
-    }, [showSource, sourceValue, editor, onChange]);
+    }, [showSource, sourceValue, editor, onChange, value]);
 
     const addLink = useCallback(() => {
       const url = window.prompt('URL');
@@ -282,7 +303,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleBold().run();
             }}
             active={editor.isActive('bold')}
-            title="Bold"
+            title={t('editor.bold')}
           >
             <Bold className="h-4 w-4" />
           </ToolbarButton>
@@ -291,7 +312,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleItalic().run();
             }}
             active={editor.isActive('italic')}
-            title="Italic"
+            title={t('editor.italic')}
           >
             <Italic className="h-4 w-4" />
           </ToolbarButton>
@@ -300,7 +321,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleStrike().run();
             }}
             active={editor.isActive('strike')}
-            title="Strikethrough"
+            title={t('editor.strikethrough')}
           >
             <Strikethrough className="h-4 w-4" />
           </ToolbarButton>
@@ -312,7 +333,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleHeading({ level: 1 }).run();
             }}
             active={editor.isActive('heading', { level: 1 })}
-            title="Heading 1"
+            title={t('editor.heading1')}
           >
             <Heading1 className="h-4 w-4" />
           </ToolbarButton>
@@ -321,7 +342,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleHeading({ level: 2 }).run();
             }}
             active={editor.isActive('heading', { level: 2 })}
-            title="Heading 2"
+            title={t('editor.heading2')}
           >
             <Heading2 className="h-4 w-4" />
           </ToolbarButton>
@@ -330,7 +351,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleHeading({ level: 3 }).run();
             }}
             active={editor.isActive('heading', { level: 3 })}
-            title="Heading 3"
+            title={t('editor.heading3')}
           >
             <Heading3 className="h-4 w-4" />
           </ToolbarButton>
@@ -342,7 +363,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleBulletList().run();
             }}
             active={editor.isActive('bulletList')}
-            title="Bullet list"
+            title={t('editor.bulletList')}
           >
             <List className="h-4 w-4" />
           </ToolbarButton>
@@ -351,7 +372,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().toggleOrderedList().run();
             }}
             active={editor.isActive('orderedList')}
-            title="Ordered list"
+            title={t('editor.orderedList')}
           >
             <ListOrdered className="h-4 w-4" />
           </ToolbarButton>
@@ -363,7 +384,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().setTextAlign('left').run();
             }}
             active={editor.isActive({ textAlign: 'left' })}
-            title="Align left"
+            title={t('editor.alignLeft')}
           >
             <AlignLeft className="h-4 w-4" />
           </ToolbarButton>
@@ -372,7 +393,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().setTextAlign('center').run();
             }}
             active={editor.isActive({ textAlign: 'center' })}
-            title="Align center"
+            title={t('editor.alignCenter')}
           >
             <AlignCenter className="h-4 w-4" />
           </ToolbarButton>
@@ -381,14 +402,18 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().setTextAlign('right').run();
             }}
             active={editor.isActive({ textAlign: 'right' })}
-            title="Align right"
+            title={t('editor.alignRight')}
           >
             <AlignRight className="h-4 w-4" />
           </ToolbarButton>
 
           <div className="w-px bg-border mx-1" />
 
-          <ToolbarButton onClick={addLink} active={editor.isActive('link')} title="Insert link">
+          <ToolbarButton
+            onClick={addLink}
+            active={editor.isActive('link')}
+            title={t('editor.insertLink')}
+          >
             <LinkIcon className="h-4 w-4" />
           </ToolbarButton>
 
@@ -396,12 +421,12 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
 
           <input
             type="color"
-            aria-label="Text color"
+            aria-label={t('editor.textColor')}
             className="w-8 h-8 rounded cursor-pointer border-0 p-0.5"
             onChange={(e) => {
               editor.chain().focus().setColor(e.target.value).run();
             }}
-            title="Text color"
+            title={t('editor.textColor')}
           />
 
           <div className="w-px bg-border mx-1" />
@@ -411,7 +436,7 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().undo().run();
             }}
             active={false}
-            title="Undo"
+            title={t('editor.undo')}
           >
             <Undo className="h-4 w-4" />
           </ToolbarButton>
@@ -420,14 +445,14 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
               editor.chain().focus().redo().run();
             }}
             active={false}
-            title="Redo"
+            title={t('editor.redo')}
           >
             <Redo className="h-4 w-4" />
           </ToolbarButton>
 
           <div className="flex-1" />
 
-          <ToolbarButton onClick={toggleSource} active={showSource} title="HTML source">
+          <ToolbarButton onClick={toggleSource} active={showSource} title={t('editor.htmlSource')}>
             <Code className="h-4 w-4" />
           </ToolbarButton>
         </div>
@@ -438,8 +463,10 @@ export const WysiwygEditor = forwardRef<WysiwygEditorHandle, WysiwygEditorProps>
             className="w-full min-h-[200px] p-3 font-mono text-sm bg-background resize-y focus:outline-hidden"
             value={sourceValue}
             onChange={(e) => {
-              setSourceValue(e.target.value);
-              onChange(e.target.value);
+              const text = e.target.value;
+              setSourceValue(text);
+              const opened = sourceOpenRef.current;
+              onChange(opened != null && text === opened.text ? opened.value : text);
             }}
           />
         ) : (
@@ -469,6 +496,7 @@ function ToolbarButton({
       className={`h-8 w-8 p-0 ${active ? 'bg-accent text-accent-foreground' : ''}`}
       onClick={onClick}
       title={title}
+      aria-label={title}
     >
       {children}
     </Button>

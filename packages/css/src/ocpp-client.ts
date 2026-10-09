@@ -4,7 +4,11 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import { checkServerIdentity, type PeerCertificate } from 'node:tls';
-import { SIMULATOR_CONNECTION_HEADER, SIMULATOR_CONNECTION_HEADER_VALUE } from '@evtivity/lib';
+import {
+  SIMULATOR_CONNECTION_HEADER,
+  SIMULATOR_CONNECTION_HEADER_VALUE,
+  tryParseJson,
+} from '@evtivity/lib';
 
 // Errors a TLS client raises when it does not accept the server certificate.
 const SERVER_CERTIFICATE_ERRORS = new Set([
@@ -329,8 +333,13 @@ export class OcppClient {
       if (this.clientKey != null) wsOptions['key'] = this.clientKey;
     }
 
+    // An explicit connect after disconnect() (the station comes back online)
+    // turns automatic reconnection back on.
+    this.destroyed = false;
+
     return new Promise<void>((resolve, reject) => {
-      this.ws = new WebSocket(url, [this._protocol], wsOptions);
+      const socket = new WebSocket(url, [this._protocol], wsOptions);
+      this.ws = socket;
 
       this.ws.on('open', () => {
         this.connected = true;
@@ -349,6 +358,9 @@ export class OcppClient {
       });
 
       this.ws.on('close', (code: number, reason: Buffer) => {
+        // The close of a socket that disconnect() dropped can arrive after a
+        // newer connection opened: it says nothing about the current one.
+        if (this.ws != null && this.ws !== socket) return;
         this.connected = false;
         if (this.onDisconnectedCallback != null) {
           this.onDisconnectedCallback();
@@ -526,10 +538,8 @@ export class OcppClient {
   }
 
   private handleMessage(raw: string): void {
-    let parsed: unknown[];
-    try {
-      parsed = JSON.parse(raw) as unknown[];
-    } catch {
+    const parsed = tryParseJson(raw);
+    if (parsed === undefined) {
       console.error(`[${this._stationId}] Invalid JSON: ${raw}`);
       return;
     }
@@ -573,9 +583,9 @@ export class OcppClient {
 
       if (this.onIncomingCall == null) {
         console.warn(
-          `[${this._stationId}] No incoming call handler registered, returning NotSupported for ${action}`,
+          `[${this._stationId}] No incoming call handler registered, answering ${action} with NotImplemented`,
         );
-        this.sendCallResult(messageId, { status: 'NotSupported' });
+        this.sendCallError(messageId, 'NotImplemented', `${action} NotImplemented`);
         return;
       }
 

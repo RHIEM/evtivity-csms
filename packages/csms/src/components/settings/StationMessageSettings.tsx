@@ -30,7 +30,9 @@ type StationMessageState =
   | 'payment_failed'
   | 'payment_required'
   | 'guest_unauthorized'
-  | 'unauthorized';
+  | 'unauthorized'
+  | 'prepaid_exhausted'
+  | 'account_credit_limit';
 
 type StationMessageLanguage = (typeof LANGUAGES)[number]['code'];
 
@@ -73,6 +75,8 @@ const ALL: ReadonlySet<StationMessageState> = new Set([
   'payment_required',
   'guest_unauthorized',
   'unauthorized',
+  'prepaid_exhausted',
+  'account_credit_limit',
 ]);
 
 const VARIABLES: VariableDef[] = [
@@ -155,6 +159,8 @@ const STATES: StationMessageState[] = [
   'payment_required',
   'guest_unauthorized',
   'unauthorized',
+  'prepaid_exhausted',
+  'account_credit_limit',
 ];
 
 const STATE_LABEL_KEY: Record<StationMessageState, string> = {
@@ -170,6 +176,8 @@ const STATE_LABEL_KEY: Record<StationMessageState, string> = {
   payment_required: 'messages.statePaymentRequired',
   guest_unauthorized: 'messages.stateGuestUnauthorized',
   unauthorized: 'messages.stateUnauthorized',
+  prepaid_exhausted: 'messages.statePrepaidExhausted',
+  account_credit_limit: 'messages.stateAccountCreditLimit',
 };
 
 interface StationMessageSettingsProps {
@@ -335,7 +343,8 @@ export function StationMessageSettings({
             body: bodyDraft,
           });
           setPreview(result.rendered);
-        } catch {
+        } catch (err) {
+          console.warn('Render station message preview failed', err);
           setPreview('');
         }
       })();

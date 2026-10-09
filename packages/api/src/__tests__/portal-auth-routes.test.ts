@@ -72,6 +72,7 @@ vi.mock('@evtivity/database', () => ({
   userTokens: {},
   getRecaptchaConfig: vi.fn().mockResolvedValue(null),
   isPortalRegistrationEnabled: vi.fn().mockResolvedValue(true),
+  resolveAccountBilling: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -95,6 +96,7 @@ vi.mock('argon2', () => ({
 }));
 
 vi.mock('@evtivity/lib', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
   AppError: class AppError extends Error {
     constructor(
       message: string,
@@ -134,6 +136,16 @@ vi.mock('@evtivity/services/template-dirs', () => ({
   OCPP_TEMPLATES_DIR: '/mock/templates',
 }));
 
+const signupLimits = vi.hoisted(() => ({
+  registrationPhone: vi.fn((phone: string | undefined) =>
+    phone == null || phone === '' ? null : phone,
+  ),
+  isPhoneRegistrationLimited: vi.fn().mockResolvedValue(false),
+  verificationResendRetryAfter: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../lib/signup-limits.js', () => signupLimits);
+
 const { activateDriverPortalMock } = vi.hoisted(() => ({
   activateDriverPortalMock: vi.fn(),
 }));
@@ -143,10 +155,11 @@ vi.mock('../services/driver-portal-access.service.js', () => ({
 }));
 
 import { eq, isNotNull } from 'drizzle-orm';
-import { AppError } from '@evtivity/lib';
-import { db } from '@evtivity/database';
+import { AppError, dispatchSystemNotification } from '@evtivity/lib';
+import { db, resolveAccountBilling } from '@evtivity/database';
 import { registerAuth } from '../plugins/auth.js';
 import { portalAuthRoutes } from '../routes/portal/auth.js';
+import * as argon2Module from 'argon2';
 
 const VALID_DRIVER_ID = 'drv_000000000001';
 const VALID_USER_ID = 'usr_000000000001';
@@ -381,7 +394,7 @@ describe('Portal auth routes - handler logic', () => {
     });
 
     it('returns 401 when password is invalid', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(false);
 
       setupDbResults([
@@ -412,7 +425,7 @@ describe('Portal auth routes - handler logic', () => {
     });
 
     it('returns driver and sets auth cookies on successful login', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(true);
 
       setupDbResults([
@@ -670,6 +683,39 @@ describe('Portal auth routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(DRIVER_ID);
       expect(body.email).toBe('john@example.com');
+      expect(body.billing).toEqual({ mode: 'card', fleetName: null });
+    });
+
+    it('returns account billing for a driver whose fleet bills on account', async () => {
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          phone: null,
+          language: 'en',
+          timezone: null,
+          themePreference: 'light',
+          distanceUnit: 'miles',
+          priceDisplay: null,
+          isActive: true,
+          emailVerified: true,
+          createdAt: '2024-01-01',
+        },
+      ]);
+      vi.mocked(resolveAccountBilling).mockResolvedValueOnce({
+        fleetId: 'flt_1',
+        fleetName: 'Acme Logistics',
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/auth/me',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().billing).toEqual({ mode: 'account', fleetName: 'Acme Logistics' });
+      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
     });
   });
 
@@ -778,6 +824,38 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().success).toBe(true);
+      const call = vi.mocked(dispatchSystemNotification).mock.calls.at(-1);
+      expect(call?.[1]).toBe('driver.AccountVerification');
+      expect(call?.[2]).not.toHaveProperty('phone');
+    });
+
+    it('refuses a resend over the per-driver cap with 429 and Retry-After', async () => {
+      signupLimits.verificationResendRetryAfter.mockResolvedValueOnce(42);
+      vi.mocked(dispatchSystemNotification).mockClear();
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          language: 'en',
+          emailVerified: false,
+        },
+      ]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/resend-verification',
+        cookies: { portal_token: signedDriverToken },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(429);
+      expect(response.headers['retry-after']).toBe('42');
+      expect(response.json()).toMatchObject({
+        code: 'VERIFICATION_RESEND_LIMITED',
+        retryAfterSeconds: 42,
+      });
+      expect(signupLimits.verificationResendRetryAfter).toHaveBeenCalledWith(DRIVER_ID);
+      expect(dispatchSystemNotification).not.toHaveBeenCalled();
     });
   });
 

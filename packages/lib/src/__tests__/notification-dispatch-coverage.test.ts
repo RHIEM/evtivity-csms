@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from 'vitest';
 
 // --- Mocks ---
 
@@ -115,6 +115,14 @@ function advanceClock(): { restore: () => void } {
   };
 }
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let notificationDispatchModule: typeof import('../notification-dispatch.js');
+let safeFetchModule: typeof import('../safe-fetch.js');
+beforeAll(async () => {
+  notificationDispatchModule = await import('../notification-dispatch.js');
+  safeFetchModule = await import('../safe-fetch.js');
+}, 30_000);
+
 describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
   let sql: ReturnType<typeof createSqlMock>;
 
@@ -140,22 +148,22 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('normalizeE164', () => {
     it('keeps an already-+-prefixed number after stripping punctuation', async () => {
-      const { normalizeE164 } = await import('../notification-dispatch.js');
+      const { normalizeE164 } = notificationDispatchModule;
       expect(normalizeE164('+1 (555) 123-4567')).toBe('+15551234567');
     });
 
     it('prepends +1 to a bare 10-digit US number', async () => {
-      const { normalizeE164 } = await import('../notification-dispatch.js');
+      const { normalizeE164 } = notificationDispatchModule;
       expect(normalizeE164('555.123.4567')).toBe('+15551234567');
     });
 
     it('prepends + to an 11-digit number that starts with 1', async () => {
-      const { normalizeE164 } = await import('../notification-dispatch.js');
+      const { normalizeE164 } = notificationDispatchModule;
       expect(normalizeE164('1 555 123 4567')).toBe('+15551234567');
     });
 
     it('returns punctuation-stripped value for non-US-shaped numbers', async () => {
-      const { normalizeE164 } = await import('../notification-dispatch.js');
+      const { normalizeE164 } = notificationDispatchModule;
       expect(normalizeE164('00 44 20 7946 0958')).toBe('00442079460958');
     });
   });
@@ -166,7 +174,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('wrapEmailHtml fallback', () => {
     it('falls back to default wrapper when custom template fails to compile', async () => {
-      const { wrapEmailHtml } = await import('../notification-dispatch.js');
+      const { wrapEmailHtml } = notificationDispatchModule;
       // Unclosed Handlebars block expression throws at compile time.
       const result = wrapEmailHtml('<p>Body</p>', 'Acme', '{{#if open}}no close');
       // Default wrapper used: body content present and DOCTYPE shell rendered.
@@ -183,7 +191,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
   describe('clearNotificationSettingsCache', () => {
     it('forces the next getNotificationSettings to re-read from the database', async () => {
       const { getNotificationSettings, clearNotificationSettingsCache } =
-        await import('../notification-dispatch.js');
+        notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults([{ key: 'smtp.host', value: 'first.example.com' }]);
@@ -208,7 +216,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
   describe('getSystemTimezoneCached', () => {
     it('reads the configured value and caches it on the second call', async () => {
       const { getSystemTimezoneCached, clearNotificationSettingsCache } =
-        await import('../notification-dispatch.js');
+        notificationDispatchModule;
       const clock = advanceClock();
       clearNotificationSettingsCache();
 
@@ -228,7 +236,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
     it('falls back to America/New_York when no row is configured', async () => {
       const { getSystemTimezoneCached, clearNotificationSettingsCache } =
-        await import('../notification-dispatch.js');
+        notificationDispatchModule;
       const clock = advanceClock();
       clearNotificationSettingsCache();
 
@@ -246,7 +254,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('loadTemplateFile cache', () => {
     it('returns cached content on the second call without re-reading the file', async () => {
-      const { loadTemplateFile } = await import('../notification-dispatch.js');
+      const { loadTemplateFile } = notificationDispatchModule;
       const uniquePath = `/cache-hit-${String(Date.now())}-${String(Math.random())}.hbs`;
       mockReadFile.mockResolvedValueOnce('<p>Cached body</p>');
 
@@ -267,14 +275,14 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('sendWebhook edge cases', () => {
     it('blocks delivery to a private/internal URL without calling fetch', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       const result = await sendWebhook('http://127.0.0.1/hook', 'Sub', 'Body', {});
       expect(result).toBe('blocked_private_url');
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('delivers to a private host in the webhook allowlist', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       mockFetch.mockResolvedValueOnce({ ok: true, status: 200, text: () => Promise.resolve('') });
       const result = await sendWebhook('http://10.0.0.7/hook', 'Sub', 'Body', {}, ['10.0.0.7']);
       expect(result).toBe('ok');
@@ -285,15 +293,15 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('still blocks a private host that is not in the allowlist', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       const result = await sendWebhook('http://10.0.0.8/hook', 'Sub', 'Body', {}, ['10.0.0.7']);
       expect(result).toBe('blocked_private_url');
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('blocks delivery when the host resolves to a private address at connect time', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
-      const { BlockedDestinationError } = await import('../safe-fetch.js');
+      const { sendWebhook } = notificationDispatchModule;
+      const { BlockedDestinationError } = safeFetchModule;
       mockFetch.mockRejectedValueOnce(
         new TypeError('fetch failed', {
           cause: new BlockedDestinationError('hook.example.com', '10.0.0.7'),
@@ -304,7 +312,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('returns timeout when the request aborts', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       const abortErr = new Error('The operation was aborted');
       abortErr.name = 'AbortError';
       mockFetch.mockRejectedValueOnce(abortErr);
@@ -314,7 +322,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
     it('aborts the controller via the 10s timer and returns timeout', async () => {
       vi.useFakeTimers();
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
 
       // fetch resolves only when its abort signal fires, so advancing the
       // fake clock past 10s triggers the setTimeout callback -> controller.abort().
@@ -344,7 +352,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('renderTemplate array templatesDir', () => {
     it('searches multiple directories and uses the first dir that has the template', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       setupSqlResults([]); // DB miss for 'en'
       mockReadFile.mockResolvedValueOnce('<p>From first dir {{companyName}}</p>');
 
@@ -363,7 +371,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('falls through to the second directory when the first misses', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       setupSqlResults([]); // DB miss for 'en'
       // first dir miss, second dir hit
       mockReadFile
@@ -390,7 +398,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('recordNotificationAttempt', () => {
     it('inserts a row with all fields and json-encoded metadata', async () => {
-      const { recordNotificationAttempt } = await import('../notification-dispatch.js');
+      const { recordNotificationAttempt } = notificationDispatchModule;
       setupSqlResults([]);
 
       await recordNotificationAttempt(sql as never, {
@@ -422,7 +430,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
   describe('dispatchDriverNotification push + pubsub', () => {
     it('records email sent, sms sent, and push rows when both channels configured', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -456,9 +464,15 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'drv_99', {
-        stationId: 'CS-1',
-      });
+      await dispatchDriverNotification(
+        sql as never,
+        'session.Completed',
+        'drv_99',
+        {
+          stationId: 'CS-1',
+        },
+        [],
+      );
 
       expect(mockSendMail).toHaveBeenCalledTimes(1);
       expect(mockFetch).toHaveBeenCalledWith(
@@ -487,7 +501,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('publishes notification.created to portal_events when pubsub provided', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       const publish = vi.fn().mockResolvedValue(undefined);
       const pubsub = { publish } as unknown as import('../pubsub.js').PubSubClient;
@@ -511,14 +525,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(
-        sql as never,
-        'session.Started',
-        'drv_pub',
-        {},
-        undefined,
-        pubsub,
-      );
+      await dispatchDriverNotification(sql as never, 'session.Started', 'drv_pub', {}, [], pubsub);
 
       expect(publish).toHaveBeenCalledWith(
         'portal_events',
@@ -531,7 +538,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('swallows pubsub publish failure and still completes (fail-open)', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       const publish = vi.fn().mockRejectedValue(new Error('redis down'));
       const pubsub = { publish } as unknown as import('../pubsub.js').PubSubClient;
@@ -556,14 +563,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
       );
 
       await expect(
-        dispatchDriverNotification(
-          sql as never,
-          'session.Started',
-          'drv_failpub',
-          {},
-          undefined,
-          pubsub,
-        ),
+        dispatchDriverNotification(sql as never, 'session.Started', 'drv_failpub', {}, [], pubsub),
       ).resolves.toBeUndefined();
 
       expect(publish).toHaveBeenCalled();
@@ -574,7 +574,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records email failure reason smtp_send_failed when send rejects', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       mockSendMail.mockRejectedValueOnce(new Error('connection refused'));
 
@@ -605,7 +605,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'drv_failmail', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'drv_failmail', {}, []);
 
       const email = decodeInsert(findInsert('email')!);
       expect(email.status).toBe('failed');
@@ -615,7 +615,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records sms failure reason twilio_send_failed when Twilio returns non-2xx', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       mockFetch.mockResolvedValueOnce({
         ok: false,
@@ -647,7 +647,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'drv_failsms', {});
+      await dispatchDriverNotification(sql as never, 'session.Completed', 'drv_failsms', {}, []);
 
       const smsRow = decodeInsert(findInsert('sms')!);
       expect(smsRow.status).toBe('failed');
@@ -657,7 +657,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records credentials_decrypt_failed when SMTP creds failed to decrypt and send fails', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       process.env['SETTINGS_ENCRYPTION_KEY'] = 'a-key';
       mockSendMail.mockRejectedValueOnce(new Error('auth failed'));
@@ -689,7 +689,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'drv_cred', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'drv_cred', {}, []);
 
       const email = decodeInsert(findInsert('email')!);
       expect(email.status).toBe('failed');
@@ -700,7 +700,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records credentials_decrypt_failed when Twilio creds failed to decrypt and send fails', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
       process.env['SETTINGS_ENCRYPTION_KEY'] = 'a-key';
       mockFetch.mockRejectedValueOnce(new Error('auth failed'));
@@ -729,7 +729,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'drv_credsms', {});
+      await dispatchDriverNotification(sql as never, 'session.Completed', 'drv_credsms', {}, []);
 
       const smsRow = decodeInsert(findInsert('sms')!);
       expect(smsRow.status).toBe('failed');
@@ -740,7 +740,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('redacts a 6-digit code in the push body for sensitive event types', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -763,7 +763,8 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT push
       );
 
-      await dispatchDriverNotification(sql as never, 'mfa.VerificationCode', 'drv_mfa', {});
+      // driver.Welcome is sensitive but not required, so the driver's opt-outs apply.
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'drv_mfa', {}, []);
 
       const push = decodeInsert(findInsert('push')!);
       const parsed = JSON.parse(push.body) as { message: string };
@@ -774,33 +775,127 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
   });
 
+  describe('dispatchDriverNotification required event types', () => {
+    it('ignores the switch and the driver opt-outs for a required event type', async () => {
+      const { dispatchDriverNotification } = notificationDispatchModule;
+      const clock = advanceClock();
+      setupSqlResults(
+        [
+          {
+            first_name: 'Req',
+            last_name: 'User',
+            email: 'req@test.com',
+            phone: null,
+            language: 'en',
+            timezone: 'UTC',
+          },
+        ],
+        [{ email_enabled: false, sms_enabled: false, push_enabled: false }],
+        [{ key: 'company.name', value: 'SecureCo' }],
+        [],
+      );
+
+      await dispatchDriverNotification(sql as never, 'driver.ForgotPassword', 'drv_req', {}, []);
+
+      const readsSwitch = sqlCalls.some((c) => c.strings.join('').includes('event_settings'));
+      expect(readsSwitch).toBe(false);
+      // the email path ran although the driver turned email off
+      expect(findInsert('email')).toBeDefined();
+
+      clock.restore();
+    });
+  });
+
   // -----------------------------------------------------------------------
   // dispatchSystemNotification
   // -----------------------------------------------------------------------
 
   describe('dispatchSystemNotification', () => {
-    it('skips entirely when system event type is disabled', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+    it('never reads system_event_settings: system events are always on', async () => {
+      const { dispatchSystemNotification } = notificationDispatchModule;
+      setupSqlResults([]);
+
+      await dispatchSystemNotification(
+        sql as never,
+        'session.EndRequestFailed',
+        { email: 'op@test.com' },
+        {},
+        [],
+      );
+
+      const readsSystem = sqlCalls.some((c) =>
+        c.strings.join('').includes('system_event_settings'),
+      );
+      expect(readsSystem).toBe(false);
+      expect(findInsert('email')).toBeDefined();
+    });
+
+    it('skips a driver event it sends when the Driver Events switch is off', async () => {
+      const { dispatchSystemNotification } = notificationDispatchModule;
       setupSqlResults([{ is_enabled: false }]);
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.ForgotPassword',
-        { email: 'op@test.com' },
+        'session.Receipt',
+        { email: 'g@test.com' },
         {},
+        [],
       );
 
-      // only the system_event_settings SELECT ran, no INSERTs
+      // only the driver_event_settings SELECT ran, no INSERTs
       expect(sqlCalls.length).toBe(1);
+      expect(sqlCalls[0]?.strings.join('')).toContain('driver_event_settings');
       expect(notificationInserts()).toHaveLength(0);
     });
 
+    it('sends a required driver event whatever the switch says', async () => {
+      const { dispatchSystemNotification } = notificationDispatchModule;
+      setupSqlResults([{ is_enabled: false }]);
+
+      await dispatchSystemNotification(
+        sql as never,
+        'driver.ForgotPassword',
+        { email: 'd@test.com' },
+        {},
+        [],
+      );
+
+      const readsSwitch = sqlCalls.some((c) => c.strings.join('').includes('event_settings'));
+      expect(readsSwitch).toBe(false);
+      expect(findInsert('email')).toBeDefined();
+    });
+
+    it('sends an MFA code by SMS even when the operator opted out of SMS', async () => {
+      const { dispatchSystemNotification } = notificationDispatchModule;
+      const clock = advanceClock();
+      setupSqlResults(
+        [{ key: 'company.name', value: 'SysCo' }], // company
+        [], // settings (no smtp/twilio)
+      );
+
+      await dispatchSystemNotification(
+        sql as never,
+        'mfa.VerificationCode',
+        { email: 'op@test.com', phone: '+15551112222', userId: 'usr_1' },
+        {},
+        [],
+      );
+
+      const readsPrefs = sqlCalls.some((c) =>
+        c.strings.join('').includes('user_notification_preferences'),
+      );
+      expect(readsPrefs).toBe(false);
+      expect(findInsert('sms')).toBeDefined();
+
+      clock.restore();
+    });
+
     it('sends email + sms when both configured and records sent rows', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
-        [{ is_enabled: true }], // system_event_settings
+        [{ is_enabled: true }], // driver_event_settings
         [{ key: 'company.name', value: 'SysCo' }], // company.*
         [
           { key: 'smtp.host', value: 'smtp.example.com' },
@@ -820,7 +915,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.ForgotPassword',
+        'session.EndRequestFailed',
         {
           email: 'op@test.com',
           phone: '+15551112222',
@@ -830,6 +925,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
           timezone: 'UTC',
         },
         { resetUrl: 'https://x' },
+        [],
       );
 
       expect(mockSendMail).toHaveBeenCalledTimes(1);
@@ -849,8 +945,59 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
       clock.restore();
     });
 
+    it('attaches the given files to the email only', async () => {
+      const { dispatchSystemNotification } = notificationDispatchModule;
+      const clock = advanceClock();
+
+      setupSqlResults(
+        [{ is_enabled: true }], // driver_event_settings
+        [{ key: 'company.name', value: 'SysCo' }], // company.*
+        [
+          { key: 'smtp.host', value: 'smtp.example.com' },
+          { key: 'smtp.port', value: '587' },
+          { key: 'smtp.username', value: 'user' },
+          { key: 'smtp.passwordEnc', value: '' },
+          { key: 'smtp.from', value: 'from@example.com' },
+        ], // settings
+        [], // email DB template miss
+        [], // INSERT email
+        [], // INSERT sms (no phone)
+      );
+
+      const pdf = {
+        filename: 'INV-202609-0001.pdf',
+        content: Buffer.from('%PDF'),
+        contentType: 'application/pdf',
+      };
+      await dispatchSystemNotification(
+        sql as never,
+        'invoice.FleetInvoice',
+        { email: 'billing@fleet.test', language: 'en', timezone: 'UTC' },
+        { invoiceNumber: 'INV-202609-0001' },
+        [],
+        [pdf],
+      );
+
+      expect(mockSendMail).toHaveBeenCalledTimes(1);
+      expect(mockSendMail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'billing@fleet.test',
+          attachments: [
+            {
+              filename: 'INV-202609-0001.pdf',
+              content: Buffer.from('%PDF'),
+              contentType: 'application/pdf',
+            },
+          ],
+        }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      clock.restore();
+    });
+
     it('records recipient_missing when email and phone are absent', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -861,7 +1008,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
         [], // INSERT sms
       );
 
-      await dispatchSystemNotification(sql as never, 'operator.PasswordChanged', {}, {});
+      await dispatchSystemNotification(sql as never, 'session.EndRequestFailed', {}, {}, []);
 
       expect(mockSendMail).not.toHaveBeenCalled();
       const email = decodeInsert(findInsert('email')!);
@@ -876,7 +1023,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records smtp_not_configured / twilio_not_configured when settings missing but recipient present', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -889,9 +1036,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com', phone: '+15551112222' },
         {},
+        [],
       );
 
       const email = decodeInsert(findInsert('email')!);
@@ -903,11 +1051,11 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('skips SMS row entirely when operator opted out (sms_enabled=false)', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
-        [{ is_enabled: true }], // system_event_settings
+        [{ is_enabled: true }], // driver_event_settings
         [{ key: 'company.name', value: 'SysCo' }], // company
         [], // settings (no smtp/twilio)
         [], // INSERT email
@@ -916,9 +1064,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com', phone: '+15551112222', userId: 'usr_1' },
         {},
+        [],
       );
 
       // email row written, but no sms row because the operator opted out
@@ -929,7 +1078,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('keeps SMS enabled when userId is set but no preference row exists', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -948,9 +1097,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { phone: '+15551112222', userId: 'usr_norow' },
         {},
+        [],
       );
 
       // SMS still sent because the missing pref row defaults to enabled.
@@ -964,7 +1114,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('keeps SMS path when user pref row says sms_enabled=true', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -983,9 +1133,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com', phone: '+15551112222', userId: 'usr_2' },
         {},
+        [],
       );
 
       expect(mockFetch).toHaveBeenCalledWith(
@@ -999,7 +1150,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records smtp_send_failed when system email send rejects', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
       mockSendMail.mockRejectedValueOnce(new Error('smtp down'));
 
@@ -1019,9 +1170,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com' },
         {},
+        [],
       );
 
       const email = decodeInsert(findInsert('email')!);
@@ -1032,7 +1184,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records twilio_send_failed when system SMS send rejects', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
       mockFetch.mockRejectedValueOnce(new Error('twilio down'));
 
@@ -1051,9 +1203,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { phone: '+15551112222' },
         {},
+        [],
       );
 
       const smsRow = decodeInsert(findInsert('sms')!);
@@ -1064,7 +1217,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records credentials_decrypt_failed for system email when creds bad and send fails', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
       process.env['SETTINGS_ENCRYPTION_KEY'] = 'a-key';
       mockSendMail.mockRejectedValueOnce(new Error('auth failed'));
@@ -1085,9 +1238,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com' },
         {},
+        [],
       );
 
       const email = decodeInsert(findInsert('email')!);
@@ -1098,7 +1252,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('records credentials_decrypt_failed for system SMS when creds bad and send fails', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
       process.env['SETTINGS_ENCRYPTION_KEY'] = 'a-key';
       mockFetch.mockRejectedValueOnce(new Error('auth failed'));
@@ -1118,9 +1272,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { phone: '+15551112222' },
         {},
+        [],
       );
 
       const smsRow = decodeInsert(findInsert('sms')!);
@@ -1131,7 +1286,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('wraps system email HTML when the rendered template has html', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -1151,9 +1306,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com' },
         {},
+        [],
       );
 
       expect(mockSendMail).toHaveBeenCalledWith(
@@ -1166,7 +1322,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('uses default timezone and en language when omitted', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -1179,9 +1335,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com', phone: '+15551112222' },
         { occurredAt: '2026-01-01T00:00:00.000Z' },
+        [],
       );
 
       // No throw, rows recorded with default behavior
@@ -1192,7 +1349,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('proceeds when no system_event_settings row exists (defaults enabled)', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const clock = advanceClock();
 
       setupSqlResults(
@@ -1205,9 +1362,10 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
 
       await dispatchSystemNotification(
         sql as never,
-        'operator.PasswordChanged',
+        'session.EndRequestFailed',
         { email: 'op@test.com', phone: '+15551112222' },
         {},
+        [],
       );
 
       expect(notificationInserts().length).toBeGreaterThanOrEqual(2);
@@ -1216,7 +1374,7 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
     });
 
     it('catches and swallows top-level errors (fail-open)', async () => {
-      const { dispatchSystemNotification } = await import('../notification-dispatch.js');
+      const { dispatchSystemNotification } = notificationDispatchModule;
       const throwingSql = (() => {
         throw new Error('db down');
       }) as unknown;
@@ -1224,11 +1382,41 @@ describe('notification-dispatch (coverage: record/push/pubsub/system)', () => {
       await expect(
         dispatchSystemNotification(
           throwingSql as never,
-          'operator.PasswordChanged',
+          'session.EndRequestFailed',
           { email: 'op@test.com' },
           {},
+          [],
         ),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('isDriverEventDisabled', () => {
+    it('is off when the driver_event_settings row is disabled', async () => {
+      const { isDriverEventDisabled } = notificationDispatchModule;
+      setupSqlResults([{ is_enabled: false }]);
+
+      await expect(isDriverEventDisabled(sql as never, 'session.Receipt')).resolves.toBe(true);
+      const query = sqlCalls[0]?.strings.join('') ?? '';
+      expect(query).toContain('driver_event_settings');
+      expect(query).not.toContain('system_event_settings');
+    });
+
+    it('is on without a row or with an enabled row', async () => {
+      const { isDriverEventDisabled } = notificationDispatchModule;
+      setupSqlResults([]);
+      await expect(isDriverEventDisabled(sql as never, 'session.Receipt')).resolves.toBe(false);
+      setupSqlResults([{ is_enabled: true }]);
+      await expect(isDriverEventDisabled(sql as never, 'session.Receipt')).resolves.toBe(false);
+    });
+
+    it('is always on for a required event type, without a query', async () => {
+      const { isDriverEventDisabled } = notificationDispatchModule;
+      setupSqlResults([{ is_enabled: false }]);
+      await expect(isDriverEventDisabled(sql as never, 'driver.ForgotPassword')).resolves.toBe(
+        false,
+      );
+      expect(sqlCalls).toHaveLength(0);
     });
   });
 });

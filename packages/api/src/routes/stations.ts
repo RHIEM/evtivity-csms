@@ -66,7 +66,7 @@ import {
   cssStations,
   cssEvses,
 } from '@evtivity/database';
-import { assertZodRefinements, zodSchema } from '../lib/zod-schema.js';
+import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { paginationQuery } from '../lib/pagination.js';
@@ -1087,7 +1087,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Refresh station configurations from the station via OCPP',
         description:
-          'Dispatches GetConfiguration (OCPP 1.6) or GetBaseReport(FullInventory) (OCPP 2.1) to pull the current variable set. The station response is processed asynchronously by the event projection, which upserts rows in station_configurations. Returns 400 if the station is offline and 502 if the station rejects the command.',
+          'Dispatches GetConfiguration (OCPP 1.6) or GetBaseReport(FullInventory) (OCPP 2.1) to pull the current variable set. The station response is processed asynchronously by the event projection, which upserts rows in station_configurations. Returns 400 if the station is offline, and 502 OCPP_COMMAND_FAILED when the station answers with an OCPP error or the command cannot be delivered.',
         operationId: 'refreshStationConfigurations',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -1775,8 +1775,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      assertZodRefinements(createEvseBody, request.body);
-      const body = request.body as z.infer<typeof createEvseBody>;
+      const body = parseZodRequest(createEvseBody, request.body);
 
       // Verify station exists
       const [station] = await db
@@ -3442,7 +3441,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof securityLogsQuery>;
+      const query = parseZodRequest(securityLogsQuery, request.query);
       const offset = (query.page - 1) * query.limit;
 
       // UNION ALL over both source tables. Both are filtered by stationId
@@ -3663,7 +3662,8 @@ export function stationRoutes(app: FastifyInstance): void {
           throw new Error('No PEM certificate block found');
         }
         new X509Certificate(firstPemBlock + '-----END CERTIFICATE-----');
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'Certificate to install did not parse, refusing it');
         await reply.status(400).send({
           error: 'certificate is not a valid PEM-encoded certificate',
           code: 'VALIDATION_ERROR',
@@ -4731,7 +4731,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Refresh charging profiles from the station via OCPP GetChargingProfiles',
         description:
-          'Dispatches GetChargingProfiles to pull the current set of profiles from the station. The station response is processed asynchronously by the ReportChargingProfiles event projection, which mirrors profiles into the charging_profiles table. OCPP 1.6 is not supported (returns 400). Returns 502 on station rejection or timeout.',
+          'Dispatches GetChargingProfiles to pull the current set of profiles from the station. The station response is processed asynchronously by the ReportChargingProfiles event projection, which mirrors profiles into the charging_profiles table. OCPP 1.6 is not supported (returns 400). Returns 502 OCPP_COMMAND_FAILED when the station answers with an OCPP error, the command cannot be delivered, or no answer comes in time.',
         operationId: 'refreshStationChargingProfiles',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -4952,7 +4952,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Clear charging profiles from the station',
         description:
-          'Dispatches ClearChargingProfile with the supplied criteria (purpose, stackLevel, evseId) or a specific chargingProfileId. On Accepted, deletes the matching rows from the charging_profiles mirror and triggers a best-effort GetChargingProfiles refresh on OCPP 2.1 stations. Returns 502 on station rejection or timeout.',
+          'Dispatches ClearChargingProfile with the supplied criteria (purpose, stackLevel, evseId) or a specific chargingProfileId. On Accepted, deletes the matching rows from the charging_profiles mirror and triggers a best-effort GetChargingProfiles refresh on OCPP 2.1 stations. Returns 502 OCPP_COMMAND_FAILED when the station answers with an OCPP error, the command cannot be delivered, or no answer comes in time.',
         operationId: 'clearStationChargingProfiles',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -5168,8 +5168,11 @@ export function stationRoutes(app: FastifyInstance): void {
             evseId: template.evseId,
           },
         });
-      } catch {
-        // Non-critical: clear failure should not block set
+      } catch (err) {
+        request.log.warn(
+          { err, stationId: station.stationId },
+          'ClearChargingProfile before the push failed, sending SetChargingProfile anyway',
+        );
       }
 
       // Build SetChargingProfile payload
@@ -5430,8 +5433,11 @@ export function stationRoutes(app: FastifyInstance): void {
             ocppVersion,
           );
         }
-      } catch {
-        // Non-critical
+      } catch (err) {
+        request.log.warn(
+          { err, stationId: station.stationId },
+          'Configuration refresh after the push failed, keeping the push result',
+        );
       }
 
       if (!hasFailure) {

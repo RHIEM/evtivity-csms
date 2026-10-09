@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/lib",
-  "version": "0.1.38",
+  "version": "0.1.42",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -17,6 +17,9 @@
     "./currency": {
       "import": "./src/currency.ts"
     },
+    "./load-allocation": {
+      "import": "./src/load-allocation.ts"
+    },
     "./number": {
       "import": "./src/number.ts"
     },
@@ -29,17 +32,29 @@
     "./station-password": {
       "import": "./src/station-password.ts"
     },
+    "./password-policy": {
+      "import": "./src/password-policy.ts"
+    },
     "./firmware-signature": {
       "import": "./src/firmware-signature.ts"
     },
     "./languages": {
       "import": "./src/languages.ts"
     },
+    "./notification-events": {
+      "import": "./src/notification-events.ts"
+    },
     "./report-labels": {
       "import": "./src/report-labels.ts"
     },
     "./pubsub-instance": {
       "import": "./src/pubsub-instance.ts"
+    },
+    "./safe-json": {
+      "import": "./src/safe-json.ts"
+    },
+    "./notification-test-sink": {
+      "import": "./src/notification-test-sink.ts"
     }
   },
   "scripts": {
@@ -48,7 +63,7 @@
   },
   "dependencies": {
     "@sentry/node": "^10.42.0",
-    "handlebars": "^4.7.8",
+    "handlebars": "^4.7.10",
     "html-to-text": "^10.0.1",
     "ioredis": "^5.9.3",
     "nanoid": "^6.0.1",
