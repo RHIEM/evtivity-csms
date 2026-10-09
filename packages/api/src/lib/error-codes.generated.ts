@@ -66,7 +66,13 @@ export const ERROR_CODES = {
   EVSE_IN_USE: 'EVSE_IN_USE',
   EVSE_NOT_FOUND: 'EVSE_NOT_FOUND',
   FAVORITE_NOT_FOUND: 'FAVORITE_NOT_FOUND',
+  FLEET_BILLING_CONTACT_REQUIRED: 'FLEET_BILLING_CONTACT_REQUIRED',
+  FLEET_BILLING_OLD_PODS_CONNECTED: 'FLEET_BILLING_OLD_PODS_CONNECTED',
+  FLEET_CREDIT_LIMIT_REACHED: 'FLEET_CREDIT_LIMIT_REACHED',
   FLEET_DISABLED: 'FLEET_DISABLED',
+  FLEET_HAS_OPEN_BILLING: 'FLEET_HAS_OPEN_BILLING',
+  FLEET_INVOICE_NOTHING_TO_BILL: 'FLEET_INVOICE_NOTHING_TO_BILL',
+  FLEET_INVOICE_PERIOD_EXISTS: 'FLEET_INVOICE_PERIOD_EXISTS',
   FLEET_NOT_FOUND: 'FLEET_NOT_FOUND',
   FLEET_RESERVATION_ALREADY_CANCELLED: 'FLEET_RESERVATION_ALREADY_CANCELLED',
   FLEET_RESERVATION_CREATE_FAILED: 'FLEET_RESERVATION_CREATE_FAILED',
@@ -92,10 +98,15 @@ export const ERROR_CODES = {
   INVALID_RESTRICTIONS: 'INVALID_RESTRICTIONS',
   INVALID_SITE_IDS: 'INVALID_SITE_IDS',
   INVALID_TOKEN: 'INVALID_TOKEN',
+  INVOICE_ALREADY_CREDITED: 'INVOICE_ALREADY_CREDITED',
+  INVOICE_ALREADY_PAID: 'INVOICE_ALREADY_PAID',
   INVOICE_CREATION_FAILED: 'INVOICE_CREATION_FAILED',
+  INVOICE_IS_CREDIT_NOTE: 'INVOICE_IS_CREDIT_NOTE',
   INVOICE_NO_DRIVER: 'INVOICE_NO_DRIVER',
   INVOICE_NO_SESSIONS: 'INVOICE_NO_SESSIONS',
   INVOICE_NOT_FOUND: 'INVOICE_NOT_FOUND',
+  INVOICE_NOT_ISSUED: 'INVOICE_NOT_ISSUED',
+  INVOICE_NOT_VOIDABLE: 'INVOICE_NOT_VOIDABLE',
   LOAD_NOT_FOUND: 'LOAD_NOT_FOUND',
   LOCAL_CA_EXISTS: 'LOCAL_CA_EXISTS',
   LOCAL_CA_NOT_CONFIGURED: 'LOCAL_CA_NOT_CONFIGURED',
@@ -142,6 +153,7 @@ export const ERROR_CODES = {
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
   NOT_PENDING: 'NOT_PENDING',
   NOT_SUPPORTED: 'NOT_SUPPORTED',
+  NOTIFICATION_EVENT_REQUIRED: 'NOTIFICATION_EVENT_REQUIRED',
   OCPP_COMMAND_FAILED: 'OCPP_COMMAND_FAILED',
   OCPP_VERSION_MISMATCH: 'OCPP_VERSION_MISMATCH',
   OCTT_RUN_NOT_FOUND: 'OCTT_RUN_NOT_FOUND',
@@ -169,6 +181,7 @@ export const ERROR_CODES = {
   PAYOUT_ACCOUNT_EXISTS: 'PAYOUT_ACCOUNT_EXISTS',
   PAYOUT_ACCOUNT_NOT_READY: 'PAYOUT_ACCOUNT_NOT_READY',
   PERMISSIONS_EXCEED_OWN: 'PERMISSIONS_EXCEED_OWN',
+  PHONE_REGISTRATION_LIMITED: 'PHONE_REGISTRATION_LIMITED',
   PKI_ROOT_REFRESH_FAILED: 'PKI_ROOT_REFRESH_FAILED',
   PNC_CONTRACT_NOT_FOUND: 'PNC_CONTRACT_NOT_FOUND',
   PNC_DISABLED: 'PNC_DISABLED',
@@ -188,6 +201,7 @@ export const ERROR_CODES = {
   RATE_LIMITED: 'RATE_LIMITED',
   RECAPTCHA_FAILED: 'RECAPTCHA_FAILED',
   RECAPTCHA_REQUIRED: 'RECAPTCHA_REQUIRED',
+  RECAPTCHA_SECRET_REQUIRED: 'RECAPTCHA_SECRET_REQUIRED',
   REFUND_EXCEEDS_REMAINING: 'REFUND_EXCEEDS_REMAINING',
   REFUND_TOP_UP_UNKNOWN: 'REFUND_TOP_UP_UNKNOWN',
   REGION_NOT_FOUND: 'REGION_NOT_FOUND',
@@ -218,6 +232,9 @@ export const ERROR_CODES = {
   SESSION_CREATE_FAILED: 'SESSION_CREATE_FAILED',
   SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   SESSION_NOT_LINKED: 'SESSION_NOT_LINKED',
+  SESSION_REBILL_IN_PROGRESS: 'SESSION_REBILL_IN_PROGRESS',
+  SESSION_REBILL_NOT_ELIGIBLE: 'SESSION_REBILL_NOT_ELIGIBLE',
+  SESSION_REBILL_PAYMENT_PENDING: 'SESSION_REBILL_PAYMENT_PENDING',
   SETTING_NOT_FOUND: 'SETTING_NOT_FOUND',
   SITE_HAS_STATIONS: 'SITE_HAS_STATIONS',
   SITE_NOT_FOUND: 'SITE_NOT_FOUND',
@@ -260,6 +277,7 @@ export const ERROR_CODES = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   VEHICLE_NOT_FOUND: 'VEHICLE_NOT_FOUND',
   VENDOR_NOT_FOUND: 'VENDOR_NOT_FOUND',
+  VERIFICATION_RESEND_LIMITED: 'VERIFICATION_RESEND_LIMITED',
   WEAK_PASSWORD: 'WEAK_PASSWORD',
   WEBHOOK_NOT_CONFIGURED: 'WEBHOOK_NOT_CONFIGURED',
   WEBHOOK_SIGNATURE_INVALID: 'WEBHOOK_SIGNATURE_INVALID',
@@ -323,7 +341,13 @@ export type ErrorCode =
   | 'EVSE_IN_USE'
   | 'EVSE_NOT_FOUND'
   | 'FAVORITE_NOT_FOUND'
+  | 'FLEET_BILLING_CONTACT_REQUIRED'
+  | 'FLEET_BILLING_OLD_PODS_CONNECTED'
+  | 'FLEET_CREDIT_LIMIT_REACHED'
   | 'FLEET_DISABLED'
+  | 'FLEET_HAS_OPEN_BILLING'
+  | 'FLEET_INVOICE_NOTHING_TO_BILL'
+  | 'FLEET_INVOICE_PERIOD_EXISTS'
   | 'FLEET_NOT_FOUND'
   | 'FLEET_RESERVATION_ALREADY_CANCELLED'
   | 'FLEET_RESERVATION_CREATE_FAILED'
@@ -349,10 +373,15 @@ export type ErrorCode =
   | 'INVALID_RESTRICTIONS'
   | 'INVALID_SITE_IDS'
   | 'INVALID_TOKEN'
+  | 'INVOICE_ALREADY_CREDITED'
+  | 'INVOICE_ALREADY_PAID'
   | 'INVOICE_CREATION_FAILED'
+  | 'INVOICE_IS_CREDIT_NOTE'
   | 'INVOICE_NO_DRIVER'
   | 'INVOICE_NO_SESSIONS'
   | 'INVOICE_NOT_FOUND'
+  | 'INVOICE_NOT_ISSUED'
+  | 'INVOICE_NOT_VOIDABLE'
   | 'LOAD_NOT_FOUND'
   | 'LOCAL_CA_EXISTS'
   | 'LOCAL_CA_NOT_CONFIGURED'
@@ -399,6 +428,7 @@ export type ErrorCode =
   | 'NOT_IMPLEMENTED'
   | 'NOT_PENDING'
   | 'NOT_SUPPORTED'
+  | 'NOTIFICATION_EVENT_REQUIRED'
   | 'OCPP_COMMAND_FAILED'
   | 'OCPP_VERSION_MISMATCH'
   | 'OCTT_RUN_NOT_FOUND'
@@ -426,6 +456,7 @@ export type ErrorCode =
   | 'PAYOUT_ACCOUNT_EXISTS'
   | 'PAYOUT_ACCOUNT_NOT_READY'
   | 'PERMISSIONS_EXCEED_OWN'
+  | 'PHONE_REGISTRATION_LIMITED'
   | 'PKI_ROOT_REFRESH_FAILED'
   | 'PNC_CONTRACT_NOT_FOUND'
   | 'PNC_DISABLED'
@@ -445,6 +476,7 @@ export type ErrorCode =
   | 'RATE_LIMITED'
   | 'RECAPTCHA_FAILED'
   | 'RECAPTCHA_REQUIRED'
+  | 'RECAPTCHA_SECRET_REQUIRED'
   | 'REFUND_EXCEEDS_REMAINING'
   | 'REFUND_TOP_UP_UNKNOWN'
   | 'REGION_NOT_FOUND'
@@ -475,6 +507,9 @@ export type ErrorCode =
   | 'SESSION_CREATE_FAILED'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_NOT_LINKED'
+  | 'SESSION_REBILL_IN_PROGRESS'
+  | 'SESSION_REBILL_NOT_ELIGIBLE'
+  | 'SESSION_REBILL_PAYMENT_PENDING'
   | 'SETTING_NOT_FOUND'
   | 'SITE_HAS_STATIONS'
   | 'SITE_NOT_FOUND'
@@ -517,6 +552,7 @@ export type ErrorCode =
   | 'VALIDATION_ERROR'
   | 'VEHICLE_NOT_FOUND'
   | 'VENDOR_NOT_FOUND'
+  | 'VERIFICATION_RESEND_LIMITED'
   | 'WEAK_PASSWORD'
   | 'WEBHOOK_NOT_CONFIGURED'
   | 'WEBHOOK_SIGNATURE_INVALID'
@@ -588,7 +624,19 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   EVSE_IN_USE: 'Another session is already active on this connector',
   EVSE_NOT_FOUND: 'EVSE not found',
   FAVORITE_NOT_FOUND: 'Favorite not found',
+  FLEET_BILLING_CONTACT_REQUIRED:
+    'The fleet needs at least one billing contact for automatic invoicing and invoice emails.',
+  FLEET_BILLING_OLD_PODS_CONNECTED:
+    'A process older than v0.1.41 is still connected. Finish the upgrade, then turn on account billing.',
+  FLEET_CREDIT_LIMIT_REACHED:
+    'The credit limit of the fleet your sessions are billed to is reached. Contact your fleet manager.',
   FLEET_DISABLED: 'Fleet is disabled',
+  FLEET_HAS_OPEN_BILLING:
+    'The fleet has sessions billed to its account and cannot be deleted. Turn off account billing instead.',
+  FLEET_INVOICE_NOTHING_TO_BILL:
+    'The fleet has no unbilled sessions with a cost to invoice for this period.',
+  FLEET_INVOICE_PERIOD_EXISTS:
+    'The fleet already has an invoice for this period. Credit it to bill the period again.',
   FLEET_NOT_FOUND: 'Fleet not found',
   FLEET_RESERVATION_ALREADY_CANCELLED: 'Fleet reservation is already cancelled',
   FLEET_RESERVATION_CREATE_FAILED: 'Failed to create fleet reservation',
@@ -614,10 +662,16 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVALID_RESTRICTIONS: 'Invalid tariff restrictions',
   INVALID_SITE_IDS: 'One or more siteIds do not exist',
   INVALID_TOKEN: 'Invalid or expired reset link',
+  INVOICE_ALREADY_CREDITED: 'The invoice is already credited by a credit note',
+  INVOICE_ALREADY_PAID: 'The invoice is already paid',
   INVOICE_CREATION_FAILED: 'Failed to create invoice',
+  INVOICE_IS_CREDIT_NOTE: 'A credit note cannot be marked paid or credited',
   INVOICE_NO_DRIVER: 'This invoice has no driver to send to',
   INVOICE_NO_SESSIONS: 'No uninvoiced sessions found for this driver in the selected date range',
   INVOICE_NOT_FOUND: 'Invoice not found',
+  INVOICE_NOT_ISSUED: 'The invoice must be issued for this action',
+  INVOICE_NOT_VOIDABLE:
+    'Only a draft invoice can be voided. Correct an issued invoice with a credit note',
   LOAD_NOT_FOUND: 'Load not found',
   LOCAL_CA_EXISTS: 'A local contract CA already exists',
   LOCAL_CA_NOT_CONFIGURED: 'Create the local contract CA first',
@@ -664,6 +718,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   NOT_IMPLEMENTED: 'Remote start on partner networks requires the OCPI Commands module',
   NOT_PENDING: 'Station is not pending approval',
   NOT_SUPPORTED: 'Not supported for OCPP 1.6',
+  NOTIFICATION_EVENT_REQUIRED:
+    'This notification is required for account access and cannot be turned off',
   OCPP_COMMAND_FAILED: 'OCPP command failed',
   OCPP_VERSION_MISMATCH: 'The command is for a different OCPP version than the station uses',
   OCTT_RUN_NOT_FOUND: 'Conformance run not found',
@@ -695,6 +751,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PAYOUT_ACCOUNT_EXISTS: 'The site already has a payout account',
   PAYOUT_ACCOUNT_NOT_READY: "The site's payout account cannot receive payments yet",
   PERMISSIONS_EXCEED_OWN: 'API key permissions must be a subset of your own permissions',
+  PHONE_REGISTRATION_LIMITED:
+    'Too many accounts were registered with this phone number. Try again later.',
   PKI_ROOT_REFRESH_FAILED: 'Root certificate refresh from the PKI provider failed',
   PNC_CONTRACT_NOT_FOUND: 'Plug & Charge contract not found',
   PNC_DISABLED: 'Plug & Charge is disabled',
@@ -712,9 +770,10 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PROVIDER_TEST_FAILED: 'Provider returned ...',
   PUSH_NOT_FOUND: 'Push not found',
   PUSH_REJECTED: 'Station rejected push: ...',
-  RATE_LIMITED: 'Too many status checks for this station',
+  RATE_LIMITED: 'Too many requests. Wait a moment and try again.',
   RECAPTCHA_FAILED: 'reCAPTCHA verification failed',
   RECAPTCHA_REQUIRED: 'reCAPTCHA token is required',
+  RECAPTCHA_SECRET_REQUIRED: 'A reCAPTCHA secret key is required to enable reCAPTCHA',
   REFUND_EXCEEDS_REMAINING: 'Refund amount exceeds remaining ...',
   REFUND_TOP_UP_UNKNOWN:
     "This payment includes a top-up charge with no recorded payment id. Refund the top-up in the payment provider's dashboard.",
@@ -747,6 +806,10 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   SESSION_CREATE_FAILED: 'Failed to create session',
   SESSION_NOT_FOUND: 'Session not found',
   SESSION_NOT_LINKED: 'Session not linked to this case',
+  SESSION_REBILL_IN_PROGRESS: 'The session is being billed. Try again in a few minutes.',
+  SESSION_REBILL_NOT_ELIGIBLE: 'This session cannot be billed',
+  SESSION_REBILL_PAYMENT_PENDING:
+    'The session has a payment the provider has not settled yet. Try again later.',
   SETTING_NOT_FOUND: 'Setting not found',
   SITE_HAS_STATIONS: 'Cannot delete site with stations. Remove or reassign stations first.',
   SITE_NOT_FOUND: 'Site not found',
@@ -792,6 +855,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   VALIDATION_ERROR: 'Validation error',
   VEHICLE_NOT_FOUND: 'Vehicle not found',
   VENDOR_NOT_FOUND: 'Vendor not found',
+  VERIFICATION_RESEND_LIMITED: 'Too many verification emails. Wait before you request another one.',
   WEAK_PASSWORD: 'Password does not meet complexity requirements',
   WEBHOOK_NOT_CONFIGURED: 'Webhook not configured',
   WEBHOOK_SIGNATURE_INVALID: 'Invalid signature',

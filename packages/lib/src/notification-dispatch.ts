@@ -8,11 +8,16 @@ import { readFile } from 'node:fs/promises';
 import { createLogger } from './logger.js';
 import { decryptString } from './encryption.js';
 import { DEFAULT_CURRENCY } from './currency.js';
+import { isRequiredDriverEventType } from './notification-events.js';
 import { formatDateTime } from './timezone.js';
 import { formatLocalizedVariables } from './notification-values.js';
 import { isPrivateUrl } from './url-validation.js';
 import { blockedDestinationOf, safeFetch } from './safe-fetch.js';
 import { sendExpoPush } from './push-send.js';
+import {
+  getNotificationTestSinkUrl,
+  postToNotificationTestSink,
+} from './notification-test-sink.js';
 import { compileAllowedTemplate, type TemplateRenderer } from './template-safety.js';
 import type { PubSubClient } from './pubsub.js';
 
@@ -308,8 +313,8 @@ export async function getNotificationSettings(sql: postgres.Sql): Promise<Notifi
     if (rawPassword != null && rawPassword !== '' && encryptionKey != null) {
       try {
         password = decryptString(rawPassword, encryptionKey);
-      } catch {
-        logger.warn('Failed to decrypt SMTP password');
+      } catch (err) {
+        logger.warn({ err, key: 'smtp.passwordEnc' }, 'Failed to decrypt SMTP password');
         smtpCredentialError = 'decrypt_failed';
       }
     }
@@ -333,8 +338,8 @@ export async function getNotificationSettings(sql: postgres.Sql): Promise<Notifi
     if (rawToken != null && rawToken !== '' && encryptionKey != null) {
       try {
         authToken = decryptString(rawToken, encryptionKey);
-      } catch {
-        logger.warn('Failed to decrypt Twilio auth token');
+      } catch (err) {
+        logger.warn({ err, key: 'twilio.authTokenEnc' }, 'Failed to decrypt Twilio auth token');
         twilioCredentialError = 'decrypt_failed';
       }
     }
@@ -377,7 +382,11 @@ export async function loadTemplateFile(filePath: string): Promise<string | null>
     const content = await readFile(filePath, 'utf-8');
     fileContentCache.set(filePath, { content, cachedAt: now });
     return content;
-  } catch {
+  } catch (err) {
+    // A missing file is the normal case: not every event has a template in every language.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn({ err, filePath }, 'Template file read failed, treating it as missing');
+    }
     return null;
   }
 }
@@ -612,8 +621,37 @@ export function normalizeE164(phone: string): string {
   return cleaned;
 }
 
-export async function sendSms(config: TwilioConfig, to: string, body: string): Promise<boolean> {
+/** What the notification test sink records next to each SMS. */
+export interface SmsSendContext {
+  eventType?: string | undefined;
+  language?: string | undefined;
+}
+
+/**
+ * Sends one SMS through Twilio, or to the notification test sink when this
+ * process has one (local development only; Twilio is then never called and
+ * its credentials are not needed). Returns false when neither is available.
+ */
+export async function sendSms(
+  config: TwilioConfig | null,
+  to: string,
+  body: string,
+  context: SmsSendContext = {},
+): Promise<boolean> {
   const normalizedTo = normalizeE164(to);
+  const sinkUrl = getNotificationTestSinkUrl();
+  if (sinkUrl != null) {
+    return postToNotificationTestSink(sinkUrl, {
+      channel: 'sms',
+      to: normalizedTo,
+      eventType: context.eventType ?? null,
+      language: context.language ?? null,
+      title: null,
+      body,
+      data: null,
+    });
+  }
+  if (config == null) return false;
   try {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${config.accountSid}/Messages.json`;
     const auth = Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64');
@@ -645,16 +683,21 @@ export async function sendSms(config: TwilioConfig, to: string, body: string): P
   }
 }
 
+function smsFailureReason(twilio: TwilioConfig | null, testSink: boolean): string {
+  if (testSink) return 'test_sink_send_failed';
+  return twilio?.credentialError === 'decrypt_failed'
+    ? 'credentials_decrypt_failed'
+    : 'twilio_send_failed';
+}
+
 function isAllowedHost(url: string, allowedPrivateHosts: readonly string[]): boolean {
   if (allowedPrivateHosts.length === 0) return false;
-  try {
-    const { protocol, hostname } = new URL(url);
-    if (protocol !== 'http:' && protocol !== 'https:') return false;
-    const host = hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase();
-    return allowedPrivateHosts.some((h) => h.toLowerCase() === host);
-  } catch {
-    return false;
-  }
+  const parsed = URL.parse(url);
+  if (parsed == null) return false;
+  const { protocol, hostname } = parsed;
+  if (protocol !== 'http:' && protocol !== 'https:') return false;
+  const host = hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+  return allowedPrivateHosts.some((h) => h.toLowerCase() === host);
 }
 
 export type WebhookResult =
@@ -730,6 +773,26 @@ export function logNotification(
   logger.info({ channel, recipient, subject }, body);
 }
 
+// --- Driver event on/off switch ---
+
+// Operators turn a driver event type off on the Driver Events tab
+// (driver_event_settings). No row means on. Some driver events (guest receipts,
+// password resets, MFA codes) go through dispatchSystemNotification, so both
+// dispatchers check it. System events are always on and have no row here.
+// Required driver event types are always on, whatever is stored.
+export async function isDriverEventDisabled(
+  sql: postgres.Sql,
+  eventType: string,
+): Promise<boolean> {
+  if (isRequiredDriverEventType(eventType)) return false;
+  const rows = await sql`
+    SELECT is_enabled FROM driver_event_settings
+    WHERE event_type = ${eventType}
+    LIMIT 1
+  `;
+  return rows[0] != null && rows[0].is_enabled === false;
+}
+
 // --- Driver notification dispatch ---
 
 export async function dispatchDriverNotification(
@@ -737,18 +800,14 @@ export async function dispatchDriverNotification(
   eventType: string,
   driverId: string,
   variables: Record<string, unknown>,
-  templatesDir?: string | string[],
+  // Required: without the template directories the file templates are not
+  // found and the notification goes out unrendered (subject
+  // "<event> Notification", body a dump of the variables).
+  templatesDir: string | string[],
   pubsub?: PubSubClient,
 ): Promise<void> {
   try {
-    // Check if this driver event type is enabled globally
-    const settingRows = await sql`
-      SELECT is_enabled FROM driver_event_settings
-      WHERE event_type = ${eventType}
-      LIMIT 1
-    `;
-    const setting = settingRows[0];
-    if (setting != null && !(setting.is_enabled as boolean)) {
+    if (await isDriverEventDisabled(sql, eventType)) {
       logger.debug({ eventType }, 'Driver event type disabled, skipping');
       return;
     }
@@ -795,7 +854,9 @@ export async function dispatchDriverNotification(
       language,
     );
 
-    const prefs = prefRows[0];
+    // A required event type (password reset, MFA code, verification, portal invite)
+    // reaches the driver on every channel they have, whatever their preferences say.
+    const prefs = isRequiredDriverEventType(eventType) ? undefined : prefRows[0];
     const emailEnabled = prefs != null ? (prefs.email_enabled as boolean) : true;
     const smsEnabled = prefs != null ? (prefs.sms_enabled as boolean) : true;
     const pushEnabled = prefs != null ? (prefs.push_enabled as boolean) : true;
@@ -887,19 +948,18 @@ export async function dispatchDriverNotification(
       let storedSmsSubject = `[${eventType}]`;
       let storedSmsBody = '';
 
+      const testSink = getNotificationTestSinkUrl() != null;
       if (phone == null || phone === '') {
         failureReason = 'recipient_missing';
-      } else if (notificationSettings.twilio == null) {
+      } else if (notificationSettings.twilio == null && !testSink) {
         failureReason = 'twilio_not_configured';
       } else {
-        const ok = await sendSms(notificationSettings.twilio, phone, smsRendered.body);
+        const ok = await sendSms(notificationSettings.twilio, phone, smsRendered.body, {
+          eventType,
+          language,
+        });
         status = ok ? 'sent' : 'failed';
-        if (!ok) {
-          failureReason =
-            notificationSettings.twilio.credentialError === 'decrypt_failed'
-              ? 'credentials_decrypt_failed'
-              : 'twilio_send_failed';
-        }
+        if (!ok) failureReason = smsFailureReason(notificationSettings.twilio, testSink);
         storedSmsSubject = redactSensitiveNotificationContent(smsRendered.subject, eventType);
         storedSmsBody = redactSensitiveNotificationContent(smsRendered.body, eventType);
       }
@@ -961,6 +1021,7 @@ export async function dispatchDriverNotification(
               body: pushMessage,
               data: pushData,
             })),
+            { eventType, language },
           );
           const dead = results.filter((r) => r.unregistered).map((r) => r.token);
           const delivered = results.filter((r) => r.ok).map((r) => r.token);
@@ -985,8 +1046,11 @@ export async function dispatchDriverNotification(
           'portal_events',
           JSON.stringify({ type: 'notification.created', driverId }),
         );
-      } catch {
-        // Non-critical: bell icon will update on next poll
+      } catch (err) {
+        logger.warn(
+          { err, eventType, driverId },
+          'Portal notification event publish failed, the bell icon updates on the next poll',
+        );
       }
     }
   } catch (err) {
@@ -1020,6 +1084,12 @@ export async function recordNotificationAttempt(
 
 // --- System notification dispatch ---
 
+/**
+ * Sends a system event to one recipient: email and SMS, rendered in the
+ * recipient's language, and records each attempt. `attachments` go with the
+ * email only (SMTP; the SMS ignores them), such as the PDF of a fleet invoice.
+ * Fail-open: an error is logged, never thrown.
+ */
 export async function dispatchSystemNotification(
   sql: postgres.Sql,
   eventType: string,
@@ -1033,18 +1103,15 @@ export async function dispatchSystemNotification(
     userId?: string | undefined;
   },
   variables: Record<string, unknown>,
-  templatesDir?: string | string[],
+  // Required, see dispatchDriverNotification.
+  templatesDir: string | string[],
+  attachments?: EmailAttachment[],
 ): Promise<void> {
   try {
-    // Check if this system event type is enabled
-    const settingRows = await sql`
-      SELECT is_enabled FROM system_event_settings
-      WHERE event_type = ${eventType}
-      LIMIT 1
-    `;
-    const setting = settingRows[0];
-    if (setting != null && !(setting.is_enabled as boolean)) {
-      logger.debug({ eventType }, 'System event type disabled, skipping');
+    // System events are always on. A driver event sent through this dispatcher
+    // still honors the Driver Events switch.
+    if (await isDriverEventDisabled(sql, eventType)) {
+      logger.debug({ eventType }, 'Driver event type disabled, skipping');
       return;
     }
 
@@ -1114,6 +1181,7 @@ export async function dispatchSystemNotification(
           rendered.subject,
           rendered.body,
           wrappedHtml,
+          attachments,
         );
         status = ok ? 'sent' : 'failed';
         if (!ok) {
@@ -1140,9 +1208,10 @@ export async function dispatchSystemNotification(
       });
     }
 
-    // Check operator SMS preferences (opt-out)
+    // Check operator SMS preferences (opt-out). A required event type (an MFA
+    // code) is sent whatever the preference says.
     let smsEnabled = true;
-    if (recipient.userId != null) {
+    if (recipient.userId != null && !isRequiredDriverEventType(eventType)) {
       const prefRows = await sql`
         SELECT sms_enabled FROM user_notification_preferences
         WHERE user_id = ${recipient.userId}
@@ -1162,9 +1231,10 @@ export async function dispatchSystemNotification(
       let storedSmsSubject = `[${eventType}]`;
       let storedSmsBody = '';
 
+      const testSink = getNotificationTestSinkUrl() != null;
       if (phone == null || phone === '') {
         failureReason = 'recipient_missing';
-      } else if (notificationSettings.twilio == null) {
+      } else if (notificationSettings.twilio == null && !testSink) {
         failureReason = 'twilio_not_configured';
       } else {
         const rendered = await renderTemplate(
@@ -1177,14 +1247,12 @@ export async function dispatchSystemNotification(
           templatesDir,
         );
 
-        const ok = await sendSms(notificationSettings.twilio, phone, rendered.body);
+        const ok = await sendSms(notificationSettings.twilio, phone, rendered.body, {
+          eventType,
+          language,
+        });
         status = ok ? 'sent' : 'failed';
-        if (!ok) {
-          failureReason =
-            notificationSettings.twilio.credentialError === 'decrypt_failed'
-              ? 'credentials_decrypt_failed'
-              : 'twilio_send_failed';
-        }
+        if (!ok) failureReason = smsFailureReason(notificationSettings.twilio, testSink);
         storedSmsSubject = redactSensitiveNotificationContent(rendered.subject, eventType);
         storedSmsBody = redactSensitiveNotificationContent(rendered.body, eventType);
       }

@@ -1,7 +1,7 @@
 # Konzept: Laden auf Rechnung
 
-- **Status:** Freigegeben (Lösungskonzept, erster schmaler Schnitt)
-- **Stand:** 29.09.2026
+- **Status:** Abgelöst durch die Flottenabrechnung von EVtivity `v0.1.41` (siehe Abschnitt „Ablösung durch Upstream“)
+- **Stand:** 29.09.2026, abgelöst 09.10.2026
 - **Quellen:** bisherige RHIEM-Dokumente zum Mitarbeiterladen (Konzept Mitarbeiterladen, EVtivity-Produktionsabgleich, Feldversuchsplanung)
 
 ## Ziel
@@ -132,3 +132,19 @@ Rangfolge beim Start (OCPP und Portal):
 Bekannte Einschränkung: Storno- und No-Show-Gebühren einer Reservierung werden per Karte bezahlt und stehen zusätzlich auf der Sammelrechnung (Upstream-Verhalten). Reservierungen verlangen weiterhin eine Karte; im Feldversuch wird nicht reserviert.
 
 Upstream: EVtivity hat am 03.10.2026 Interesse bekundet und will den Vorschlag prüfen. Antwort mit dem Stand auf `v0.1.37` am 05.10.2026 ([Kommentar](https://github.com/EVtivity/evtivity-csms/discussions/12#discussioncomment-18760460)): Rechnung als Zahlungsart in `classifySessionPayment()`, Ausschluss von Kartenzahlungen aus der Sammelrechnung entfällt (angeboten: auf `payment_mode = 'invoice'` beschränkt, falls gewünscht).
+
+## Ablösung durch Upstream (09.10.2026)
+
+EVtivity hat das Feature in `v0.1.41` neu gebaut („Charge on account“, in den Release-Notes mit Verweis auf Diskussion #12) und nicht den Fork-Zweig übernommen. Die Flotte ist das Rechnungskonto: `fleets.account_billing_enabled`, Abwahl je Mitglied (`fleet_drivers.account_billing_opt_out`), Rechnungsprofil der Flotte, Stempel je Sitzung beim Start (`charging_sessions.billing_mode` `card`/`account`, `billing_fleet_id`), Kreditlimit, Flottenrechnung mit lückenlosen Nummern, Gutschriften und Monatslauf. Eine Fahrer-Einstellung „Rechnung“ ohne Flotte gibt es dort nicht.
+
+Übernahme im Fork (Zweig `rhiem/update-v0.1.42`):
+
+- Code der Zahlungsart vollständig zurückgenommen; `rhiem_0001_payment_mode` bleibt im Journal, weil sie in bestehenden Datenbanken gelaufen ist.
+- Migration `rhiem_0003_payment_mode_to_fleet_billing` überträgt die Daten und entfernt danach Spalten und Enum:
+  - Flotten mit `invoice` erhalten `account_billing_enabled`.
+  - Mitglieder dieser Flotten mit Fahrerwert `card` werden abgewählt (`account_billing_opt_out`).
+  - Noch nicht abgerechnete Vorgänge mit `invoice` (keine Rechnung, kein Karten-Zahlungseintrag) werden der ältesten Rechnungsflotte des Fahrers zugeordnet (`billing_mode = 'account'`).
+  - Fahrer mit `invoice` ohne Rechnungsflotte meldet die Migration per `NOTICE`; ihre Vorgänge bleiben ohne Stempel und müssen nach Aufnahme in eine Flotte von Hand nachgezogen werden.
+- Geprüft am 09.10.2026 mit einer Wegwerf-Datenbank: Stand `rhiem/main` (v0.1.38 plus `rhiem_0001`/`0002`) mit Testdaten, dann alle Migrationen bis `rhiem_0003`.
+
+Rechnungsprofil, Rechnungskontakte, automatischer Monatslauf und Kreditlimit sind nach dem Update in der Betreiberoberfläche je Flotte einzurichten.

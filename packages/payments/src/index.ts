@@ -146,36 +146,28 @@ export type {
   PaymentWebhookPublisher,
 } from './simulated-delivery.js';
 export type { PaymentContext, PaymentLogger } from './context.js';
-export { activeProvider, pinnedProvider } from './pinning.js';
+export { activeProvider, pinnedProvider, resolveActiveProvider } from './pinning.js';
 export { describePaymentProviders } from './provider-catalog.js';
 export type { ProviderCatalogCapabilities, ProviderCatalogEntry } from './provider-catalog.js';
 export {
   assertProviderSelectable,
   GUARDED_PROVIDER_IDS,
   isGuardedProvider,
-  LEGACY_CLEAN_MS,
-  legacyProcessCheck,
   PaymentProviderUpgradePendingError,
-  PROCESS_VERSION_WATCH_KEY,
   providerUpgradePending,
-  recordProcessWatch,
-  WATCH_FRESH_MS,
 } from './provider-switch-guard.js';
-export type {
-  LegacyProcessCheck,
-  ProcessWatchState,
-  ProcessWatchStore,
-  ProviderUpgradePendingDetails,
-} from './provider-switch-guard.js';
+export type { ProviderUpgradePendingDetails } from './provider-switch-guard.js';
 export type { PaymentRecord } from './payment-records.js';
 export { closeUnstartedRemoteStart, failUnstartedGuestSession } from './unstarted-starts.js';
 export type { UnstartedGuestOutcome, UnstartedStartOutcome } from './unstarted-starts.js';
 export {
   authorizeSessionHold,
+  BELOW_MINIMUM_CAPTURE_PREFIX,
   cancelOpenSessionHold,
   cancelSessionHold,
   captureSessionHold,
   holdTerms,
+  isReleasedBelowMinimum,
   retryShortfallForRecord,
   retryShortfalls,
   settleSessionPayment,
@@ -191,8 +183,23 @@ export type {
 } from './session-payments.js';
 export { classifySessionPayment } from './payment-mode.js';
 export type { SessionPaymentFacts, SessionPaymentMode } from './payment-mode.js';
-export { recordTerminalSettlement } from './payment-records.js';
-export type { PrepaidSettlement } from './payment-records.js';
+export {
+  claimFeeRecordsForInvoice,
+  releaseInvoiceFeeRecords,
+  isRebillRecord,
+  isStaleRebillCharge,
+  REBILL_RESUME_MAX_HOURS,
+  recordTerminalSettlement,
+  settlePrepaidSession,
+} from './payment-records.js';
+export type {
+  PrepaidSettlement,
+  PrepaidSettlementOptions,
+  RebillChargeRequest,
+  RebillRecordClaim,
+} from './payment-records.js';
+export { chargeSessionRebill, REBILL_PAYOUT_NOT_READY_CODE } from './session-rebill.js';
+export type { SessionRebillChargeInput, SessionRebillChargeOutcome } from './session-rebill.js';
 export { refundPaymentRecord } from './refunds.js';
 export type { ChargeRefund, RefundOutcome, RefundRequest, RefundTarget } from './refunds.js';
 export { applyPaymentEvent, ingestPaymentWebhook } from './webhooks.js';
@@ -200,6 +207,12 @@ export type { PaymentWebhookNotice, WebhookResult } from './webhooks.js';
 export { dispatchPaymentWebhookNotices } from './webhook-notices.js';
 export { dispatchFeeRefundNotification, FEE_REFUNDED_EVENT } from './fee-refund-notice.js';
 export type { FeeRefundNoticeDeps } from './fee-refund-notice.js';
+export {
+  crossedLowCreditThreshold,
+  dispatchPrepaidLowCreditNotice,
+  PREPAID_LOW_CREDIT_EVENT,
+} from './prepaid-notices.js';
+export type { PrepaidNoticeDeps } from './prepaid-notices.js';
 export { isSameWebhookUrl, partitionWebhookEndpoints } from './webhook-endpoint-url.js';
 export type { WebhookNoticeDeps } from './webhook-notices.js';
 export {
@@ -269,3 +282,10 @@ export type {
   ReservationFeeResult,
   ReservationFeeType,
 } from './reservation-fees.js';
+export {
+  dispatchFleetCreditLimitNotices,
+  FLEET_CREDIT_LIMIT_WARNING_EVENT,
+  FLEET_CREDIT_LIMIT_REACHED_EVENT,
+  FLEET_CREDIT_NOTICE_PERMISSION,
+} from './fleet-credit-notices.js';
+export type { FleetCreditNoticeDeps } from './fleet-credit-notices.js';

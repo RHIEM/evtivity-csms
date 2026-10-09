@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, type Mock } from 'vitest';
 import type { EventBus, DomainEvent, PubSubClient } from '@evtivity/lib';
 
 // SQL mock: a function that handles tagged template calls and returns configurable results
@@ -24,6 +24,16 @@ function createSqlMock() {
 
   const sqlFn = (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]> => {
     sqlCalls.push({ strings: [...strings], values });
+    // The session end notice claims answer by text (claimed), outside the
+    // queued results, since the settlement runs beside the Ended projection.
+    if (/SET (completed_notified_at|receipt_notified_at) = now\(\)/.test(strings.join('?'))) {
+      return Promise.resolve(Object.assign([{ id: 'session-claimed' }], { count: 1 }));
+    }
+    // The resend check (TransactionProjector.isResentEvent) answers by text,
+    // outside the queued results: no event is a resend unless a test says so.
+    if (strings.join('?').includes('AND te.seq_no = ?')) {
+      return Promise.resolve(Object.assign([], { count: 0 }));
+    }
     const idx = sqlCallIndex;
     sqlCallIndex++;
     const error = sqlErrors.get(idx);
@@ -78,9 +88,12 @@ vi.mock('@evtivity/payments', async (importOriginal) => ({
     mockRecordTerminalSettlement(...args) as unknown,
 }));
 const mockPaymentContext = { registry: {}, logger: {} };
+// The settlement options of a first run that can still be retried.
+const SETTLE_OPTIONS = { rethrowConnectionErrors: true, resumeAdjustment: false };
 vi.mock('../lib/payments.js', () => ({
   paymentRegistry: {},
   paymentContext: () => mockPaymentContext,
+  activePaymentProvider: () => Promise.resolve({ id: 'stripe' }),
 }));
 
 /**
@@ -129,6 +142,12 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/station-status.js',
   )),
+  // The real driver availability rule (station-watch alert).
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/driver-availability.js',
+  )),
+  // The real station-watch check, running on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/station-watch.js')),
   // The real session pricing writes (tariff snapshot, segments, final cost),
   // running on the mocked client. The cost itself comes from mockPriceSessionAt.
   ...(await vi.importActual<Record<string, unknown>>(
@@ -138,6 +157,8 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/tariff-resolution.js',
   )),
+  // The real Postgres error readers (the projection retry classifies errors).
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   getCompanyTaxBasis: vi.fn().mockResolvedValue('net'),
   priceSessionAt: (...args: unknown[]) => mockPriceSessionAt(...args) as unknown,
   storeRunningCost: (...args: unknown[]) => mockStoreRunningCost(...args) as unknown,
@@ -154,6 +175,8 @@ vi.mock('@evtivity/database', async () => ({
   isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
   getCompanyPriceDisplay: vi.fn().mockResolvedValue('net'),
+  // Driver sessions pay by card (no fleet account billing) unless a test says so.
+  stampSessionBilling: vi.fn().mockResolvedValue({ mode: 'card', fleetId: null, fleetName: null }),
 }));
 
 const mockDispatchOcpp = vi.fn().mockResolvedValue(undefined);
@@ -168,6 +191,7 @@ vi.mock('../server/notification-dispatcher.js', () => ({
 
 const mockDecryptString = vi.fn().mockReturnValue('sk_test_decrypted');
 const mockLoggerError = vi.fn();
+const mockLoggerWarn = vi.fn();
 
 vi.mock('@evtivity/lib', async () => {
   const actual = await vi.importActual<typeof import('@evtivity/lib')>('@evtivity/lib');
@@ -176,12 +200,12 @@ vi.mock('@evtivity/lib', async () => {
     decryptString: mockDecryptString,
     createLogger: () => ({
       info: vi.fn(),
-      warn: vi.fn(),
+      warn: mockLoggerWarn,
       error: mockLoggerError,
       debug: vi.fn(),
       child: () => ({
         info: vi.fn(),
-        warn: vi.fn(),
+        warn: mockLoggerWarn,
         error: mockLoggerError,
         debug: vi.fn(),
       }),
@@ -263,6 +287,13 @@ describe('Event projections - coverage expansion', () => {
   let eventBus: ReturnType<typeof createMockEventBus>;
   const timerCallbacks: Array<{ fn: () => void; interval: number }> = [];
   let mockPubSub: PubSubClient;
+
+  // The first import loads the whole projection module graph, which under coverage on a busy
+  // machine took longer than one test's 5 s timeout. Load it once here so setup() reads it
+  // from the module cache.
+  beforeAll(async () => {
+    await import('../server/event-projections.js');
+  }, 30_000);
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1128,6 +1159,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions
         [], // SELECT session (empty) - first subscriber stops here
         // Second subscriber
@@ -1158,6 +1190,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // 0: resolveStationId
         [], // 1: SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // 2: UPDATE charging_sessions
         [
           {
@@ -1223,6 +1256,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions
         [
           {
@@ -1284,6 +1318,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber (main Ended handler)
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions
         [
           {
@@ -1305,9 +1340,14 @@ describe('Event projections - coverage expansion', () => {
         [], // carbon query (no region found)
         [{ site_id: null }], // resolveSiteId
         // notifyChange and TransactionEnded go through pubsub (not SQL)
+        [], // SELECT ocpp_protocol (station_message_transaction)
+        // Second subscriber (auto-capture Ended)
+        [{ id: 'session-1', final_cost_cents: 2500, site_id: null }], // SELECT session
+        // Driver notifications after the settlement (notifySessionEnded)
         [
           {
             driver_id: 'driver-ended',
+            status: 'completed',
             energy_delivered_wh: 10000,
             final_cost_cents: 2500,
             tariff_tax_rate: '0.19',
@@ -1316,9 +1356,7 @@ describe('Event projections - coverage expansion', () => {
             ended_at: '2024-01-01T01:00:00Z',
           },
         ], // SELECT driver info for notification
-        // Second subscriber (auto-capture Ended)
-        [{ id: 'session-1', final_cost_cents: 2500, site_id: null }], // SELECT session
-        [], // SELECT payment_records (empty - no pre-auth)
+        [], // SELECT payment_records (no hold)
       );
 
       await eventBus.emit(
@@ -1356,10 +1394,87 @@ describe('Event projections - coverage expansion', () => {
           finalCostCents: 2500,
           currency: 'EUR',
           costIncludesTax: true,
+          notCharged: false,
         }),
         ['/mock/templates'],
         expect.anything(),
       );
+    });
+
+    it('says nothing was charged when the hold was released below the provider minimum', async () => {
+      mockDispatchDriver.mockClear();
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationId
+        [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
+        [], // UPDATE charging_sessions
+        [
+          {
+            id: 'session-min',
+            tariff_id: null,
+            current_cost_cents: 0,
+            started_at: '2024-01-01T00:00:00Z',
+            ended_at: '2024-01-01T01:00:00Z',
+            energy_delivered_wh: 1000,
+            currency: 'USD',
+            tariff_price_per_kwh: null,
+            tariff_price_per_minute: null,
+            tariff_price_per_session: null,
+            tariff_idle_fee_price_per_minute: null,
+            tariff_tax_rate: null,
+          },
+        ],
+        [], // INSERT transaction_events
+        [], // carbon query (no region found)
+        [{ site_id: null }], // resolveSiteId
+        [], // SELECT ocpp_protocol (station_message_transaction)
+        [{ id: 'session-min', final_cost_cents: 22, site_id: null }], // settlement session
+        [
+          {
+            driver_id: 'driver-min',
+            status: 'completed',
+            energy_delivered_wh: 1000,
+            final_cost_cents: 22,
+            tariff_tax_rate: null,
+            currency: 'USD',
+            started_at: '2024-01-01T00:00:00Z',
+            ended_at: '2024-01-01T01:00:00Z',
+          },
+        ],
+        [
+          {
+            status: 'cancelled',
+            failure_reason:
+              'Capture below the provider minimum charge (50c USD); 22c not collectable, hold released',
+          },
+        ],
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+          eventType: 'Ended',
+          stationId: 'CS-001',
+          transactionId: 'tx-end-min',
+          seqNo: 2,
+          triggerReason: 'EVDeparted',
+          timestamp: '2024-01-01T01:00:00Z',
+          stoppedReason: 'Local',
+        }),
+      );
+
+      for (const eventType of ['session.Completed', 'session.Receipt']) {
+        expect(mockDispatchDriver).toHaveBeenCalledWith(
+          expect.anything(),
+          eventType,
+          'driver-min',
+          expect.objectContaining({ finalCostCents: 22, notCharged: true }),
+          ['/mock/templates'],
+          expect.anything(),
+        );
+      }
     });
   });
 
@@ -1380,6 +1495,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions
         [
           {
@@ -2428,8 +2544,7 @@ describe('Event projections - coverage expansion', () => {
       [], // INSERT session_tariff_segments
       [{ site_id: 'site-pay' }], // resolveSiteId
       [{ name: 'Site Pay' }], // resolveSiteName
-      // runPaymentGate: snapshotPaymentMode (no row: card), then the hold
-      // goes through the service
+      // runPaymentGate: no SQL of its own, the hold goes through the service
     ];
     const emitDriverStarted = (transactionId: string) =>
       eventBus.emit(
@@ -2514,22 +2629,6 @@ describe('Event projections - coverage expansion', () => {
       expect(paymentNotifications()).toHaveLength(0);
     });
 
-    it('lets an invoice driver charge on a paid tariff without a hold', async () => {
-      await setup();
-      setupSqlResults(...driverStartedResults(), [{ payment_mode: 'invoice' }]);
-
-      await emitDriverStarted('tx-invoice');
-
-      // The resolved payment mode is snapshotted on the session.
-      const snapshot = findSql(/SET payment_mode = COALESCE/);
-      expect(snapshot?.values).toEqual(['driver-pay', 'driver-pay', 'session-preauth']);
-      // Invoice: billed afterwards, so no hold and no stop.
-      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
-      expect(stopCommands()).toHaveLength(0);
-      expect(faultUpdate()).toBeUndefined();
-      expect(paymentNotifications()).toHaveLength(0);
-    });
-
     it('stops and faults the session when the driver has no payment method', async () => {
       mockAuthorizeSessionHold.mockResolvedValueOnce({ outcome: 'no_method' });
       await setup();
@@ -2565,15 +2664,21 @@ describe('Event projections - coverage expansion', () => {
         outcome: 'declined',
         reason: 'card_declined',
         paymentRecordId: 9,
+        failure: 'declined',
       });
       await setup();
       mockLoggerError.mockClear();
+      mockLoggerWarn.mockClear();
       setupSqlResults(...driverStartedResults());
 
       await emitDriverStarted('tx-decline');
 
-      expect(mockLoggerError).toHaveBeenCalledWith(
+      expect(mockLoggerWarn).toHaveBeenCalledWith(
         { sessionId: 'session-preauth', reason: 'card_declined' },
+        'Auto pre-auth declined, stopping session',
+      );
+      expect(mockLoggerError).not.toHaveBeenCalledWith(
+        expect.anything(),
         'Auto pre-auth failed, stopping session',
       );
       const stops = stopCommands();
@@ -2605,6 +2710,7 @@ describe('Event projections - coverage expansion', () => {
         outcome: 'declined',
         reason: longReason,
         paymentRecordId: null,
+        failure: 'declined',
       });
       await setup();
       setupSqlResults(...driverStartedResults());
@@ -2657,6 +2763,7 @@ describe('Event projections - coverage expansion', () => {
         outcome: 'declined',
         reason: 'card_declined',
         paymentRecordId: 9,
+        failure: 'declined',
       });
       await setup();
       vi.mocked(mockPubSub.publish).mockRejectedValue(new Error('redis down'));
@@ -2671,7 +2778,12 @@ describe('Event projections - coverage expansion', () => {
     it.each([
       { outcome: { outcome: 'no_method' }, reason: 'MissingPaymentMethod' },
       {
-        outcome: { outcome: 'declined', reason: 'card_declined', paymentRecordId: 9 },
+        outcome: {
+          outcome: 'declined',
+          reason: 'card_declined',
+          paymentRecordId: 9,
+          failure: 'declined',
+        },
         reason: 'PaymentFailed',
       },
     ])(
@@ -3030,6 +3142,90 @@ describe('Event projections - coverage expansion', () => {
       expect(stopCmd).toBeUndefined();
     });
 
+    it('stamps the guest hold as the cost ceiling of the session', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationId
+        [], // eager OCPI roaming check (idToken present, no match)
+        [{ id: 'session-guest' }], // INSERT charging_sessions RETURNING id
+        [], // UPDATE stale sessions
+        [], // INSERT transaction_events
+        [{ is_roaming: false }], // SELECT is_roaming (eager-state seed)
+        [{ driver_id: null }], // SELECT driver_id (null)
+        [], // driver_tokens (empty)
+        [
+          {
+            status: 'payment_authorized',
+            guest_email: 'g@test.com',
+            pre_auth_amount_cents: 265,
+            provider_payment_id: 'pi_1',
+          },
+        ], // guest_sessions (authorized hold)
+        [], // UPDATE charging_sessions SET cost_ceiling_cents
+        [], // loadStationPricing: no pricing group applies
+        [{ site_id: null }], // resolveSiteId
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+          eventType: 'Started',
+          stationId: 'CS-001',
+          transactionId: 'tx-guest-hold',
+          seqNo: 0,
+          triggerReason: 'Authorized',
+          timestamp: '2024-01-01T00:00:00Z',
+          idToken: 'guest-token-abc',
+          tokenType: 'ISO14443',
+        }),
+      );
+
+      const stamp = findSql(/SET cost_ceiling_cents/);
+      expect(stamp?.values).toEqual([265, 'session-guest']);
+    });
+
+    it('stamps no cost ceiling for a guest session without a hold', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }],
+        [],
+        [{ id: 'session-guest' }],
+        [],
+        [],
+        [{ is_roaming: false }],
+        [{ driver_id: null }],
+        [],
+        [
+          {
+            status: 'payment_authorized',
+            guest_email: '',
+            pre_auth_amount_cents: null,
+            provider_payment_id: null,
+          },
+        ], // free guest session
+        [], // loadStationPricing
+        [{ site_id: null }],
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+          eventType: 'Started',
+          stationId: 'CS-001',
+          transactionId: 'tx-guest-free',
+          seqNo: 0,
+          triggerReason: 'Authorized',
+          timestamp: '2024-01-01T00:00:00Z',
+          idToken: 'guest-token-abc',
+          tokenType: 'ISO14443',
+        }),
+      );
+
+      expect(findSql(/SET cost_ceiling_cents/)).toBeUndefined();
+    });
+
     it('stops a guest session whose payment was not authorized and emails the guest', async () => {
       const { dispatchSystemNotification } = await import('../server/notification-dispatcher.js');
       await setup();
@@ -3091,6 +3287,7 @@ describe('Event projections - coverage expansion', () => {
     ): unknown[][] => [
       [{ id: 'sta_000000000001' }], // resolveStationId
       [], // SELECT payment_records (no failed payment)
+      [], // SELECT the active session with an open idle period (JB-2 due notice): none
       [], // UPDATE charging_sessions SET status=completed
       [
         {
@@ -3111,9 +3308,14 @@ describe('Event projections - coverage expansion', () => {
       [], // INSERT transaction_events
       [], // carbon query (no region found)
       [{ site_id: null }], // resolveSiteId
+      [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station_message_transaction)
+      // Settlement subscriber
+      settlementSession == null ? [] : [settlementSession], // SELECT session + station
+      // Driver notifications after the settlement (notifySessionEnded)
       [
         {
           driver_id: 'driver-capture',
+          status: 'completed',
           energy_delivered_wh: 10000,
           final_cost_cents: 2000,
           currency: 'USD',
@@ -3121,10 +3323,8 @@ describe('Event projections - coverage expansion', () => {
           ended_at: '2024-01-01T01:00:00Z',
         },
       ], // SELECT driver info for notification
+      [], // SELECT payment_records
       [{ name: null }], // resolveSiteName
-      [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station_message_transaction)
-      // Settlement subscriber
-      settlementSession == null ? [] : [settlementSession], // SELECT session + station
       ...after,
     ];
     const settlementRow = (finalCostCents: number | null, currency = 'USD') => ({
@@ -3157,7 +3357,11 @@ describe('Event projections - coverage expansion', () => {
       await emitEnded('tx-settle');
 
       expect(mockSettleSessionPayment).toHaveBeenCalledTimes(1);
-      expect(mockSettleSessionPayment).toHaveBeenCalledWith('session-capture', mockPaymentContext);
+      expect(mockSettleSessionPayment).toHaveBeenCalledWith(
+        'session-capture',
+        mockPaymentContext,
+        SETTLE_OPTIONS,
+      );
     });
 
     it('notifies the driver of the captured amount when the capture was recorded', async () => {
@@ -3776,6 +3980,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status = 'completed'
         [
           {
@@ -3845,6 +4050,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status = 'completed'
         [
           {
@@ -3916,6 +4122,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status = 'completed'
         [
           {
@@ -3940,6 +4147,9 @@ describe('Event projections - coverage expansion', () => {
         [], // INSERT transaction_events
         [], // carbon query (no region found)
         [{ site_id: null }], // resolveSiteId
+        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station_message_transaction)
+        // Second subscriber (settlement)
+        [{ id: 'session-connect-timeout', final_cost_cents: 0, site_id: null }],
         [
           {
             driver_id: 'drv_1',
@@ -3950,10 +4160,7 @@ describe('Event projections - coverage expansion', () => {
             started_at: '2024-01-01T00:00:00Z',
             ended_at: '2024-01-01T00:01:00Z',
           },
-        ], // SELECT for driver notification
-        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station_message_transaction)
-        // Second subscriber (settlement)
-        [{ id: 'session-connect-timeout', final_cost_cents: 0, site_id: null }],
+        ], // SELECT for driver notification (after the settlement)
       );
 
       await eventBus.emit(
@@ -3989,6 +4196,7 @@ describe('Event projections - coverage expansion', () => {
       expect(mockSettleSessionPayment).toHaveBeenCalledWith(
         'session-connect-timeout',
         mockPaymentContext,
+        SETTLE_OPTIONS,
       );
     });
   });
@@ -4001,6 +4209,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // UPDATE charging_sessions SET status = 'completed'
         [
           {
@@ -4112,7 +4321,7 @@ describe('Event projections - coverage expansion', () => {
         idToken: 'PREPAID-1',
         tokenType: 'ISO14443',
       });
-    const startedResults = (prepaidBalanceCents: number) => [
+    const startedResults = (prepaidBalanceCents: number, reservedCents = 0) => [
       [{ id: 'sta_000000000001' }], // resolveStationId
       [], // eager OCPI roaming check
       [{ id: 'session-pp' }], // INSERT charging_sessions RETURNING id
@@ -4121,6 +4330,9 @@ describe('Event projections - coverage expansion', () => {
       [{ is_roaming: false }], // SELECT is_roaming
       [{ driver_id: null }], // SELECT driver_id
       [{ id: 'dtk_pp', driver_id: 'drv_pp', prepaid_balance_cents: prepaidBalanceCents }], // driver_tokens
+      [{ prepaid_balance_cents: prepaidBalanceCents }], // driver_tokens FOR UPDATE
+      [{ reserved_cents: reservedCents }], // other active sessions of the token
+      [], // UPDATE charging_sessions SET token_id, cost_ceiling_cents
     ];
     const stopCommands = (): unknown[][] =>
       (mockPubSub.publish as Mock<PubSubClient['publish']>).mock.calls.filter(
@@ -4142,16 +4354,85 @@ describe('Event projections - coverage expansion', () => {
       expect(stopCommands()).toHaveLength(0);
     });
 
+    it('stamps the prepaid credit as the cost ceiling of the session (C17.FR.03)', async () => {
+      await setup();
+      setupSqlResults(...startedResults(5000));
+
+      await eventBus.emit('ocpp.TransactionEvent', startedEvent('tx-pp-ceil'));
+
+      const link = findSql(/SET token_id = .*cost_ceiling_cents/s);
+      expect(link?.values).toEqual(['dtk_pp', 5000, 'session-pp']);
+    });
+
     it('stops a session started by a prepaid token without credit', async () => {
       await setup();
       setupSqlResults(...startedResults(0));
 
       await eventBus.emit('ocpp.TransactionEvent', startedEvent('tx-pp-0'));
 
+      // No credit: a zero ceiling, so nothing is billed.
+      expect(findSql(/SET token_id = .*cost_ceiling_cents/s)?.values).toEqual([
+        'dtk_pp',
+        0,
+        'session-pp',
+      ]);
       expect(stopCommands()).toHaveLength(1);
       expect(sqlCalls.some((c) => c.strings.join('?').includes('driver_payment_methods'))).toBe(
         false,
       );
+    });
+
+    it("reserves the credit of the token's other active sessions", async () => {
+      await setup();
+      setupSqlResults(...startedResults(5000, 3000));
+
+      await eventBus.emit('ocpp.TransactionEvent', startedEvent('tx-pp-second'));
+
+      expect(findSql(/FROM driver_tokens WHERE id = .* FOR UPDATE/s)?.values).toEqual(['dtk_pp']);
+      // Other active sessions, ended ones without a debit for 24 hours, and
+      // re-billable EndRequestFailed ones without a time limit, in the company
+      // currency.
+      const reserved = findSql(/AS reserved_cents/);
+      expect(reserved?.values).toEqual(['USD', 'EndRequestFailed', 'dtk_pp', 'session-pp', 24]);
+      const reservedSql = reserved?.strings.join('?') ?? '';
+      expect(reservedSql).toContain('NOT EXISTS (SELECT 1 FROM payment_records');
+      expect(reservedSql).toContain("rebill_status IS NULL OR cs.rebill_status = 'in_progress'");
+      expect(reservedSql).toContain('OR (o.unsettled AND o.rebillable)');
+      expect(findSql(/SET token_id = .*cost_ceiling_cents/s)?.values).toEqual([
+        'dtk_pp',
+        2000,
+        'session-pp',
+      ]);
+      expect(stopCommands()).toHaveLength(0);
+    });
+
+    it('links without a ceiling when the token is no longer prepaid at the lock', async () => {
+      await setup();
+      const results: unknown[][] = startedResults(5000);
+      // The operator made the token postpaid between the lookup and the lock.
+      results.splice(8, 3, [{ prepaid_balance_cents: null }], []);
+      setupSqlResults(...results);
+
+      await eventBus.emit('ocpp.TransactionEvent', startedEvent('tx-pp-postpaid'));
+
+      expect(findSql(/SET token_id = .*cost_ceiling_cents/s)).toBeUndefined();
+      expect(findSql(/AS reserved_cents/)).toBeUndefined();
+      const link = findSql(/UPDATE charging_sessions SET token_id = /);
+      expect(link?.values).toEqual(['dtk_pp', 'session-pp']);
+    });
+
+    it('stops a second session when the other sessions reserve the whole credit', async () => {
+      await setup();
+      setupSqlResults(...startedResults(5000, 5000));
+
+      await eventBus.emit('ocpp.TransactionEvent', startedEvent('tx-pp-full'));
+
+      expect(findSql(/SET token_id = .*cost_ceiling_cents/s)?.values).toEqual([
+        'dtk_pp',
+        0,
+        'session-pp',
+      ]);
+      expect(stopCommands()).toHaveLength(1);
     });
 
     it('reports the prepaid debit when the session ends', async () => {
@@ -4166,6 +4447,7 @@ describe('Event projections - coverage expansion', () => {
         // First subscriber
         [{ id: 'sta_000000000001' }],
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [],
         [
           {
@@ -4186,16 +4468,6 @@ describe('Event projections - coverage expansion', () => {
         [],
         [], // carbon query
         [{ site_id: null }],
-        [
-          {
-            driver_id: null,
-            energy_delivered_wh: 0,
-            final_cost_cents: null,
-            currency: 'USD',
-            started_at: '2024-01-01T00:00:00Z',
-            ended_at: '2024-01-01T01:00:00Z',
-          },
-        ],
         [], // SELECT ocpp_protocol
         // Second subscriber
         [
@@ -4223,7 +4495,11 @@ describe('Event projections - coverage expansion', () => {
         }),
       );
 
-      expect(mockSettleSessionPayment).toHaveBeenCalledWith('session-pp-end', mockPaymentContext);
+      expect(mockSettleSessionPayment).toHaveBeenCalledWith(
+        'session-pp-end',
+        mockPaymentContext,
+        SETTLE_OPTIONS,
+      );
       expect(mockPubSub.publish).toHaveBeenCalledWith(
         'csms_events',
         JSON.stringify({ eventType: 'token.changed', tokenId: 'dtk_pp' }),
@@ -4254,12 +4530,12 @@ describe('Event projections - coverage expansion', () => {
       setupSqlResults(
         [{ id: 'sta_000000000001' }],
         [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [],
         [{ id: 'session-pp-end', tariff_id: null, current_cost_cents: 0, currency: 'USD' }],
         [],
         [], // carbon query
         [{ site_id: null }],
-        [{ driver_id: null, energy_delivered_wh: 0, final_cost_cents: null, currency: 'USD' }],
         [], // SELECT ocpp_protocol
         [{ id: 'session-pp-end', final_cost_cents: 1000, station_uuid: null, currency: 'USD' }],
       );

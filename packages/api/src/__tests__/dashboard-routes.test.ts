@@ -138,6 +138,7 @@ import { registerAuth } from '../plugins/auth.js';
 import { dashboardRoutes } from '../routes/dashboard.js';
 import { db } from '@evtivity/database';
 import { getUserSiteIds } from '../lib/site-access.js';
+import * as sessionRevenueModule from '@evtivity/services/session-revenue';
 
 const getUserSiteIdsMock = getUserSiteIds as ReturnType<typeof vi.fn>;
 
@@ -337,7 +338,7 @@ describe('Dashboard routes', () => {
   it('GET /v1/dashboard/financial-stats returns revenue, electricity cost, and profit in the company currency', async () => {
     setupDbResults([{ totalElectricityCostCents: 120000, dayElectricityCostCents: 3000 }]);
     // The shared revenue definition (session-revenue.ts), split by today.
-    const { aggregateRevenueRows } = await import('@evtivity/services/session-revenue');
+    const { aggregateRevenueRows } = sessionRevenueModule;
     mockQueryRevenue.mockResolvedValueOnce(
       aggregateRevenueRows([
         { key: 'false', taxRate: '0.19', grossCents: 1190, source: 'session', count: 392 },
@@ -346,6 +347,9 @@ describe('Dashboard routes', () => {
         { key: 'true', taxRate: '0.07', grossCents: 480, source: 'session', count: 1 },
         // A reservation fee: revenue, but not a session.
         { key: 'true', taxRate: '0.19', grossCents: 595, source: 'fee', count: 1 },
+        // Unpaid account sessions: billed on account, not revenue.
+        { key: 'false', taxRate: '0.19', grossCents: 2380, source: 'account', count: 2 },
+        { key: 'true', taxRate: '0.19', grossCents: 1190, source: 'account', count: 1 },
       ]),
     );
     const response = await app.inject({
@@ -371,6 +375,8 @@ describe('Dashboard routes', () => {
     // Profit = revenue excluding tax - electricity cost
     expect(body).toHaveProperty('totalProfitCents', 424469 - 120000);
     expect(body).toHaveProperty('dayProfitCents', 8949 - 3000);
+    expect(body).toHaveProperty('billedOnAccountCents', 2 * 2380 + 1190);
+    expect(body).toHaveProperty('billedOnAccountCount', 3);
     expect(body).toHaveProperty('currency', 'EUR');
     expect(mockQueryRevenue).toHaveBeenCalledWith(
       expect.objectContaining({ companyCurrency: 'EUR', where: [] }),
@@ -391,11 +397,12 @@ describe('Dashboard routes', () => {
     expect(body.totalTaxCents).toBe(0);
     expect(body.totalProfitCents).toBe(0);
     expect(body.dayProfitCents).toBe(0);
+    expect(body.billedOnAccountCents).toBe(0);
     expect(body.currency).toBe('EUR');
   });
 
   it('GET /v1/dashboard/revenue-history returns daily revenue data', async () => {
-    const { aggregateRevenueRows } = await import('@evtivity/services/session-revenue');
+    const { aggregateRevenueRows } = sessionRevenueModule;
     mockQueryRevenue.mockResolvedValueOnce(
       aggregateRevenueRows([
         { key: '2025-01-02', taxRate: '0', grossCents: 500, source: 'session', count: 14 },

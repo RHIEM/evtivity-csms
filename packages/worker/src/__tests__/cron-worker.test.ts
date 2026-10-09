@@ -1,8 +1,10 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import type { Job } from 'bullmq';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const mockLog = { info: vi.fn(), error: vi.fn(), warn: vi.fn() };
 vi.mock('@evtivity/lib', () => ({
@@ -82,9 +84,13 @@ const handlerMocks = {
   logRetentionPruneHandler: vi.fn().mockResolvedValue(undefined),
   mfaChallengePruneHandler: vi.fn().mockResolvedValue(undefined),
   refreshTokenPruneHandler: vi.fn().mockResolvedValue(undefined),
+  stationWatchPruneHandler: vi.fn().mockResolvedValue(undefined),
   maintenanceSchedulerHandler: vi.fn().mockResolvedValue(undefined),
+  ocpiLocationSyncHandler: vi.fn().mockResolvedValue(undefined),
   payoutAccountSyncHandler: vi.fn().mockResolvedValue(undefined),
   processVersionWatchHandler: vi.fn().mockResolvedValue(undefined),
+  stationOfflineSweepHandler: vi.fn().mockResolvedValue(undefined),
+  fleetInvoiceRunHandler: vi.fn().mockResolvedValue(undefined),
 };
 
 vi.mock('../handlers/report-scheduler.js', () => ({
@@ -144,8 +150,14 @@ vi.mock('../handlers/mfa-challenge-prune.js', () => ({
 vi.mock('../handlers/refresh-token-prune.js', () => ({
   refreshTokenPruneHandler: (...a: unknown[]) => handlerMocks.refreshTokenPruneHandler(...a),
 }));
+vi.mock('../handlers/station-watch-prune.js', () => ({
+  stationWatchPruneHandler: (...a: unknown[]) => handlerMocks.stationWatchPruneHandler(...a),
+}));
 vi.mock('../handlers/maintenance-scheduler.js', () => ({
   maintenanceSchedulerHandler: (...a: unknown[]) => handlerMocks.maintenanceSchedulerHandler(...a),
+}));
+vi.mock('../handlers/ocpi-location-sync.js', () => ({
+  ocpiLocationSyncHandler: (...a: unknown[]) => handlerMocks.ocpiLocationSyncHandler(...a),
 }));
 vi.mock('../handlers/payout-account-sync.js', () => ({
   payoutAccountSyncHandler: (...a: unknown[]) => handlerMocks.payoutAccountSyncHandler(...a),
@@ -153,10 +165,51 @@ vi.mock('../handlers/payout-account-sync.js', () => ({
 vi.mock('../handlers/process-version-watch.js', () => ({
   processVersionWatchHandler: (...a: unknown[]) => handlerMocks.processVersionWatchHandler(...a),
 }));
+vi.mock('../handlers/station-offline-sweep.js', () => ({
+  stationOfflineSweepHandler: (...a: unknown[]) => handlerMocks.stationOfflineSweepHandler(...a),
+}));
+vi.mock('../handlers/fleet-invoice-run.js', () => ({
+  fleetInvoiceRunHandler: (...a: unknown[]) => handlerMocks.fleetInvoiceRunHandler(...a),
+}));
+
+const migrationsDir = join(import.meta.dirname, '..', '..', '..', 'database', 'src', 'migrations');
+
+// Every cron job name a migration inserts into `cronjobs` (VALUES rows and
+// INSERT ... SELECT 'name' forms), minus any a later migration deletes.
+function seededCronJobNames(): string[] {
+  const names = new Set<string>();
+  const files = readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  for (const file of files) {
+    const sql = readFileSync(join(migrationsDir, file), 'utf8');
+    for (const stmt of sql.matchAll(/INSERT INTO "?cronjobs"?\s*\([^)]*\)\s*([\s\S]*?);/gi)) {
+      const body = stmt[1] ?? '';
+      if (/^VALUES/i.test(body)) {
+        for (const row of body.matchAll(/\(\s*'([^']+)'/g)) names.add(row[1] as string);
+      } else {
+        const selected = /^SELECT\s+'([^']+)'/i.exec(body);
+        if (selected?.[1] !== undefined) names.add(selected[1]);
+      }
+    }
+    for (const del of sql.matchAll(/DELETE FROM "?cronjobs"?\s+WHERE\s+name\s*=\s*'([^']+)'/gi)) {
+      names.delete(del[1] as string);
+    }
+  }
+  return [...names].sort();
+}
 
 function makeJob(name: string, data: unknown = {}): Job {
   return { name, data } as unknown as Job;
 }
+
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let bullmqModule: typeof import('bullmq');
+let cronWorkerModule: typeof import('../cron-worker.js');
+beforeAll(async () => {
+  bullmqModule = await import('bullmq');
+  cronWorkerModule = await import('../cron-worker.js');
+}, 30_000);
 
 beforeEach(() => {
   capturedProcessor = undefined;
@@ -184,8 +237,8 @@ beforeEach(() => {
 
 describe('createCronWorker', () => {
   it('creates a BullMQ Worker on the cron-jobs queue with concurrency 1', async () => {
-    const { Worker } = await import('bullmq');
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { Worker } = bullmqModule;
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     expect(Worker).toHaveBeenCalledWith(
@@ -196,7 +249,7 @@ describe('createCronWorker', () => {
   });
 
   it('passes the provided connection through to the Worker', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     const connection = { host: 'redis-cron' } as never;
     createCronWorker(connection);
 
@@ -204,7 +257,7 @@ describe('createCronWorker', () => {
   });
 
   it('returns the worker instance', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     const worker = createCronWorker({});
     expect(worker).toBeDefined();
     expect(typeof (worker as unknown as { on: unknown }).on).toBe('function');
@@ -213,7 +266,7 @@ describe('createCronWorker', () => {
 
 describe('cron-worker processor dispatch', () => {
   it('dispatches a known job name to the matching handler and runs the success path', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     await capturedProcessor?.(makeJob('payment-reconciliation'));
@@ -241,7 +294,7 @@ describe('cron-worker processor dispatch', () => {
   });
 
   it('routes each registered job name to its own handler', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     const routes: Array<[string, keyof typeof handlerMocks]> = [
@@ -254,6 +307,8 @@ describe('cron-worker processor dispatch', () => {
       ['audit-retention-prune', 'auditRetentionPruneHandler'],
       ['payout-account-sync', 'payoutAccountSyncHandler'],
       ['process-version-watch', 'processVersionWatchHandler'],
+      ['station-offline-sweep', 'stationOfflineSweepHandler'],
+      ['fleet-invoice-run', 'fleetInvoiceRunHandler'],
     ];
 
     for (const [jobName, handlerKey] of routes) {
@@ -262,8 +317,32 @@ describe('cron-worker processor dispatch', () => {
     }
   });
 
+  it('has a handler for every cron job the migrations seed', async () => {
+    const seeded = seededCronJobNames();
+    // Non-vacuous: the migrations seed 22 cron jobs as of migration 0124.
+    expect(seeded.length).toBeGreaterThanOrEqual(22);
+
+    const { createCronWorker } = cronWorkerModule;
+    createCronWorker({});
+
+    const missing: string[] = [];
+    for (const name of seeded) {
+      try {
+        await capturedProcessor?.(makeJob(name));
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith('No handler registered')) {
+          missing.push(name);
+        } else {
+          throw err;
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+    expect(mockLogJobStarted).toHaveBeenCalledTimes(seeded.length);
+  });
+
   it('throws for an unknown job name and never starts a job log', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     await expect(capturedProcessor?.(makeJob('does-not-exist'))).rejects.toThrow(
@@ -276,7 +355,7 @@ describe('cron-worker processor dispatch', () => {
 
   it('logs failure and rethrows when a handler throws, without marking completed', async () => {
     handlerMocks.dashboardSnapshotHandler.mockRejectedValueOnce(new Error('snapshot boom'));
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     await expect(capturedProcessor?.(makeJob('dashboard-snapshot'))).rejects.toThrow(
@@ -298,7 +377,7 @@ describe('cron-worker processor dispatch', () => {
 
   it('uses "Unknown error" when a handler throws a non-Error', async () => {
     handlerMocks.reportSchedulerHandler.mockRejectedValueOnce('weird');
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     await expect(capturedProcessor?.(makeJob('report-scheduler'))).rejects.toBe('weird');
@@ -308,7 +387,7 @@ describe('cron-worker processor dispatch', () => {
   it('swallows a logJobFailed write error but still rethrows the original handler error', async () => {
     handlerMocks.tariffBoundaryCheckHandler.mockRejectedValueOnce(new Error('original'));
     mockLogJobFailed.mockRejectedValueOnce(new Error('log write failed'));
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     await expect(capturedProcessor?.(makeJob('tariff-boundary-check'))).rejects.toThrow('original');
@@ -317,7 +396,7 @@ describe('cron-worker processor dispatch', () => {
 
 describe('cron-worker failed listener', () => {
   it('marks the cronjobs row failed with a truncated error message', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     const failedHandler = onHandlers.get('failed');
@@ -337,7 +416,7 @@ describe('cron-worker failed listener', () => {
   });
 
   it('falls back to "Unknown error" for a non-Error reason', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     const failedHandler = onHandlers.get('failed');
@@ -348,7 +427,7 @@ describe('cron-worker failed listener', () => {
   });
 
   it('ignores a null job', async () => {
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     const failedHandler = onHandlers.get('failed');
@@ -360,7 +439,7 @@ describe('cron-worker failed listener', () => {
 
   it('swallows a db update rejection in the failed listener (fail-open)', async () => {
     dbUpdateWhere.mockReturnValueOnce(Promise.reject(new Error('db down')));
-    const { createCronWorker } = await import('../cron-worker.js');
+    const { createCronWorker } = cronWorkerModule;
     createCronWorker({});
 
     const failedHandler = onHandlers.get('failed');

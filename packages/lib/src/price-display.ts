@@ -537,6 +537,11 @@ export function taxPerRate(parts: readonly RatedAmount[], basis: TaxBasis): TaxL
 export interface CostComponentGroup {
   segment: number | null;
   taxLines: CostTaxLine[];
+  /**
+   * Idle minutes billed in this group (after the grace period), when its
+   * idle fee is not zero. Absent in breakdowns stored before it was recorded.
+   */
+  billableIdleMinutes?: number;
 }
 
 /**
@@ -563,6 +568,13 @@ export interface SessionCostBreakdown {
    * a charged amount that differs from the calculation.
    */
   components: CostComponentGroup[] | null;
+  /**
+   * The tariff price, tax included, when it was above the session's cost
+   * ceiling (the guest's card authorization, which OCPP 2.1 C25 makes the
+   * ceiling for the cost): grossCents is then the ceiling, and the rest was
+   * not billed (capCostBreakdown). Absent when the cost was not capped.
+   */
+  pricedGrossCents?: number;
 }
 
 /**
@@ -613,6 +625,24 @@ export function reconcileCostBreakdown(
   };
 }
 
+/**
+ * A breakdown limited to the session's cost ceiling. Unchanged when it is at
+ * or below the ceiling (or there is none); otherwise reconciled to the
+ * ceiling (reconcileCostBreakdown, components dropped) with the tariff price
+ * kept in pricedGrossCents, so the amount not billed stays on record.
+ */
+export function capCostBreakdown(
+  breakdown: SessionCostBreakdown,
+  ceilingCents: number | null,
+  fallbackRate: number,
+): SessionCostBreakdown {
+  if (ceilingCents == null || breakdown.grossCents <= ceilingCents) return breakdown;
+  return {
+    ...reconcileCostBreakdown(breakdown, Math.max(0, ceilingCents), fallbackRate),
+    pricedGrossCents: breakdown.pricedGrossCents ?? breakdown.grossCents,
+  };
+}
+
 /** The component tax lines of a breakdown merged per rate, or null when it has no components. */
 export function componentTaxLines(breakdown: SessionCostBreakdown): CostTaxLine[] | null {
   if (breakdown.components == null) return null;
@@ -650,7 +680,13 @@ function parseComponents(value: unknown): CostComponentGroup[] | null | undefine
     const lines = g['taxLines'];
     if (segment !== null && !isFiniteNumber(segment)) return undefined;
     if (!Array.isArray(lines) || !lines.every(isCostTaxLineValue)) return undefined;
-    groups.push({ segment, taxLines: lines });
+    const idle = g['billableIdleMinutes'];
+    if (idle !== undefined && !isFiniteNumber(idle)) return undefined;
+    groups.push(
+      idle === undefined
+        ? { segment, taxLines: lines }
+        : { segment, taxLines: lines, billableIdleMinutes: idle },
+    );
   }
   return groups;
 }
@@ -683,5 +719,10 @@ export function parseSessionCostBreakdown(value: unknown): SessionCostBreakdown 
   }
   const components = parseComponents(b['components']);
   if (components === undefined) return null;
-  return { basis, netCents, taxCents, grossCents, taxLines: lines, components };
+  const pricedGrossCents = b['pricedGrossCents'];
+  if (pricedGrossCents === undefined) {
+    return { basis, netCents, taxCents, grossCents, taxLines: lines, components };
+  }
+  if (!isFiniteNumber(pricedGrossCents) || pricedGrossCents <= grossCents) return null;
+  return { basis, netCents, taxCents, grossCents, taxLines: lines, components, pricedGrossCents };
 }

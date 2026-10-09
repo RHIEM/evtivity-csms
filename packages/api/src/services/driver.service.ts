@@ -1,10 +1,9 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, desc, sql } from 'drizzle-orm';
+import { eq, desc } from 'drizzle-orm';
 import { db } from '@evtivity/database';
 import { drivers, driverTokens } from '@evtivity/database';
-import type { PaymentMode } from '@evtivity/database';
 import * as tokenService from './token.service.js';
 
 export async function listDrivers() {
@@ -69,39 +68,4 @@ export async function deactivateDriverToken(tokenId: string) {
     { isActive: false, revokedReason: 'Deactivated via driver service' },
     { type: 'system' },
   );
-}
-
-/**
- * Resolve how a driver pays for charging: driver > fleet > 'card'.
- *
- * A driver-level payment_mode overrides the fleet. fleet_drivers has no unique
- * constraint on driverId, so among the driver's fleets that set a mode the
- * oldest membership wins, mirroring resolveTariffGroup() in tariff.service.ts.
- *
- * The OCPP payment gate (packages/ocpp/src/server/event-projections.ts)
- * inlines the same query; keep both in sync.
- */
-export async function resolvePaymentMode(driverId: string): Promise<PaymentMode> {
-  const rows = await db.execute<{ payment_mode: PaymentMode }>(sql`
-    WITH driver_mode AS (
-      SELECT d.payment_mode, 1 AS priority
-      FROM drivers d
-      WHERE d.id = ${driverId} AND d.payment_mode IS NOT NULL
-    ),
-    fleet_mode AS (
-      SELECT f.payment_mode, 2 AS priority
-      FROM fleet_drivers fd
-      JOIN fleets f ON f.id = fd.fleet_id
-      WHERE fd.driver_id = ${driverId} AND f.payment_mode IS NOT NULL
-      ORDER BY fd.created_at ASC
-      LIMIT 1
-    )
-    SELECT payment_mode FROM (
-      SELECT payment_mode, priority FROM driver_mode
-      UNION ALL SELECT payment_mode, priority FROM fleet_mode
-    ) modes
-    ORDER BY priority
-    LIMIT 1
-  `);
-  return rows[0]?.payment_mode ?? 'card';
 }

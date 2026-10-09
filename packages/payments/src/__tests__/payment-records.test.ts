@@ -102,7 +102,11 @@ vi.mock('@evtivity/database', () => ({
     tokenId: 'cs.token_id',
     finalCostCents: 'cs.final_cost_cents',
     currency: 'cs.currency',
+    status: 'cs.status',
+    stoppedReason: 'cs.stopped_reason',
+    rebillStatus: 'cs.rebill_status',
   },
+  SESSION_END_FAILED_REASON: 'EndRequestFailed',
   driverTokens: {
     id: 't.id',
     driverId: 't.driver_id',
@@ -126,6 +130,7 @@ vi.mock('@evtivity/database', () => ({
     pendingOperationRef: 'pr.pending_operation_ref',
     pendingOperationAt: 'pr.pending_operation_at',
     providerRefunds: 'pr.provider_refunds',
+    invoiceId: 'pr.invoice_id',
   },
 }));
 
@@ -133,6 +138,7 @@ vi.mock('drizzle-orm', () => ({
   and: (...args: unknown[]) => ({ op: 'and', args }),
   eq: (col: unknown, value: unknown) => ({ op: 'eq', col, value }),
   inArray: (col: unknown, values: unknown) => ({ op: 'inArray', col, values }),
+  isNull: (col: unknown) => ({ op: 'isNull', col }),
   lte: (col: unknown, value: unknown) => ({ op: 'lte', col, value }),
   or: (...args: unknown[]) => ({ op: 'or', args }),
   sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
@@ -144,9 +150,17 @@ vi.mock('drizzle-orm', () => ({
 
 import {
   addPendingRefunds,
+  claimFeeRecordsForInvoice,
+  releaseInvoiceFeeRecords,
+  claimRebillRecord,
+  isStaleRebillCharge,
+  REBILL_RESUME_MAX_HOURS,
+  rebillChargeRequest,
   clearPendingAdjustment,
+  isRebillRecord,
   confirmOperation,
   markAdjustmentPending,
+  reclaimStaleAdjustment,
   matchPendingAdjustment,
   setAdjustmentRef,
   failPendingCapture,
@@ -227,11 +241,8 @@ describe('inserts', () => {
       sitePaymentConfigId: 3,
       provider: 'stripe',
       providerPaymentId: 'pi_1',
-      stripePaymentIntentId: 'pi_1',
       providerCustomerId: 'cus_1',
-      stripeCustomerId: 'cus_1',
       providerPaymentMethodId: 'pm_1',
-      stripePaymentMethodId: 'pm_1',
       paymentSource: 'web_portal',
       currency: 'EUR',
       preAuthAmountCents: 5000,
@@ -239,26 +250,6 @@ describe('inserts', () => {
     });
     expect(call.conflict).toEqual({ target: 'pr.session_id' });
     expect(call.returning).toEqual({ id: 'pr.id' });
-  });
-
-  it('recordHold never writes an id of another provider to the stripe_* columns', async () => {
-    h.results.push([{ id: 7 }]);
-    await recordHold({
-      ...hold,
-      provider: 'adyen',
-      paymentId: 'PSP1',
-      customerId: 'SH1',
-      methodId: 'T1',
-    });
-    expect(last().values).toMatchObject({
-      provider: 'adyen',
-      providerPaymentId: 'PSP1',
-      stripePaymentIntentId: null,
-      providerCustomerId: 'SH1',
-      stripeCustomerId: null,
-      providerPaymentMethodId: 'T1',
-      stripePaymentMethodId: null,
-    });
   });
 
   it('recordHold returns null on conflict', async () => {
@@ -284,12 +275,10 @@ describe('inserts', () => {
     const call = last();
     expect(call.values?.['status']).toBe('failed');
     expect(call.values?.['failureReason']).toBe('x'.repeat(500));
-    expect(call.values).not.toHaveProperty('stripePaymentIntentId');
     expect(call.values).not.toHaveProperty('providerPaymentId');
     expect(call.values).toMatchObject({
       provider: 'stripe',
       providerCustomerId: null,
-      stripeCustomerId: null,
     });
     expect(call.conflict).toEqual({ target: 'pr.session_id' });
   });
@@ -331,7 +320,6 @@ describe('inserts', () => {
       sitePaymentConfigId: 1,
       provider: 'stripe',
       providerPaymentId: 'pi_g',
-      stripePaymentIntentId: 'pi_g',
       paymentSource: 'guest',
       currency: 'USD',
       preAuthAmountCents: 2000,
@@ -374,10 +362,8 @@ describe('inserts', () => {
       sitePaymentConfigId: null,
       provider: 'simulated',
       providerCustomerId: 'cus_sim_1',
-      stripeCustomerId: 'cus_sim_1',
       providerPaymentMethodId: 'pm_sim_1',
-      stripePaymentMethodId: 'pm_sim_1',
-      paymentSource: 'web_portal',
+      paymentSource: 'operator',
       currency: 'USD',
       taxRate: '0.19',
       status: 'pending',
@@ -587,7 +573,6 @@ describe('status updates are guarded by their from-states', () => {
       status: 'captured',
       provider: 'stripe',
       providerPaymentId: 'pi_4',
-      stripePaymentIntentId: 'pi_4',
       capturedAmountCents: 900,
     });
     expect(last().where).toEqual(guard(4, ['pending']));
@@ -853,12 +838,44 @@ describe('settlePrepaidSession', () => {
     expect(h.writeAudit.mock.calls[0]?.[3]).toBeUndefined();
   });
 
-  it('returns null without a debit when the session was already settled', async () => {
+  it('returns null without a debit when the conflicting record cannot be read', async () => {
     h.results.push([ROW], []);
     expect(await settlePrepaidSession('s1', logger)).toBeNull();
     expect(h.calls.filter((c) => c.kind === 'update')).toHaveLength(0);
     expect(h.writeAudit).not.toHaveBeenCalled();
   });
+
+  it('reports the debit already recorded without debiting again', async () => {
+    // A rerun after a lost connection: the first run committed the debit.
+    h.results.push(
+      [ROW],
+      [],
+      [{ capturedCents: 1200, source: 'prepaid', status: 'captured' }],
+      [{ balanceCents: 3800 }],
+    );
+    expect(await settlePrepaidSession('s1', logger)).toEqual({
+      tokenId: 't1',
+      debitedCents: 1200,
+      balanceCents: 3800,
+      repeated: true,
+    });
+    expect(h.calls.filter((c) => c.kind === 'update')).toHaveLength(0);
+    expect(h.writeAudit).not.toHaveBeenCalled();
+  });
+
+  it('returns null when the session was settled another way', async () => {
+    h.results.push([ROW], [], [{ capturedCents: 1200, source: 'card', status: 'captured' }]);
+    expect(await settlePrepaidSession('s1', logger)).toBeNull();
+    expect(h.writeAudit).not.toHaveBeenCalled();
+  });
+
+  it.each([['refunded'], ['partially_refunded']])(
+    'returns null for a recorded debit that was %s',
+    async (status) => {
+      h.results.push([ROW], [], [{ capturedCents: 1200, source: 'prepaid', status }]);
+      expect(await settlePrepaidSession('s1', logger)).toBeNull();
+    },
+  );
 
   it.each([[[]], [[{ balanceCents: null }]]])(
     'returns null when the balance update returns nothing (%j)',
@@ -906,6 +923,29 @@ describe('authorisation adjustment (P10 Part D)', () => {
     ]);
     expect((where.args[2] as { text: string }).text).toBe('? IS NULL');
     expect(await markAdjustmentPending(1)).toBe(false);
+  });
+
+  it('reclaimStaleAdjustment takes over only an old unreferenced claim on an open hold', async () => {
+    const olderThan = new Date('2026-10-07T11:00:00Z');
+    h.results.push([{ id: 1, pendingOperation: 'adjust' }]);
+    expect(await reclaimStaleAdjustment(1, olderThan)).toEqual({
+      id: 1,
+      pendingOperation: 'adjust',
+    });
+    const call = last();
+    expect(call.set?.['pendingOperationAt']).toBeInstanceOf(Date);
+    const where = call.where as { args: unknown[] };
+    expect(where.args.slice(0, 3)).toEqual([
+      { op: 'eq', col: 'pr.id', value: 1 },
+      { op: 'inArray', col: 'pr.status', values: ['pre_authorized'] },
+      { op: 'eq', col: 'pr.pending_operation', value: 'adjust' },
+    ]);
+    expect((where.args[3] as { text: string }).text).toBe('? IS NULL');
+    expect(where.args[4]).toMatchObject({ text: '? < ?' });
+    expect((where.args[4] as { values: unknown[] }).values[1]).toBe(olderThan);
+    // Nothing to take (a concurrent re-drive took it, or a webhook stored the reference).
+    h.results.push([]);
+    expect(await reclaimStaleAdjustment(1, olderThan)).toBeNull();
   });
 
   it('setAdjustmentRef stores the reference of an unreferenced pending adjustment', async () => {
@@ -1188,6 +1228,44 @@ describe('async operations (P10a)', () => {
     );
   });
 
+  it('settleRefund of one of two pending refunds settles only its entry', async () => {
+    const both = [entry('RF1', 'pending', 'PSP1', 60), entry('RF2', 'pending', 'PSP1', 1940)];
+    h.results.push([locked({ providerRefunds: both })], [{ id: 9 }]);
+    await settleRefund(9, {
+      refundId: 'RF2',
+      paymentId: 'PSP1',
+      amountCents: 1940,
+      outcome: 'succeeded',
+    });
+    expect(last().set).toMatchObject({ status: 'partially_refunded', refundedAmountCents: 1940 });
+    expect(last().set?.['providerRefunds']).toEqual([
+      expect.objectContaining({ refundId: 'RF1', state: 'pending' }),
+      expect.objectContaining({ refundId: 'RF2', state: 'succeeded' }),
+    ]);
+
+    h.results.push(
+      [
+        locked({
+          status: 'partially_refunded',
+          refundedAmountCents: 1940,
+          providerRefunds: [both[0], { ...both[1], state: 'succeeded' }],
+        }),
+      ],
+      [{ id: 9 }],
+    );
+    await settleRefund(9, {
+      refundId: 'RF1',
+      paymentId: 'PSP1',
+      amountCents: 60,
+      outcome: 'succeeded',
+    });
+    expect(last().set).toMatchObject({ status: 'refunded', refundedAmountCents: 2000 });
+    expect(last().set?.['providerRefunds']).toEqual([
+      expect.objectContaining({ refundId: 'RF1', state: 'succeeded' }),
+      expect.objectContaining({ refundId: 'RF2', state: 'succeeded' }),
+    ]);
+  });
+
   it('settleRefund applies a duplicate once', async () => {
     h.results.push([locked({ providerRefunds: [entry('RF1', 'succeeded')] })]);
     expect(
@@ -1269,5 +1347,270 @@ describe('async operations (P10a)', () => {
     expect(where.values).toContain(olderThan);
     expect(where.values).toContain(since);
     expect(last().limit).toBe(50);
+  });
+});
+
+describe('settlePrepaidSession for a re-bill', () => {
+  it('debits the given cost and marks the record as the re-bill', async () => {
+    h.getCompanyCurrency.mockResolvedValue('EUR');
+    h.writeAudit.mockResolvedValue(undefined);
+    h.results.push(
+      [
+        {
+          tokenId: 't1',
+          tokenDriverId: 'd1',
+          balanceCents: 5000,
+          driverId: 'd1',
+          finalCostCents: 0,
+          currency: 'EUR',
+        },
+      ],
+      [{ id: 9 }],
+      [{ balanceCents: 4100 }],
+    );
+    expect(await settlePrepaidSession('s1', undefined, { costCents: 900, rebill: true })).toEqual({
+      tokenId: 't1',
+      debitedCents: 900,
+      balanceCents: 4100,
+    });
+    const insert = h.calls.find((c) => c.kind === 'insert');
+    expect(insert?.values?.['capturedAmountCents']).toBe(900);
+    expect(insert?.values?.['metadata']).toEqual({
+      tokenId: 't1',
+      rebill: { requestedAt: expect.any(String) as string },
+    });
+  });
+});
+
+describe('claimRebillRecord', () => {
+  const request = {
+    provider: 'stripe' as const,
+    customerId: 'cus_1',
+    methodId: 'pm_1',
+    grossCents: 1190,
+    currency: 'EUR',
+    feeTaxRate: 0.19,
+    platformFeePercent: 10,
+    payoutAccountId: 'acct_1',
+  };
+  const input = { sessionId: 's1', driverId: 'd1', sitePaymentConfigId: 3, request };
+  const held = [{ id: 's1' }];
+  const cancelledHold = {
+    id: 7,
+    status: 'cancelled',
+    provider: 'stripe',
+    providerPaymentId: 'pi_hold',
+    capturedAmountCents: 0,
+    refundedAmountCents: 0,
+    pendingOperation: null,
+    providerRefunds: [],
+    failureReason: null,
+    metadata: null,
+  };
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.now() - hours * 3_600_000).toISOString();
+
+  it('inserts a pending record with the request when the session has none', async () => {
+    h.results.push(held, [], [{ id: 11 }]);
+    expect(await claimRebillRecord(input)).toEqual({
+      state: 'claimed',
+      id: 11,
+      request,
+      resumed: false,
+    });
+    const [session, lock, insert] = h.calls;
+    expect(session?.lock).toBe('share');
+    expect(session?.where).toEqual({
+      op: 'and',
+      args: [
+        { op: 'eq', col: 'cs.id', value: 's1' },
+        { op: 'eq', col: 'cs.status', value: 'faulted' },
+        { op: 'eq', col: 'cs.stopped_reason', value: 'EndRequestFailed' },
+        { op: 'eq', col: 'cs.rebill_status', value: 'in_progress' },
+      ],
+    });
+    expect(lock?.lock).toBe('update');
+    expect(insert?.values).toMatchObject({
+      sessionId: 's1',
+      driverId: 'd1',
+      sitePaymentConfigId: 3,
+      provider: 'stripe',
+      providerPaymentId: null,
+      providerCustomerId: 'cus_1',
+      providerPaymentMethodId: 'pm_1',
+      paymentSource: 'operator',
+      currency: 'EUR',
+      status: 'pending',
+      metadata: { rebill: { requestedAt: expect.any(String) as string, request } },
+    });
+    expect(insert?.conflict).toEqual({ target: 'pr.session_id' });
+  });
+
+  it('writes nothing when the session is no longer faulted with its claim held (P11)', async () => {
+    h.results.push([]);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'session_not_claimed' });
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('refuses when a concurrent insert won', async () => {
+    h.results.push(held, [], []);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'refused', status: 'pending' });
+  });
+
+  it('takes over a cancelled hold that took no money, keeping its ids', async () => {
+    h.results.push(held, [cancelledHold], [{ id: 7 }]);
+    expect(await claimRebillRecord(input)).toEqual({
+      state: 'claimed',
+      id: 7,
+      request,
+      resumed: false,
+    });
+    const update = h.calls.find((c) => c.kind === 'update');
+    expect(update?.set).toMatchObject({
+      status: 'pending',
+      provider: 'stripe',
+      providerPaymentId: null,
+      paymentSource: 'operator',
+      capturedAmountCents: null,
+      pendingOperation: null,
+    });
+    const metadata = update?.set?.['metadata'] as { values: unknown[] };
+    expect(String(metadata.values[1])).toContain('"previousPaymentId":"pi_hold"');
+    expect(String(metadata.values[1])).toContain('"grossCents":1190');
+    expect(update?.where).toEqual(guard(7, ['cancelled', 'failed']));
+  });
+
+  it.each([
+    [{ ...cancelledHold, status: 'pre_authorized' }],
+    [{ ...cancelledHold, status: 'captured', capturedAmountCents: 500 }],
+    [{ ...cancelledHold, pendingOperation: 'cancel' }],
+    [{ ...cancelledHold, status: 'failed', refundedAmountCents: 1 }],
+  ])('refuses a record that holds another payment (%j)', async (record) => {
+    h.results.push(held, [record]);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'refused', status: record.status });
+    expect(h.calls.filter((c) => c.kind === 'update')).toHaveLength(0);
+  });
+
+  it('reports the state of a record the re-bill already wrote', async () => {
+    const stored = { ...request, grossCents: 900 };
+    const marked = {
+      ...cancelledHold,
+      providerPaymentId: null,
+      metadata: { rebill: { requestedAt: hoursAgo(1), request: stored } },
+    };
+    h.results.push(held, [{ ...marked, status: 'pending' }]);
+    expect(await claimRebillRecord(input)).toEqual({
+      state: 'claimed',
+      id: 7,
+      request: stored,
+      resumed: true,
+    });
+    h.results.push(held, [{ ...marked, status: 'captured', capturedAmountCents: 900 }]);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'charged', id: 7, amountCents: 900 });
+    h.results.push(held, [{ ...marked, status: 'failed', failureReason: 'declined' }]);
+    expect(await claimRebillRecord(input)).toEqual({
+      state: 'failed',
+      id: 7,
+      reason: 'declined',
+      amountCents: 900,
+    });
+    h.results.push(held, [{ ...marked, status: 'refunded' }]);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'refused', status: 'refunded' });
+    expect(h.calls.filter((c) => c.kind === 'update')).toHaveLength(0);
+  });
+
+  it('refuses to resume a charge without an answer for REBILL_RESUME_MAX_HOURS', async () => {
+    h.results.push(held, [
+      {
+        ...cancelledHold,
+        status: 'pending',
+        providerPaymentId: null,
+        metadata: { rebill: { requestedAt: hoursAgo(REBILL_RESUME_MAX_HOURS), request } },
+      },
+    ]);
+    expect(await claimRebillRecord(input)).toEqual({ state: 'refused', status: 'pending' });
+  });
+
+  it('stores the request on a pending re-bill record that has none', async () => {
+    h.results.push(
+      held,
+      [{ ...cancelledHold, status: 'pending', metadata: { rebill: { requestedAt: hoursAgo(1) } } }],
+      [],
+    );
+    expect(await claimRebillRecord(input)).toEqual({
+      state: 'claimed',
+      id: 7,
+      request,
+      resumed: false,
+    });
+    const update = h.calls.find((c) => c.kind === 'update');
+    expect(String((update?.set?.['metadata'] as { values: unknown[] }).values[1])).toContain(
+      '"grossCents":1190',
+    );
+  });
+
+  it('isStaleRebillCharge and rebillChargeRequest read the marker', () => {
+    const pending = {
+      status: 'pending',
+      providerPaymentId: null,
+      metadata: { rebill: { requestedAt: hoursAgo(REBILL_RESUME_MAX_HOURS + 1), request } },
+    };
+    expect(isStaleRebillCharge(pending)).toBe(true);
+    expect(isStaleRebillCharge({ ...pending, providerPaymentId: 'pi_1' })).toBe(false);
+    expect(isStaleRebillCharge({ ...pending, status: 'captured' })).toBe(false);
+    expect(
+      isStaleRebillCharge({ ...pending, metadata: { rebill: { requestedAt: hoursAgo(22) } } }),
+    ).toBe(false);
+    expect(isStaleRebillCharge({ ...pending, metadata: null })).toBe(false);
+    expect(rebillChargeRequest(pending)).toEqual(request);
+    expect(
+      rebillChargeRequest({ metadata: { rebill: { request: { grossCents: 1 } } } }),
+    ).toBeNull();
+    expect(REBILL_RESUME_MAX_HOURS).toBeLessThan(24);
+  });
+
+  it('isRebillRecord reads the marker', () => {
+    expect(isRebillRecord({ metadata: { rebill: {} } })).toBe(true);
+    expect(isRebillRecord({ metadata: { tokenId: 't1' } })).toBe(false);
+    expect(isRebillRecord({ metadata: null })).toBe(false);
+  });
+});
+
+describe('invoice claims of reservation fee charges', () => {
+  it('claims only unclaimed fee records and returns the ids it claimed', async () => {
+    h.results.push([{ id: 7 }]);
+
+    const claimed = await claimFeeRecordsForInvoice(h.db as never, [7, 8], 'inv_1');
+
+    expect(claimed).toEqual([7]);
+    expect(last()).toMatchObject({
+      kind: 'update',
+      set: { invoiceId: 'inv_1' },
+      where: {
+        op: 'and',
+        args: [
+          { op: 'inArray', col: 'pr.id', values: [7, 8] },
+          { op: 'isNull', col: 'pr.invoice_id' },
+        ],
+      },
+    });
+  });
+
+  it('claims nothing without fee records', async () => {
+    expect(await claimFeeRecordsForInvoice(h.db as never, [], 'inv_1')).toEqual([]);
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('releases the fee records of a voided invoice', async () => {
+    h.results.push([{ id: 7 }, { id: 9 }]);
+
+    const released = await releaseInvoiceFeeRecords(h.db as never, 'inv_1');
+
+    expect(released).toEqual([7, 9]);
+    expect(last()).toMatchObject({
+      kind: 'update',
+      set: { invoiceId: null },
+      where: { op: 'eq', col: 'pr.invoice_id', value: 'inv_1' },
+    });
   });
 });

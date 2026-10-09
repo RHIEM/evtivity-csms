@@ -20,7 +20,9 @@
     "deactivate": "Deactivate",
     "remove": "Remove",
     "inclTax": "incl. tax",
-    "amountInclTax": "{{amount}} incl. tax"
+    "amountInclTax": "{{amount}} incl. tax",
+    "close": "Close",
+    "toggleSuggestions": "Toggle suggestions"
   },
   "nav": {
     "home": "Home",
@@ -52,6 +54,7 @@
     "registrationFailed": "Registration failed",
     "mfaTitle": "Verification Required",
     "mfaSubtitle": "Enter the 6-digit code from your {{method}}",
+    "mfaCodeLabel": "Verification code",
     "mfaVerify": "Verify",
     "mfaResend": "Resend code",
     "mfaResending": "Sending...",
@@ -144,7 +147,7 @@
     "charging": "Charging",
     "idle": "Idle",
     "limitReached": {
-      "cost": "Charging paused: the session reached its cost limit (the amount held on your card).",
+      "cost": "Charging paused: the session reached its cost limit.",
       "energy": "Charging paused: the session reached its energy limit.",
       "time": "Charging paused: the session reached its time limit."
     },
@@ -245,7 +248,8 @@
     "priceDisplayDefault": "Operator default ({{value}})",
     "priceDisplayGross": "Including tax (gross)",
     "priceDisplayNet": "Excluding tax (net)",
-    "priceDisplayHelper": "Including tax shows prices with tax added. Excluding tax shows prices before tax. You are charged the same amount either way, and until you choose, the operator default applies."
+    "priceDisplayHelper": "Including tax shows prices with tax added. Excluding tax shows prices before tax. You are charged the same amount either way, and until you choose, the operator default applies.",
+    "mfaQrCode": "Authenticator app QR code"
   },
   "charger": {
     "loadingInfo": "Loading charger info...",
@@ -540,7 +544,13 @@
     "EVSE_IN_USE": "Another session is already active on this connector",
     "EVSE_NOT_FOUND": "EVSE not found",
     "FAVORITE_NOT_FOUND": "Favorite not found",
+    "FLEET_CREDIT_LIMIT_REACHED": "The credit limit of the fleet your sessions are billed to is reached. Contact your fleet manager.",
     "FLEET_DISABLED": "Fleet is disabled",
+    "FLEET_BILLING_OLD_PODS_CONNECTED": "A process older than v0.1.41 is still connected. Finish the upgrade, then turn on account billing.",
+    "FLEET_BILLING_CONTACT_REQUIRED": "The fleet needs at least one billing contact for automatic invoicing and invoice emails.",
+    "FLEET_INVOICE_PERIOD_EXISTS": "The fleet already has an invoice for this period. Credit it to bill the period again.",
+    "FLEET_INVOICE_NOTHING_TO_BILL": "The fleet has no unbilled sessions with a cost to invoice for this period.",
+    "FLEET_HAS_OPEN_BILLING": "The fleet has sessions billed to its account and cannot be deleted. Turn off account billing instead.",
     "FLEET_NOT_FOUND": "Fleet not found",
     "FLEET_RESERVATION_ALREADY_CANCELLED": "Fleet reservation is already cancelled",
     "FLEET_RESERVATION_CREATE_FAILED": "Failed to create fleet reservation",
@@ -566,7 +576,12 @@
     "INVALID_RESTRICTIONS": "Invalid tariff restrictions",
     "INVALID_SITE_IDS": "One or more siteIds do not exist",
     "INVALID_TOKEN": "This reset link is invalid or has expired.",
+    "INVOICE_ALREADY_PAID": "The invoice is already paid",
     "INVOICE_CREATION_FAILED": "Failed to create invoice",
+    "INVOICE_NOT_ISSUED": "The invoice must be issued for this action",
+    "INVOICE_IS_CREDIT_NOTE": "A credit note cannot be marked paid or credited",
+    "INVOICE_ALREADY_CREDITED": "The invoice is already credited by a credit note",
+    "INVOICE_NOT_VOIDABLE": "Only a draft invoice can be voided. Correct an issued invoice with a credit note",
     "INVOICE_NO_SESSIONS": "No uninvoiced sessions in the selected date range",
     "INVOICE_NO_DRIVER": "This invoice has no driver to send to",
     "INVOICE_NOT_FOUND": "Invoice not found",
@@ -592,6 +607,7 @@
     "MFA_TOTP_NO_RESEND": "Cannot resend TOTP codes",
     "MISSING_PAYMENT_INTENT": "Payment intent missing",
     "MISSING_VERSION_URL": "Partner version URL is required for registration",
+    "NOTIFICATION_EVENT_REQUIRED": "This notification is required for account access and cannot be turned off",
     "NOT_BLOCKED": "Station is not blocked",
     "NOT_CHARGING": "Session is not currently charging",
     "NOT_DRAFT": "Only draft campaigns can be updated",
@@ -651,9 +667,10 @@
     "PROVIDER_TEST_FAILED": "Provider returned ...",
     "PUSH_NOT_FOUND": "Push not found",
     "PUSH_REJECTED": "Station rejected push: ...",
-    "RATE_LIMITED": "Too many status checks for this station",
+    "RATE_LIMITED": "Too many requests. Wait a moment and try again.",
     "RECAPTCHA_FAILED": "reCAPTCHA verification failed",
     "RECAPTCHA_REQUIRED": "reCAPTCHA token is required",
+    "RECAPTCHA_SECRET_REQUIRED": "A reCAPTCHA secret key is required to enable reCAPTCHA",
     "REFUND_EXCEEDS_REMAINING": "Refund amount exceeds remaining ...",
     "REFUND_TOP_UP_UNKNOWN": "This payment includes a top-up charge with no recorded payment id. Refund the top-up in the payment provider's dashboard.",
     "REGION_NOT_FOUND": "Region not found",
@@ -682,6 +699,9 @@
     "SESSION_CREATE_FAILED": "Failed to create session",
     "SESSION_NOT_FOUND": "Session not found",
     "SESSION_NOT_LINKED": "Session not linked to this case",
+    "SESSION_REBILL_IN_PROGRESS": "The session is being billed. Try again in a few minutes.",
+    "SESSION_REBILL_NOT_ELIGIBLE": "This session cannot be billed",
+    "SESSION_REBILL_PAYMENT_PENDING": "The session has a payment the provider has not settled yet. Try again later.",
     "SETTING_NOT_FOUND": "Setting not found",
     "SITE_HAS_STATIONS": "Cannot delete site with stations. Remove or reassign stations first.",
     "SITE_NOT_FOUND": "Site not found",
@@ -744,12 +764,24 @@
     "EMAID_PREFIX_NOT_CONFIGURED": "Set the eMAID country code and provider ID first",
     "LOCAL_CA_EXISTS": "A local contract CA already exists",
     "LOCAL_CA_NOT_CONFIGURED": "Create the local contract CA first",
-    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge contract not found"
+    "PNC_CONTRACT_NOT_FOUND": "Plug & Charge contract not found",
+    "PHONE_REGISTRATION_LIMITED": "Too many accounts were registered with this phone number. Try again later.",
+    "VERIFICATION_RESEND_LIMITED": "Too many verification emails. Wait before you request another one."
   },
   "validation": {
     "required": "This field is required",
     "email": "Enter a valid email address",
-    "minLength": "Must be at least {{min}} characters"
+    "minLength": "Must be at least {{min}} characters",
+    "passwordNeeds": "Password needs:",
+    "passwordMissing": "Password needs {{rules}}.",
+    "passwordRuleMet": "met",
+    "passwordRuleNotMet": "not met",
+    "passwordRule": {
+      "minLength": "at least {{min}} characters",
+      "uppercase": "an uppercase letter",
+      "lowercase": "a lowercase letter",
+      "number": "a number"
+    }
   },
   "activity": {
     "title": "Activity",
@@ -763,7 +795,9 @@
     "co2Avoided": "CO₂ Avoided",
     "co2AvoidedMessage": "You avoided {{amount}} kg CO₂ this month",
     "miles": "Miles",
-    "km": "km"
+    "km": "km",
+    "previousMonth": "Previous month",
+    "nextMonth": "Next month"
   },
   "statement": {
     "title": "Monthly Statement",
@@ -981,5 +1015,27 @@
         "home": "Go to home"
       }
     }
+  },
+  "sessionStatus": {
+    "active": "Active",
+    "completed": "Completed",
+    "invalid": "Invalid",
+    "faulted": "Faulted",
+    "failed": "Failed"
+  },
+  "fleetBilling": {
+    "billedTo": "Billed to {{fleet}}",
+    "startHint": "Your fleet pays for this session. You need no payment method.",
+    "title": "Fleet billing",
+    "fleet": "Billed to",
+    "status": "Status",
+    "state": {
+      "unbilled": "Not invoiced yet",
+      "invoiced": "Invoiced to the fleet",
+      "paid": "Paid by the fleet"
+    },
+    "sessionLine": "{{fleet}}: {{state}}",
+    "paymentMethodsNote": "Your charging is billed to {{fleet}}. You need no payment method to charge.",
+    "noMethods": "No payment methods yet."
   }
 }

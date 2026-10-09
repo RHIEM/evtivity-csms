@@ -157,7 +157,6 @@ describe('Portal sessions routes - handler logic', () => {
             endedAt: '2024-01-01T01:00:00Z',
             energyDeliveredWh: 10000,
             finalCostCents: 500,
-            tariffTaxRate: '0.19',
             taxCents: 80,
             currency: 'USD',
             stationName: 'CS-001',
@@ -182,8 +181,70 @@ describe('Portal sessions routes - handler logic', () => {
       expect(body.total).toBe(1);
       expect(body.data[0].id).toBe(VALID_SESSION_ID);
       expect(body.data[0].status).toBe('completed');
-      expect(body.data[0].tariffTaxRate).toBe('0.19');
       expect(body.data[0].taxCents).toBe(80);
+    });
+
+    it('returns the account billing state of a session billed to a fleet', async () => {
+      const base = {
+        transactionId: 'tx-1',
+        status: 'completed',
+        startedAt: '2024-01-01T00:00:00Z',
+        endedAt: '2024-01-01T01:00:00Z',
+        energyDeliveredWh: 10000,
+        finalCostCents: 500,
+        taxCents: null,
+        currency: 'EUR',
+        stationName: 'CS-001',
+        siteName: null,
+        siteAddress: null,
+        siteCity: null,
+        siteState: null,
+        co2AvoidedKg: null,
+        reservationId: null,
+      };
+      setupDbResults(
+        [
+          {
+            ...base,
+            id: 'ses_a',
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: 'issued',
+            billingHasPaymentRecord: false,
+          },
+          {
+            ...base,
+            id: 'ses_b',
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: null,
+            billingHasPaymentRecord: true,
+          },
+          {
+            ...base,
+            id: 'ses_c',
+            billingMode: 'card',
+            billingFleetName: null,
+            billingInvoiceStatus: null,
+            billingHasPaymentRecord: true,
+          },
+        ],
+        [{ count: 3 }],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/sessions',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const [a, b, c] = response.json().data;
+      expect(a.accountBilling).toEqual({ state: 'invoiced', fleetName: 'Acme' });
+      // A payment record means the session was paid by card (an operator hold).
+      expect(b.accountBilling).toBeNull();
+      expect(c.accountBilling).toBeNull();
+      // The fleet invoice is the fleet's document: no invoice field reaches the driver.
+      expect(a).not.toHaveProperty('billingInvoiceStatus');
+      expect(a).not.toHaveProperty('invoiceId');
     });
 
     it('returns empty data with zero total when no sessions', async () => {
@@ -267,7 +328,6 @@ describe('Portal sessions routes - handler logic', () => {
           endedAt: '2024-01-01T01:00:00Z',
           energyDeliveredWh: 10000,
           currentCostCents: null,
-          tariffTaxRate: '0.19',
           finalCostCents: 500,
           currency: 'USD',
           meterStart: 0,
@@ -298,7 +358,6 @@ describe('Portal sessions routes - handler logic', () => {
             endedAt: '2024-01-01T01:00:00Z',
             energyDeliveredWh: 10000,
             currentCostCents: null,
-            tariffTaxRate: '0.19',
             finalCostCents: 500,
             // The split stored with the final cost (as read back from jsonb).
             costBreakdown: {
@@ -350,7 +409,6 @@ describe('Portal sessions routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(VALID_SESSION_ID);
       expect(body.status).toBe('completed');
-      expect(body.tariffTaxRate).toBe('0.19');
       expect(body.netCents).toBe(420);
       expect(body.taxCents).toBe(80);
       expect(body.taxRate).toBe('0.19');
@@ -371,7 +429,6 @@ describe('Portal sessions routes - handler logic', () => {
             endedAt: null,
             energyDeliveredWh: 10000,
             currentCostCents: 350,
-            tariffTaxRate: null,
             finalCostCents: null,
             // A breakdown stored for another amount is not used.
             costBreakdown: {
@@ -424,7 +481,6 @@ describe('Portal sessions routes - handler logic', () => {
             endedAt: '2024-01-01T01:00:00Z',
             energyDeliveredWh: 10000,
             currentCostCents: null,
-            tariffTaxRate: '0.19',
             finalCostCents: 0,
             currency: 'USD',
             meterStart: 0,
@@ -454,6 +510,53 @@ describe('Portal sessions routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(VALID_SESSION_ID);
       expect(body.payment).toBeNull();
+    });
+
+    it('returns the paid account billing of a session on a paid fleet invoice', async () => {
+      setupDbResults(
+        [
+          {
+            id: VALID_SESSION_ID,
+            transactionId: 'tx-1',
+            status: 'completed',
+            startedAt: '2024-01-01T00:00:00Z',
+            endedAt: '2024-01-01T01:00:00Z',
+            energyDeliveredWh: 10000,
+            currentCostCents: null,
+            finalCostCents: 900,
+            currency: 'EUR',
+            meterStart: 0,
+            meterStop: 10000,
+            stoppedReason: null,
+            stationName: 'CS-001',
+            siteName: null,
+            siteAddress: null,
+            siteCity: null,
+            siteState: null,
+            driverId: DRIVER_ID,
+            updatedAt: '2024-01-01T01:00:00Z',
+            idleStartedAt: null,
+            co2AvoidedKg: null,
+            reservationId: null,
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: 'paid',
+            billingHasPaymentRecord: false,
+          },
+        ],
+        [],
+        [],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: `/portal/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.accountBilling).toEqual({ state: 'paid', fleetName: 'Acme' });
+      expect(body).not.toHaveProperty('billingMode');
+      expect(body).not.toHaveProperty('billingInvoiceStatus');
     });
 
     it('returns 400 with invalid id parameter', async () => {

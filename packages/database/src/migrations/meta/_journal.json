@@ -1035,14 +1035,294 @@
       "idx": 147,
       "version": "7",
       "when": 1791000012036,
-      "tag": "rhiem_0001_payment_mode",
+      "tag": "0147_session_transaction_contract",
       "breakpoints": true
     },
     {
       "idx": 148,
       "version": "7",
-      "when": 1791000012037,
+      "when": 1791000012040,
+      "tag": "0148_payment_provider_contract_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 149,
+      "version": "7",
+      "when": 1791000012041,
+      "tag": "0149_payment_provider_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 150,
+      "version": "7",
+      "when": 1791000012042,
+      "tag": "0150_payment_provider_check_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 151,
+      "version": "7",
+      "when": 1791000012050,
+      "tag": "0151_session_cost_ceiling",
+      "breakpoints": true
+    },
+    {
+      "idx": 152,
+      "version": "7",
+      "when": 1791000012058,
+      "tag": "0152_payment_pending_operation_check_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 153,
+      "version": "7",
+      "when": 1791000012066,
+      "tag": "0153_payment_provider_drop_stripe_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 154,
+      "version": "7",
+      "when": 1791000012074,
+      "tag": "0154_cron_station_offline_sweep",
+      "breakpoints": true
+    },
+    {
+      "idx": 155,
+      "version": "7",
+      "when": 1791000012082,
+      "tag": "0155_session_rebill",
+      "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1791000012090,
+      "tag": "0156_notification_switches",
+      "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1791000012098,
+      "tag": "0157_prepaid_session_cost_ceiling",
+      "breakpoints": true
+    },
+    {
+      "idx": 158,
+      "version": "7",
+      "when": 1791000012099,
+      "tag": "0158_drop_suffixless_secret_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 159,
+      "version": "7",
+      "when": 1791000012100,
+      "tag": "0159_drop_system_event_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 160,
+      "version": "7",
+      "when": 1791000012101,
+      "tag": "0160_operator_payment_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 161,
+      "version": "7",
+      "when": 1791000012102,
+      "tag": "0161_prepaid_notices",
+      "breakpoints": true
+    },
+    {
+      "idx": 162,
+      "version": "7",
+      "when": 1791000012103,
+      "tag": "0162_invoice_claim_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 163,
+      "version": "7",
+      "when": 1791000012104,
+      "tag": "0163_invoice_claim_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 164,
+      "version": "7",
+      "when": 1791000012105,
+      "tag": "0164_invoice_claim_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 165,
+      "version": "7",
+      "when": 1791000012106,
+      "tag": "0165_invoice_claim_fk_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 166,
+      "version": "7",
+      "when": 1791000012107,
+      "tag": "0166_seed_invoice_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 167,
+      "version": "7",
+      "when": 1791000012108,
+      "tag": "0167_invoice_credit_note_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 168,
+      "version": "7",
+      "when": 1791000012109,
+      "tag": "0168_invoice_credit_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 169,
+      "version": "7",
+      "when": 1791000012110,
+      "tag": "0169_fleet_account_billing_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 170,
+      "version": "7",
+      "when": 1791000012111,
+      "tag": "0170_fleet_account_billing_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 171,
+      "version": "7",
+      "when": 1791000012112,
+      "tag": "0171_fleet_account_billing_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 172,
+      "version": "7",
+      "when": 1791000012113,
+      "tag": "0172_fleet_account_billing_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 173,
+      "version": "7",
+      "when": 1791000012180,
+      "tag": "0180_fleet_billing_profile",
+      "breakpoints": true
+    },
+    {
+      "idx": 174,
+      "version": "7",
+      "when": 1791000020000,
+      "tag": "0200_fleet_credit_limit",
+      "breakpoints": true
+    },
+    {
+      "idx": 175,
+      "version": "7",
+      "when": 1791000022000,
+      "tag": "0220_fleet_credit_notice_bigint",
+      "breakpoints": true
+    },
+    {
+      "idx": 176,
+      "version": "7",
+      "when": 1791000022100,
+      "tag": "0210_fleet_invoice_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 177,
+      "version": "7",
+      "when": 1791000022200,
+      "tag": "0211_fleet_invoices",
+      "breakpoints": true
+    },
+    {
+      "idx": 178,
+      "version": "7",
+      "when": 1791000023000,
+      "tag": "0230_fleet_invoice_overdue_notice",
+      "breakpoints": true
+    },
+    {
+      "idx": 179,
+      "version": "7",
+      "when": 1791000023100,
+      "tag": "0231_seed_fleet_invoice_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 180,
+      "version": "7",
+      "when": 1791000023200,
+      "tag": "0232_fleet_invoice_run_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 181,
+      "version": "7",
+      "when": 1791000024000,
+      "tag": "0240_fleet_credit_reservation",
+      "breakpoints": true
+    },
+    {
+      "idx": 182,
+      "version": "7",
+      "when": 1791000025000,
+      "tag": "0250_session_end_notice_claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 183,
+      "version": "7",
+      "when": 1791000026000,
+      "tag": "0251_session_energy_rose_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1791000027000,
+      "tag": "0252_session_end_notice_claims_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 185,
+      "version": "7",
+      "when": 1791000028000,
+      "tag": "0270_invoice_claim_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1791000028001,
+      "tag": "rhiem_0001_payment_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1791000028002,
       "tag": "rhiem_0002_signed_meter_data",
+      "breakpoints": true
+    },
+    {
+      "idx": 188,
+      "version": "7",
+      "when": 1791000028003,
+      "tag": "rhiem_0003_payment_mode_to_fleet_billing",
       "breakpoints": true
     }
   ]

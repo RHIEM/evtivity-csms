@@ -120,10 +120,6 @@ vi.mock('@evtivity/lib/pubsub-instance', () => ({
   setPubSub: vi.fn(),
 }));
 
-vi.mock('../services/driver.service.js', () => ({
-  resolvePaymentMode: vi.fn().mockResolvedValue('card'),
-}));
-
 const mockTriggerAndWaitForStatus = vi.fn().mockResolvedValue({ status: 'available' });
 
 vi.mock('@evtivity/services/ocpp-command', async (importOriginal) => ({

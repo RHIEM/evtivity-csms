@@ -34,7 +34,6 @@ function renderTab(language = 'de'): void {
           phone: null,
           language,
           isActive: true,
-          paymentMode: null,
           createdAt: '2026-10-01T00:00:00Z',
           updatedAt: '2026-10-01T00:00:00Z',
         }}

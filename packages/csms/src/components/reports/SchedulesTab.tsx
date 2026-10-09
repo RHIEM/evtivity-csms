@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { Pagination } from '@/components/ui/pagination';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { CancelButton } from '@/components/cancel-button';
@@ -28,6 +29,8 @@ import {
 } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { LoadingLogo } from '@/components/loading-logo';
+import { reportTypeFormats, useReportTypes } from '@/hooks/use-report-types';
+import { ReportTypesLoadError } from '@/components/reports/ReportTypesLoadError';
 
 interface Schedule {
   id: number;
@@ -42,18 +45,6 @@ interface Schedule {
   isEnabled: boolean;
   createdAt: string;
 }
-
-const REPORT_TYPES = [
-  'revenue',
-  'utilization',
-  'energy',
-  'stationHealth',
-  'sessions',
-  'sustainability',
-  'driverActivity',
-] as const;
-
-const FORMATS = ['csv', 'pdf', 'xlsx'] as const;
 
 const FREQUENCIES = ['daily', 'weekly', 'monthly'] as const;
 
@@ -79,8 +70,8 @@ export function SchedulesTab(): React.JSX.Element {
 
   // Form state
   const [name, setName] = useState('');
-  const [reportType, setReportType] = useState<string>(REPORT_TYPES[0]);
-  const [format, setFormat] = useState<string>(FORMATS[0]);
+  const [reportType, setReportType] = useState('');
+  const [format, setFormat] = useState('');
   const [frequency, setFrequency] = useState<string>(FREQUENCIES[0]);
   const [dayOfWeek, setDayOfWeek] = useState<number>(0);
   const [dayOfMonth, setDayOfMonth] = useState<number>(1);
@@ -88,6 +79,19 @@ export function SchedulesTab(): React.JSX.Element {
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const [hasSubmitted, setHasSubmitted] = useState(false);
+
+  const {
+    all: reportTypes,
+    offered,
+    isError: reportTypesError,
+    refetch: refetchReportTypes,
+  } = useReportTypes();
+  // A new schedule starts on the first offered type and its first format.
+  const selectedType = reportType !== '' ? reportType : (offered[0]?.type ?? '');
+  const formats = reportTypeFormats(reportTypes, selectedType);
+  // Unlike GenerateTab, fall back to the stored format, so saving an edited schedule
+  // keeps its format while the types are not loaded.
+  const selectedFormat = formats.includes(format) ? format : (formats[0] ?? format);
 
   const { data: schedulesResponse, isLoading } = useQuery({
     queryKey: ['report-schedules'],
@@ -158,8 +162,8 @@ export function SchedulesTab(): React.JSX.Element {
 
   function resetForm(): void {
     setName('');
-    setReportType(REPORT_TYPES[0]);
-    setFormat(FORMATS[0]);
+    setReportType('');
+    setFormat('');
     setFrequency(FREQUENCIES[0]);
     setDayOfWeek(0);
     setDayOfMonth(1);
@@ -167,6 +171,8 @@ export function SchedulesTab(): React.JSX.Element {
     setDateFrom('');
     setDateTo('');
     setHasSubmitted(false);
+    createMutation.reset();
+    updateMutation.reset();
   }
 
   function closeDialog(): void {
@@ -211,7 +217,7 @@ export function SchedulesTab(): React.JSX.Element {
   function handleSubmit(e: React.SyntheticEvent): void {
     e.preventDefault();
     setHasSubmitted(true);
-    if (Object.keys(scheduleErrors).length > 0) return;
+    if (Object.keys(scheduleErrors).length > 0 || selectedType === '') return;
     const filters: Record<string, string> = {};
     if (dateFrom) filters['dateFrom'] = dateFrom;
     if (dateTo) filters['dateTo'] = dateTo;
@@ -223,8 +229,8 @@ export function SchedulesTab(): React.JSX.Element {
 
     const body: Record<string, unknown> = {
       name,
-      reportType,
-      format,
+      reportType: selectedType,
+      format: selectedFormat,
       frequency,
       filters,
       recipientEmails: emails,
@@ -245,6 +251,7 @@ export function SchedulesTab(): React.JSX.Element {
   }
 
   const isPending = createMutation.isPending || updateMutation.isPending;
+  const saveError = createMutation.error ?? updateMutation.error;
 
   return (
     <Card>
@@ -387,47 +394,51 @@ export function SchedulesTab(): React.JSX.Element {
                 )}
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="schedule-type" className="leading-6">
-                    {t('reports.reportType')}
-                  </Label>
-                  <Select
-                    id="schedule-type"
-                    className="h-9"
-                    value={reportType}
-                    onChange={(e) => {
-                      setReportType(e.target.value);
-                    }}
-                  >
-                    {REPORT_TYPES.map((rt) => (
-                      <option key={rt} value={rt}>
-                        {t(`reports.types.${rt}`, rt)}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
+              {reportTypesError ? (
+                <ReportTypesLoadError onRetry={refetchReportTypes} />
+              ) : (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="schedule-type" className="leading-6">
+                      {t('reports.reportType')}
+                    </Label>
+                    <Select
+                      id="schedule-type"
+                      className="h-9"
+                      value={selectedType}
+                      onChange={(e) => {
+                        setReportType(e.target.value);
+                      }}
+                    >
+                      {offered.map(({ type }) => (
+                        <option key={type} value={type}>
+                          {t(`reports.types.${type}`, type)}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
 
-                <div className="space-y-2">
-                  <Label htmlFor="schedule-format" className="leading-6">
-                    {t('reports.format')}
-                  </Label>
-                  <Select
-                    id="schedule-format"
-                    className="h-9"
-                    value={format}
-                    onChange={(e) => {
-                      setFormat(e.target.value);
-                    }}
-                  >
-                    {FORMATS.map((f) => (
-                      <option key={f} value={f}>
-                        {t(`reports.formats.${f}`, f)}
-                      </option>
-                    ))}
-                  </Select>
+                  <div className="space-y-2">
+                    <Label htmlFor="schedule-format" className="leading-6">
+                      {t('reports.format')}
+                    </Label>
+                    <Select
+                      id="schedule-format"
+                      className="h-9"
+                      value={selectedFormat}
+                      onChange={(e) => {
+                        setFormat(e.target.value);
+                      }}
+                    >
+                      {formats.map((f) => (
+                        <option key={f} value={f}>
+                          {t(`reports.formats.${f}`, f)}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
@@ -496,7 +507,7 @@ export function SchedulesTab(): React.JSX.Element {
                 <div className="flex items-center gap-2">
                   <Input
                     type="date"
-                    aria-label="Start date"
+                    aria-label={t('common.startDate')}
                     value={dateFrom}
                     onChange={(e) => {
                       setDateFrom(e.target.value);
@@ -505,7 +516,7 @@ export function SchedulesTab(): React.JSX.Element {
                   <span className="text-sm text-muted-foreground">{t('dashboard.to')}</span>
                   <Input
                     type="date"
-                    aria-label="End date"
+                    aria-label={t('common.endDate')}
                     value={dateTo}
                     onChange={(e) => {
                       setDateTo(e.target.value);
@@ -534,12 +545,20 @@ export function SchedulesTab(): React.JSX.Element {
                 )}
               </div>
 
+              {saveError != null && (
+                <p className="text-sm text-destructive">{getErrorMessage(saveError, t)}</p>
+              )}
+
               <DialogFooter>
                 <CancelButton onClick={closeDialog} />
                 {editingSchedule != null ? (
                   <SaveButton isPending={isPending} />
                 ) : (
-                  <CreateButton label={t('common.create')} type="submit" disabled={isPending} />
+                  <CreateButton
+                    label={t('common.create')}
+                    type="submit"
+                    disabled={isPending || selectedType === ''}
+                  />
                 )}
               </DialogFooter>
             </form>

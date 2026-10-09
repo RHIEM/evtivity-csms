@@ -155,6 +155,8 @@ import {
   DuplicateTokenError,
 } from '../services/token.service.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import * as databaseModule from '@evtivity/database';
 
 beforeEach(() => {
   dbResults = [];
@@ -281,6 +283,8 @@ describe('createToken', () => {
         tokenType: 'ISO14443',
         addedBy: 'operator',
       }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -317,6 +321,8 @@ describe('createToken', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'you' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -335,7 +341,7 @@ describe('createToken', () => {
     // dup pre-check returns empty, but the insert throws a unique-violation as
     // a concurrent insert won the TOCTOU race.
     setupDbResults([]);
-    const { db } = await import('@evtivity/database');
+    const { db } = databaseModule;
     const uniqueErr = Object.assign(new Error('duplicate key'), { code: '23505' });
     vi.mocked(db.insert).mockImplementationOnce(
       () =>
@@ -353,7 +359,7 @@ describe('createToken', () => {
 
   it('rethrows non-unique-violation insert errors', async () => {
     setupDbResults([]);
-    const { db } = await import('@evtivity/database');
+    const { db } = databaseModule;
     const otherErr = new Error('connection lost');
     vi.mocked(db.insert).mockImplementationOnce(
       () =>
@@ -449,6 +455,8 @@ describe('updateToken', () => {
       'token.Deactivated',
       'drv_1',
       expect.objectContaining({ reason: 'Lost card' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -484,6 +492,8 @@ describe('updateToken', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'operator' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -579,12 +589,16 @@ describe('bulkSetActive', () => {
       'token.Deactivated',
       'drv_1',
       expect.objectContaining({ reason: '' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
     expect(dispatchDriverNotification).toHaveBeenCalledWith(
       expect.anything(),
       'token.Deactivated',
       'drv_2',
       expect.objectContaining({ reason: '' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -603,6 +617,8 @@ describe('bulkSetActive', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'operator' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 });

@@ -8,7 +8,7 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { EventSettingsLayout } from '@/components/EventSettingsLayout';
 import { api } from '@/lib/api';
-import { OCPP_COMMON_EVENTS, OCPP_21_EVENTS } from '@/lib/template-variables';
+import { OCPP_COMMON_EVENTS, OCPP_16_EVENTS, OCPP_21_EVENTS } from '@/lib/template-variables';
 
 const CHANNELS = ['email', 'webhook'] as const;
 
@@ -44,12 +44,19 @@ export function OcppEvents(): React.JSX.Element {
     }
   }
 
+  // The recipient field reloads when the selection or its stored value changes (after a save
+  // or a deactivation), so it always starts from the stored state.
+  function recipientSyncKey(settingKey: string): string {
+    return `${settingKey}|${recipientMap.get(settingKey) ?? ''}`;
+  }
+
   return (
     <EventSettingsLayout
       sidebarTitle={t('notifications.ocppEvents')}
       emptyMessage={t('notifications.selectOcppEvent')}
       sections={[
         { title: t('notifications.ocppCommonEvents'), events: OCPP_COMMON_EVENTS },
+        { title: t('notifications.ocpp16Events'), events: OCPP_16_EVENTS },
         { title: t('notifications.ocpp21Events'), events: OCPP_21_EVENTS },
       ]}
       channels={CHANNELS}
@@ -57,12 +64,13 @@ export function OcppEvents(): React.JSX.Element {
       toggleQueryKey={['ocpp-event-settings']}
       enabledMap={enabledMap}
       defaultEnabled={false}
-      renderSettingsExtra={({ selectedEvent, channel, markDirty }) => {
+      renderSettingsExtra={({ selectedEvent, channel }) => {
         const settingKey = `${selectedEvent}:${channel}`;
-        // Sync recipient from DB when event/channel selection changes
-        if (settingKey !== recipientLoadedKey && eventSettings != null) {
+        // Sync recipient from DB when the selection or the stored recipient changes
+        const syncKey = recipientSyncKey(settingKey);
+        if (syncKey !== recipientLoadedKey && eventSettings != null) {
           setRecipient(recipientMap.get(settingKey) ?? '');
-          setRecipientLoadedKey(settingKey);
+          setRecipientLoadedKey(syncKey);
         }
 
         return (
@@ -77,7 +85,6 @@ export function OcppEvents(): React.JSX.Element {
               value={recipient}
               onChange={(e) => {
                 setRecipient(e.target.value);
-                markDirty();
               }}
               placeholder={
                 channel === 'webhook'
@@ -86,6 +93,13 @@ export function OcppEvents(): React.JSX.Element {
               }
             />
           </div>
+        );
+      }}
+      isSettingsExtraDirty={({ selectedEvent, channel }) => {
+        const settingKey = `${selectedEvent}:${channel}`;
+        return (
+          recipientSyncKey(settingKey) === recipientLoadedKey &&
+          recipient !== (recipientMap.get(settingKey) ?? '')
         );
       }}
       onSave={async ({ eventType, channel, language }) => {
@@ -102,7 +116,7 @@ export function OcppEvents(): React.JSX.Element {
           channel,
           language,
         });
-        void queryClient.invalidateQueries({ queryKey: ['ocpp-event-settings'] });
+        await queryClient.invalidateQueries({ queryKey: ['ocpp-event-settings'] });
       }}
     />
   );

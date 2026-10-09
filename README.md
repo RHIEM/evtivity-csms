@@ -7,8 +7,9 @@
 <p align="center">
   <a href="https://github.com/EVtivity/evtivity-csms/releases/latest"><img src="https://img.shields.io/github/v/release/EVtivity/evtivity-csms?label=Release&color=4ade80" alt="Release" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml"><img src="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FEVtivity%2Fevtivity-csms%2Fbadges%2Fcoverage.json" alt="Coverage" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-BUSL--1.1-blue.svg" alt="License: BUSL-1.1" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/TypeScript-6.x-3178C6.svg" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-339933.svg" alt="Node.js" />
   <img src="https://img.shields.io/badge/OCPP-1.6%20%7C%202.1-4ade80.svg" alt="OCPP" />
   <img src="https://img.shields.io/badge/OCPI-2.2.1%20%7C%202.3.0-4ade80.svg" alt="OCPI" />
@@ -217,11 +218,21 @@ graph TB
 | Multi-language UI   | 6 languages: English, German, Spanish, Korean, Simplified and Traditional Chinese                                                   |
 | Responsive Filters  | Filter controls collapse into dropdown on tablet and mobile for all list pages                                                      |
 | Server-down Page    | Friendly error page with retry when API is unreachable, on both CSMS and Portal                                                     |
-| Release Management  | Automated version bumping across all packages and Helm chart via release script                                                     |
+| Release Management  | Stable, alpha and beta channels. Each stable release bumps the Helm chart and AWS CDK app to its version                            |
 
-## Services
+## Deployment
 
-When deployed with the Helm chart, each service is exposed on its own subdomain via Gateway API:
+| Option                | Use it for                                           | Source                                                                        | Guide                                                                      |
+| --------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Docker Compose        | Local development and single-host installs           | `docker-compose.yml` in this repository                                       | [Docker Compose](https://www.evtivity.com/docs/deployment/docker-compose/) |
+| Kubernetes Helm chart | Production on Kubernetes (Istio or Envoy Gateway)    | [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm) | [Helm chart](https://www.evtivity.com/docs/deployment/helm-chart/)         |
+| AWS CDK               | Production on AWS (ECS Fargate, Aurora, ElastiCache) | [EVtivity/evtivity-csms-cdk](https://github.com/EVtivity/evtivity-csms-cdk)   | [AWS](https://www.evtivity.com/docs/deployment/aws/)                       |
+
+The Helm chart and the AWS CDK app track stable releases only. See [Helm chart and AWS CDK versions](#helm-chart-and-aws-cdk-versions).
+
+### Service endpoints
+
+With the Helm chart, each service is exposed on its own subdomain via Gateway API:
 
 | Service            | URL                                | Public Port | Internal Port |
 | ------------------ | ---------------------------------- | ----------- | ------------- |
@@ -237,9 +248,33 @@ When deployed with the Helm chart, each service is exposed on its own subdomain 
 
 All hostnames share a single load balancer IP. DNS records for each hostname must point to that IP. OCPP TLS (port 8443) is provisioned as a separate `LoadBalancer` service for direct station connections using Security Profile 3 (mTLS).
 
-## Helm Chart
+## Skills
 
-The Kubernetes Helm chart is maintained in a separate repository: [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm)
+[EVtivity Agent Skills](https://github.com/EVtivity/evtivity-skills) teach your AI coding agent to work with EVtivity. They follow the open [Agent Skills](https://agentskills.io) standard, so the same skills work in Claude Code, Codex, GitHub Copilot, Gemini CLI, Cursor and other agents.
+
+| Skill                      | Helps you                                                                   |
+| -------------------------- | --------------------------------------------------------------------------- |
+| `evtivity-getting-started` | Install and run EVtivity locally with Docker and sign in                    |
+| `evtivity-deployment`      | Deploy and upgrade with Docker Compose, Helm or AWS CDK                     |
+| `evtivity-configuration`   | Set environment variables, secrets, auth, database and station security     |
+| `evtivity-csms`            | Operate the dashboard: sites, stations, sessions, drivers, pricing, reports |
+| `evtivity-portal`          | Use the driver portal: find a station, charge, pay, manage cards            |
+| `evtivity-mobile-app`      | Build, brand and release the driver mobile app                              |
+| `evtivity-guides`          | Follow step-by-step guides such as station onboarding and stuck sessions    |
+| `evtivity-integrations`    | Set up Stripe, Adyen, the test payment provider and payouts                 |
+| `evtivity-api`             | Call the REST API: API keys, error codes, OCPP command routes               |
+| `evtivity-simulator`       | Run simulated OCPP 1.6 and 2.1 stations and charging sessions               |
+| `evtivity-conformance`     | Send OCPP commands, read message logs and run OCTT conformance tests        |
+| `evtivity-troubleshoot`    | Find and fix a failing service, station connection or sign-in               |
+| `evtivity-report-issue`    | Collect the version and redacted logs and draft a GitHub issue              |
+
+Install them for any agent:
+
+```bash
+npx skills add EVtivity/evtivity-skills
+```
+
+Skill releases use the same tags as EVtivity. Install the tag that matches your deployment. Pull requests and discussions for new skills are welcome.
 
 ## Releases
 
@@ -247,12 +282,11 @@ Versions follow [Semantic Versioning](https://semver.org): `vMAJOR.MINOR.PATCH`.
 
 ### Channels
 
-| Channel | Tag example         | Purpose                                                      | GitHub release |
-| ------- | ------------------- | ------------------------------------------------------------ | -------------- |
-| Stable  | `v0.1.38`           | Production release                                           | Latest         |
-| Beta    | `v0.1.38-beta.2`    | Feature-complete preview of the next stable release          | Pre-release    |
-| Alpha   | `v0.1.39-alpha.1`   | Early preview while the version's features are still in work | Pre-release    |
-| Nightly | `v0.1.38-nightly.7` | Test build between alphas or betas                           | Pre-release    |
+| Channel | Tag example       | Purpose                                                      | GitHub release |
+| ------- | ----------------- | ------------------------------------------------------------ | -------------- |
+| Stable  | `v0.1.38`         | Production release                                           | Latest         |
+| Beta    | `v0.1.38-beta.2`  | Feature-complete preview of the next stable release          | Pre-release    |
+| Alpha   | `v0.1.39-alpha.1` | Early preview while the version's features are still in work | Pre-release    |
 
 Prereleases rank below the stable version they lead to (`v0.1.38-beta.2` comes before `v0.1.38`). Run only stable releases in production.
 
@@ -264,13 +298,13 @@ Images are published to `ghcr.io/evtivity/evtivity-csms/<service>` for `linux/am
 
 - Every release has an exact, immutable tag: `0.1.38`, `0.1.38-beta.2`.
 - Stable releases also move `0.1`, `0`, `latest` and `stable`.
-- Prereleases move the alias of their channel only: `beta`, `alpha` or `nightly`.
+- Prereleases move the alias of their channel only: `beta` or `alpha`.
 
 Aliases always point to the newest image of their channel, and a deployment picks up a new one only when it pulls the image again. Pin an exact tag in production.
 
-### Helm chart and AWS CDK
+### Helm chart and AWS CDK versions
 
-The [Helm chart](https://github.com/EVtivity/evtivity-csms-helm) and the AWS CDK app follow stable releases only. Each stable release bumps them to its version. To try a prerelease, set the image tag yourself, for example `image.tag=0.1.38-beta.2`.
+The [Helm chart](https://github.com/EVtivity/evtivity-csms-helm) and the [AWS CDK app](https://github.com/EVtivity/evtivity-csms-cdk) follow stable releases only. Each stable release bumps them to its version. To try a prerelease, set the image tag yourself, for example `image.tag=0.1.38-beta.2`.
 
 ### Release notes and upgrades
 

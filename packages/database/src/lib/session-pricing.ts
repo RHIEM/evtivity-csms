@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 // The one session cost assembly (issue #33). Every running cost, final cost,
-// TransactionEventResponse totalCost, CostUpdated, prepaid stop, and stale
+// TransactionEventResponse totalCost, CostUpdated, cost ceiling stop, and stale
 // session close prices a session here, from its price snapshots, and stores
 // the cost with its net amount, tax, and breakdown in one statement.
 // Invoices, OCPI, the portal, and reports read the stored breakdown and never
@@ -12,6 +12,7 @@
 import type postgres from 'postgres';
 import {
   calculateSessionCostAt,
+  capCostBreakdown,
   chargedCostBreakdown,
   resolveTaxBasis,
   toSessionCostBreakdown,
@@ -24,6 +25,7 @@ import type {
 } from '@evtivity/lib';
 import { getIdlingGracePeriodMinutes } from './idling-setting.js';
 import { isSplitBillingEnabled } from './pricing-settings.js';
+import { resolveStationTariff } from './tariff-resolution.js';
 
 /** The tariff columns copied onto a session or a tariff segment. */
 export interface TariffPriceSnapshot {
@@ -47,6 +49,8 @@ export interface SessionPricingRow {
   idleMinutes: number;
   /** The reservation's start (or creation) when the session fulfilled one. */
   reservationReferenceAt: Date | null;
+  /** The most the session can be billed (a guest's card authorization), or null. */
+  costCeilingCents: number | null;
 }
 
 function toDate(value: unknown): Date | null {
@@ -76,7 +80,7 @@ export async function loadSessionPricing(
            s.tariff_idle_fee_price_per_minute, s.tariff_tax_rate,
            CASE WHEN s.tax_basis IS NULL THEN t.reservation_fee_per_minute
                 ELSE s.tariff_reservation_fee_per_minute END AS reservation_fee_per_minute,
-           s.idle_started_at, s.idle_minutes,
+           s.idle_started_at, s.idle_minutes, s.cost_ceiling_cents,
            COALESCE(r.starts_at, r.created_at) AS reservation_reference_at
     FROM charging_sessions s
     LEFT JOIN tariffs t ON t.id = s.tariff_id
@@ -102,6 +106,7 @@ export async function loadSessionPricing(
     idleStartedAt: toDate(row.idle_started_at),
     idleMinutes: Number(row.idle_minutes ?? 0),
     reservationReferenceAt: toDate(row.reservation_reference_at),
+    costCeilingCents: row.cost_ceiling_cents != null ? Number(row.cost_ceiling_cents) : null,
   };
 }
 
@@ -162,8 +167,10 @@ async function loadSegments(sql: postgres.Sql, sessionId: string): Promise<Sessi
  * The cost of a session at `at` with `energyWh` delivered: its tariff
  * segments when split billing is on and the tariff changed during the
  * session, else its tariff snapshot, with the idle grace period and the
- * reservation holding fee. Null for a session without a tariff snapshot (not
- * billed, such as free vend or no pricing).
+ * reservation holding fee, at most the session's cost ceiling (a guest's card
+ * authorization or a prepaid token's credit: the tariff price above it is
+ * kept in pricedGrossCents and not billed). Null for a session without a tariff snapshot (not billed, such
+ * as free vend or no pricing).
  */
 export async function priceSession(
   sql: postgres.Sql,
@@ -177,7 +184,7 @@ export async function priceSession(
     isSplitBillingEnabled(),
   ]);
   const segments = splitEnabled ? await loadSegments(sql, session.id) : [];
-  return toSessionCostBreakdown(
+  const priced = toSessionCostBreakdown(
     calculateSessionCostAt({
       basis: session.basis,
       tariff: session.tariff,
@@ -190,6 +197,7 @@ export async function priceSession(
       segments,
     }),
   );
+  return capCostBreakdown(priced, session.costCeilingCents, Number(session.tariff.taxRate ?? 0));
 }
 
 /** loadSessionPricing then priceSession. Null for an unknown, unstarted, or unpriced session. */
@@ -286,15 +294,14 @@ export async function storeFinalCost(
 
 /**
  * Copy a tariff's prices and the company tax basis onto a session (the
- * snapshot it is priced from) and open its first tariff segment with the
- * same prices.
+ * snapshot it is priced from). One UPDATE, safe to run again. The session's
+ * first tariff segment is opened by openFirstTariffSegment.
  */
 export async function snapshotSessionTariff(
   sql: postgres.Sql,
   sessionId: string,
   tariff: TariffPriceSnapshot,
   basis: TaxBasis,
-  startedAt: string | Date,
 ): Promise<void> {
   await sql`
     UPDATE charging_sessions
@@ -309,6 +316,18 @@ export async function snapshotSessionTariff(
         updated_at = now()
     WHERE id = ${sessionId}
   `;
+}
+
+/**
+ * Open a session's first tariff segment with the prices of its tariff. One
+ * INSERT: running it twice opens two segments.
+ */
+export async function openFirstTariffSegment(
+  sql: postgres.Sql,
+  sessionId: string,
+  tariff: TariffPriceSnapshot,
+  startedAt: string | Date,
+): Promise<void> {
   await insertSegment(sql, sessionId, tariff, startedAt, 0);
 }
 
@@ -331,6 +350,81 @@ async function insertSegment(
       ${tariff.idleFeePricePerMinute}, ${tariff.reservationFeePerMinute}, ${tariff.taxRate}
     )
   `;
+}
+
+/**
+ * Prices a session from the tariff of its driver when the driver is linked
+ * after the start: a 2.1 transaction started at plug-in without an idToken
+ * (E02, TxStartPoint EVConnected) is snapshotted at Started without a driver,
+ * so a driver-specific tariff (driver or fleet pricing group) was not applied.
+ * The session belongs to that driver from its start, so the tariff the driver
+ * resolves at the session start replaces the session snapshot, and every
+ * tariff segment is re-priced from the tariff the driver resolves at that
+ * segment's start and energy (one segment unless split billing switched
+ * already). A session without segments gets its first one. Nothing changes
+ * when the driver resolves the tariff the session already has. One
+ * transaction under the session row lock; safe to run again (the second run
+ * finds the driver's tariff). Returns whether the snapshot was replaced.
+ */
+export async function repriceSessionForDriver(
+  sql: postgres.Sql,
+  params: { sessionId: string; stationUuid: string; driverUuid: string; basis: TaxBasis },
+): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    const txSql = tx as unknown as postgres.Sql;
+    const [session] = await txSql`
+      SELECT started_at, tariff_id, tax_basis FROM charging_sessions
+      WHERE id = ${params.sessionId}
+      FOR UPDATE
+    `;
+    if (session == null) return false;
+    const startedAt = new Date(session.started_at as string | Date);
+    const tariff = await resolveStationTariff(
+      { stationUuid: params.stationUuid, driverUuid: params.driverUuid, at: startedAt },
+      txSql,
+    );
+    if (tariff == null || tariff.id === (session.tariff_id as string | null)) return false;
+    // The tax basis stays the one stamped at Started.
+    const basis = (session.tax_basis as TaxBasis | null) ?? params.basis;
+    await snapshotSessionTariff(txSql, params.sessionId, tariff, basis);
+    const segments = await txSql`
+      SELECT id, started_at, energy_wh_start FROM session_tariff_segments
+      WHERE session_id = ${params.sessionId}
+      ORDER BY started_at, id
+    `;
+    if (segments.length === 0) {
+      await insertSegment(txSql, params.sessionId, tariff, startedAt.toISOString(), 0);
+      return true;
+    }
+    for (const [index, segment] of segments.entries()) {
+      const segmentTariff =
+        index === 0
+          ? tariff
+          : await resolveStationTariff(
+              {
+                stationUuid: params.stationUuid,
+                driverUuid: params.driverUuid,
+                at: new Date(segment.started_at as string | Date),
+                sessionEnergyKwh: Number(segment.energy_wh_start ?? 0) / 1000,
+              },
+              txSql,
+            );
+      if (segmentTariff == null) continue;
+      await txSql`
+        UPDATE session_tariff_segments
+        SET tariff_id = ${segmentTariff.id},
+            price_snapshot = true,
+            price_per_kwh = ${segmentTariff.pricePerKwh},
+            price_per_minute = ${segmentTariff.pricePerMinute},
+            price_per_session = ${segmentTariff.pricePerSession},
+            idle_fee_price_per_minute = ${segmentTariff.idleFeePricePerMinute},
+            reservation_fee_per_minute = ${segmentTariff.reservationFeePerMinute},
+            tax_rate = ${segmentTariff.taxRate}
+        WHERE id = ${segment.id as number}
+      `;
+    }
+    return true;
+  });
 }
 
 /**

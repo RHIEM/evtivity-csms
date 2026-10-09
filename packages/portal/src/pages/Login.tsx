@@ -12,10 +12,19 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { useAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
+import { isRateLimited } from '@/lib/error-message';
 import { executeRecaptcha } from '@/lib/recaptcha';
 import { MfaChallenge } from '@/components/MfaChallenge';
 
 const DEV_AUTO_LOGIN = import.meta.env.VITE_PORTAL_AUTO_LOGIN;
+
+// The error is kept as a translation key and translated at render, so it follows the
+// language (the saved one, or one picked on this page) instead of the one active when it was set.
+type LoginErrorKey =
+  | 'auth.sessionExpired'
+  | 'auth.invalidCredentials'
+  | 'auth.recaptchaFailed'
+  | 'errors.RATE_LIMITED';
 
 interface SecurityPublic {
   recaptchaEnabled: boolean;
@@ -31,7 +40,7 @@ export function Login(): React.JSX.Element {
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoginErrorKey | null>(null);
   const [loading, setLoading] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const autoLoginAttempted = useRef(false);
@@ -55,10 +64,10 @@ export function Login(): React.JSX.Element {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('reason') === 'session_expired') {
-      setError(t('auth.sessionExpired'));
+      setError('auth.sessionExpired');
       window.history.replaceState({}, '', '/login');
     }
-  }, [t]);
+  }, []);
 
   useEffect(() => {
     if (
@@ -102,15 +111,17 @@ export function Login(): React.JSX.Element {
       }
       await login(email, password, recaptchaToken);
     } catch (err) {
-      if (err instanceof ApiError) {
+      if (isRateLimited(err)) {
+        setError('errors.RATE_LIMITED');
+      } else if (err instanceof ApiError) {
         const body = err.body as { code?: string } | null;
         if (body?.code === 'RECAPTCHA_REQUIRED' || body?.code === 'RECAPTCHA_FAILED') {
-          setError(t('auth.recaptchaFailed'));
+          setError('auth.recaptchaFailed');
         } else {
-          setError(t('auth.invalidCredentials'));
+          setError('auth.invalidCredentials');
         }
       } else {
-        setError(t('auth.invalidCredentials'));
+        setError('auth.invalidCredentials');
       }
     } finally {
       setLoading(false);
@@ -127,7 +138,7 @@ export function Login(): React.JSX.Element {
       <Card className="w-full max-w-sm">
         <CardHeader className="text-center">
           <h2 className="text-2xl font-semibold">{t('auth.signIn')}</h2>
-          {error != null && <p className="mt-2 text-sm text-destructive">{error}</p>}
+          {error != null && <p className="mt-2 text-sm text-destructive">{t(error)}</p>}
         </CardHeader>
         <CardContent>
           <form

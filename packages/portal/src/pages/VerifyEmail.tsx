@@ -9,7 +9,18 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { Spinner } from '@/components/ui/spinner';
 import { useAuth } from '@/lib/auth';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, getApiErrorCode } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
+
+// The API allows one verification email a minute (and five a day) per driver.
+const RESEND_COOLDOWN_SECONDS = 60;
+
+function retryAfterSeconds(err: unknown): number | null {
+  if (!(err instanceof ApiError)) return null;
+  const body = err.body as { retryAfterSeconds?: unknown } | null;
+  const value = body?.retryAfterSeconds;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.ceil(value) : null;
+}
 
 export function VerifyEmail(): React.JSX.Element {
   const { t } = useTranslation();
@@ -19,9 +30,12 @@ export function VerifyEmail(): React.JSX.Element {
   const driver = useAuth((s) => s.driver);
 
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [verifyError, setVerifyError] = useState('');
   const [resendCooldown, setResendCooldown] = useState(0);
   const [resendLoading, setResendLoading] = useState(false);
   const [resendSuccess, setResendSuccess] = useState(false);
+  // Kept as the error, translated at render.
+  const [resendError, setResendError] = useState<unknown>(null);
 
   // Token verification mode
   const verifyToken = useCallback(async () => {
@@ -33,10 +47,16 @@ export function VerifyEmail(): React.JSX.Element {
       setTimeout(() => {
         void navigate('/', { replace: true });
       }, 2000);
-    } catch {
+    } catch (err) {
+      // errors.INVALID_TOKEN names a reset link, so an invalid verification link keeps its own text.
+      setVerifyError(
+        getApiErrorCode(err) === 'INVALID_TOKEN'
+          ? t('auth.verifyEmailFailed')
+          : getErrorMessage(err, t, 'auth.verifyEmailFailed'),
+      );
       setStatus('error');
     }
-  }, [token, navigate]);
+  }, [token, navigate, t]);
 
   useEffect(() => {
     void verifyToken();
@@ -56,16 +76,20 @@ export function VerifyEmail(): React.JSX.Element {
   async function handleResend(): Promise<void> {
     setResendLoading(true);
     setResendSuccess(false);
+    setResendError(null);
     try {
       await api.post('/v1/portal/auth/resend-verification', {});
       setResendSuccess(true);
-      setResendCooldown(60);
+      setResendCooldown(RESEND_COOLDOWN_SECONDS);
     } catch (err) {
-      if (err instanceof ApiError) {
-        const body = err.body as { code?: string } | null;
-        if (body?.code === 'ALREADY_VERIFIED') {
-          void navigate('/', { replace: true });
-        }
+      const code = getApiErrorCode(err);
+      if (code === 'ALREADY_VERIFIED') {
+        void navigate('/', { replace: true });
+        return;
+      }
+      setResendError(err);
+      if (code === 'VERIFICATION_RESEND_LIMITED' || code === 'RATE_LIMITED') {
+        setResendCooldown(retryAfterSeconds(err) ?? RESEND_COOLDOWN_SECONDS);
       }
     } finally {
       setResendLoading(false);
@@ -103,7 +127,7 @@ export function VerifyEmail(): React.JSX.Element {
             {status === 'error' && (
               <>
                 <AlertCircle className="h-8 w-8 text-destructive" />
-                <p className="text-sm text-destructive">{t('auth.verifyEmailFailed')}</p>
+                <p className="text-sm text-destructive">{verifyError}</p>
               </>
             )}
           </CardContent>
@@ -112,9 +136,14 @@ export function VerifyEmail(): React.JSX.Element {
     );
   }
 
-  // Check your email mode
+  // Check your email mode. Rendered inside the app Layout, whose <main> is a flex column between
+  // the header and the bottom nav: flex-1 fills it, so the card centers in the visible area
+  // (min-h-screen here overflowed <main> and pushed the card below the middle).
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4">
+    <div
+      className="flex flex-1 flex-col items-center justify-center"
+      data-testid="verify-email-pending"
+    >
       <Card className="w-full max-w-sm">
         <CardHeader className="text-center">
           <h2 className="text-2xl font-semibold">{t('auth.verifyEmailTitle')}</h2>
@@ -127,6 +156,11 @@ export function VerifyEmail(): React.JSX.Element {
           {resendSuccess && (
             <p className="text-sm text-success">{t('auth.resendVerificationSuccess')}</p>
           )}
+          {resendError != null && (
+            <p className="text-sm text-destructive" role="alert">
+              {getErrorMessage(resendError, t)}
+            </p>
+          )}
           <Button
             variant="outline"
             className="w-full"
@@ -137,7 +171,7 @@ export function VerifyEmail(): React.JSX.Element {
           >
             {resendLoading
               ? t('auth.resendingVerification')
-              : resendCooldown > 0
+              : resendCooldown > 0 && resendCooldown <= RESEND_COOLDOWN_SECONDS
                 ? t('auth.resendVerificationCooldown', { seconds: resendCooldown })
                 : t('auth.resendVerification')}
           </Button>

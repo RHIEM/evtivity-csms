@@ -59,7 +59,32 @@ vi.mock('@evtivity/database', () => ({
   clearMobileAppConfigCache: vi.fn(),
   clearStationMessageSettingsCache: vi.fn(),
   clearWebhookSettingsCache: vi.fn(),
+  clearRoamingCache: vi.fn(),
+  clearSupportCache: vi.fn(),
+  clearFleetCache: vi.fn(),
   WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY: 'notifications.webhookAllowedPrivateHosts',
+  PREPAID_LOW_CREDIT_THRESHOLD_KEY: 'prepaid.lowCreditThresholdCents',
+  MAX_PREPAID_LOW_CREDIT_THRESHOLD_CENTS: 100_000_000,
+  parsePrepaidLowCreditThresholdCents: (value: unknown) =>
+    typeof value === 'number' ? value : null,
+  clearPrepaidSettingsCache: vi.fn(),
+  INVOICE_PAYMENT_TERMS_DAYS_KEY: 'invoice.paymentTermsDays',
+  MAX_INVOICE_PAYMENT_TERMS_DAYS: 365,
+  parseInvoicePaymentTermsDays: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 365
+      ? value
+      : null,
+  FLEET_INVOICE_RUN_DAY_KEY: 'fleet.invoiceRunDay',
+  MAX_FLEET_INVOICE_RUN_DAY: 28,
+  parseFleetInvoiceRunDay: () => null,
+  clearInvoiceSettingsCache: vi.fn(),
+  FLEET_CREDIT_RESERVATION_KEY: 'fleet.creditReservationCents',
+  MAX_FLEET_CREDIT_RESERVATION_CENTS: 100_000_000,
+  parseFleetCreditReservationCents: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100_000_000
+      ? value
+      : null,
+  clearFleetCreditSettingsCache: vi.fn(),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -203,6 +228,12 @@ async function buildApp(): Promise<FastifyInstance> {
   return app;
 }
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let libModule: typeof import('@evtivity/lib');
+beforeAll(async () => {
+  libModule = await import('@evtivity/lib');
+}, 30_000);
+
 describe('Settings routes - full coverage', () => {
   let app: FastifyInstance;
   let operatorToken: string;
@@ -292,6 +323,19 @@ describe('Settings routes - full coverage', () => {
       const res = await app.inject({ method: 'GET', url: '/portal/branding' });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ currency: 'USD', priceDisplay: 'net', taxBasis: 'net' });
+    });
+
+    it('returns the QR code icon as qrCodeIcon', async () => {
+      setupDbResults([
+        { key: 'company.name', value: 'Acme Charging' },
+        { key: 'qr_code_icon', value: '<svg/>' },
+      ]);
+      const res = await app.inject({ method: 'GET', url: '/portal/branding' });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.qrCodeIcon).toBe('<svg/>');
+      expect(body.name).toBe('Acme Charging');
+      expect(body).not.toHaveProperty('qr_code_icon');
     });
 
     it('converts non-string values to empty string', async () => {
@@ -824,7 +868,7 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       expect(res.json().success).toBe(true);
 
-      const { encryptString } = await import('@evtivity/lib');
+      const { encryptString } = libModule;
       expect(encryptString).toHaveBeenCalledWith('AKIA123', 'test-encryption-key-32chars!!!!!');
       expect(encryptString).toHaveBeenCalledWith('secret123', 'test-encryption-key-32chars!!!!!');
       expect(mockClearS3ConfigCache).toHaveBeenCalled();

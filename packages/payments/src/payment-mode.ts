@@ -10,8 +10,9 @@
  * - `free_vend`: the site's free vend; nothing is charged.
  * - `prepaid`: the session's token holds a prepaid balance (OCPP 2.1 C17);
  *   the balance is debited at the end, no card hold.
- * - `invoice`: a driver billed afterwards through an aggregated invoice
- *   (`payment_mode = 'invoice'` on the driver or a fleet); no card hold.
+ * - `account`: a driver session billed to a fleet (charge on account): the
+ *   session's write-once stamp `billing_mode = 'account'`. No card, no hold,
+ *   no payment record; the fleet invoice bills it.
  * - `card`: a driver session, paid with the driver's saved card (hold at
  *   the start, capture at the end).
  * - `guest`: a guest checkout or ad hoc payment session (guest_sessions row);
@@ -22,7 +23,7 @@ export type SessionPaymentMode =
   | 'roaming'
   | 'free_vend'
   | 'prepaid'
-  | 'invoice'
+  | 'account'
   | 'card'
   | 'guest'
   | 'anonymous';
@@ -32,8 +33,8 @@ export interface SessionPaymentFacts {
   freeVend: boolean;
   /** The session's token has a prepaid balance (`driver_tokens.prepaid_balance_cents` set). */
   prepaid: boolean;
-  /** The session's driver pays by invoice (`charging_sessions.payment_mode = 'invoice'`). */
-  invoice: boolean;
+  /** The session is billed to a fleet account (`charging_sessions.billing_mode = 'account'`). */
+  account: boolean;
   driverId: string | null;
   /** A guest_sessions row matched the session's token. */
   guestSession: boolean;
@@ -43,7 +44,7 @@ export function classifySessionPayment(facts: SessionPaymentFacts): SessionPayme
   if (facts.isRoaming) return 'roaming';
   if (facts.freeVend) return 'free_vend';
   if (facts.prepaid) return 'prepaid';
-  if (facts.invoice) return 'invoice';
+  if (facts.account && facts.driverId != null) return 'account';
   if (facts.driverId != null) return 'card';
   if (facts.guestSession) return 'guest';
   return 'anonymous';

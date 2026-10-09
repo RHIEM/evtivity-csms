@@ -38,7 +38,12 @@ import {
   recordNotificationAttempt,
 } from '@evtivity/lib';
 import QRCode from 'qrcode';
-import { setAuthCookies, clearAuthCookies, isSecureRequest } from '../lib/auth-cookies.js';
+import {
+  setAuthCookies,
+  clearAuthCookies,
+  isSecureRequest,
+  readRefreshCookie,
+} from '../lib/auth-cookies.js';
 import { checkRecaptcha } from '../lib/recaptcha-check.js';
 import {
   createRefreshToken,
@@ -47,7 +52,8 @@ import {
   revokeAllUserRefreshTokens,
   revokeAllUserSessions,
 } from '../services/refresh-token.service.js';
-import { zodSchema } from '../lib/zod-schema.js';
+import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
+import { emailEquals } from '../lib/email-match.js';
 import { generateUserToken, hashUserToken } from '../lib/user-token.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -64,14 +70,9 @@ import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize, invalidatePermissionCache } from '../middleware/rbac.js';
 import { invalidateUserActiveCache } from '../plugins/auth.js';
 import { invalidateSiteAccessCache } from '../lib/site-access.js';
-import {
-  PERMISSIONS,
-  PERMISSION_GROUPS,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
-  VIEWER_DEFAULT_PERMISSIONS,
-} from '@evtivity/lib';
+import { permissionCatalog } from '@evtivity/lib';
 import { validatePasswordComplexity } from '../lib/password-validation.js';
+import { PASSWORD_MIN_LENGTH } from '@evtivity/lib/password-policy';
 import { config as apiConfig } from '../lib/config.js';
 import {
   isMfaChallengeExhausted,
@@ -163,12 +164,12 @@ const updateMeBody = z.object({
 });
 
 const resetPasswordBody = z.object({
-  password: z.string().min(12),
+  password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const changePasswordBody = z.object({
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(12),
+  newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const forgotPasswordBody = z.object({
@@ -178,13 +179,13 @@ const forgotPasswordBody = z.object({
 
 const resetPasswordWithTokenBody = z.object({
   token: z.string().min(1).describe('Password reset token from email link'),
-  password: z.string().min(12),
+  password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const forceChangePasswordBody = z.object({
   email: z.string().email(),
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(12),
+  newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const userSelect = {
@@ -356,7 +357,7 @@ export function userRoutes(app: FastifyInstance): void {
       const recaptchaOk = await checkRecaptcha(recaptchaToken, reply);
       if (!recaptchaOk) return;
 
-      const [user] = await db.select().from(users).where(ilike(users.email, email));
+      const [user] = await db.select().from(users).where(emailEquals(users.email, email));
 
       if (user == null) {
         // Equalize timing with the user-exists branch so email enumeration
@@ -459,9 +460,9 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const rawRefreshToken = request.cookies['csms_refresh'];
-      if (rawRefreshToken) {
-        await revokeRefreshToken(rawRefreshToken);
+      const refreshCookie = readRefreshCookie('csms', request);
+      if (refreshCookie.status === 'valid') {
+        await revokeRefreshToken(refreshCookie.value);
       }
       // Clear cached permissions for the logged-out user
       const jwtUser = request.user as unknown as Record<string, unknown>;
@@ -498,13 +499,16 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const rawToken = request.cookies['csms_refresh'];
-      if (!rawToken) {
+      const refreshCookie = readRefreshCookie('csms', request);
+      if (refreshCookie.status === 'absent') {
         await reply.status(401).send({ error: 'No refresh token', code: 'NO_REFRESH_TOKEN' });
         return;
       }
 
-      const result = await validateAndRotateRefreshToken(rawToken);
+      const result =
+        refreshCookie.status === 'valid'
+          ? await validateAndRotateRefreshToken(refreshCookie.value)
+          : null;
       if (result == null || result.userId == null) {
         clearAuthCookies('csms', reply, isSecureRequest(request));
         await reply
@@ -577,7 +581,7 @@ export function userRoutes(app: FastifyInstance): void {
           language: users.language,
         })
         .from(users)
-        .where(ilike(users.email, email));
+        .where(emailEquals(users.email, email));
 
       if (user != null) {
         // Revoke existing password_reset tokens
@@ -686,8 +690,12 @@ export function userRoutes(app: FastifyInstance): void {
               metadata,
             });
           }
-        } catch {
-          // Silently fail email sending to not leak user existence
+        } catch (err) {
+          // The response stays the same so it does not reveal whether the user exists.
+          request.log.warn(
+            { err },
+            'Password reset email dispatch failed, answering success anyway',
+          );
         }
       }
 
@@ -832,7 +840,7 @@ export function userRoutes(app: FastifyInstance): void {
         typeof forceChangePasswordBody
       >;
 
-      const [user] = await db.select().from(users).where(ilike(users.email, email));
+      const [user] = await db.select().from(users).where(emailEquals(users.email, email));
 
       if (user == null) {
         // Equalize timing with the user-exists branch (see login handler).
@@ -1173,15 +1181,15 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const body = request.body as z.infer<typeof createUserBody>;
+      const body = parseZodRequest(createUserBody, request.body);
 
       // Pre-check the unique email constraint (case-insensitive) so we return
       // a clean 409 instead of letting Postgres raise a 500. Body email is
-      // already lowercased + trimmed by the Zod transform on createUserBody.
+      // lowercased + trimmed by the Zod transform on createUserBody.
       const [existing] = await db
         .select({ id: users.id })
         .from(users)
-        .where(ilike(users.email, body.email))
+        .where(emailEquals(users.email, body.email))
         .limit(1);
       if (existing != null) {
         await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
@@ -1264,12 +1272,7 @@ export function userRoutes(app: FastifyInstance): void {
         .from(roles)
         .where(eq(roles.id, body.roleId));
 
-      const roleDefaults =
-        createdRole?.name === 'admin'
-          ? ADMIN_DEFAULT_PERMISSIONS
-          : createdRole?.name === 'viewer'
-            ? VIEWER_DEFAULT_PERMISSIONS
-            : OPERATOR_DEFAULT_PERMISSIONS;
+      const roleDefaults = permissionCatalog.defaultsFor(createdRole?.name);
 
       if (roleDefaults.length > 0) {
         await db
@@ -1503,12 +1506,7 @@ export function userRoutes(app: FastifyInstance): void {
           .from(roles)
           .where(eq(roles.id, body.roleId));
 
-        const defaults =
-          newRole?.name === 'admin'
-            ? ADMIN_DEFAULT_PERMISSIONS
-            : newRole?.name === 'viewer'
-              ? VIEWER_DEFAULT_PERMISSIONS
-              : OPERATOR_DEFAULT_PERMISSIONS;
+        const defaults = permissionCatalog.defaultsFor(newRole?.name);
 
         await db.delete(userPermissions).where(eq(userPermissions.userId, id));
         if (defaults.length > 0) {
@@ -1919,7 +1917,8 @@ export function userRoutes(app: FastifyInstance): void {
       let payload: { userId: string; roleId: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -2061,7 +2060,8 @@ export function userRoutes(app: FastifyInstance): void {
       let payload: { userId: string; roleId: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -2939,8 +2939,16 @@ export function userRoutes(app: FastifyInstance): void {
 
   const permissionGroupItem = z
     .object({
-      label: z.string().describe('Display label for the permission group'),
-      permissions: z.array(z.string()).describe('Permission strings that belong to this group'),
+      resource: z
+        .string()
+        .describe('Resource of the group, the part before the colon, e.g. stations'),
+      kind: z
+        .enum(['page', 'settings'])
+        .describe('page for a CSMS page, settings for a Settings tab'),
+      labelKey: z.string().describe('CSMS locale key of the group label'),
+      permissions: z
+        .array(z.string())
+        .describe('The read and write permission strings of the resource'),
     })
     .passthrough();
 
@@ -2964,7 +2972,7 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     () => {
-      return [...PERMISSION_GROUPS];
+      return permissionCatalog.groups();
     },
   );
 
@@ -3041,7 +3049,7 @@ export function userRoutes(app: FastifyInstance): void {
         response: {
           200: arrayResponse(z.string()),
           400: errorWith('Invalid permissions', [ERROR_CODES.INVALID_PERMISSIONS]),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
+          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN, ERROR_CODES.SELF_EDIT_FORBIDDEN]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
         },
       },
@@ -3067,8 +3075,7 @@ export function userRoutes(app: FastifyInstance): void {
       }
 
       // Validate all permissions are in the catalog
-      const catalogSet = new Set<string>(PERMISSIONS);
-      const invalid = permissions.filter((p) => !catalogSet.has(p));
+      const invalid = permissions.filter((p) => !permissionCatalog.isKnown(p));
       if (invalid.length > 0) {
         await reply.status(400).send({
           error: `Invalid permissions: ${invalid.join(', ')}`,

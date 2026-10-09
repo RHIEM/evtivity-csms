@@ -1,11 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, lt, sql } from 'drizzle-orm';
 import { db, reports, users, getSystemTimezone } from '@evtivity/database';
 import { createLogger } from '@evtivity/lib';
 import { isUiLanguage, type UiLanguage } from '@evtivity/lib/languages';
-import { generateNeviReport } from './report-generators/nevi-report.js';
+import { ReportGeneratorRegistry, REPORT_FORMATS } from './report-registry.js';
+import type { ReportFormat, ReportGeneratorResult } from './report-registry.js';
+import { generateNeviReport, neviFiltersError } from './report-generators/nevi-report.js';
 import { generateRevenueReport } from './report-generators/revenue-report.js';
 import { generateEnergyReport } from './report-generators/energy-report.js';
 import { generateSessionsReport } from './report-generators/sessions-report.js';
@@ -78,23 +80,7 @@ export async function computeNextRunAtInTz(
   return row.next_run_at instanceof Date ? row.next_run_at : new Date(row.next_run_at);
 }
 
-export interface ReportGeneratorResult {
-  data: Buffer;
-  fileName: string;
-}
-
-/**
- * Builds a report file. `language` sets its labels and PDF formatting
- * (report-generators/report-locale.ts). NEVI ignores it: the EV-ChART template
- * has fixed English field names.
- */
-export type ReportGenerator = (
-  filters: Record<string, unknown>,
-  format: string,
-  language: UiLanguage,
-) => Promise<ReportGeneratorResult>;
-
-/** Report types a generator exists for. */
+/** Built-in report types. The API validates requests against this list. */
 export const REPORT_TYPES = [
   'nevi',
   'revenue',
@@ -108,22 +94,54 @@ export const REPORT_TYPES = [
 
 export type ReportType = (typeof REPORT_TYPES)[number];
 
-// Every process that queues a report generates it in-process (the API for
-// operator requests, the worker for schedules), so the generators are part of
-// this module rather than registered at startup.
-const generators: Record<ReportType, ReportGenerator> = {
-  nevi: generateNeviReport,
-  revenue: generateRevenueReport,
-  energy: generateEnergyReport,
-  sessions: generateSessionsReport,
-  utilization: generateUtilizationReport,
-  stationHealth: generateStationHealthReport,
-  sustainability: generateSustainabilityReport,
-  driverActivity: generateDriverActivityReport,
-};
+// The worker generates every report (`reports` queue); the API only stores and
+// announces it. Schedules render ad hoc files with renderReport, so the built-in
+// generators are registered here, once per process, rather than at startup.
+export const reportGenerators = new ReportGeneratorRegistry();
 
-function isReportType(value: string): value is ReportType {
-  return (REPORT_TYPES as readonly string[]).includes(value);
+// Registration order is the order the CSMS lists the types in.
+for (const [type, generate] of [
+  ['revenue', generateRevenueReport],
+  ['utilization', generateUtilizationReport],
+  ['energy', generateEnergyReport],
+  ['stationHealth', generateStationHealthReport],
+  ['sessions', generateSessionsReport],
+  ['sustainability', generateSustainabilityReport],
+  ['driverActivity', generateDriverActivityReport],
+] as const) {
+  reportGenerators.register({ type, generate, formats: REPORT_FORMATS, generateFromUi: true });
+}
+reportGenerators.register({
+  type: 'nevi',
+  generate: generateNeviReport,
+  // The EV-ChART template is an XLSX workbook. Its quarter and year come from
+  // the NEVI Compliance tab, so the Generate and Schedules tabs do not offer it.
+  formats: ['xlsx'],
+  generateFromUi: false,
+  validateFilters: neviFiltersError,
+});
+
+export interface ReportTypeInfo {
+  type: string;
+  formats: readonly ReportFormat[];
+  generateFromUi: boolean;
+}
+
+/** The registered report types, for the CSMS report pages. */
+export function listReportTypes(): ReportTypeInfo[] {
+  return reportGenerators.list().map(({ type, formats, generateFromUi }) => ({
+    type,
+    formats,
+    generateFromUi,
+  }));
+}
+
+/** Why the filters cannot produce this report type, or null when they can. */
+export function reportFiltersError(
+  reportType: string,
+  filters: Record<string, unknown>,
+): string | null {
+  return reportGenerators.get(reportType)?.validateFilters?.(filters) ?? null;
 }
 
 /**
@@ -150,25 +168,63 @@ export async function renderReport(
   format: string,
   language: UiLanguage,
 ): Promise<ReportGeneratorResult> {
-  if (!isReportType(reportType)) {
+  const descriptor = reportGenerators.get(reportType);
+  if (descriptor == null) {
     throw new Error(`No generator registered for report type: ${reportType}`);
   }
-  return generators[reportType](filters, format, language);
+  return descriptor.generate(filters, format, language);
 }
 
-export async function queueReport(params: {
-  name: string;
-  reportType: string;
-  format: string;
-  filters: Record<string, unknown>;
-  userId: string;
-}): Promise<string> {
+/**
+ * Pub/sub channel the API announces a new report on; the worker turns each
+ * message into a `reports` job. Payload: `{ reportId }`.
+ */
+export const REPORT_GENERATE_CHANNEL = 'report_generate';
+
+/** A report still pending this long after it was created is queued again. */
+export const REPORT_PENDING_RETRY_MS = 2 * 60_000;
+
+/** A report still generating this long after it was created is marked failed. */
+export const REPORT_GENERATING_TIMEOUT_MS = 30 * 60_000;
+
+export const REPORT_TIMED_OUT_ERROR = 'Report generation timed out';
+
+/** BullMQ job id of a report: one job per report, however often it is announced. */
+export function reportJobId(reportId: string): string {
+  return `report-${reportId}`;
+}
+
+/**
+ * The format a report's file is written in: the asked format when the generator writes it,
+ * else its first format (NEVI is always xlsx), so the row and the download match the file.
+ */
+export function reportFileFormat(reportType: string, format: string): string {
+  const formats: readonly string[] | undefined = reportGenerators.get(reportType)?.formats;
+  if (formats == null || formats.includes(format)) return format;
+  return formats[0] ?? format;
+}
+
+/**
+ * Stores a pending report and hands it to `dispatch`, which queues the
+ * generation in the worker. A dispatch that fails is logged and the report
+ * stays pending; the worker's report sweep queues it again.
+ */
+export async function queueReport(
+  params: {
+    name: string;
+    reportType: string;
+    format: string;
+    filters: Record<string, unknown>;
+    userId: string | null;
+  },
+  dispatch: (reportId: string) => Promise<void>,
+): Promise<string> {
   const [row] = await db
     .insert(reports)
     .values({
       name: params.name,
       reportType: params.reportType,
-      format: params.format,
+      format: reportFileFormat(params.reportType, params.format),
       filters: params.filters,
       generatedById: params.userId,
     })
@@ -177,29 +233,41 @@ export async function queueReport(params: {
   const reportId = row?.id;
   if (reportId == null) return '';
 
-  setImmediate(() => {
-    void generateReport(reportId);
-  });
+  try {
+    await dispatch(reportId);
+  } catch (err: unknown) {
+    log.warn({ reportId, err }, 'Failed to queue report generation; the report sweep retries it');
+  }
 
   return reportId;
 }
 
+/**
+ * Generates a pending report. Only the caller that moves it from pending to
+ * generating runs the generator, so a job delivered twice does the work once.
+ * The final status is written only while the report is still generating, so a
+ * report the sweep timed out stays failed.
+ */
 export async function generateReport(reportId: string): Promise<void> {
-  await db.update(reports).set({ status: 'generating' }).where(eq(reports.id, reportId));
-
   const [report] = await db
-    .select({
+    .update(reports)
+    .set({ status: 'generating' })
+    .where(and(eq(reports.id, reportId), eq(reports.status, 'pending')))
+    .returning({
       reportType: reports.reportType,
       format: reports.format,
       filters: reports.filters,
       generatedById: reports.generatedById,
-    })
-    .from(reports)
-    .where(eq(reports.id, reportId));
+    });
 
-  if (report == null) return;
+  if (report == null) {
+    log.debug({ reportId }, 'Report is not pending; skipping generation');
+    return;
+  }
 
-  const generator = isReportType(report.reportType) ? generators[report.reportType] : undefined;
+  const stillGenerating = and(eq(reports.id, reportId), eq(reports.status, 'generating'));
+
+  const generator = reportGenerators.get(report.reportType)?.generate;
   if (generator == null) {
     await db
       .update(reports)
@@ -208,7 +276,7 @@ export async function generateReport(reportId: string): Promise<void> {
         error: `No generator registered for report type: ${report.reportType}`,
         completedAt: sql`now()`,
       })
-      .where(eq(reports.id, reportId));
+      .where(stillGenerating);
     return;
   }
 
@@ -228,7 +296,7 @@ export async function generateReport(reportId: string): Promise<void> {
         fileSize: result.data.length,
         completedAt: sql`now()`,
       })
-      .where(eq(reports.id, reportId));
+      .where(stillGenerating);
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : 'Unknown error';
     log.error({ reportId, error: err }, 'Report generation failed');
@@ -239,6 +307,30 @@ export async function generateReport(reportId: string): Promise<void> {
         error: errorMsg.slice(0, 1000),
         completedAt: sql`now()`,
       })
-      .where(eq(reports.id, reportId));
+      .where(stillGenerating);
   }
+}
+
+/**
+ * Report sweep, run by the worker: returns the ids of reports still pending
+ * after `REPORT_PENDING_RETRY_MS` (their queue message was lost) so they are
+ * queued again, and marks failed the reports still generating after
+ * `REPORT_GENERATING_TIMEOUT_MS` (the worker running them stopped).
+ */
+export async function sweepStaleReports(): Promise<{ pending: string[]; timedOut: number }> {
+  const pendingBefore = new Date(Date.now() - REPORT_PENDING_RETRY_MS);
+  const generatingBefore = new Date(Date.now() - REPORT_GENERATING_TIMEOUT_MS);
+
+  const pendingRows = await db
+    .select({ id: reports.id })
+    .from(reports)
+    .where(and(eq(reports.status, 'pending'), lt(reports.createdAt, pendingBefore)));
+
+  const timedOutRows = await db
+    .update(reports)
+    .set({ status: 'failed', error: REPORT_TIMED_OUT_ERROR, completedAt: sql`now()` })
+    .where(and(eq(reports.status, 'generating'), lt(reports.createdAt, generatingBefore)))
+    .returning({ id: reports.id });
+
+  return { pending: pendingRows.map((row) => row.id), timedOut: timedOutRows.length };
 }

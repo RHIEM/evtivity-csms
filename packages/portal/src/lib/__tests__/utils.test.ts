@@ -6,8 +6,10 @@ import i18next from 'i18next';
 import {
   cn,
   formatCents,
+  formatClockTime,
   formatDate,
   formatDistance,
+  formatDuration,
   formatEnergy,
   formatMonthYear,
   formatNumber,
@@ -179,6 +181,13 @@ describe('formatting in the UI language', () => {
     expect(formatDate('2026-03-05T08:04:09Z', 'Europe/Berlin')).toMatch(/^Mar 5, 2026, 9:04\sAM$/);
   });
 
+  it('formats a chart clock time in the selected language and time zone', async () => {
+    await i18next.changeLanguage('de');
+    expect(formatClockTime(Date.UTC(2026, 9, 6, 19, 5), 'America/New_York')).toBe('15:05');
+    await i18next.changeLanguage('en');
+    expect(formatClockTime(Date.UTC(2026, 9, 6, 19, 5), 'America/New_York')).toMatch(/^3:05\sPM$/);
+  });
+
   it('keeps English formatting for English', async () => {
     await i18next.changeLanguage('en');
     expect(formatUnitPrice(0.49, 'EUR')).toBe('€0.49');
@@ -195,5 +204,46 @@ describe('formatting in the UI language', () => {
     await i18next.changeLanguage('de');
     expect(formatTaxPercent(0.19)).toBe('19');
     expect(formatTaxPercent(0.075)).toBe('7,5');
+  });
+});
+
+describe('formatDuration', () => {
+  it('returns n/a when either end is missing', () => {
+    expect(formatDuration(null, '2026-01-01T00:00:00Z')).toBe('n/a');
+    expect(formatDuration('2026-01-01T00:00:00Z', undefined)).toBe('n/a');
+  });
+
+  it('returns n/a when the end is before the start', () => {
+    expect(formatDuration('2026-01-01T01:00:00Z', '2026-01-01T00:00:00Z')).toBe('n/a');
+  });
+
+  it('formats minutes, then hours and minutes', () => {
+    expect(formatDuration('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')).toBe('0m');
+    expect(formatDuration('2026-01-01T00:00:00Z', '2026-01-01T00:59:20Z')).toBe('59m');
+    expect(formatDuration(new Date('2026-01-01T00:00:00Z'), new Date('2026-01-01T01:00:00Z'))).toBe(
+      '1h 0m',
+    );
+    expect(formatDuration('2026-01-01T00:00:00Z', '2026-01-01T02:15:00Z')).toBe('2h 15m');
+  });
+});
+
+describe('formatDistance edge cases', () => {
+  it('returns n/a for a missing or non-numeric energy value', () => {
+    expect(formatDistance(null, 3.5)).toBe('n/a');
+    expect(formatDistance('abc', 3.5)).toBe('n/a');
+  });
+
+  it('parses a string energy value', () => {
+    expect(formatDistance('10000', 3)).toBe('30 Miles');
+  });
+
+  it('converts miles to km', () => {
+    expect(formatDistance(10000, 3, 'km')).toBe('48 km');
+  });
+});
+
+describe('formatMonthYear', () => {
+  it('formats the month and year in upper case', () => {
+    expect(formatMonthYear(new Date(2026, 2, 15))).toBe('MARCH 2026');
   });
 });

@@ -19,10 +19,12 @@ import { TokensTable } from '@/components/TokensTable';
 import { VehiclesTable, type Vehicle } from '@/components/VehiclesTable';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
 import { api } from '@/lib/api';
+import { useFeatureFlags } from '@/hooks/use-feature-flags';
 import { useHasPermission } from '@/lib/auth';
 import { useUserTimezone } from '@/lib/timezone';
 import { DriverDetailsTab } from '@/components/driver/DriverDetailsTab';
 import type { PortalAccess } from '@/components/driver/DriverPortalAccessCard';
+import type { DriverBilling } from '@/components/driver/DriverBillingCard';
 import { DriverInvoicesTab } from '@/components/driver/DriverInvoicesTab';
 import { DriverPaymentMethodsTab } from '@/components/driver/DriverPaymentMethodsTab';
 import { DriverPricingTab } from '@/components/driver/DriverPricingTab';
@@ -38,10 +40,10 @@ interface Driver {
   phone: string | null;
   language: string;
   isActive: boolean;
-  paymentMode: 'card' | 'invoice' | null;
   createdAt: string;
   updatedAt: string;
   portalAccess?: PortalAccess;
+  billing?: DriverBilling;
 }
 
 interface DriverToken {
@@ -64,13 +66,9 @@ export function DriverDetail(): React.JSX.Element {
   const [tab, setTab] = useTab('details');
 
   // Hide the Reservations tab when the global reservation feature is off.
-  const { data: globalSettings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => api.get<Record<string, unknown>>('/v1/settings'),
-    staleTime: 60_000,
-  });
-  const reservationEnabled =
-    globalSettings == null || globalSettings['reservation.enabled'] !== false;
+  const {
+    flags: { reservationEnabled },
+  } = useFeatureFlags();
 
   const { data: driver, isLoading } = useQuery({
     queryKey: ['drivers', id],

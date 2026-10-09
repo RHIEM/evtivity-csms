@@ -16,8 +16,12 @@ vi.mock('@/lib/api', () => ({
 vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => undefined },
   useTranslation: () => ({
-    t: (key: string, options?: { amount?: string }) =>
-      options?.amount != null ? `${key}:${options.amount}` : key,
+    t: (key: string, options?: { amount?: string; fleet?: string; state?: string }) =>
+      options?.amount != null
+        ? `${key}:${options.amount}`
+        : options?.fleet != null
+          ? `${key}:${options.fleet}:${options.state ?? ''}`
+          : key,
     i18n: { language: 'en', changeLanguage: vi.fn() },
   }),
 }));
@@ -61,6 +65,21 @@ afterEach(() => {
 });
 
 describe('Sessions', () => {
+  it('shows the fleet and billing state of a session billed on account', async () => {
+    getMock.mockResolvedValue({
+      data: [
+        { ...session('5', 1000, null), accountBilling: { state: 'invoiced', fleetName: 'Acme' } },
+        { ...session('6', 1000, null), accountBilling: null },
+      ],
+      total: 2,
+    });
+    renderPage();
+    expect(
+      await screen.findByText('fleetBilling.sessionLine:Acme:fleetBilling.state.invoiced'),
+    ).toBeDefined();
+    expect(screen.getAllByText(/fleetBilling\.sessionLine/)).toHaveLength(1);
+  });
+
   it('labels a taxed amount as including tax, through the interpolated key', async () => {
     getMock.mockResolvedValue({ data: [session('1', 1190, 190)], total: 1 });
     renderPage();
@@ -74,11 +93,8 @@ describe('Sessions', () => {
     expect(screen.queryByText(/common\.amountInclTax/)).toBeNull();
   });
 
-  it('reads the stored tax, not the tariff rate: no label when no tax was charged', async () => {
-    getMock.mockResolvedValue({
-      data: [{ ...session('4', 1000, 0), tariffTaxRate: '0.19' }],
-      total: 1,
-    });
+  it('shows no label when the stored tax is 0', async () => {
+    getMock.mockResolvedValue({ data: [session('4', 1000, 0)], total: 1 });
     renderPage();
     expect(await screen.findByText('€10.00')).toBeDefined();
     expect(screen.queryByText(/common\.amountInclTax/)).toBeNull();

@@ -9,8 +9,8 @@ import {
   formatUnitPrice as formatLocaleUnitPrice,
 } from '@evtivity/lib/currency';
 import { formatNumber as formatLocaleNumber } from '@evtivity/lib/number';
-import { formatDateTime } from '@evtivity/lib/timezone';
 import { formatTaxRatePercent } from '@evtivity/lib/price-display';
+import { formatDateTime } from '@evtivity/lib/timezone';
 import i18next from 'i18next';
 
 export function cn(...inputs: ClassValue[]): string {
@@ -70,6 +70,16 @@ export function formatDate(date: string | Date | null | undefined, timezone?: st
     date,
     timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     { dateStyle: 'medium', timeStyle: 'short' },
+    uiLocale(),
+  );
+}
+
+/** Format a clock time in the UI language and time zone, e.g. "3:05 PM" (en) or "15:05" (de). */
+export function formatClockTime(date: string | Date | number, timezone: string): string {
+  return formatDateTime(
+    typeof date === 'number' ? new Date(date) : date,
+    timezone,
+    { timeStyle: 'short' },
     uiLocale(),
   );
 }

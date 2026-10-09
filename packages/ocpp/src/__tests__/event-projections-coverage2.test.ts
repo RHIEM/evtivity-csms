@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, type Mock } from 'vitest';
 import type { EventBus, DomainEvent, PubSubClient } from '@evtivity/lib';
 
 // SQL mock: records every tagged-template call (strings + interpolated values)
@@ -20,6 +20,11 @@ const EMPTY = Object.assign([] as unknown[], { __zeroCount: true });
 function createSqlMock() {
   const sqlFn = (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]> => {
     sqlCalls.push({ strings: [...strings], values });
+    // The resend check (TransactionProjector.isResentEvent) answers by text,
+    // outside the queued results: no event is a resend unless a test says so.
+    if (strings.join('?').includes('AND te.seq_no = ?')) {
+      return Promise.resolve(Object.assign([], { count: 0 }));
+    }
     const idx = sqlCallIndex;
     sqlCallIndex++;
     const error = sqlErrors.get(idx);
@@ -60,17 +65,27 @@ const mockIsRoamingEnabled = vi.fn().mockResolvedValue(false);
 const mockAuthorizeSessionHold = vi.fn();
 const mockSettleSessionPayment = vi.fn();
 const mockRecordTerminalSettlement = vi.fn();
+const mockDispatchFleetCreditNotices = vi.fn().mockResolvedValue(null);
+const mockReadFleetCreditLimit = vi.fn().mockResolvedValue(null);
+const mockFleetCreditNoticesClaimed = vi.fn().mockResolvedValue(false);
+// No credit left by default: the ceiling stays and the cost loop stops at it.
+const mockExtendFleetSessionCeiling = vi.fn();
 vi.mock('@evtivity/payments', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  dispatchFleetCreditLimitNotices: (...args: unknown[]) =>
+    mockDispatchFleetCreditNotices(...args) as unknown,
   authorizeSessionHold: (...args: unknown[]) => mockAuthorizeSessionHold(...args) as unknown,
   settleSessionPayment: (...args: unknown[]) => mockSettleSessionPayment(...args) as unknown,
   recordTerminalSettlement: (...args: unknown[]) =>
     mockRecordTerminalSettlement(...args) as unknown,
 }));
 const mockPaymentContext = { registry: {}, logger: {} };
+// The settlement options of a first run that can still be retried.
+const SETTLE_OPTIONS = { rethrowConnectionErrors: true, resumeAdjustment: false };
 vi.mock('../lib/payments.js', () => ({
   paymentRegistry: {},
   paymentContext: () => mockPaymentContext,
+  activePaymentProvider: () => Promise.resolve({ id: 'stripe' }),
 }));
 const mockIsAutoDisableOnCritical = vi.fn().mockResolvedValue(false);
 const mockWriteAudit = vi.fn().mockResolvedValue(undefined);
@@ -115,6 +130,12 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/station-status.js',
   )),
+  // The real driver availability rule (station-watch alert).
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/driver-availability.js',
+  )),
+  // The real station-watch check, running on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/station-watch.js')),
   // The real session pricing writes (tariff snapshot, segments, final cost),
   // running on the mocked client. The cost itself comes from mockPriceSessionAt.
   ...(await vi.importActual<Record<string, unknown>>(
@@ -124,6 +145,8 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/tariff-resolution.js',
   )),
+  // The real Postgres error readers (the projection retry classifies errors).
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   getCompanyTaxBasis: vi.fn().mockResolvedValue('net'),
   priceSessionAt: (...args: unknown[]) => mockPriceSessionAt(...args) as unknown,
   storeRunningCost: (...args: unknown[]) => mockStoreRunningCost(...args) as unknown,
@@ -146,6 +169,26 @@ vi.mock('@evtivity/database', async () => ({
   isSiteFreeVendEnabledByStation: mockIsSiteFreeVend,
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
   getCompanyPriceDisplay: vi.fn().mockResolvedValue('net'),
+  readFleetCreditLimit: (...args: unknown[]) => mockReadFleetCreditLimit(...args) as unknown,
+  fleetCreditNoticesClaimed: (...args: unknown[]) =>
+    mockFleetCreditNoticesClaimed(...args) as unknown,
+  extendFleetSessionCeiling: (...args: unknown[]) =>
+    mockExtendFleetSessionCeiling(...args) as unknown,
+  // The rule of fleet-credit-limit.ts: headroom below 20 % of the slice or
+  // twice the last reading's cost.
+  ceilingExtensionDue: (input: {
+    pricedCents: number;
+    ceilingCents: number;
+    sliceCents: number;
+    lastReadingCents?: number;
+  }) => {
+    const headroom = input.ceilingCents - input.pricedCents;
+    return (
+      headroom * 100 < input.sliceCents * 20 ||
+      headroom < 2 * Math.max(input.lastReadingCents ?? 0, 0)
+    );
+  },
+  getFleetCreditReservationCents: vi.fn().mockResolvedValue(50),
 }));
 
 const mockDispatchOcpp = vi.fn().mockResolvedValue(undefined);
@@ -253,6 +296,13 @@ describe('Event projections - coverage round 2', () => {
   let mockPubSub: PubSubClient;
   const timerCallbacks: Array<() => void> = [];
 
+  // The first import loads the whole projection module graph, which under coverage on a busy
+  // machine took longer than one test's 5 s timeout. Load it once here so setup() reads it
+  // from the module cache.
+  beforeAll(async () => {
+    await import('../server/event-projections.js');
+  }, 30_000);
+
   beforeEach(() => {
     vi.useFakeTimers();
     timerCallbacks.length = 0;
@@ -337,6 +387,152 @@ describe('Event projections - coverage round 2', () => {
       await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapStarted' });
       expect(mockLoggerError).toHaveBeenCalledWith(
         expect.objectContaining({ eventType: 'ocpp.BatterySwap' }),
+        'Event projection failed',
+      );
+    });
+
+    // A foreign key violation as postgres.js reports it.
+    const fkViolation = (table: string) =>
+      Object.assign(
+        new Error(`insert or update on table "${table}" violates foreign key constraint`),
+        { code: '23503', constraint_name: `${table}_station_id_fkey` },
+      );
+
+    it('logs a message log whose station was deleted meanwhile at debug, not error', async () => {
+      await setup();
+      // The INSERT ... WHERE EXISTS saw the station, then its FK check waited for
+      // the DELETE and failed once it committed. The station lookup finds nothing.
+      setupSqlResults([], []);
+      sqlErrors.set(0, fkViolation('ocpp_message_logs'));
+
+      await emit('ocpp.MessageLog', 'CS-GONE', {
+        stationId: 'CS-GONE',
+        stationDbId: 'sta_gone',
+        direction: 'inbound',
+        messageType: 2,
+        messageId: 'm-1',
+        action: 'Heartbeat',
+        payload: {},
+      });
+
+      expect(sqlCalls).toHaveLength(2);
+      expect(sqlCalls[1]?.strings.join('?')).toContain(
+        'SELECT 1 FROM charging_stations WHERE station_id =',
+      );
+      expect(sqlCalls[1]?.values).toEqual(['CS-GONE']);
+      expect(mockLoggerError).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'Event projection failed',
+      );
+      expect(mockLoggerDebug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: 'ocpp.MessageLog',
+          stationId: 'CS-GONE',
+          errorCode: '23503',
+          constraint: 'ocpp_message_logs_station_id_fkey',
+        }),
+        'Event projection skipped: the station no longer exists',
+      );
+    });
+
+    it('forgets the cached id of a deleted station', async () => {
+      await setup();
+      // BatterySwap resolves (and caches) the station, then its INSERT fails.
+      setupSqlResults(STA, [], []);
+      sqlErrors.set(1, fkViolation('battery_swap_events'));
+      await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapStarted' });
+      expect(mockLoggerError).not.toHaveBeenCalled();
+
+      // The next event looks the station up again instead of using the cache.
+      sqlErrors = new Map();
+      setupSqlResults([]);
+      await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapEnded' });
+      expect(sqlCalls[0]?.strings.join('?')).toContain(
+        'SELECT id FROM charging_stations WHERE station_id =',
+      );
+      expect(sqlCalls).toHaveLength(1);
+    });
+
+    it('still logs a foreign key violation at error when the station exists', async () => {
+      await setup();
+      setupSqlResults(STA, [], [{ '?column?': 1 }]);
+      sqlErrors.set(1, fkViolation('battery_swap_events'));
+
+      await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapStarted' });
+
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: 'ocpp.BatterySwap', errorCode: '23503' }),
+        'Event projection failed',
+      );
+      expect(mockLoggerDebug).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'Event projection skipped: the station no longer exists',
+      );
+    });
+
+    it('logs the foreign key violation at error when the station lookup fails', async () => {
+      await setup();
+      setupSqlResults(STA);
+      sqlErrors.set(1, fkViolation('battery_swap_events'));
+      sqlErrors.set(2, new Error('lookup failed'));
+
+      await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapStarted' });
+
+      expect(mockLoggerWarn).toHaveBeenCalledWith(
+        expect.objectContaining({ stationId: 'CS-1' }),
+        'Station lookup after a failed projection failed',
+      );
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: 'ocpp.BatterySwap', errorCode: '23503' }),
+        'Event projection failed',
+      );
+    });
+
+    it('never treats another error as a deleted station', async () => {
+      await setup();
+      setupSqlResults(STA, [], []);
+      sqlErrors.set(1, Object.assign(new Error('not null violation'), { code: '23502' }));
+
+      await emit('ocpp.BatterySwap', 'CS-1', { eventType: 'BatterySwapStarted' });
+
+      // No station lookup ran: only the resolve and the failed INSERT.
+      expect(sqlCalls).toHaveLength(2);
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ errorCode: '23502' }),
+        'Event projection failed',
+      );
+    });
+
+    it('logs each retry at warn and the given-up projection at error with its station', async () => {
+      await setup();
+      // Heartbeat with stationDbId: its UPDATE is the first statement of every attempt.
+      const timeout = () =>
+        Object.assign(new Error('write CONNECT_TIMEOUT localhost:5433'), {
+          code: 'CONNECT_TIMEOUT',
+        });
+      for (const idx of [0, 1, 2]) sqlErrors.set(idx, timeout());
+
+      const done = emit('ocpp.Heartbeat', 'CS-1', { stationDbId: 'sta_0001' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await done;
+
+      const retries = mockLoggerWarn.mock.calls.filter(
+        (c: unknown[]) => c[1] === 'Event projection lost its database connection; retrying',
+      );
+      expect(retries).toHaveLength(2);
+      expect(retries[0]?.[0]).toMatchObject({
+        eventType: 'ocpp.Heartbeat',
+        stationId: 'CS-1',
+        attempt: 1,
+        errorCode: 'CONNECT_TIMEOUT',
+      });
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: 'ocpp.Heartbeat',
+          stationId: 'CS-1',
+          attempts: 3,
+          errorCode: 'CONNECT_TIMEOUT',
+        }),
         'Event projection failed',
       );
     });
@@ -1084,7 +1280,7 @@ describe('Event projections - coverage round 2', () => {
     });
   });
 
-  // ---- ocpp.NotifyPeriodicEventStream / QRCodeScanned ----
+  // ---- ocpp.NotifyPeriodicEventStream ----
 
   describe('OCPP 2.1 stub persistence', () => {
     it('NotifyPeriodicEventStream inserts a row', async () => {
@@ -1237,7 +1433,7 @@ describe('Event projections - coverage round 2', () => {
       expect(ocpi.length).toBe(1);
     });
 
-    it('1.6 idle detection: SuspendedEV sets idle_started_at and notifies', async () => {
+    it('1.6 idle detection: SuspendedEV sets idle_started_at and sends no notice at the period start', async () => {
       await setup();
       setupSqlResults(
         STA,
@@ -1247,19 +1443,8 @@ describe('Event projections - coverage round 2', () => {
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
+        [], // SELECT the active session with an open idle period (JB-2): none yet
         [], // UPDATE charging_sessions set idle_started_at
-        [{ id: 'ses_1', transaction_id: 'tx_1' }], // SELECT active session
-        // dispatchIdlingNotification:
-        [
-          {
-            driver_id: 'drv_1',
-            idle_started_at: 't',
-            tariff_idle_fee_price_per_minute: '0.05',
-            currency: 'USD',
-          },
-        ],
-        STA, // resolveStationUuid (cached, but be safe)
-        [{ name: 'Site A' }], // resolveSiteName
       );
       await emit('ocpp.StatusNotification', 'CS-1', {
         evseId: 1,
@@ -1268,11 +1453,52 @@ describe('Event projections - coverage round 2', () => {
         timestamp: '2026-01-01T00:00:00Z',
       });
       expect(findSql(/UPDATE charging_sessions\s+SET idle_started_at/)).toBeDefined();
+      // Owner rule (JB-2): the notice waits until the period lasted 60 s.
+      expect(findSql(/WITH claimed AS/)).toBeUndefined();
+      expect(mockDispatchDriver).not.toHaveBeenCalled();
+    });
+
+    it('1.6 idle detection: a later status notifies from the due claim before it ends the period', async () => {
+      await setup();
+      setupSqlResults(
+        STA,
+        [{ id: 'evs_1' }],
+        [{ previous_status: 'suspended_ev', applied: true }], // guarded UPDATE connectors
+        [], // INSERT port_status_log (suspended_ev -> charging)
+        [], // SELECT charging_stations FOR UPDATE (availability lock)
+        [], // UPDATE charging_stations (connector fault reconciliation)
+        [{ site_id: null }], // resolveSiteId
+        [{ id: 'ses_1', transaction_id: 'tx_1' }], // SELECT the active session with an open idle period
+        // dispatchDueIdlingNotification: the claim (period open for 60 s or more)
+        [
+          {
+            driver_id: 'drv_1',
+            idle_started_at: '2026-01-01T00:00:00Z',
+            idle_fee_price_per_minute: '0.05',
+            currency: 'USD',
+            site_name: 'Site A',
+          },
+        ],
+        [], // UPDATE charging_sessions: close the period
+      );
+      await emit('ocpp.StatusNotification', 'CS-1', {
+        evseId: 1,
+        connectorId: 1,
+        connectorStatus: 'Charging',
+        timestamp: '2026-01-01T00:02:00Z',
+      });
+      const claimIndex = sqlCalls.findIndex((c) => c.strings.join('?').includes('WITH claimed AS'));
+      const closeIndex = sqlCalls.findIndex((c) =>
+        c.strings.join('?').includes('SET idle_minutes = idle_minutes'),
+      );
+      expect(claimIndex).toBeGreaterThan(-1);
+      expect(closeIndex).toBeGreaterThan(claimIndex);
+      expect(sqlCalls[claimIndex]?.values).toContain('2026-01-01T00:02:00Z');
       expect(mockDispatchDriver).toHaveBeenCalledWith(
         expect.anything(),
         'session.IdlingStarted',
         'drv_1',
-        expect.anything(),
+        expect.objectContaining({ transactionId: 'tx_1', stationId: 'CS-1' }),
         expect.anything(),
         expect.anything(),
       );
@@ -1400,34 +1626,32 @@ describe('Event projections - coverage round 2', () => {
       expect(cost.length).toBe(1);
     });
 
-    describe('prepaid credit on OCPP 1.6', () => {
-      const costSession = (ocppProtocol: string, prepaidBalanceCents: number | null) => ({
+    describe('prepaid credit (cost ceiling)', () => {
+      const costSession = (
+        ocppProtocol: string,
+        costCeilingCents: number | null,
+        currentCostCents = 0,
+      ) => ({
         id: 'ses_1',
         transaction_id: '1001',
         tariff_id: 'trf_1',
         driver_id: 'drv_1',
-        started_at: new Date(Date.now() - 3_600_000).toISOString(),
+        token_id: 'dtk_1',
         energy_delivered_wh: 950,
-        current_cost_cents: 0,
-        currency: 'USD',
-        tariff_price_per_kwh: '0.25',
-        tariff_price_per_minute: '0',
-        tariff_price_per_session: '0',
-        tariff_idle_fee_price_per_minute: '0',
-        tariff_tax_rate: '0',
+        current_cost_cents: currentCostCents,
+        cost_ceiling_cents: costCeilingCents,
         idle_started_at: null,
         idle_minutes: 0,
         ocpp_protocol: ocppProtocol,
-        prepaid_balance_cents: prepaidBalanceCents,
       });
-      // 950 Wh at 0.25/kWh costs 24 cents (the cost assembly is mocked to that).
+      // The cost assembly (mocked) bills 24 cents.
       beforeEach(() => {
         mockPriceSessionAt.mockResolvedValue(costBreakdown(24));
       });
       afterEach(() => {
         mockPriceSessionAt.mockResolvedValue(costBreakdown(1500));
       });
-      const results = (session: Record<string, unknown>, claim: unknown[]) => [
+      const base = [
         STA, // resolveStationUuid
         [{ id: 'ses_1' }], // resolveMeterValueSession
         [], // INSERT meter_values
@@ -1435,9 +1659,6 @@ describe('Event projections - coverage round 2', () => {
         [], // UPDATE meter_start
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle accrue
-        [session], // active sessions
-        claim, // claim the prepaid stop (only when the credit is used up)
-        [{ site_id: null }], // resolveSiteId
       ];
       const emitReading = () =>
         emit('ocpp.MeterValues', 'CS-1', {
@@ -1457,14 +1678,18 @@ describe('Event projections - coverage round 2', () => {
           (c) => c[0] === 'ocpp_commands' && (c[1] as string).includes('RequestStopTransaction'),
         );
 
-      it('records the stop and sends RequestStopTransaction when the cost reaches the credit', async () => {
+      it('stops an OCPP 1.6 transaction once the cost reaches the credit', async () => {
         await setup();
-        setupSqlResults(...results(costSession('ocpp1.6', 20), [{ id: 'ses_1' }]));
+        setupSqlResults(
+          ...base,
+          [costSession('ocpp1.6', 20)], // active sessions
+          [{ id: 'ses_1' }], // claim the stop
+          [{ site_id: null }], // resolveSiteId
+        );
 
         await emitReading();
 
         const claim = findSql(/stopped_reason IS NULL/);
-        expect(claim).toBeDefined();
         expect(claim?.values).toContain('PrepaidCreditExhausted');
         const stops = stopCommands();
         expect(stops).toHaveLength(1);
@@ -1479,7 +1704,7 @@ describe('Event projections - coverage round 2', () => {
 
       it('sends the stop only once (the session was already claimed)', async () => {
         await setup();
-        setupSqlResults(...results(costSession('ocpp1.6', 20), []));
+        setupSqlResults(...base, [costSession('ocpp1.6', 20)], [], [{ site_id: null }]);
 
         await emitReading();
 
@@ -1489,7 +1714,7 @@ describe('Event projections - coverage round 2', () => {
 
       it('keeps charging while the cost is below the credit', async () => {
         await setup();
-        setupSqlResults(...results(costSession('ocpp1.6', 5000), []));
+        setupSqlResults(...base, [costSession('ocpp1.6', 5000)], [{ site_id: null }]);
 
         await emitReading();
 
@@ -1497,14 +1722,437 @@ describe('Event projections - coverage round 2', () => {
         expect(stopCommands()).toHaveLength(0);
       });
 
-      it('leaves an OCPP 2.1 prepaid transaction to the station transactionLimit', async () => {
+      it('leaves an OCPP 2.1 transaction to the station limit at the reading that reaches the credit', async () => {
         await setup();
-        setupSqlResults(...results(costSession('ocpp2.1', 20), []));
+        setupSqlResults(...base, [costSession('ocpp2.1', 24, 20)], [{ site_id: null }]);
 
         await emitReading();
 
         expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
         expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('keeps an OCPP 2.1 transaction the station suspended at its cost limit open', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [costSession('ocpp2.1', 24, 24)], // the credit was reached at an earlier reading
+          [{ '?column?': 1 }], // the station reported CostLimitReached
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('stops an OCPP 2.1 transaction still running past the credit without CostLimitReached', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [costSession('ocpp2.1', 24, 24)],
+          [], // no CostLimitReached (the station ignores or does not support maxCost)
+          [{ id: 'ses_1' }], // claim the stop
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)?.values).toContain('PrepaidCreditExhausted');
+        expect(stopCommands()).toHaveLength(1);
+      });
+    });
+
+    describe('guest hold (cost ceiling)', () => {
+      const guestSession = (
+        ocppProtocol: string,
+        costCeilingCents: number | null,
+        currentCostCents: number,
+      ) => ({
+        id: 'ses_1',
+        transaction_id: '1001',
+        tariff_id: 'trf_1',
+        driver_id: null,
+        energy_delivered_wh: 950,
+        current_cost_cents: currentCostCents,
+        cost_ceiling_cents: costCeilingCents,
+        idle_started_at: null,
+        idle_minutes: 0,
+        ocpp_protocol: ocppProtocol,
+        token_id: null,
+      });
+      // The cost assembly (mocked) bills the ceiling: 24 cents.
+      beforeEach(() => {
+        mockPriceSessionAt.mockResolvedValue({ ...costBreakdown(24), pricedGrossCents: 31 });
+      });
+      afterEach(() => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(1500));
+      });
+      const base = [
+        STA, // resolveStationUuid
+        [{ id: 'ses_1' }], // resolveMeterValueSession
+        [], // INSERT meter_values
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [], // UPDATE meter_start
+        [], // UPDATE energy_delivered_wh
+        [], // UPDATE idle accrue
+      ];
+      const emitReading = () =>
+        emit('ocpp.MeterValues', 'CS-1', {
+          stationId: 'CS-1',
+          evseId: 0,
+          transactionId: '1001',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2026-01-01T01:00:00Z',
+              sampledValue: [{ measurand: 'Energy.Active.Import.Register', value: 1000 }],
+            },
+          ],
+        });
+      const stopCommands = () =>
+        (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c) => c[0] === 'ocpp_commands' && (c[1] as string).includes('RequestStopTransaction'),
+        );
+
+      it('stops an OCPP 1.6 transaction once the cost reaches the hold', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [guestSession('ocpp1.6', 24, 20)], // active sessions
+          [{ id: 'ses_1' }], // claim the stop
+          [{ site_id: null }], // resolveSiteId
+        );
+
+        await emitReading();
+
+        const claim = findSql(/stopped_reason IS NULL/);
+        expect(claim?.values).toContain('GuestHoldExhausted');
+        const stops = stopCommands();
+        expect(stops).toHaveLength(1);
+        expect(JSON.parse(stops[0]?.[1] as string)).toMatchObject({
+          action: 'RequestStopTransaction',
+          payload: { transactionId: '1001' },
+        });
+        // The station ends the transaction, which settles the hold.
+        expect(findSql(/SET status = 'faulted'/)).toBeUndefined();
+        expect(findSql(/trigger_reason = 'CostLimitReached'/)).toBeUndefined();
+      });
+
+      it('keeps an OCPP 1.6 transaction charging below the hold', async () => {
+        await setup();
+        setupSqlResults(...base, [guestSession('ocpp1.6', 5000, 20)], [{ site_id: null }]);
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('leaves an OCPP 2.1 transaction to the station limit at the reading that reaches the hold', async () => {
+        await setup();
+        setupSqlResults(...base, [guestSession('ocpp2.1', 24, 20)], [{ site_id: null }]);
+
+        await emitReading();
+
+        expect(findSql(/trigger_reason = 'CostLimitReached'/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('keeps an OCPP 2.1 transaction the station suspended at its cost limit open', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [guestSession('ocpp2.1', 24, 24)], // the hold was reached at an earlier reading
+          [{ '?column?': 1 }], // the station reported CostLimitReached
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/trigger_reason = 'CostLimitReached'/)).toBeDefined();
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('stops an OCPP 2.1 transaction still running past the hold without CostLimitReached', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [guestSession('ocpp2.1', 24, 24)],
+          [], // no CostLimitReached from the station
+          [{ id: 'ses_1' }], // claim the stop
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)?.values).toContain('GuestHoldExhausted');
+        expect(stopCommands()).toHaveLength(1);
+      });
+
+      it('does not stop a session without a ceiling', async () => {
+        await setup();
+        setupSqlResults(...base, [guestSession('ocpp1.6', null, 20)], [{ site_id: null }]);
+
+        await emitReading();
+
+        expect(stopCommands()).toHaveLength(0);
+      });
+    });
+
+    describe('fleet credit (account cost ceiling, plan S8)', () => {
+      // An account driver's RFID card: the session has a token, but the
+      // ceiling is the fleet credit it reserved, not a prepaid credit.
+      const accountSession = (
+        ocppProtocol: string,
+        costCeilingCents: number | null,
+        currentCostCents: number,
+        fleetLimitCents: number | null = 10_000,
+      ) => ({
+        id: 'ses_1',
+        transaction_id: '1001',
+        tariff_id: 'trf_1',
+        driver_id: 'drv_1',
+        token_id: 'dtk_1',
+        energy_delivered_wh: 950,
+        current_cost_cents: currentCostCents,
+        cost_ceiling_cents: costCeilingCents,
+        idle_started_at: null,
+        idle_minutes: 0,
+        ocpp_protocol: ocppProtocol,
+        billing_mode: 'account',
+        billing_fleet_id: 'flt_1',
+        fleet_credit_limit_cents: fleetLimitCents,
+      });
+      const credit = (level: 'ok' | 'warning' | 'reached') => ({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        limitCents: 10_000,
+        warningPercent: 80,
+        exposure: {
+          unbilledCents: 0,
+          invoicedCents: 0,
+          runningCents: 24,
+          totalCents: 24,
+          currency: 'USD',
+        },
+        level,
+        remainingCents: 0,
+        ceilingCents: null,
+      });
+      beforeEach(() => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(24));
+        mockReadFleetCreditLimit.mockReset();
+        mockReadFleetCreditLimit.mockResolvedValue(credit('ok'));
+        mockDispatchFleetCreditNotices.mockClear();
+        mockFleetCreditNoticesClaimed.mockReset();
+        mockFleetCreditNoticesClaimed.mockResolvedValue(false);
+        mockExtendFleetSessionCeiling.mockReset();
+        mockExtendFleetSessionCeiling.mockResolvedValue({
+          previousCents: 20,
+          ceilingCents: 20,
+          grown: false,
+        });
+      });
+      afterEach(() => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(1500));
+      });
+      const base = [
+        STA, // resolveStationUuid
+        [{ id: 'ses_1' }], // resolveMeterValueSession
+        [], // INSERT meter_values
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [], // UPDATE meter_start
+        [], // UPDATE energy_delivered_wh
+        [], // UPDATE idle accrue
+      ];
+      const emitReading = () =>
+        emit('ocpp.MeterValues', 'CS-1', {
+          stationId: 'CS-1',
+          evseId: 0,
+          transactionId: '1001',
+          source: 'TransactionEvent',
+          meterValues: [
+            {
+              timestamp: '2026-01-01T01:00:00Z',
+              sampledValue: [{ measurand: 'Energy.Active.Import.Register', value: 1000 }],
+            },
+          ],
+        });
+      const stopCommands = () =>
+        (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c) => c[0] === 'ocpp_commands' && (c[1] as string).includes('RequestStopTransaction'),
+        );
+
+      it('stops an OCPP 1.6 transaction at the ceiling with the account reason', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [accountSession('ocpp1.6', 20, 0)], // active sessions
+          [{ id: 'ses_1', driver_id: 'drv_1' }], // claim the stop
+          [], // station message settings
+          [{ driver_id: 'drv_1', fleet_name: 'Acme', site_name: null }], // notice read
+          [{ site_id: null }], // resolveSiteId
+        );
+
+        await emitReading();
+
+        // The ceiling could not grow (the fleet has no credit left), so it stops.
+        expect(mockExtendFleetSessionCeiling).toHaveBeenCalledWith(
+          expect.anything(),
+          'flt_1',
+          'ses_1',
+          { pricedCents: 24, sliceCents: 50, lastReadingCents: 24 },
+        );
+        const claim = findSql(/stopped_reason IS NULL/);
+        expect(claim?.values).toContain('AccountCreditLimit');
+        expect(claim?.values).not.toContain('PrepaidCreditExhausted');
+        expect(stopCommands()).toHaveLength(1);
+        // Billed up to the ceiling, not faulted: the station's end settles it.
+        expect(findSql(/SET status = 'faulted'/)).toBeUndefined();
+        expect(findSql(/LEFT JOIN fleets f ON f.id = cs.billing_fleet_id/)).toBeDefined();
+      });
+
+      it('grows the ceiling of a session at its ceiling while the fleet has credit, prices again and does not stop', async () => {
+        mockExtendFleetSessionCeiling.mockResolvedValue({
+          previousCents: 20,
+          ceilingCents: 5020,
+          grown: true,
+        });
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp1.6', 20, 0)], [{ site_id: null }]);
+        mockPriceSessionAt.mockClear();
+
+        await emitReading();
+
+        // Priced once with the old ceiling, once more under the grown one.
+        expect(mockPriceSessionAt).toHaveBeenCalledTimes(2);
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('grows the ceiling early when the reading added more than half the headroom', async () => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(70));
+        mockExtendFleetSessionCeiling.mockResolvedValue({
+          previousCents: 100,
+          ceilingCents: 120,
+          grown: true,
+        });
+        await setup();
+        // Ceiling 100, cost 50 -> 70: 30 left (above 20 % of the 50 slice),
+        // but the reading added 20, and twice that is more than what is left.
+        setupSqlResults(...base, [accountSession('ocpp2.1', 100, 50)], [{ site_id: null }]);
+
+        await emitReading();
+
+        expect(mockExtendFleetSessionCeiling).toHaveBeenCalledWith(
+          expect.anything(),
+          'flt_1',
+          'ses_1',
+          { pricedCents: 70, sliceCents: 50, lastReadingCents: 20 },
+        );
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('extends nothing while the headroom covers the slice bound and the last reading', async () => {
+        mockPriceSessionAt.mockResolvedValue(costBreakdown(60));
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp2.1', 100, 50)], [{ site_id: null }]);
+
+        await emitReading();
+
+        expect(mockExtendFleetSessionCeiling).not.toHaveBeenCalled();
+      });
+
+      it('extends nothing for a session claimed at the ceiling already', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [{ ...accountSession('ocpp2.1', 24, 24), stopped_reason: 'AccountCreditLimit' }],
+          [{ '?column?': 1 }], // the station reported CostLimitReached
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(mockExtendFleetSessionCeiling).not.toHaveBeenCalled();
+      });
+
+      it('stops an OCPP 2.1 transaction still running past the ceiling without CostLimitReached', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [accountSession('ocpp2.1', 24, 24)],
+          [], // no CostLimitReached (the station ignores or does not support maxCost)
+          [{ id: 'ses_1', driver_id: 'drv_1' }], // claim the stop
+          [],
+          [{ driver_id: 'drv_1', fleet_name: 'Acme', site_name: null }],
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)?.values).toContain('AccountCreditLimit');
+        expect(stopCommands()).toHaveLength(1);
+      });
+
+      it('leaves an OCPP 2.1 transaction that reported CostLimitReached to the station', async () => {
+        await setup();
+        setupSqlResults(
+          ...base,
+          [accountSession('ocpp2.1', 24, 24)],
+          [{ '?column?': 1 }], // the station reported CostLimitReached
+          [{ site_id: null }],
+        );
+
+        await emitReading();
+
+        expect(findSql(/stopped_reason IS NULL/)).toBeUndefined();
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('sends the fleet credit notices when the running cost passes the warning', async () => {
+        mockReadFleetCreditLimit.mockResolvedValue(credit('warning'));
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp1.6', 5000, 0)], [{ site_id: null }]);
+
+        await emitReading();
+        await vi.waitFor(() => {
+          expect(mockDispatchFleetCreditNotices).toHaveBeenCalledTimes(1);
+        });
+
+        expect(mockReadFleetCreditLimit).toHaveBeenCalledWith(expect.anything(), 'flt_1');
+        expect(mockDispatchFleetCreditNotices.mock.calls[0]?.[0]).toMatchObject({
+          fleetId: 'flt_1',
+          level: 'warning',
+        });
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('sends no fleet notice below the warning', async () => {
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp1.6', 5000, 0)], [{ site_id: null }]);
+
+        await emitReading();
+        await vi.waitFor(() => {
+          expect(mockReadFleetCreditLimit).toHaveBeenCalledTimes(1);
+        });
+
+        expect(mockDispatchFleetCreditNotices).not.toHaveBeenCalled();
+      });
+
+      it('reads no fleet credit for a fleet without a limit or an unchanged cost', async () => {
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp1.6', null, 0, null)], [{ site_id: null }]);
+        await emitReading();
+
+        await setup();
+        setupSqlResults(...base, [accountSession('ocpp1.6', 5000, 24)], [{ site_id: null }]);
+        await emitReading();
+
+        expect(mockReadFleetCreditLimit).not.toHaveBeenCalled();
       });
     });
 
@@ -1514,7 +2162,7 @@ describe('Event projections - coverage round 2', () => {
         STA, // 0
         [{ id: 'ses_1' }], // 1 session
         [], // 2 INSERT meter_values
-        [{ energy_delivered_wh: 100, meter_start: '50' }], // 3 prev
+        [{ energy_delivered_wh: 100, meter_start: '50', last_rise_at: '2026-01-01T00:59:00Z' }], // 3 prev
         [], // 4 UPDATE meter_start
         [], // 5 UPDATE energy
         // newEnergyWh = 150-50 = 100 == prevEnergyWh -> flat -> mark idle
@@ -1540,6 +2188,9 @@ describe('Event projections - coverage round 2', () => {
           /idle_started_at IS NULL/.test(c.strings.join(' ')),
       );
       expect(idleUpdate).toBeDefined();
+      // A reading older than the newest status of the EVSE (offline replay) opens nothing.
+      expect(idleUpdate!.strings.join('?')).toContain('c.status_reported_at > ?::timestamptz');
+      expect(idleUpdate!.values).toContain('2026-01-01T01:00:00Z');
     });
 
     it('Power.Active.Import = 0 marks idle; nonzero accrues idle', async () => {
@@ -1564,7 +2215,37 @@ describe('Event projections - coverage round 2', () => {
           },
         ],
       });
-      expect(findSql(/SET idle_started_at/)).toBeDefined();
+      const idleOpen = findSql(/SET idle_started_at/);
+      expect(idleOpen).toBeDefined();
+      // A reading older than the newest status of the EVSE (offline replay) opens nothing.
+      expect(idleOpen!.strings.join('?')).toContain('c.status_reported_at > ?::timestamptz');
+    });
+
+    it('a nonzero power reading closes an idle period only when it is not older than the status', async () => {
+      await setup();
+      setupSqlResults(
+        STA,
+        [{ id: 'ses_1' }], // session
+        [], // INSERT meter_values
+        [], // UPDATE idle_minutes (power resumed)
+        [], // active sessions empty
+        [{ site_id: null }], // resolveSiteId
+      );
+      await emit('ocpp.MeterValues', 'CS-1', {
+        stationId: 'CS-1',
+        evseId: 0,
+        transactionId: 'tx-1',
+        source: 'TransactionEvent',
+        meterValues: [
+          {
+            timestamp: '2026-01-01T01:00:00Z',
+            sampledValue: [{ measurand: 'Power.Active.Import', value: 7000 }],
+          },
+        ],
+      });
+      const idleClose = findSql(/SET idle_minutes/);
+      expect(idleClose).toBeDefined();
+      expect(idleClose!.strings.join('?')).toContain('c.status_reported_at > ?::timestamptz');
     });
 
     it('re-resolves station and re-inserts when first meter_values insert conflicts', async () => {
@@ -2029,14 +2710,19 @@ describe('Event projections - coverage round 2', () => {
 
     it('settles the session through the payment service', async () => {
       await emitEndedSecondOnly([sessionRow()]);
-      expect(mockSettleSessionPayment).toHaveBeenCalledWith('ses_1', mockPaymentContext);
+      expect(mockSettleSessionPayment).toHaveBeenCalledWith(
+        'ses_1',
+        mockPaymentContext,
+        SETTLE_OPTIONS,
+      );
       // Nothing to settle (the default outcome): no notification.
       expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
 
     it('captured and recorded: sends the receipt in the session currency', async () => {
       mockSettleSessionPayment.mockResolvedValueOnce(captured({ capturedCents: 1750 }));
-      await emitEndedSecondOnly([sessionRow()], [{ name: 'Site A' }]);
+      // [] = the session-end notifications find no driver session (notifySessionEnded).
+      await emitEndedSecondOnly([sessionRow()], [], [{ name: 'Site A' }]);
       expect(driverCalls('session.PaymentReceived')).toEqual([
         [
           expect.anything(),
@@ -2195,6 +2881,7 @@ describe('Event projections - coverage round 2', () => {
       await emitEndedFirstOnly(
         [{ id: 'sta_1' }], // 0 resolveStationId
         [], // 1 failed payment_records -> none
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [], // 2 UPDATE charging_sessions CASE
         [
           {
@@ -2243,7 +2930,8 @@ describe('Event projections - coverage round 2', () => {
     it('logs warning when region set but intensity factor missing', async () => {
       await emitEndedFirstOnly(
         [{ id: 'sta_1' }],
-        [],
+        [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [],
         [
           {
@@ -2287,7 +2975,8 @@ describe('Event projections - coverage round 2', () => {
       const first = handlers[0];
       setupSqlResults(
         [{ id: 'sta_1' }],
-        [],
+        [], // SELECT payment_records (no failed payment)
+        [], // SELECT the active session with an open idle period (JB-2 due notice): none
         [],
         [
           {
@@ -2306,11 +2995,11 @@ describe('Event projections - coverage round 2', () => {
         ],
         [], // INSERT transaction_events
       );
-      // carbon query (index 5) throws
-      sqlErrors.set(5, new Error('carbon table missing'));
-      // resolveSiteId (6), endedDriverRows (7), station message protocol (8)
-      sqlResults[6] = [{ site_id: null }];
-      sqlResults[7] = [
+      // carbon query (index 6, after the JB-2 open idle period SELECT) throws
+      sqlErrors.set(6, new Error('carbon table missing'));
+      // resolveSiteId (7), endedDriverRows (8), station message protocol (9)
+      sqlResults[7] = [{ site_id: null }];
+      sqlResults[8] = [
         {
           driver_id: null,
           status: 'completed',
@@ -2318,7 +3007,7 @@ describe('Event projections - coverage round 2', () => {
           ended_at: '2026-01-01T01:00:00Z',
         },
       ];
-      sqlResults[8] = [];
+      sqlResults[9] = [];
       await first?.(
         makeDomainEvent('ocpp.TransactionEvent', 'CS-1', {
           eventType: 'Ended',

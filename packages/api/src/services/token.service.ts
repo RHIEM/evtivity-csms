@@ -13,6 +13,7 @@ import {
 } from '@evtivity/database';
 import { dispatchDriverNotification, createLogger, csvEscape } from '@evtivity/lib';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import type { PaginationParams, PaginatedResponse } from '../lib/pagination.js';
 
 const logger = createLogger('token-service');
@@ -193,7 +194,14 @@ async function notifyDriver(
 ): Promise<void> {
   if (driverId == null) return;
   try {
-    await dispatchDriverNotification(client, eventType, driverId, variables);
+    await dispatchDriverNotification(
+      client,
+      eventType,
+      driverId,
+      variables,
+      ALL_TEMPLATES_DIRS,
+      getPubSub(),
+    );
   } catch (err) {
     // Non-critical for the mutation, but operators need a signal that SMTP/
     // Twilio is misconfigured. Logged at warn so it shows up in normal log
@@ -213,8 +221,8 @@ async function publishTokenChanged(tokenId: string | null): Promise<void> {
   try {
     const pubsub = getPubSub();
     await pubsub.publish('csms_events', JSON.stringify({ eventType: 'token.changed', tokenId }));
-  } catch {
-    // Non-critical
+  } catch (err) {
+    logger.warn({ err, tokenId }, 'token.changed publish failed, open token pages refresh later');
   }
 }
 
@@ -242,8 +250,11 @@ async function bumpStationsHoldingToken(tokenId: string): Promise<void> {
         JSON.stringify({ eventType: 'localAuthList.changed', stationId }),
       );
     }
-  } catch {
-    // Non-critical
+  } catch (err) {
+    logger.warn(
+      { err, tokenId },
+      'localAuthList.changed publish failed, open station pages refresh later',
+    );
   }
 }
 
@@ -539,8 +550,11 @@ export async function bulkSetActive(
           JSON.stringify({ eventType: 'localAuthList.changed', stationId }),
         );
       }
-    } catch {
-      // Non-critical
+    } catch (err) {
+      logger.warn(
+        { err, stationIds },
+        'localAuthList.changed publish failed, open station pages refresh later',
+      );
     }
   }
 

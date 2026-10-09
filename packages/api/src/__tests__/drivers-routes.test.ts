@@ -49,7 +49,14 @@ function makeChain() {
   return chain;
 }
 
+const { mockResolveAccountBilling, mockResolveDriverPricingSource } = vi.hoisted(() => ({
+  mockResolveAccountBilling: vi.fn(() => Promise.resolve(null)),
+  mockResolveDriverPricingSource: vi.fn(() => Promise.resolve(null)),
+}));
+
 vi.mock('@evtivity/database', () => ({
+  resolveAccountBilling: mockResolveAccountBilling,
+  resolveDriverPricingSource: mockResolveDriverPricingSource,
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
     select: vi.fn(() => makeChain()),
@@ -181,7 +188,6 @@ function makeDriver(overrides: Record<string, unknown> = {}) {
     phone: '+15551234567',
     language: 'en',
     isActive: true,
-    paymentMode: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -376,6 +382,75 @@ describe('Driver routes (operator)', () => {
       expect(res.json().portalAccess).toEqual({
         status: 'invited',
         inviteExpiresAt: inviteExpiresAt.toISOString(),
+      });
+    });
+
+    it('includes the billing mode, the billing fleet and the pricing fleet', async () => {
+      setupDbResults([makeDriver()]);
+      mockResolveAccountBilling.mockResolvedValueOnce({
+        fleetId: 'flt_000000000001',
+        fleetName: 'Acme',
+      } as never);
+      mockResolveDriverPricingSource.mockResolvedValueOnce({
+        source: 'fleet',
+        fleetId: 'flt_000000000002',
+        fleetName: 'Priced',
+        pricingGroupId: 'pgr_000000000001',
+        pricingGroupName: 'Fleet prices',
+      } as never);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().billing).toEqual({
+        mode: 'account',
+        billingFleet: { id: 'flt_000000000001', name: 'Acme' },
+        pricingFleet: { id: 'flt_000000000002', name: 'Priced' },
+        pricingSource: 'fleet',
+        pricingGroup: { id: 'pgr_000000000001', name: 'Fleet prices' },
+      });
+    });
+
+    it('reports a driver pricing group that overrides fleet pricing', async () => {
+      setupDbResults([makeDriver()]);
+      mockResolveDriverPricingSource.mockResolvedValueOnce({
+        source: 'driver',
+        pricingGroupId: 'pgr_000000000003',
+        pricingGroupName: 'VIP',
+      } as never);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.json().billing).toMatchObject({
+        pricingFleet: null,
+        pricingSource: 'driver',
+        pricingGroup: { id: 'pgr_000000000003', name: 'VIP' },
+      });
+    });
+
+    it('reports card billing without a qualifying fleet', async () => {
+      setupDbResults([makeDriver()]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.json().billing).toEqual({
+        mode: 'card',
+        billingFleet: null,
+        pricingFleet: null,
+        pricingSource: null,
+        pricingGroup: null,
       });
     });
   });
@@ -614,56 +689,6 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().email).toBe('new@example.com');
-    });
-
-    it('sets the invoice payment mode override', async () => {
-      const updated = makeDriver({ paymentMode: 'invoice' });
-      setupDbResults([updated], [updated]);
-      vi.mocked(db.update).mockClear();
-
-      const res = await app.inject({
-        method: 'PATCH',
-        url: `/drivers/${VALID_DRIVER_ID}`,
-        headers: { authorization: `Bearer ${token}` },
-        payload: { paymentMode: 'invoice' },
-      });
-
-      expect(res.statusCode).toBe(200);
-      expect(res.json().paymentMode).toBe('invoice');
-      const update = vi.mocked(db.update).mock.results[0]?.value as {
-        set: ReturnType<typeof vi.fn>;
-      };
-      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ paymentMode: 'invoice' }));
-    });
-
-    it('clears the payment mode override with null so the fleet mode applies', async () => {
-      const updated = makeDriver({ paymentMode: null });
-      setupDbResults([updated], [updated]);
-      vi.mocked(db.update).mockClear();
-
-      const res = await app.inject({
-        method: 'PATCH',
-        url: `/drivers/${VALID_DRIVER_ID}`,
-        headers: { authorization: `Bearer ${token}` },
-        payload: { paymentMode: null },
-      });
-
-      expect(res.statusCode).toBe(200);
-      const update = vi.mocked(db.update).mock.results[0]?.value as {
-        set: ReturnType<typeof vi.fn>;
-      };
-      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ paymentMode: null }));
-    });
-
-    it('returns 400 for an unknown payment mode', async () => {
-      const res = await app.inject({
-        method: 'PATCH',
-        url: `/drivers/${VALID_DRIVER_ID}`,
-        headers: { authorization: `Bearer ${token}` },
-        payload: { paymentMode: 'cash' },
-      });
-
-      expect(res.statusCode).toBe(400);
     });
 
     it('returns 200 with only phone', async () => {

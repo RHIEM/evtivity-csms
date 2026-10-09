@@ -106,6 +106,9 @@ interface FinancialStats {
   dayElectricityCostCents: number;
   totalProfitCents: number;
   dayProfitCents: number;
+  /** Account sessions whose fleet invoice is not paid yet (not revenue). */
+  billedOnAccountCents?: number;
+  billedOnAccountCount?: number;
   currency: string;
 }
 
@@ -180,6 +183,7 @@ function ScrollSnapRow({
 }: {
   pages: { id: string; content: React.ReactNode }[];
 }): React.JSX.Element {
+  const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(0);
 
@@ -213,7 +217,7 @@ function ScrollSnapRow({
           <button
             key={page.id}
             type="button"
-            aria-label={`Show ${page.id}`}
+            aria-label={t('dashboard.showPage', { page: index + 1, total: pages.length })}
             onClick={() => {
               goTo(index);
             }}
@@ -709,6 +713,24 @@ function AdminDashboard({
       </div>
     );
 
+    // Charge on account: shown only when account sessions are waiting for
+    // their fleet invoice to be paid.
+    const billedOnAccountCount = financialStats.data?.billedOnAccountCount ?? 0;
+    const accountGrid = (
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          title={t('dashboard.billedOnAccount')}
+          value={formatMoney(financialStats.data?.billedOnAccountCents ?? 0, liveCurrency)}
+          info={t('dashboard.info.billedOnAccount')}
+        />
+        <StatCard
+          title={t('dashboard.billedOnAccountSessions')}
+          value={billedOnAccountCount}
+          info={t('dashboard.info.billedOnAccountSessions')}
+        />
+      </div>
+    );
+
     return (
       <>
         <div className={SIX_CARD_GRID_CLASS}>
@@ -814,6 +836,7 @@ function AdminDashboard({
             { id: 'revenue', content: revenueGrid },
             { id: 'tax', content: taxGrid },
             { id: 'cost', content: costGrid },
+            ...(billedOnAccountCount > 0 ? [{ id: 'account', content: accountGrid }] : []),
           ]}
         />
       </>

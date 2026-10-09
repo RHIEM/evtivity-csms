@@ -12,9 +12,19 @@ import {
   reportFrequencyEnum,
 } from '@evtivity/database';
 
-const REPORT_FORMATS = ['csv', 'pdf', 'xlsx'] as const;
+// The worker generates the report; the API only announces it.
+async function announceReport(reportId: string): Promise<void> {
+  await getPubSub().publish(REPORT_GENERATE_CHANNEL, JSON.stringify({ reportId }));
+}
+
+// A report whose filters cannot produce it is refused now, not failed later in the job.
+function assertReportFilters(reportType: string, filters: Record<string, unknown>): void {
+  const error = reportFiltersError(reportType, filters);
+  if (error != null) throw new ValidationError(error);
+}
 import { zodSchema } from '../lib/zod-schema.js';
 import {
+  arrayResponse,
   successResponse,
   paginatedResponse,
   itemResponse,
@@ -23,9 +33,31 @@ import {
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
-import { queueReport, computeNextRunAtInTz, REPORT_TYPES } from '@evtivity/services/report.service';
+import {
+  queueReport,
+  computeNextRunAtInTz,
+  listReportTypes,
+  reportFiltersError,
+  REPORT_GENERATE_CHANNEL,
+  REPORT_TYPES,
+} from '@evtivity/services/report.service';
+import { REPORT_FORMATS } from '@evtivity/services/report-registry';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { ValidationError } from '@evtivity/lib';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
+
+const reportTypeItem = z
+  .object({
+    type: z.string().describe('Report type identifier'),
+    formats: z
+      .array(z.enum(REPORT_FORMATS))
+      .describe('File formats the report is written in; another requested format gets the first'),
+    generateFromUi: z
+      .boolean()
+      .describe('Whether the dashboard Generate and Schedules tabs offer this type'),
+  })
+  .passthrough();
 
 const reportItem = z
   .object({
@@ -179,6 +211,21 @@ export function reportRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.get(
+    '/reports/types',
+    {
+      onRequest: [authorize('reports:read')],
+      schema: {
+        tags: ['Reports'],
+        summary: 'List report types',
+        operationId: 'listReportTypes',
+        security: [{ bearerAuth: [] }],
+        response: { 200: arrayResponse(reportTypeItem) },
+      },
+    },
+    () => listReportTypes(),
+  );
+
   // Get single report metadata
   app.get(
     '/reports/:id',
@@ -283,6 +330,7 @@ export function reportRoutes(app: FastifyInstance): void {
         body: zodSchema(generateBody),
         response: {
           200: itemResponse(reportQueuedResponse),
+          400: errorWith('Invalid report filters', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
         },
       },
@@ -310,19 +358,23 @@ export function reportRoutes(app: FastifyInstance): void {
       // the caller's scope).
       const siteIds = await getUserSiteIds(user.userId);
       const filters = body.filters ?? {};
+      assertReportFilters(body.reportType, filters);
       const requestedSite = typeof filters['siteId'] === 'string' ? filters['siteId'] : null;
       if (siteIds != null && requestedSite != null && !siteIds.includes(requestedSite)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
 
-      const reportId = await queueReport({
-        name: body.name,
-        reportType: body.reportType,
-        format: body.format,
-        filters,
-        userId: user.userId,
-      });
+      const reportId = await queueReport(
+        {
+          name: body.name,
+          reportType: body.reportType,
+          format: body.format,
+          filters,
+          userId: user.userId,
+        },
+        announceReport,
+      );
 
       return { id: reportId, status: 'pending' };
     },
@@ -399,6 +451,7 @@ export function reportRoutes(app: FastifyInstance): void {
         body: zodSchema(createScheduleBody),
         response: {
           200: itemResponse(scheduleItem),
+          400: errorWith('Invalid report filters', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
         },
       },
@@ -412,6 +465,7 @@ export function reportRoutes(app: FastifyInstance): void {
       // the cron would later run on their behalf.
       const siteIds = await getUserSiteIds(user.userId);
       const filters = body.filters ?? {};
+      assertReportFilters(body.reportType, filters);
       const requestedSite = typeof filters['siteId'] === 'string' ? filters['siteId'] : null;
       if (siteIds != null && requestedSite != null && !siteIds.includes(requestedSite)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
@@ -457,6 +511,7 @@ export function reportRoutes(app: FastifyInstance): void {
         body: zodSchema(updateScheduleBody),
         response: {
           200: itemResponse(scheduleItem),
+          400: errorWith('Invalid report filters', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Resource not found', [
             ERROR_CODES.SCHEDULE_NOT_FOUND,
             ERROR_CODES.SITE_NOT_FOUND,
@@ -469,13 +524,24 @@ export function reportRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof updateScheduleBody>;
 
       const [existing] = await db
-        .select({ id: reportSchedules.id })
+        .select({
+          id: reportSchedules.id,
+          reportType: reportSchedules.reportType,
+          filters: reportSchedules.filters,
+        })
         .from(reportSchedules)
         .where(eq(reportSchedules.id, id));
 
       if (existing == null) {
         await reply.status(404).send({ error: 'Schedule not found', code: 'SCHEDULE_NOT_FOUND' });
         return;
+      }
+
+      if (body.reportType != null || body.filters != null) {
+        assertReportFilters(
+          body.reportType ?? existing.reportType,
+          body.filters ?? (existing.filters as Record<string, unknown> | null) ?? {},
+        );
       }
 
       // Same site-access guard as create — without it a restricted
@@ -598,13 +664,16 @@ export function reportRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const reportId = await queueReport({
-        name: schedule.name,
-        reportType: schedule.reportType,
-        format: schedule.format,
-        filters,
-        userId: user.userId,
-      });
+      const reportId = await queueReport(
+        {
+          name: schedule.name,
+          reportType: schedule.reportType,
+          format: schedule.format,
+          filters,
+          userId: user.userId,
+        },
+        announceReport,
+      );
 
       return { id: reportId, status: 'pending' };
     },

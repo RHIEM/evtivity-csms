@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 export * from './settings.js';
-export * from './payment-mode.js';
 export * from './assets.js';
 export * from './drivers.js';
 export * from './charging.js';

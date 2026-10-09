@@ -37,7 +37,7 @@ export type { DependencyContainer } from './container.js';
 
 export { formatDateTime, formatDate, formatRelativeTime, isValidTimezone } from './timezone.js';
 
-export { encryptString, decryptString } from './encryption.js';
+export { encryptString, decryptString, decryptSettingOrNull } from './encryption.js';
 
 export {
   assertTemplateAllowed,
@@ -73,6 +73,14 @@ export { createRedisClient, redisTlsOptions } from './redis-client.js';
 
 export { RedisConnectionRegistry } from './connection-registry.js';
 export type { ConnectionRegistry } from './connection-registry.js';
+export {
+  LIVENESS_WRITE_INTERVAL_SECONDS,
+  MIN_HEARTBEAT_TIMEOUT_MS,
+  OFFLINE_SWEEP_SLACK_MS,
+  heartbeatTimeoutFor,
+  offlineSweepThresholdMs,
+  shouldMarkStationOffline,
+} from './station-liveness.js';
 
 export {
   DEFAULT_CURRENCY,
@@ -125,6 +133,7 @@ export {
   taxPerRate,
   chargedCostBreakdown,
   reconcileCostBreakdown,
+  capCostBreakdown,
   componentTaxLines,
   parseSessionCostBreakdown,
 } from './price-display.js';
@@ -151,8 +160,27 @@ export {
   toAuthorizationKeyHex,
 } from './station-password.js';
 export type { StationOcppProtocol, StationPasswordError } from './station-password.js';
+export {
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_RULES,
+  passwordRuleResults,
+  missingPasswordRules,
+} from './password-policy.js';
+export type { PasswordRule } from './password-policy.js';
 export { UI_LANGUAGES, isUiLanguage, toUiLanguage } from './languages.js';
 export type { UiLanguage } from './languages.js';
+export {
+  REQUIRED_DRIVER_EVENT_TYPES,
+  isRequiredDriverEventType,
+  OCPP_NOTIFICATION_EVENTS,
+  OCPP_NOTIFICATION_EVENT_TYPES,
+  ocppNotificationEventsFor,
+} from './notification-events.js';
+export type { OcppNotificationVersion, OcppNotificationEventType } from './notification-events.js';
+export { LOAD_ALLOCATION_STRATEGIES } from './load-allocation.js';
+export type { LoadAllocationStrategy } from './load-allocation.js';
+export { OCPI_PULL_MODULES } from './ocpi-modules.js';
+export type { OcpiPullModule } from './ocpi-modules.js';
 export {
   FIRMWARE_SIGNING_CERTIFICATE_MAX_LENGTH,
   FIRMWARE_SIGNATURE_MAX_LENGTH,
@@ -198,6 +226,8 @@ export {
   notificationTaxRate,
   formatLocalizedVariables,
 } from './notification-values.js';
+export { receiptBilling, sessionReceiptVariables } from './session-receipt.js';
+export type { SessionReceiptInput } from './session-receipt.js';
 
 export {
   tariffRestrictionsSchema,
@@ -239,6 +269,7 @@ export {
 export type {
   SmtpConfig,
   TwilioConfig,
+  SmsSendContext,
   NotificationSettings,
   Recipient,
   RenderedTemplate,
@@ -262,7 +293,17 @@ export {
 export type { GuardOptions, SafeFetchInit, SafeFetchResponse } from './safe-fetch.js';
 
 export { sendExpoPush, isExpoPushToken } from './push-send.js';
-export type { ExpoPushMessage, ExpoPushResult } from './push-send.js';
+export type { ExpoPushMessage, ExpoPushResult, PushSendContext } from './push-send.js';
+export {
+  resolveNotificationTestSinkUrl,
+  getNotificationTestSinkUrl,
+  clearNotificationTestSinkCache,
+  postToNotificationTestSink,
+} from './notification-test-sink.js';
+export type {
+  NotificationTestSinkEnv,
+  NotificationTestSinkMessage,
+} from './notification-test-sink.js';
 
 export { initSentry } from './sentry.js';
 export type { SentryConfig } from './sentry.js';
@@ -304,18 +345,20 @@ export type {
 } from './station-message-dispatch.js';
 
 export {
-  PERMISSIONS,
-  PAGE_PERMISSIONS,
-  SETTINGS_PERMISSIONS,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
-  VIEWER_DEFAULT_PERMISSIONS,
-  PERMISSION_GROUPS,
+  PermissionCatalog,
+  createPermissionCatalog,
+  permissionCatalog,
   hasPermission,
   isSubsetOf,
   hasAnySettingsPermission,
 } from './permissions.js';
-export type { Permission } from './permissions.js';
+export type {
+  Permission,
+  PermissionAction,
+  PermissionGroup,
+  PermissionGroupDefinition,
+  PermissionKind,
+} from './permissions.js';
 
 export {
   renderMaintenanceMessage,
@@ -376,3 +419,7 @@ export {
   SIMULATOR_CONNECTION_HEADER,
   SIMULATOR_CONNECTION_HEADER_VALUE,
 } from './simulator-connection.js';
+
+export { OCTT_TEST_DRIVER_EMAIL } from './octt-test-driver.js';
+
+export { tryParseJson } from './safe-json.js';

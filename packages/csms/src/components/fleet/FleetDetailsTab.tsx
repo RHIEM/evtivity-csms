@@ -11,7 +11,6 @@ import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select } from '@/components/ui/select';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { EnergyChart } from '@/components/charts/EnergyChart';
 import { api } from '@/lib/api';
@@ -22,12 +21,9 @@ interface Fleet {
   id: string;
   name: string;
   description: string | null;
-  paymentMode: PaymentMode | null;
   createdAt: string;
   updatedAt: string;
 }
-
-type PaymentMode = 'card' | 'invoice';
 
 interface FleetMetrics {
   totalSessions: number;
@@ -56,7 +52,6 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [paymentMode, setPaymentMode] = useState<PaymentMode | ''>('');
   const [hasSubmitted, setHasSubmitted] = useState(false);
 
   const { data: metrics } = useQuery({
@@ -78,7 +73,7 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
   });
 
   const updateMutation = useMutation({
-    mutationFn: (body: { name?: string; description?: string; paymentMode?: PaymentMode | null }) =>
+    mutationFn: (body: { name?: string; description?: string }) =>
       api.patch<Fleet>(`/v1/fleets/${fleetId}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['fleets'] });
@@ -99,7 +94,6 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
   function startEdit(): void {
     setName(fleet.name);
     setDescription(fleet.description ?? '');
-    setPaymentMode(fleet.paymentMode ?? '');
     setHasSubmitted(false);
     setEditing(true);
   }
@@ -118,11 +112,7 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(errors).length > 0) return;
-    updateMutation.mutate({
-      name,
-      description,
-      paymentMode: paymentMode === '' ? null : paymentMode,
-    });
+    updateMutation.mutate({ name, description });
   }
 
   const driverCount = driversResponse?.total ?? 0;
@@ -177,23 +167,6 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
                   className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-payment-mode">{t('payments.paymentMode')}</Label>
-                <Select
-                  id="edit-payment-mode"
-                  value={paymentMode}
-                  onChange={(e) => {
-                    setPaymentMode(e.target.value as PaymentMode | '');
-                  }}
-                >
-                  <option value="">{t('payments.paymentModeUnset')}</option>
-                  <option value="card">{t('payments.paymentModeCard')}</option>
-                  <option value="invoice">{t('payments.paymentModeInvoice')}</option>
-                </Select>
-                <p className="text-xs text-muted-foreground">
-                  {t('payments.paymentModeFleetHelp')}
-                </p>
-              </div>
               <div className="flex justify-end gap-2">
                 <CancelButton
                   onClick={() => {
@@ -212,16 +185,6 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
               <div>
                 <dt className="text-muted-foreground">{t('common.description')}</dt>
                 <dd className="font-medium">{fleet.description ?? '-'}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
-                <dd className="font-medium">
-                  {fleet.paymentMode === 'invoice'
-                    ? t('payments.paymentModeInvoice')
-                    : fleet.paymentMode === 'card'
-                      ? t('payments.paymentModeCard')
-                      : t('payments.paymentModeUnset')}
-                </dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.created')}</dt>

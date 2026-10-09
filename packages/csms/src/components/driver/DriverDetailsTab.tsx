@@ -9,7 +9,6 @@ import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select } from '@/components/ui/select';
 import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,6 +17,7 @@ import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
 import { DriverPortalAccessCard, type PortalAccess } from './DriverPortalAccessCard';
 import { DriverPncContractsCard } from './DriverPncContractsCard';
+import { DriverBillingCard, type DriverBilling } from './DriverBillingCard';
 
 interface Driver {
   id: string;
@@ -27,13 +27,11 @@ interface Driver {
   phone: string | null;
   language: string;
   isActive: boolean;
-  paymentMode: PaymentMode | null;
   createdAt: string;
   updatedAt: string;
   portalAccess?: PortalAccess;
+  billing?: DriverBilling;
 }
-
-type PaymentMode = 'card' | 'invoice';
 
 export interface DriverDetailsTabProps {
   driver: Driver;
@@ -51,7 +49,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [phone, setPhone] = useState('');
   const [language, setLanguage] = useState('en');
   const [isActive, setIsActive] = useState(true);
-  const [paymentMode, setPaymentMode] = useState<PaymentMode | ''>('');
   const [hasSubmittedEdit, setHasSubmittedEdit] = useState(false);
 
   const updateMutation = useMutation({
@@ -62,7 +59,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       phone?: string;
       language?: string;
       isActive?: boolean;
-      paymentMode?: PaymentMode | null;
     }) => api.patch<Driver>(`/v1/drivers/${driver.id}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['drivers', driver.id] });
@@ -79,7 +75,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setPhone(driver.phone ?? '');
     setLanguage(driver.language);
     setIsActive(driver.isActive);
-    setPaymentMode(driver.paymentMode ?? '');
     setEditing(true);
   }
 
@@ -107,7 +102,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       ...(phone !== '' ? { phone } : {}),
       language,
       isActive,
-      paymentMode: paymentMode === '' ? null : paymentMode,
     });
   }
 
@@ -187,23 +181,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 <LanguageSelect id="edit-language" value={language} onChange={setLanguage} />
                 <p className="text-sm text-muted-foreground">{t('drivers.languageHelp')}</p>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-payment-mode">{t('payments.paymentMode')}</Label>
-                <Select
-                  id="edit-payment-mode"
-                  value={paymentMode}
-                  onChange={(e) => {
-                    setPaymentMode(e.target.value as PaymentMode | '');
-                  }}
-                >
-                  <option value="">{t('payments.paymentModeInherit')}</option>
-                  <option value="card">{t('payments.paymentModeCard')}</option>
-                  <option value="invoice">{t('payments.paymentModeInvoice')}</option>
-                </Select>
-                <p className="text-xs text-muted-foreground">
-                  {t('payments.paymentModeDriverHelp')}
-                </p>
-              </div>
               <div className="flex items-center gap-2">
                 <input
                   id="edit-active"
@@ -252,16 +229,6 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 </dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">{t('payments.paymentMode')}</dt>
-                <dd className="font-medium">
-                  {driver.paymentMode === 'invoice'
-                    ? t('payments.paymentModeInvoice')
-                    : driver.paymentMode === 'card'
-                      ? t('payments.paymentModeCard')
-                      : t('payments.paymentModeInherit')}
-                </dd>
-              </div>
-              <div>
                 <dt className="text-muted-foreground">{t('common.status')}</dt>
                 <dd className="font-medium">
                   <Badge variant={driver.isActive ? 'default' : 'outline'}>
@@ -281,6 +248,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
           )}
         </CardContent>
       </Card>
+      <DriverBillingCard billing={driver.billing} />
       <DriverPortalAccessCard driver={driver} timezone={timezone} />
       <DriverPncContractsCard driverId={driver.id} timezone={timezone} />
     </TabsContent>

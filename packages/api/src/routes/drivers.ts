@@ -4,7 +4,15 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, ne, and, or, ilike, sql, desc, asc } from 'drizzle-orm';
-import { db, pgErrorCode, PG_UNIQUE_VIOLATION, PG_FOREIGN_KEY_VIOLATION } from '@evtivity/database';
+import {
+  db,
+  client,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+  PG_FOREIGN_KEY_VIOLATION,
+  resolveAccountBilling,
+  resolveDriverPricingSource,
+} from '@evtivity/database';
 import {
   drivers,
   driverTokens,
@@ -54,10 +62,6 @@ const driverItem = z
       .string()
       .describe('Preferred language of the portal, notifications and invoices (e.g. en, de)'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
-    paymentMode: z
-      .enum(['card', 'invoice'])
-      .nullable()
-      .describe('Driver payment mode override; null inherits the fleet payment mode'),
     createdAt: z.coerce.date().describe('Timestamp when the driver was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the driver was last updated'),
   })
@@ -77,8 +81,52 @@ const portalAccessItem = z
   })
   .passthrough();
 
+const fleetRefItem = z
+  .object({
+    id: z.string().describe('Fleet identifier'),
+    name: z.string().max(255).describe('Fleet display name'),
+  })
+  .passthrough();
+
+const driverBillingItem = z
+  .object({
+    mode: z
+      .enum(['card', 'account'])
+      .describe(
+        "How the driver's new sessions are paid: account (billed to billingFleet, no card) or card",
+      ),
+    billingFleet: fleetRefItem
+      .nullable()
+      .describe(
+        'The fleet new sessions are billed to (the oldest membership in a fleet with account billing that the driver has not opted out of), or null for card',
+      ),
+    pricingFleet: fleetRefItem
+      .nullable()
+      .describe(
+        'The fleet whose pricing group prices the driver (the oldest membership in a fleet with a pricing group), or null, also when a driver pricing group overrides it. Can differ from billingFleet.',
+      ),
+    pricingSource: z
+      .enum(['driver', 'fleet'])
+      .nullable()
+      .describe(
+        'What prices the driver at every station: driver (a driver pricing group, which overrides fleet pricing), fleet (pricingFleet), or null (the station, site or default group)',
+      ),
+    pricingGroup: z
+      .object({
+        id: z.string().describe('Pricing group identifier'),
+        name: z.string().describe('Pricing group name'),
+      })
+      .passthrough()
+      .nullable()
+      .describe('The driver or fleet pricing group, null when pricingSource is null'),
+  })
+  .passthrough();
+
 const driverDetailItem = driverItem
-  .extend({ portalAccess: portalAccessItem.describe('Driver portal access state') })
+  .extend({
+    portalAccess: portalAccessItem.describe('Driver portal access state'),
+    billing: driverBillingItem.describe('Billing mode, billing fleet and pricing fleet'),
+  })
   .passthrough();
 
 const portalInviteItem = z
@@ -169,13 +217,6 @@ const driverReservationItem = z
   })
   .passthrough();
 
-const paymentModeField = z
-  .enum(['card', 'invoice'])
-  .nullable()
-  .optional()
-  .describe(
-    'Payment mode override: card (payment method + pre-authorization) or invoice (billed later through an aggregated invoice). Null inherits the fleet payment mode.',
-  );
 const driverLanguage = z
   .enum(UI_LANGUAGES)
   .describe('Preferred language of the portal, notifications and invoices');
@@ -185,7 +226,6 @@ const createDriverBody = z.object({
   lastName: z.string().max(100),
   email: z.string().email().optional(),
   phone: z.string().max(50).optional(),
-  paymentMode: paymentModeField,
   language: driverLanguage.optional().describe('Preferred language (default en)'),
 });
 
@@ -197,7 +237,6 @@ const updateDriverBody = z.object({
   language: driverLanguage.optional(),
   isActive: z.boolean().optional().describe('Whether the driver account is active'),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
-  paymentMode: paymentModeField,
 });
 
 const createTokenBody = z.object({
@@ -319,7 +358,6 @@ const driverSafeSelect = {
   mfaEnabled: drivers.mfaEnabled,
   mfaMethod: drivers.mfaMethod,
   isActive: drivers.isActive,
-  paymentMode: drivers.paymentMode,
   emailVerified: drivers.emailVerified,
   lastNotificationReadAt: drivers.lastNotificationReadAt,
   createdAt: drivers.createdAt,
@@ -407,7 +445,27 @@ export function driverRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
-      return { ...driver, portalAccess: await getPortalAccess(driver.id) };
+      const [portalAccess, billingFleet, pricing] = await Promise.all([
+        getPortalAccess(driver.id),
+        resolveAccountBilling(client, driver.id),
+        resolveDriverPricingSource(client, driver.id),
+      ]);
+      return {
+        ...driver,
+        portalAccess,
+        billing: {
+          mode: billingFleet != null ? 'account' : 'card',
+          billingFleet:
+            billingFleet != null
+              ? { id: billingFleet.fleetId, name: billingFleet.fleetName }
+              : null,
+          pricingFleet:
+            pricing?.source === 'fleet' ? { id: pricing.fleetId, name: pricing.fleetName } : null,
+          pricingSource: pricing?.source ?? null,
+          pricingGroup:
+            pricing != null ? { id: pricing.pricingGroupId, name: pricing.pricingGroupName } : null,
+        },
+      };
     },
   );
 
@@ -551,7 +609,6 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.language !== undefined) fields['language'] = body.language;
       if (body.isActive !== undefined) fields['isActive'] = body.isActive;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
-      if (body.paymentMode !== undefined) fields['paymentMode'] = body.paymentMode;
 
       // before is used only for the audit row — writeAudit's redactor masks
       // sensitive fields, so it's safe to fetch the full row here. The

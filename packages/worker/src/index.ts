@@ -4,6 +4,7 @@
 import { Worker } from 'bullmq';
 import {
   createLogger,
+  tryParseJson,
   createBullMQConnection,
   logBullMQErrors,
   RedisPubSubClient,
@@ -28,6 +29,11 @@ import {
   createMaintenanceFanoutWorker,
   startMaintenanceFanoutBridge,
 } from './maintenance-fanout-worker.js';
+import {
+  createFleetBillingFanoutWorker,
+  startFleetBillingFanoutBridge,
+} from './fleet-billing-fanout-worker.js';
+import { createFleetInvoiceWorker, setFleetInvoiceQueue } from './fleet-invoice-worker.js';
 import { createStationWatchWorker, startStationWatchBridge } from './station-watch-worker.js';
 import {
   createPaymentWebhookWorker,
@@ -40,6 +46,7 @@ import {
   startRemoteStartTimeoutBridge,
 } from './remote-start-timeout-worker.js';
 import { createStationMessageWorker, startStationMessageBridge } from './station-message-worker.js';
+import { createReportWorker, setReportQueue, startReportBridge } from './report-worker.js';
 import { octtRunnerHandler } from './handlers/octt-runner.js';
 import type { OcttJobData } from './handlers/octt-runner.js';
 
@@ -61,12 +68,17 @@ async function start(): Promise<void> {
     reservationQueue,
     octtQueue,
     maintenanceFanoutQueue,
+    fleetBillingFanoutQueue,
+    fleetInvoiceQueue,
     stationWatchQueue,
     paymentWebhookQueue,
     remoteStartTimeoutQueue,
     stationMessageQueue,
+    reportQueue,
   } = createQueues(REDIS_URL);
   setSimulatedEventSink(queueSimulatedSink(paymentWebhookQueue));
+  setReportQueue(reportQueue);
+  setFleetInvoiceQueue(fleetInvoiceQueue);
 
   // Schedule cron jobs from database
   await scheduleCronJobs(cronQueue);
@@ -97,6 +109,10 @@ async function start(): Promise<void> {
     createBullMQConnection(REDIS_URL),
     createBullMQConnection(REDIS_URL),
   );
+  const fleetBillingFanoutWorker = createFleetBillingFanoutWorker(
+    createBullMQConnection(REDIS_URL),
+  );
+  const fleetInvoiceWorker = createFleetInvoiceWorker(createBullMQConnection(REDIS_URL));
   const stationWatchWorker = createStationWatchWorker(createBullMQConnection(REDIS_URL));
   const paymentWebhookWorker = createPaymentWebhookWorker(
     createBullMQConnection(REDIS_URL),
@@ -111,6 +127,8 @@ async function start(): Promise<void> {
     createBullMQConnection(REDIS_URL),
     createBullMQConnection(REDIS_URL),
   );
+
+  const reportWorker = createReportWorker(createBullMQConnection(REDIS_URL));
 
   // OCTT conformance test worker
   const octtWorker = new Worker<OcttJobData>(
@@ -130,10 +148,13 @@ async function start(): Promise<void> {
     guestWorker,
     reservationWorker,
     maintenanceFanoutWorker,
+    fleetBillingFanoutWorker,
+    fleetInvoiceWorker,
     stationWatchWorker,
     paymentWebhookWorker,
     remoteStartTimeoutWorker,
     stationMessageWorker,
+    reportWorker,
     octtWorker,
   })) {
     // BullMQ re-emits Redis errors on every Worker; unheard, it prints each one
@@ -148,6 +169,10 @@ async function start(): Promise<void> {
     pubsub,
     maintenanceFanoutQueue,
   );
+  const stopFleetBillingFanoutBridge = await startFleetBillingFanoutBridge(
+    pubsub,
+    fleetBillingFanoutQueue,
+  );
   const stopStationWatchBridge = await startStationWatchBridge(pubsub, stationWatchQueue);
   const stopPaymentWebhookBridge = await startPaymentWebhookBridge(pubsub, paymentWebhookQueue);
   const stopRemoteStartTimeoutBridge = await startRemoteStartTimeoutBridge(
@@ -155,6 +180,7 @@ async function start(): Promise<void> {
     remoteStartTimeoutQueue,
   );
   const stopStationMessageBridge = await startStationMessageBridge(pubsub, stationMessageQueue);
+  const stopReportBridge = await startReportBridge(pubsub);
 
   // Listen for credential-rotation invalidations from the API so the next
   // dispatchDriverNotification / scheduled report email reads fresh SMTP and
@@ -162,19 +188,19 @@ async function start(): Promise<void> {
   const cacheInvalidateSubscription = await pubsub.subscribe(
     'cache_invalidate',
     (payload: string) => {
-      try {
-        const msg = JSON.parse(payload) as { kind?: string };
-        if (msg.kind === 'notification_settings') {
-          clearNotificationSettingsCache();
-        }
-        if (msg.kind === 'station_message') {
-          // Station screens render here (station-messages and tariff boundary jobs).
-          clearStationMessageCache();
-          clearStationMessageSettingsCache();
-          clearSystemSettingsCache();
-        }
-      } catch {
-        // ignore malformed payloads
+      const msg = tryParseJson(payload) as { kind?: string } | null | undefined;
+      if (msg == null || typeof msg !== 'object') {
+        log.warn({ payload }, 'Malformed cache_invalidate message ignored');
+        return;
+      }
+      if (msg.kind === 'notification_settings') {
+        clearNotificationSettingsCache();
+      }
+      if (msg.kind === 'station_message') {
+        // Station screens render here (station-messages and tariff boundary jobs).
+        clearStationMessageCache();
+        clearStationMessageSettingsCache();
+        clearSystemSettingsCache();
       }
     },
   );
@@ -200,10 +226,12 @@ async function start(): Promise<void> {
     await stopGuestBridge();
     await stopReservationBridge();
     await stopMaintenanceFanoutBridge();
+    await stopFleetBillingFanoutBridge();
     await stopStationWatchBridge();
     await stopPaymentWebhookBridge();
     await stopRemoteStartTimeoutBridge();
     await stopStationMessageBridge();
+    await stopReportBridge();
     await octtSubscription.unsubscribe();
     await cacheInvalidateSubscription.unsubscribe();
     await cronWorker.close();
@@ -211,10 +239,13 @@ async function start(): Promise<void> {
     await guestWorker.close();
     await reservationWorker.close();
     await maintenanceFanoutWorker.close();
+    await fleetBillingFanoutWorker.close();
+    await fleetInvoiceWorker.close();
     await stationWatchWorker.close();
     await paymentWebhookWorker.close();
     await remoteStartTimeoutWorker.close();
     await stationMessageWorker.close();
+    await reportWorker.close();
     await octtWorker.close();
     await cronQueue.close();
     await loadQueue.close();
@@ -222,11 +253,15 @@ async function start(): Promise<void> {
     await reservationQueue.close();
     await octtQueue.close();
     await maintenanceFanoutQueue.close();
+    await fleetBillingFanoutQueue.close();
+    setFleetInvoiceQueue(null);
+    await fleetInvoiceQueue.close();
     await stationWatchQueue.close();
     setSimulatedEventSink(null);
     await paymentWebhookQueue.close();
     await remoteStartTimeoutQueue.close();
     await stationMessageQueue.close();
+    await reportQueue.close();
     await pubsub.close();
     log.info('Worker shutdown complete');
     process.exit(0);

@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/database",
-  "version": "0.1.38",
+  "version": "0.1.42",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -25,6 +25,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@evtivity/lib": "*",
     "argon2": "^0.44.0",
     "drizzle-orm": "^0.45.2",
     "nanoid": "^6.0.1",

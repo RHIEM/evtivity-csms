@@ -14,14 +14,16 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  check,
 } from 'drizzle-orm/pg-core';
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { tariffs } from './pricing.js';
 import { chargingStations, evses, connectors } from './assets.js';
-import { drivers, driverTokens, vehicles } from './drivers.js';
+import { drivers, driverTokens, vehicles, fleets } from './drivers.js';
 import { reservations } from './reservations.js';
-import { paymentModeEnum } from './payment-mode.js';
+import { invoices } from './invoices.js';
 
 export const sessionStatusEnum = pgEnum('session_status', [
   'active',
@@ -30,6 +32,14 @@ export const sessionStatusEnum = pgEnum('session_status', [
   'faulted',
   'failed',
 ]);
+
+/** charging_sessions.rebill_status: the state of an operator re-bill. */
+export const SESSION_REBILL_STATUSES = ['in_progress', 'billed', 'manual'] as const;
+export type SessionRebillStatus = (typeof SESSION_REBILL_STATUSES)[number];
+
+/** charging_sessions.billing_mode: how a driver session is paid (fleet account billing). */
+export const SESSION_BILLING_MODES = ['card', 'account'] as const;
+export type SessionBillingMode = (typeof SESSION_BILLING_MODES)[number];
 
 export const transactionEventTypeEnum = pgEnum('transaction_event_type', [
   'started',
@@ -51,11 +61,8 @@ export const chargingSessions = pgTable(
     driverId: text('driver_id').references(() => drivers.id),
     tokenId: text('token_id').references(() => driverTokens.id, { onDelete: 'set null' }),
     vehicleId: text('vehicle_id').references(() => vehicles.id, { onDelete: 'set null' }),
-    // OCPP 2.1 transactionIds are unique per station only (E01.FR.08): new code
-    // keys by uq_charging_sessions_station_transaction. The global unique
-    // (charging_sessions_transaction_id_unique) stays until the N4 contract,
-    // because pods before v0.1.38 insert with ON CONFLICT (transaction_id).
-    transactionId: varchar('transaction_id', { length: 36 }).notNull().unique(),
+    // Unique per station only (OCPP 2.1 E01.FR.08): uq_charging_sessions_station_transaction.
+    transactionId: varchar('transaction_id', { length: 36 }).notNull(),
     status: sessionStatusEnum('status').notNull().default('active'),
     startedAt: timestamp('started_at', { withTimezone: true }),
     endedAt: timestamp('ended_at', { withTimezone: true }),
@@ -87,11 +94,28 @@ export const chargingSessions = pgTable(
     netCents: integer('net_cents'),
     taxCents: integer('tax_cents'),
     costBreakdown: jsonb('cost_breakdown'),
+    // The most the session can be billed, tax included, stamped when the
+    // session starts: the authorized amount of a guest's card hold (OCPP 2.1
+    // C25: the authorization is the ceiling for the cost) or a prepaid
+    // token's credit (C17.FR.03). The cost assembly bills at most this
+    // amount. Null: no ceiling.
+    costCeilingCents: integer('cost_ceiling_cents'),
+    // The ceiling last sent to an OCPP 2.1 station as transactionLimit.maxCost.
+    costCeilingSentCents: integer('cost_ceiling_sent_cents'),
     idleStartedAt: timestamp('idle_started_at', { withTimezone: true }),
+    // Timestamp of the meter reading that last raised energy_delivered_wh by
+    // 1 Wh or more. The flat-energy idle fallback opens a period only when the
+    // register stayed flat for a full sample interval since then (finding J3).
+    energyRoseAt: timestamp('energy_rose_at', { withTimezone: true }),
     idleMinutes: numeric('idle_minutes').notNull().default('0'),
     // The idle_started_at the idle notification was sent for (one per idle period).
     idleNotifiedAt: timestamp('idle_notified_at', { withTimezone: true }),
     lastUpdateNotifiedAt: timestamp('last_update_notified_at', { withTimezone: true }),
+    // Claims of the end notices: session.Completed and session.Receipt go out
+    // only from the projection run that set them (one per session, also when
+    // the station resends its Ended event).
+    completedNotifiedAt: timestamp('completed_notified_at', { withTimezone: true }),
+    receiptNotifiedAt: timestamp('receipt_notified_at', { withTimezone: true }),
     // A durable request to end the session the normal way (completed and
     // billed) because the station will not: 'GhostRecovered' or 'Superseded'.
     // end_claimed_at is the lease of the OCPP pod processing it (retried by the
@@ -100,12 +124,31 @@ export const chargingSessions = pgTable(
     endClaimedAt: timestamp('end_claimed_at', { withTimezone: true }),
     // Claims taken for the end request; the sweep gives up after a cap.
     endAttempts: integer('end_attempts').notNull().default(0),
+    // Operator re-bill of a session the CSMS gave up ending (stopped reason
+    // EndRequestFailed): 'in_progress' while a request holds the claim
+    // (rebill_claimed_at is its lease), then 'billed' (charged, debited or
+    // nothing to charge) or 'manual' (collected outside the platform). Null:
+    // never re-billed. See packages/api/src/services/session-rebill.service.ts.
+    rebillStatus: varchar('rebill_status', { length: 16 }).$type<SessionRebillStatus>(),
+    rebillClaimedAt: timestamp('rebill_claimed_at', { withTimezone: true }),
+    // The invoice that bills this session, set in the invoice transaction only
+    // while null, so a session is never on two invoices. A voided invoice
+    // releases it.
+    invoiceId: text('invoice_id').references((): AnyPgColumn => invoices.id, {
+      onDelete: 'set null',
+    }),
+    // How the driver session is paid, decided once at its start and never
+    // rewritten (write-once stamp, P5): 'card' (the driver's card) or
+    // 'account' (billed to billing_fleet_id on the fleet invoice). Stamped by
+    // the portal start or the payment gate on TransactionEvent Started after
+    // roaming, free vend and prepaid are ruled out. Null: older sessions and
+    // sessions without a driver, roaming, free vend or prepaid.
+    billingMode: varchar('billing_mode', { length: 8 }).$type<SessionBillingMode>(),
+    billingFleetId: text('billing_fleet_id').references((): AnyPgColumn => fleets.id, {
+      onDelete: 'restrict',
+    }),
     metadata: jsonb('metadata'),
     freeVend: boolean('free_vend').notNull().default(false),
-    // Driver payment mode resolved when the session started. Null when none was
-    // resolved: no driver, or an OCPP start that skipped the payment gate
-    // (free-vend, roaming).
-    paymentMode: paymentModeEnum('payment_mode'),
     co2AvoidedKg: numeric('co2_avoided_kg'),
     electricityCostCents: integer('electricity_cost_cents'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -114,7 +157,6 @@ export const chargingSessions = pgTable(
   (table) => [
     index('idx_sessions_station_id').on(table.stationId),
     index('idx_sessions_status').on(table.status),
-    index('idx_sessions_transaction_id').on(table.transactionId),
     uniqueIndex('uq_charging_sessions_station_transaction').on(
       table.stationId,
       table.transactionId,
@@ -134,6 +176,30 @@ export const chargingSessions = pgTable(
     index('idx_charging_sessions_end_request')
       .on(table.endRequestReason)
       .where(sql`status = 'active' AND end_request_reason IS NOT NULL`),
+    index('idx_charging_sessions_rebill_manual')
+      .on(table.createdAt)
+      .where(sql`rebill_status = 'manual'`),
+    index('idx_sessions_invoice_id')
+      .on(table.invoiceId)
+      .where(sql`invoice_id IS NOT NULL`),
+    index('idx_sessions_billing_fleet_id')
+      .on(table.billingFleetId)
+      .where(sql`billing_fleet_id IS NOT NULL`),
+    index('idx_sessions_account_unbilled')
+      .on(table.billingFleetId)
+      .where(sql`billing_mode = 'account' AND invoice_id IS NULL`),
+    check(
+      'charging_sessions_billing_mode_check',
+      sql`billing_mode IS NULL OR billing_mode IN ('card', 'account')`,
+    ),
+    check(
+      'charging_sessions_billing_fleet_check',
+      sql`coalesce(billing_mode = 'account', false) = (billing_fleet_id IS NOT NULL)`,
+    ),
+    check(
+      'charging_sessions_rebill_status_check',
+      sql`rebill_status IS NULL OR rebill_status IN ('in_progress', 'billed', 'manual')`,
+    ),
   ],
 );
 

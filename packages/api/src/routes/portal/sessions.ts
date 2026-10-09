@@ -26,6 +26,11 @@ import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { paginationQuery } from '../../lib/pagination.js';
 import type { PaginatedResponse } from '../../lib/pagination.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
+import {
+  sessionAccountBillingColumns,
+  sessionAccountBillingSchema,
+  withAccountBilling,
+} from '../../lib/portal-billing.js';
 
 const portalSessionListItem = z
   .object({
@@ -49,12 +54,6 @@ const portalSessionListItem = z
       .min(0)
       .nullable()
       .describe('Final session cost in cents, including tax'),
-    tariffTaxRate: z
-      .string()
-      .nullable()
-      .describe(
-        'Tax rate of the session tariff as a decimal (e.g. 0.19), null without tax. Costs include it',
-      ),
     taxCents: z
       .number()
       .int()
@@ -73,6 +72,11 @@ const portalSessionListItem = z
       .string()
       .nullable()
       .describe('Reservation ID this session was started from, if any'),
+    accountBilling: sessionAccountBillingSchema
+      .nullable()
+      .describe(
+        'Set when the session is billed to a fleet (charge on account): the billing state and the fleet. Null for a session paid by card or not billed',
+      ),
   })
   .passthrough();
 
@@ -97,7 +101,9 @@ const paymentRecordItem = z
     paymentSource: z
       .string()
       .max(20)
-      .describe('Source channel (web_portal, guest, terminal, etc.)'),
+      .describe(
+        'Who started the payment: web_portal (driver), guest, prepaid, ocpp_terminal, or operator (re-bill and reservation fee charges)',
+      ),
     failureReason: z
       .string()
       .max(500)
@@ -248,12 +254,6 @@ const monthlyStatementSessionItem = z
       .min(0)
       .nullable()
       .describe('Final session cost in cents, including tax'),
-    tariffTaxRate: z
-      .string()
-      .nullable()
-      .describe(
-        'Tax rate of the session tariff as a decimal (e.g. 0.19), null without tax. Costs include it',
-      ),
     taxCents: z
       .number()
       .int()
@@ -339,7 +339,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
             energyDeliveredWh: chargingSessions.energyDeliveredWh,
             co2AvoidedKg: chargingSessions.co2AvoidedKg,
             finalCostCents: chargingSessions.finalCostCents,
-            tariffTaxRate: chargingSessions.tariffTaxRate,
             taxCents: chargingSessions.taxCents,
             currency: sessionCurrencySql(),
             stationName: chargingStations.stationId,
@@ -348,6 +347,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
             siteCity: sites.city,
             siteState: sites.state,
             reservationId: chargingSessions.reservationId,
+            ...sessionAccountBillingColumns(),
           })
           .from(chargingSessions)
           .leftJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
@@ -362,8 +362,9 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           .where(whereClause),
       ]);
 
-      return { data, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
-        (typeof data)[number]
+      const items = data.map(withAccountBilling);
+      return { data: items, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
+        (typeof items)[number]
       >;
     },
   );
@@ -441,7 +442,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           energyDeliveredWh: chargingSessions.energyDeliveredWh,
           co2AvoidedKg: chargingSessions.co2AvoidedKg,
           finalCostCents: chargingSessions.finalCostCents,
-          tariffTaxRate: chargingSessions.tariffTaxRate,
           taxCents: chargingSessions.taxCents,
           currency: sessionCurrencySql(),
           siteName: sites.name,
@@ -511,7 +511,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           co2AvoidedKg: chargingSessions.co2AvoidedKg,
           currentCostCents: chargingSessions.currentCostCents,
           finalCostCents: chargingSessions.finalCostCents,
-          tariffTaxRate: chargingSessions.tariffTaxRate,
           costBreakdown: chargingSessions.costBreakdown,
           currency: sessionCurrencySql(),
           meterStart: chargingSessions.meterStart,
@@ -532,6 +531,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           vehicleMake: vehicles.make,
           vehicleModel: vehicles.model,
           vehicleYear: vehicles.year,
+          ...sessionAccountBillingColumns(),
         })
         .from(chargingSessions)
         .leftJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
@@ -553,8 +553,8 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       const [payment, latestPower, latestSoc, vehicleEfficiency] = await Promise.all([
         // Only return display-safe fields. The full payment_records row
         // contains the provider ids (provider_payment_id, provider_customer_id,
-        // provider_payment_method_id and their stripe_* copies until P8)
-        // which the portal does not need; surfacing them is the same
+        // provider_payment_method_id) which the portal does not need;
+        // surfacing them is the same
         // defense-in-depth issue the payment-methods list was just fixed for.
         db
           .select({
@@ -613,7 +613,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         vehicleYear,
         costBreakdown,
         ...sessionRest
-      } = session;
+      } = withAccountBilling(session);
       const costTax = storedSessionCostTax({
         costCents: session.finalCostCents ?? session.currentCostCents,
         costBreakdown,

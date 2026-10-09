@@ -7,7 +7,7 @@ set -euo pipefail
 #   scripts/release.sh minor --push       # Minor bump (0.1.x -> 0.2.0)
 #   scripts/release.sh major --push       # Major bump (0.x.y -> 1.0.0)
 #   scripts/release.sh v0.2.1 --push      # Explicit version (for hotfixes)
-#   scripts/release.sh v0.1.38-beta.1 --push  # Prerelease: alpha, beta or nightly only
+#   scripts/release.sh v0.1.38-beta.1 --push  # Prerelease: alpha or beta only
 #   scripts/release.sh --force --push     # Overwrite existing tag and release
 #
 # Bump types: patch (default), minor, major. Auto-increment starts from the
@@ -32,7 +32,7 @@ for arg in "$@"; do
     major|minor|patch) BUMP="$arg" ;;
     v[0-9]*)
       if ! release_tag_is_valid "$arg"; then
-        echo "Invalid version: $arg. Use v + semver, e.g. v1.2.3 or v1.2.3-beta.1 (no +build metadata)."
+        echo "Invalid version: $arg. $RELEASE_TAG_HELP"
         exit 1
       fi
       EXPLICIT="$arg"
@@ -225,11 +225,19 @@ if [ "$unpushed" -gt 0 ]; then
   fi
 fi
 
+# Commit messages never name a prerelease channel (owner rule): a prerelease
+# commit names its base version, the tag and the GitHub release carry the rest.
+if release_tag_is_prerelease "$next"; then
+  release_subject="release: prepare ${next_version%%-*}"
+else
+  release_subject="release: version $next_version"
+fi
+
 git add package.json packages/*/package.json packages/api/src/services/ai/tools.ts
 if git diff --cached --quiet; then
-  git commit --allow-empty -m "release: version $next_version"
+  git commit --allow-empty -m "$release_subject"
 else
-  git commit -m "release: version $next_version"
+  git commit -m "$release_subject"
 fi
 RELEASE_COMMITTED=true
 git tag "$next"
@@ -237,7 +245,7 @@ git push origin HEAD "$next"
 
 echo "Pushed $next. CI will build and push images to ghcr.io/evtivity."
 if [ "$PRERELEASE" = true ]; then
-  echo "Prerelease: CI tags images $next_version and its channel alias (alpha, beta or nightly),"
+  echo "Prerelease: CI tags images $next_version and its channel alias (alpha or beta),"
   echo "creates a GitHub prerelease, and"
   echo "skips the Helm chart and CDK bumps. Do not bump the website csms-version.txt."
 fi
