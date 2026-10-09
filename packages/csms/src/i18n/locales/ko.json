@@ -1603,13 +1603,6 @@
       "refunded": "환불됨",
       "partially_refunded": "부분 환불됨"
     },
-    "paymentMode": "결제 방식",
-    "paymentModeCard": "카드",
-    "paymentModeInvoice": "청구서",
-    "paymentModeInherit": "플릿 설정 상속",
-    "paymentModeUnset": "설정 안 됨",
-    "paymentModeDriverHelp": "플릿 결제 방식을 재정의합니다. 청구서 방식 운전자는 결제 수단 없이 충전하며 통합 청구서로 청구됩니다.",
-    "paymentModeFleetHelp": "운전자가 자체 결제 방식을 설정하지 않은 경우 이 플릿의 모든 운전자에게 적용됩니다. 청구서 방식 운전자는 결제 수단 없이 충전하며 통합 청구서로 청구됩니다.",
     "connectedAccountHelpManual": "Stripe에서 온보딩한 계정용입니다. 위에서 생성한 계정은 이 필드를 자동으로 채웁니다.",
     "payoutAccountTitle": "정산 계정",
     "payoutAccountDescription": "이 사이트의 결제를 받는 Stripe 연결 계정입니다.",

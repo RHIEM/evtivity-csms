@@ -1603,13 +1603,6 @@
       "refunded": "Erstattet",
       "partially_refunded": "Teilweise erstattet"
     },
-    "paymentMode": "Zahlungsart",
-    "paymentModeCard": "Karte",
-    "paymentModeInvoice": "Rechnung",
-    "paymentModeInherit": "Von Flotte übernehmen",
-    "paymentModeUnset": "Nicht festgelegt",
-    "paymentModeDriverHelp": "Überschreibt die Zahlungsart der Flotte. Fahrer mit Zahlungsart Rechnung laden ohne Zahlungsmethode und werden über eine Sammelrechnung abgerechnet.",
-    "paymentModeFleetHelp": "Gilt für alle Fahrer dieser Flotte, sofern ein Fahrer keine eigene Zahlungsart hat. Fahrer mit Zahlungsart Rechnung laden ohne Zahlungsmethode und werden über eine Sammelrechnung abgerechnet.",
     "connectedAccountHelpManual": "Für ein in Stripe eingerichtetes Konto. Oben erstellte Konten füllen dieses Feld aus.",
     "payoutAccountTitle": "Auszahlungskonto",
     "payoutAccountDescription": "Das verbundene Stripe-Konto, das die Zahlungen dieses Standorts erhält.",

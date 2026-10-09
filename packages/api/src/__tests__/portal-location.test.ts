@@ -132,10 +132,6 @@ vi.mock('../lib/payments.js', () => ({
   paymentContext: vi.fn(() => ({})),
 }));
 
-vi.mock('../services/driver.service.js', () => ({
-  resolvePaymentMode: vi.fn(() => Promise.resolve('card')),
-}));
-
 vi.mock('@evtivity/lib', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@evtivity/lib')>();
   return {

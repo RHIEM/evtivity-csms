@@ -35,10 +35,6 @@ const fleetListItem = z
     id: z.string().describe('Fleet identifier'),
     name: z.string().max(255).describe('Fleet display name'),
     description: z.string().max(1000).nullable().describe('Fleet description'),
-    paymentMode: z
-      .enum(['card', 'invoice'])
-      .nullable()
-      .describe('Payment mode for all drivers in the fleet; null leaves it unset'),
     createdAt: z.coerce.date().describe('Timestamp when the fleet was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the fleet was last updated'),
     driverCount: z.number().int().min(0).describe('Number of drivers in this fleet'),
@@ -51,10 +47,6 @@ const fleetItem = z
     id: z.string().describe('Fleet identifier'),
     name: z.string().max(255).describe('Fleet display name'),
     description: z.string().max(1000).nullable().describe('Fleet description'),
-    paymentMode: z
-      .enum(['card', 'invoice'])
-      .nullable()
-      .describe('Payment mode for all drivers in the fleet; null leaves it unset'),
     createdAt: z.coerce.date().describe('Timestamp when the fleet was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the fleet was last updated'),
   })
@@ -246,24 +238,14 @@ const fleetParams = z.object({
   id: ID_PARAMS.fleetId.describe('Fleet ID'),
 });
 
-const fleetPaymentModeField = z
-  .enum(['card', 'invoice'])
-  .nullable()
-  .optional()
-  .describe(
-    'Payment mode for all drivers in the fleet: card (payment method + pre-authorization) or invoice (billed later through an aggregated invoice). A driver payment mode overrides it. Null leaves it unset.',
-  );
-
 const createFleetBody = z.object({
   name: z.string().max(255),
   description: z.string().max(500).optional(),
-  paymentMode: fleetPaymentModeField,
 });
 
 const updateFleetBody = z.object({
   name: z.string().max(255).optional(),
   description: z.string().max(500).optional(),
-  paymentMode: fleetPaymentModeField,
 });
 
 const addDriverBody = z.object({
@@ -379,11 +361,10 @@ export function fleetRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const { name, description, paymentMode } = request.body as z.infer<typeof createFleetBody>;
+      const { name, description } = request.body as z.infer<typeof createFleetBody>;
       const fleet = await fleetService.createFleet({
         name,
         ...(description != null ? { description } : {}),
-        ...(paymentMode !== undefined ? { paymentMode } : {}),
       });
       if (fleet != null) {
         const actor = getAuditActor(request);
@@ -423,14 +404,11 @@ export function fleetRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof fleetParams>;
-      const { name, description, paymentMode } = request.body as z.infer<typeof updateFleetBody>;
+      const { name, description } = request.body as z.infer<typeof updateFleetBody>;
       const before = await fleetService.getFleet(id);
       const fleet = await fleetService.updateFleet(id, {
         ...(name != null ? { name } : {}),
         ...(description != null ? { description } : {}),
-        // Null is meaningful here (unset the fleet payment mode), so only an
-        // omitted field leaves it unchanged.
-        ...(paymentMode !== undefined ? { paymentMode } : {}),
       });
       if (fleet == null) {
         await reply.status(404).send({ error: 'Fleet not found', code: 'FLEET_NOT_FOUND' });

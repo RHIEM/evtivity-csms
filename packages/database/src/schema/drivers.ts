@@ -19,7 +19,6 @@ import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { chargingStations } from './assets.js';
 import { chargingSessions } from './charging.js';
-import { paymentModeEnum } from './payment-mode.js';
 
 export const guestSessionStatusEnum = pgEnum('guest_session_status', [
   'pending_payment',
@@ -57,9 +56,6 @@ export const drivers = pgTable(
     // Kept until P8; driver_payment_customers holds the customer per provider
     // (drivers_payment_customer_sync copies writes of the previous release).
     stripeCustomerId: varchar('stripe_customer_id', { length: 255 }),
-    // Overrides the fleet payment mode. Null inherits from the fleet (see
-    // resolvePaymentMode in the API).
-    paymentMode: paymentModeEnum('payment_mode'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -221,9 +217,6 @@ export const fleets = pgTable('fleets', {
     .$defaultFn(() => createId('fleet')),
   name: varchar('name', { length: 255 }).notNull(),
   description: varchar('description', { length: 500 }),
-  // Payment mode for every driver in the fleet. Null leaves it unset so the
-  // next fleet (or the 'card' default) applies.
-  paymentMode: paymentModeEnum('payment_mode'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });

@@ -1603,13 +1603,6 @@
       "refunded": "Reembolsado",
       "partially_refunded": "Parcialmente Reembolsado"
     },
-    "paymentMode": "Modo de pago",
-    "paymentModeCard": "Tarjeta",
-    "paymentModeInvoice": "Factura",
-    "paymentModeInherit": "Heredar de la flota",
-    "paymentModeUnset": "Sin definir",
-    "paymentModeDriverHelp": "Sustituye el modo de pago de la flota. Los conductores con factura cargan sin método de pago y se facturan mediante una factura agregada.",
-    "paymentModeFleetHelp": "Se aplica a todos los conductores de esta flota salvo que un conductor tenga su propio modo de pago. Los conductores con factura cargan sin método de pago y se facturan mediante una factura agregada.",
     "connectedAccountHelpManual": "Para una cuenta configurada en Stripe. Las cuentas creadas arriba rellenan este campo.",
     "payoutAccountTitle": "Cuenta de pagos",
     "payoutAccountDescription": "La cuenta conectada de Stripe que recibe los pagos de este sitio.",

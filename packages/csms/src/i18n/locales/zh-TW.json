@@ -1603,13 +1603,6 @@
       "refunded": "已退款",
       "partially_refunded": "部分退款"
     },
-    "paymentMode": "付款方式",
-    "paymentModeCard": "信用卡",
-    "paymentModeInvoice": "發票",
-    "paymentModeInherit": "沿用車隊設定",
-    "paymentModeUnset": "未設定",
-    "paymentModeDriverHelp": "覆寫車隊的付款方式。發票付款的司機無需付款方式即可充電，並透過彙總發票結算。",
-    "paymentModeFleetHelp": "適用於此車隊的所有司機，除非司機設定了自己的付款方式。發票付款的司機無需付款方式即可充電，並透過彙總發票結算。",
     "connectedAccountHelpManual": "用於在 Stripe 中完成註冊的帳戶。在上方建立的帳戶會自動填入此欄位。",
     "payoutAccountTitle": "收款帳戶",
     "payoutAccountDescription": "接收此站點款項的 Stripe 關聯帳戶。",

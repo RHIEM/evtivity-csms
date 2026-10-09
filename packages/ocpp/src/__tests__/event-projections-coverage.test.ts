@@ -2428,8 +2428,7 @@ describe('Event projections - coverage expansion', () => {
       [], // INSERT session_tariff_segments
       [{ site_id: 'site-pay' }], // resolveSiteId
       [{ name: 'Site Pay' }], // resolveSiteName
-      // runPaymentGate: snapshotPaymentMode (no row: card), then the hold
-      // goes through the service
+      // runPaymentGate: no SQL of its own, the hold goes through the service
     ];
     const emitDriverStarted = (transactionId: string) =>
       eventBus.emit(
@@ -2509,22 +2508,6 @@ describe('Event projections - coverage expansion', () => {
       await emitDriverStarted('tx-not-configured');
 
       // Payments are not configured: the session is neither stopped nor faulted.
-      expect(stopCommands()).toHaveLength(0);
-      expect(faultUpdate()).toBeUndefined();
-      expect(paymentNotifications()).toHaveLength(0);
-    });
-
-    it('lets an invoice driver charge on a paid tariff without a hold', async () => {
-      await setup();
-      setupSqlResults(...driverStartedResults(), [{ payment_mode: 'invoice' }]);
-
-      await emitDriverStarted('tx-invoice');
-
-      // The resolved payment mode is snapshotted on the session.
-      const snapshot = findSql(/SET payment_mode = COALESCE/);
-      expect(snapshot?.values).toEqual(['driver-pay', 'driver-pay', 'session-preauth']);
-      // Invoice: billed afterwards, so no hold and no stop.
-      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
       expect(stopCommands()).toHaveLength(0);
       expect(faultUpdate()).toBeUndefined();
       expect(paymentNotifications()).toHaveLength(0);

@@ -728,7 +728,6 @@ interface SettlementSession extends SessionCharge {
   isRoaming: boolean;
   freeVend: boolean;
   prepaid: boolean;
-  invoice: boolean;
 }
 
 async function settlementSession(sessionId: string): Promise<SettlementSession | null> {
@@ -739,7 +738,6 @@ async function settlementSession(sessionId: string): Promise<SettlementSession |
       isRoaming: chargingSessions.isRoaming,
       freeVend: chargingSessions.freeVend,
       prepaid: sql<boolean>`${driverTokens.prepaidBalanceCents} IS NOT NULL`,
-      invoice: sql<boolean>`COALESCE(${chargingSessions.paymentMode} = 'invoice', false)`,
       finalCostCents: chargingSessions.finalCostCents,
       tariffTaxRate: chargingSessions.tariffTaxRate,
       costBreakdown: chargingSessions.costBreakdown,
@@ -771,8 +769,7 @@ async function settlementSession(sessionId: string): Promise<SettlementSession |
  * (only from `pre_authorized`, P5). When the provider charged but the record
  * cannot be updated, the outcome says `recorded: false` and the error is
  * logged; no failure is reported to the driver. A guest hold is left to the
- * worker. An invoice session has no hold and is billed afterwards through an
- * aggregated invoice. Notifications stay with the caller.
+ * worker. Notifications stay with the caller.
  */
 export async function settleSessionPayment(
   sessionId: string,

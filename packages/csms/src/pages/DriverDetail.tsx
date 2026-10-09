@@ -38,7 +38,6 @@ interface Driver {
   phone: string | null;
   language: string;
   isActive: boolean;
-  paymentMode: 'card' | 'invoice' | null;
   createdAt: string;
   updatedAt: string;
   portalAccess?: PortalAccess;

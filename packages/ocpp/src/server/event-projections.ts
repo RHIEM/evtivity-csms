@@ -3712,49 +3712,6 @@ export function registerProjections(
     }
   }
 
-  /**
-   * Resolves how a driver pays (driver > fleet > 'card') and snapshots it on
-   * the session in one statement. Among the driver's fleets that set a mode
-   * the oldest membership wins. Mirrors resolvePaymentMode() in
-   * packages/api/src/services/driver.service.ts; inlined to avoid an API
-   * package dependency from the OCPP package. Falls back to 'card' when the
-   * session row is missing.
-   */
-  async function snapshotPaymentMode(
-    sessionId: string,
-    driverId: string,
-  ): Promise<'card' | 'invoice'> {
-    const rows = await sql`
-      WITH driver_mode AS (
-        SELECT d.payment_mode, 1 AS priority
-        FROM drivers d
-        WHERE d.id = ${driverId} AND d.payment_mode IS NOT NULL
-      ),
-      fleet_mode AS (
-        SELECT f.payment_mode, 2 AS priority
-        FROM fleet_drivers fd
-        JOIN fleets f ON f.id = fd.fleet_id
-        WHERE fd.driver_id = ${driverId} AND f.payment_mode IS NOT NULL
-        ORDER BY fd.created_at ASC
-        LIMIT 1
-      ),
-      resolved AS (
-        SELECT payment_mode FROM (
-          SELECT payment_mode, priority FROM driver_mode
-          UNION ALL SELECT payment_mode, priority FROM fleet_mode
-        ) modes
-        ORDER BY priority
-        LIMIT 1
-      )
-      UPDATE charging_sessions
-      SET payment_mode = COALESCE((SELECT payment_mode FROM resolved), 'card'),
-          updated_at = now()
-      WHERE id = ${sessionId}
-      RETURNING payment_mode
-    `;
-    return rows[0]?.payment_mode === 'invoice' ? 'invoice' : 'card';
-  }
-
   async function runPaymentGate(params: PaymentGateParams): Promise<void> {
     const {
       sessionId,
@@ -3777,25 +3734,18 @@ export function registerProjections(
     // fee makes the session paid only when it started from a reservation.
     const tariffIsFree = isTariffFree(sessionTariff, { reserved });
 
-    // Snapshot the driver's payment mode so later fleet or driver changes do
-    // not rewrite history.
-    const paymentMode =
-      driverId != null && !isRoaming ? await snapshotPaymentMode(sessionId, driverId) : null;
-
     // How the session is paid (one definition with the settlement on Ended).
     // Free vend never reaches the gate (the Started handler skips it).
     const mode = classifySessionPayment({
       isRoaming,
       freeVend: false,
       prepaid: prepaidBalanceCents != null,
-      invoice: paymentMode === 'invoice',
       driverId,
       guestSession: guestStatus != null,
     });
 
-    // Roaming: billing handled by the eMSP via the CDR. Invoice: billed
-    // afterwards through an aggregated invoice, no payment method or hold.
-    if (mode === 'roaming' || mode === 'free_vend' || mode === 'invoice') return;
+    // Roaming: billing handled by the eMSP via the CDR.
+    if (mode === 'roaming' || mode === 'free_vend') return;
 
     const stopSession = (reason: PaymentStopReason): Promise<void> =>
       stopSessionForPayment({ sessionId, transactionId, ocppStationId, stationDbId }, reason);
