@@ -989,7 +989,7 @@ export function sessionRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as JwtPayload;
       const smvSiteIds = await getUserSiteIds(userId);
-      if (smvSiteIds != null && session.siteId != null && !smvSiteIds.includes(session.siteId)) {
+      if (!siteInScope(smvSiteIds, session.siteId)) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }

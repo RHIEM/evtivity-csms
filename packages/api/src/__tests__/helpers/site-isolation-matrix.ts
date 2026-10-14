@@ -2288,6 +2288,14 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     { unsited: true },
   ),
   s(
+    'GET',
+    '/sessions/:id/signed-meter-values',
+    'sessions:read',
+    (f) => `/sessions/${f.session}/signed-meter-values`,
+    'SESSION_NOT_FOUND',
+    { unsited: true },
+  ),
+  s(
     'POST',
     '/sessions/:id/rebill',
     'payments:write',
@@ -2993,6 +3001,16 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     '/stations/:id/certificates',
     'stations:read',
     (f) => `${st(f)}/certificates`,
+    'STATION_NOT_FOUND',
+    {
+      unsited: true,
+    },
+  ),
+  s(
+    'GET',
+    '/stations/:id/meter-public-keys',
+    'stations:read',
+    (f) => `${st(f)}/meter-public-keys`,
     'STATION_NOT_FOUND',
     {
       unsited: true,

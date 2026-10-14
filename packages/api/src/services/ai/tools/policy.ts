@@ -707,6 +707,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   getSession: supportRead({ id: 'case.sessionIds' }, { redactedFields: ['sessionToken'] }),
   getSessionNeighbors: N,
   listSessionMeterValues: supportRead({ id: 'case.sessionIds' }),
+  // Signed meter data is billing evidence (Eichrecht): not an assistant tool.
+  listSessionSignedMeterValues: N,
   listSessionTransactionEvents: supportRead({ id: 'case.sessionIds' }),
   listSessions: R,
   rebillSession: N,
@@ -833,6 +835,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   listStationEvents: supportRead({ id: 'case.stationId' }),
   listStationFirmwareHistory: N,
   listStationImages: R,
+  listStationMeterPublicKeys: N,
   listStationMeterValues: R,
   listStationMonitoringRules: R,
   listStationSecurityEvents: R,
