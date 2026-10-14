@@ -38,6 +38,8 @@ const db = {
   // The transaction_events rows the session holds (eventRowKey): the resend
   // check (finding JB-6) finds the row a first run wrote.
   eventRows: new Set<string>(),
+  // The site of the station (null: a station without a site).
+  stationSiteId: 'site-1' as string | null,
 };
 
 function connectionError(code: string): Error {
@@ -49,6 +51,10 @@ function eventRowKey(eventType: string, seqNo: number, timestamp: string): strin
 }
 
 function route(text: string, values: unknown[]): unknown[] {
+  // The session's one tariff segment (closeSegmentsAt on Ended).
+  if (text.includes('SELECT id, started_at FROM session_tariff_segments')) {
+    return [{ id: 1, started_at: '2026-10-07T09:00:00.000Z' }];
+  }
   // The resend check of TransactionProjector (event type is its third value).
   // Values: station, transaction, event type, seqNo, timestamp, triggerReason.
   if (text.includes('AND te.seq_no = ?')) {
@@ -106,13 +112,16 @@ function route(text: string, values: unknown[]): unknown[] {
     return [{ id: 'session-1' }];
   }
   if (text.includes('SELECT id FROM charging_stations WHERE station_id')) return [{ id: 'sta-1' }];
-  if (text.includes('SELECT site_id FROM charging_stations')) return [{ site_id: 'site-1' }];
+  if (text.includes('SELECT site_id FROM charging_stations')) {
+    return [{ site_id: db.stationSiteId }];
+  }
   if (text.includes('SELECT s.name FROM sites')) return [{ name: 'Site 1' }];
   if (text.includes('ocpp_protocol FROM charging_stations')) return [{ ocpp_protocol: 'ocpp2.1' }];
   if (text.includes('INSERT INTO charging_sessions')) return [{ id: 'session-1' }];
   if (text.includes('SELECT is_roaming')) return [{ is_roaming: false }];
   if (text.includes('SELECT driver_id FROM charging_sessions')) return [{ driver_id: db.driverId }];
-  if (text.includes('FROM driver_tokens')) return db.tokenRow != null ? [db.tokenRow] : [];
+  if (text.includes('FROM driver_tokens') && !text.includes('JOIN reservations r'))
+    return db.tokenRow != null ? [db.tokenRow] : [];
   if (text.includes('UPDATE charging_sessions SET driver_id')) return [];
   if (text.includes('FROM guest_sessions')) {
     // TransactionStarted moves the guest session to charging, so a second
@@ -127,13 +136,32 @@ function route(text: string, values: unknown[]): unknown[] {
       },
     ];
   }
-  if (text.includes('token_id FROM reservations')) {
-    // The active reservation, or the one the session is already linked to
-    // when the statement matches that too.
-    const linkedMatch = text.includes('r.id = (SELECT cs.reservation_id');
+  if (text.includes('JOIN reservations r ON r.station_id = cs.station_id')) {
+    // The echoed reservation while active, or the one the session is already
+    // linked to. The holder (drv-1) started it with another of their cards.
+    // A Started without a reservation id finds no hold in its window.
+    const echoed = text.includes('AND r.reservation_id = ?');
     const found =
-      db.reservationStatus === 'active' || (linkedMatch && db.sessionReservationId === 'res-1');
-    return found ? [{ id: 'res-1', token_id: 'tok-1' }] : [];
+      (echoed && db.reservationStatus === 'active') || db.sessionReservationId === 'res-1';
+    return found
+      ? [
+          {
+            id: 'res-1',
+            reservation_id: 7,
+            driver_id: 'drv-1',
+            token_id: 'tok-0',
+            evse_id: null,
+            status: db.reservationStatus,
+            expires_at: '2030-01-01 00:00:00+00',
+            session_driver_id: 'drv-1',
+            session_token_id: 'tok-1',
+            session_evse_id: 'evse-1',
+            session_reservation_id: db.sessionReservationId,
+            id_token_id: 'tok-1',
+            id_token_driver_id: 'drv-1',
+          },
+        ]
+      : [];
   }
   if (text.includes('UPDATE charging_sessions SET reservation_id')) {
     db.sessionReservationId = 'res-1';
@@ -142,9 +170,8 @@ function route(text: string, values: unknown[]): unknown[] {
   if (text.includes("UPDATE reservations SET status = 'in_use'")) {
     if (db.reservationStatus !== 'active') return [];
     db.reservationStatus = 'in_use';
-    return [{ id: 'res-1', driver_id: 'drv-1' }];
+    return [{ id: 'res-1' }];
   }
-  if (text.includes('SELECT token_id FROM charging_sessions')) return [{ token_id: 'tok-1' }];
   if (text.includes('SELECT reservation_id FROM charging_sessions')) {
     return [{ reservation_id: db.sessionReservationId }];
   }
@@ -259,6 +286,8 @@ const mockReprice = vi.fn().mockResolvedValue(false);
 const mockFreeVend = vi.fn().mockResolvedValue(false);
 const mockElectricityPeriods = vi.fn().mockResolvedValue([]);
 vi.mock('@evtivity/database', async () => ({
+  // The session audit of a CSMS stop or fault (tested in payment-stop.test.ts).
+  writeCsmsSessionAudit: vi.fn().mockResolvedValue(undefined),
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../../database/src/lib/session-end-request.js',
   )),
@@ -269,8 +298,13 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../../database/src/lib/session-pricing.js',
   )),
+  // The real register energy rule (session-energy), on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../../database/src/lib/session-energy.js',
+  )),
   ...(await vi.importActual<Record<string, unknown>>('../../../../database/src/lib/pg-errors.js')),
   resolveStationTariff: vi.fn(() => Promise.resolve(TARIFF)),
+  sessionGroupHasPaidTariff: vi.fn(() => Promise.resolve(false)),
   repriceSessionForDriver: (...args: unknown[]) => mockReprice(...args) as unknown,
   // Every ended session costs 15.00 (net, no tax).
   priceSessionAt: vi.fn(() =>
@@ -441,6 +475,7 @@ beforeEach(() => {
   db.reservedCents = 0;
   db.unauthorizedClaimOpen = false;
   db.eventRows.clear();
+  db.stationSiteId = 'site-1';
   vi.clearAllMocks();
   mockFreeVend.mockResolvedValue(false);
   mockElectricityPeriods.mockResolvedValue([]);
@@ -451,16 +486,43 @@ beforeEach(() => {
   });
 });
 
+describe('TransactionEvent Started tariff time (B5)', () => {
+  it('resolves the tariff at the Started timestamp, once across a rerun', async () => {
+    const { resolveStationTariff } = await import('@evtivity/database');
+    failOn = { match: 'SELECT token_id FROM charging_sessions', code: 'CONNECT_TIMEOUT', left: 1 };
+
+    await projectWithRetry(startedEvent({ timestamp: '2026-10-07T09:30:00.000Z' }));
+
+    expect(resolveStationTariff).toHaveBeenCalledTimes(1);
+    expect(resolveStationTariff).toHaveBeenCalledWith(
+      expect.objectContaining({ at: new Date('2026-10-07T09:30:00.000Z') }),
+      expect.anything(),
+    );
+  });
+
+  it('resolves a Started timestamp ahead of the CSMS clock at now', async () => {
+    const { resolveStationTariff } = await import('@evtivity/database');
+    const before = Date.now();
+
+    await projectWithRetry(startedEvent({ timestamp: '2099-01-01T00:00:00.000Z' }));
+
+    const [query] = vi.mocked(resolveStationTariff).mock.calls[0] ?? [];
+    const at = query?.at ?? new Date(0);
+    expect(at.getTime()).toBeGreaterThanOrEqual(before);
+    expect(at.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+});
+
 describe('TransactionEvent Started run again after a lost connection', () => {
   it('keeps the reservation link and writes each effect once when the reservation step fails', async () => {
     db.tokenRow = { id: 'tok-1', driver_id: 'drv-1', prepaid_balance_cents: null };
-    // The reservation token check runs after the transaction event, the
-    // tariff segment and the reservation moving to in_use.
-    failOn = { match: 'SELECT token_id FROM charging_sessions', code: 'CONNECT_TIMEOUT', left: 1 };
+    // The reservation token mismatch marker is written after the transaction
+    // event, the tariff segment and the reservation moving to in_use.
+    failOn = { match: 'reservationTokenMismatch', code: 'CONNECT_TIMEOUT', left: 1 };
 
     await projectWithRetry(startedEvent({ reservationId: 7 }));
 
-    expect(countCalls('SELECT token_id FROM charging_sessions')).toBe(2);
+    expect(countCalls('reservationTokenMismatch')).toBe(2);
     expect(countCalls('INSERT INTO transaction_events')).toBe(1);
     expect(countCalls('INSERT INTO session_tariff_segments')).toBe(1);
     expect(mockWriteReservationAudit).toHaveBeenCalledTimes(1);
@@ -627,11 +689,11 @@ describe('TransactionEvent Started run again after a lost connection', () => {
 
   it('gates the session on the last run when the reservation link keeps failing', async () => {
     db.tokenRow = { id: 'tok-1', driver_id: 'drv-1', prepaid_balance_cents: null };
-    failOn = { match: 'SELECT token_id FROM charging_sessions', code: 'CONNECT_TIMEOUT', left: 3 };
+    failOn = { match: 'reservationTokenMismatch', code: 'CONNECT_TIMEOUT', left: 3 };
 
     await projectWithRetry(startedEvent({ reservationId: 7 }));
 
-    expect(countCalls('SELECT token_id FROM charging_sessions')).toBe(3);
+    expect(countCalls('reservationTokenMismatch')).toBe(3);
     expect(mockAuthorizeSessionHold).toHaveBeenCalledTimes(1);
     expect(drain).toHaveBeenCalledTimes(1);
   });
@@ -855,7 +917,7 @@ describe('TransactionEvent Ended run again after a lost connection', () => {
 
     expect(finalCosts()).toEqual([1500, 1500]);
     expect(countCalls('INSERT INTO transaction_events')).toBe(1);
-    // Closing the open segment again is a no-op (ended_at IS NULL guard).
+    // Closing the segments again at the same end writes the same values.
     expect(countCalls('UPDATE session_tariff_segments')).toBe(2);
     expect(csmsEvents('TransactionEnded')).toHaveLength(1);
     expect(countCalls("UPDATE reservations SET status = 'used'")).toBe(1);
@@ -916,6 +978,64 @@ describe('TransactionEvent Ended run again after a lost connection', () => {
     expect(mockElectricityPeriods).toHaveBeenCalledTimes(2);
     expect(countCalls('INSERT INTO transaction_events')).toBe(1);
     expect(csmsEvents('TransactionEnded')).toHaveLength(1);
+  });
+
+  describe('a session left without an electricity cost', () => {
+    const period = (restrictions: Record<string, unknown> | null) => ({
+      id: 1,
+      siteId: 'site-1',
+      name: 'Rate',
+      ratePerKwh: '0.200000',
+      restrictions,
+      priority: restrictions == null ? 0 : 20,
+      isDefault: restrictions == null,
+    });
+
+    function noCostLogs(): unknown[][] {
+      return vi
+        .mocked(logger.info)
+        .mock.calls.filter((call) => call[1] === 'Electricity cost not recorded');
+    }
+
+    it.each([
+      ['no_periods', () => mockElectricityPeriods.mockResolvedValue([])],
+      [
+        'no_matching_period',
+        () =>
+          mockElectricityPeriods.mockResolvedValue([
+            period({ timeRange: { startTime: '00:00', endTime: '23:59' }, daysOfWeek: [] }),
+          ]),
+      ],
+      [
+        'zero_energy',
+        () => {
+          db.endedEnergyWh = 0;
+          mockElectricityPeriods.mockResolvedValue([period(null)]);
+        },
+      ],
+      ['no_site', () => (db.stationSiteId = null)],
+    ])('logs the reason %s once at info and writes no cost', async (reason, arrange) => {
+      arrange();
+
+      await projectWithRetry(transactionEvent('Ended'));
+
+      expect(noCostLogs()).toEqual([
+        [
+          expect.objectContaining({ sessionId: 'session-1', stationId: 'CS-1', reason }),
+          'Electricity cost not recorded',
+        ],
+      ]);
+      expect(countCalls('SET electricity_cost_cents')).toBe(0);
+    });
+
+    it('writes the cost without a log when the default period applies', async () => {
+      mockElectricityPeriods.mockResolvedValue([period(null)]);
+
+      await projectWithRetry(transactionEvent('Ended'));
+
+      expect(noCostLogs()).toEqual([]);
+      expect(countCalls('SET electricity_cost_cents')).toBe(1);
+    });
   });
 
   it('finishes the end on the last run when a fail-open step keeps failing', async () => {

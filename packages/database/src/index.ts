@@ -3,6 +3,8 @@
 
 export * from './schema/index.js';
 export { db, client } from './config.js';
+export { toDate, toDateOrNull, toIsoOrNull } from './lib/raw-timestamp.js';
+export type { RawTimestamp } from './lib/raw-timestamp.js';
 export { PgEventPersistence } from './event-persistence.js';
 export {
   pgErrorCode,
@@ -12,6 +14,8 @@ export {
   PG_FOREIGN_KEY_VIOLATION,
 } from './lib/pg-errors.js';
 export type { PgConnectionErrorKind } from './lib/pg-errors.js';
+export { guardPgConnectionRejections } from './lib/pg-connection-rejections.js';
+export type { PgConnectionRejectionLogger } from './lib/pg-connection-rejections.js';
 export { isRoamingEnabled, clearRoamingCache } from './lib/roaming-setting.js';
 export {
   isPncEnabled,
@@ -27,6 +31,7 @@ export {
 export { isSiteFreeVendEnabledByStation, clearFreeVendCache } from './lib/free-vend-setting.js';
 export {
   getElectricityRatePeriodsForSite,
+  loadElectricityRatePeriodsForSite,
   clearElectricityRateCache,
 } from './lib/electricity-rate.js';
 export {
@@ -35,15 +40,27 @@ export {
   invalidateReservationSettingsCache,
 } from './lib/reservation-setting.js';
 export type { ReservationSettings } from './lib/reservation-setting.js';
+export {
+  snapshotReservationFeeTerms,
+  resolveReservationFeeTerms,
+} from './lib/reservation-fee-terms.js';
+export type { ReservationFeeSnapshot, ReservationFeeTerms } from './lib/reservation-fee-terms.js';
 export { isSupportEnabled, clearSupportCache } from './lib/support-setting.js';
 export { getPlatformFeePercent, clearPlatformFeeCache } from './lib/payment-settings.js';
 export { writeReservationAudit, reservationDiffChanged } from './lib/reservation-audit.js';
+export { writeCsmsSessionAudit } from './lib/session-csms-audit.js';
+export type { CsmsSessionAuditArgs } from './lib/session-csms-audit.js';
 export type {
   ReservationAuditAction,
   ReservationAuditActor,
   WriteReservationAuditArgs,
 } from './lib/reservation-audit.js';
-export { writeAudit, redactAuditPayload } from './lib/audit.js';
+export {
+  writeAudit,
+  redactAuditPayload,
+  runWithAuditViaAi,
+  currentAuditViaAi,
+} from './lib/audit.js';
 export { createCreditCdr, creditCdrData, negateOcpiPrice } from './lib/ocpi-credit-cdr.js';
 export type { CreditCdrResult } from './lib/ocpi-credit-cdr.js';
 export { ocpiLocationAudience } from './lib/ocpi-location-audience.js';
@@ -58,6 +75,7 @@ export type { RemovedOcpiEvse, RemovedEvseConnector } from './lib/ocpi-removed-e
 export {
   loadSessionPricing,
   sessionIdleMinutesAt,
+  eventTimeAtMostNow,
   reservationHoldingMinutes,
   priceSession,
   priceSessionAt,
@@ -67,12 +85,23 @@ export {
   storeFinalCost,
   snapshotSessionTariff,
   openFirstTariffSegment,
-  closeOpenSegment,
-  openSegmentTariffId,
+  closeSegmentsAt,
+  segmentsAt,
   switchTariffSegment,
   repriceSessionForDriver,
 } from './lib/session-pricing.js';
 export type { SessionPricingRow, TariffPriceSnapshot } from './lib/session-pricing.js';
+export {
+  applyRegisterReading,
+  applySessionEnergyReading,
+  registerStateFromRow,
+} from './lib/session-energy.js';
+export type {
+  RegisterReadingKind,
+  RegisterReadingResult,
+  SessionEnergyUpdate,
+  SessionRegisterState,
+} from './lib/session-energy.js';
 export {
   SESSION_REBILL_LEASE_SECONDS,
   claimSessionRebill,
@@ -83,7 +112,14 @@ export {
 export type { RebillPricing, SessionRebillOutcome } from './lib/session-rebill.js';
 export {
   loadStationPricing,
+  loadStationPricingChain,
+  loadGroupPricingAtStation,
+  pickFromChain,
+  hasPaidTariff,
+  sessionGroupHasPaidTariff,
+  listPricingGroupsWithoutDefault,
   resolveStationTariff,
+  resolveStationPricing,
   resolveGroupTariffs,
   pickTariff,
   isStationChargingFree,
@@ -93,6 +129,7 @@ export {
 } from './lib/tariff-resolution.js';
 export {
   ACCOUNT_BILLING_MIN_VERSION,
+  MEMBER_INVOICE_MIN_VERSION,
   resolveAccountBilling,
   loadBillingMemberships,
   pickAccountBilling,
@@ -176,12 +213,27 @@ export {
 } from './lib/station-offline.js';
 export type { StaleOnlineStation, StationMarkedOffline } from './lib/station-offline.js';
 export {
-  STATION_WATCH_CHANNEL,
+  LEGACY_OCPP_HEALTH_ID,
+  OCPP_HEALTH_PRUNE_MS,
+  OCPP_HEALTH_SNAPSHOT_INTERVAL_MS,
+  OCPP_HEALTH_STALE_MS,
+  aggregateOcppHealth,
+  deleteOcppInstanceHealth,
+  getOcppFleetHealth,
+  pruneStaleOcppHealth,
+  writeOcppInstanceHealth,
+} from './lib/ocpp-server-health.js';
+export type {
+  OcppFleetHealth,
+  OcppInstanceHealth,
+  OcppInstanceHealthSnapshot,
+} from './lib/ocpp-server-health.js';
+export {
+  STATION_WATCH_JOB_NAME,
   findDueStationWatch,
   alertStationWatchersIfAvailable,
   claimStationWatches,
 } from './lib/station-watch.js';
-export type { StationWatchPublisher } from './lib/station-watch.js';
 export type {
   StationAvailability,
   StationDisabledReason,
@@ -193,7 +245,25 @@ export type {
   ConnectorStatusResult,
   StationLevelState,
 } from './lib/station-status.js';
-export type { AuditActor, WriteAuditArgs } from './lib/audit.js';
+export type { AuditActor, AuditViaAi, WriteAuditArgs } from './lib/audit.js';
+export {
+  FIRMWARE_UPDATE_TERMINAL_STATUSES,
+  FIRMWARE_UPDATE_REFUSED_RESPONSES,
+  FIRMWARE_STATUS_TO_CAMPAIGN_STATION,
+  isTerminalFirmwareUpdateStatus,
+  applyFirmwareCampaignStationStatus,
+  completeFirmwareCampaignIfDone,
+  rejectFirmwareUpdate,
+  failCanceledFirmwareCampaignUpdates,
+} from './lib/firmware-updates.js';
+export type {
+  FirmwareCampaignStationStatus,
+  CampaignStationUpdate,
+} from './lib/firmware-updates.js';
+export {
+  dispatchPendingFirmwareCampaigns,
+  newFirmwareRequestId,
+} from './lib/firmware-campaign-dispatch.js';
 export { isFleetEnabled, clearFleetCache } from './lib/fleet-setting.js';
 export {
   guardVersion,
@@ -214,7 +284,7 @@ export type {
 } from './lib/process-versions.js';
 export { isPortalRegistrationEnabled } from './lib/portal-registration-setting.js';
 export { isGuestChargingEnabled, clearGuestChargingCache } from './lib/guest-setting.js';
-export { getIdlingGracePeriodMinutes } from './lib/idling-setting.js';
+export { getIdlingGracePeriodMinutes, clearIdlingSettingCache } from './lib/idling-setting.js';
 export {
   PREPAID_LOW_CREDIT_THRESHOLD_KEY,
   DEFAULT_PREPAID_LOW_CREDIT_THRESHOLD_CENTS,
@@ -278,6 +348,16 @@ export {
 export type { RecaptchaConfig, MfaConfig } from './lib/security-settings.js';
 export { isSplitBillingEnabled, clearPricingSettingsCache } from './lib/pricing-settings.js';
 export {
+  buildStationOcppTariff,
+  sendSessionTariffChange,
+  stationTariffCapabilities,
+} from './lib/ocpp-session-tariff.js';
+export type {
+  StationTariffCapabilities,
+  StationTariffQuery,
+  TariffChangeOutcome,
+} from './lib/ocpp-session-tariff.js';
+export {
   isStationMessageEnabled,
   getStationMessagePricingFormat,
   getStationMessageRefreshSeconds,
@@ -294,6 +374,8 @@ export {
   getSampledMeasurands,
   getAlignedMeasurands,
   getTxEndedMeasurands,
+  isIso15118Enabled,
+  getDefaultMaxPowerW,
 } from './lib/ocpp-settings.js';
 export {
   getRegistrationPolicy,
@@ -301,8 +383,49 @@ export {
 } from './lib/registration-settings.js';
 export { isAutoDisableOnCriticalEnabled } from './lib/auto-disable-setting.js';
 export { getSentryConfig } from './lib/sentry-settings.js';
-export { isChatbotAiEnabled, clearChatbotAiSettingsCache } from './lib/ai-settings.js';
-export { isSupportAiEnabled, clearSupportAiSettingsCache } from './lib/support-ai-setting.js';
+export {
+  getAiSettings,
+  isChatbotAiEnabled,
+  isSupportAiEnabled,
+  getOpsAiSettings,
+  isOpsAiEnabled,
+  getDriverAiSettings,
+  isDriverAiEnabled,
+  getAiInsightSettings,
+  getInsightAiSettings,
+  getAiWorkerSettings,
+  getAiMcpSettings,
+  isAiMcpEnabled,
+  isAiInsightsEnabled,
+  clearAiSettingsCache,
+} from './lib/ai-settings.js';
+export { computeInsightScopeCounts, insightSiteScopeCounts } from './lib/insight-scope.js';
+export type { InsightScopeInput } from './lib/insight-scope.js';
+export {
+  AI_USAGE_THRESHOLD_EVENT,
+  aiBudgetLevel,
+  aiUsageBySiteAndSurface,
+  aiUsageMonth,
+  aiUsageMonthOf,
+  aiUsageOfUser,
+  aiUsageTopUsers,
+  aiUsageUtcDay,
+  checkAiBudgets,
+  clearAiUsageCache,
+  evaluateAiBudgets,
+  getSiteMonthlyTokenBudget,
+  isAiUsageMonth,
+  recordAiUsage,
+} from './lib/ai-usage.js';
+export type {
+  AiBudgetContext,
+  AiBudgetLimits,
+  AiBudgetSumKey,
+  AiUsageMonth,
+  AiUsagePeriod,
+  AiUsageRecord,
+  AiUsageSums,
+} from './lib/ai-usage.js';
 export { getSsoConfig, clearSsoSettingsCache } from './lib/sso-settings.js';
 export type { SsoConfig } from './lib/sso-settings.js';
 export { getAttestationConfig, clearAttestationConfigCache } from './lib/attestation-settings.js';

@@ -38,7 +38,7 @@ describe('createQueues', () => {
     }
   });
 
-  it('creates all thirteen queues with the expected names', async () => {
+  it('creates all seventeen queues with the expected names', async () => {
     const { createQueues, QUEUE_NAMES } = queuesModule;
     const queues = createQueues('redis://localhost:6379');
 
@@ -50,11 +50,15 @@ describe('createQueues', () => {
     expect(queues.maintenanceFanoutQueue).toBeDefined();
     expect(queues.fleetBillingFanoutQueue).toBeDefined();
     expect(queues.fleetInvoiceQueue).toBeDefined();
+    expect(queues.memberInvoiceQueue).toBeDefined();
     expect(queues.stationWatchQueue).toBeDefined();
     expect(queues.paymentWebhookQueue).toBeDefined();
     expect(queues.remoteStartTimeoutQueue).toBeDefined();
     expect(queues.stationMessageQueue).toBeDefined();
     expect(queues.reportQueue).toBeDefined();
+    expect(queues.aiWorkerQueue).toBeDefined();
+    expect(queues.aiInsightQueue).toBeDefined();
+    expect(queues.driverAiQueue).toBeDefined();
 
     const names = queueCalls.map((c) => c.name);
     expect(names).toEqual([
@@ -66,11 +70,15 @@ describe('createQueues', () => {
       QUEUE_NAMES.MAINTENANCE_FANOUT,
       QUEUE_NAMES.FLEET_BILLING_FANOUT,
       QUEUE_NAMES.FLEET_INVOICES,
+      QUEUE_NAMES.MEMBER_INVOICES,
       QUEUE_NAMES.STATION_WATCH,
       QUEUE_NAMES.PAYMENT_WEBHOOKS,
       QUEUE_NAMES.REMOTE_START_TIMEOUTS,
       QUEUE_NAMES.STATION_MESSAGES,
       QUEUE_NAMES.REPORTS,
+      QUEUE_NAMES.AI_WORKERS,
+      QUEUE_NAMES.AI_INSIGHTS,
+      QUEUE_NAMES.DRIVER_AI,
     ]);
     expect(names).toEqual([
       'cron-jobs',
@@ -81,11 +89,15 @@ describe('createQueues', () => {
       'maintenance-fanout',
       'fleet-billing-fanout',
       'fleet-invoices',
+      'member-invoices',
       'station-watch',
       'payment-webhooks',
       'remote-start-timeouts',
       'station-messages',
       'reports',
+      'ai-workers',
+      'ai-insights',
+      'driver-ai',
     ]);
   });
 
@@ -94,7 +106,7 @@ describe('createQueues', () => {
     const { createQueues } = queuesModule;
     createQueues('redis://localhost:6379');
 
-    expect(createBullMQConnection).toHaveBeenCalledTimes(13);
+    expect(createBullMQConnection).toHaveBeenCalledTimes(17);
     expect(createBullMQConnection).toHaveBeenCalledWith('redis://localhost:6379');
     for (const call of queueCalls) {
       expect(call.opts.connection).toBe(mockConnection);
@@ -132,6 +144,10 @@ describe('createQueues', () => {
       attempts: 6,
       backoff: { type: 'exponential', delay: 300_000 },
     });
+    // Member invoices share the fleet invoice options on their own queue.
+    expect(byName['member-invoices']?.['defaultJobOptions']).toEqual(
+      byName['fleet-invoices']?.['defaultJobOptions'],
+    );
   });
 
   it('configures retry attempts and exponential backoff on guest-session and reservation queues', async () => {

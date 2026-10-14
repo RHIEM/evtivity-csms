@@ -4,14 +4,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { BillingMembership } from '@evtivity/database';
 
-const { isFleetEnabled, loadBillingMemberships, dispatchDriverNotification, publish } = vi.hoisted(
-  () => ({
-    isFleetEnabled: vi.fn(),
-    loadBillingMemberships: vi.fn(),
-    dispatchDriverNotification: vi.fn(),
-    publish: vi.fn(),
-  }),
-);
+const { isFleetEnabled, loadBillingMemberships, dispatchDriverNotification, add, jobQueue } =
+  vi.hoisted(() => {
+    const addFn = vi.fn();
+    return {
+      isFleetEnabled: vi.fn(),
+      loadBillingMemberships: vi.fn(),
+      dispatchDriverNotification: vi.fn(),
+      add: addFn,
+      jobQueue: vi.fn(() => ({ add: addFn, addBulk: vi.fn() })),
+    };
+  });
 
 vi.mock('@evtivity/database', async () => {
   const actual = await vi.importActual<typeof import('../../../database/src/lib/fleet-billing.js')>(
@@ -27,17 +30,20 @@ vi.mock('@evtivity/lib', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@evtivity/lib')>()),
   dispatchDriverNotification,
 }));
-vi.mock('@evtivity/lib/pubsub-instance', () => ({ getPubSub: () => ({ publish }) }));
+vi.mock('@evtivity/lib/job-queues', () => ({ jobQueue }));
 vi.mock('../template-dirs.js', () => ({ ALL_TEMPLATES_DIRS: ['templates'] }));
 
 const {
+  fanoutChange,
   membershipsAround,
   notifyAccountBillingChange,
   fleetBillingFanoutJobId,
-  publishFleetBillingFanout,
+  enqueueFleetBillingFanout,
   runFleetBillingFanout,
-  FLEET_BILLING_FANOUT_CHANNEL,
+  FLEET_BILLING_FANOUT_JOB_NAME,
 } = await import('../fleet-billing-notice.js');
+const { FLEET_BILLING_FANOUT_JOB_OPTIONS, FLEET_BILLING_FANOUT_QUEUE } =
+  await import('@evtivity/lib/worker-queues');
 
 const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 const sql = vi.fn() as never;
@@ -45,7 +51,9 @@ const sql = vi.fn() as never;
 function m(
   id: number,
   fleet: string,
-  options: Partial<Pick<BillingMembership, 'accountBillingEnabled' | 'optOut'>> & {
+  options: Partial<
+    Pick<BillingMembership, 'accountBillingEnabled' | 'optOut' | 'invoiceRecipient'>
+  > & {
     day?: number;
   } = {},
 ): BillingMembership {
@@ -54,6 +62,7 @@ function m(
     fleetId: `flt_${fleet}`,
     fleetName: fleet,
     accountBillingEnabled: options.accountBillingEnabled ?? true,
+    invoiceRecipient: options.invoiceRecipient ?? 'fleet',
     optOut: options.optOut ?? false,
     createdAt: new Date(Date.UTC(2026, 0, options.day ?? id)),
   };
@@ -75,6 +84,37 @@ describe('membershipsAround', () => {
     });
     expect(before[0]?.accountBillingEnabled).toBe(false);
     expect(after[0]?.accountBillingEnabled).toBe(true);
+  });
+
+  it('pins the invoice recipient (and a switch set in the same write) in after', () => {
+    const current = [m(1, 'A', { invoiceRecipient: 'member', accountBillingEnabled: false })];
+    const only = membershipsAround(current, {
+      kind: 'recipient',
+      fleetId: 'flt_A',
+      recipient: 'member',
+    });
+    expect(only.before[0]).toMatchObject({
+      invoiceRecipient: 'fleet',
+      accountBillingEnabled: false,
+    });
+    expect(only.after[0]).toMatchObject({
+      invoiceRecipient: 'member',
+      accountBillingEnabled: false,
+    });
+    const both = membershipsAround(current, {
+      kind: 'recipient',
+      fleetId: 'flt_A',
+      recipient: 'member',
+      enabled: true,
+    });
+    expect(both.before[0]).toMatchObject({
+      invoiceRecipient: 'fleet',
+      accountBillingEnabled: false,
+    });
+    expect(both.after[0]).toMatchObject({
+      invoiceRecipient: 'member',
+      accountBillingEnabled: true,
+    });
   });
 
   it('adds back a membership that was removed', () => {
@@ -106,9 +146,43 @@ describe('notifyAccountBillingChange', () => {
       sql,
       'fleet.AccountBillingChanged',
       'drv_1',
-      { fleetName: 'A', billedTo: 'A', accountBilling: true },
+      {
+        fleetName: 'A',
+        billedTo: 'A',
+        accountBilling: true,
+        invoicedTo: 'fleet',
+        invoicedToMember: false,
+      },
       ['templates'],
     );
+  });
+
+  it('tells a member their sessions are now invoiced to them (invoicedTo)', async () => {
+    loadBillingMemberships.mockResolvedValue([m(1, 'A', { invoiceRecipient: 'member' })]);
+    expect(
+      await notifyAccountBillingChange(
+        sql,
+        'drv_1',
+        { kind: 'recipient', fleetId: 'flt_A', recipient: 'member' },
+        log,
+      ),
+    ).toBe(true);
+    expect(dispatchDriverNotification.mock.calls[0]?.[3]).toEqual({
+      fleetName: 'A',
+      billedTo: 'A',
+      accountBilling: true,
+      invoicedTo: 'member',
+      invoicedToMember: true,
+    });
+  });
+
+  it('notifies nothing on a recipient change for a member billed elsewhere or by card', async () => {
+    loadBillingMemberships.mockResolvedValue([m(1, 'Old'), m(2, 'A')]);
+    const change = { kind: 'recipient' as const, fleetId: 'flt_A', recipient: 'member' as const };
+    expect(await notifyAccountBillingChange(sql, 'drv_1', change, log)).toBe(false);
+    loadBillingMemberships.mockResolvedValue([m(1, 'A', { optOut: true })]);
+    expect(await notifyAccountBillingChange(sql, 'drv_1', change, log)).toBe(false);
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
   });
 
   it('notifies nothing when an older membership still wins (billing unchanged)', async () => {
@@ -144,7 +218,13 @@ describe('notifyAccountBillingChange', () => {
       sql,
       'fleet.AccountBillingChanged',
       'drv_1',
-      { fleetName: 'Old', billedTo: 'New', accountBilling: true },
+      {
+        fleetName: 'Old',
+        billedTo: 'New',
+        accountBilling: true,
+        invoicedTo: 'fleet',
+        invoicedToMember: false,
+      },
       ['templates'],
     );
   });
@@ -161,7 +241,13 @@ describe('notifyAccountBillingChange', () => {
       sql,
       'fleet.AccountBillingChanged',
       'drv_1',
-      { fleetName: 'A', billedTo: '', accountBilling: false },
+      {
+        fleetName: 'A',
+        billedTo: '',
+        accountBilling: false,
+        invoicedTo: '',
+        invoicedToMember: false,
+      },
       ['templates'],
     );
   });
@@ -194,12 +280,37 @@ describe('fleet switch fan-out', () => {
     expect(fleetBillingFanoutJobId(job)).not.toContain(':');
   });
 
-  it('publishes the job and logs a lost publish (fail-open)', async () => {
-    publish.mockResolvedValueOnce(undefined);
-    await publishFleetBillingFanout(job, log);
-    expect(publish).toHaveBeenCalledWith(FLEET_BILLING_FANOUT_CHANNEL, JSON.stringify(job));
-    publish.mockRejectedValueOnce(new Error('redis down'));
-    await expect(publishFleetBillingFanout(job, log)).resolves.toBeUndefined();
+  it('gives a recipient change its own job id and member-level change', () => {
+    const recipientJob = { ...job, recipient: 'member' as const };
+    expect(fleetBillingFanoutJobId(recipientJob)).toBe(
+      `fbf.flt_A.on.member.${String(Date.parse(job.changedAt))}`,
+    );
+    expect(fanoutChange(job)).toEqual({ kind: 'fleet', fleetId: 'flt_A', enabled: true });
+    expect(fanoutChange(recipientJob)).toEqual({
+      kind: 'recipient',
+      fleetId: 'flt_A',
+      recipient: 'member',
+    });
+    expect(fanoutChange({ ...recipientJob, enabledChanged: true })).toEqual({
+      kind: 'recipient',
+      fleetId: 'flt_A',
+      recipient: 'member',
+      enabled: true,
+    });
+  });
+
+  it('adds the job to the worker queue under its change id and logs a failed add (fail-open)', async () => {
+    add.mockResolvedValueOnce(undefined);
+    await enqueueFleetBillingFanout(job, log);
+    expect(jobQueue).toHaveBeenCalledWith(
+      FLEET_BILLING_FANOUT_QUEUE,
+      FLEET_BILLING_FANOUT_JOB_OPTIONS,
+    );
+    expect(add).toHaveBeenCalledWith(FLEET_BILLING_FANOUT_JOB_NAME, job, {
+      jobId: fleetBillingFanoutJobId(job),
+    });
+    add.mockRejectedValueOnce(new Error('redis down'));
+    await expect(enqueueFleetBillingFanout(job, log)).resolves.toBeUndefined();
     expect(log.error).toHaveBeenCalled();
   });
 

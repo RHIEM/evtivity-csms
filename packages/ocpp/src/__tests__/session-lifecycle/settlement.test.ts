@@ -151,10 +151,14 @@ describe('settleTransactionEnded', () => {
     sqlResults = [[sessionRow], [endedSessionRow('completed')], []];
     mockSettleSessionPayment.mockResolvedValue({ mode: 'none' });
     await settleTransactionEnded(deps, endedEvent(), attempt);
-    expect(mockSettleSessionPayment).toHaveBeenCalledWith('sess-1', deps.payments, {
-      rethrowConnectionErrors: false,
-      resumeAdjustment: false,
-    });
+    expect(mockSettleSessionPayment).toHaveBeenCalledWith(
+      'sess-1',
+      { ...deps.payments, actor: { actor: 'ocpp', actorLabel: 'session-settlement' } },
+      {
+        rethrowConnectionErrors: false,
+        resumeAdjustment: false,
+      },
+    );
   });
 
   it('prepaid: a debit already recorded is logged as such and still published', async () => {
@@ -191,10 +195,14 @@ describe('settleTransactionEnded', () => {
 
     await settleTransactionEnded(deps, endedEvent(), { ...attempt, number: 2, isLast: false });
 
-    expect(mockSettleSessionPayment).toHaveBeenCalledWith('sess-1', deps.payments, {
-      rethrowConnectionErrors: true,
-      resumeAdjustment: true,
-    });
+    expect(mockSettleSessionPayment).toHaveBeenCalledWith(
+      'sess-1',
+      { ...deps.payments, actor: { actor: 'ocpp', actorLabel: 'session-settlement' } },
+      {
+        rethrowConnectionErrors: true,
+        resumeAdjustment: true,
+      },
+    );
   });
 
   it('prepaid: notifies payment.settled, publishes token.changed, sends the session end emails', async () => {
@@ -340,11 +348,34 @@ describe('settleTransactionEnded', () => {
       expect(variablesOf(eventType)).toMatchObject({
         billingMode: 'account',
         billedTo: 'Acme',
+        billedToMember: false,
         notCharged: false,
       });
     }
     expect(notifyChange).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('member-billed account session: the emails say it is invoiced to the driver', async () => {
+    sqlResults = [
+      [sessionRow],
+      [
+        {
+          ...endedSessionRow('completed'),
+          billing_mode: 'account',
+          member_billed: true,
+          billing_fleet_name: 'Acme',
+        },
+      ],
+      [],
+    ];
+    mockSettleSessionPayment.mockResolvedValue({ mode: 'account', billingFleetId: 'flt-1' });
+
+    await settleTransactionEnded(deps, endedEvent(), attempt);
+
+    for (const eventType of ['session.Completed', 'session.Receipt']) {
+      expect(variablesOf(eventType)).toMatchObject({ billedTo: 'Acme', billedToMember: true });
+    }
   });
 
   it('account with a payment record (operator hold): the emails do not say billed to the fleet', async () => {
@@ -598,7 +629,15 @@ describe('projectNotifySettlement', () => {
 
   it('records the settlement in cents and notifies the driver', async () => {
     sqlResults = [
-      [{ id: 'sess-1', driver_id: 'drv-1', station_id: 'station-uuid', currency: 'USD' }],
+      [
+        {
+          id: 'sess-1',
+          driver_id: 'drv-1',
+          station_id: 'station-uuid',
+          site_id: 'site-1',
+          currency: 'USD',
+        },
+      ],
     ];
     mockRecordTerminalSettlement.mockResolvedValue(true);
 
@@ -607,13 +646,21 @@ describe('projectNotifySettlement', () => {
       settlementEvent({ transactionId: 'tx-1', settlementAmount: 12.34 }),
     );
 
-    expect(mockRecordTerminalSettlement).toHaveBeenCalledWith({
-      sessionId: 'sess-1',
-      driverId: 'drv-1',
-      currency: 'USD',
-      capturedCents: 1234,
-    });
-    expect(notifyChange).toHaveBeenCalledWith('payment.settled', null, null, 'sess-1');
+    expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
+      {
+        sessionId: 'sess-1',
+        driverId: 'drv-1',
+        currency: 'USD',
+        capturedCents: 1234,
+      },
+      expect.objectContaining({ actor: { actor: 'ocpp', actorLabel: 'NotifySettlement' } }),
+    );
+    expect(notifyChange).toHaveBeenCalledWith(
+      'payment.settled',
+      'station-uuid',
+      'site-1',
+      'sess-1',
+    );
     expect(sentEvents()).toEqual(['session.PaymentReceived', 'payment.Complete']);
     expect(variablesOf('session.PaymentReceived')).toMatchObject({
       siteName: 'Main Site',

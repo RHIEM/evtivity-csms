@@ -20,6 +20,7 @@ import {
   FileBarChart,
   Globe,
   Shield,
+  Lightbulb,
   type LucideIcon,
 } from 'lucide-react';
 import type { ParseKeys } from 'i18next';
@@ -37,6 +38,11 @@ export interface NavEntry {
   requiredPermission: string | readonly string[];
   /** Feature toggle check. Omitted: always visible to users with the permission. */
   isVisible?: (flags: NavFeatureFlags) => boolean;
+  /**
+   * Company-wide page: shown only to users with access to every site (the API
+   * answers 404 to site-restricted users).
+   */
+  requiresAllSiteAccess?: boolean;
 }
 
 /** Every settings tab's read permission: the Settings entry shows when the user holds any. */
@@ -161,6 +167,16 @@ export const NAV_ENTRIES: readonly NavEntry[] = [
     isVisible: (flags) => flags.supportEnabled,
   },
   {
+    // Automatic insights, with the background worker suggestions whose action
+    // waits for a decision (the nav count).
+    to: '/ai/insights',
+    labelKey: 'nav.aiInsights',
+    icon: Lightbulb,
+    order: 145,
+    requiredPermission: 'aiInsights:read',
+    isVisible: (flags) => flags.aiInsightsEnabled,
+  },
+  {
     to: '/notifications',
     labelKey: 'nav.notifications',
     icon: Bell,
@@ -173,6 +189,8 @@ export const NAV_ENTRIES: readonly NavEntry[] = [
     icon: ScrollText,
     order: 160,
     requiredPermission: 'logs:read',
+    // Access logs and worker logs span every site.
+    requiresAllSiteAccess: true,
   },
   {
     to: '/audit',
@@ -190,15 +208,20 @@ export const NAV_ENTRIES: readonly NavEntry[] = [
   },
 ];
 
-/** The entries a user with `permissions` sees under `flags`, in sidebar order. */
+/**
+ * The entries a user with `permissions` sees under `flags`, in sidebar order.
+ * `hasAllSiteAccess` false hides the company-wide entries.
+ */
 export function visibleNavEntries(
   permissions: string[],
   flags: NavFeatureFlags,
+  hasAllSiteAccess: boolean,
   entries: readonly NavEntry[] = NAV_ENTRIES,
 ): NavEntry[] {
   return entries
     .filter((entry) => {
       if (entry.isVisible != null && !entry.isVisible(flags)) return false;
+      if (entry.requiresAllSiteAccess === true && !hasAllSiteAccess) return false;
       const required =
         typeof entry.requiredPermission === 'string'
           ? [entry.requiredPermission]

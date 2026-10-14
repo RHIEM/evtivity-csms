@@ -53,6 +53,15 @@ const BUILT_IN_GROUPS = [
   { resource: 'users', kind: 'page' },
   { resource: 'audit', kind: 'page' },
   { resource: 'maintenance', kind: 'page' },
+  // Chatting with the AI assistant. Configuring AI stays settings.ai.
+  { resource: 'aiAssistant', kind: 'page' },
+  // Automatic insights: read them; write regenerates, dismisses or rates them,
+  // and confirms or rejects the action an insight carries.
+  { resource: 'aiInsights', kind: 'page' },
+  // AI token usage and budgets. Own usage needs only aiAssistant:read.
+  { resource: 'aiUsage', kind: 'page' },
+  // MCP server access for API keys (`AI_MCP_USE_PERMISSION`).
+  { resource: 'aiMcp', kind: 'page' },
   { resource: 'settings.system', kind: 'settings' },
   { resource: 'settings.notification', kind: 'settings' },
   { resource: 'settings.payment', kind: 'settings' },
@@ -111,6 +120,13 @@ const OPERATOR_DEFAULTS: readonly Permission[] = [
   'audit:read',
   'maintenance:read',
   'maintenance:write',
+  'aiAssistant:read',
+  'aiAssistant:write',
+  'aiInsights:read',
+  'aiInsights:write',
+  'aiUsage:read',
+  'aiMcp:read',
+  'aiMcp:write',
 ];
 
 /** Viewer gets read-only access to operational pages. No write, no settings. */
@@ -137,7 +153,16 @@ const VIEWER_DEFAULTS: readonly Permission[] = [
   'users:read',
   'audit:read',
   'maintenance:read',
+  'aiAssistant:read',
+  'aiInsights:read',
 ];
+
+/**
+ * The scope an API key needs to call the MCP server (the plan's `aiMcp:use`).
+ * Permissions are read and write pairs, so using MCP is `aiMcp:read`;
+ * `aiMcp:write` implies it.
+ */
+export const AI_MCP_USE_PERMISSION: Permission = 'aiMcp:read';
 
 const RESOURCE_PATTERN = /^(settings\.)?[a-z][a-zA-Z0-9]*$/;
 

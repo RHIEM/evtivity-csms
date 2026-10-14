@@ -10,7 +10,9 @@ const {
   writeReservationAuditMock,
   chargeCancellationFeeMock,
   alertStationWatchersMock,
+  feeTermsMock,
 } = vi.hoisted(() => ({
+  feeTermsMock: vi.fn(),
   alertStationWatchersMock: vi.fn(async (..._args: unknown[]) => false),
   executeMock: vi.fn(),
   updateMock: vi.fn(),
@@ -36,6 +38,7 @@ vi.mock('@evtivity/database', () => ({
   },
   reservations: { id: 'id' },
   getReservationSettings: getReservationSettingsMock,
+  resolveReservationFeeTerms: feeTermsMock,
   writeReservationAudit: writeReservationAuditMock,
   alertStationWatchersIfAvailable: alertStationWatchersMock,
   client: { tag: 'client' },
@@ -88,6 +91,12 @@ beforeEach(() => {
     cancellationFeeCents: 500,
     cancellationWindowMinutes: 30,
   });
+  feeTermsMock.mockResolvedValue({
+    basis: 'net',
+    taxRate: '0.19',
+    feePerMinute: null,
+    cancellationFeeCents: 500,
+  });
 });
 
 describe('applyReservationCancellation', () => {
@@ -99,6 +108,7 @@ describe('applyReservationCancellation', () => {
       cancelled: false,
       feeChargeFailed: false,
       feeCurrency: null,
+      statusBefore: null,
     });
     expect(writeReservationAuditMock).not.toHaveBeenCalled();
     expect(chargeCancellationFeeMock).not.toHaveBeenCalled();
@@ -116,6 +126,7 @@ describe('applyReservationCancellation', () => {
       cancelled: true,
       feeChargeFailed: false,
       feeCurrency: null,
+      statusBefore: 'active',
     });
     expect(writeReservationAuditMock).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -124,9 +135,54 @@ describe('applyReservationCancellation', () => {
         actor: 'driver',
         statusBefore: 'active',
         statusAfter: 'cancelled',
+        reason: 'driver_initiated',
         notes: 'changed plans',
       }),
     );
+  });
+
+  it('TC-RES-09: returns the status it moved the row from, scheduled included', async () => {
+    executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'scheduled' }]);
+    const result = await applyReservationCancellation(
+      baseInput({ chargeFee: false, payments: undefined }),
+    );
+    expect(result.statusBefore).toBe('scheduled');
+  });
+
+  it('TC-RES-22: writes the given audit action with the cancel reason as after.reason', async () => {
+    executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'active' }]);
+    await applyReservationCancellation(
+      baseInput({
+        actor: 'system',
+        reason: 'station_rejected_occupied',
+        auditAction: 'station_rejected',
+        chargeFee: false,
+        payments: undefined,
+      }),
+    );
+    expect(writeReservationAuditMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'station_rejected',
+        actor: 'system',
+        reason: 'station_rejected_occupied',
+      }),
+    );
+  });
+
+  it('publishes reservation.changed on the pub/sub client the caller passes', async () => {
+    executeMock.mockResolvedValueOnce([
+      { id: 'rsv_1', status_before: 'active', station_id: 'sta_1' },
+    ]);
+    const publish = vi.fn(async () => undefined);
+    const pubsub = { publish, subscribe: vi.fn() };
+    await applyReservationCancellation(
+      baseInput({ chargeFee: false, payments: undefined, pubsub }),
+    );
+    expect(publish).toHaveBeenCalledWith(
+      'csms_events',
+      expect.stringContaining('reservation.changed'),
+    );
+    expect(alertStationWatchersMock).toHaveBeenCalledWith({ tag: 'client' }, 'sta_1');
   });
 
   // A cancelled reservation can free the station with no connector change, so
@@ -136,11 +192,7 @@ describe('applyReservationCancellation', () => {
       { id: 'rsv_1', status_before: 'active', station_id: 'sta_1' },
     ]);
     await applyReservationCancellation(baseInput({ chargeFee: false, payments: undefined }));
-    expect(alertStationWatchersMock).toHaveBeenCalledWith(
-      { tag: 'client' },
-      expect.objectContaining({ publish: expect.any(Function) }),
-      'sta_1',
-    );
+    expect(alertStationWatchersMock).toHaveBeenCalledWith({ tag: 'client' }, 'sta_1');
   });
 
   it('still cancels when the station watch check fails', async () => {
@@ -181,10 +233,12 @@ describe('applyReservationCancellation', () => {
     expect(chargeCancellationFeeMock).not.toHaveBeenCalled();
   });
 
-  it('does not charge a fee when cancellationFeeCents is 0', async () => {
-    getReservationSettingsMock.mockResolvedValue({
+  it('does not charge a fee when the reservation terms have no cancellation fee', async () => {
+    feeTermsMock.mockResolvedValue({
+      basis: 'net',
+      taxRate: '0.19',
+      feePerMinute: null,
       cancellationFeeCents: 0,
-      cancellationWindowMinutes: 30,
     });
     executeMock.mockResolvedValueOnce([{ id: 'rsv_1', status_before: 'active' }]);
     const result = await applyReservationCancellation(
@@ -223,16 +277,17 @@ describe('applyReservationCancellation', () => {
       baseInput({ startsAt: new Date(Date.now() + 5 * 60_000) }),
     );
 
-    // The fee setting (500) is net; the charge adds the station tariff's tax.
-    // The charge runs with the caller's payment context.
+    // The fee (500) is in the terms' basis (net); the charge prices it with
+    // the engine. The charge runs with the caller's payment context.
     expect(chargeCancellationFeeMock).toHaveBeenCalledWith(
       {
         type: 'reservation_cancellation',
         reservationId: 'rsv_1',
         driverId: 'drv_1',
-        stationId: 'sta_1',
         siteId: 'sit_1',
-        netCents: 500,
+        fee: { amountCents: 500 },
+        basis: 'net',
+        taxRate: '0.19',
       },
       payments,
     );
@@ -241,11 +296,95 @@ describe('applyReservationCancellation', () => {
       cancelled: true,
       feeChargeFailed: false,
       feeCurrency: 'EUR',
+      statusBefore: 'active',
     });
     // The follow-up UPDATE writes the amount charged, tax included.
     expect(updateChain.set).toHaveBeenCalledWith(
       expect.objectContaining({ cancellationFeeCents: 595 }),
     );
+  });
+
+  for (const [id, basis, gross] of [
+    ['TC-T3-22', 'net', 357],
+    ['TC-T3-23', 'gross', 300],
+  ] as const) {
+    it(`${id} charges the cancellation fee on the ${basis} basis from the snapshot at creation`, async () => {
+      executeMock.mockResolvedValueOnce([
+        {
+          id: 'rsv_1',
+          status_before: 'active',
+          station_id: 'sta_1',
+          fee_tax_basis: basis,
+          fee_tax_rate: '0.19',
+          fee_per_minute: '0.10',
+          fee_cancellation_cents: 300,
+        },
+      ]);
+      // The setting changed since the reservation was made; the snapshot wins.
+      getReservationSettingsMock.mockResolvedValue({
+        cancellationFeeCents: 900,
+        cancellationWindowMinutes: 30,
+      });
+      feeTermsMock.mockResolvedValue({
+        basis,
+        taxRate: '0.19',
+        feePerMinute: '0.10',
+        cancellationFeeCents: 300,
+      });
+      chargeCancellationFeeMock.mockResolvedValueOnce({
+        status: 'charged',
+        paymentRecordId: 1,
+        grossCents: gross,
+        netCents: basis === 'net' ? 300 : 252,
+        taxCents: basis === 'net' ? 57 : 48,
+        taxRate: 0.19,
+        currency: 'EUR',
+      });
+      const updateChain = makeUpdateChain();
+      updateMock.mockReturnValue(updateChain);
+
+      const result = await applyReservationCancellation(
+        baseInput({ startsAt: new Date(Date.now() + 5 * 60_000) }),
+      );
+
+      expect(feeTermsMock).toHaveBeenCalledWith({
+        stationId: 'sta_1',
+        driverId: 'drv_1',
+        feeTaxBasis: basis,
+        feeTaxRate: '0.19',
+        feePerMinute: '0.10',
+        feeCancellationCents: 300,
+      });
+      expect(chargeCancellationFeeMock).toHaveBeenCalledWith(
+        expect.objectContaining({ fee: { amountCents: 300 }, basis, taxRate: '0.19' }),
+        payments,
+      );
+      expect(result.feeChargedCents).toBe(gross);
+      expect(updateChain.set).toHaveBeenCalledWith(
+        expect.objectContaining({ cancellationFeeCents: gross }),
+      );
+    });
+  }
+
+  it('reports the fee failed when the fee terms cannot be resolved', async () => {
+    executeMock.mockResolvedValueOnce([
+      { id: 'rsv_1', status_before: 'active', station_id: 'sta_1' },
+    ]);
+    feeTermsMock.mockRejectedValueOnce(new Error('db down'));
+    const errorLog = vi.fn();
+
+    const result = await applyReservationCancellation(
+      baseInput({ startsAt: new Date(Date.now() + 5 * 60_000), logger: { error: errorLog } }),
+    );
+
+    expect(result).toEqual({
+      feeChargedCents: 0,
+      cancelled: true,
+      feeChargeFailed: true,
+      feeCurrency: null,
+      statusBefore: 'active',
+    });
+    expect(chargeCancellationFeeMock).not.toHaveBeenCalled();
   });
 
   it('reports no fee when the charge is skipped for lack of a payment method', async () => {
@@ -266,6 +405,7 @@ describe('applyReservationCancellation', () => {
       cancelled: true,
       feeChargeFailed: false,
       feeCurrency: null,
+      statusBefore: 'active',
     });
     expect(updateChain.set).not.toHaveBeenCalled();
   });
@@ -287,6 +427,7 @@ describe('applyReservationCancellation', () => {
       cancelled: true,
       feeChargeFailed: true,
       feeCurrency: null,
+      statusBefore: 'active',
     });
     expect(errorLog).toHaveBeenCalledWith(
       expect.objectContaining({ reservationId: 'rsv_1', plannedFeeCents: 500 }),
@@ -320,6 +461,7 @@ describe('applyReservationCancellation', () => {
       cancelled: true,
       feeChargeFailed: true,
       feeCurrency: null,
+      statusBefore: 'active',
     });
     expect(warnLog).toHaveBeenCalledWith(
       { reservationId: 'rsv_1', paymentRecordId: 4 },

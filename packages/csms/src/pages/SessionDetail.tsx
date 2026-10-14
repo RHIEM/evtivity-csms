@@ -26,7 +26,11 @@ import { useUserTimezone } from '@/lib/timezone';
 import { sessionStatusVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
+import { useFeatureFlags } from '@/hooks/use-feature-flags';
 import { useHasPermission } from '@/lib/auth';
+import { ExplainButton } from '@/components/ai/ExplainButton';
+import { RecordInsight } from '@/components/ai/insights/RecordInsight';
+import { RecordInsightsTab } from '@/components/ai/insights/RecordInsightsTab';
 
 interface GuestSessionInfo {
   sessionToken: string;
@@ -60,6 +64,8 @@ interface SessionDetailData {
   freeVend: boolean | null;
   billingMode?: 'card' | 'account' | null;
   billingFleetName?: string | null;
+  /** Billed on the driver's own member invoice (a fleet that invoices each driver). */
+  memberBilled?: boolean;
   invoiceStatus?: string | null;
   rebillStatus?: RebillStatus | null;
   rebillClaimedAt?: string | null;
@@ -85,6 +91,8 @@ export function SessionDetail(): React.JSX.Element {
 
   const [tab, setTab] = useTab('details');
   const canReadAudit = useHasPermission('audit:read');
+  const { flags } = useFeatureFlags();
+  const showInsightsTab = useHasPermission('aiInsights:read') && flags.aiInsightsEnabled;
 
   const {
     data: session,
@@ -136,13 +144,15 @@ export function SessionDetail(): React.JSX.Element {
           actual: string | null;
         })
       : null;
+  const explainContext =
+    id == null ? null : { kind: 'session' as const, id, label: session.stationName };
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/sessions" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{t('sessions.title')}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{t('sessions.title')}</h1>
           <CopyableId id={id ?? ''} />
         </div>
         <Badge
@@ -159,19 +169,40 @@ export function SessionDetail(): React.JSX.Element {
           <Badge variant="warning">{t('sessions.manualBilling')}</Badge>
         )}
         {isBilledOnAccount(session) && (
-          <Badge variant="info" data-testid="session-billing-badge">
-            {t('sessions.billedTo', { fleet: session.billingFleetName ?? '' })}
+          <Badge
+            variant="info"
+            className="max-w-full whitespace-normal"
+            data-testid="session-billing-badge"
+          >
+            {t(session.memberBilled === true ? 'sessions.billedToMember' : 'sessions.billedTo', {
+              fleet: session.billingFleetName ?? '',
+            })}
             {' · '}
             {t(`sessions.billingState.${accountBillingState(session.invoiceStatus)}`)}
           </Badge>
         )}
         {tokenMismatch != null && (
-          <Badge variant="warning" title={t('sessions.reservationTokenMismatchTooltip')}>
+          <Badge
+            variant="warning"
+            className="max-w-full whitespace-normal"
+            title={t('sessions.reservationTokenMismatchTooltip')}
+          >
             {t('sessions.reservationTokenMismatch')}
           </Badge>
         )}
+        {(session.status === 'failed' || session.status === 'faulted') &&
+          explainContext != null && <ExplainButton context={explainContext} />}
         <EntityNavButtons resource="sessions" basePath="/sessions" currentId={id} />
       </div>
+
+      {id != null && showInsightsTab && (
+        <RecordInsight
+          filter={{ sessionId: id }}
+          onOpen={() => {
+            setTab('ai-insights');
+          }}
+        />
+      )}
 
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
@@ -180,6 +211,9 @@ export function SessionDetail(): React.JSX.Element {
           <TabsTrigger value="payment">{t('sessions.payment')}</TabsTrigger>
           {session.guestSession != null && (
             <TabsTrigger value="guest">{t('sessions.guestSessionTab')}</TabsTrigger>
+          )}
+          {showInsightsTab && (
+            <TabsTrigger value="ai-insights">{t('aiInsights.list.title')}</TabsTrigger>
           )}
           {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
@@ -225,6 +259,11 @@ export function SessionDetail(): React.JSX.Element {
           </TabsContent>
         )}
 
+        {showInsightsTab && id != null && (
+          <TabsContent value="ai-insights">
+            <RecordInsightsTab filter={{ sessionId: id }} />
+          </TabsContent>
+        )}
         <TabsContent value="history">
           <EntityHistoryTab entityType="session" entityId={id ?? ''} />
         </TabsContent>

@@ -6,32 +6,40 @@ import { createLogger } from '@evtivity/lib';
 import {
   clearPaymentSettingsCache,
   createPaymentRegistry,
-  pubsubSimulatedSink,
+  PAYMENT_SYSTEM_ACTOR,
+  queueSimulatedSink,
   resolveActiveProvider,
 } from '@evtivity/payments';
-import type { PaymentContext, PaymentLogger, PaymentProvider } from '@evtivity/payments';
+import type {
+  PaymentActor,
+  PaymentContext,
+  PaymentLogger,
+  PaymentProvider,
+} from '@evtivity/payments';
 import { config } from './config.js';
-import { getPubSub } from '@evtivity/lib/pubsub-instance';
 
 /**
  * The API process's payment providers (@evtivity/payments), built once with
  * this process's SETTINGS_ENCRYPTION_KEY and PAYMENTS_ALLOW_SIMULATED.
- * Simulated provider events (the dispute card) go to the worker over the
- * `payment_webhook_deliveries` channel of the process's pub/sub client.
+ * Simulated provider events (the dispute card) are added to the worker's
+ * `payment-webhooks` queue (the job queues are initialized at startup).
  */
 export const paymentRegistry = createPaymentRegistry({
   encryptionKey: config.SETTINGS_ENCRYPTION_KEY,
   allowSimulated: config.PAYMENTS_ALLOW_SIMULATED,
   simulated: {
-    events: pubsubSimulatedSink({
-      publish: (channel, payload) => getPubSub().publish(channel, payload),
-    }),
+    events: queueSimulatedSink(),
     logger: createLogger('payments'),
   },
 });
 
-export function paymentContext(logger: PaymentLogger): PaymentContext {
-  return { registry: paymentRegistry, logger };
+/**
+ * The payment context of one call. `actor` is who the audit rows of the
+ * payment writes name: `getAuditActor(request)` in a route, or `system` with
+ * the reason for a call no request made.
+ */
+export function paymentContext(logger: PaymentLogger, actor: PaymentActor): PaymentContext {
+  return { registry: paymentRegistry, logger, actor };
 }
 
 /**
@@ -60,5 +68,6 @@ export function isPaymentSettingKey(key: string): boolean {
  * or the selected provider is not usable here (resolveActiveProvider).
  */
 export function activePaymentProvider(logger: PaymentLogger): Promise<PaymentProvider | null> {
-  return resolveActiveProvider(paymentContext(logger));
+  // A read: resolving the provider writes nothing.
+  return resolveActiveProvider(paymentContext(logger, PAYMENT_SYSTEM_ACTOR));
 }

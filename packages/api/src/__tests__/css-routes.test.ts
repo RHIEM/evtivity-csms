@@ -53,6 +53,11 @@ function makeChain() {
   return chain;
 }
 
+const { mockAuditStationChange } = vi.hoisted(() => ({
+  mockAuditStationChange: vi.fn(() => Promise.resolve()),
+}));
+vi.mock('../lib/station-audit.js', () => ({ auditStationChange: mockAuditStationChange }));
+
 vi.mock('@evtivity/database', () => {
   const dbMock: Record<string, unknown> = {
     select: vi.fn(() => makeChain()),
@@ -377,6 +382,35 @@ describe('CSS routes', () => {
       expect(response.statusCode).toBe(200);
       const published = mockState.publishCalls.find(([ch]) => ch === 'css_commands');
       expect(JSON.parse(published?.[1] ?? '{}')).toMatchObject({ action, params });
+    });
+
+    it.each([
+      ['ocpp2.1', 'NoReply'],
+      ['ocpp1.6', 'Occupied'],
+    ])('TC-RES-29: publishes reservationReply on a %s station', async (ocppProtocol, reply) => {
+      setupDbResults([{ id: 'id-1', stationId: 'TEST-R', ocppProtocol }]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/css/actions/reservationReply',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { stationId: 'TEST-R', reply },
+      });
+      expect(response.statusCode).toBe(200);
+      const published = mockState.publishCalls.find(([ch]) => ch === 'css_commands');
+      expect(JSON.parse(published?.[1] ?? '{}')).toMatchObject({
+        action: 'reservationReply',
+        params: { reply },
+      });
+    });
+
+    it('TC-RES-29: refuses an unknown reservationReply value', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/css/actions/reservationReply',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { stationId: 'TEST-R', reply: 'Faulted' },
+      });
+      expect(response.statusCode).toBe(400);
     });
 
     it('registers the Plug and Charge actions for OCPP 2.1 stations only', async () => {

@@ -53,6 +53,23 @@ class MockPostgresError extends Error {
   }
 }
 
+// Jobs the projections add to the worker queues themselves (station screens,
+// maintenance re-assert, station-watch alerts), kept as [job name, JSON data]
+// rows in add order.
+const queuedJobs = vi.hoisted(() => [] as Array<[string, string]>);
+vi.mock('@evtivity/lib/job-queues', () => ({
+  jobQueue: () => ({
+    add: (name: string, data: unknown) => {
+      queuedJobs.push([name, JSON.stringify(data)]);
+      return Promise.resolve();
+    },
+    addBulk: () => Promise.resolve(),
+  }),
+}));
+function jobsNamed(name: string): Array<[string, string]> {
+  return queuedJobs.filter((j) => j[0] === name);
+}
+
 vi.mock('postgres', () => {
   const factory = () => createSqlMock();
   factory.PostgresError = MockPostgresError;
@@ -82,7 +99,19 @@ vi.mock('../../../database/src/lib/pricing-settings.js', () => ({
   isSplitBillingEnabled: vi.fn().mockResolvedValue(false),
 }));
 
+// The firmware campaign helpers write their completion audit through the
+// audit module directly.
+vi.mock('../../../database/src/lib/audit.js', () => ({
+  writeAudit: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('@evtivity/database', async () => ({
+  // The session audit of a CSMS stop or fault (tested in payment-stop.test.ts).
+  writeCsmsSessionAudit: vi.fn().mockResolvedValue(undefined),
+  // The real firmware update and campaign progress writes, on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/firmware-updates.js',
+  )),
   // The session end request channel and reasons.
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/session-end-request.js',
@@ -102,6 +131,10 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/session-pricing.js',
   )),
+  // The real register energy rule (session-energy), on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/session-energy.js',
+  )),
   // The real tariff resolver, running on the mocked client.
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/tariff-resolution.js',
@@ -118,6 +151,8 @@ vi.mock('@evtivity/database', async () => ({
   getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
   getCompanyPriceDisplay: vi.fn().mockResolvedValue('net'),
   writeReservationAudit: vi.fn().mockResolvedValue(undefined),
+  // The real raw timestamp readers (reservation rows).
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/raw-timestamp.js')),
   // The real Postgres error readers.
   ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
 }));
@@ -131,6 +166,33 @@ vi.mock('../server/notification-dispatcher.js', () => ({
   dispatchDriverNotification: mockDispatchDriver,
   dispatchSystemNotification: mockDispatchSystem,
   ALL_TEMPLATES_DIRS: ['/mock/templates'],
+}));
+
+// The shared reservation services (@evtivity/services): the reservation
+// projections themselves are covered in event-projections-reservations.test.ts.
+const mockCancelHoldsForStationOutage = vi.fn().mockResolvedValue(0);
+const mockExpireStationReportedReservation = vi.fn().mockResolvedValue(false);
+const mockApplyReservationCancellation = vi.fn().mockResolvedValue({
+  cancelled: false,
+  statusBefore: null,
+  feeChargedCents: 0,
+  feeChargeFailed: false,
+  feeCurrency: null,
+});
+const mockNotifyReservationDriver = vi.fn().mockResolvedValue(undefined);
+vi.mock('@evtivity/services/reservation-expiry', () => ({
+  cancelHoldsForStationOutage: (...args: unknown[]) =>
+    mockCancelHoldsForStationOutage(...args) as unknown,
+  expireStationReportedReservation: (...args: unknown[]) =>
+    mockExpireStationReportedReservation(...args) as unknown,
+}));
+vi.mock('@evtivity/services/reservation-cancel', () => ({
+  applyReservationCancellation: (...args: unknown[]) =>
+    mockApplyReservationCancellation(...args) as unknown,
+}));
+vi.mock('@evtivity/services/reservation-notify', () => ({
+  notifyReservationDriver: (...args: unknown[]) => mockNotifyReservationDriver(...args) as unknown,
+  cancelReasonNoticeFlags: () => ({}),
 }));
 
 // The payment service (@evtivity/payments): the gate's hold, the settlement on
@@ -235,6 +297,7 @@ describe('Event projections', () => {
     sqlFailOn = null;
     sqlRoute = null;
     vi.clearAllMocks();
+    queuedJobs.length = 0;
     mockAuthorizeSessionHold.mockResolvedValue({
       outcome: 'authorized',
       paymentRecordId: 1,
@@ -347,7 +410,17 @@ describe('Event projections', () => {
         (c: unknown[]) => c[0],
       );
       expect(channels).toContain('ocpp_commands');
-      expect(channels).toContain('station_message_refresh');
+      expect(jobsNamed('station-message-refresh')).toHaveLength(1);
+      // The sent command leaves the queue: the message log stops showing it as Queued.
+      const events = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls
+        .filter((c: unknown[]) => c[0] === 'csms_events')
+        .map((c: unknown[]) => JSON.parse(String(c[1])) as Record<string, unknown>);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          eventType: 'ocpp.message',
+          stationId: 'sta_ready_test1',
+        }),
+      );
       // Superseded screen and cost commands are expired before the queue is read.
       const collapse = sqlCalls.findIndex((c) => c.strings.join('?').includes('rn > 1'));
       const drain = sqlCalls.findIndex((c) =>
@@ -379,11 +452,11 @@ describe('Event projections', () => {
         (c: unknown[]) => c[0],
       );
       expect(channels).not.toContain('ocpp_commands');
-      expect(channels).not.toContain('station_message_refresh');
-      expect(channels).not.toContain('maintenance_fanout');
+      expect(jobsNamed('station-message-refresh')).toHaveLength(0);
+      expect(jobsNamed('maintenance-fanout')).toHaveLength(0);
     });
 
-    it('publishes a maintenance re-assert when the station is ready under an active event', async () => {
+    it('queues a maintenance re-assert when the station is ready under an active event', async () => {
       await setup();
 
       setupSqlResults(
@@ -400,9 +473,7 @@ describe('Event projections', () => {
         }),
       );
 
-      const fanoutCall = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.find(
-        (c: unknown[]) => c[0] === 'maintenance_fanout',
-      );
+      const fanoutCall = jobsNamed('maintenance-fanout')[0];
       expect(fanoutCall).toBeDefined();
       const payload = JSON.parse(fanoutCall?.[1] as string) as Record<string, unknown>;
       expect(payload.eventId).toBe('mne_maint1');
@@ -411,7 +482,7 @@ describe('Event projections', () => {
       expect(typeof payload.nonce).toBe('string');
     });
 
-    it('does not publish a maintenance re-assert when no active event covers the station', async () => {
+    it('does not queue a maintenance re-assert when no active event covers the station', async () => {
       await setup();
 
       setupSqlResults(
@@ -428,9 +499,7 @@ describe('Event projections', () => {
         }),
       );
 
-      const fanoutCall = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.find(
-        (c: unknown[]) => c[0] === 'maintenance_fanout',
-      );
+      const fanoutCall = jobsNamed('maintenance-fanout')[0];
       expect(fanoutCall).toBeUndefined();
     });
 
@@ -493,7 +562,7 @@ describe('Event projections', () => {
       expect(sqlCalls.length).toBe(1);
     });
 
-    it('dispatches reservation.StationFaulted notification when station disconnects with active reservations', async () => {
+    it('tells the driver of an in_use hold and cancels the active holds of a station that went offline', async () => {
       await setup();
 
       setupSqlResults(
@@ -502,7 +571,7 @@ describe('Event projections', () => {
         [], // INSERT connection_logs
         [], // SELECT connectors JOIN evses
         [{ site_id: null }], // resolveSiteId
-        [{ id: 'res_001', driver_id: 'drv_001' }], // SELECT reservations
+        [{ id: 'res_001', reservation_id: 11, driver_id: 'drv_001', expires_at: null }], // in_use holds
       );
 
       await eventBus.emit(
@@ -510,17 +579,29 @@ describe('Event projections', () => {
         makeDomainEvent('station.Disconnected', 'CS-001', {}),
       );
 
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
+      expect(mockNotifyReservationDriver).toHaveBeenCalledWith(
         'reservation.StationFaulted',
-        'drv_001',
-        { reservationId: 'res_001', stationId: 'CS-001' },
+        expect.objectContaining({
+          reservationDbId: 'res_001',
+          reservationOcppId: 11,
+          stationOcppId: 'CS-001',
+          driverId: 'drv_001',
+        }),
+        {},
         expect.anything(),
+      );
+      expect(mockCancelHoldsForStationOutage).toHaveBeenCalledWith(
         expect.anything(),
+        expect.objectContaining({
+          stationUuid: 'sta_000000000001',
+          stationOcppId: 'CS-001',
+          cause: 'offline',
+          evseUuid: null,
+        }),
       );
     });
 
-    it('does not dispatch notification when disconnected station has no active reservations', async () => {
+    it('sends no in_use notice when the disconnected station has no hold in use', async () => {
       await setup();
 
       setupSqlResults(
@@ -529,7 +610,7 @@ describe('Event projections', () => {
         [], // INSERT connection_logs
         [], // SELECT connectors JOIN evses
         [{ site_id: null }], // resolveSiteId
-        [], // SELECT reservations (empty)
+        [], // in_use holds (none)
       );
 
       await eventBus.emit(
@@ -537,41 +618,8 @@ describe('Event projections', () => {
         makeDomainEvent('station.Disconnected', 'CS-001', {}),
       );
 
-      expect(mockDispatchDriver).not.toHaveBeenCalledWith(
-        expect.anything(),
-        'reservation.StationFaulted',
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-      );
-    });
-
-    it('does not dispatch notification when reservation has no driver', async () => {
-      await setup();
-
-      setupSqlResults(
-        [{ id: 'sta_000000000001' }], // resolveStationId
-        [], // UPDATE charging_stations
-        [], // INSERT connection_logs
-        [], // SELECT connectors JOIN evses
-        [{ site_id: null }], // resolveSiteId
-        [{ id: 'res_002', driver_id: null }], // SELECT reservations (driver_id is null)
-      );
-
-      await eventBus.emit(
-        'station.Disconnected',
-        makeDomainEvent('station.Disconnected', 'CS-001', {}),
-      );
-
-      expect(mockDispatchDriver).not.toHaveBeenCalledWith(
-        expect.anything(),
-        'reservation.StationFaulted',
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-      );
+      expect(mockNotifyReservationDriver).not.toHaveBeenCalled();
+      expect(mockCancelHoldsForStationOutage).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -649,9 +697,7 @@ describe('Event projections', () => {
     }
 
     function watchSignals(): unknown[][] {
-      return (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c: unknown[]) => c[0] === 'station_watch_available',
-      );
+      return jobsNamed('station-watch-dispatch');
     }
 
     beforeEach(() => {
@@ -681,10 +727,10 @@ describe('Event projections', () => {
 
       watchDue = true;
       await eventBus.emit('ocpp.StatusNotification', available());
-      expect(mockPubSub.publish).toHaveBeenCalledWith(
-        'station_watch_available',
+      expect(jobsNamed('station-watch-dispatch')).toContainEqual([
+        'station-watch-dispatch',
         JSON.stringify({ stationId: 'CS-001' }),
-      );
+      ]);
     });
 
     it('checks the watches when the station reports itself available (EVSE 0)', async () => {
@@ -748,21 +794,6 @@ describe('Event projections', () => {
       );
       expect(watchSignals()).toHaveLength(1);
     });
-
-    it('checks the watches when the station expires or removes a reservation', async () => {
-      await setup();
-      routeWatch();
-      for (const reservationUpdateStatus of ['Expired', 'Removed']) {
-        await eventBus.emit(
-          'ocpp.ReservationStatusUpdate',
-          makeDomainEvent('ocpp.ReservationStatusUpdate', 'CS-001', {
-            reservationId: 7,
-            reservationUpdateStatus,
-          }),
-        );
-      }
-      expect(watchSignals()).toHaveLength(2);
-    });
   });
 
   describe('ocpp.StatusNotification', () => {
@@ -774,7 +805,6 @@ describe('Event projections', () => {
         [], // SELECT evses (not found)
         [{ id: 'evs_000000000001' }], // INSERT evses RETURNING id
         [{ id: 'con_000000000001' }], // INSERT connectors RETURNING id
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -799,7 +829,6 @@ describe('Event projections', () => {
         [{ id: 'evs_000000000001' }], // SELECT evses (found)
         [], // guarded UPDATE connectors (not found)
         [{ id: 'con_000000000001' }], // INSERT connectors RETURNING id
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -823,7 +852,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationId
         [{ id: 'evs_000000000001' }], // SELECT evses
         [{ previous_status: 'available', applied: true }], // guarded UPDATE connectors
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -848,7 +876,6 @@ describe('Event projections', () => {
         [], // SELECT evses (not found)
         [{ id: 'evs_000000000001' }], // INSERT evses
         [{ id: 'con_000000000001' }], // INSERT connectors RETURNING id
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -873,7 +900,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // UPDATE charging_sessions SET idle_started_at
         [], // SELECT active session for notification dispatch (no session found)
@@ -900,7 +926,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -956,7 +981,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -998,7 +1022,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -1057,7 +1080,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -1110,7 +1132,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -1136,7 +1157,6 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'suspended_ev', applied: true }], // guarded UPDATE connectors (prevRows)
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
         [], // UPDATE charging_sessions (clear idle)
@@ -1159,18 +1179,17 @@ describe('Event projections', () => {
       expect(idleClearCalls.length).toBe(1);
     });
 
-    it('publishes station_message_refresh on connector status change for OCPP 2.1 stations', async () => {
+    it('queues the station screen refresh on connector status change for OCPP 2.1 stations', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'available', applied: true }], // guarded UPDATE connectors (prev)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
-        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol for station_message_refresh
+        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol for the station screen refresh
       );
 
       await eventBus.emit(
@@ -1182,22 +1201,19 @@ describe('Event projections', () => {
         }),
       );
 
-      const refreshCalls = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      const refreshCalls = jobsNamed('station-message-refresh');
       expect(refreshCalls.length).toBe(1);
       expect(refreshCalls[0]?.[1]).toContain('CS-001');
       expect(refreshCalls[0]?.[1]).toContain('ocpp2.1');
     });
 
-    it('does NOT publish station_message_refresh when connector status unchanged', async () => {
+    it('does NOT queue the station screen refresh when connector status unchanged', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'available', applied: true }], // guarded UPDATE connectors (prev = same as new)
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
       );
 
@@ -1210,24 +1226,21 @@ describe('Event projections', () => {
         }),
       );
 
-      const refreshCalls = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      const refreshCalls = jobsNamed('station-message-refresh');
       expect(refreshCalls.length).toBe(0);
     });
 
-    it('publishes station_message_refresh for OCPP 1.6 stations (Idle screen via DataTransfer)', async () => {
+    it('queues the station screen refresh for OCPP 1.6 stations (Idle screen via DataTransfer)', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'available', applied: true }], // guarded UPDATE connectors (prev)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
-        [{ ocpp_protocol: 'ocpp1.6' }], // SELECT ocpp_protocol for station_message_refresh
+        [{ ocpp_protocol: 'ocpp1.6' }], // SELECT ocpp_protocol for the station screen refresh
       );
 
       await eventBus.emit(
@@ -1239,9 +1252,7 @@ describe('Event projections', () => {
         }),
       );
 
-      const refreshCalls = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      const refreshCalls = jobsNamed('station-message-refresh');
       expect(refreshCalls.length).toBe(1);
       expect(JSON.parse(refreshCalls[0]?.[1] as string)).toMatchObject({
         stationOcppId: 'CS-001',
@@ -1249,14 +1260,13 @@ describe('Event projections', () => {
       });
     });
 
-    it('publishes station_message_refresh for Faulted transitions on OCPP 2.1', async () => {
+    it('queues the station screen refresh for Faulted transitions on OCPP 2.1', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'evse_000000000001' }], // SELECT evses (found)
         [{ previous_status: 'available', applied: true }], // guarded UPDATE connectors (prev)
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -1272,9 +1282,7 @@ describe('Event projections', () => {
         }),
       );
 
-      const refreshCalls = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      const refreshCalls = jobsNamed('station-message-refresh');
       expect(refreshCalls.length).toBe(1);
     });
 
@@ -1319,7 +1327,7 @@ describe('Event projections', () => {
       });
     }
 
-    it('publishes station_message_refresh on auto-create EVSE branch for OCPP 2.1', async () => {
+    it('queues the station screen refresh on auto-create EVSE branch for OCPP 2.1', async () => {
       await setup();
 
       setupSqlResults(
@@ -1327,12 +1335,11 @@ describe('Event projections', () => {
         [], // SELECT evses (not found)
         [{ id: 'evs_000000000001' }], // INSERT evses RETURNING id
         [{ id: 'con_000000000001' }], // INSERT connectors RETURNING id
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (auto-discovery GetBaseReport branch)
-        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station_message_refresh branch)
+        [{ ocpp_protocol: 'ocpp2.1' }], // SELECT ocpp_protocol (station screen refresh branch)
       );
 
       await eventBus.emit(
@@ -1344,9 +1351,7 @@ describe('Event projections', () => {
         }),
       );
 
-      const refreshCalls = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      const refreshCalls = jobsNamed('station-message-refresh');
       expect(refreshCalls.length).toBe(1);
     });
   });
@@ -1393,7 +1398,10 @@ describe('Event projections', () => {
       );
 
       const joined = sqlCalls.map((c) => c.strings.join(''));
-      expect(joined.some((q) => q.includes('INSERT INTO port_status_log'))).toBe(false);
+      // The guarded write holds the log row; no separate log statement runs.
+      expect(joined.some((q) => q.trimStart().startsWith('INSERT INTO port_status_log'))).toBe(
+        false,
+      );
       expect(joined.some((q) => q.includes('SET idle_started_at'))).toBe(false);
       expect(mockPubSub.publish).not.toHaveBeenCalled();
     });
@@ -1798,7 +1806,7 @@ describe('Event projections', () => {
             driver_id: 'driver-1',
             energy_delivered_wh: 5000,
             current_cost_cents: 150,
-            tariff_tax_rate: null,
+            tax_cents: 0,
             currency: 'USD',
             started_at: '2024-01-01T00:00:00Z',
           },
@@ -1821,8 +1829,50 @@ describe('Event projections', () => {
         expect.anything(),
         'session.Updated',
         'driver-1',
-        // No tariff tax rate: the templates do not label the cost "incl. tax".
+        // TC-T3-34: no stored tax, so the templates do not label the cost "incl. tax".
         expect.objectContaining({ transactionId: 'tx-1', costIncludesTax: false }),
+        ['/mock/templates'],
+        expect.anything(),
+      );
+    });
+
+    it('labels the session.Updated cost from the stored running tax (TC-T3-34)', async () => {
+      await setup();
+
+      setupSqlResults(
+        [{ id: 'sta_000000000001' }], // resolveStationId
+        [{ id: 'session-1' }], // SELECT id FROM charging_sessions
+        [], // INSERT transaction_events
+        [{ site_id: null }], // resolveSiteId
+        [
+          {
+            driver_id: 'driver-1',
+            energy_delivered_wh: 5000,
+            current_cost_cents: 119,
+            tax_cents: 19,
+            currency: 'EUR',
+            started_at: '2024-01-01T00:00:00Z',
+          },
+        ],
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-001', {
+          eventType: 'Updated',
+          stationId: 'CS-001',
+          transactionId: 'tx-1',
+          seqNo: 1,
+          triggerReason: 'MeterValuePeriodic',
+          timestamp: '2024-01-01T00:30:00Z',
+        }),
+      );
+
+      expect(mockDispatchDriver).toHaveBeenCalledWith(
+        expect.anything(),
+        'session.Updated',
+        'driver-1',
+        expect.objectContaining({ transactionId: 'tx-1', costIncludesTax: true }),
         ['/mock/templates'],
         expect.anything(),
       );
@@ -2420,6 +2470,16 @@ describe('Event projections', () => {
     it('includes idle_minutes in final cost calculation on Ended', async () => {
       await setup();
 
+      // closeSegmentsAt: the session lock, one segment, no idle on others.
+      sqlRoute = (text) => {
+        if (text.includes('SELECT id FROM charging_sessions WHERE id = ? FOR UPDATE')) return [];
+        if (text.includes('SELECT id, started_at FROM session_tariff_segments')) {
+          return [{ id: 1, started_at: '2024-01-01T00:00:00Z' }];
+        }
+        if (text.includes('AND id <> ?')) return [{ total: '0' }];
+        if (text.includes('UPDATE session_tariff_segments')) return [];
+        return undefined;
+      };
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // SELECT payment_records (no failed payment)
@@ -2444,7 +2504,6 @@ describe('Event projections', () => {
           },
         ], // SELECT session with idle columns
         [], // INSERT transaction_events
-        [], // UPDATE session_tariff_segments SET ended_at
         [], // UPDATE charging_sessions SET final_cost_cents
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify (session.ended)
@@ -2607,8 +2666,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 0, meter_start: 0 }], // SELECT prev energy for flat-reading check
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: 0, meter_start: 0 }], // SELECT prev energy for flat-reading check
+        [{ energy_delivered_wh: 0, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
         [], // UPDATE idle (flat energy check)
         [], // SELECT active sessions
@@ -2646,8 +2705,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: null, meter_start: null }], // SELECT prev energy
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: null, meter_start: null }], // SELECT prev energy
+        [{ energy_delivered_wh: null, meter_start: null }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
       );
 
@@ -2676,8 +2735,12 @@ describe('Event projections', () => {
       expect(insert?.values).toContain(2908.2475);
       const meterStart = sqlCalls.find((c) => c.strings.join('?').includes('SET meter_start'));
       expect(meterStart?.values[0]).toBe(2908248);
-      const energy = sqlCalls.find((c) => c.strings.join('?').includes('SET energy_delivered_wh'));
-      expect(energy?.values[0]).toBe(2908247.5);
+      // The register energy update (applySessionEnergyReading): values[2] is
+      // the newest register reading in Wh, values[4] the session energy.
+      const energy = sqlCalls.find((c) =>
+        c.strings.join('?').includes('meter_register_offset_wh = ?'),
+      );
+      expect(energy?.values[2]).toBe(2908247.5);
     });
 
     it('applies the OCPP 2.1 multiplier and defaults a missing measurand to the energy register', async () => {
@@ -2686,8 +2749,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: null, meter_start: null }], // SELECT prev energy
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: null, meter_start: null }], // SELECT prev energy
+        [{ energy_delivered_wh: null, meter_start: null }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
       );
 
@@ -2709,8 +2772,12 @@ describe('Event projections', () => {
       const insert = sqlCalls.find((c) => c.strings.join('?').includes('INSERT INTO meter_values'));
       expect(insert?.values).toContain('Energy.Active.Import.Register');
       expect(insert?.values).toContain(5000);
-      const energy = sqlCalls.find((c) => c.strings.join('?').includes('SET energy_delivered_wh'));
-      expect(energy?.values[0]).toBe(5000);
+      // The register energy update (applySessionEnergyReading): values[2] is
+      // the newest register reading in Wh, values[4] the session energy.
+      const energy = sqlCalls.find((c) =>
+        c.strings.join('?').includes('meter_register_offset_wh = ?'),
+      );
+      expect(energy?.values[2]).toBe(5000);
     });
 
     it('does not update session energy for an energy register in a non-energy unit', async () => {
@@ -2742,7 +2809,7 @@ describe('Event projections', () => {
         }),
       );
 
-      expect(sqlCalls.some((c) => c.strings.join('?').includes('SET energy_delivered_wh'))).toBe(
+      expect(sqlCalls.some((c) => c.strings.join('?').includes('energy_delivered_wh = ?'))).toBe(
         false,
       );
       expect(sqlCalls.some((c) => c.strings.join('?').includes('SET meter_start'))).toBe(false);
@@ -2754,8 +2821,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 0, meter_start: 2909465 }], // SELECT prev energy
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: 0, meter_start: 2909465 }], // SELECT prev energy
+        [{ energy_delivered_wh: 0, meter_start: 2909465 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
       );
 
@@ -2776,11 +2843,13 @@ describe('Event projections', () => {
         }),
       );
 
-      const meterStart = sqlCalls.find((c) => c.strings.join('?').includes('SET meter_start'));
-      expect(meterStart?.values[0]).toBe(2909560);
-      const energy = sqlCalls.find((c) => c.strings.join('?').includes('SET energy_delivered_wh'));
-      expect(energy?.strings.join('?')).toContain('?::numeric - meter_start');
-      expect(energy?.values[0]).toBe(2909560.3);
+      // meter_start stays; the decimal register and energy are passed as numbers.
+      const energy = sqlCalls.find((c) =>
+        c.strings.join('?').includes('meter_register_offset_wh = ?'),
+      );
+      expect(energy?.values[0]).toBe(2909465);
+      expect(energy?.values[2]).toBe(2909560.3);
+      expect(energy?.values[4]).toBeCloseTo(95.3, 6);
     });
 
     it('uses the total energy register, not a per-phase one, for session energy', async () => {
@@ -2791,8 +2860,8 @@ describe('Event projections', () => {
         [], // INSERT meter_values (total)
         [], // INSERT meter_values (L1)
         [], // INSERT meter_values (L3)
-        [{ energy_delivered_wh: null, meter_start: 0 }], // SELECT prev energy
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: null, meter_start: 0 }], // SELECT prev energy
+        [{ energy_delivered_wh: null, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
       );
 
@@ -2816,10 +2885,10 @@ describe('Event projections', () => {
       );
 
       const energyUpdates = sqlCalls.filter((c) =>
-        c.strings.join('?').includes('SET energy_delivered_wh'),
+        c.strings.join('?').includes('meter_register_offset_wh = ?'),
       );
       expect(energyUpdates).toHaveLength(1);
-      expect(energyUpdates[0]?.values[0]).toBe(9000);
+      expect(energyUpdates[0]?.values[2]).toBe(9000);
     });
 
     it('sums per-phase energy registers when no total is reported', async () => {
@@ -2830,8 +2899,8 @@ describe('Event projections', () => {
         [], // INSERT meter_values (L1)
         [], // INSERT meter_values (L2)
         [], // INSERT meter_values (L3)
-        [{ energy_delivered_wh: null, meter_start: 0 }], // SELECT prev energy
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: null, meter_start: 0 }], // SELECT prev energy
+        [{ energy_delivered_wh: null, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
       );
 
@@ -2854,8 +2923,12 @@ describe('Event projections', () => {
         }),
       );
 
-      const energy = sqlCalls.find((c) => c.strings.join('?').includes('SET energy_delivered_wh'));
-      expect(energy?.values[0]).toBe(6000);
+      // The register energy update (applySessionEnergyReading): values[2] is
+      // the newest register reading in Wh, values[4] the session energy.
+      const energy = sqlCalls.find((c) =>
+        c.strings.join('?').includes('meter_register_offset_wh = ?'),
+      );
+      expect(energy?.values[2]).toBe(6000);
     });
 
     it('ignores Inlet energy readings for session energy', async () => {
@@ -2883,7 +2956,7 @@ describe('Event projections', () => {
         }),
       );
 
-      expect(sqlCalls.some((c) => c.strings.join('?').includes('SET energy_delivered_wh'))).toBe(
+      expect(sqlCalls.some((c) => c.strings.join('?').includes('energy_delivered_wh = ?'))).toBe(
         false,
       );
     });
@@ -2946,8 +3019,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 4000, meter_start: 0 }], // SELECT prev energy for flat-reading check
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: 4000, meter_start: 0 }], // SELECT prev energy for flat-reading check
+        [{ energy_delivered_wh: 4000, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
         [], // UPDATE idle (flat energy, energy increased)
         [
@@ -3137,8 +3210,15 @@ describe('Event projections', () => {
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values (energy)
         [], // INSERT meter_values (power)
-        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
-        [], // UPDATE meter_start (no-op, already set)
+        [
+          {
+            id: 'ses_mv',
+            energy_delivered_wh: 5000,
+            meter_start: 1000,
+            last_rise_at: '2024-01-01T00:59:00Z',
+          },
+        ], // SELECT prev energy
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle_started_at (flat energy)
         [], // UPDATE idle_started_at (power = 0)
@@ -3184,8 +3264,15 @@ describe('Event projections', () => {
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values (energy)
         [], // INSERT meter_values (power)
-        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
-        [], // UPDATE meter_start (no-op, already set)
+        [
+          {
+            id: 'ses_mv',
+            energy_delivered_wh: 5000,
+            meter_start: 1000,
+            last_rise_at: '2024-01-01T00:59:00Z',
+          },
+        ], // SELECT prev energy
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // SELECT active sessions
       );
@@ -3215,7 +3302,7 @@ describe('Event projections', () => {
 
       const joined = sqlCalls.map((c) => c.strings.join(''));
       // The energy is still stored, but no idle period opens or closes.
-      expect(joined.some((t) => t.includes('SET energy_delivered_wh'))).toBe(true);
+      expect(joined.some((t) => t.includes('meter_register_offset_wh = '))).toBe(true);
       expect(joined.some((t) => t.includes('SET idle_started_at'))).toBe(false);
       expect(joined.some((t) => t.includes('idle_started_at = NULL'))).toBe(false);
     });
@@ -3230,8 +3317,15 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT prev energy
-        [], // UPDATE meter_start (no-op, already set)
+        [
+          {
+            id: 'ses_mv',
+            energy_delivered_wh: 5000,
+            meter_start: 1000,
+            last_rise_at: '2024-01-01T00:59:00Z',
+          },
+        ], // SELECT prev energy
+        [{ energy_delivered_wh: 5000, meter_start: 1000, last_rise_at: '2024-01-01T00:59:00Z' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle_started_at (flat energy)
         [], // SELECT active sessions
@@ -3276,14 +3370,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [
-          {
-            energy_delivered_wh: 5000,
-            meter_start: 1000,
-            last_rise_at: '2024-01-01T00:59:59.600Z',
-          },
-        ], // SELECT prev energy (rose 0.4 s earlier)
-        [], // UPDATE meter_start (no-op, already set)
+        [{ id: 'ses_mv', last_rise_at: '2024-01-01T00:59:59.600Z' }], // SELECT prev (rose 0.4 s earlier)
+        [{ energy_delivered_wh: 5000, meter_start: 1000 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // SELECT active sessions
         [{ site_id: null }], // resolveSiteId
@@ -3327,8 +3415,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 5000, meter_start: 1000 }], // SELECT prev energy
-        [], // UPDATE meter_start (no-op)
+        [{ id: 'ses_mv', energy_delivered_wh: 5000, meter_start: 1000 }], // SELECT prev energy
+        [{ energy_delivered_wh: 5000, meter_start: 1000 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle_minutes (energy increased, clear idle)
         [], // SELECT active sessions
@@ -3376,8 +3464,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: null, meter_start: null }], // SELECT prev energy (no previous)
-        [], // UPDATE meter_start (sets it for first time)
+        [{ id: 'ses_mv', energy_delivered_wh: null, meter_start: null }], // SELECT prev energy (no previous)
+        [{ energy_delivered_wh: null, meter_start: null }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // SELECT active sessions
         [{ site_id: null }], // resolveSiteId
@@ -3420,8 +3508,8 @@ describe('Event projections', () => {
         [{ id: 'sta_000000000001' }], // resolveStationUuid
         [{ id: 'ses_mv', evse_id: 'evs_mv' }], // resolveMeterValueSession by transactionId
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 9000, meter_start: 0 }], // SELECT prev energy for flat-reading check
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: 9000, meter_start: 0 }], // SELECT prev energy for flat-reading check
+        [{ energy_delivered_wh: 9000, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh (delta)
         [], // UPDATE idle (flat energy, energy increased)
         [
@@ -3614,8 +3702,8 @@ describe('Event projections', () => {
         [{ id: 'evs_000000000001' }], // resolveEvseUuid
         [{ id: 'ses_000000000001' }], // resolveMeterValueSession
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 0, meter_start: 0 }], // SELECT prev energy for flat-reading check
-        [], // UPDATE meter_start (set if NULL)
+        [{ id: 'ses_mv', energy_delivered_wh: 0, meter_start: 0 }], // SELECT prev energy for flat-reading check
+        [{ energy_delivered_wh: 0, meter_start: 0 }], // SELECT register state FOR UPDATE
         [], // UPDATE energy (filtered by evse_id)
         [], // UPDATE idle (flat energy check)
         [], // SELECT active sessions
@@ -3662,9 +3750,7 @@ describe('Event projections', () => {
         [{ id: 'ses_old', evse_id: 'evs_000000000001' }], // resolveMeterValueSession (completed)
         [], // INSERT meter_values (energy)
         [], // INSERT meter_values (power)
-        [], // SELECT prev energy (session no longer active)
-        [], // UPDATE meter_start
-        [], // UPDATE energy
+        [], // SELECT prev energy (session no longer active: no energy update)
         [], // UPDATE idle (power)
         [], // SELECT active sessions
         [{ site_id: null }], // resolveSiteId
@@ -3697,8 +3783,8 @@ describe('Event projections', () => {
           !joined.includes('INSERT INTO meter_values')
         );
       });
-      // prev energy, meter_start, energy, idle, cost query
-      expect(sessionCalls.length).toBe(5);
+      // prev energy (no active match, so no energy update), idle, cost query
+      expect(sessionCalls.length).toBe(3);
       for (const call of sessionCalls) {
         const joined = call.strings.join('?');
         // Matched by session id, still only while active, never by EVSE alone.
@@ -4153,12 +4239,15 @@ describe('Event projections', () => {
         }),
       );
 
-      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith({
-        sessionId: 'session-1',
-        driverId: 'driver-1',
-        currency: 'EUR',
-        capturedCents: 1550,
-      });
+      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
+        {
+          sessionId: 'session-1',
+          driverId: 'driver-1',
+          currency: 'EUR',
+          capturedCents: 1550,
+        },
+        expect.objectContaining({ actor: { actor: 'ocpp', actorLabel: 'NotifySettlement' } }),
+      );
 
       expect(mockDispatchDriver).toHaveBeenCalledWith(
         expect.anything(),
@@ -4197,6 +4286,7 @@ describe('Event projections', () => {
 
       expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
         expect.objectContaining({ sessionId: 'session-1', driverId: null, capturedCents: 1000 }),
+        expect.objectContaining({ actor: { actor: 'ocpp', actorLabel: 'NotifySettlement' } }),
       );
       expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
@@ -4518,9 +4608,7 @@ describe('Event projections', () => {
 
         expect(connectorWrites()).toEqual(['occupied']);
         // The station screen refresh follows the real transition, once.
-        const refreshes = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-          (c: unknown[]) => c[0] === 'station_message_refresh',
-        );
+        const refreshes = jobsNamed('station-message-refresh');
         expect(refreshes).toHaveLength(1);
       });
     });

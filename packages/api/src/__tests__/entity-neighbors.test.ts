@@ -51,6 +51,17 @@ vi.mock('../middleware/rbac.js', () => ({
 
 vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn(() => Promise.resolve(siteIdsResult)),
+  requireAllSiteAccess: vi.fn(
+    async (
+      _request: unknown,
+      reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+      notFound: unknown,
+    ) => {
+      if (siteIdsResult == null) return true;
+      await reply.status(404).send(notFound);
+      return false;
+    },
+  ),
 }));
 
 function fakeTable(name: string): { id: unknown; createdAt: unknown } {
@@ -79,10 +90,18 @@ vi.mock('@evtivity/database', () => ({
   chargingProfileTemplates: fakeTable('charging_profile_templates'),
   firmwareCampaigns: fakeTable('firmware_campaigns'),
   octtRuns: fakeTable('octt_runs'),
+  aiInsights: {
+    ...fakeTable('ai_insights'),
+    siteId: { name: 'site_id' },
+    kind: { name: 'kind' },
+    status: { name: 'status' },
+  },
+  isReservationEnabled: vi.fn(() => Promise.resolve(true)),
 }));
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(() => ({})),
+  ne: vi.fn(() => ({})),
   and: vi.fn(() => ({})),
   or: vi.fn(() => ({})),
   sql: vi.fn(() => ({})),
@@ -90,6 +109,7 @@ vi.mock('drizzle-orm', () => ({
   desc: vi.fn(() => ({})),
   inArray: vi.fn(() => ({})),
   isNull: vi.fn(() => ({})),
+  notInArray: vi.fn(() => ({})),
 }));
 
 import { registerAuth } from '../plugins/auth.js';
@@ -200,6 +220,7 @@ describe('Entity neighbor routes', () => {
       '/smart-charging/templates/x/neighbors',
       '/firmware-campaigns/x/neighbors',
       '/octt/runs/1/neighbors',
+      '/ai/insights/x/neighbors',
     ]) {
       setupDbResults([]);
       const res = await app.inject({

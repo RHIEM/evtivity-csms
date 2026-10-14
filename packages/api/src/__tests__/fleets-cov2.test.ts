@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -43,6 +47,7 @@ vi.mock('@evtivity/database', () => {
     chargingStations: { id: 'charging_stations.id' },
     pricingGroups: { id: 'pricing_groups.id' },
     fleetAuditLog: { name: 'fleetAuditLog' },
+    driverAuditLog: { name: 'driverAuditLog' },
     pricingAssignmentAuditLog: { name: 'pricingAssignmentAuditLog' },
     writeAudit,
     pgErrorCode: (err: unknown) => (err as { code?: string }).code,

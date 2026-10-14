@@ -17,14 +17,21 @@ import {
   chargingStations,
   stationConfigurations,
   stationAuditLog,
+  localAuthListAuditLog,
   writeAudit,
 } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, errorResponse } from '../lib/response-schemas.js';
+import { ocppCommandQueued, ocppCommandQueuedBody } from '../lib/ocpp-command-queued.js';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
-import { getUserSiteIds } from '../lib/site-access.js';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { assertFirmwareSignature } from '../lib/firmware-signature.js';
+import { assertNoStationCredentialWrite } from '../lib/station-credential-guard.js';
+import {
+  isReservedProfileId,
+  maxExternalConstraintsIdByIdentity,
+  reservedProfileIdMessage,
+} from '../lib/charging-profile-id.js';
 
 // --- v21 type imports ---
 import {
@@ -84,6 +91,7 @@ import {
   chargingProfilePurposeEnum as chargingProfilePurposeEnumV16,
   chargingRateUnitEnum as chargingRateUnitEnumV16,
 } from '../lib/ocpp-zod-types-v16.js';
+import { findCommandStation } from '../lib/command-station.js';
 
 const RESPONSE_TIMEOUT_MS = 35_000;
 
@@ -113,25 +121,12 @@ const ocppCommandError = z
   })
   .passthrough();
 
-const ocppCommandQueued = z
-  .object({
-    status: z
-      .literal('queued')
-      .describe('Indicates the command was queued because the station is offline'),
-    code: z.literal('COMMAND_QUEUED').describe('Stable code for offline-queued commands'),
-    stationId: z.string().describe('Target station OCPP ID'),
-    action: z.string().describe('OCPP action that was dispatched'),
-    message: z
-      .string()
-      .describe('Human-readable note explaining the command will be delivered on reconnect'),
-  })
-  .passthrough();
-
 interface CommandResult {
   commandId: string;
   response?: Record<string, unknown>;
   error?: string;
   queued?: boolean;
+  timedOut?: boolean;
 }
 
 const commandResponses = {
@@ -179,6 +174,7 @@ async function recordCommandAudit(
   action: string,
   payload: Record<string, unknown>,
   outcome: string,
+  response?: unknown,
 ): Promise<void> {
   // Skip when we never resolved the station's internal id -- this happens
   // on chunked dispatch continuations (subsequent chunks skip site access)
@@ -190,7 +186,8 @@ async function recordCommandAudit(
       {
         entityId: stationInternalId,
         entityIdSnapshot: stationInternalId,
-        action: 'command_dispatched',
+        // A Reset has its own action so a station's resets are easy to find.
+        action: action === 'Reset' ? 'reset_triggered' : 'command_dispatched',
         ...actor,
         notes: `${action} (${outcome})`,
         after: { action, payload: truncatedAuditPayload(payload), outcome },
@@ -198,6 +195,25 @@ async function recordCommandAudit(
       db,
       app.log,
     );
+    // A successful GetLocalListVersion reads the station's local list
+    // version: recorded on the station's local auth list history too.
+    if (action === 'GetLocalListVersion' && outcome === 'accepted') {
+      const body = (response ?? {}) as Record<string, unknown>;
+      // 2.1 answers versionNumber, 1.6 listVersion.
+      const listVersion = body['versionNumber'] ?? body['listVersion'] ?? null;
+      await writeAudit(
+        { table: localAuthListAuditLog, idColumn: 'station_id' },
+        {
+          entityId: stationInternalId,
+          entityIdSnapshot: stationInternalId,
+          action: 'pulled',
+          ...actor,
+          after: { listVersion },
+        },
+        db,
+        app.log,
+      );
+    }
   } catch (err: unknown) {
     // Audit failures must not break the command response. Log at warn so
     // it surfaces in ops monitoring without affecting the operator.
@@ -251,25 +267,8 @@ async function dispatchCommandRaw(
   // restricted site visibility.
   let stationInternalId: string | null = null;
   if (options?.skipSiteAccess !== true) {
-    const [station] = await db
-      .select({
-        id: chargingStations.id,
-        siteId: chargingStations.siteId,
-        ocppProtocol: chargingStations.ocppProtocol,
-      })
-      .from(chargingStations)
-      .where(eq(chargingStations.stationId, stationId));
+    const station = await findCommandStation(userId, stationId);
     if (station == null) {
-      return {
-        code: 404,
-        body: { error: 'Station not found', code: 'STATION_NOT_FOUND' },
-      };
-    }
-    const siteAccessIds = await getUserSiteIds(userId);
-    if (
-      siteAccessIds != null &&
-      (station.siteId == null || !siteAccessIds.includes(station.siteId))
-    ) {
       return {
         code: 404,
         body: { error: 'Station not found', code: 'STATION_NOT_FOUND' },
@@ -294,6 +293,25 @@ async function dispatchCommandRaw(
     stationInternalId = station.id;
   }
 
+  // K01.FR.81: a 2.1 station rejects a profile id at or below its
+  // MaxExternalConstraintsId. 1.6 has no such variable.
+  if (action === 'SetChargingProfile' && ocppVersion !== 'ocpp1.6') {
+    const profileId = (payload['chargingProfile'] as { id?: unknown } | undefined)?.id;
+    if (typeof profileId === 'number') {
+      const maxExternalId = await maxExternalConstraintsIdByIdentity(stationId);
+      if (isReservedProfileId(profileId, maxExternalId) && maxExternalId != null) {
+        return {
+          code: 400,
+          body: {
+            error: reservedProfileIdMessage(profileId, maxExternalId),
+            code: 'CHARGING_PROFILE_ID_RESERVED',
+            action,
+          },
+        };
+      }
+    }
+  }
+
   const commandId = crypto.randomUUID();
   app.log.info({ commandId, stationId, action }, 'OCPP command requested');
 
@@ -305,7 +323,11 @@ async function dispatchCommandRaw(
       send: () =>
         publishOcppCommand(pubsub, { commandId, stationId, action, payload, version: ocppVersion }),
     });
-    const result: CommandResult = reply ?? { commandId, error: 'No response within 35s' };
+    const result: CommandResult = reply ?? {
+      commandId,
+      error: 'No response within 35s',
+      timedOut: true,
+    };
 
     // The CommandListener publishes { queued: true } when the station is
     // not connected to any OCPP pod -- the command is held in
@@ -323,18 +345,12 @@ async function dispatchCommandRaw(
       );
       return {
         code: 202,
-        body: {
-          status: 'queued',
-          code: 'COMMAND_QUEUED',
-          stationId,
-          action,
-          message: result.error ?? 'Station offline, command queued',
-        },
+        body: ocppCommandQueuedBody(stationId, action, result.error),
       };
     }
 
     if (result.error != null) {
-      const isTimeout = result.error.includes('No response within');
+      const isTimeout = result.timedOut === true;
       void recordCommandAudit(
         app,
         actor,
@@ -355,7 +371,15 @@ async function dispatchCommandRaw(
       };
     }
 
-    void recordCommandAudit(app, actor, stationInternalId, action, payload, 'accepted');
+    void recordCommandAudit(
+      app,
+      actor,
+      stationInternalId,
+      action,
+      payload,
+      'accepted',
+      result.response,
+    );
     return {
       code: 200,
       body: { status: 'accepted', stationId, action, response: result.response },
@@ -443,6 +467,8 @@ function commandRoute(
     async (request, reply) => {
       const body = request.body as { stationId: string } & Record<string, unknown>;
       const { stationId, ...payload } = body;
+      // Station passwords change only through the station security service (P3).
+      assertNoStationCredentialWrite(commandName, payload);
       validatePayload?.(payload);
       return dispatchCommand(
         app,
@@ -1355,7 +1381,7 @@ export function ocppCommandRoutes(app: FastifyInstance): void {
     'ocpp2.1',
     'Set station variables',
     setVariablesV21Body,
-    'Sets one or more OCPP 2.1 configuration variables on the station. The CSMS must respect the station-reported ItemsPerMessageSetVariables limit; oversized batches must be split by the caller. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time.',
+    'Sets one or more OCPP 2.1 configuration variables on the station. A write to SecurityCtrlr.BasicAuthPassword is refused with 400 STATION_CREDENTIALS_ROUTE_REQUIRED: change station passwords with POST /v1/stations/{id}/credentials, which keeps the stored password hash in step with the station. The CSMS must respect the station-reported ItemsPerMessageSetVariables limit; oversized batches must be split by the caller. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time.',
   );
 
   commandRoute(
@@ -1485,7 +1511,7 @@ export function ocppCommandRoutes(app: FastifyInstance): void {
     'ocpp2.1',
     'Set network connection profile',
     setNetworkProfileV21Body,
-    'Configures a network connection profile (e.g., OCPP server URL, security profile, APN) for the station to use on next boot. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time. The station applies the profile after a reset.',
+    'Configures a network connection profile (e.g., OCPP server URL, security profile, APN) for the station to use on next boot. A profile with connectionData.basicAuthPassword is refused with 400 STATION_CREDENTIALS_ROUTE_REQUIRED: change station passwords and security profiles with POST /v1/stations/{id}/credentials and PATCH /v1/stations/{id}. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time. The station applies the profile after a reset.',
   );
 
   commandRoute(
@@ -1555,7 +1581,7 @@ export function ocppCommandRoutes(app: FastifyInstance): void {
     'ocpp2.1',
     'Change tariff for active transaction',
     changeTransactionTariffV21Body,
-    'Switches the tariff applied to an active transaction so the station can display the new price and the CSMS can bill the post-change segment correctly. Used by split-billing on tariff boundaries. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time.',
+    'Sends a new tariff for an active transaction to a station that calculates the cost locally (I11). The station applies it from now on; the CSMS bill does not change, it is priced from the tariff segments. With split billing the CSMS sends this command itself at a tariff boundary when the tariff the station applies no longer describes the session. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time.',
   );
 
   commandRoute(
@@ -1899,7 +1925,7 @@ export function ocppCommandRoutes(app: FastifyInstance): void {
     'ocpp1.6',
     'Change a station configuration key',
     changeConfigurationV16Body,
-    'Sets a single OCPP 1.6 configuration key on the station. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time. Some keys require a station reset to take effect.',
+    'Sets a single OCPP 1.6 configuration key on the station. The AuthorizationKey is refused with 400 STATION_CREDENTIALS_ROUTE_REQUIRED: change station passwords with POST /v1/stations/{id}/credentials, which keeps the stored password hash in step with the station. The station answer comes back with HTTP 200 in `response`, also when it is Rejected. 502 COMMAND_ERROR means the station answered with an OCPP error or the command could not be delivered; 504 COMMAND_TIMEOUT means no answer in time. Some keys require a station reset to take effect.',
   );
 
   commandRoute(

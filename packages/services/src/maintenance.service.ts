@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { ServiceLogger } from '@evtivity/lib';
+import crypto from 'node:crypto';
 import { and, eq, inArray, or, isNull, lt, gt, sql } from 'drizzle-orm';
 import {
   db,
@@ -20,14 +21,21 @@ import {
   createLogger,
   dispatchDriverNotification,
   AppError,
+  assertTemplateAllowed,
   renderMaintenanceMessage,
 } from '@evtivity/lib';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { jobQueue } from '@evtivity/lib/job-queues';
+import {
+  MAINTENANCE_FANOUT_JOB_OPTIONS,
+  MAINTENANCE_FANOUT_QUEUE,
+} from '@evtivity/lib/worker-queues';
 import { buildDerivedStatusSubquery } from './station-derived-status.js';
 import { sleep } from './sleep.js';
 import { sendOcppCommandAndWait } from './ocpp-command.js';
 import { sendAvailabilityCommand } from './availability-command.js';
 import { applyReservationCancellation } from './reservation-cancel.js';
+import { publishCancelReservation } from './reservation.service.js';
 import { invalidateMaintenanceCheckCache } from './maintenance-check.js';
 import {
   pushStationMessageSlot,
@@ -66,8 +74,8 @@ export interface CreateMaintenanceInput {
 // push + reservation cancels + session stops + driver notifications) must NOT
 // run inside the request: it would blow past the nginx 60s proxy timeout and
 // the operator would see a 504 even though the state mutation already landed.
-// Instead the request publishes the `maintenance_fanout` channel and the worker
-// runs the fan-out through BullMQ, so it survives an API restart. When
+// Instead the request adds a `maintenance-fanout` job to the worker's queue,
+// which waits in Redis while no worker runs and survives an API restart. When
 // false/absent (worker scheduler, tests) the side effects are awaited inline
 // because there is no timeout pressure and effects must complete before the
 // call resolves.
@@ -91,13 +99,44 @@ export interface MaintenanceFanoutJob {
   phase: MaintenanceFanoutPhase;
   stationDbIds?: string[];
   actor?: MaintenanceFanoutActor;
-  // Reassert publishes carry a per-reconnect nonce so the worker's
-  // deterministic jobId does not collapse a later reconnect's re-assert into
-  // an already-completed job for the same station.
+  // Add, remove and reassert requests carry a nonce so the deterministic
+  // jobId does not collapse a later request (the same stations added again
+  // after a remove, a station's next reconnect) into an already-completed job
+  // the queue still keeps.
   nonce?: string;
 }
 
-export const MAINTENANCE_FANOUT_CHANNEL = 'maintenance_fanout';
+/** The BullMQ job name of one fan-out. */
+export const MAINTENANCE_FANOUT_JOB_NAME = 'maintenance-fanout';
+
+/**
+ * Stable job id, so the same logical fan-out added twice runs once (P7). For
+ * add and remove the station set is part of the identity. Segments join with
+ * '.' because BullMQ rejects custom job ids containing ':'.
+ */
+export function maintenanceFanoutJobId(job: MaintenanceFanoutJob): string {
+  let id = `mf.${job.eventId}.${job.phase}`;
+  if (job.stationDbIds != null && job.stationDbIds.length > 0) {
+    id += `.${[...job.stationDbIds].sort().join(',')}`;
+  }
+  if (job.nonce != null) {
+    id += `.${job.nonce}`;
+  }
+  return id;
+}
+
+/**
+ * Hands a station fan-out to the worker: adds the `maintenance-fanout` job
+ * itself (API, worker cron, OCPP reconnect re-assert), so it waits in Redis
+ * while no worker runs. Throws when the job cannot be added (Redis down).
+ */
+export async function enqueueMaintenanceFanout(job: MaintenanceFanoutJob): Promise<void> {
+  await jobQueue(MAINTENANCE_FANOUT_QUEUE, MAINTENANCE_FANOUT_JOB_OPTIONS).add(
+    MAINTENANCE_FANOUT_JOB_NAME,
+    job,
+    { jobId: maintenanceFanoutJobId(job) },
+  );
+}
 
 // Concurrency-bound the per-station fan-out so a site with ~90 stations does not
 // open 90 simultaneous OCPP waits. The pool keeps `limit` tasks in flight.
@@ -232,19 +271,18 @@ function makeActiveAbortCheck(eventId: string): () => Promise<boolean> {
   };
 }
 
-// Hand the station fan-out to the worker via the `maintenance_fanout` channel.
-// A publish failure leaves the event in its committed state (active/completed/
-// cancelled) with the fleet uncommanded, so it is logged at ERROR — not warn —
-// even though the request still returns success (the state mutation already
-// landed). The maintenance-scheduler cron and an operator re-save are the
-// recovery paths that re-trigger the fan-out.
-async function publishFanout(job: MaintenanceFanoutJob, logger?: ServiceLogger): Promise<void> {
+// Hand the station fan-out to the worker's queue (a stopped worker runs it when
+// it starts). An add failure (Redis down) leaves the event in its committed
+// state (active/completed/cancelled) with the fleet uncommanded, so it is
+// logged at ERROR, not warn, even though the request still returns success
+// (the state mutation already landed). An operator re-save re-triggers it.
+async function queueFanout(job: MaintenanceFanoutJob, logger?: ServiceLogger): Promise<void> {
   try {
-    await getPubSub().publish(MAINTENANCE_FANOUT_CHANNEL, JSON.stringify(job));
+    await enqueueMaintenanceFanout(job);
   } catch (err) {
     logger?.error(
       { err, eventId: job.eventId, phase: job.phase },
-      'maintenance fan-out publish failed; fleet left uncommanded until re-trigger',
+      'maintenance fan-out job not queued; fleet left uncommanded until re-trigger',
     );
   }
 }
@@ -369,6 +407,23 @@ async function findOverlappingScheduledEvents(
   return filtered.map((r) => rowFromDb(r as Record<string, unknown>));
 }
 
+/**
+ * Refuses a custom message the station message renderer would reject, so the
+ * operator sees the error on save instead of the fan-out failing to render it.
+ */
+function assertMaintenanceMessageAllowed(message: string | null | undefined): void {
+  if (message == null || message === '') return;
+  try {
+    assertTemplateAllowed(message);
+  } catch (err: unknown) {
+    throw new AppError(
+      `Custom message is not a valid template: ${err instanceof Error ? err.message : String(err)}`,
+      400,
+      'VALIDATION_ERROR',
+    );
+  }
+}
+
 export async function createEvent(
   input: CreateMaintenanceInput,
   options: SideEffectOptions = {},
@@ -376,6 +431,7 @@ export async function createEvent(
   if (input.plannedEndAt.getTime() <= input.plannedStartAt.getTime()) {
     throw new AppError('Maintenance end must be after start', 400, 'MAINTENANCE_INVALID_RANGE');
   }
+  assertMaintenanceMessageAllowed(input.customMessage);
 
   const overlaps = await findOverlappingScheduledEvents(
     input.siteId,
@@ -477,7 +533,7 @@ export async function enterMaintenance(
   await publishStateChange(event.siteId, event.id);
 
   if (options.detachSideEffects === true) {
-    await publishFanout(
+    await queueFanout(
       { eventId: event.id, siteId: event.siteId, phase: 'enter', actor: fanoutActor(actor) },
       logger,
     );
@@ -630,12 +686,15 @@ async function cancelOverlappingReservations(
   const candidates = await db
     .select({
       id: reservations.id,
+      reservationOcppId: reservations.reservationId,
       stationId: reservations.stationId,
+      stationOcppId: chargingStations.stationId,
       driverId: reservations.driverId,
       startsAt: reservations.startsAt,
       createdAt: reservations.createdAt,
     })
     .from(reservations)
+    .innerJoin(chargingStations, eq(reservations.stationId, chargingStations.id))
     .where(
       and(
         inArray(reservations.stationId, stationIds),
@@ -661,6 +720,16 @@ async function cancelOverlappingReservations(
           ...(logger != null ? { logger } : {}),
         });
         if (!result.cancelled) return false;
+        // The station holds an active reservation until told (G8). A
+        // scheduled one never reached it. Fail-open: the row is cancelled.
+        if (result.statusBefore === 'active') {
+          await publishCancelReservation(
+            getPubSub(),
+            row.stationOcppId,
+            row.reservationOcppId,
+            logger,
+          );
+        }
         if (row.driverId != null) {
           try {
             await dispatchDriverNotification(
@@ -809,7 +878,7 @@ export async function exitMaintenance(
   await publishStateChange(event.siteId, event.id);
 
   if (options.detachSideEffects === true) {
-    await publishFanout(
+    await queueFanout(
       { eventId: event.id, siteId: event.siteId, phase: 'release', actor: fanoutActor(actor) },
       logger,
     );
@@ -875,10 +944,9 @@ async function runReleaseStations(
   // status, so watching drivers are alerted here for each station that is now
   // free by the shared driver availability rule (a disabled one is not).
   // Per-station fail-open: the release is stored.
-  const pubsub = getPubSub();
   await mapWithConcurrency(stations, STATION_FANOUT_CONCURRENCY, async (station) => {
     try {
-      await alertStationWatchersIfAvailable(client, pubsub, station.id);
+      await alertStationWatchersIfAvailable(client, station.id);
     } catch (err) {
       logger?.warn({ err, stationId: station.stationId }, 'maintenance station-watch check failed');
     }
@@ -973,6 +1041,7 @@ export async function updateEvent(
     updateSet['activeSessionPolicy'] = changes.activeSessionPolicy;
   }
   if (changes.customMessage !== undefined) {
+    assertMaintenanceMessageAllowed(changes.customMessage);
     updateSet['customMessage'] = changes.customMessage;
   }
   if (changes.reason !== undefined) {
@@ -1160,13 +1229,14 @@ export async function addStationsToMaintenance(
   // Only an active event needs to take the newly added stations offline.
   if (after.status === 'active') {
     if (options.detachSideEffects === true) {
-      await publishFanout(
+      await queueFanout(
         {
           eventId: after.id,
           siteId: after.siteId,
           phase: 'add',
           stationDbIds: trulyNew,
           actor: fanoutActor(actor),
+          nonce: crypto.randomUUID(),
         },
         logger,
       );
@@ -1191,7 +1261,10 @@ async function runAddStationSideEffects(
       ocppProtocol: chargingStations.ocppProtocol,
     })
     .from(chargingStations)
-    .where(inArray(chargingStations.id, newStationIds));
+    // Only stations still at the event's site (the job can run after a move).
+    .where(
+      and(inArray(chargingStations.id, newStationIds), eq(chargingStations.siteId, after.siteId)),
+    );
 
   const [site] = await db
     .select({ name: sites.name })
@@ -1406,13 +1479,14 @@ export async function removeStationsFromMaintenance(
   // Only an active event left the removed stations Inoperative; release them.
   if (before.status === 'active' && removed.length > 0) {
     if (options.detachSideEffects === true) {
-      await publishFanout(
+      await queueFanout(
         {
           eventId: after.id,
           siteId: after.siteId,
           phase: 'remove',
           stationDbIds: removed,
           actor: fanoutActor(actor),
+          nonce: crypto.randomUUID(),
         },
         logger,
       );
@@ -1437,7 +1511,14 @@ async function runRemoveStationSideEffects(
       disabledReason: chargingStations.disabledReason,
     })
     .from(chargingStations)
-    .where(inArray(chargingStations.id, removedStationIds));
+    // A station that moved to another site since it was added is not this
+    // event's to release: commanding it would act on another site's station.
+    .where(
+      and(
+        inArray(chargingStations.id, removedStationIds),
+        eq(chargingStations.siteId, after.siteId),
+      ),
+    );
 
   await runReleaseStations(after, 'remove-stations', logger, releasedStations);
 }
@@ -1503,7 +1584,7 @@ export async function cancelEvent(
   // slow leg, so detach it on the HTTP path and await it on the worker path.
   if (wasActive) {
     if (options.detachSideEffects === true) {
-      await publishFanout(
+      await queueFanout(
         { eventId: event.id, siteId: event.siteId, phase: 'release', actor: fanoutActor(actor) },
         logger,
       );

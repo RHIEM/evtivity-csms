@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, and, count, sql, inArray, or, isNull, desc } from 'drizzle-orm';
+import { eq, and, count, sql, inArray, desc } from 'drizzle-orm';
 import { db } from '@evtivity/database';
 import {
   cssStations,
@@ -14,6 +14,7 @@ import {
   chargingStations,
   evses,
   connectors,
+  sites,
 } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, paginatedResponse, errorWith } from '../lib/response-schemas.js';
@@ -55,9 +56,11 @@ import {
 import { OCPP21_CONFIG_DEFAULTS, OCPP16_CONFIG_DEFAULTS } from '../lib/css-config-defaults.js';
 import { authorize } from '../middleware/rbac.js';
 import { getUserSiteIds } from '../lib/site-access.js';
+import { siteInScope } from '../lib/site-scope.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { generateStationPassword, tryParseJson } from '@evtivity/lib';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { auditStationChange } from '../lib/station-audit.js';
 import {
   initialStationPassword,
   changeStationPassword,
@@ -68,8 +71,10 @@ import {
 // charging_stations.siteId for the css_stations row and verifies the
 // operator can read it per the same rules as charging_stations:
 //   - full access (siteIds == null) wins
-//   - no paired charging_stations row OR paired with siteId=null is visible
-//     to everyone (matches stations.ts behavior for unsited rows)
+//   - no paired charging_stations row, or one with siteId=null, is visible
+//     to all-site users only (matches stations.ts behavior for unsited rows).
+//     So a site-restricted user cannot create a simulator for a new station
+//     id (it would create an unsited station) or take over an unsited one.
 //   - otherwise the paired siteId must be in the operator's allow-list
 // Returns 404 (not 403) on denial to avoid leaking existence.
 async function isCssStationAccessible(stationId: string, userId: string): Promise<boolean> {
@@ -80,9 +85,29 @@ async function isCssStationAccessible(stationId: string, userId: string): Promis
     .from(chargingStations)
     .where(eq(chargingStations.stationId, stationId))
     .limit(1);
-  if (cs == null) return true;
-  if (cs.siteId == null) return true;
-  return siteIds.includes(cs.siteId);
+  return siteInScope(siteIds, cs?.siteId);
+}
+
+/**
+ * Audits a simulator change on the paired charging station. A simulator row
+ * without a charging_stations row has no station entity to audit.
+ */
+async function auditCssStation(
+  request: FastifyRequest,
+  stationId: string,
+  enabled: boolean | null,
+  notes: string,
+): Promise<void> {
+  const [cs] = await db
+    .select({ id: chargingStations.id })
+    .from(chargingStations)
+    .where(eq(chargingStations.stationId, stationId))
+    .limit(1);
+  if (cs == null) return;
+  await auditStationChange(request, cs.id, 'simulator_toggled', {
+    after: enabled == null ? { simulator: 'deleted' } : { simulatorEnabled: enabled },
+    notes,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +129,7 @@ export const HIGH_LEVEL_ACTIONS = [
   'powerCycle',
   'goOffline',
   'comeOnline',
+  'reservationReply',
 ] as const;
 
 // Station-initiated messages registered under both v16/ and v21/ prefixes
@@ -132,6 +158,7 @@ export const ACTION_VERSIONS: Record<string, 'all' | 'ocpp1.6' | 'ocpp2.1'> = {
   powerCycle: 'all',
   goOffline: 'all',
   comeOnline: 'all',
+  reservationReply: 'all',
 
   // OCPP 2.1 only
   createPncEv: 'ocpp2.1',
@@ -210,6 +237,12 @@ const createStationBody = z.object({
   caCert: z.string().optional().describe('CA certificate PEM'),
   sourceType: z.enum(['api', 'chaos', 'cli']).optional().describe('Source type'),
   evses: z.array(createStationEvse).min(1).max(50).describe('EVSE configurations'),
+  siteId: z
+    .string()
+    .optional()
+    .describe(
+      'Site of the charging station created for a new station id. A site-restricted user must give one of its sites. Ignored when the charging station already exists (it keeps its site).',
+    ),
 });
 
 const updateStationBody = z.object({
@@ -428,6 +461,14 @@ const startPncChargingBody = z.object({
 const goOfflineBody = z.object({});
 
 const comeOnlineBody = z.object({});
+
+const reservationReplyBody = z.object({
+  reply: z
+    .enum(['Rejected', 'Occupied', 'NoReply', 'Accepted'])
+    .describe(
+      'Answer of the next ReserveNow only: Rejected or Occupied answer that status, NoReply sends no reply (the CSMS times out), Accepted clears the override',
+    ),
+});
 
 // --- Station-initiated messages (all versions) ---
 
@@ -1126,7 +1167,10 @@ export function cssRoutes(app: FastifyInstance): void {
         response: {
           201: itemResponse(stationItem),
           400: errorWith('Invalid password', [ERROR_CODES.VALIDATION_ERROR]),
-          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          404: errorWith('Station or site not found', [
+            ERROR_CODES.STATION_NOT_FOUND,
+            ERROR_CODES.SITE_NOT_FOUND,
+          ]),
           409: errorWith('Duplicate station id', [ERROR_CODES.DUPLICATE_STATION_ID]),
           502: errorWith('The station did not accept the password', [
             ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
@@ -1140,11 +1184,36 @@ export function cssRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof createStationBody>;
       const { userId } = request.user as JwtPayload;
 
-      // Reject if the caller is scoped to a site set that doesn't include the
-      // paired charging_stations row's site. Unsited / not-yet-existing
-      // charging_stations are fine -- those are visible to every operator.
-      if (!(await isCssStationAccessible(body.stationId, userId))) {
-        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      // An existing charging_stations row must be in the caller's sites: a
+      // site-restricted user cannot take over an unsited or foreign real
+      // station. A new station id creates a charging station in body.siteId,
+      // which must exist and be one of the caller's sites; without a site the
+      // new station is unsited, which only an all-site user may create.
+      const callerSiteIds = await getUserSiteIds(userId);
+      if (callerSiteIds != null || body.siteId != null) {
+        const [pairedStation] = await db
+          .select({ siteId: chargingStations.siteId })
+          .from(chargingStations)
+          .where(eq(chargingStations.stationId, body.stationId))
+          .limit(1);
+        if (pairedStation != null) {
+          if (!siteInScope(callerSiteIds, pairedStation.siteId)) {
+            return reply
+              .status(404)
+              .send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          }
+        } else if (body.siteId != null) {
+          const [targetSite] = await db
+            .select({ id: sites.id })
+            .from(sites)
+            .where(eq(sites.id, body.siteId))
+            .limit(1);
+          if (targetSite == null || !siteInScope(callerSiteIds, targetSite.id)) {
+            return reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+          }
+        } else {
+          return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        }
       }
 
       // Check for duplicate stationId (read-only, safe outside the transaction).
@@ -1202,18 +1271,24 @@ export function cssRoutes(app: FastifyInstance): void {
       // and an incomplete cssStations setup.
       const result = await db.transaction(async (tx) => {
         // Ensure a charging_stations row exists, marked as simulator.
+        let chargingStationId = existingCs?.id ?? null;
         if (existingCs == null) {
-          await tx.insert(chargingStations).values({
-            stationId: body.stationId,
-            model: body.model ?? 'CSS-1000',
-            serialNumber: body.serialNumber ?? `SN-${body.stationId}`,
-            firmwareVersion: body.firmwareVersion ?? '1.0.0',
-            securityProfile: body.securityProfile ?? 1,
-            ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
-            basicAuthPasswordHash: newStationPasswordHash,
-            isSimulator: true,
-            onboardingStatus: 'accepted',
-          });
+          const [created] = await tx
+            .insert(chargingStations)
+            .values({
+              stationId: body.stationId,
+              siteId: body.siteId ?? null,
+              model: body.model ?? 'CSS-1000',
+              serialNumber: body.serialNumber ?? `SN-${body.stationId}`,
+              firmwareVersion: body.firmwareVersion ?? '1.0.0',
+              securityProfile: body.securityProfile ?? 1,
+              ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
+              basicAuthPasswordHash: newStationPasswordHash,
+              isSimulator: true,
+              onboardingStatus: 'accepted',
+            })
+            .returning({ id: chargingStations.id });
+          chargingStationId = created?.id ?? null;
         } else if (!existingCs.isSimulator) {
           await tx
             .update(chargingStations)
@@ -1268,8 +1343,38 @@ export function cssRoutes(app: FastifyInstance): void {
         // the just-inserted rows.
         const evses = await tx.select().from(cssEvses).where(eq(cssEvses.cssStationId, station.id));
 
-        return { station, evses };
+        return { station, evses, chargingStationId };
       });
+
+      if (result.chargingStationId != null) {
+        await auditStationChange(
+          request,
+          result.chargingStationId,
+          existingCs == null ? 'created' : 'updated',
+          {
+            before: existingCs == null ? null : { isSimulator: existingCs.isSimulator },
+            after: {
+              stationId: body.stationId,
+              isSimulator: true,
+              simulator: {
+                targetUrl: body.targetUrl,
+                sourceType: body.sourceType ?? 'api',
+                evseCount: result.evses.length,
+              },
+              ...(existingCs == null
+                ? {
+                    siteId: body.siteId ?? null,
+                    model: body.model ?? 'CSS-1000',
+                    ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
+                    securityProfile: body.securityProfile ?? 1,
+                  }
+                : {}),
+            },
+            notes:
+              existingCs == null ? 'Simulator station created' : 'Simulator paired to the station',
+          },
+        );
+      }
 
       return reply.status(201).send({ ...publicCssStation(result.station), evses: result.evses });
     },
@@ -1305,16 +1410,10 @@ export function cssRoutes(app: FastifyInstance): void {
 
       // Filter css_stations by the paired charging_stations.siteId. LEFT JOIN
       // because some css_stations rows have no charging_stations pair (legacy
-      // seeded fixtures); those stay visible. Same rule for siteId=null --
-      // unsited stations are visible to everyone per site-access-control.md.
+      // seeded fixtures). Rows without a pair or with siteId=null are visible
+      // to all-site users only, per site-access-control.md.
       const accessCondition =
-        siteIds == null
-          ? undefined
-          : or(
-              isNull(chargingStations.id),
-              isNull(chargingStations.siteId),
-              inArray(chargingStations.siteId, siteIds),
-            );
+        siteIds == null ? undefined : inArray(chargingStations.siteId, siteIds);
 
       const [data, totalResult] = await Promise.all([
         db
@@ -1439,7 +1538,11 @@ export function cssRoutes(app: FastifyInstance): void {
       }
 
       const [existing] = await db
-        .select({ id: cssStations.id })
+        .select({
+          id: cssStations.id,
+          targetUrl: cssStations.targetUrl,
+          enabled: cssStations.enabled,
+        })
         .from(cssStations)
         .where(eq(cssStations.stationId, stationId));
 
@@ -1448,7 +1551,13 @@ export function cssRoutes(app: FastifyInstance): void {
       }
 
       const [pairedCs] = await db
-        .select({ id: chargingStations.id })
+        .select({
+          id: chargingStations.id,
+          ocppProtocol: chargingStations.ocppProtocol,
+          model: chargingStations.model,
+          serialNumber: chargingStations.serialNumber,
+          firmwareVersion: chargingStations.firmwareVersion,
+        })
         .from(chargingStations)
         .where(eq(chargingStations.stationId, stationId));
 
@@ -1509,6 +1618,36 @@ export function cssRoutes(app: FastifyInstance): void {
       if (updated == null) {
         return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
       }
+
+      // Changed fields only. The password and security profile are audited by
+      // the station security service; certificates and keys are recorded as
+      // changed, never by value.
+      if (pairedCs != null) {
+        const before: Record<string, unknown> = {};
+        const after: Record<string, unknown> = {};
+        const record = (key: string, prev: unknown, next: unknown): void => {
+          if (next !== undefined && prev !== next) {
+            before[key] = prev;
+            after[key] = next;
+          }
+        };
+        record('ocppProtocol', pairedCs.ocppProtocol, body.ocppProtocol);
+        record('model', pairedCs.model, body.model);
+        record('serialNumber', pairedCs.serialNumber, body.serialNumber);
+        record('firmwareVersion', pairedCs.firmwareVersion, body.firmwareVersion);
+        record('simulatorTargetUrl', existing.targetUrl, body.targetUrl);
+        record('simulatorEnabled', existing.enabled, body.enabled);
+        for (const key of ['clientCert', 'clientKey', 'caCert'] as const) {
+          if (body[key] !== undefined) after[`${key}Changed`] = true;
+        }
+        if (Object.keys(after).length > 0) {
+          await auditStationChange(request, pairedCs.id, 'updated', {
+            before,
+            after,
+            notes: 'Simulator station updated',
+          });
+        }
+      }
       return publicCssStation(updated);
     },
   );
@@ -1548,6 +1687,7 @@ export function cssRoutes(app: FastifyInstance): void {
       }
 
       await db.delete(cssStations).where(eq(cssStations.id, existing.id));
+      await auditCssStation(request, stationId, null, 'Simulator removed from the station');
 
       return reply.status(204).send();
     },
@@ -1596,6 +1736,7 @@ export function cssRoutes(app: FastifyInstance): void {
       if (updated == null) {
         return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
       }
+      await auditCssStation(request, stationId, true, 'Simulator enabled');
       return publicCssStation(updated);
     },
   );
@@ -1643,6 +1784,7 @@ export function cssRoutes(app: FastifyInstance): void {
       if (updated == null) {
         return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
       }
+      await auditCssStation(request, stationId, false, 'Simulator disabled');
       return publicCssStation(updated);
     },
   );
@@ -1683,6 +1825,13 @@ export function cssRoutes(app: FastifyInstance): void {
     'all',
     'Reconnect station to OCPP server without a reboot: reports connector statuses and replays queued transaction messages',
     comeOnlineBody,
+  );
+  actionRoute(
+    app,
+    'reservationReply',
+    'all',
+    'Force the answer of the next ReserveNow (test control)',
+    reservationReplyBody,
   );
 
   // --- Station-initiated messages (version-specific endpoints) ---

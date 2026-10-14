@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useRef, useState } from 'react';
+import { Children, useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { ArrowUp, ArrowDown, ArrowRight, ChevronDown } from 'lucide-react';
@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { api } from '@/lib/api';
-import { useAuth } from '@/lib/auth';
+import { useAuth, useHasAllSiteAccess } from '@/lib/auth';
 import { EnergyChart } from '@/components/charts/EnergyChart';
 import { SessionsChart } from '@/components/charts/SessionsChart';
 import { Sparkline } from '@/components/charts/Sparkline';
@@ -26,6 +26,8 @@ import { DateRangeControl } from '@/components/DateRangeControl';
 import { useDateRange } from '@/hooks/useDateRange';
 import { localDateString } from '@/lib/date-range';
 import { useUpdateCheck } from '@/hooks/use-update-check';
+import { ActiveInsightsWidget } from '@/components/ai/insights/ActiveInsightsWidget';
+import { ScrollSnapRow } from '@/components/ui/scroll-snap-row';
 import { useDayDeltaContext, type SnapshotData } from '@/hooks/use-day-delta-context';
 import { useCompanyCurrency } from '@/hooks/use-company-currency';
 import { formatCents, formatNumber, formatNumberUpTo } from '@/lib/formatting';
@@ -58,6 +60,24 @@ const STAT_VALUE_CLASS =
 
 /** Rows of six stat cards; three per row below xl, where six leave no room for the values. */
 const SIX_CARD_GRID_CLASS = 'grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-6';
+
+/**
+ * Columns of a stat card row by its card count, so a short row fits its
+ * cards instead of leaving empty columns: one card spans the row; two or
+ * three stack on phones and share the row from md; four or more keep two
+ * columns on phones and four from lg.
+ */
+export function statGridClass(count: number): string {
+  if (count <= 1) return 'grid gap-4 grid-cols-1';
+  if (count === 2) return 'grid gap-4 grid-cols-1 md:grid-cols-2';
+  if (count === 3) return 'grid gap-4 grid-cols-1 md:grid-cols-3';
+  return 'grid gap-4 grid-cols-2 lg:grid-cols-4';
+}
+
+/** A row of stat cards laid out by `statGridClass` (every dashboard stat row). */
+function StatGrid({ children }: { children: React.ReactNode }): React.JSX.Element {
+  return <div className={statGridClass(Children.toArray(children).length)}>{children}</div>;
+}
 
 type DashboardMode = 'live' | 'historical' | 'trend';
 
@@ -133,6 +153,9 @@ interface OcppHealthStats {
   totalPongsReceived: number;
   serverStartedAt: string | null;
   updatedAt: string | null;
+  /** Running OCPP server processes; the stats above are their fleet totals. */
+  instanceCount: number;
+  instances?: Array<{ instanceId: string; connectedStations: number }>;
 }
 
 interface CarbonStats {
@@ -178,59 +201,6 @@ function useAnimatedValue(value: string | number): string {
   return formatParsedValue(parsed, display, i18n.language);
 }
 
-function ScrollSnapRow({
-  pages,
-}: {
-  pages: { id: string; content: React.ReactNode }[];
-}): React.JSX.Element {
-  const { t } = useTranslation();
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [active, setActive] = useState(0);
-
-  function handleScroll(): void {
-    const el = scrollRef.current;
-    if (el == null) return;
-    setActive(Math.round(el.scrollLeft / el.clientWidth));
-  }
-
-  function goTo(index: number): void {
-    const el = scrollRef.current;
-    if (el == null) return;
-    el.scrollTo({ left: index * el.clientWidth, behavior: 'smooth' });
-  }
-
-  return (
-    <div className="space-y-2">
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [-ms-overflow-style:none] scrollbar-none [&::-webkit-scrollbar]:hidden"
-      >
-        {pages.map((page) => (
-          <div key={page.id} className="w-full shrink-0 snap-start">
-            {page.content}
-          </div>
-        ))}
-      </div>
-      <div className="flex justify-center gap-1.5">
-        {pages.map((page, index) => (
-          <button
-            key={page.id}
-            type="button"
-            aria-label={t('dashboard.showPage', { page: index + 1, total: pages.length })}
-            onClick={() => {
-              goTo(index);
-            }}
-            className={`h-1.5 rounded-full transition-all ${
-              index === active ? 'w-4 bg-primary' : 'w-1.5 bg-muted-foreground/40'
-            }`}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function StatCard({
   title,
   value,
@@ -266,8 +236,8 @@ function StatCard({
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle className="text-sm font-medium flex items-center gap-1">
+      <CardHeader variant="stat">
+        <CardTitle variant="stat">
           {title}
           {info != null && <InfoTooltip content={<div className="max-w-56">{info}</div>} />}
         </CardTitle>
@@ -337,8 +307,8 @@ function TrendStatCard({
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle className="text-sm font-medium flex items-center gap-1">
+      <CardHeader variant="stat">
+        <CardTitle variant="stat">
           {title}
           {info != null && <InfoTooltip content={<div className="max-w-56">{info}</div>} />}
         </CardTitle>
@@ -509,6 +479,8 @@ function AdminDashboard({
   toDate: string;
 }): React.JSX.Element {
   const { t } = useTranslation();
+  // The OCPP server ping statistics cover every site: all-site users only.
+  const hasAllSiteAccess = useHasAllSiteAccess();
 
   const energy = useDateRange();
   const sessions = useDateRange();
@@ -631,7 +603,7 @@ function AdminDashboard({
 
   function renderLiveStatCards(): React.JSX.Element {
     const revenueGrid = (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <StatCard
           title={t('dashboard.totalRevenue')}
           value={formatMoney(financialStats.data?.totalRevenueCents ?? 0, liveCurrency)}
@@ -660,11 +632,11 @@ function AdminDashboard({
           dayDelta={dayDelta(yd?.totalTransactions, db?.totalTransactions)}
           deltaLabel={deltaLabel}
         />
-      </div>
+      </StatGrid>
     );
 
     const taxGrid = (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <StatCard
           title={t('dashboard.netRevenue')}
           value={formatMoney(financialStats.data?.totalNetRevenueCents ?? 0, liveCurrency)}
@@ -685,11 +657,11 @@ function AdminDashboard({
           value={formatMoney(financialStats.data?.todayTaxCents ?? 0, liveCurrency)}
           info={t('dashboard.info.todayTaxCollected')}
         />
-      </div>
+      </StatGrid>
     );
 
     const costGrid = (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <StatCard
           title={t('dashboard.electricityCost')}
           value={formatMoney(financialStats.data?.totalElectricityCostCents ?? 0, liveCurrency)}
@@ -710,14 +682,14 @@ function AdminDashboard({
           value={formatMoney(financialStats.data?.dayProfitCents ?? 0, liveCurrency)}
           info={t('dashboard.info.dayProfit')}
         />
-      </div>
+      </StatGrid>
     );
 
     // Charge on account: shown only when account sessions are waiting for
     // their fleet invoice to be paid.
     const billedOnAccountCount = financialStats.data?.billedOnAccountCount ?? 0;
     const accountGrid = (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <StatCard
           title={t('dashboard.billedOnAccount')}
           value={formatMoney(financialStats.data?.billedOnAccountCents ?? 0, liveCurrency)}
@@ -728,7 +700,7 @@ function AdminDashboard({
           value={billedOnAccountCount}
           info={t('dashboard.info.billedOnAccountSessions')}
         />
-      </div>
+      </StatGrid>
     );
 
     return (
@@ -769,8 +741,8 @@ function AdminDashboard({
             positiveIsGood={false}
           />
           <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium flex items-center gap-1">
+            <CardHeader variant="stat">
+              <CardTitle variant="stat">
                 {t('dashboard.co2Avoided')}
                 <InfoTooltip
                   content={<div className="max-w-56">{t('dashboard.co2AvoidedTooltip')}</div>}
@@ -806,22 +778,38 @@ function AdminDashboard({
             info={t('dashboard.info.ocppConnections')}
             dayDelta={dayDelta(yd?.connectedStations, db?.connectedStations)}
             deltaLabel={deltaLabel}
+            extra={
+              (ocppHealth.data?.instanceCount ?? 0) > 1 ? (
+                <p
+                  className="text-xs text-muted-foreground"
+                  title={ocppHealth.data?.instances
+                    ?.map((i) => `${i.instanceId}: ${String(i.connectedStations)}`)
+                    .join('\n')}
+                >
+                  {t('dashboard.ocppServers', { count: ocppHealth.data?.instanceCount ?? 0 })}
+                </p>
+              ) : undefined
+            }
           />
-          <StatCard
-            title={t('dashboard.pingLatency')}
-            value={`${formatNumberUpTo(ocppHealth.data?.avgPingLatencyMs ?? 0, 2)}\u00a0ms`}
-            info={t('dashboard.info.pingLatency')}
-            positiveIsGood={false}
-            dayDelta={dayDelta(yd?.avgPingLatencyMs, db?.avgPingLatencyMs)}
-            deltaLabel={deltaLabel}
-          />
-          <StatCard
-            title={t('dashboard.pingSuccessRate')}
-            value={`${formatNumberUpTo(ocppHealth.data?.pingSuccessRate ?? 100, 1)}%`}
-            info={t('dashboard.info.pingSuccessRate')}
-            dayDelta={dayDelta(yd?.pingSuccessRate, db?.pingSuccessRate)}
-            deltaLabel={deltaLabel}
-          />
+          {hasAllSiteAccess && (
+            <>
+              <StatCard
+                title={t('dashboard.pingLatency')}
+                value={`${formatNumberUpTo(ocppHealth.data?.avgPingLatencyMs ?? 0, 2)}\u00a0ms`}
+                info={t('dashboard.info.pingLatency')}
+                positiveIsGood={false}
+                dayDelta={dayDelta(yd?.avgPingLatencyMs, db?.avgPingLatencyMs)}
+                deltaLabel={deltaLabel}
+              />
+              <StatCard
+                title={t('dashboard.pingSuccessRate')}
+                value={`${formatNumberUpTo(ocppHealth.data?.pingSuccessRate ?? 100, 1)}%`}
+                info={t('dashboard.info.pingSuccessRate')}
+                dayDelta={dayDelta(yd?.pingSuccessRate, db?.pingSuccessRate)}
+                deltaLabel={deltaLabel}
+              />
+            </>
+          )}
           <StatCard
             title={t('dashboard.totalPorts')}
             value={uptimeQuery.data?.totalPorts ?? 0}
@@ -832,12 +820,13 @@ function AdminDashboard({
         </div>
 
         <ScrollSnapRow
-          pages={[
+          items={[
             { id: 'revenue', content: revenueGrid },
             { id: 'tax', content: taxGrid },
             { id: 'cost', content: costGrid },
             ...(billedOnAccountCount > 0 ? [{ id: 'account', content: accountGrid }] : []),
           ]}
+          gap="gap-4"
         />
       </>
     );
@@ -861,7 +850,7 @@ function AdminDashboard({
 
     return (
       <>
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatGrid>
           <StatCard
             title={t('dashboard.totalStations')}
             value={s.totalStations}
@@ -882,9 +871,9 @@ function AdminDashboard({
             value={s.activeSessions}
             info={t('dashboard.historicalInfo.activeSessions', d)}
           />
-        </div>
+        </StatGrid>
 
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatGrid>
           <StatCard
             title={t('dashboard.dayEnergy')}
             value={formatEnergy(s.dayEnergyWh)}
@@ -905,9 +894,9 @@ function AdminDashboard({
             value={s.dayTransactions}
             info={t('dashboard.historicalInfo.dayTransactions', d)}
           />
-        </div>
+        </StatGrid>
 
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatGrid>
           <StatCard
             title={t('dashboard.totalRevenue')}
             value={formatMoney(s.totalRevenueCents, companyCurrency)}
@@ -928,7 +917,7 @@ function AdminDashboard({
             value={s.totalTransactions}
             info={t('dashboard.historicalInfo.totalTransactions', d)}
           />
-        </div>
+        </StatGrid>
       </>
     );
   }
@@ -953,7 +942,7 @@ function AdminDashboard({
     const tr = { from: oldest?.date ?? '', to: newest?.date ?? '' };
 
     return (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <TrendStatCard
           title={t('dashboard.totalStations')}
           value={Math.round(avg('totalStations'))}
@@ -1002,7 +991,7 @@ function AdminDashboard({
           data={pluck('totalSessions')}
           info={t('dashboard.trendInfo.totalSessions', tr)}
         />
-      </div>
+      </StatGrid>
     );
   }
 
@@ -1036,6 +1025,8 @@ function AdminDashboard({
           {mode === 'trend' && renderTrendStatCards()}
         </div>
       </div>
+
+      <ActiveInsightsWidget />
 
       <div className="grid gap-4 grid-cols-1 lg:grid-cols-2">
         <StationStatusChart
@@ -1143,7 +1134,7 @@ function OperatorDashboard({
   function renderLiveStatCards(): React.JSX.Element {
     return (
       <>
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <StatGrid>
           <StatCard
             title={t('dashboard.stations')}
             value={stats.totalStations}
@@ -1171,7 +1162,7 @@ function OperatorDashboard({
             info={t('dashboard.info.faults')}
             positiveIsGood={false}
           />
-        </div>
+        </StatGrid>
       </>
     );
   }
@@ -1193,7 +1184,7 @@ function OperatorDashboard({
     const d = isRange ? { date: `${fromDate} to ${toDate}` } : { date: fromDate };
 
     return (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <StatCard
           title={t('dashboard.totalStations')}
           value={s.totalStations}
@@ -1214,7 +1205,7 @@ function OperatorDashboard({
           value={s.daySessions}
           info={t('dashboard.historicalInfo.daySessions', d)}
         />
-      </div>
+      </StatGrid>
     );
   }
 
@@ -1238,7 +1229,7 @@ function OperatorDashboard({
     const tr = { from: oldest?.date ?? '', to: newest?.date ?? '' };
 
     return (
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+      <StatGrid>
         <TrendStatCard
           title={t('dashboard.totalStations')}
           value={Math.round(avg('totalStations'))}
@@ -1263,7 +1254,7 @@ function OperatorDashboard({
           data={pluck('daySessions')}
           info={t('dashboard.trendInfo.daySessions', tr)}
         />
-      </div>
+      </StatGrid>
     );
   }
 
@@ -1281,6 +1272,8 @@ function OperatorDashboard({
           {mode === 'trend' && renderTrendStatCards()}
         </div>
       </div>
+
+      <ActiveInsightsWidget />
 
       <div className="grid gap-4 grid-cols-1 lg:grid-cols-2">
         <EnergyChart

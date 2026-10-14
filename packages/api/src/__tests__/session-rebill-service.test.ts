@@ -61,7 +61,7 @@ vi.mock('@evtivity/lib', async () => {
 vi.mock('@evtivity/lib/pubsub-instance', () => ({ getPubSub: () => ({ publish: m.publish }) }));
 vi.mock('@evtivity/services/template-dirs', () => ({ ALL_TEMPLATES_DIRS: ['templates'] }));
 vi.mock('../lib/payments.js', () => ({
-  paymentContext: (logger: unknown) => ({ registry: {}, logger }),
+  paymentContext: (logger: unknown, actor: unknown) => ({ registry: {}, logger, actor }),
 }));
 
 import { AppError } from '@evtivity/lib';
@@ -183,6 +183,8 @@ describe('rebillSession', () => {
       sessionId: 'ses_1',
       breakdown: BREAKDOWN,
       endedAt: ENDED_AT,
+      // The billed energy, for the electricity cost of the re-billed session.
+      energyWh: 10000,
       outcome: 'billed',
     });
     expect(m.writeAudit).toHaveBeenCalledWith(
@@ -201,7 +203,17 @@ describe('rebillSession', () => {
       m.client,
       'session.Receipt',
       'drv_1',
-      expect.objectContaining({ finalCostCents: 1190, stationId: 'CS-1', notCharged: false }),
+      // TC-T3-30: the tax label and amount come from the split the session
+      // was completed with, and nothing is left unpaid.
+      expect.objectContaining({
+        finalCostCents: 1190,
+        stationId: 'CS-1',
+        notCharged: false,
+        costIncludesTax: true,
+        taxCents: 190,
+        partiallyPaid: false,
+        unpaidCents: 0,
+      }),
       ['templates'],
       expect.anything(),
     );
@@ -364,10 +376,11 @@ describe('rebillSession', () => {
       result: 'prepaid',
       paymentRecordId: 12,
     });
-    expect(m.settlePrepaidSession).toHaveBeenCalledWith('ses_1', log, {
-      costCents: 1190,
-      rebill: true,
-    });
+    expect(m.settlePrepaidSession).toHaveBeenCalledWith(
+      'ses_1',
+      expect.objectContaining({ logger: log, actor: ctx.actor }),
+      { costCents: 1190, rebill: true },
+    );
     expect(m.chargeSessionRebill).not.toHaveBeenCalled();
     expect(m.dispatchPrepaidLowCreditNotice).toHaveBeenCalledWith(
       { tokenId: 't1', debitedCents: 1190, balanceCents: 10 },

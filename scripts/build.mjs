@@ -2,7 +2,7 @@
 
 import * as esbuild from 'esbuild';
 import { resolve, dirname } from 'path';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { statSync } from 'fs';
 
@@ -19,8 +19,8 @@ const SERVICES = {
 };
 
 // Packages loaded from node_modules at runtime instead of bundled: native
-// addons, and packages that read their own files through __dirname (undefined
-// in the ESM bundle), such as pdfkit's font metrics.
+// addons, and packages that read their own files at runtime, such as pdfkit's
+// standard font metrics and ICC profile (resolved from its own import.meta.url).
 export const EXTERNAL = [
   'argon2',
   'pino',
@@ -29,14 +29,18 @@ export const EXTERNAL = [
   'pg-native',
   '@resvg/resvg-js',
   'pdfkit',
+  // Native libvips binding (AI and support attachment re-encoding); the
+  // platform binary comes from its @img/sharp-<platform> optional dependency.
+  'sharp',
 ];
 
 export const BANNER =
   "import { createRequire } from 'module'; const require = createRequire(import.meta.url);";
 
 // Map workspace @evtivity/* imports to source directories so esbuild reads .ts
-const WORKSPACE_PACKAGES = {
+export const WORKSPACE_PACKAGES = {
   '@evtivity/lib': resolve(root, 'packages/lib'),
+  '@evtivity/ai': resolve(root, 'packages/ai'),
   '@evtivity/database': resolve(root, 'packages/database'),
   '@evtivity/payments': resolve(root, 'packages/payments'),
   '@evtivity/services': resolve(root, 'packages/services'),
@@ -72,6 +76,49 @@ export const embedWasmPlugin = {
   },
 };
 
+// The API reads the OCPP request schemas (schemas/ocpp-2.1/<Action>Request.json,
+// schemas/ocpp-1.6/<Action>.json) through packages/api/src/lib/ocpp-schema-files.ts.
+// In the bundles that module is replaced by one that embeds them, so the
+// service images need no schemas folder next to the bundle.
+const OCPP_SCHEMA_FILES_MODULE = resolve(root, 'packages/api/src/lib/ocpp-schema-files.ts');
+
+export function embeddedOcppSchemas() {
+  const files = {};
+  for (const [dir, isRequest] of [
+    ['ocpp-2.1', (name) => name.endsWith('Request.json')],
+    ['ocpp-1.6', (name) => name.endsWith('.json') && !name.endsWith('Response.json')],
+  ]) {
+    const names = readdirSync(resolve(root, 'schemas', dir))
+      .filter(isRequest)
+      .sort();
+    // Fail the build when the schemas are missing (a Docker build stage without them).
+    if (names.length === 0) throw new Error(`No OCPP request schemas in schemas/${dir}`);
+    for (const name of names) {
+      const content = readFileSync(resolve(root, 'schemas', dir, name), 'utf8');
+      files[`${dir}/${name}`] = JSON.stringify(JSON.parse(content));
+    }
+  }
+  return files;
+}
+
+export const embedOcppSchemasPlugin = {
+  name: 'embed-ocpp-schemas',
+  setup(build) {
+    build.onLoad({ filter: /ocpp-schema-files\.ts$/ }, (args) => {
+      if (args.path !== OCPP_SCHEMA_FILES_MODULE) return undefined;
+      return {
+        contents:
+          `const FILES: Record<string, string> = ${JSON.stringify(embeddedOcppSchemas())};\n` +
+          'export function readOcppSchemaFile(relativePath: string): Promise<string | null> {\n' +
+          '  return Promise.resolve(Object.hasOwn(FILES, relativePath) ? FILES[relativePath] : null);\n' +
+          '}\n',
+        loader: 'ts',
+        resolveDir: dirname(args.path),
+      };
+    });
+  },
+};
+
 // The source .ts file a workspace package exports for a subpath, from the
 // "types" (or a .ts "import") condition of its package.json "exports" entry.
 function exportedSource(pkgDir, subpath) {
@@ -88,7 +135,7 @@ function exportedSource(pkgDir, subpath) {
   return statSync(file, { throwIfNoEntry: false })?.isFile() === true ? file : undefined;
 }
 
-const workspacePlugin = {
+export const workspacePlugin = {
   name: 'workspace-source',
   setup(build) {
     // Intercept @evtivity/* imports and resolve to source .ts files
@@ -145,7 +192,7 @@ async function main() {
       minify: true,
       treeShaking: true,
       external: EXTERNAL,
-      plugins: [workspacePlugin, embedWasmPlugin],
+      plugins: [workspacePlugin, embedWasmPlugin, embedOcppSchemasPlugin],
       loader: { '.wasm': 'binary' },
       banner: { js: BANNER },
     });
@@ -158,7 +205,7 @@ async function main() {
   console.log(`\nDone in ${total}ms`);
 }
 
-// Build only when run as a script; tests import EXTERNAL and BANNER.
+// Build only when run as a script; tests import EXTERNAL, BANNER and the plugins.
 if (process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main();
 }

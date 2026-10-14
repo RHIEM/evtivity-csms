@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi, beforeEach } from 'vitest';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -21,13 +21,13 @@ const { state, rec, mocks } = vi.hoisted(() => ({
     isFleetEnabled: vi.fn(),
     isGuestChargingEnabled: vi.fn(),
     isChatbotAiEnabled: vi.fn(),
+    isAiInsightsEnabled: vi.fn(),
     clearRoamingCache: vi.fn(),
     clearSupportCache: vi.fn(),
     clearFleetCache: vi.fn(),
     clearGuestChargingCache: vi.fn(),
     clearPncSettingsCache: vi.fn(),
-    clearChatbotAiSettingsCache: vi.fn(),
-    clearSupportAiSettingsCache: vi.fn(),
+    clearAiSettingsCache: vi.fn(),
     getReservationSettings: vi.fn(),
     clearS3ConfigCache: vi.fn(),
   },
@@ -60,6 +60,10 @@ function makeChain(): Record<string, unknown> {
   return chain;
 }
 
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
+
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   getCompanyTaxBasis: vi.fn(() => Promise.resolve('net')),
@@ -72,13 +76,13 @@ vi.mock('@evtivity/database', () => ({
   isFleetEnabled: mocks.isFleetEnabled,
   isGuestChargingEnabled: mocks.isGuestChargingEnabled,
   isChatbotAiEnabled: mocks.isChatbotAiEnabled,
+  isAiInsightsEnabled: mocks.isAiInsightsEnabled,
   clearRoamingCache: mocks.clearRoamingCache,
   clearSupportCache: mocks.clearSupportCache,
   clearFleetCache: mocks.clearFleetCache,
   clearGuestChargingCache: mocks.clearGuestChargingCache,
   clearPncSettingsCache: mocks.clearPncSettingsCache,
-  clearChatbotAiSettingsCache: mocks.clearChatbotAiSettingsCache,
-  clearSupportAiSettingsCache: mocks.clearSupportAiSettingsCache,
+  clearAiSettingsCache: mocks.clearAiSettingsCache,
   clearSystemSettingsCache: vi.fn(),
   clearMobileAppConfigCache: vi.fn(),
   clearStationMessageSettingsCache: vi.fn(),
@@ -173,6 +177,10 @@ vi.mock('../lib/payments.js', async (importOriginal) => ({
   clearPaymentCaches: vi.fn(),
 }));
 
+vi.mock('../lib/driver-ai-availability.js', () => ({
+  readDriverAiAvailability: () => Promise.resolve({ available: false, perMinute: 2 }),
+}));
+
 vi.mock('@evtivity/services/station-message.service', () => ({
   requestStationMessageRepush: vi.fn().mockResolvedValue(undefined),
 }));
@@ -184,6 +192,8 @@ vi.mock('../lib/provider-switch.js', async (importOriginal) => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { settingsRoutes } from '../routes/settings.js';
+import { defaultSystemPrompt } from '../services/ai/engine/prompt-defaults.js';
+import { resetSiteAccessMock, setMockUserSiteIds } from './helpers/site-access-mock.js';
 
 const HOSTS_KEY = 'notifications.webhookAllowedPrivateHosts';
 const SERVER_MANAGED = {
@@ -227,6 +237,7 @@ describe('settings routes (cov2)', () => {
     mocks.isFleetEnabled.mockResolvedValue(true);
     mocks.isGuestChargingEnabled.mockResolvedValue(false);
     mocks.isChatbotAiEnabled.mockResolvedValue(true);
+    mocks.isAiInsightsEnabled.mockResolvedValue(false);
     mocks.getReservationSettings.mockResolvedValue({
       cancellationFeeCents: 250,
       cancellationWindowMinutes: 15,
@@ -242,6 +253,10 @@ describe('settings routes (cov2)', () => {
       fleetEnabled: true,
       guestChargingEnabled: false,
       chatbotAiEnabled: true,
+      aiInsightsEnabled: false,
+      // TC-AI-DR-03: off by default.
+      driverAiSupport: false,
+      driverAiNoticeVersion: 1,
       reservationCancellationFeeCents: 250,
       reservationCancellationWindowMinutes: 15,
       reservationMaxHours: 4,
@@ -257,6 +272,100 @@ describe('settings routes (cov2)', () => {
     const res = await app.inject({ method: 'GET', url: '/settings', headers: auth });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ 'company.name': 'Acme' });
+  });
+
+  it('GET /settings leaves out the SSO and security settings', async () => {
+    setupDbResults([
+      { key: 'company.name', value: 'Acme' },
+      { key: 'security.recaptcha.secretKeyEnc', value: '' },
+      { key: 'sso.entryPoint', value: 'https://idp.example.com' },
+    ]);
+    const res = await app.inject({ method: 'GET', url: '/settings', headers: auth });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ 'company.name': 'Acme' });
+  });
+
+  it.each(['security.mfa.emailEnabled', 'sso.certEnc'])(
+    'refuses the SSO and security setting %s on the generic routes',
+    async (key) => {
+      const get = await app.inject({ method: 'GET', url: `/settings/${key}`, headers: auth });
+      expect(get.statusCode).toBe(404);
+      for (const method of ['PUT', 'PATCH', 'DELETE'] as const) {
+        const res = await app.inject({
+          method,
+          url: `/settings/${key}`,
+          headers: auth,
+          ...(method === 'DELETE' ? {} : { payload: { value: false } }),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().code).toBe('VALIDATION_ERROR');
+      }
+      expect(rec.values).toEqual([]);
+      expect(rec.deletes).toBe(0);
+    },
+  );
+
+  describe('site-restricted user', () => {
+    beforeEach(() => {
+      setMockUserSiteIds(['sit_000000000001']);
+    });
+    afterEach(() => {
+      resetSiteAccessMock();
+    });
+
+    it('GET /settings returns only the allowlisted keys, never a secret', async () => {
+      setupDbResults([
+        { key: 'company.name', value: 'Acme' },
+        { key: 'stripe.secretKeyEnc', value: 'enc' },
+        { key: 'smtp.passwordEnc', value: 'enc' },
+        { key: 'payments.provider', value: 'stripe' },
+        { key: 'prepaid.lowCreditThresholdCents', value: 500 },
+        { key: 'invoice.paymentTermsDays', value: 30 },
+        { key: 'fleet.invoiceRunDay', value: 1 },
+      ]);
+      const res = await app.inject({ method: 'GET', url: '/settings', headers: auth });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        'prepaid.lowCreditThresholdCents': 500,
+        'invoice.paymentTermsDays': 30,
+        'fleet.invoiceRunDay': 1,
+      });
+    });
+
+    it('reads an allowlisted key but cannot write it (company-wide)', async () => {
+      setupDbResults([{ key: 'invoice.paymentTermsDays', value: 30 }]);
+      const get = await app.inject({
+        method: 'GET',
+        url: '/settings/invoice.paymentTermsDays',
+        headers: auth,
+      });
+      expect(get.statusCode).toBe(200);
+
+      setupDbResults([], [{ key: 'invoice.paymentTermsDays', value: 14 }]);
+      for (const method of ['PUT', 'PATCH'] as const) {
+        const write = await app.inject({
+          method,
+          url: '/settings/invoice.paymentTermsDays',
+          headers: auth,
+          payload: { value: 14 },
+        });
+        expect(write.statusCode).toBe(404);
+        expect(write.json()).toEqual({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
+      }
+      expect(state.index).toBe(0);
+    });
+
+    it('answers 404 for any other key without reading it', async () => {
+      setupDbResults([{ key: 'stripe.secretKeyEnc', value: 'enc' }]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/settings/stripe.secretKeyEnc',
+        headers: auth,
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
+      expect(state.index).toBe(0);
+    });
   });
 
   it('PUT refuses a server-managed setting', async () => {
@@ -288,8 +397,7 @@ describe('settings routes (cov2)', () => {
     ['fleet.enabled', 'clearFleetCache'],
     ['guest.enabled', 'clearGuestChargingCache'],
     ['pnc.enabled', 'clearPncSettingsCache'],
-    ['chatbotAi.enabled', 'clearChatbotAiSettingsCache'],
-    ['supportAi.enabled', 'clearSupportAiSettingsCache'],
+    ['chatbotAi.enabled', 'clearAiSettingsCache'],
   ] as const)('PUT %s clears its cached reader', async (key, clear) => {
     setupDbResults([], [{ key, value: false }]);
     const res = await app.inject({
@@ -306,11 +414,220 @@ describe('settings routes (cov2)', () => {
       'clearFleetCache',
       'clearGuestChargingCache',
       'clearPncSettingsCache',
-      'clearChatbotAiSettingsCache',
-      'clearSupportAiSettingsCache',
+      'clearAiSettingsCache',
     ] as const) {
       if (other !== clear) expect(mocks[other]).not.toHaveBeenCalled();
     }
+  });
+
+  describe('AI settings (TC-AI-C-05, TC-AI-C-06)', () => {
+    it.each([
+      ['ai.openai.baseUrl', 'https://proxy.example.com/v1'],
+      ['ai.rateLimit.userPerMinute', 30],
+      ['chatbotAi.effort', 'low'],
+      ['supportAi.provider', 'deepseek'],
+    ] as const)('PUT %s stores the value and clears the AI settings cache', async (key, value) => {
+      setupDbResults([], [{ key, value }]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(mocks.clearAiSettingsCache).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['opsAi.enabled', true],
+      ['opsAi.effort', 'medium'],
+      ['aiInsights.cooldownMinutes', 30],
+      ['aiInsights.primaryLanguage', 'ko'],
+      ['aiWorkers.stuckSessions.enabled', true],
+      ['ai.mcp.enabled', true],
+      ['ai.mcp.allowedOrigins', ['https://app.example.com']],
+      ['ai.budget.siteDailyTokens', 0],
+    ] as const)(
+      'TC-AI-C-11: PUT %s stores the value and clears the AI settings cache',
+      async (key, value) => {
+        setupDbResults([], [{ key, value }]);
+        const res = await app.inject({
+          method: 'PUT',
+          url: `/settings/${key}`,
+          headers: auth,
+          payload: { value },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(rec.values[0]).toEqual({ key, value });
+        expect(mocks.clearAiSettingsCache).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([
+      ['opsAi.enabled', 'true'],
+      ['opsAi.provider', 'mistral'],
+      ['aiInsights.debounceSeconds', 3601],
+      ['aiInsights.primaryLanguage', 'fr'],
+      ['aiWorkers.proposalTtlHours', 0],
+      ['ai.mcp.allowedOrigins', ['https://app.example.com/path']],
+      ['ai.budget.warnPercent', 101],
+    ] as const)('TC-AI-C-11: refuses %s = %j and keeps the cache', async (key, value) => {
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(rec.values).toEqual([]);
+      expect(mocks.clearAiSettingsCache).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['driverAi.enabled', true],
+      ['driverAi.provider', 'gemini'],
+      ['driverAi.model', 'gemini-x'],
+      ['driverAi.effort', 'medium'],
+      ['driverAi.systemPrompt', 'Be brief.'],
+      ['driverAi.maxCasesPerDriverPerDay', 5],
+      ['driverAi.feedbackTimeoutHours', 48],
+      ['ai.budget.driverDailyTokens', 0],
+      ['ai.rateLimit.driverPerMinute', 4],
+      ['aiInsights.reservation.enabled', false],
+    ] as const)(
+      'TC-CFG-04: PUT %s stores the value and clears the AI settings cache',
+      async (key, value) => {
+        setupDbResults([], [{ key, value }]);
+        const res = await app.inject({
+          method: 'PUT',
+          url: `/settings/${key}`,
+          headers: auth,
+          payload: { value },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(rec.values[0]).toEqual({ key, value });
+        expect(mocks.clearAiSettingsCache).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([
+      ['driverAi.enabled', 'yes', 'driverAi.enabled must be true or false'],
+      ['driverAi.provider', 'mistral', 'driverAi.provider must be one of: (empty), anthropic'],
+      ['driverAi.effort', 'max', 'driverAi.effort must be one of: low, medium, high'],
+      ['driverAi.maxCasesPerDriverPerDay', 0, 'from 1 to 100'],
+      ['driverAi.feedbackTimeoutHours', 169, 'from 1 to 168'],
+      ['ai.budget.driverDailyTokens', -1, 'from 0 to 10000000000'],
+      ['ai.rateLimit.driverPerMinute', 0, 'from 1 to 1000'],
+      ['aiInsights.reservation.enabled', 1, 'must be true or false'],
+    ] as const)('TC-CFG-04: refuses %s = %j and keeps the cache', async (key, value, message) => {
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+      expect(res.json().error).toContain(message);
+      expect(rec.values).toEqual([]);
+      expect(mocks.clearAiSettingsCache).not.toHaveBeenCalled();
+    });
+
+    it('stores a limit sent as a numeric string as a number', async () => {
+      setupDbResults([], [{ key: 'ai.maxToolCallsPerTurn', value: 30 }]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/ai.maxToolCallsPerTurn',
+        headers: auth,
+        payload: { value: '30' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(rec.values[0]).toEqual({ key: 'ai.maxToolCallsPerTurn', value: 30 });
+    });
+
+    it.each([
+      ['chatbotAi.systemPrompt', 'chatbot', 'de'],
+      ['supportAi.systemPrompt', 'support', 'zh-TW'],
+    ] as const)(
+      'PUT %s stores an unchanged built-in prompt as empty',
+      async (key, surface, language) => {
+        setupDbResults([], [{ key, value: '' }]);
+        const res = await app.inject({
+          method: 'PUT',
+          url: `/settings/${key}`,
+          headers: auth,
+          payload: { value: `${defaultSystemPrompt(surface, language)}\n` },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(rec.values[0]).toEqual({ key, value: '' });
+      },
+    );
+
+    it('PUT chatbotAi.systemPrompt keeps a custom prompt', async () => {
+      setupDbResults([], [{ key: 'chatbotAi.systemPrompt', value: 'Be brief.' }]);
+      await app.inject({
+        method: 'PUT',
+        url: '/settings/chatbotAi.systemPrompt',
+        headers: auth,
+        payload: { value: 'Be brief.' },
+      });
+      expect(rec.values[0]).toEqual({ key: 'chatbotAi.systemPrompt', value: 'Be brief.' });
+    });
+
+    it.each([
+      ['https://10.0.0.5'],
+      ['http://api.example.com'],
+      ['https://user:pass@api.example.com'],
+      ['https://localhost:4010'],
+    ])('refuses the base URL %s with AI_BASE_URL_INVALID', async (url) => {
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/ai.anthropic.baseUrl',
+        headers: auth,
+        payload: { value: url },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'AI_BASE_URL_INVALID' });
+      expect(rec.values).toEqual([]);
+      expect(mocks.clearAiSettingsCache).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['chatbotAi.temperature', '0.5', 'chatbotAi.effort'],
+      ['supportAi.topK', '10', 'supportAi.effort'],
+      ['chatbotAi.apiKeyEnc', 'sk-old', 'ai.<provider>.apiKeyEnc'],
+    ])('refuses the removed key %s and names its replacement', async (key, value, replacement) => {
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({
+        error: `${key} was removed, use ${replacement}`,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(rec.values).toEqual([]);
+    });
+
+    it.each([
+      ['chatbotAi.provider', 'mistral', 'must be one of'],
+      ['supportAi.effort', 'max', 'must be one of: low, medium, high'],
+      ['supportAi.tone', 'sarcastic', 'must be one of'],
+      ['ai.maxToolCallsPerTurn', 0, 'must be a whole number from 1 to 100'],
+      ['chatbotAi.enabled', 'yes', 'must be true or false'],
+    ] as const)('refuses %s = %s', async (key, value, message) => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+      expect(res.json().error).toContain(message);
+    });
   });
 
   describe('webhook allowed private hosts', () => {

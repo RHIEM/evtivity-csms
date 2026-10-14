@@ -18,6 +18,16 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+const access = vi.hoisted(() => ({ canWrite: true }));
+// Mocked so the test can prove the editor renders no History list of its own.
+vi.mock('@/components/EntityHistoryTab', () => ({
+  EntityHistoryTab: ({ entityType, entityId }: { entityType: string; entityId: string | null }) => (
+    <div data-testid="entity-history">{`${entityType}:${entityId ?? '*'}`}</div>
+  ),
+}));
+
+vi.mock('@/lib/auth', () => ({ useHasCompanyWidePermission: () => access.canWrite }));
+
 vi.mock('@/lib/api', () => ({
   api: { get: getMock, put: putMock, post: postMock, delete: deleteMock },
 }));
@@ -67,6 +77,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  access.canWrite = true;
 });
 
 describe('StationMessageSettings', () => {
@@ -75,6 +86,8 @@ describe('StationMessageSettings', () => {
     await waitFor(() => {
       expect(body().value).toBe('DE verfügbar');
     });
+    // Template changes are listed in the Settings History tab, not under the editor.
+    expect(screen.queryByTestId('entity-history')).toBeNull();
     await waitFor(() => {
       expect(postMock).toHaveBeenCalledWith(
         '/v1/station-message-templates/preview',
@@ -125,6 +138,16 @@ describe('StationMessageSettings', () => {
         body: 'EN edited',
       });
     });
+  });
+
+  it('hides the template Save and Reset for a site-restricted user', async () => {
+    access.canWrite = false;
+    renderSettings({ 'stationMessage.language': 'en' });
+    await waitFor(() => {
+      expect(body().value).toBe('EN available');
+    });
+    expect(screen.getAllByRole('button', { name: /common.save|save/i })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: /messages.resetToDefault/ })).toBeNull();
   });
 
   it('saves the display language setting', async () => {

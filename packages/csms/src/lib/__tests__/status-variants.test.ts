@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   reservationStatusVariant,
+  insightStatusVariant,
   fleetReservationStatusVariant,
   sessionStatusVariant,
   simpleSessionStatusVariant,
@@ -48,6 +49,7 @@ table('reservationStatusVariant', reservationStatusVariant, [
 ]);
 
 table('fleetReservationStatusVariant', fleetReservationStatusVariant, [
+  ['scheduled', 'info'],
   ['active', 'success'],
   ['partial', 'warning'],
   ['cancelled', 'destructive'],
@@ -118,6 +120,7 @@ table('supportCaseStatusVariant', supportCaseStatusVariant, [
   ['waiting_on_driver', 'outline'],
   ['resolved', 'secondary'],
   ['closed', 'outline'],
+  ['ai_assist', 'info'],
   ['other', 'outline'],
 ]);
 
@@ -261,5 +264,22 @@ describe('notificationStatusBadgeClass', () => {
 
   it('returns an empty class for an unknown state', () => {
     expect(notificationStatusBadgeClass('queued')).toBe('');
+  });
+});
+
+describe('AI status variants', () => {
+  it('maps the one insight status', () => {
+    expect(insightStatusVariant('open')).toBe('info');
+    expect(insightStatusVariant('pending')).toBe('warning');
+    expect(insightStatusVariant('done')).toBe('success');
+    expect(insightStatusVariant('resolved')).toBe('default');
+    expect(insightStatusVariant('rejected')).toBe('destructive');
+    expect(insightStatusVariant('dismissed')).toBe('secondary');
+    expect(insightStatusVariant('expired')).toBe('outline');
+  });
+
+  it('gives every shown insight status its own color', () => {
+    const shown = ['open', 'pending', 'done', 'resolved', 'rejected', 'dismissed', 'expired'];
+    expect(new Set(shown.map(insightStatusVariant)).size).toBe(shown.length);
   });
 });

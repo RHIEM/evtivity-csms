@@ -1,12 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import Handlebars from 'handlebars';
+import { and, eq } from 'drizzle-orm';
 import {
   db,
   stationMessageTemplates,
+  stationMessageTemplateAuditLog,
+  writeAudit,
   getCompanyCurrency,
   getCompanyPriceDisplay,
   getCompanyTaxBasis,
@@ -16,8 +18,10 @@ import {
 import {
   STATION_MESSAGE_DEFAULTS,
   STATION_MESSAGE_LANGUAGES,
+  assertTemplateAllowed,
   buildStationPriceContext,
   clearStationMessageCache,
+  compileAllowedTemplate,
   formatCurrencyAmount,
   formatStationElapsed,
   formatStationIdleFeeRate,
@@ -29,12 +33,65 @@ import {
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
+import { getAuditActor } from '../lib/audit-actor.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
 
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_TEMPLATE_NOT_FOUND = {
+  error: 'Template not found',
+  code: 'TEMPLATE_NOT_FOUND',
+} as const;
+
 // State screens re-render on a template change; one-shot templates render on
 // their next dispatch.
+/** The stored body of one template language, or null when none is stored. */
+async function storedTemplateBody(
+  state: StationMessageState,
+  language: StationMessageLanguage,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ body: stationMessageTemplates.body })
+    .from(stationMessageTemplates)
+    .where(
+      and(eq(stationMessageTemplates.state, state), eq(stationMessageTemplates.language, language)),
+    );
+  return row?.body ?? null;
+}
+
+/**
+ * station_message_template audit row (id the state), written only when the
+ * body changed. Fail-open: writeAudit logs and continues.
+ */
+async function auditTemplateChange(
+  request: FastifyRequest,
+  change: {
+    state: StationMessageState;
+    language: StationMessageLanguage;
+    action: 'updated' | 'reset';
+    before: string | null;
+    after: string;
+  },
+): Promise<void> {
+  if (change.before === change.after) return;
+  await writeAudit(
+    { table: stationMessageTemplateAuditLog, idColumn: 'station_message_template_id' },
+    {
+      entityId: change.state,
+      entityIdSnapshot: change.state,
+      action: change.action,
+      ...getAuditActor(request),
+      before: { language: change.language, body: change.before },
+      after: { language: change.language, body: change.after },
+    },
+    db,
+    request.log,
+  );
+}
+
 const STATE_SCREEN_TEMPLATES = new Set<StationMessageState>([
   'available',
   'occupied',
@@ -197,17 +254,34 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
         body: zodSchema(updateBody),
         response: {
           200: itemResponse(templateItem),
+          400: errorWith('The template uses a construct templates do not allow', [
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
           404: errorWith('Template not found', [ERROR_CODES.TEMPLATE_NOT_FOUND]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const { state } = request.params as z.infer<typeof stateParams>;
       const { language } = request.query as z.infer<typeof languageQuery>;
       const { body } = request.body as z.infer<typeof updateBody>;
+      // Same rules as the renderer (plain variables and if/unless only), so a
+      // template that saves is a template the stations get.
+      try {
+        assertTemplateAllowed(body);
+      } catch (err: unknown) {
+        await reply.status(400).send({
+          error: 'Template is invalid',
+          code: 'VALIDATION_ERROR',
+          details: { body: err instanceof Error ? err.message : String(err) },
+        });
+        return;
+      }
       const jwtUser = request.user as unknown as JwtPayload;
       const userId = typeof jwtUser.userId === 'string' ? jwtUser.userId : null;
 
+      const beforeBody = await storedTemplateBody(state, language);
       const updatedAt = new Date();
       const [row] = await db
         .insert(stationMessageTemplates)
@@ -229,6 +303,13 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
         return;
       }
 
+      await auditTemplateChange(request, {
+        state,
+        language,
+        action: 'updated',
+        before: beforeBody,
+        after: row.body,
+      });
       clearStationMessageCache();
       if (STATE_SCREEN_TEMPLATES.has(state)) await requestStationMessageRepush(request.log);
       return row;
@@ -246,10 +327,16 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         params: zodSchema(stateParams),
         querystring: zodSchema(languageQuery),
-        response: { 200: itemResponse(templateItem) },
+        response: {
+          200: itemResponse(templateItem),
+          404: errorWith('Template not found, or the user is restricted to some sites', [
+            ERROR_CODES.TEMPLATE_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const { state } = request.params as z.infer<typeof stateParams>;
       const { language } = request.query as z.infer<typeof languageQuery>;
       const defaultBody = STATION_MESSAGE_DEFAULTS[language][state];
@@ -258,6 +345,7 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
       const userId = typeof jwtUser.userId === 'string' ? jwtUser.userId : null;
       const updatedAt = new Date();
 
+      const beforeBody = await storedTemplateBody(state, language);
       const [row] = await db
         .insert(stationMessageTemplates)
         .values({ state, language, body: defaultBody, updatedAt, updatedBy: userId })
@@ -273,6 +361,15 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
           updatedBy: stationMessageTemplates.updatedBy,
         });
 
+      if (row != null) {
+        await auditTemplateChange(request, {
+          state,
+          language,
+          action: 'reset',
+          before: beforeBody,
+          after: row.body,
+        });
+      }
       clearStationMessageCache();
       if (STATE_SCREEN_TEMPLATES.has(state)) await requestStationMessageRepush(request.log);
       return row;
@@ -308,8 +405,9 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
 
       let rendered: string;
       try {
-        const template = Handlebars.compile(body, { noEscape: true });
-        rendered = template(ctx);
+        // Operator text is never compiled to JavaScript: the allowed-template
+        // renderer walks the parsed template (variables and if/unless only).
+        rendered = compileAllowedTemplate(body, { noEscape: true })(ctx);
       } catch (err) {
         request.log.debug(
           { err },

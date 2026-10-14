@@ -71,6 +71,7 @@ describe('useFeatureFlags', () => {
       fleetEnabled: false,
       guestChargingEnabled: false,
       chatbotAiEnabled: true,
+      aiInsightsEnabled: true,
     };
     getMock.mockResolvedValue(flags);
     const { result } = renderHook(() => useFeatureFlags(), { wrapper });
@@ -98,6 +99,7 @@ describe('useFeatureFlags', () => {
       fleetEnabled: true,
       guestChargingEnabled: true,
       chatbotAiEnabled: false,
+      aiInsightsEnabled: false,
     });
   });
 });

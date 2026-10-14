@@ -100,6 +100,7 @@ vi.mock('drizzle-orm', () => ({
   gte: vi.fn(),
   lte: vi.fn(),
   between: vi.fn(),
+  isNotNull: vi.fn(),
 }));
 
 vi.mock('../lib/site-access.js', () => ({
@@ -108,6 +109,16 @@ vi.mock('../lib/site-access.js', () => ({
 }));
 
 vi.mock('@evtivity/services/load-management.service', () => ({
+  computeSiteAllocation: vi.fn(async (siteId: string, strategy: string) => {
+    const svc = await import('@evtivity/services/load-management.service');
+    const status = await svc.getSitePowerStatus(siteId);
+    const hierarchy = await svc.buildSiteHierarchy(siteId, status.stations);
+    const allocations =
+      hierarchy.length > 0 ? svc.computeHierarchicalAllocation(hierarchy, strategy as never) : [];
+    return { status, hierarchy, managed: [], reservedKw: new Map(), allocations };
+  }),
+  clearLoadManagementProfiles: vi.fn().mockResolvedValue(true),
+  parseAppliedAllocations: vi.fn(() => null),
   getSitePowerStatus: vi.fn().mockResolvedValue({
     totalDrawKw: 50,
     stations: [
@@ -120,6 +131,8 @@ vi.mock('@evtivity/services/load-management.service', () => ({
         loadPriority: 5,
         isOnline: true,
         hasActiveSession: true,
+        minPowerKw: 0,
+        rateUnit: 'W',
       },
       {
         id: 'sit_000000000002',
@@ -130,6 +143,8 @@ vi.mock('@evtivity/services/load-management.service', () => ({
         loadPriority: 3,
         isOnline: true,
         hasActiveSession: false,
+        minPowerKw: 0,
+        rateUnit: 'W',
       },
     ],
   }),
@@ -144,8 +159,16 @@ vi.mock('@evtivity/services/load-management.service', () => ({
   ]),
 }));
 
+const siteAuditMock = vi.fn().mockResolvedValue(undefined);
+const stationAuditMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../lib/load-management-audit.js', () => ({
+  writeSiteLoadManagementAudit: (...args: unknown[]) => siteAuditMock(...args) as Promise<void>,
+  writeStationLoadAudit: (...args: unknown[]) => stationAuditMock(...args) as Promise<void>,
+}));
+
 import { registerAuth } from '../plugins/auth.js';
 import { loadManagementRoutes } from '../routes/load-management.js';
+import { clearLoadManagementProfiles } from '@evtivity/services/load-management.service';
 
 const VALID_SITE_ID = 'sit_000000000001';
 const VALID_STATION_ID = 'sta_000000000001';
@@ -175,6 +198,8 @@ describe('Load management routes', () => {
 
   beforeEach(() => {
     setupDbResults();
+    siteAuditMock.mockClear();
+    stationAuditMock.mockClear();
   });
 
   // --- Auth requirements ---
@@ -291,8 +316,8 @@ describe('Load management routes', () => {
           siteId: VALID_SITE_ID,
           strategy: 'equal_share',
           isEnabled: false,
-          createdAt: '2026-01-01T00:00:00Z',
-          updatedAt: '2026-01-01T00:00:00Z',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-01T00:00:00Z'),
         },
       ],
       [
@@ -301,8 +326,8 @@ describe('Load management routes', () => {
           siteId: VALID_SITE_ID,
           strategy: 'equal_share',
           isEnabled: true,
-          createdAt: '2026-01-01T00:00:00Z',
-          updatedAt: '2026-01-02T00:00:00Z',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-02T00:00:00Z'),
         },
       ],
     );
@@ -315,6 +340,77 @@ describe('Load management routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.strategy).toBe('equal_share');
+    expect(siteAuditMock).toHaveBeenCalledWith(expect.anything(), VALID_SITE_ID, {
+      before: { isEnabled: false },
+      after: { isEnabled: true },
+      notes: 'load management configuration updated',
+    });
+  });
+
+  it('PUT with an unchanged config writes no audit row', async () => {
+    const row = {
+      id: 1,
+      siteId: VALID_SITE_ID,
+      strategy: 'equal_share',
+      isEnabled: true,
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      updatedAt: new Date('2026-01-01T00:00:00Z'),
+    };
+    setupDbResults([row], [row]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/sites/${VALID_SITE_ID}/load-management`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { strategy: 'equal_share', isEnabled: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(siteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('PUT turning load management off clears the limit of every managed station', async () => {
+    vi.mocked(clearLoadManagementProfiles).mockClear();
+    setupDbResults(
+      [
+        {
+          id: 1,
+          siteId: VALID_SITE_ID,
+          strategy: 'equal_share',
+          isEnabled: true,
+          appliedAllocations: [
+            { stationId: 'STATION-OLD', stationDbId: 'sta_old', allocatedKw: 10 },
+          ],
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-01T00:00:00Z'),
+        },
+      ],
+      [
+        {
+          id: 1,
+          siteId: VALID_SITE_ID,
+          strategy: 'equal_share',
+          isEnabled: false,
+          appliedAllocations: null,
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-02T00:00:00Z'),
+        },
+      ],
+      [{ stationId: 'STATION-001' }],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/sites/${VALID_SITE_ID}/load-management`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { strategy: 'equal_share', isEnabled: false },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.isEnabled).toBe(false);
+    // The stored allocations stay internal.
+    expect(body).not.toHaveProperty('appliedAllocations');
+    expect(clearLoadManagementProfiles).toHaveBeenCalledWith(
+      expect.arrayContaining(['STATION-001']),
+      expect.anything(),
+    );
   });
 
   it('PUT /v1/sites/:id/load-management creates new config when none exists', async () => {
@@ -326,8 +422,8 @@ describe('Load management routes', () => {
           siteId: VALID_SITE_ID,
           strategy: 'priority_based',
           isEnabled: true,
-          createdAt: '2026-01-01T00:00:00Z',
-          updatedAt: '2026-01-01T00:00:00Z',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-01T00:00:00Z'),
         },
       ],
     );
@@ -340,10 +436,18 @@ describe('Load management routes', () => {
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
     expect(body.strategy).toBe('priority_based');
+    expect(siteAuditMock).toHaveBeenCalledWith(expect.anything(), VALID_SITE_ID, {
+      before: null,
+      after: { strategy: 'priority_based', isEnabled: true },
+      notes: 'load management configuration created',
+    });
   });
 
   it('PATCH load-priority updates station priority', async () => {
-    setupDbResults([{ id: VALID_STATION_ID, stationId: 'STATION-001', loadPriority: 7 }]);
+    setupDbResults(
+      [{ loadPriority: 3 }],
+      [{ id: VALID_STATION_ID, stationId: 'STATION-001', loadPriority: 7 }],
+    );
     const response = await app.inject({
       method: 'PATCH',
       url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-priority`,
@@ -354,10 +458,100 @@ describe('Load management routes', () => {
     const body = JSON.parse(response.body);
     expect(body.stationId).toBe('STATION-001');
     expect(body.loadPriority).toBe(7);
+    expect(stationAuditMock).toHaveBeenCalledWith(expect.anything(), VALID_STATION_ID, {
+      before: { loadPriority: 3 },
+      after: { loadPriority: 7 },
+      notes: 'load priority changed',
+    });
+  });
+
+  it('PATCH load-priority with the same value writes no audit row', async () => {
+    setupDbResults(
+      [{ loadPriority: 7 }],
+      [{ id: VALID_STATION_ID, stationId: 'STATION-001', loadPriority: 7 }],
+    );
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-priority`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { loadPriority: 7 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(stationAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH load-min-power sets and clears the station minimum', async () => {
+    setupDbResults(
+      [{ loadMinPowerKw: null }],
+      [{ id: VALID_STATION_ID, stationId: 'STATION-001', loadMinPowerKw: '4.1' }],
+    );
+    const set = await app.inject({
+      method: 'PATCH',
+      url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-min-power`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { loadMinPowerKw: 4.1 },
+    });
+    expect(set.statusCode).toBe(200);
+    expect(JSON.parse(set.body).loadMinPowerKw).toBe(4.1);
+    expect(stationAuditMock).toHaveBeenLastCalledWith(expect.anything(), VALID_STATION_ID, {
+      before: { loadMinPowerKw: null },
+      after: { loadMinPowerKw: 4.1 },
+      notes: 'load minimum power changed',
+    });
+
+    setupDbResults(
+      [{ loadMinPowerKw: '4.1' }],
+      [{ id: VALID_STATION_ID, stationId: 'STATION-001', loadMinPowerKw: null }],
+    );
+    const cleared = await app.inject({
+      method: 'PATCH',
+      url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-min-power`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { loadMinPowerKw: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(JSON.parse(cleared.body).loadMinPowerKw).toBeNull();
+    expect(stationAuditMock).toHaveBeenLastCalledWith(expect.anything(), VALID_STATION_ID, {
+      before: { loadMinPowerKw: 4.1 },
+      after: { loadMinPowerKw: null },
+      notes: 'load minimum power changed',
+    });
+
+    const negative = await app.inject({
+      method: 'PATCH',
+      url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-min-power`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { loadMinPowerKw: -1 },
+    });
+    expect(negative.statusCode).toBe(400);
+  });
+
+  it('PATCH load-min-power and load-priority refuse an OCPP station identifier', async () => {
+    // The AI assistant sent the OCPP identifier (CS-0084) for the station: the
+    // params schema refuses it before any write instead of a 404 after confirm.
+    for (const [path, payload] of [
+      ['load-min-power', { loadMinPowerKw: 7 }],
+      ['load-priority', { loadPriority: 5 }],
+    ] as const) {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/sites/${VALID_SITE_ID}/stations/CS-0084/${path}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload,
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    const badSite = await app.inject({
+      method: 'PATCH',
+      url: `/sites/Community%20Center/stations/${VALID_STATION_ID}/load-min-power`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { loadMinPowerKw: 7 },
+    });
+    expect(badSite.statusCode).toBe(400);
   });
 
   it('PATCH load-priority returns 404 when station not found', async () => {
-    setupDbResults([]);
+    setupDbResults([], []);
     const response = await app.inject({
       method: 'PATCH',
       url: `/sites/${VALID_SITE_ID}/stations/${VALID_STATION_ID}/load-priority`,
@@ -367,6 +561,7 @@ describe('Load management routes', () => {
     expect(response.statusCode).toBe(404);
     const body = JSON.parse(response.body);
     expect(body.code).toBe('STATION_NOT_FOUND');
+    expect(stationAuditMock).not.toHaveBeenCalled();
   });
 
   it('GET /v1/sites/:id/load-management/history returns allocation log', async () => {

@@ -65,6 +65,8 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
+const { writeAuditMock } = vi.hoisted(() => ({ writeAuditMock: vi.fn() }));
+
 vi.mock('@evtivity/database', () => ({
   db: {
     select: vi.fn(() => makeChain()),
@@ -77,10 +79,30 @@ vi.mock('@evtivity/database', () => ({
   tariffs: {},
   pricingGroups: {},
   ocpiPartners: {},
+  tariffAuditLog: { name: 'tariff_audit_log' },
+  pricingGroupAuditLog: { name: 'pricing_group_audit_log' },
+  ocpiPartnerAuditLog: { name: 'ocpi_partner_audit_log' },
+  writeAudit: writeAuditMock,
 }));
 
-const { publishOcpiTariffPush } = vi.hoisted(() => ({ publishOcpiTariffPush: vi.fn() }));
+const { publishOcpiTariffPush, allSiteUser } = vi.hoisted(() => ({
+  publishOcpiTariffPush: vi.fn(),
+  allSiteUser: { value: true },
+}));
 vi.mock('../lib/ocpi-tariff-push.js', () => ({ publishOcpiTariffPush }));
+vi.mock('../lib/site-access.js', () => ({
+  requireAllSiteAccess: vi.fn(
+    async (
+      _request: unknown,
+      reply: { status: (code: number) => { send: (body: unknown) => Promise<void> } },
+      notFound: unknown,
+    ) => {
+      if (allSiteUser.value) return true;
+      await reply.status(404).send(notFound);
+      return false;
+    },
+  ),
+}));
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(),
@@ -146,6 +168,39 @@ describe('OCPI tariff mapping routes', () => {
   beforeEach(() => {
     setupDbResults();
     publishOcpiTariffPush.mockClear();
+    writeAuditMock.mockClear();
+    allSiteUser.value = true;
+  });
+
+  describe('site-restricted user', () => {
+    it('gets 404 on every tariff mapping route and nothing is written', async () => {
+      allSiteUser.value = false;
+      const headers = { authorization: `Bearer ${token}` };
+      const requests = [
+        { method: 'GET' as const, url: '/ocpi/tariff-mappings' },
+        { method: 'GET' as const, url: '/ocpi/tariff-mappings/1' },
+        {
+          method: 'POST' as const,
+          url: '/ocpi/tariff-mappings',
+          payload: { tariffId: 'trf_000000000001', ocpiTariffId: 'T-1' },
+        },
+        {
+          method: 'PATCH' as const,
+          url: '/ocpi/tariff-mappings/1',
+          payload: { ocpiTariffId: 'T-2' },
+        },
+        { method: 'DELETE' as const, url: '/ocpi/tariff-mappings/1' },
+      ];
+      for (const req of requests) {
+        const res = await app.inject({ ...req, headers });
+        expect(res.statusCode).toBe(404);
+        expect(res.json()).toEqual({
+          error: 'Tariff mapping not found',
+          code: 'MAPPING_NOT_FOUND',
+        });
+      }
+      expect(publishOcpiTariffPush).not.toHaveBeenCalled();
+    });
   });
 
   // -------------------------------------------------------
@@ -249,6 +304,25 @@ describe('OCPI tariff mapping routes', () => {
       expect(publishOcpiTariffPush).toHaveBeenCalledWith({
         targets: [{ partnerId: null, ocpiTariffId: 'TARIFF-001' }],
       });
+      // One row on the pricing group the mapping names, none for a null partner.
+      expect(writeAuditMock).toHaveBeenCalledTimes(1);
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        { table: { name: 'pricing_group_audit_log' }, idColumn: 'pricing_group_id' },
+        expect.objectContaining({
+          entityId: 'pgr_000000000001',
+          action: 'tariff_mapping_changed',
+          before: null,
+          after: {
+            id: 5,
+            ocpiTariffId: 'TARIFF-001',
+            partnerId: null,
+            tariffId: null,
+            pricingGroupId: 'pgr_000000000001',
+          },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('trims the OCPI tariff id before storing and pushing it', async () => {
@@ -343,6 +417,29 @@ describe('OCPI tariff mapping routes', () => {
           { partnerId: null, ocpiTariffId: 'OLD-1' },
         ],
       });
+      // The old tariff and the new pricing group each get the changed fields.
+      const change = {
+        before: {
+          id: 1,
+          ocpiTariffId: 'OLD-1',
+          tariffId: 'trf_000000000001',
+          pricingGroupId: null,
+        },
+        after: { id: 1, ocpiTariffId: 'NEW-1', tariffId: null, pricingGroupId: 'pgr_000000000001' },
+      };
+      expect(writeAuditMock).toHaveBeenCalledTimes(2);
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        { table: { name: 'tariff_audit_log' }, idColumn: 'tariff_id' },
+        expect.objectContaining({ entityId: 'trf_000000000001', ...change }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        { table: { name: 'pricing_group_audit_log' }, idColumn: 'pricing_group_id' },
+        expect.objectContaining({ entityId: 'pgr_000000000001', ...change }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('trims the OCPI tariff id before storing and pushing it', async () => {
@@ -388,7 +485,14 @@ describe('OCPI tariff mapping routes', () => {
 
   describe('DELETE /v1/ocpi/tariff-mappings/:id', () => {
     it('deletes the mapping and asks the OCPI server to resync its id', async () => {
-      setupDbResults([{ partnerId: 'opr_000000000001', ocpiTariffId: 'T-1' }]);
+      setupDbResults([
+        {
+          partnerId: 'opr_000000000001',
+          ocpiTariffId: 'T-1',
+          tariffId: 'trf_000000000001',
+          pricingGroupId: null,
+        },
+      ]);
       const res = await app.inject({
         method: 'DELETE',
         url: '/ocpi/tariff-mappings/1',
@@ -398,6 +502,31 @@ describe('OCPI tariff mapping routes', () => {
       expect(publishOcpiTariffPush).toHaveBeenCalledWith({
         targets: [{ partnerId: 'opr_000000000001', ocpiTariffId: 'T-1' }],
       });
+      const before = {
+        id: 1,
+        partnerId: 'opr_000000000001',
+        ocpiTariffId: 'T-1',
+        tariffId: 'trf_000000000001',
+        pricingGroupId: null,
+      };
+      expect(writeAuditMock).toHaveBeenCalledTimes(2);
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        { table: { name: 'tariff_audit_log' }, idColumn: 'tariff_id' },
+        expect.objectContaining({ entityId: 'trf_000000000001', before, after: null }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        { table: { name: 'ocpi_partner_audit_log' }, idColumn: 'ocpi_partner_id' },
+        expect.objectContaining({
+          entityId: 'opr_000000000001',
+          action: 'tariff_mapping_changed',
+          before,
+          after: null,
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('returns 404 for an unknown mapping', async () => {

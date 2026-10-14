@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, desc, count, and, or, ilike, like } from 'drizzle-orm';
 import { readFile } from 'node:fs/promises';
@@ -14,6 +14,8 @@ import {
   driverEventSettings,
   ocppEventSettings,
   settings,
+  notificationTemplateAuditLog,
+  writeAudit,
 } from '@evtivity/database';
 import {
   assertTemplateAllowed,
@@ -71,8 +73,70 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { config as apiConfig } from '../lib/config.js';
 import { authorize } from '../middleware/rbac.js';
+import { getAuditActor } from '../lib/audit-actor.js';
+
+type AuditFields = Record<string, unknown>;
+
+/**
+ * notification_template audit row (id the event type). With a before and an
+ * after state it records only the fields that differ, and writes nothing when
+ * none does. Fail-open: writeAudit logs and continues.
+ */
+async function auditNotificationTemplate(
+  request: FastifyRequest,
+  change: {
+    eventType: string;
+    action: 'updated' | 'deleted' | 'event_settings_changed';
+    /** Identifies the row within the event type (channel, language); always recorded. */
+    key: AuditFields;
+    before: AuditFields | null;
+    after: AuditFields | null;
+    notes?: string;
+  },
+): Promise<void> {
+  let before = change.before;
+  let after = change.after;
+  if (before != null && after != null) {
+    const changed = Object.keys(after).filter(
+      (field) => JSON.stringify(before?.[field] ?? null) !== JSON.stringify(after?.[field] ?? null),
+    );
+    if (changed.length === 0) return;
+    before = Object.fromEntries(changed.map((field) => [field, change.before?.[field] ?? null]));
+    after = Object.fromEntries(changed.map((field) => [field, change.after?.[field] ?? null]));
+  }
+  await writeAudit(
+    { table: notificationTemplateAuditLog, idColumn: 'notification_template_id' },
+    {
+      entityId: change.eventType,
+      entityIdSnapshot: change.eventType,
+      action: change.action,
+      ...getAuditActor(request),
+      before: before == null ? null : { ...change.key, ...before },
+      after: after == null ? null : { ...change.key, ...after },
+      notes: change.notes ?? null,
+    },
+    db,
+    request.log,
+  );
+}
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_MESSAGE_NOT_FOUND = {
+  error: 'Message not found',
+  code: 'MESSAGE_NOT_FOUND',
+} as const;
+const ALL_SITES_SETTING_NOT_FOUND = {
+  error: 'Setting not found',
+  code: 'SETTING_NOT_FOUND',
+} as const;
+const ALL_SITES_TEMPLATE_NOT_FOUND = {
+  error: 'Template not found',
+  code: 'TEMPLATE_NOT_FOUND',
+} as const;
 
 const ocppEventSettingItem = z
   .object({
@@ -248,11 +312,16 @@ export const DRIVER_EVENT_TYPES = [
   'reservation.Expiring',
   'reservation.Expired',
   'reservation.StationFaulted',
+  'reservation.TakenByOther',
   'invoice.Sent',
   'invoice.CreditNote',
+  'invoice.MemberInvoice',
+  'invoice.MemberCreditNote',
+  'invoice.MemberOverdue',
   'supportCase.Created',
   'supportCase.OperatorReply',
   'supportCase.Resolved',
+  'supportCase.AiAnswered',
   'mfa.VerificationCode',
   'token.Added',
   'token.Removed',
@@ -280,6 +349,7 @@ export const SYSTEM_EVENT_TYPES = [
   'invoice.FleetInvoice',
   'invoice.FleetCreditNote',
   'invoice.FleetOverdue',
+  'ai.ProposalDigest',
 ];
 
 const ALL_EVENT_TYPES = [
@@ -309,7 +379,8 @@ function safeTemplatePath(
   const lang = TEMPLATE_LANGUAGES.has(language) ? language : 'en';
   const baseResolved = resolve(baseDir);
   const filePath = resolve(baseResolved, lang, eventType.replace(/\./g, '/'), `${channel}.hbs`);
-  if (filePath !== baseResolved && !filePath.startsWith(baseResolved + sep)) return null;
+  // The file always lies below the base (it ends in `<channel>.hbs`).
+  if (!filePath.startsWith(baseResolved + sep)) return null;
   return filePath;
 }
 
@@ -449,6 +520,22 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'transactionId',
     'energyDeliveredWh',
     'finalCostCents',
+    'costIncludesTax',
+    'taxFormatted',
+    'taxCents',
+    'netFormatted',
+    'taxRatePercent',
+    'taxLinesFormatted',
+    'energyCostFormatted',
+    'timeCostFormatted',
+    'sessionFeeFormatted',
+    'idleCostFormatted',
+    'reservationFeeFormatted',
+    'partiallyPaid',
+    'chargedFormatted',
+    'chargedCents',
+    'unpaidFormatted',
+    'unpaidCents',
     'currency',
     'durationMinutes',
     'startedAt',
@@ -456,6 +543,7 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'notCharged',
     'billingMode',
     'billedTo',
+    'billedToMember',
   ],
   'session.Faulted': ['firstName', 'lastName', 'email', 'stationId', 'reason'],
   'session.PaymentReceived': [
@@ -547,6 +635,22 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'transactionId',
     'energyDeliveredWh',
     'finalCostCents',
+    'costIncludesTax',
+    'taxFormatted',
+    'taxCents',
+    'netFormatted',
+    'taxRatePercent',
+    'taxLinesFormatted',
+    'energyCostFormatted',
+    'timeCostFormatted',
+    'sessionFeeFormatted',
+    'idleCostFormatted',
+    'reservationFeeFormatted',
+    'partiallyPaid',
+    'chargedFormatted',
+    'chargedCents',
+    'unpaidFormatted',
+    'unpaidCents',
     'currency',
     'durationMinutes',
     'startedAt',
@@ -555,6 +659,7 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'notCharged',
     'billingMode',
     'billedTo',
+    'billedToMember',
   ],
   'fleet.AccountBillingChanged': [
     'firstName',
@@ -563,6 +668,8 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'fleetName',
     'billedTo',
     'accountBilling',
+    'invoicedTo',
+    'invoicedToMember',
   ],
   'payment.AccountCreditLimit': [
     'firstName',
@@ -618,6 +725,46 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'currency',
     'wasPaid',
   ],
+  'invoice.MemberInvoice': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'invoice.MemberCreditNote': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'creditNoteNumber',
+    'invoiceNumber',
+    'periodLabel',
+    'creditReason',
+    'issuedAt',
+    'total',
+    'totalCents',
+    'currency',
+    'wasPaid',
+  ],
+  'invoice.MemberOverdue': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
   'invoice.FleetOverdue': [
     'fleetName',
     'invoiceNumber',
@@ -635,10 +782,23 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'period',
     'fleetCount',
     'fleetNames',
+    'memberCount',
     'issuedNotEmailed',
     'issuedNotEmailedCount',
     'notInvoiced',
     'notInvoicedCount',
+  ],
+  // Daily digest of pending AI insight actions: counts only, never model text.
+  'ai.ProposalDigest': [
+    'firstName',
+    'lastName',
+    'digestDate',
+    'pendingCount',
+    'stuckSessionsCount',
+    'networkSummaryCount',
+    'siteCount',
+    'siteNames',
+    'insightsUrl',
   ],
 };
 
@@ -787,10 +947,14 @@ export function notificationRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(ocppEventSettingItem),
           400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof ocppEventSettingsBody>;
       const channel = body.channel ?? 'email';
       // Validate the recipient against the channel format so misconfigured
@@ -827,6 +991,19 @@ export function notificationRoutes(app: FastifyInstance): void {
       if (body.templateHtml !== undefined) updates['templateHtml'] = body.templateHtml;
       if (body.language !== undefined) updates['language'] = body.language;
 
+      const [existing] = await db
+        .select({
+          recipient: ocppEventSettings.recipient,
+          templateHtml: ocppEventSettings.templateHtml,
+          language: ocppEventSettings.language,
+        })
+        .from(ocppEventSettings)
+        .where(
+          and(
+            eq(ocppEventSettings.eventType, body.eventType),
+            eq(ocppEventSettings.channel, channel),
+          ),
+        );
       const [saved] = await db
         .insert(ocppEventSettings)
         .values({
@@ -841,6 +1018,19 @@ export function notificationRoutes(app: FastifyInstance): void {
           set: updates,
         })
         .returning();
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
+          eventType: body.eventType,
+          action: 'event_settings_changed',
+          key: { setting: 'ocpp', channel },
+          before: existing ?? null,
+          after: {
+            recipient: saved.recipient,
+            templateHtml: saved.templateHtml,
+            language: saved.language,
+          },
+        });
+      }
       await invalidateOcppEventSettingsCache(request.log);
       return saved;
     },
@@ -868,6 +1058,7 @@ export function notificationRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const { eventType, channel } = request.query as { eventType: string; channel: string };
       const deleted = await db
         .delete(ocppEventSettings)
@@ -878,10 +1069,23 @@ export function notificationRoutes(app: FastifyInstance): void {
           ),
         )
         .returning();
-      if (deleted.length === 0) {
+      const [removed] = deleted;
+      if (removed == null) {
         await reply.status(404).send({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
         return;
       }
+      await auditNotificationTemplate(request, {
+        eventType,
+        action: 'event_settings_changed',
+        key: { setting: 'ocpp', channel: removed.channel },
+        before: {
+          recipient: removed.recipient,
+          templateHtml: removed.templateHtml,
+          language: removed.language,
+        },
+        after: null,
+        notes: 'Setting removed',
+      });
       await invalidateOcppEventSettingsCache(request.log);
       return { success: true };
     },
@@ -899,10 +1103,16 @@ export function notificationRoutes(app: FastifyInstance): void {
         operationId: 'listNotifications',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(notificationListQuery),
-        response: { 200: paginatedResponse(notificationHistoryItem) },
+        response: {
+          200: paginatedResponse(notificationHistoryItem),
+          404: errorWith('Message not found, or the user is restricted to some sites', [
+            ERROR_CODES.MESSAGE_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_MESSAGE_NOT_FOUND))) return;
       const params = request.query as z.infer<typeof notificationListQuery>;
       const offset = (params.page - 1) * params.limit;
 
@@ -967,10 +1177,14 @@ export function notificationRoutes(app: FastifyInstance): void {
             ERROR_CODES.EMAIL_SEND_FAILED,
             ERROR_CODES.SMS_SEND_FAILED,
           ]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const { channel, recipient } = request.body as z.infer<typeof testBody>;
 
       // Fail fast on bad recipients so operators don't see a vague SMTP/Twilio
@@ -1143,10 +1357,14 @@ export function notificationRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(eventToggleSettingItem),
           400: errorWith('The event type is always on', [ERROR_CODES.NOTIFICATION_EVENT_REQUIRED]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof driverEventSettingBody>;
       if (!body.isEnabled && isRequiredDriverEventType(body.eventType)) {
         await reply.status(400).send({
@@ -1155,6 +1373,10 @@ export function notificationRoutes(app: FastifyInstance): void {
         });
         return;
       }
+      const [existing] = await db
+        .select({ isEnabled: driverEventSettings.isEnabled })
+        .from(driverEventSettings)
+        .where(eq(driverEventSettings.eventType, body.eventType));
       const [saved] = await db
         .insert(driverEventSettings)
         .values({
@@ -1169,6 +1391,15 @@ export function notificationRoutes(app: FastifyInstance): void {
           },
         })
         .returning();
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
+          eventType: body.eventType,
+          action: 'event_settings_changed',
+          key: { setting: 'driver' },
+          before: { isEnabled: existing?.isEnabled ?? null },
+          after: { isEnabled: saved.isEnabled },
+        });
+      }
       return saved;
     },
   );
@@ -1280,10 +1511,14 @@ export function notificationRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(notificationTemplateDbItem),
           400: errorWith('Template is invalid', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Template not found, or the user is restricted to some sites', [
+            ERROR_CODES.TEMPLATE_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof templateUpsertBody>;
       const details: Record<string, string> = {};
       const subjectError = templateError(body.subject);
@@ -1296,6 +1531,18 @@ export function notificationRoutes(app: FastifyInstance): void {
           .send({ error: 'Template is invalid', code: 'VALIDATION_ERROR', details });
         return;
       }
+      const templateMatch = and(
+        eq(notificationTemplates.eventType, body.eventType),
+        eq(notificationTemplates.channel, body.channel),
+        eq(notificationTemplates.language, body.language),
+      );
+      const [existing] = await db
+        .select({
+          subject: notificationTemplates.subject,
+          bodyHtml: notificationTemplates.bodyHtml,
+        })
+        .from(notificationTemplates)
+        .where(templateMatch);
       const [saved] = await db
         .insert(notificationTemplates)
         .values({
@@ -1318,6 +1565,16 @@ export function notificationRoutes(app: FastifyInstance): void {
           },
         })
         .returning();
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
+          eventType: body.eventType,
+          action: 'updated',
+          key: { channel: body.channel, language: body.language },
+          // No stored row: the default file template applied before.
+          before: existing ?? { subject: null, bodyHtml: null },
+          after: { subject: saved.subject, bodyHtml: saved.bodyHtml },
+        });
+      }
       return saved;
     },
   );
@@ -1332,12 +1589,18 @@ export function notificationRoutes(app: FastifyInstance): void {
         operationId: 'deleteNotificationTemplate',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(templateCrudQuery),
-        response: { 200: successResponse },
+        response: {
+          200: successResponse,
+          404: errorWith('Template not found, or the user is restricted to some sites', [
+            ERROR_CODES.TEMPLATE_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const { eventType, channel, language } = request.query as z.infer<typeof templateCrudQuery>;
-      await db
+      const removed = await db
         .delete(notificationTemplates)
         .where(
           and(
@@ -1345,8 +1608,22 @@ export function notificationRoutes(app: FastifyInstance): void {
             eq(notificationTemplates.channel, channel),
             eq(notificationTemplates.language, language),
           ),
-        );
+        )
+        .returning({
+          subject: notificationTemplates.subject,
+          bodyHtml: notificationTemplates.bodyHtml,
+        });
 
+      const [deleted] = removed;
+      if (deleted != null) {
+        await auditNotificationTemplate(request, {
+          eventType,
+          action: 'deleted',
+          key: { channel, language },
+          before: deleted,
+          after: null,
+        });
+      }
       return { success: true };
     },
   );
@@ -1484,11 +1761,19 @@ export function notificationRoutes(app: FastifyInstance): void {
         sessionCount: 42,
         period: '2026-09',
         fleetCount: 2,
+        memberCount: 0,
         fleetNames: 'Acme Logistics, Nordic Vans',
         issuedNotEmailedCount: 1,
         issuedNotEmailed: 'Acme Logistics (INV-202610-0012): SMTP connection timed out',
         notInvoicedCount: 1,
         notInvoiced: 'Nordic Vans: Connection terminated unexpectedly',
+        digestDate: '2026-10-10',
+        pendingCount: 3,
+        stuckSessionsCount: 2,
+        networkSummaryCount: 1,
+        siteCount: 2,
+        siteNames: 'Downtown Charging Hub, Airport Parking',
+        insightsUrl: 'https://csms.example.com/ai/insights?status=pending',
         balanceCents: 350,
         // Money and rates as the dispatcher formats them, in the template language.
         ...formatLocalizedVariables(
@@ -1503,6 +1788,12 @@ export function notificationRoutes(app: FastifyInstance): void {
             exposureFormatted: notificationMoney(812_500, companyCurrency),
             limitFormatted: notificationMoney(1_000_000, companyCurrency),
             idleFeeFormatted: notificationUnitPrice(0.25, companyCurrency),
+            taxFormatted: notificationMoney(200, companyCurrency),
+            netFormatted: notificationMoney(1050, companyCurrency),
+            energyCostFormatted: notificationMoney(1000, companyCurrency),
+            sessionFeeFormatted: notificationMoney(250, companyCurrency),
+            chargedFormatted: notificationMoney(1000, companyCurrency),
+            unpaidFormatted: notificationMoney(250, companyCurrency),
             taxRatePercent: notificationTaxRate(0.19),
           },
           body.language,
@@ -1510,11 +1801,22 @@ export function notificationRoutes(app: FastifyInstance): void {
         totalCents: 1250,
         cancellationFeeCents: 595,
         costIncludesTax: true,
+        taxCents: 200,
+        taxLinesFormatted: '',
+        timeCostFormatted: '',
+        idleCostFormatted: '',
+        reservationFeeFormatted: '',
+        partiallyPaid: false,
+        chargedCents: 1250,
+        unpaidCents: 0,
         notCharged: false,
         billingMode: 'account',
         billedTo: 'Acme Logistics',
+        billedToMember: false,
         fleetName: 'Acme Logistics',
         accountBilling: true,
+        invoicedTo: 'fleet',
+        invoicedToMember: false,
         exposureCents: 812_500,
         limitCents: 1_000_000,
         warningPercent: 80,

@@ -88,7 +88,11 @@ export interface SessionHoldInput {
   sessionId: string;
   /** The session's driver (null on an operator pre-auth of a session without one). */
   driverId: string | null;
-  /** A `driver_payment_methods` row; null takes the driver's default method. */
+  /**
+   * A `driver_payment_methods` row of `driverId`; null takes the driver's
+   * default method. Another driver's row, or any row on a session without a
+   * driver, answers `no_method`.
+   */
   methodRowId: number | null;
   siteId: string | null;
   /** Operator override; default the site or global hold amount. */
@@ -129,17 +133,20 @@ interface MethodRow {
 }
 
 async function sessionMethod(input: SessionHoldInput): Promise<MethodRow | null> {
-  // The given row, else the default method of the session's driver.
+  // The given row of the session's driver, else that driver's default method.
+  // A session without a driver has no method: a row id alone could name
+  // another driver's card (P11, the operator pre-authorize route).
+  if (input.driverId == null) return null;
   const condition =
     input.methodRowId != null
-      ? eq(driverPaymentMethods.id, input.methodRowId)
-      : input.driverId != null
-        ? and(
-            eq(driverPaymentMethods.driverId, input.driverId),
-            eq(driverPaymentMethods.isDefault, true),
-          )
-        : null;
-  if (condition == null) return null;
+      ? and(
+          eq(driverPaymentMethods.id, input.methodRowId),
+          eq(driverPaymentMethods.driverId, input.driverId),
+        )
+      : and(
+          eq(driverPaymentMethods.driverId, input.driverId),
+          eq(driverPaymentMethods.isDefault, true),
+        );
   const [row] = await db
     .select({
       id: driverPaymentMethods.id,
@@ -199,18 +206,21 @@ export async function authorizeSessionHold(
   if (currency == null) throw new Error(`Session ${input.sessionId} not found`);
   const amountCents = input.amountCents ?? terms.preAuthAmountCents;
   const failed = (reason: string): Promise<number | null> =>
-    recordFailedHold({
-      sessionId: input.sessionId,
-      driverId: input.driverId,
-      sitePaymentConfigId: terms.sitePaymentConfigId,
-      provider: provider.id,
-      customerId: method.customerId,
-      methodId: method.methodId,
-      source: 'web_portal',
-      currency,
-      preAuthAmountCents: input.trigger === 'operator' ? amountCents : null,
-      reason,
-    });
+    recordFailedHold(
+      {
+        sessionId: input.sessionId,
+        driverId: input.driverId,
+        sitePaymentConfigId: terms.sitePaymentConfigId,
+        provider: provider.id,
+        customerId: method.customerId,
+        methodId: method.methodId,
+        source: 'web_portal',
+        currency,
+        preAuthAmountCents: input.trigger === 'operator' ? amountCents : null,
+        reason,
+      },
+      ctx,
+    );
 
   if (terms.payoutBlocked) {
     ctx.logger.warn(
@@ -279,19 +289,22 @@ export async function authorizeSessionHold(
   }
 
   try {
-    const recordId = await recordHold({
-      sessionId: input.sessionId,
-      driverId: input.driverId,
-      sitePaymentConfigId: terms.sitePaymentConfigId,
-      provider: provider.id,
-      paymentId,
-      customerId: method.customerId,
-      methodId: method.methodId,
-      source: 'web_portal',
-      currency,
-      preAuthAmountCents: amountCents,
-      providerState,
-    });
+    const recordId = await recordHold(
+      {
+        sessionId: input.sessionId,
+        driverId: input.driverId,
+        sitePaymentConfigId: terms.sitePaymentConfigId,
+        provider: provider.id,
+        paymentId,
+        customerId: method.customerId,
+        methodId: method.methodId,
+        source: 'web_portal',
+        currency,
+        preAuthAmountCents: amountCents,
+        providerState,
+      },
+      ctx,
+    );
     if (recordId != null) return { outcome: 'authorized', paymentRecordId: recordId, paymentId };
     // A concurrent trigger recorded first. With the shared key it is this hold.
     const winner = await findSessionRecord(input.sessionId);
@@ -377,7 +390,7 @@ export async function captureSessionHold(
       merchantReference: `sess_${input.sessionId}`,
       idempotencyKey: cancelKey(paymentId),
     });
-    if (!(await markCancelled(record.id, pendingRef(cancelled)))) {
+    if (!(await markCancelled(record.id, { pendingRef: pendingRef(cancelled) }, ctx))) {
       ctx.logger.warn({ paymentRecordId: record.id }, 'Hold cancelled but the record had moved on');
     }
     return { status: 'cancelled', record: (await findRecord(record.id)) ?? record };
@@ -398,11 +411,15 @@ export async function captureSessionHold(
     idempotencyKey: captureKey(paymentId),
   });
   if (
-    !(await markCaptured(record.id, {
-      capturedCents: amountCents,
-      failureReason: null,
-      pendingRef: pendingRef(captured),
-    }))
+    !(await markCaptured(
+      record.id,
+      {
+        capturedCents: amountCents,
+        failureReason: null,
+        pendingRef: pendingRef(captured),
+      },
+      ctx,
+    ))
   ) {
     ctx.logger.warn({ paymentRecordId: record.id }, 'Hold captured but the record had moved on');
   }
@@ -424,7 +441,7 @@ export async function cancelSessionHold(
       record.sessionId != null ? `sess_${record.sessionId}` : `rec_${String(record.id)}`,
     idempotencyKey: cancelKey(paymentId),
   });
-  if (!(await markCancelled(record.id, pendingRef(cancelled)))) {
+  if (!(await markCancelled(record.id, { pendingRef: pendingRef(cancelled) }, ctx))) {
     ctx.logger.warn(
       { paymentRecordId: record.id, reason },
       'Hold cancelled but the record had moved on',
@@ -618,12 +635,17 @@ export async function retryShortfallForRecord(
     }
     return { status: 'failed', reason: errorMessage(err, 'Top-up failed', 400) };
   }
-  const updated = await markShortfallRecovered(record.id, {
-    capturedCents: finalCostCents,
-    actorUserId: input.actorUserId,
-    actionReason: `Operator retry top-up; recovered ${String(result.shortfallCents)}c via ${result.topUpId}`,
-    topUp: { paymentId: result.topUpId, amountCents: result.topUpCents },
-  });
+  const updated = await markShortfallRecovered(
+    record.id,
+    {
+      capturedCents: finalCostCents,
+      actorUserId: input.actorUserId,
+      actionReason: `Operator retry top-up; recovered ${String(result.shortfallCents)}c via ${result.topUpId}`,
+      topUp: { paymentId: result.topUpId, amountCents: result.topUpCents },
+      previousCapturedCents: record.capturedAmountCents,
+    },
+    ctx,
+  );
   return {
     status: 'recovered',
     record: updated ?? record,
@@ -675,12 +697,17 @@ export async function retryShortfalls(
         `Capture retry for session ${row.session_id}`,
         ctx,
       );
-      await markShortfallRecovered(record.id, {
-        capturedCents: finalCostCents,
-        actorUserId: null,
-        actionReason: `Cron retry top-up; recovered ${String(shortfall)}c via ${result.topUpId}`,
-        topUp: { paymentId: result.topUpId, amountCents: result.topUpCents },
-      });
+      await markShortfallRecovered(
+        record.id,
+        {
+          capturedCents: finalCostCents,
+          actorUserId: null,
+          actionReason: `Cron retry top-up; recovered ${String(shortfall)}c via ${result.topUpId}`,
+          topUp: { paymentId: result.topUpId, amountCents: result.topUpCents },
+          previousCapturedCents: record.capturedAmountCents,
+        },
+        ctx,
+      );
       recovered++;
       ctx.logger.info(
         { paymentRecordId: record.id, shortfall, topUpIntentId: result.topUpId },
@@ -843,7 +870,7 @@ export async function settleSessionPayment(
 
   if (mode === 'prepaid') {
     try {
-      const settled = await settlePrepaidSession(sessionId, ctx.logger);
+      const settled = await settlePrepaidSession(sessionId, ctx);
       if (settled != null) return { mode: 'prepaid', ...settled };
     } catch (err) {
       // A lost connection is the caller's to retry: reporting no debit here
@@ -1260,7 +1287,7 @@ async function settleHold(
     ctx.logger.error({ err, sessionId, paymentRecordId: record.id }, 'Auto capture/cancel failed');
     const reason = errorMessage(err, 'Unknown capture error');
     try {
-      await markHoldFailed(record.id, reason);
+      await markHoldFailed(record.id, reason, ctx);
     } catch (dbErr) {
       ctx.logger.error(
         { err: dbErr, paymentRecordId: record.id },
@@ -1274,14 +1301,22 @@ async function settleHold(
   let recorded: boolean;
   try {
     recorded = cancelled
-      ? await markCancelled(record.id, operationRef, uncollectableReason)
-      : await markCaptured(record.id, {
-          capturedCents,
-          failureReason: topUpFailureReason,
-          topUp,
-          pendingRef: operationRef,
-          ...(adjustedHoldCents != null ? { authorizedCents: adjustedHoldCents } : {}),
-        });
+      ? await markCancelled(
+          record.id,
+          { pendingRef: operationRef, failureReason: uncollectableReason },
+          ctx,
+        )
+      : await markCaptured(
+          record.id,
+          {
+            capturedCents,
+            failureReason: topUpFailureReason,
+            topUp,
+            pendingRef: operationRef,
+            ...(adjustedHoldCents != null ? { authorizedCents: adjustedHoldCents } : {}),
+          },
+          ctx,
+        );
     if (!recorded) {
       ctx.logger.warn(
         { paymentRecordId: record.id, paymentId },

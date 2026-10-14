@@ -17,7 +17,8 @@ import {
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
-import { getUserSiteIds } from '../lib/site-access.js';
+import { auditStationChange } from '../lib/station-audit.js';
+import { getUserSiteIds, userCanAccessSite } from '../lib/site-access.js';
 
 const neviStationDataItem = z
   .object({
@@ -137,6 +138,27 @@ const excludedDowntimeQuery = paginationQuery.extend({
   to: z.string().optional().describe('ISO 8601 date-time upper bound for startedAt'),
 });
 
+interface DowntimeRow {
+  id: number;
+  evseId: number | null;
+  reason: string;
+  startedAt: Date;
+  endedAt: Date | null;
+  notes: string | null;
+}
+
+/** The audited fields of an excluded downtime record. */
+function downtimeAudit(row: DowntimeRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    evseId: row.evseId,
+    reason: row.reason,
+    startedAt: row.startedAt,
+    endedAt: row.endedAt,
+    notes: row.notes,
+  };
+}
+
 export function neviRoutes(app: FastifyInstance): void {
   // List NEVI station data
   app.get(
@@ -222,11 +244,15 @@ export function neviRoutes(app: FastifyInstance): void {
       }
 
       const { userId } = request.user as { userId: string };
-      const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && station.siteId != null && !siteIds.includes(station.siteId)) {
+      if (!(await userCanAccessSite(userId, station.siteId))) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
+
+      const [previous] = await db
+        .select()
+        .from(neviStationData)
+        .where(eq(neviStationData.stationId, stationId));
 
       const values = {
         stationId,
@@ -253,6 +279,25 @@ export function neviRoutes(app: FastifyInstance): void {
           set: values,
         })
         .returning();
+
+      // Changed NEVI fields only (all of them on the first save).
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(values)) {
+        if (key === 'stationId' || key === 'updatedAt') continue;
+        const prev = previous == null ? null : (previous as Record<string, unknown>)[key];
+        if (JSON.stringify(prev ?? null) !== JSON.stringify(value ?? null)) {
+          before[key] = prev ?? null;
+          after[key] = value;
+        }
+      }
+      if (Object.keys(after).length > 0) {
+        await auditStationChange(request, stationId, 'nevi_data_changed', {
+          before: previous == null ? null : { stationData: before },
+          after: { stationData: after },
+          notes: 'NEVI station data saved',
+        });
+      }
 
       return row;
     },
@@ -361,8 +406,7 @@ export function neviRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const siteIds = await getUserSiteIds(user.userId);
-      if (siteIds != null && station.siteId != null && !siteIds.includes(station.siteId)) {
+      if (!(await userCanAccessSite(user.userId, station.siteId))) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
@@ -379,6 +423,13 @@ export function neviRoutes(app: FastifyInstance): void {
           createdById: user.userId,
         })
         .returning();
+
+      if (row != null) {
+        await auditStationChange(request, body.stationId, 'nevi_data_changed', {
+          after: { excludedDowntime: downtimeAudit(row) },
+          notes: `Excluded downtime ${String(row.id)} created`,
+        });
+      }
 
       return row;
     },
@@ -397,7 +448,10 @@ export function neviRoutes(app: FastifyInstance): void {
         body: zodSchema(updateExcludedDowntimeBody),
         response: {
           200: itemResponse(neviExcludedDowntimeItem),
-          404: errorWith('Downtime not found', [ERROR_CODES.DOWNTIME_NOT_FOUND]),
+          404: errorWith('Downtime or station not found', [
+            ERROR_CODES.DOWNTIME_NOT_FOUND,
+            ERROR_CODES.STATION_NOT_FOUND,
+          ]),
         },
       },
     },
@@ -409,6 +463,11 @@ export function neviRoutes(app: FastifyInstance): void {
         .select({
           id: neviExcludedDowntime.id,
           stationId: neviExcludedDowntime.stationId,
+          evseId: neviExcludedDowntime.evseId,
+          reason: neviExcludedDowntime.reason,
+          startedAt: neviExcludedDowntime.startedAt,
+          endedAt: neviExcludedDowntime.endedAt,
+          notes: neviExcludedDowntime.notes,
           siteId: chargingStations.siteId,
         })
         .from(neviExcludedDowntime)
@@ -424,13 +483,25 @@ export function neviRoutes(app: FastifyInstance): void {
       }
 
       const { userId } = request.user as { userId: string };
-      const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && existing.siteId != null && !siteIds.includes(existing.siteId)) {
+      if (!(await userCanAccessSite(userId, existing.siteId))) {
         await reply.status(404).send({
           error: 'Excluded downtime record not found',
           code: 'DOWNTIME_NOT_FOUND',
         });
         return;
+      }
+
+      // Moving the record to another station: the target must exist and be
+      // within the caller's sites, like the create route.
+      if (body.stationId != null && body.stationId !== existing.stationId) {
+        const [target] = await db
+          .select({ siteId: chargingStations.siteId })
+          .from(chargingStations)
+          .where(eq(chargingStations.id, body.stationId));
+        if (target == null || !(await userCanAccessSite(userId, target.siteId))) {
+          await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          return;
+        }
       }
 
       const updates: Record<string, unknown> = { updatedAt: sql`now()` };
@@ -447,6 +518,19 @@ export function neviRoutes(app: FastifyInstance): void {
         .set(updates)
         .where(eq(neviExcludedDowntime.id, id))
         .returning();
+
+      if (updated != null) {
+        const change = {
+          before: { excludedDowntime: downtimeAudit(existing) },
+          after: { excludedDowntime: downtimeAudit(updated) },
+          notes: `Excluded downtime ${String(id)} updated`,
+        };
+        await auditStationChange(request, updated.stationId, 'nevi_data_changed', change);
+        // Moved to another station: the station it left records the change too.
+        if (updated.stationId !== existing.stationId) {
+          await auditStationChange(request, existing.stationId, 'nevi_data_changed', change);
+        }
+      }
 
       return updated;
     },
@@ -474,6 +558,12 @@ export function neviRoutes(app: FastifyInstance): void {
       const [existing] = await db
         .select({
           id: neviExcludedDowntime.id,
+          stationId: neviExcludedDowntime.stationId,
+          evseId: neviExcludedDowntime.evseId,
+          reason: neviExcludedDowntime.reason,
+          startedAt: neviExcludedDowntime.startedAt,
+          endedAt: neviExcludedDowntime.endedAt,
+          notes: neviExcludedDowntime.notes,
           siteId: chargingStations.siteId,
         })
         .from(neviExcludedDowntime)
@@ -489,8 +579,7 @@ export function neviRoutes(app: FastifyInstance): void {
       }
 
       const { userId } = request.user as { userId: string };
-      const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && existing.siteId != null && !siteIds.includes(existing.siteId)) {
+      if (!(await userCanAccessSite(userId, existing.siteId))) {
         await reply.status(404).send({
           error: 'Excluded downtime record not found',
           code: 'DOWNTIME_NOT_FOUND',
@@ -499,6 +588,10 @@ export function neviRoutes(app: FastifyInstance): void {
       }
 
       await db.delete(neviExcludedDowntime).where(eq(neviExcludedDowntime.id, id));
+      await auditStationChange(request, existing.stationId, 'nevi_data_changed', {
+        before: { excludedDowntime: downtimeAudit(existing) },
+        notes: `Excluded downtime ${String(id)} deleted`,
+      });
       return { success: true };
     },
   );

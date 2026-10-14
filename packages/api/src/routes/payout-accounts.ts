@@ -28,6 +28,7 @@ import {
   openPayoutInvite,
   revokePayoutInvites,
 } from '../services/payout-onboarding.service.js';
+import { siteInScope } from '../lib/site-scope.js';
 
 // A site host's Stripe Connect payout account (plan P3.5 Part C). The
 // payments service `payout-accounts.ts` writes the account columns; the
@@ -142,18 +143,17 @@ async function findAccessibleSite(
 } | null> {
   const { userId } = request.user as { userId: string };
   const siteIds = await getUserSiteIds(userId);
-  const [site] =
-    siteIds != null && !siteIds.includes(siteId)
-      ? []
-      : await db
-          .select({
-            id: sites.id,
-            name: sites.name,
-            country: sites.country,
-            contactEmail: sites.contactEmail,
-          })
-          .from(sites)
-          .where(eq(sites.id, siteId));
+  const [site] = !siteInScope(siteIds, siteId)
+    ? []
+    : await db
+        .select({
+          id: sites.id,
+          name: sites.name,
+          country: sites.country,
+          contactEmail: sites.contactEmail,
+        })
+        .from(sites)
+        .where(eq(sites.id, siteId));
   if (site == null) {
     await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
     return null;
@@ -298,7 +298,7 @@ export function payoutAccountRoutes(app: FastifyInstance): void {
         outcome = await createSitePayoutAccount(
           id,
           { displayName: site.name, contactEmail, country },
-          paymentContext(request.log),
+          paymentContext(request.log, getAuditActor(request)),
         );
       } catch (err) {
         await sendPayoutProviderError(request, reply, err);
@@ -363,7 +363,10 @@ export function payoutAccountRoutes(app: FastifyInstance): void {
       if ((await findAccessibleSite(request, reply, id)) == null) return;
       let status;
       try {
-        status = await refreshSitePayoutAccount(id, paymentContext(request.log));
+        status = await refreshSitePayoutAccount(
+          id,
+          paymentContext(request.log, getAuditActor(request)),
+        );
       } catch (err) {
         await sendPayoutProviderError(request, reply, err);
         return;

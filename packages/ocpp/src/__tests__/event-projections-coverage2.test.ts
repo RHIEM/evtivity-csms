@@ -52,6 +52,23 @@ class MockPostgresError extends Error {
   }
 }
 
+// Jobs the projections add to the worker queues themselves (station screens,
+// maintenance re-assert, station-watch alerts), kept as [job name, JSON data]
+// rows in add order.
+const queuedJobs = vi.hoisted(() => [] as Array<[string, string]>);
+vi.mock('@evtivity/lib/job-queues', () => ({
+  jobQueue: () => ({
+    add: (name: string, data: unknown) => {
+      queuedJobs.push([name, JSON.stringify(data)]);
+      return Promise.resolve();
+    },
+    addBulk: () => Promise.resolve(),
+  }),
+}));
+function jobsNamed(name: string): Array<[string, string]> {
+  return queuedJobs.filter((j) => j[0] === name);
+}
+
 vi.mock('postgres', () => {
   const factory = () => createSqlMock();
   factory.PostgresError = MockPostgresError;
@@ -67,6 +84,33 @@ const mockSettleSessionPayment = vi.fn();
 const mockRecordTerminalSettlement = vi.fn();
 const mockDispatchFleetCreditNotices = vi.fn().mockResolvedValue(null);
 const mockReadFleetCreditLimit = vi.fn().mockResolvedValue(null);
+// The shared reservation services (@evtivity/services): the reservation
+// projections themselves are covered in event-projections-reservations.test.ts.
+const mockCancelHoldsForStationOutage = vi.fn().mockResolvedValue(0);
+const mockExpireStationReportedReservation = vi.fn().mockResolvedValue(false);
+const mockApplyReservationCancellation = vi.fn().mockResolvedValue({
+  cancelled: false,
+  statusBefore: null,
+  feeChargedCents: 0,
+  feeChargeFailed: false,
+  feeCurrency: null,
+});
+const mockNotifyReservationDriver = vi.fn().mockResolvedValue(undefined);
+vi.mock('@evtivity/services/reservation-expiry', () => ({
+  cancelHoldsForStationOutage: (...args: unknown[]) =>
+    mockCancelHoldsForStationOutage(...args) as unknown,
+  expireStationReportedReservation: (...args: unknown[]) =>
+    mockExpireStationReportedReservation(...args) as unknown,
+}));
+vi.mock('@evtivity/services/reservation-cancel', () => ({
+  applyReservationCancellation: (...args: unknown[]) =>
+    mockApplyReservationCancellation(...args) as unknown,
+}));
+vi.mock('@evtivity/services/reservation-notify', () => ({
+  notifyReservationDriver: (...args: unknown[]) => mockNotifyReservationDriver(...args) as unknown,
+  cancelReasonNoticeFlags: () => ({}),
+}));
+
 const mockFleetCreditNoticesClaimed = vi.fn().mockResolvedValue(false);
 // No credit left by default: the ceiling stays and the cost loop stops at it.
 const mockExtendFleetSessionCeiling = vi.fn();
@@ -80,6 +124,11 @@ vi.mock('@evtivity/payments', async (importOriginal) => ({
     mockRecordTerminalSettlement(...args) as unknown,
 }));
 const mockPaymentContext = { registry: {}, logger: {} };
+// Each payment step names itself on the payment audit rows.
+const SETTLE_PAYMENT_CONTEXT = {
+  ...mockPaymentContext,
+  actor: { actor: 'ocpp', actorLabel: 'session-settlement' },
+};
 // The settlement options of a first run that can still be retried.
 const SETTLE_OPTIONS = { rethrowConnectionErrors: true, resumeAdjustment: false };
 vi.mock('../lib/payments.js', () => ({
@@ -121,7 +170,19 @@ vi.mock('../../../database/src/lib/pricing-settings.js', () => ({
   isSplitBillingEnabled: vi.fn().mockResolvedValue(false),
 }));
 
+// The firmware campaign helpers write their completion audit through the
+// audit module directly.
+vi.mock('../../../database/src/lib/audit.js', () => ({
+  writeAudit: (...args: unknown[]) => mockWriteAudit(...args) as unknown,
+}));
+
 vi.mock('@evtivity/database', async () => ({
+  // The session audit of a CSMS stop or fault (tested in payment-stop.test.ts).
+  writeCsmsSessionAudit: vi.fn().mockResolvedValue(undefined),
+  // The real firmware update and campaign progress writes, on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/firmware-updates.js',
+  )),
   // The session end request channel and reasons.
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/session-end-request.js',
@@ -141,10 +202,16 @@ vi.mock('@evtivity/database', async () => ({
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/session-pricing.js',
   )),
+  // The real register energy rule (session-energy), on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/session-energy.js',
+  )),
   // The real tariff resolver, running on the mocked client.
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/tariff-resolution.js',
   )),
+  // The real raw timestamp readers (reservation rows).
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/raw-timestamp.js')),
   // The real Postgres error readers (the projection retry classifies errors).
   ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   getCompanyTaxBasis: vi.fn().mockResolvedValue('net'),
@@ -321,6 +388,7 @@ describe('Event projections - coverage round 2', () => {
     sqlErrors = new Map();
     sqlCountOverrides = new Map();
     vi.clearAllMocks();
+    queuedJobs.length = 0;
     mockIsRoamingEnabled.mockResolvedValue(false);
     mockIsAutoDisableOnCritical.mockResolvedValue(false);
     mockGetMeterValueInterval.mockResolvedValue(0);
@@ -569,6 +637,7 @@ describe('Event projections - coverage round 2', () => {
       ['ocpp.LogStatusNotification', { status: 'Idle' }],
       ['ocpp.DiagnosticsStatus', { status: 'Idle' }],
       ['command.SetChargingProfile', { response: { status: 'Accepted' }, request: {} }],
+      ['command.GetChargingProfiles', { response: { status: 'NoProfiles' }, request: {} }],
       ['command.GetVariables', { response: {} }],
       ['command.GetConfiguration', { response: {} }],
       ['command.UpdateFirmware', { request: {} }],
@@ -650,10 +719,8 @@ describe('Event projections - coverage round 2', () => {
       // Temperature filtered out of 2.1 measurands
       const txMeas = cmds.find((c) => (c[1] as string).includes('TxUpdatedMeasurands'));
       expect(txMeas?.[1]).not.toContain('Temperature');
-      // station_message_refresh published for 2.1
-      const refresh = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c) => c[0] === 'station_message_refresh',
-      );
+      // station screen refresh queued for 2.1
+      const refresh = jobsNamed('station-message-refresh');
       expect(refresh.length).toBe(1);
     });
 
@@ -812,6 +879,77 @@ describe('Event projections - coverage round 2', () => {
       expect(ins?.values).toContain(2);
       expect(ins?.values).toContain(9);
       expect(ins?.values).toContain('EMS');
+    });
+  });
+
+  // ---- command.ClearChargingProfile ----
+
+  describe('command.ClearChargingProfile', () => {
+    it('removes the matching stored profiles of the station and notifies', async () => {
+      await setup();
+      setupSqlResults(STA, [], [{ site_id: 'sit_1' }]);
+      await emit('command.ClearChargingProfile', 'CS-1', {
+        request: {
+          chargingProfileCriteria: { chargingProfilePurpose: 'TxDefaultProfile', evseId: 2 },
+        },
+        response: { status: 'Accepted' },
+      });
+      const del = findSql(/DELETE FROM charging_profiles/);
+      expect(del?.strings.join(' ')).toContain('jsonb_path_exists');
+      expect(del?.values).toContain(2);
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('station.chargingProfiles'),
+      );
+    });
+
+    it('changes nothing when the station did not accept', async () => {
+      await setup();
+      setupSqlResults(STA);
+      await emit('command.ClearChargingProfile', 'CS-1', {
+        request: { chargingProfileId: 1 },
+        response: { status: 'Unknown' },
+      });
+      expect(findSql(/DELETE FROM charging_profiles/)).toBeUndefined();
+    });
+  });
+
+  // ---- command.GetChargingProfiles ----
+
+  describe('command.GetChargingProfiles', () => {
+    it('drops every stored station profile when the station has none', async () => {
+      await setup();
+      setupSqlResults(STA, []);
+      await emit('command.GetChargingProfiles', 'CS-1', {
+        request: { requestId: 3, chargingProfile: {} },
+        response: { status: 'NoProfiles' },
+      });
+      const del = findSql(/DELETE FROM charging_profiles/);
+      expect(del?.strings.join(' ')).toContain("source = 'station_reported'");
+      expect(del?.strings.join(' ')).not.toContain('request_id');
+    });
+
+    it('drops rows of earlier requests when the station accepted', async () => {
+      await setup();
+      setupSqlResults(STA, []);
+      await emit('command.GetChargingProfiles', 'CS-1', {
+        request: { requestId: 4, evseId: 1, chargingProfile: {} },
+        response: { status: 'Accepted' },
+      });
+      const del = findSql(/DELETE FROM charging_profiles/);
+      expect(del?.strings.join(' ')).toContain('request_id IS DISTINCT FROM');
+      expect(del?.values).toContain(4);
+      expect(del?.values).toContain(1);
+    });
+
+    it('keeps the stored rows when the request filtered by profile criteria', async () => {
+      await setup();
+      setupSqlResults(STA);
+      await emit('command.GetChargingProfiles', 'CS-1', {
+        request: { requestId: 5, chargingProfile: { chargingProfilePurpose: 'TxProfile' } },
+        response: { status: 'NoProfiles' },
+      });
+      expect(findSql(/DELETE FROM charging_profiles/)).toBeUndefined();
     });
   });
 
@@ -1001,6 +1139,19 @@ describe('Event projections - coverage round 2', () => {
       expect(findSql(/INSERT INTO charging_profiles .* 'csms_set'/s)).toBeDefined();
     });
 
+    it('reads the id and connector of a native 1.6 request', async () => {
+      await setup();
+      setupSqlResults(STA, [], []);
+      await emit('command.SetChargingProfile', 'CS-1', {
+        response: { status: 'Accepted' },
+        request: { connectorId: 2, csChargingProfiles: { chargingProfileId: 9, stackLevel: 0 } },
+      });
+      const del = findSql(/DELETE FROM charging_profiles/);
+      expect(del?.values).toContain(9);
+      const ins = findSql(/INSERT INTO charging_profiles .* 'csms_set'/s);
+      expect(ins?.values).toContain(2);
+    });
+
     it('inserts without delete when profile id is absent', async () => {
       await setup();
       setupSqlResults(STA, []);
@@ -1107,6 +1258,81 @@ describe('Event projections - coverage round 2', () => {
       expect(ins?.values).toContain('ftp://fw');
       expect(ins?.strings.join(' ')).not.toMatch(/ON CONFLICT/);
     });
+
+    it.each(['Rejected', 'InvalidCertificate', 'RevokedCertificate'])(
+      'ends a refused update (%s) as Rejected and fails its campaign station',
+      async (status) => {
+        await setup();
+        setupSqlResults(
+          STA,
+          [], // upsert firmware_updates
+          [{ campaign_id: 'fwc_1' }], // UPDATE firmware_updates SET status = 'Rejected'
+          [], // UPDATE firmware_campaign_stations
+          EMPTY, // UPDATE firmware_campaigns (other stations still open)
+        );
+        await emit('command.UpdateFirmware', 'CS-1', {
+          request: { requestId: 5, firmware: { location: 'https://fw' } },
+          response: { status, statusInfo: { reasonCode: 'CertNotValid' } },
+        });
+        const rejected = findSql(/SET status = 'Rejected'/);
+        expect(rejected?.values).toContainEqual({
+          reasonCode: status,
+          additionalInfo: 'CertNotValid',
+        });
+        const station = findSql(/UPDATE firmware_campaign_stations/);
+        expect(station?.values).toContain('failed');
+        expect(station?.values).toContain(status);
+        expect(findSql(/UPDATE firmware_campaigns\s+SET status = 'completed'/)).toBeDefined();
+      },
+    );
+
+    it('ends an update the station answered with an error as CommandFailed', async () => {
+      await setup();
+      setupSqlResults(STA, [], [{ campaign_id: null }]);
+      await emit('command.UpdateFirmware', 'CS-1', {
+        request: { requestId: 6, firmware: { location: 'https://fw' } },
+        error: 'NotSupported',
+      });
+      const rejected = findSql(/SET status = 'Rejected'/);
+      expect(rejected?.values).toContainEqual({
+        reasonCode: 'CommandFailed',
+        additionalInfo: 'NotSupported',
+      });
+      // No campaign: nothing else is written.
+      expect(findSql(/UPDATE firmware_campaign_stations/)).toBeUndefined();
+    });
+
+    it('leaves an accepted update open', async () => {
+      await setup();
+      setupSqlResults(STA, []);
+      await emit('command.UpdateFirmware', 'CS-1', {
+        request: { requestId: 7, firmware: { location: 'https://fw' } },
+        response: { status: 'Accepted' },
+      });
+      expect(findSql(/SET status = 'Rejected'/)).toBeUndefined();
+      expect(findSql(/firmware_campaign_stations/)).toBeUndefined();
+    });
+
+    it('fails the campaign station of the update an AcceptedCanceled cancelled', async () => {
+      await setup();
+      setupSqlResults(
+        STA,
+        [], // upsert firmware_updates
+        [{ campaign_id: 'fwc_old' }], // open campaign updates of the station
+        [], // UPDATE firmware_campaign_stations
+        EMPTY, // UPDATE firmware_campaigns
+      );
+      await emit('command.UpdateFirmware', 'CS-1', {
+        request: { requestId: 8, firmware: { location: 'https://fw' } },
+        response: { status: 'AcceptedCanceled' },
+      });
+      const open = findSql(/SELECT DISTINCT campaign_id FROM firmware_updates/);
+      expect(open?.values).toContain(8);
+      const station = findSql(/UPDATE firmware_campaign_stations/);
+      expect(station?.values).toContain('fwc_old');
+      expect(station?.values).toContain('AcceptedCanceled');
+      expect(findSql(/SET status = 'Rejected'/)).toBeUndefined();
+    });
   });
 
   // ---- command.GetLog / command.GetDiagnostics ----
@@ -1131,80 +1357,110 @@ describe('Event projections - coverage round 2', () => {
     });
   });
 
-  // ---- command.ReserveNow ----
+  // ---- command.SetDisplayMessage / command.ClearDisplayMessage ----
 
-  describe('command.ReserveNow', () => {
-    it('returns immediately when status is Accepted', async () => {
+  describe('command.SetDisplayMessage', () => {
+    it('marks the pending row accepted on Accepted and notifies the dashboard', async () => {
       await setup();
-      setupSqlResults();
-      await emit('command.ReserveNow', 'CS-1', {
-        request: { id: 1 },
+      setupSqlResults(STA, [], [{ site_id: 'site_1' }]);
+      await emit('command.SetDisplayMessage', 'CS-1', {
+        request: { message: { id: 4 } },
         response: { status: 'Accepted' },
       });
-      expect(sqlCalls.length).toBe(0);
-    });
-
-    it('returns when reservation id cannot be derived', async () => {
-      await setup();
-      setupSqlResults();
-      await emit('command.ReserveNow', 'CS-1', {
-        request: {},
-        response: { status: 'Rejected' },
-      });
-      expect(sqlCalls.length).toBe(0);
-    });
-
-    it('cancels reservation as occupied and notifies driver', async () => {
-      await setup();
-      setupSqlResults(STA, [{ driver_id: 'drv_1' }]);
-      await emit('command.ReserveNow', 'CS-1', {
-        request: { id: 88 },
-        response: { status: 'Occupied' },
-      });
-      const upd = findSql(/UPDATE reservations\s+SET status = 'cancelled'/);
-      expect(upd).toBeDefined();
-      expect(upd?.values).toContain('station_rejected_occupied');
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
-        'reservation.Cancelled',
-        'drv_1',
-        expect.objectContaining({ reservationId: 88 }),
-        expect.anything(),
-        expect.anything(),
+      const upd = findSql(/UPDATE display_messages/);
+      expect(upd?.strings.join('?')).toContain("status = 'pending'");
+      expect(upd?.values).toEqual(expect.arrayContaining(['accepted', 'sta_0001', 4]));
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('displayMessage.updated'),
       );
     });
 
-    it('uses reservationId fallback and skips notify when no driver', async () => {
+    it('marks the pending row rejected on any other status', async () => {
       await setup();
-      setupSqlResults(STA, [{ driver_id: null }]);
-      await emit('command.ReserveNow', 'CS-1', {
-        request: { reservationId: 99 },
-        response: { status: 'Faulted' },
+      setupSqlResults(STA, []);
+      await emit('command.SetDisplayMessage', 'CS-1', {
+        request: { message: { id: 4 } },
+        response: { status: 'NotSupportedPriority' },
       });
-      const upd = findSql(/UPDATE reservations\s+SET status = 'cancelled'/);
-      expect(upd?.values).toContain('station_rejected_other');
-      expect(mockDispatchDriver).not.toHaveBeenCalled();
+      expect(findSql(/UPDATE display_messages/)?.values).toContain('rejected');
     });
 
-    it('swallows driver notification failure (fail-open)', async () => {
+    it('does not notify when no pending row matched', async () => {
       await setup();
-      mockDispatchDriver.mockRejectedValueOnce(new Error('smtp down'));
-      setupSqlResults(STA, [{ driver_id: 'drv_2' }]);
-      await emit('command.ReserveNow', 'CS-1', {
-        request: { id: 5 },
-        response: { status: 'Unavailable' },
+      setupSqlResults(STA, EMPTY);
+      await emit('command.SetDisplayMessage', 'CS-1', {
+        request: { message: { id: 9000 } },
+        response: { status: 'Accepted' },
       });
-      expect(mockLoggerWarn).toHaveBeenCalled();
+      expect(findSql(/UPDATE display_messages/)).toBeDefined();
+      expect(mockPubSub.publish).not.toHaveBeenCalledWith('csms_events', expect.anything());
     });
 
-    it('returns when station unresolvable but id present', async () => {
+    it('ignores a reply without a message id or status', async () => {
       await setup();
-      setupSqlResults([]); // resolveStationUuid null
-      await emit('command.ReserveNow', 'CS-1', {
-        request: { id: 5 },
-        response: { status: 'Rejected' },
+      setupSqlResults();
+      await emit('command.SetDisplayMessage', 'CS-1', { request: {}, response: {} });
+      expect(sqlCalls.length).toBe(0);
+    });
+
+    it('stops when the station is unknown', async () => {
+      await setup();
+      setupSqlResults([]);
+      await emit('command.SetDisplayMessage', 'CS-X', {
+        request: { message: { id: 4 } },
+        response: { status: 'Accepted' },
       });
-      expect(findSql(/UPDATE reservations/)).toBeUndefined();
+      expect(findSql(/UPDATE display_messages/)).toBeUndefined();
+    });
+  });
+
+  describe('command.ClearDisplayMessage', () => {
+    it('marks a pending or accepted row cleared on Accepted and notifies', async () => {
+      await setup();
+      setupSqlResults(STA, [], [{ site_id: 'site_1' }]);
+      await emit('command.ClearDisplayMessage', 'CS-1', {
+        request: { id: 4 },
+        response: { status: 'Accepted' },
+      });
+      const upd = findSql(/UPDATE display_messages/);
+      expect(upd?.strings.join('?')).toContain("SET status = 'cleared'");
+      expect(upd?.strings.join('?')).toContain("status IN ('pending', 'accepted')");
+      expect(upd?.values).toEqual(expect.arrayContaining(['sta_0001', 4]));
+      expect(mockPubSub.publish).toHaveBeenCalledWith(
+        'csms_events',
+        expect.stringContaining('displayMessage.updated'),
+      );
+    });
+
+    it.each(['Unknown', 'Rejected'])('keeps the row on %s', async (status) => {
+      await setup();
+      setupSqlResults();
+      await emit('command.ClearDisplayMessage', 'CS-1', {
+        request: { id: 4 },
+        response: { status },
+      });
+      expect(sqlCalls.length).toBe(0);
+    });
+
+    it('does not notify when the row is already cleared', async () => {
+      await setup();
+      setupSqlResults(STA, EMPTY);
+      await emit('command.ClearDisplayMessage', 'CS-1', {
+        request: { id: 4 },
+        response: { status: 'Accepted' },
+      });
+      expect(mockPubSub.publish).not.toHaveBeenCalledWith('csms_events', expect.anything());
+    });
+
+    it('stops when the station is unknown', async () => {
+      await setup();
+      setupSqlResults([]);
+      await emit('command.ClearDisplayMessage', 'CS-X', {
+        request: { id: 4 },
+        response: { status: 'Accepted' },
+      });
+      expect(findSql(/UPDATE display_messages/)).toBeUndefined();
     });
   });
 
@@ -1222,6 +1478,7 @@ describe('Event projections - coverage round 2', () => {
           requestedEnergyTransfer: 'AC',
           controlMode: 'ScheduledControl',
         },
+        transactionId: 'tx-1',
       });
       expect(findSql(/INSERT INTO ev_charging_needs/)).toBeDefined();
       expect(mockPubSub.publish).toHaveBeenCalledWith('csms_events', expect.any(String));
@@ -1232,7 +1489,11 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       mockComputeAndSendChargingProfile.mockRejectedValueOnce(new Error('boom'));
       setupSqlResults(STA, [], [{ site_id: null }]);
-      await emit('ocpp.NotifyEVChargingNeeds', 'CS-1', { evseId: 1, chargingNeeds: {} });
+      await emit('ocpp.NotifyEVChargingNeeds', 'CS-1', {
+        evseId: 1,
+        chargingNeeds: {},
+        transactionId: 'tx-1',
+      });
       expect(mockLoggerError).toHaveBeenCalledWith(
         expect.objectContaining({ err: expect.any(Error) }),
         'ISO 15118 profile computation failed',
@@ -1278,6 +1539,41 @@ describe('Event projections - coverage round 2', () => {
         /WHERE EXISTS \(SELECT 1 FROM charging_stations WHERE station_id = \?\)/,
       );
     });
+
+    function messageLogEvents(): Record<string, unknown>[] {
+      return (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls
+        .filter((c: unknown[]) => c[0] === 'csms_events')
+        .map((c: unknown[]) => JSON.parse(String(c[1])) as Record<string, unknown>)
+        .filter((e) => e.eventType === 'ocpp.message');
+    }
+
+    it('refreshes the message log, which lists the command as Queued', async () => {
+      await setup();
+      setupSqlResults([], [{ id: 'sta_q1' }], [{ site_id: 'site-q' }]);
+      await emit('command.Queued', 'CS-Q1', {
+        commandId: 'cmd-2',
+        stationId: 'CS-Q1',
+        action: 'ClearCache',
+        payload: {},
+        version: 'ocpp2.1',
+      });
+      expect(messageLogEvents()).toEqual([
+        expect.objectContaining({ stationId: 'sta_q1', siteId: 'site-q' }),
+      ]);
+    });
+
+    it('sends no refresh when nothing was queued (a deleted station, a repeat)', async () => {
+      await setup();
+      setupSqlResults(Object.assign([], { __zeroCount: true }));
+      await emit('command.Queued', 'CS-Q2', {
+        commandId: 'cmd-3',
+        stationId: 'CS-Q2',
+        action: 'ClearCache',
+        payload: {},
+        version: 'ocpp2.1',
+      });
+      expect(messageLogEvents()).toEqual([]);
+    });
   });
 
   // ---- ocpp.NotifyPeriodicEventStream ----
@@ -1313,7 +1609,6 @@ describe('Event projections - coverage round 2', () => {
         [], // SELECT evses -> none
         [{ id: 'evs_new' }], // INSERT evses RETURNING
         [{ id: 'con_new' }], // INSERT connectors RETURNING
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp1.6' }], // didAutoCreate GetBaseReport check (1.6, no publish)
       );
@@ -1339,12 +1634,11 @@ describe('Event projections - coverage round 2', () => {
         [], // SELECT evses
         [{ id: 'evs_new' }], // INSERT evses
         [{ id: 'con_new' }], // INSERT connectors RETURNING
-        [], // INSERT port_status_log
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // availability recompute (unchanged)
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp2.1' }], // GetBaseReport branch
-        [{ ocpp_protocol: 'ocpp2.1' }], // station_message_refresh branch
+        [{ ocpp_protocol: 'ocpp2.1' }], // station screen refresh branch
       );
       await emit('ocpp.StatusNotification', 'CS-1', {
         evseId: 3,
@@ -1386,8 +1680,10 @@ describe('Event projections - coverage round 2', () => {
         connectorId: 1,
         connectorStatus: 'Available',
       });
-      // No status change -> no port_status_log insert
-      expect(findSql(/INSERT INTO port_status_log/)).toBeUndefined();
+      // No status change -> no port_status_log row: the guarded write logs
+      // only a change, and no separate log statement runs.
+      expect(findSql(/^\s*INSERT INTO port_status_log/)).toBeUndefined();
+      expect(findSql(/prev\.status::text IS DISTINCT FROM/)).toBeDefined();
       expect(findSql(/UPDATE connectors c\s+SET status/)).toBeDefined();
     });
 
@@ -1398,7 +1694,6 @@ describe('Event projections - coverage round 2', () => {
         [{ id: 'evs_1' }], // SELECT evses
         [], // guarded UPDATE connectors -> no row (length 0)
         [{ id: 'con_2' }], // INSERT connectors RETURNING
-        [], // INSERT port_status_log (status changed: undefined -> faulted)
         [{ site_id: null }], // resolveSiteId
         [{ ocpp_protocol: 'ocpp1.6' }], // GetBaseReport check (1.6)
       );
@@ -1439,7 +1734,6 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ id: 'evs_1' }],
         [{ previous_status: 'charging', applied: true }], // guarded UPDATE connectors
-        [], // INSERT port_status_log (charging -> suspended_ev)
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -1464,7 +1758,6 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ id: 'evs_1' }],
         [{ previous_status: 'suspended_ev', applied: true }], // guarded UPDATE connectors
-        [], // INSERT port_status_log (suspended_ev -> charging)
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // UPDATE charging_stations (connector fault reconciliation)
         [{ site_id: null }], // resolveSiteId
@@ -1510,9 +1803,8 @@ describe('Event projections - coverage round 2', () => {
         STA,
         [{ id: 'evs_1' }],
         [{ previous_status: 'suspended_ev', applied: true }], // guarded UPDATE connectors
-        [], // INSERT port_status_log
         [{ site_id: null }], // resolveSiteId
-        // station_message_refresh: Charging is not in STATION_MESSAGE_RELEVANT? It is not.
+        // station screen refresh: Charging is not in STATION_MESSAGE_RELEVANT? It is not.
         [], // UPDATE charging_sessions resume
       );
       await emit('ocpp.StatusNotification', 'CS-1', {
@@ -1573,8 +1865,8 @@ describe('Event projections - coverage round 2', () => {
         STA, // 0 resolveStationUuid
         [{ id: 'ses_1' }], // 1 resolveMeterValueSession by transactionId
         [], // 2 INSERT meter_values (count 1, success)
-        [{ energy_delivered_wh: 100, meter_start: '50' }], // 3 prev energy/meter_start
-        [], // 4 UPDATE meter_start (no-op, already set)
+        [{ id: 'ses_mv', energy_delivered_wh: 100, meter_start: '50' }], // 3 prev energy/meter_start
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // SELECT register state FOR UPDATE
         [], // 5 UPDATE energy_delivered_wh
         // existingMeterStart='50', prevEnergyWh=100 -> newEnergyWh=1000-50=950, |950-100|>=1 -> energy increased branch
         [], // 6 UPDATE idle accrue (energy increased)
@@ -1655,8 +1947,8 @@ describe('Event projections - coverage round 2', () => {
         STA, // resolveStationUuid
         [{ id: 'ses_1' }], // resolveMeterValueSession
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
-        [], // UPDATE meter_start
+        [{ id: 'ses_mv', energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle accrue
       ];
@@ -1793,8 +2085,8 @@ describe('Event projections - coverage round 2', () => {
         STA, // resolveStationUuid
         [{ id: 'ses_1' }], // resolveMeterValueSession
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
-        [], // UPDATE meter_start
+        [{ id: 'ses_mv', energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle accrue
       ];
@@ -1963,8 +2255,8 @@ describe('Event projections - coverage round 2', () => {
         STA, // resolveStationUuid
         [{ id: 'ses_1' }], // resolveMeterValueSession
         [], // INSERT meter_values
-        [{ energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
-        [], // UPDATE meter_start
+        [{ id: 'ses_mv', energy_delivered_wh: 100, meter_start: '50' }], // prev energy/meter_start
+        [{ energy_delivered_wh: 100, meter_start: '50' }], // SELECT register state FOR UPDATE
         [], // UPDATE energy_delivered_wh
         [], // UPDATE idle accrue
       ];
@@ -2162,8 +2454,15 @@ describe('Event projections - coverage round 2', () => {
         STA, // 0
         [{ id: 'ses_1' }], // 1 session
         [], // 2 INSERT meter_values
-        [{ energy_delivered_wh: 100, meter_start: '50', last_rise_at: '2026-01-01T00:59:00Z' }], // 3 prev
-        [], // 4 UPDATE meter_start
+        [
+          {
+            id: 'ses_mv',
+            energy_delivered_wh: 100,
+            meter_start: '50',
+            last_rise_at: '2026-01-01T00:59:00Z',
+          },
+        ], // 3 prev
+        [{ energy_delivered_wh: 100, meter_start: '50', last_rise_at: '2026-01-01T00:59:00Z' }], // SELECT register state FOR UPDATE
         [], // 5 UPDATE energy
         // newEnergyWh = 150-50 = 100 == prevEnergyWh -> flat -> mark idle
         [], // 6 UPDATE idle_started_at
@@ -2277,8 +2576,8 @@ describe('Event projections - coverage round 2', () => {
   describe('ocpp.FirmwareStatusNotification', () => {
     it('clears the firmware state on Installed and upserts firmware (2.1 path), no campaign', async () => {
       await setup();
-      // firmware_state UPDATE, availability recompute (unchanged), firmware upsert
-      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
+      // firmware upsert, firmware_state UPDATE, availability recompute (unchanged)
+      setupSqlResults(STA, [{ campaign_id: null }], [], []);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', { status: 'Installed', requestId: 5 });
       expect(findSql(/SET firmware_state = /)?.values[0]).toBeNull();
       expect(findSql(/SET availability = /)).toBeDefined();
@@ -2289,7 +2588,7 @@ describe('Event projections - coverage round 2', () => {
 
     it('records a failed install on InstallationFailed', async () => {
       await setup();
-      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
+      setupSqlResults(STA, [{ campaign_id: null }], [], []);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
         status: 'InstallationFailed',
         requestId: 6,
@@ -2299,7 +2598,7 @@ describe('Event projections - coverage round 2', () => {
 
     it('records an install in progress on Installing', async () => {
       await setup();
-      setupSqlResults(STA, [], [], [{ campaign_id: null }]);
+      setupSqlResults(STA, [{ campaign_id: null }], [], []);
       await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
         status: 'Installing',
         requestId: 7,
@@ -2311,13 +2610,14 @@ describe('Event projections - coverage round 2', () => {
       'ends an install in progress on %s but keeps a failed install',
       async (status) => {
         await setup();
+        // Idle persists nothing; DownloadFailed upserts its row first.
         setupSqlResults(
           STA,
+          ...(status === 'Idle' ? [] : [[{ campaign_id: null }]]),
           [],
           [],
           [{ id: 'sta_1' }],
           [{ site_id: null }],
-          [{ campaign_id: null }],
         );
         await emit('ocpp.FirmwareStatusNotification', 'CS-1', { status, requestId: 11 });
         const clear = findSql(/SET firmware_state = NULL/);
@@ -2341,6 +2641,40 @@ describe('Event projections - coverage round 2', () => {
       expect(findSql(/SET availability/)).toBeUndefined();
     });
 
+    it('ignores a late report for a finished update (P5)', async () => {
+      await setup();
+      // The upsert's terminal guard matched nothing: the row already finished.
+      setupSqlResults(STA, []);
+      await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
+        status: 'Installing',
+        requestId: 13,
+      });
+      const upsert = findSql(/INSERT INTO firmware_updates .* ON CONFLICT/s);
+      expect(upsert?.strings.join(' ')).toMatch(/<> ALL/);
+      expect(findSql(/SET firmware_state/)).toBeUndefined();
+      expect(findSql(/firmware_campaign_stations/)).toBeUndefined();
+    });
+
+    it('persists nothing for Idle, which belongs to no update', async () => {
+      await setup();
+      setupSqlResults(STA, [], [], []);
+      await emit('ocpp.FirmwareStatusNotification', 'CS-1', { status: 'Idle' });
+      expect(findSql(/firmware_updates/)).toBeUndefined();
+    });
+
+    it('records the statusInfo and maps InstallRebooting to installing', async () => {
+      await setup();
+      setupSqlResults(STA, [{ campaign_id: 'fwc_3' }], [], EMPTY);
+      await emit('ocpp.FirmwareStatusNotification', 'CS-1', {
+        status: 'InstallRebooting',
+        requestId: 14,
+        statusInfo: { reasonCode: 'Reboot' },
+      });
+      const upsert = findSql(/INSERT INTO firmware_updates .* ON CONFLICT/s);
+      expect(JSON.stringify(upsert?.values)).toContain('Reboot');
+      expect(findSql(/UPDATE firmware_campaign_stations/)?.values).toContain('installing');
+    });
+
     it('1.6 path: updates most recent non-terminal firmware row', async () => {
       await setup();
       setupSqlResults(STA, [{ campaign_id: null }]); // UPDATE returns a row
@@ -2360,10 +2694,10 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA,
+        [{ campaign_id: 'fwc_1' }], // upsert firmware_updates RETURNING
         [], // UPDATE charging_stations firmware_state (Installed)
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // availability recompute (unchanged)
-        [{ campaign_id: 'fwc_1' }], // upsert firmware_updates RETURNING
         [], // UPDATE firmware_campaign_stations
         [{ id: 'fwc_1' }], // UPDATE firmware_campaigns RETURNING (completed)
       );
@@ -2371,7 +2705,7 @@ describe('Event projections - coverage round 2', () => {
       expect(findSql(/UPDATE firmware_campaign_stations/)).toBeDefined();
       expect(findSql(/UPDATE firmware_campaigns\s+SET status = 'completed'/)).toBeDefined();
       expect(mockWriteAudit).toHaveBeenCalledWith(
-        { table: { __table: 'firmware_campaign_audit_log' }, idColumn: 'campaign_id' },
+        expect.objectContaining({ idColumn: 'campaign_id' }),
         expect.objectContaining({ action: 'completed', actor: 'ocpp' }),
       );
       const publishes = (mockPubSub.publish as ReturnType<typeof vi.fn>).mock.calls.map(
@@ -2384,10 +2718,10 @@ describe('Event projections - coverage round 2', () => {
       await setup();
       setupSqlResults(
         STA,
+        [{ campaign_id: 'fwc_2' }], // upsert RETURNING
         [], // UPDATE firmware_state (DownloadFailed ends an install in progress)
         [], // SELECT charging_stations FOR UPDATE (availability lock)
         [], // availability recompute (unchanged)
-        [{ campaign_id: 'fwc_2' }], // upsert RETURNING
         [], // UPDATE firmware_campaign_stations
         EMPTY, // UPDATE firmware_campaigns -> count 0 (not all terminal)
       );
@@ -2489,89 +2823,6 @@ describe('Event projections - coverage round 2', () => {
     });
   });
 
-  // ---- ocpp.ReservationStatusUpdate ----
-
-  describe('ocpp.ReservationStatusUpdate', () => {
-    it('Expired: updates to expired and writes audit', async () => {
-      await setup();
-      setupSqlResults([{ id: 'rsv_1', driver_id: 'drv_1' }]);
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 5,
-        reservationUpdateStatus: 'Expired',
-      });
-      expect(findSql(/UPDATE reservations\s+SET status = 'expired'/)).toBeDefined();
-      expect(mockWriteReservationAudit).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'expired', reservationId: 'rsv_1' }),
-        undefined,
-        expect.anything(),
-      );
-    });
-
-    it('Expired: no audit when no row transitioned', async () => {
-      await setup();
-      setupSqlResults([]); // UPDATE returns nothing
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 5,
-        reservationUpdateStatus: 'Expired',
-      });
-      expect(mockWriteReservationAudit).not.toHaveBeenCalled();
-    });
-
-    it('Removed: cancels reservation, audits, and notifies driver', async () => {
-      await setup();
-      setupSqlResults(STA, [{ id: 'rsv_2', driver_id: 'drv_2' }]);
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 6,
-        reservationUpdateStatus: 'Removed',
-      });
-      expect(findSql(/UPDATE reservations\s+SET status = 'cancelled'/)).toBeDefined();
-      expect(mockWriteReservationAudit).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'cancelled', reservationId: 'rsv_2' }),
-        undefined,
-        expect.anything(),
-      );
-      expect(mockDispatchDriver).toHaveBeenCalledWith(
-        expect.anything(),
-        'reservation.Cancelled',
-        'drv_2',
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-      );
-    });
-
-    it('Removed: returns when station unresolvable', async () => {
-      await setup();
-      setupSqlResults([]); // resolveStationUuid null
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 6,
-        reservationUpdateStatus: 'Removed',
-      });
-      expect(findSql(/UPDATE reservations/)).toBeUndefined();
-    });
-
-    it('Removed: swallows notification failure', async () => {
-      await setup();
-      mockDispatchDriver.mockRejectedValueOnce(new Error('boom'));
-      setupSqlResults(STA, [{ id: 'rsv_3', driver_id: 'drv_3' }]);
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 7,
-        reservationUpdateStatus: 'Removed',
-      });
-      expect(mockLoggerWarn).toHaveBeenCalled();
-    });
-
-    it('ignores other update statuses', async () => {
-      await setup();
-      setupSqlResults();
-      await emit('ocpp.ReservationStatusUpdate', 'CS-1', {
-        reservationId: 8,
-        reservationUpdateStatus: 'NoTransaction',
-      });
-      expect(sqlCalls.length).toBe(0);
-    });
-  });
-
   // ---- ocpp.NotifySettlement ----
 
   describe('ocpp.NotifySettlement', () => {
@@ -2600,12 +2851,15 @@ describe('Event projections - coverage round 2', () => {
         transactionId: 'tx-1',
         settlementAmount: 12.5,
       });
-      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith({
-        sessionId: 'ses_1',
-        driverId: 'drv_1',
-        currency: 'USD',
-        capturedCents: 1250, // 12.50 -> cents
-      });
+      expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
+        {
+          sessionId: 'ses_1',
+          driverId: 'drv_1',
+          currency: 'USD',
+          capturedCents: 1250, // 12.50 -> cents
+        },
+        expect.objectContaining({ actor: { actor: 'ocpp', actorLabel: 'NotifySettlement' } }),
+      );
       expect(mockDispatchDriver).toHaveBeenCalledWith(
         expect.anything(),
         'session.PaymentReceived',
@@ -2648,6 +2902,7 @@ describe('Event projections - coverage round 2', () => {
       await emit('ocpp.NotifySettlement', 'CS-1', { transactionId: 'tx-2', settlementAmount: 3 });
       expect(mockRecordTerminalSettlement).toHaveBeenCalledWith(
         expect.objectContaining({ sessionId: 'ses_2', driverId: null, capturedCents: 300 }),
+        expect.objectContaining({ actor: { actor: 'ocpp', actorLabel: 'NotifySettlement' } }),
       );
       expect(mockDispatchDriver).not.toHaveBeenCalled();
     });
@@ -2712,7 +2967,7 @@ describe('Event projections - coverage round 2', () => {
       await emitEndedSecondOnly([sessionRow()]);
       expect(mockSettleSessionPayment).toHaveBeenCalledWith(
         'ses_1',
-        mockPaymentContext,
+        SETTLE_PAYMENT_CONTEXT,
         SETTLE_OPTIONS,
       );
       // Nothing to settle (the default outcome): no notification.

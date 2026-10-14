@@ -16,14 +16,16 @@ vi.mock('@evtivity/database', () => ({
 
 // Real drizzle-orm so `sql.identifier` and template interpolation produce
 // inspectable query objects that `renderSql` walks for assertions.
+import { sql } from 'drizzle-orm';
 import { pruneOldRows } from '../../lib/prune-old-rows.js';
 
 function makeLog(): Logger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
 }
 
-function rowCountResult(n: number): { rowCount: number } {
-  return { rowCount: n };
+// The postgres.js result list db.execute returns: rows plus `count`.
+function rowCountResult(n: number): unknown[] & { count: number } {
+  return Object.assign([], { count: n });
 }
 
 beforeEach(() => {
@@ -134,10 +136,12 @@ describe('pruneOldRows', () => {
     expect(mockExecute).toHaveBeenCalledTimes(1);
   });
 
-  it('treats a missing rowCount on the result as zero deletions and exits', async () => {
+  it('reads the deleted count from the postgres.js result list, not rowCount', async () => {
     const log = makeLog();
-    // db.execute resolves without a rowCount field -> deleted defaults to 0.
-    mockExecute.mockResolvedValueOnce({});
+    // A full batch reported through `count` keeps the loop going.
+    mockExecute
+      .mockResolvedValueOnce(Object.assign([], { count: 1000, rowCount: undefined }))
+      .mockResolvedValueOnce(Object.assign([], { count: 4 }));
 
     const result = await pruneOldRows({
       table: 'access_logs',
@@ -146,8 +150,8 @@ describe('pruneOldRows', () => {
       log,
     });
 
-    expect(result).toBe(0);
-    expect(mockExecute).toHaveBeenCalledTimes(1);
+    expect(result).toBe(1004);
+    expect(mockExecute).toHaveBeenCalledTimes(2);
   });
 
   it('targets the supplied table and cutoff column in the batched CTE/DELETE', async () => {
@@ -172,6 +176,36 @@ describe('pruneOldRows', () => {
     // retentionDays (30) and batchSize (1000) are interpolated into the query.
     expect(rendered.numbers).toContain(30);
     expect(rendered.numbers).toContain(1000);
+  });
+
+  it('limits the batch to the rows the filter matches', async () => {
+    const log = makeLog();
+    mockExecute.mockResolvedValueOnce(rowCountResult(0));
+
+    await pruneOldRows({
+      table: 'user_audit_log',
+      cutoffColumn: 'created_at',
+      retentionDays: 90,
+      filter: sql`action::text IN ('login_succeeded', 'login_failed')`,
+      log,
+    });
+
+    const rendered = renderSql(mockExecute.mock.calls[0]![0]);
+    expect(rendered.sql).toMatch(
+      /"created_at" < NOW\(\) - .* AND action::text IN \('login_succeeded', 'login_failed'\)\s+LIMIT/s,
+    );
+  });
+
+  it('adds no condition without a filter', async () => {
+    const log = makeLog();
+    mockExecute.mockResolvedValueOnce(rowCountResult(0));
+    await pruneOldRows({
+      table: 'access_logs',
+      cutoffColumn: 'created_at',
+      retentionDays: 30,
+      log,
+    });
+    expect(renderSql(mockExecute.mock.calls[0]![0]).sql).not.toContain(' AND ');
   });
 
   it('swallows a thrown db error, logs a warn, and resolves with the running total', async () => {

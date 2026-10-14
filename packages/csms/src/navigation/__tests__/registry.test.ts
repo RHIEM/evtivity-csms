@@ -23,6 +23,7 @@ const ALL_ON = {
   reservationEnabled: true,
   supportEnabled: true,
   fleetEnabled: true,
+  aiInsightsEnabled: true,
 };
 
 describe('NAV_ENTRIES', () => {
@@ -55,13 +56,57 @@ describe('visibleNavEntries', () => {
       },
     ];
     expect(
-      visibleNavEntries(['users:write', 'logs:read'], ALL_ON, entries).map((e) => e.to),
+      visibleNavEntries(['users:write', 'logs:read'], ALL_ON, true, entries).map((e) => e.to),
     ).toEqual(['/a', '/b', '/c']);
     expect(
-      visibleNavEntries(['users:read'], { ...ALL_ON, fleetEnabled: false }, entries).map(
+      visibleNavEntries(['users:read'], { ...ALL_ON, fleetEnabled: false }, true, entries).map(
         (e) => e.to,
       ),
     ).toEqual(['/a']);
-    expect(visibleNavEntries([], ALL_ON, entries)).toEqual([]);
+    expect(visibleNavEntries([], ALL_ON, true, entries)).toEqual([]);
+  });
+
+  it('hides company-wide entries from a site-restricted user', () => {
+    const entries: NavEntry[] = [
+      {
+        to: '/logs',
+        labelKey: 'nav.logs',
+        icon: Bell,
+        order: 1,
+        requiredPermission: 'logs:read',
+        requiresAllSiteAccess: true,
+      },
+      {
+        to: '/audit',
+        labelKey: 'nav.audit',
+        icon: Bell,
+        order: 2,
+        requiredPermission: 'audit:read',
+      },
+    ];
+    const perms = ['logs:read', 'audit:read'];
+    expect(visibleNavEntries(perms, ALL_ON, true, entries).map((e) => e.to)).toEqual([
+      '/logs',
+      '/audit',
+    ]);
+    expect(visibleNavEntries(perms, ALL_ON, false, entries).map((e) => e.to)).toEqual(['/audit']);
+  });
+
+  it('marks the logs entry as company-wide', () => {
+    expect(NAV_ENTRIES.find((e) => e.to === '/logs')?.requiresAllSiteAccess).toBe(true);
+  });
+});
+
+describe('AI Insights entry', () => {
+  it('shows only while AI Insights are on, and no AI Inbox entry remains', () => {
+    const on = visibleNavEntries(['aiInsights:read'], ALL_ON, true).map((e) => e.to);
+    expect(on).toContain('/ai/insights');
+    expect(NAV_ENTRIES.map((e) => e.to)).not.toContain('/ai/inbox');
+    const off = visibleNavEntries(
+      ['aiInsights:read'],
+      { ...ALL_ON, aiInsightsEnabled: false },
+      true,
+    );
+    expect(off.map((e) => e.to)).not.toContain('/ai/insights');
   });
 });

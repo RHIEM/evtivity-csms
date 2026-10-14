@@ -9,6 +9,7 @@ import {
   createPermissionCatalog,
   permissionCatalog,
   PermissionCatalog,
+  AI_MCP_USE_PERMISSION,
 } from '../permissions.js';
 
 describe('hasPermission', () => {
@@ -92,9 +93,9 @@ describe('hasAnySettingsPermission', () => {
 describe('built-in permission catalog', () => {
   const all = permissionCatalog.all();
 
-  it('holds 33 resources with read and write each', () => {
-    expect(permissionCatalog.groups()).toHaveLength(33);
-    expect(all).toHaveLength(66);
+  it('holds 37 resources with read and write each', () => {
+    expect(permissionCatalog.groups()).toHaveLength(37);
+    expect(all).toHaveLength(74);
     expect(new Set(all).size).toBe(all.length);
   });
 
@@ -131,7 +132,9 @@ describe('built-in permission catalog', () => {
 
   it('gives operator operational access without settings or users:write', () => {
     const operator = permissionCatalog.defaultsFor('operator');
-    expect(operator).toHaveLength(38);
+    expect(operator).toHaveLength(45);
+    expect(operator).toContain('aiAssistant:read');
+    expect(operator).toContain('aiAssistant:write');
     expect(operator).not.toContain('users:write');
     expect(operator.some((p) => p.startsWith('settings.'))).toBe(false);
     expect(operator).toContain('notifications:read');
@@ -141,13 +144,17 @@ describe('built-in permission catalog', () => {
     for (const p of operator) expect(permissionCatalog.isKnown(p)).toBe(true);
   });
 
-  it('gives viewer read-only access to every page', () => {
+  it('gives viewer read-only access to every page but AI usage and MCP', () => {
     const viewer = permissionCatalog.defaultsFor('viewer');
     const pageReads = permissionCatalog
       .groups()
       .filter((g) => g.kind === 'page')
-      .map((g) => g.permissions[0]);
+      .map((g) => g.permissions[0])
+      .filter((p) => p !== 'aiUsage:read' && p !== 'aiMcp:read');
     expect([...viewer].sort()).toEqual([...pageReads].sort());
+    // A viewer can read AI conversations but not chat (aiAssistant:write).
+    expect(viewer).toContain('aiAssistant:read');
+    expect(viewer).not.toContain('aiAssistant:write');
   });
 
   it('gives any other role the operator defaults', () => {
@@ -164,8 +171,8 @@ describe('built-in permission catalog', () => {
     permissionCatalog.defaultsFor('operator').push('x:read');
     const [first] = permissionCatalog.groups();
     if (first != null) first.resource = 'changed';
-    expect(permissionCatalog.all()).toHaveLength(66);
-    expect(permissionCatalog.defaultsFor('operator')).toHaveLength(38);
+    expect(permissionCatalog.all()).toHaveLength(74);
+    expect(permissionCatalog.defaultsFor('operator')).toHaveLength(45);
     expect(permissionCatalog.groups()[0]?.resource).toBe('dashboard');
   });
 });
@@ -217,5 +224,38 @@ describe('PermissionCatalog.register', () => {
         catalog.register({ resource, kind: 'page', labelKey: 'x' });
       }).toThrow('Invalid permission resource');
     }
+  });
+});
+
+describe('AI roadmap permissions (TC-AI-C-12)', () => {
+  it('registers the insight group: operators read and write, viewers read', () => {
+    expect(permissionCatalog.isKnown('aiInsights:read')).toBe(true);
+    expect(permissionCatalog.isKnown('aiInsights:write')).toBe(true);
+    const operator = permissionCatalog.defaultsFor('operator');
+    expect(operator).toContain('aiInsights:read');
+    expect(operator).toContain('aiInsights:write');
+    const viewer = permissionCatalog.defaultsFor('viewer');
+    expect(viewer).toContain('aiInsights:read');
+    expect(viewer).not.toContain('aiInsights:write');
+  });
+
+  it('TC-AI-IA-06 registers the usage and MCP groups, and no AI Inbox proposal permission', () => {
+    expect(permissionCatalog.isKnown('aiProposals:read')).toBe(false);
+    expect(permissionCatalog.isKnown('aiProposals:write')).toBe(false);
+    for (const p of ['aiUsage:read', 'aiMcp:read', 'aiMcp:write']) {
+      expect(permissionCatalog.isKnown(p)).toBe(true);
+    }
+    expect(AI_MCP_USE_PERMISSION).toBe('aiMcp:read');
+  });
+
+  it('gives operators every AI permission but aiUsage:write, viewers no usage or MCP', () => {
+    const operator = permissionCatalog.defaultsFor('operator');
+    expect(operator.filter((p) => /^ai(Usage|Mcp):/.test(p)).sort()).toEqual([
+      'aiMcp:read',
+      'aiMcp:write',
+      'aiUsage:read',
+    ]);
+    const viewer = permissionCatalog.defaultsFor('viewer');
+    expect(viewer.filter((p) => /^ai(Usage|Mcp):/.test(p))).toEqual([]);
   });
 });

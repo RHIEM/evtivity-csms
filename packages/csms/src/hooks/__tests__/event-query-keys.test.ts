@@ -16,6 +16,22 @@ function makeEvent(eventType: string, extra: Partial<CsmsEvent> = {}): CsmsEvent
   };
 }
 
+describe('AI roadmap events (v0.1.44)', () => {
+  it('TC-AI-WK-UI-01: the AI Inbox event is gone; an action change refreshes the insights', () => {
+    expect(getQueryKeysForEvent(makeEvent('ai.proposal.updated', { siteId: 's1' }))).toEqual([]);
+    expect(IMMEDIATE_EVENT_TYPES.has('ai.proposal.updated')).toBe(false);
+  });
+
+  it('ai.insight.updated refreshes every insight view now (translations included)', () => {
+    expect(getQueryKeysForEvent(makeEvent('ai.insight.updated'))).toEqual([['ai', 'insights']]);
+    expect(IMMEDIATE_EVENT_TYPES.has('ai.insight.updated')).toBe(true);
+  });
+
+  it('ai.usage.threshold refreshes the usage views', () => {
+    expect(getQueryKeysForEvent(makeEvent('ai.usage.threshold'))).toEqual([['ai', 'usage']]);
+  });
+});
+
 function hasKey(keys: string[][], key: string[]): boolean {
   return keys.some((k) => k.length === key.length && k.every((p, i) => p === key[i]));
 }
@@ -67,11 +83,13 @@ describe('getQueryKeysForEvent', () => {
     });
   });
 
-  it('invalidates support-cases list, detail (via prefix), and unread count on supportCase.newMessage', () => {
-    const keys = getQueryKeysForEvent(makeEvent('supportCase.newMessage', { caseId: 'case-1' }));
-    // ['support-cases'] is a prefix of the detail key ['support-cases', id].
-    expect(hasKey(keys, ['support-cases'])).toBe(true);
-    expect(hasKey(keys, ['support-cases-unread-count'])).toBe(true);
+  it('invalidates support-cases list, detail and nav count (via prefix) on supportCase events', () => {
+    for (const type of ['supportCase.created', 'supportCase.updated', 'supportCase.newMessage']) {
+      const keys = getQueryKeysForEvent(makeEvent(type, { caseId: 'case-1' }));
+      // ['support-cases'] is a prefix of the detail key ['support-cases', id] and
+      // of the nav count key ['support-cases', 'unassigned-count'].
+      expect(hasKey(keys, ['support-cases'])).toBe(true);
+    }
   });
 
   it('treats support-case events as immediate (bypass the invalidation throttle)', () => {
@@ -100,6 +118,17 @@ describe('getQueryKeysForEvent', () => {
       expect(hasKey(keys, ['sites', 'S-1', 'layout'])).toBe(true);
       expect(keys.some((k) => k[0] === 'stations' && k.length > 1)).toBe(false);
     });
+  });
+
+  it('station.evChargingNeeds refreshes the station charging needs and EV schedules', () => {
+    const keys = getQueryKeysForEvent(makeEvent('station.evChargingNeeds', { stationId: 'CS-1' }));
+    expect(hasKey(keys, ['stations', 'CS-1', 'ev-charging-needs'])).toBe(true);
+    expect(hasKey(keys, ['stations', 'CS-1', 'ev-charging-schedules'])).toBe(true);
+  });
+
+  it('session.ended refreshes the charging needs, which end with the transaction', () => {
+    const keys = getQueryKeysForEvent(makeEvent('session.ended', { stationId: 'CS-1' }));
+    expect(hasKey(keys, ['stations', 'CS-1', 'ev-charging-needs'])).toBe(true);
   });
 
   describe.each(['session.started', 'session.ended'])('%s', (type) => {
@@ -167,6 +196,20 @@ describe('getQueryKeysForEvent', () => {
       ['stations', 'CS-1', 'ocpp-logs'],
     ]);
     expect(getQueryKeysForEvent(makeEvent('ocpp.message'))).toEqual([]);
+  });
+
+  it('displayMessage.updated refreshes the station display messages', () => {
+    expect(
+      getQueryKeysForEvent(makeEvent('displayMessage.updated', { stationId: 'sta-1' })),
+    ).toEqual([['display-messages', 'sta-1']]);
+    expect(getQueryKeysForEvent(makeEvent('displayMessage.updated'))).toEqual([]);
+  });
+
+  it('station.chargingProfiles refreshes the station charging profiles', () => {
+    expect(
+      getQueryKeysForEvent(makeEvent('station.chargingProfiles', { stationId: 'sta-1' })),
+    ).toEqual([['stations', 'sta-1', 'charging-profiles']]);
+    expect(getQueryKeysForEvent(makeEvent('station.chargingProfiles'))).toEqual([]);
   });
 
   it('station.securityEvent refreshes security logs and the station detail', () => {

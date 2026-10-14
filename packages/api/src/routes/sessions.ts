@@ -21,7 +21,9 @@ import {
   guestSessions,
   sessionStatusEnum,
   SESSION_REBILL_STATUSES,
+  getCompanyCurrency,
 } from '@evtivity/database';
+import { sessionCostMissing } from '@evtivity/services/electricity-cost.service';
 import { PaymentProviderUnavailableError } from '@evtivity/payments';
 import { zodSchema } from '../lib/zod-schema.js';
 import { sessionCurrencySql } from '@evtivity/services/company-currency';
@@ -31,6 +33,7 @@ import type { PaginatedResponse } from '../lib/pagination.js';
 import { paginatedResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds } from '../lib/site-access.js';
+import { siteInScope } from '../lib/site-scope.js';
 import { pendingOperationSchema, providerRefundsSchema } from '../lib/payment-provider-schemas.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { authorize } from '../middleware/rbac.js';
@@ -230,6 +233,12 @@ const sessionDetail = z
       .string()
       .nullable()
       .describe('Name of the fleet an account session is billed to, null otherwise'),
+    memberBilled: z
+      .boolean()
+      .optional()
+      .describe(
+        "An account session of a fleet that invoices each driver: billed on the driver's own member invoice, not the fleet invoice. Decided once at its start",
+      ),
     invoiceId: z
       .string()
       .nullable()
@@ -246,6 +255,26 @@ const sessionDetail = z
       .nullable()
       .describe(
         'When the running re-bill claimed the session (rebillStatus in_progress); a claim older than 5 minutes belongs to a request that died and may be taken over',
+      ),
+    stationTariffId: z
+      .string()
+      .nullable()
+      .describe(
+        'OCPP 2.1 local cost calculation: the tariffId the station last reported for the transaction (transactionInfo.tariffId), null when it reported none',
+      ),
+    stationCostCents: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'The cost the station last calculated (costDetails.totalCost.total, including tax when the station sent it), in cents. The session is billed at its own cost; null when the station sent no cost details',
+      ),
+    stationCostDifferenceCents: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        "The station's final cost minus the billed final cost, in cents, set when the session ended with station cost details",
       ),
     rebillable: z
       .boolean()
@@ -406,6 +435,12 @@ const sessionListQuery = paginationQuery.extend({
     .describe(
       'Filter by session status, "idling" for active and idle, or "manual_billing" for re-billed sessions left to manual billing',
     ),
+  costMissing: z
+    .enum(['true', 'false'])
+    .optional()
+    .describe(
+      'true: only billed sessions in the company currency that delivered energy and have no electricity cost (left out of profit). POST /v1/sites/{id}/electricity-cost/recalculate fills them from the site rates',
+    ),
 });
 
 const rebillResponse = z
@@ -483,9 +518,8 @@ export function sessionRoutes(app: FastifyInstance): void {
       },
     },
     async (request) => {
-      const { page, limit, search, siteId, stationId, status } = request.query as z.infer<
-        typeof sessionListQuery
-      >;
+      const { page, limit, search, siteId, stationId, status, costMissing } =
+        request.query as z.infer<typeof sessionListQuery>;
       const offset = (page - 1) * limit;
 
       const { userId } = request.user as JwtPayload;
@@ -525,6 +559,9 @@ export function sessionRoutes(app: FastifyInstance): void {
         } else {
           conditions.push(eq(chargingSessions.status, status));
         }
+      }
+      if (costMissing === 'true') {
+        conditions.push(sessionCostMissing(await getCompanyCurrency()));
       }
 
       const where = conditions.length > 0 ? and(...conditions) : undefined;
@@ -632,11 +669,15 @@ export function sessionRoutes(app: FastifyInstance): void {
           billingFleetName: sql<
             string | null
           >`(SELECT f.name FROM fleets f WHERE f.id = ${chargingSessions.billingFleetId})`,
+          memberBilled: chargingSessions.memberBilled,
           invoiceId: chargingSessions.invoiceId,
           invoiceStatus: sql<
             string | null
           >`(SELECT i.status::text FROM invoices i WHERE i.id = ${chargingSessions.invoiceId})`,
           rebillClaimedAt: chargingSessions.rebillClaimedAt,
+          stationTariffId: chargingSessions.stationTariffId,
+          stationCostCents: chargingSessions.stationCostCents,
+          stationCostDifferenceCents: chargingSessions.stationCostDifferenceCents,
           tokenId: driverTokens.id,
           tokenIdToken: driverTokens.idToken,
           tokenType: driverTokens.tokenType,
@@ -681,7 +722,7 @@ export function sessionRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && row.siteId != null && !siteIds.includes(row.siteId)) {
+      if (!siteInScope(siteIds, row.siteId)) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }
@@ -801,7 +842,7 @@ export function sessionRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as JwtPayload;
       const txSiteIds = await getUserSiteIds(userId);
-      if (txSiteIds != null && session.siteId != null && !txSiteIds.includes(session.siteId)) {
+      if (!siteInScope(txSiteIds, session.siteId)) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }
@@ -869,7 +910,7 @@ export function sessionRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as JwtPayload;
       const mvSiteIds = await getUserSiteIds(userId);
-      if (mvSiteIds != null && session.siteId != null && !mvSiteIds.includes(session.siteId)) {
+      if (!siteInScope(mvSiteIds, session.siteId)) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }

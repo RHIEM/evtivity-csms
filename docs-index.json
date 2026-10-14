@@ -52,7 +52,22 @@
   {
     "path": "/docs/csms/ai-assistant",
     "title": "AI Assistant",
-    "description": "Query your charging network data using natural language with the built-in AI assistant."
+    "description": "Ask questions about your charging network, review proposed changes, and draft support replies with the built-in AI assistant."
+  },
+  {
+    "path": "/docs/csms/ai-insights",
+    "title": "Automatic Insights",
+    "description": "Short root-cause notes with suggested fixes for offline or faulted stations, failed sessions, refused authorizations, and reservation problems, and background worker suggestions with an action you confirm."
+  },
+  {
+    "path": "/docs/csms/ai-usage",
+    "title": "AI Usage and Budgets",
+    "description": "See how many AI tokens your company, sites, and users use, and set daily and monthly token budgets."
+  },
+  {
+    "path": "/docs/csms/ai-workers",
+    "title": "Background AI Workers",
+    "description": "Optional scheduled jobs that summarize your network, find stuck sessions, and check tariffs. Their suggestions are insights with an action that runs only when you confirm it."
   },
   {
     "path": "/docs/csms/certificates",
@@ -232,7 +247,7 @@
   {
     "path": "/docs/getting-started/introduction",
     "title": "Introduction",
-    "description": "What EVtivity CSMS is, what it does, and how it is built."
+    "description": "What EVtivity CSMS is, the AI-powered EV charging platform, what it does, and how it is built."
   },
   {
     "path": "/docs/getting-started/project-structure",
@@ -335,6 +350,11 @@
     "description": "Load management, smart charging profiles, and carbon footprint tracking."
   },
   {
+    "path": "/docs/integrations/mcp-server",
+    "title": "MCP Server",
+    "description": "Connect AI agents to EVtivity over the Model Context Protocol with an API key. Every call runs under the key's permissions and sites. Writes run only when you allow them."
+  },
+  {
     "path": "/docs/integrations/payment-providers",
     "title": "Payment Providers",
     "description": "Overview of the payment providers. Stripe, Adyen, and the test provider, how the active provider is chosen, provider pinning, the payment lifecycle, webhooks, statuses, and reconciliation."
@@ -412,7 +432,7 @@
   {
     "path": "/docs/mobile-app/guide/payments",
     "title": "Payments",
-    "description": "Add a card with Stripe, Adyen, or the test provider, confirm it with your bank, set a default, and manage your saved payment methods."
+    "description": "Add a card with Stripe, Adyen, or the test provider, confirm it with your bank, set a default, manage your saved payment methods, and view your invoices."
   },
   {
     "path": "/docs/mobile-app/guide/reservations",
@@ -498,6 +518,11 @@
     "path": "/docs/portal/guest-charging",
     "title": "Guest Charging",
     "description": "Charge without an account using a QR code, pay with a credit card through the operator's payment provider, and track your session."
+  },
+  {
+    "path": "/docs/portal/invoices",
+    "title": "Invoices",
+    "description": "View your invoices and credit notes, including the monthly invoices your fleet addresses to you, and download each as a PDF."
   },
   {
     "path": "/docs/portal/location-detail",

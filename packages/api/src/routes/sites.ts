@@ -11,13 +11,21 @@ import {
   configTemplateAuditLog,
   clearFreeVendCache,
   clearElectricityRateCache,
+  clearAiUsageCache,
   getCompanyCurrency,
   pgErrorCode,
   PG_FOREIGN_KEY_VIOLATION,
+  toDate,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { changedFields } from '../lib/audit-diff.js';
 import { inCompanyCurrency, sessionCurrencySql } from '@evtivity/services/company-currency';
-import { queryRevenue, queryRevenueTotal, revenueItem } from '@evtivity/services/session-revenue';
+import {
+  profitCents,
+  queryRevenue,
+  queryRevenueTotal,
+  revenueItem,
+} from '@evtivity/services/session-revenue';
 import { siteNameEq } from '../lib/site-lookup.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
@@ -70,7 +78,7 @@ import {
   exportSitesTemplateCsv,
   importSitesCsv,
 } from '../services/site-import.service.js';
-import { getUserSiteIds } from '../lib/site-access.js';
+import { getUserSiteIds, requireAllSiteAccess } from '../lib/site-access.js';
 import { dateRangeQuery, parseDateRange } from '../lib/date-range.js';
 import { enumerateLocalDays, zeroFillDays } from '../lib/daily-series.js';
 import { buildUnderMaintenanceSubquery } from '../lib/station-maintenance-flag.js';
@@ -78,6 +86,8 @@ import { pushTemplateToSiteStations } from '../lib/config-push.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { authorize } from '../middleware/rbac.js';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
+import { recalculateSiteElectricityCost } from '@evtivity/services/electricity-cost.service';
+import { siteInScope } from '../lib/site-scope.js';
 
 const importSiteRow = z.object({
   siteName: z.string().min(1).max(255),
@@ -236,7 +246,24 @@ const updateSiteBody = z.object({
     .describe(
       'Display language of the station screens at this site. Null follows the stationMessage.language setting',
     ),
+  aiInsightsEnabled: z
+    .boolean()
+    .optional()
+    .describe('Whether automatic insights run for this site. Users with access to every site only'),
+  aiMonthlyTokenBudget: z
+    .number()
+    .int()
+    .min(0)
+    .max(1_000_000_000_000)
+    .nullable()
+    .optional()
+    .describe(
+      'Monthly AI token budget of this site. Null follows the ai.budget.siteMonthlyTokens setting, 0 means no limit. Users with access to every site only',
+    ),
 });
+
+/** Site fields only a user with access to every site may change (a restricted user gets 404). */
+const ALL_SITE_FIELDS = ['aiInsightsEnabled', 'aiMonthlyTokenBudget'] as const;
 
 const siteSelect = {
   id: sites.id,
@@ -264,6 +291,8 @@ const siteSelect = {
   freeVendTemplateId21: sites.freeVendTemplateId21,
   freeVendTemplateId16: sites.freeVendTemplateId16,
   stationMessageLanguage: sites.stationMessageLanguage,
+  aiInsightsEnabled: sites.aiInsightsEnabled,
+  aiMonthlyTokenBudget: sites.aiMonthlyTokenBudget,
   underMaintenance: sql<boolean>`EXISTS (
     SELECT 1
     FROM maintenance_events me
@@ -324,6 +353,13 @@ const siteItem = z
       .describe(
         'Display language of the station screens at this site (en, de, es, ko, zh, zh-TW). Null follows the stationMessage.language setting',
       ),
+    aiInsightsEnabled: z.boolean().describe('Whether automatic insights run for this site'),
+    aiMonthlyTokenBudget: z
+      .number()
+      .nullable()
+      .describe(
+        'Monthly AI token budget of this site. Null follows the ai.budget.siteMonthlyTokens setting, 0 means no limit',
+      ),
   })
   .passthrough();
 
@@ -349,6 +385,13 @@ const siteBase = z
       .nullable()
       .describe(
         'Display language of the station screens at this site (en, de, es, ko, zh, zh-TW). Null follows the stationMessage.language setting',
+      ),
+    aiInsightsEnabled: z.boolean().describe('Whether automatic insights run for this site'),
+    aiMonthlyTokenBudget: z
+      .number()
+      .nullable()
+      .describe(
+        'Monthly AI token budget of this site. Null follows the ai.budget.siteMonthlyTokens setting, 0 means no limit',
       ),
     createdAt: z.coerce.date().describe('Timestamp when the site was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the site was last updated'),
@@ -429,8 +472,20 @@ const siteMetricsResponse = z
       .number()
       .int()
       .describe(
-        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative',
+        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative. Sessions without an electricity cost (costMissingSessionCount) are left out.',
       ),
+    costMissingSessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Ended billed sessions in the period that delivered energy but have no electricity cost (no matching site rate period, or no site). Left out of profit.',
+      ),
+    costMissingRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Revenue of those sessions in cents, tax included. Left out of profit.'),
     periodMonths: z.number().describe('Number of months covered by this metrics report'),
     currency: z
       .string()
@@ -855,7 +910,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -886,11 +941,21 @@ export function siteRoutes(app: FastifyInstance): void {
         body: zodSchema(createSiteBody),
         response: {
           201: itemResponse(siteBase),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
           409: errorResponse,
         },
       },
     },
     async (request, reply) => {
+      // Creating a site is company-wide: a site-restricted user gets 404.
+      if (
+        !(await requireAllSiteAccess(request, reply, {
+          error: 'Site not found',
+          code: 'SITE_NOT_FOUND',
+        }))
+      ) {
+        return;
+      }
       const body = parseZodRequest(createSiteBody, request.body);
 
       // Pre-check the unique name constraint (case-insensitive) so duplicate
@@ -949,11 +1014,16 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
       const body = parseZodRequest(updateSiteBody, request.body);
+      // A restricted operator cannot change company-wide AI controls of its own site.
+      if (ALL_SITE_FIELDS.some((field) => body[field] !== undefined) && siteIds !== null) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
       const [before] = await db.select().from(sites).where(eq(sites.id, id));
 
       // If the name is actually changing, pre-check the unique constraint
@@ -1003,6 +1073,7 @@ export function siteRoutes(app: FastifyInstance): void {
       ) {
         await requestStationMessageRepush(request.log, { siteId: site.id });
       }
+      if (body.aiMonthlyTokenBudget !== undefined) clearAiUsageCache();
       return site;
     },
   );
@@ -1028,7 +1099,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1100,7 +1171,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1273,7 +1344,9 @@ export function siteRoutes(app: FastifyInstance): void {
         totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
         totalNetRevenueCents: revenue.netCents,
         totalTaxCents: revenue.taxCents,
-        totalProfitCents: revenue.netCents - (financialStats?.totalElectricityCostCents ?? 0),
+        totalProfitCents: profitCents(revenue, financialStats?.totalElectricityCostCents ?? 0),
+        costMissingSessionCount: revenue.costMissingCount,
+        costMissingRevenueCents: revenue.costMissingGrossCents,
         periodMonths: months,
         currency,
       };
@@ -1306,7 +1379,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1384,7 +1457,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1440,7 +1513,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1522,7 +1595,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1592,7 +1665,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1606,7 +1679,8 @@ export function siteRoutes(app: FastifyInstance): void {
       if (measurand != null) {
         const bucketRows = await db
           .select({
-            timestamp: sql<Date>`date_trunc('minute', ${meterValues.timestamp})`,
+            // A sql field has no column mapper: postgres text, mapped below.
+            timestamp: sql<Date | string>`date_trunc('minute', ${meterValues.timestamp})`,
             value: sql<string>`sum(${meterValues.value}::numeric)::text`,
             unit: sql<string | null>`max(${meterValues.unit})`,
           })
@@ -1625,7 +1699,7 @@ export function siteRoutes(app: FastifyInstance): void {
           {
             measurand,
             unit: bucketRows[0]?.unit ?? null,
-            values: bucketRows.map((r) => ({ timestamp: r.timestamp, value: r.value })),
+            values: bucketRows.map((r) => ({ timestamp: toDate(r.timestamp), value: r.value })),
           },
         ];
       }
@@ -1693,7 +1767,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1773,7 +1847,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1950,7 +2024,10 @@ export function siteRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
+          404: errorWith('Site or station not found', [
+            ERROR_CODES.SITE_NOT_FOUND,
+            ERROR_CODES.STATION_NOT_FOUND,
+          ]),
         },
       },
     },
@@ -1958,7 +2035,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1968,6 +2045,35 @@ export function siteRoutes(app: FastifyInstance): void {
       if (site == null) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
+      }
+
+      // Every position must name a station of this site. The upsert keys on
+      // the station, so a foreign station would otherwise get a layout row
+      // pointing at this site.
+      const requested = [...new Set(positions.map((p) => p.stationId))];
+      let previousPositions: { stationId: string; positionX: number; positionY: number }[] = [];
+      if (requested.length > 0) {
+        const own = await db
+          .select({ id: chargingStations.id })
+          .from(chargingStations)
+          .where(and(inArray(chargingStations.id, requested), eq(chargingStations.siteId, id)));
+        if (own.length !== requested.length) {
+          await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          return;
+        }
+        const previousRows = await db
+          .select({
+            stationId: stationLayoutPositions.stationId,
+            positionX: stationLayoutPositions.positionX,
+            positionY: stationLayoutPositions.positionY,
+          })
+          .from(stationLayoutPositions)
+          .where(inArray(stationLayoutPositions.stationId, requested));
+        previousPositions = previousRows.map((row) => ({
+          stationId: row.stationId,
+          positionX: Number(row.positionX),
+          positionY: Number(row.positionY),
+        }));
       }
 
       for (const pos of positions) {
@@ -1987,6 +2093,23 @@ export function siteRoutes(app: FastifyInstance): void {
               updatedAt: new Date(),
             },
           });
+      }
+
+      if (positions.length > 0) {
+        await writeAudit(
+          { table: siteAuditLog, idColumn: 'site_id' },
+          {
+            entityId: id,
+            entityIdSnapshot: id,
+            action: 'updated',
+            ...getAuditActor(request),
+            before: { layoutPositions: previousPositions },
+            after: { layoutPositions: positions },
+            notes: 'station layout updated',
+          },
+          db,
+          request.log,
+        );
       }
 
       return { ok: true };
@@ -2015,7 +2138,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2059,7 +2182,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2152,7 +2275,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id, pricingGroupId } = request.params as z.infer<typeof sitePricingGroupParams>;
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2235,7 +2358,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { userId } = request.user as JwtPayload;
 
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(id)) {
+      if (!siteInScope(siteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2429,7 +2552,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2481,7 +2604,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { regionCode } = request.body as z.infer<typeof carbonRegionBody>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2578,7 +2701,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof siteParams>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2622,7 +2745,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof electricityRateBody>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -2656,6 +2779,20 @@ export function siteRoutes(app: FastifyInstance): void {
         throw new Error('Electricity rate insert returned no row');
       }
       clearElectricityRateCache(id);
+      await writeAudit(
+        { table: siteAuditLog, idColumn: 'site_id' },
+        {
+          entityId: id,
+          entityIdSnapshot: id,
+          action: 'electricity_rates_changed',
+          ...getAuditActor(request),
+          before: null,
+          after: { electricityRate: created },
+          notes: `electricity rate created: ${created.name}`,
+        },
+        db,
+        request.log,
+      );
       await reply.status(201).send({
         id: created.id,
         siteId: created.siteId,
@@ -2691,7 +2828,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof electricityRateBody>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply
           .status(404)
           .send({ error: 'Electricity rate not found', code: 'ELECTRICITY_RATE_NOT_FOUND' });
@@ -2707,6 +2844,15 @@ export function siteRoutes(app: FastifyInstance): void {
           .send({ error: 'Invalid rate restrictions', code: 'VALIDATION_ERROR' });
         return;
       }
+      const [previous] = await db
+        .select()
+        .from(siteElectricityRatePeriods)
+        .where(
+          and(
+            eq(siteElectricityRatePeriods.id, periodId),
+            eq(siteElectricityRatePeriods.siteId, id),
+          ),
+        );
       const [updated] = await db
         .update(siteElectricityRatePeriods)
         .set({
@@ -2731,6 +2877,21 @@ export function siteRoutes(app: FastifyInstance): void {
         return;
       }
       clearElectricityRateCache(id);
+      const rateChange = changedFields(previous ?? {}, updated);
+      await writeAudit(
+        { table: siteAuditLog, idColumn: 'site_id' },
+        {
+          entityId: id,
+          entityIdSnapshot: id,
+          action: 'electricity_rates_changed',
+          ...getAuditActor(request),
+          before: { electricityRateId: updated.id, ...rateChange.before },
+          after: { electricityRateId: updated.id, ...rateChange.after },
+          notes: `electricity rate updated: ${updated.name}`,
+        },
+        db,
+        request.log,
+      );
       return {
         id: updated.id,
         siteId: updated.siteId,
@@ -2763,7 +2924,7 @@ export function siteRoutes(app: FastifyInstance): void {
       const { id, periodId } = request.params as z.infer<typeof electricityRateParams>;
       const { userId } = request.user as JwtPayload;
       const userSiteIds = await getUserSiteIds(userId);
-      if (userSiteIds != null && !userSiteIds.includes(id)) {
+      if (!siteInScope(userSiteIds, id)) {
         await reply
           .status(404)
           .send({ error: 'Electricity rate not found', code: 'ELECTRICITY_RATE_NOT_FOUND' });
@@ -2785,7 +2946,92 @@ export function siteRoutes(app: FastifyInstance): void {
         return;
       }
       clearElectricityRateCache(id);
+      await writeAudit(
+        { table: siteAuditLog, idColumn: 'site_id' },
+        {
+          entityId: id,
+          entityIdSnapshot: id,
+          action: 'electricity_rates_changed',
+          ...getAuditActor(request),
+          before: { electricityRate: deleted },
+          after: null,
+          notes: `electricity rate deleted: ${deleted.name}`,
+        },
+        db,
+        request.log,
+      );
       return { success: true };
+    },
+  );
+
+  const recalculateElectricityCostResponse = z
+    .object({
+      updated: z
+        .number()
+        .int()
+        .min(0)
+        .describe('Sessions that got an electricity cost from this request'),
+      remaining: z
+        .number()
+        .int()
+        .min(0)
+        .describe(
+          'Billed sessions at the site still without an electricity cost: send the request again while it is above 0 and updated was above 0 (one request writes at most 5000 costs); sessions whose end time matches no rate period stay',
+        ),
+    })
+    .passthrough();
+
+  app.post(
+    '/sites/:id/electricity-cost/recalculate',
+    {
+      onRequest: [authorize('sites:write')],
+      schema: {
+        tags: ['Sites'],
+        summary: 'Fill missing electricity costs from the site rates',
+        description:
+          "Computes the electricity cost of the site's billed sessions in the company currency that delivered energy and have none, from the site's current rate periods at each session's end time in the site timezone, as session end does. Never overwrites a cost, so it is safe to repeat.",
+        operationId: 'recalculateSiteElectricityCost',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(siteParams),
+        response: {
+          200: itemResponse(recalculateElectricityCostResponse),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof siteParams>;
+      const { userId } = request.user as JwtPayload;
+      const userSiteIds = await getUserSiteIds(userId);
+      if (!siteInScope(userSiteIds, id)) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+      const [site] = await db.select({ id: sites.id }).from(sites).where(eq(sites.id, id)).limit(1);
+      if (site == null) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+      const { before, updated, remaining } = await recalculateSiteElectricityCost(id, {
+        companyCurrency: await getCompanyCurrency(),
+      });
+      if (updated > 0) {
+        await writeAudit(
+          { table: siteAuditLog, idColumn: 'site_id' },
+          {
+            entityId: id,
+            entityIdSnapshot: id,
+            action: 'updated',
+            ...getAuditActor(request),
+            before: { sessionsWithoutElectricityCost: before },
+            after: { sessionsWithoutElectricityCost: remaining, electricityCostsFilled: updated },
+            notes: 'electricity cost recalculated',
+          },
+          db,
+          request.log,
+        );
+      }
+      return { updated, remaining };
     },
   );
 }

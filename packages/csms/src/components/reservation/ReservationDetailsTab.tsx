@@ -32,6 +32,8 @@ import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatDateTime } from '@/lib/timezone';
 import { formatCents } from '@/lib/formatting';
+import { reservationFeeLabel } from '@/lib/reservation-fee';
+import type { ReservationCancellationFee } from '@/lib/reservation-fee';
 import { reservationStatusVariant } from '@/lib/status-variants';
 
 function getStatusLabel(status: string, t: (key: string) => string): string {
@@ -91,6 +93,12 @@ interface ReservationData {
   cancelReason: string | null;
   cancelNote: string | null;
   cancellationFeeCents: number;
+  /**
+   * The fee cancelling now would charge, tax included, on the terms
+   * snapshotted when the reservation was made. Null when it is not open or has
+   * no fee.
+   */
+  cancellationFee: ReservationCancellationFee | null;
   sessionId: string | null;
   sessionStatus: string | null;
   sessionEnergyWh: string | null;
@@ -181,22 +189,25 @@ export function ReservationDetailsTab({
   });
 
   // Cancellation policy is system-wide. Reuse the public /portal/features
-  // endpoint (no auth) so the cancel dialog can warn about the configured fee.
-  // `currency` is the currency the cancellation fee is charged in.
+  // endpoint (no auth): the cancellation window and the currency the fee is
+  // charged in. The fee amount comes with the reservation (its own terms).
   const policyQuery = useQuery({
     queryKey: ['reservation-cancellation-policy'],
     queryFn: () =>
       api.get<{
-        reservationCancellationFeeCents: number;
         reservationCancellationWindowMinutes: number;
         currency: string;
       }>('/v1/portal/features'),
     staleTime: 5 * 60_000,
   });
-  const policyFeeCents = policyQuery.data?.reservationCancellationFeeCents ?? 0;
   const policyWindowMinutes = policyQuery.data?.reservationCancellationWindowMinutes ?? 0;
   const feeCurrency = policyQuery.data?.currency;
-  const policyActive = policyFeeCents > 0 && policyWindowMinutes > 0;
+  const reservationFee = reservation.cancellationFee;
+  const policyActive = reservationFee != null && policyWindowMinutes > 0;
+  const policyFeeLabel =
+    reservationFee != null && feeCurrency != null
+      ? reservationFeeLabel(t, reservationFee, feeCurrency)
+      : '';
 
   const reassignMutation = useMutation({
     mutationFn: (body: { newStationOcppId: string; newEvseId?: number }) =>
@@ -320,7 +331,6 @@ export function ReservationDetailsTab({
               <EditButton label={t('common.edit')} onClick={startEdit} />
               <Button
                 variant="outline"
-                size="sm"
                 className="gap-1.5"
                 onClick={() => {
                   reassignMutation.reset();
@@ -334,7 +344,6 @@ export function ReservationDetailsTab({
               </Button>
               <Button
                 variant="destructive"
-                size="sm"
                 className="gap-1.5"
                 onClick={() => {
                   setCancelOpen(true);
@@ -485,7 +494,7 @@ export function ReservationDetailsTab({
                   {reservation.tokenId != null && reservation.tokenIdToken != null ? (
                     <Link
                       to={`/tokens/${reservation.tokenId}`}
-                      className="text-primary hover:underline"
+                      className="text-link hover:underline"
                     >
                       <span>{reservation.tokenIdToken}</span>
                       {reservation.tokenType != null && (
@@ -550,7 +559,7 @@ export function ReservationDetailsTab({
                   <dt className="text-muted-foreground">{t('reservations.cancellationPolicy')}</dt>
                   <dd className="font-medium">
                     {t('reservations.cancellationPolicyText', {
-                      fee: formatCents(policyFeeCents, feeCurrency),
+                      fee: policyFeeLabel,
                       minutes: policyWindowMinutes,
                     })}
                   </dd>
@@ -588,11 +597,7 @@ export function ReservationDetailsTab({
                   setCancelChargeFee(e.target.checked);
                 }}
               />
-              <span>
-                {t('reservations.chargeCancellationFeeLabel', {
-                  fee: formatCents(policyFeeCents, feeCurrency),
-                })}
-              </span>
+              <span>{t('reservations.chargeCancellationFeeLabel', { fee: policyFeeLabel })}</span>
             </label>
           )}
           <div className="grid gap-1.5">

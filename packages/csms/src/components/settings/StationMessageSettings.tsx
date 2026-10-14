@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { RotateCcw } from 'lucide-react';
 import { SaveButton } from '@/components/save-button';
@@ -17,6 +18,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 
 type StationMessageState =
   | 'available'
@@ -180,6 +182,12 @@ const STATE_LABEL_KEY: Record<StationMessageState, string> = {
   account_credit_limit: 'messages.stateAccountCreditLimit',
 };
 
+/** Translated name of a station message state, or the raw code for an unknown one. */
+export function stationMessageStateLabel(t: TFunction, state: string): string {
+  const key = (STATE_LABEL_KEY as Record<string, string | undefined>)[state];
+  return key != null ? t(key as never) : state;
+}
+
 interface StationMessageSettingsProps {
   settings: Record<string, unknown> | undefined;
 }
@@ -190,6 +198,8 @@ export function StationMessageSettings({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  // Template writes are company-wide: the API answers 404 to a site-restricted user.
+  const canWriteTemplates = useHasCompanyWidePermission('settings.integrations:write');
 
   // Settings keys
   const [enabled, setEnabled] = useState(false);
@@ -304,6 +314,8 @@ export function StationMessageSettings({
       ),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['station-message-templates'] });
+      // Template changes are listed in the Settings History tab.
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'setting'] });
       toast({ title: t('messages.saved'), variant: 'success' });
     },
     onError: () => {
@@ -319,6 +331,8 @@ export function StationMessageSettings({
       ),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['station-message-templates'] });
+      // Template changes are listed in the Settings History tab.
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'setting'] });
       toast({ title: t('messages.resetSuccess'), variant: 'success' });
     },
     onError: () => {
@@ -527,7 +541,7 @@ export function StationMessageSettings({
                     }}
                     className={`block w-full px-4 py-3 text-left text-sm transition-colors ${
                       active
-                        ? 'bg-primary/10 font-medium text-primary'
+                        ? 'bg-primary/10 font-medium text-link'
                         : 'hover:bg-muted text-foreground'
                     }`}
                   >
@@ -606,31 +620,33 @@ export function StationMessageSettings({
                 <AlertDescription>{t('messages.description')}</AlertDescription>
               </Alert>
 
-              <div className="flex justify-end flex-wrap items-center gap-3">
-                <SaveButton
-                  isPending={saveMutation.isPending}
-                  type="button"
-                  disabled={bodyDraft === originalBody}
-                  onClick={() => {
-                    saveMutation.mutate({
-                      state: selectedState,
-                      language: templateLanguage,
-                      body: bodyDraft,
-                    });
-                  }}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setResetOpen(true);
-                  }}
-                  disabled={resetMutation.isPending}
-                >
-                  <RotateCcw className="h-4 w-4" />
-                  {t('messages.resetToDefault')}
-                </Button>
-              </div>
+              {canWriteTemplates && (
+                <div className="flex justify-end flex-wrap items-center gap-3">
+                  <SaveButton
+                    isPending={saveMutation.isPending}
+                    type="button"
+                    disabled={bodyDraft === originalBody}
+                    onClick={() => {
+                      saveMutation.mutate({
+                        state: selectedState,
+                        language: templateLanguage,
+                        body: bodyDraft,
+                      });
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setResetOpen(true);
+                    }}
+                    disabled={resetMutation.isPending}
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                    {t('messages.resetToDefault')}
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         </CardContent>

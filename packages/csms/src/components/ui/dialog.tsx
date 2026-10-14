@@ -5,6 +5,7 @@ import * as React from 'react';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
+import { useEscapeLayer } from './escape-layer';
 
 interface DialogContextValue {
   onClose: () => void;
@@ -21,9 +22,56 @@ interface DialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   children: React.ReactNode;
+  /**
+   * False while the dialog must not be dismissed (an action is running): Escape
+   * and a click on the backdrop then leave it open. Default true.
+   */
+  dismissible?: boolean;
 }
 
-function Dialog({ open, onOpenChange, children }: DialogProps): React.JSX.Element | null {
+// Escape dismisses the topmost dialog (`useEscapeLayer`), and focus returns to
+// the element that had it when the dialog opened. Mounted only while the
+// dialog is open.
+function useDialogDismiss(onDismiss: () => void, dismissible: boolean): void {
+  // Read during the first render, before an autoFocus child takes focus.
+  const [returnFocusTo] = React.useState<Element | null>(() =>
+    typeof document === 'undefined' ? null : document.activeElement,
+  );
+  // The topmost dialog consumes Escape even while busy, so the dialog below it
+  // does not close instead.
+  useEscapeLayer(() => {
+    if (dismissible) onDismiss();
+  });
+
+  React.useEffect(
+    () => () => {
+      if (returnFocusTo instanceof HTMLElement && returnFocusTo.isConnected) {
+        returnFocusTo.focus();
+      }
+    },
+    [returnFocusTo],
+  );
+}
+
+function Dialog({
+  open,
+  onOpenChange,
+  children,
+  dismissible = true,
+}: DialogProps): React.JSX.Element | null {
+  if (!open) return null;
+  return (
+    <OpenDialog onOpenChange={onOpenChange} dismissible={dismissible}>
+      {children}
+    </OpenDialog>
+  );
+}
+
+function OpenDialog({
+  onOpenChange,
+  children,
+  dismissible,
+}: Omit<DialogProps, 'open'> & { dismissible: boolean }): React.JSX.Element {
   const titleId = React.useId();
   const descriptionId = React.useId();
   const [descriptionCount, setDescriptionCount] = React.useState(0);
@@ -33,8 +81,9 @@ function Dialog({ open, onOpenChange, children }: DialogProps): React.JSX.Elemen
       setDescriptionCount((n) => n - 1);
     };
   }, []);
-
-  if (!open) return null;
+  useDialogDismiss(() => {
+    onOpenChange(false);
+  }, dismissible);
 
   return (
     <DialogContext.Provider
@@ -51,7 +100,7 @@ function Dialog({ open, onOpenChange, children }: DialogProps): React.JSX.Elemen
         <div
           className="fixed inset-0 bg-foreground/80"
           onClick={() => {
-            onOpenChange(false);
+            if (dismissible) onOpenChange(false);
           }}
         />
         <div className="fixed inset-0 flex items-center justify-center p-4">{children}</div>
@@ -140,7 +189,8 @@ function DialogFooter({
   return (
     <div
       className={cn(
-        'flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2 [&>button]:w-full sm:[&>button]:w-auto',
+        // gap, not space-x: stacked buttons on a phone need the space too.
+        'flex flex-col-reverse gap-2 sm:flex-row sm:justify-end [&>button]:w-full sm:[&>button]:w-auto',
         className,
       )}
       {...props}

@@ -7,9 +7,16 @@ import { WebSocketServer } from 'ws';
 import type WebSocket from 'ws';
 import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
 import type postgres from 'postgres';
-import { createLogger, InMemoryEventBus, OcppError, tryParseJson } from '@evtivity/lib';
+import {
+  CACHE_INVALIDATE_CHANNEL,
+  createLogger,
+  InMemoryEventBus,
+  OcppError,
+  parseStationAuthInvalidation,
+  tryParseJson,
+} from '@evtivity/lib';
 import { getHeartbeatIntervalSeconds } from '@evtivity/database';
-import type { Logger, EventBus, EventPersistence } from '@evtivity/lib';
+import type { Logger, EventBus, EventPersistence, PubSubClient, Subscription } from '@evtivity/lib';
 import { ConnectionManager } from './connection-manager.js';
 import { createSessionState } from './session-state.js';
 import { selectOcppSubprotocol } from './subprotocol.js';
@@ -33,6 +40,11 @@ import {
 } from './middleware/authenticate.js';
 import type { AuthResult } from './middleware/authenticate.js';
 import {
+  StationAuthCache,
+  StationPasswordVerifier,
+} from './middleware/station-password-verifier.js';
+import type { StationPasswordVerifierStats } from './middleware/station-password-verifier.js';
+import {
   ConnectionAuthBusyError,
   ConnectionAuthLimiter,
   DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
@@ -42,6 +54,7 @@ import {
 import type { ConnectionAuthLimits, ConnectionAuthStats } from './connection-auth-limiter.js';
 import { MessageLifecycle } from './message-lifecycle.js';
 import { CommandDispatcher } from './command-dispatcher.js';
+import { MESSAGE_LOG_EVENT, publishMessageLog } from './message-log.js';
 import { registerHandlers } from '../handlers/handler-registry.js';
 import {
   isCall,
@@ -117,6 +130,12 @@ export interface OcppServerOptions {
   // Bounds on concurrent connection authentications. By default half the
   // database pool, 1000 queued, 10 s wait (see connection-auth-limiter.ts).
   connectionAuthLimits?: Partial<ConnectionAuthLimits> | undefined;
+  // This process's instance ID (the connection registry ID). Keys its
+  // ocpp_server_health row. Without one the ping monitor generates an ID.
+  instanceId?: string | undefined;
+  // Station password checks. By default a cache of successful checks and an
+  // argon2 concurrency gate (see station-password-verifier.ts).
+  passwordVerifier?: StationPasswordVerifier | undefined;
 }
 
 // Refused connection authentications are logged at most this often.
@@ -154,6 +173,7 @@ export class OcppServer {
   private readonly trustedProxies: ReturnType<typeof parseTrustedProxies>;
   private readonly fixedIdleTimeoutMs: number | null;
   private readonly authLimiter: ConnectionAuthLimiter;
+  private readonly passwordVerifier: StationPasswordVerifier;
   private authBusyLoggedAt = 0;
   private authBusySinceLog = 0;
   private idleTimeoutMs = MIN_IDLE_TIMEOUT_MS;
@@ -177,7 +197,7 @@ export class OcppServer {
         // (ocpp_message_logs, meter_values, charging_stations.last_heartbeat)
         // via projections; archiving it again in domain_events accounted for
         // ~87% of that table's rows with no readers.
-        persistDenylist: ['ocpp.MessageLog', 'ocpp.MeterValues', 'ocpp.Heartbeat'],
+        persistDenylist: [MESSAGE_LOG_EVENT, 'ocpp.MeterValues', 'ocpp.Heartbeat'],
       });
     this.lifecycle = new MessageLifecycle(this.logger);
     this.dispatcher = new CommandDispatcher(this.connectionManager, this.correlator, this.logger);
@@ -193,6 +213,8 @@ export class OcppServer {
       maxQueued: limits?.maxQueued ?? DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
       maxWaitMs: limits?.maxWaitMs ?? DEFAULT_CONNECTION_AUTH_MAX_WAIT_MS,
     });
+    this.passwordVerifier =
+      options?.passwordVerifier ?? new StationPasswordVerifier({ cache: new StationAuthCache() });
 
     // Set up middleware pipeline
     this.pipeline = new MiddlewarePipeline();
@@ -295,7 +317,7 @@ export class OcppServer {
       );
     }
 
-    this.pingMonitor.start(this.sql);
+    this.pingMonitor.start(this.sql, null, options.instanceId);
 
     if (this.fixedIdleTimeoutMs == null && this.sql != null) {
       await this.refreshIdleTimeout();
@@ -371,6 +393,7 @@ export class OcppServer {
           this.sql,
           remoteIp === 'unknown' ? null : remoteIp,
           isTlsConnection(req, this.trustedProxies),
+          this.passwordVerifier,
         );
       })
       .then((auth) => {
@@ -419,6 +442,26 @@ export class OcppServer {
   /** Connection authentications running, queued, and refused (health endpoint). */
   getConnectionAuthStats(): ConnectionAuthStats {
     return this.authLimiter.stats();
+  }
+
+  /** Cached station password checks and argon2 computations running and queued. */
+  getStationPasswordStats(): StationPasswordVerifierStats {
+    return this.passwordVerifier.stats();
+  }
+
+  /**
+   * Evicts a station's cached password check in this process when the API
+   * publishes a station auth invalidation (password or security profile
+   * changed). The cache entry also binds the stored hash, so a lost message
+   * never lets an old password through; this evicts the entry at once.
+   */
+  subscribeStationAuthInvalidation(pubsub: PubSubClient): Promise<Subscription> {
+    return pubsub.subscribe(CACHE_INVALIDATE_CHANNEL, (payload: string) => {
+      const stationDbId = parseStationAuthInvalidation(tryParseJson(payload));
+      if (stationDbId == null) return;
+      this.passwordVerifier.invalidate(stationDbId);
+      this.logger.debug({ stationDbId }, 'Station auth cache entry invalidated');
+    });
   }
 
   // The CSMS sends a station queued commands and screen messages only once it
@@ -621,36 +664,26 @@ export class OcppServer {
         // returned for CSMS-initiated commands. Without this the OCPP log
         // tab only carries the outbound CALL row (logged by
         // command-listener.ts) and the response is invisible.
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'inbound',
-            messageType: MESSAGE_TYPE_CALLRESULT,
-            messageId: parsed[1],
-            action: null,
-            payload: parsed[2],
-          },
+        publishMessageLog(this.eventBus, {
+          stationId: session.stationId,
+          stationDbId: session.stationDbId,
+          direction: 'inbound',
+          messageType: MESSAGE_TYPE_CALLRESULT,
+          messageId: parsed[1],
+          action: null,
+          payload: parsed[2],
         });
         this.correlator.handleResponse(session, parsed);
       } else if (isCallError(parsed)) {
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'inbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId: parsed[1],
-            action: null,
-            errorCode: parsed[2],
-            errorDescription: parsed[3],
-          },
+        publishMessageLog(this.eventBus, {
+          stationId: session.stationId,
+          stationDbId: session.stationDbId,
+          direction: 'inbound',
+          messageType: MESSAGE_TYPE_CALLERROR,
+          messageId: parsed[1],
+          action: null,
+          errorCode: parsed[2],
+          errorDescription: parsed[3],
         });
         this.correlator.handleResponse(session, parsed);
       }
@@ -676,19 +709,14 @@ export class OcppServer {
     session.lastHeartbeat = new Date();
 
     // Log inbound CALL from station
-    void this.eventBus.publish({
-      eventType: 'ocpp.MessageLog',
-      aggregateType: 'ChargingStation',
-      aggregateId: session.stationId,
-      payload: {
-        stationId: session.stationId,
-        stationDbId: session.stationDbId,
-        direction: 'inbound',
-        messageType: MESSAGE_TYPE_CALL,
-        messageId,
-        action,
-        payload,
-      },
+    publishMessageLog(this.eventBus, {
+      stationId: session.stationId,
+      stationDbId: session.stationDbId,
+      direction: 'inbound',
+      messageType: MESSAGE_TYPE_CALL,
+      messageId,
+      action,
+      payload,
     });
 
     const ctx: HandlerContext = {
@@ -716,19 +744,14 @@ export class OcppServer {
         this.announceReady(session, action);
 
         // Log outbound CALLRESULT to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLRESULT,
-            messageId,
-            action,
-            payload: ctx.response,
-          },
+        publishMessageLog(this.eventBus, {
+          stationId: session.stationId,
+          stationDbId: session.stationDbId,
+          direction: 'outbound',
+          messageType: MESSAGE_TYPE_CALLRESULT,
+          messageId,
+          action,
+          payload: ctx.response,
         });
       }
     } catch (err: unknown) {
@@ -743,20 +766,15 @@ export class OcppServer {
         this.lifecycle.errored(messageId, err.errorCode);
 
         // Log outbound CALLERROR to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId,
-            action,
-            errorCode: err.errorCode,
-            errorDescription: err.errorDescription,
-          },
+        publishMessageLog(this.eventBus, {
+          stationId: session.stationId,
+          stationDbId: session.stationDbId,
+          direction: 'outbound',
+          messageType: MESSAGE_TYPE_CALLERROR,
+          messageId,
+          action,
+          errorCode: err.errorCode,
+          errorDescription: err.errorDescription,
         });
       } else {
         this.logger.error(
@@ -772,20 +790,15 @@ export class OcppServer {
         this.lifecycle.errored(messageId, OcppErrorCode.InternalError);
 
         // Log outbound CALLERROR to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId,
-            action,
-            errorCode: OcppErrorCode.InternalError,
-            errorDescription: 'Internal server error',
-          },
+        publishMessageLog(this.eventBus, {
+          stationId: session.stationId,
+          stationDbId: session.stationDbId,
+          direction: 'outbound',
+          messageType: MESSAGE_TYPE_CALLERROR,
+          messageId,
+          action,
+          errorCode: OcppErrorCode.InternalError,
+          errorDescription: 'Internal server error',
         });
       }
     }

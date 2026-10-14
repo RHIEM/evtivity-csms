@@ -137,15 +137,18 @@ export {
 } from './providers/simulated/webhook-signing.js';
 export {
   deferredSimulatedSink,
-  PAYMENT_WEBHOOK_CHANNEL,
-  pubsubSimulatedSink,
+  PAYMENT_WEBHOOK_JOB_NAME,
+  paymentWebhookJobId,
+  queueSimulatedSink,
 } from './simulated-delivery.js';
+export type { DeferredSimulatedSink, PaymentWebhookDelivery } from './simulated-delivery.js';
+export { PAYMENT_SYSTEM_ACTOR, withPaymentActor } from './context.js';
 export type {
-  DeferredSimulatedSink,
-  PaymentWebhookDelivery,
-  PaymentWebhookPublisher,
-} from './simulated-delivery.js';
-export type { PaymentContext, PaymentLogger } from './context.js';
+  PaymentActor,
+  PaymentAuditContext,
+  PaymentContext,
+  PaymentLogger,
+} from './context.js';
 export { activeProvider, pinnedProvider, resolveActiveProvider } from './pinning.js';
 export { describePaymentProviders } from './provider-catalog.js';
 export type { ProviderCatalogCapabilities, ProviderCatalogEntry } from './provider-catalog.js';
@@ -202,7 +205,7 @@ export { chargeSessionRebill, REBILL_PAYOUT_NOT_READY_CODE } from './session-reb
 export type { SessionRebillChargeInput, SessionRebillChargeOutcome } from './session-rebill.js';
 export { refundPaymentRecord } from './refunds.js';
 export type { ChargeRefund, RefundOutcome, RefundRequest, RefundTarget } from './refunds.js';
-export { applyPaymentEvent, ingestPaymentWebhook } from './webhooks.js';
+export { applyPaymentEvent, ingestPaymentWebhook, paymentWebhookActor } from './webhooks.js';
 export type { PaymentWebhookNotice, WebhookResult } from './webhooks.js';
 export { dispatchPaymentWebhookNotices } from './webhook-notices.js';
 export { dispatchFeeRefundNotification, FEE_REFUNDED_EVENT } from './fee-refund-notice.js';
@@ -276,7 +279,7 @@ export type {
 } from './payout-accounts.js';
 export { findSitePayoutAccount } from './payout-account-records.js';
 export type { PayoutAccountDetails, SitePayoutAccountRow } from './payout-account-records.js';
-export { chargeReservationFee } from './reservation-fees.js';
+export { chargeReservationFee, priceReservationFee } from './reservation-fees.js';
 export type {
   ReservationFeeInput,
   ReservationFeeResult,

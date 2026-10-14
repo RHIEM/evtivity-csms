@@ -135,8 +135,31 @@ describe('docker/redis/acl-rules.conf', () => {
 
   it('finds the channels in the sources (the scan itself works)', () => {
     expect(channelsUsedBy('ocpp').has('ocpp_commands')).toBe(true);
-    expect(channelsUsedBy('worker').has('station_watch_available')).toBe(true);
+    expect(channelsUsedBy('worker').has('reservation_schedule')).toBe(true);
     expect(channelsUsedBy('api').has('css_commands')).toBe(true);
+  });
+
+  it('grants the automatic insight request channel to the core set (TC-AI-C-13)', () => {
+    // AI_INSIGHT_REQUESTS_CHANNEL in @evtivity/services, published by the API
+    // and read by the worker bridge.
+    expect(channelsUsedBy('services').has('ai_insight_requests')).toBe(true);
+    for (const name of ['api', 'ocpp', 'worker']) {
+      expect(user(name).channels, name).toContain('ai_insight_requests');
+    }
+    expect(user('ocpi').channels).not.toContain('ai_insight_requests');
+  });
+
+  it('TC-CFG-07 grants the driver AI request channel to api, ocpp and worker only', () => {
+    // DRIVER_AI_REQUESTS_CHANNEL in @evtivity/lib/driver-ai, published by the
+    // API and read by the worker bridge to the driver-ai queue.
+    expect(LIB_CHANNEL_CONSTANTS.get('DRIVER_AI_REQUESTS_CHANNEL')).toBe('driver_ai_requests');
+    expect(channelsUsedBy('lib').has('driver_ai_requests')).toBe(true);
+    for (const name of ['api', 'ocpp', 'worker']) {
+      expect(user(name).channels, name).toContain('driver_ai_requests');
+    }
+    for (const name of ['ocpi', 'css']) {
+      expect(user(name).channels, name).not.toContain('driver_ai_requests');
+    }
   });
 
   it('grants each process its keys and nothing outside them', () => {
@@ -149,14 +172,23 @@ describe('docker/redis/acl-rules.conf', () => {
     const noncePrefix = /PREFIX = '([^']+)'/.exec(
       readFileSync(join(ROOT, 'packages/api/src/lib/device-attestation/challenge.ts'), 'utf8'),
     )?.[1];
+    const aiRateLimitPrefix = /AI_RATE_LIMIT_KEY_PREFIX = '([^']+)'/.exec(
+      readFileSync(join(ROOT, 'packages/api/src/services/ai/engine/limits.ts'), 'utf8'),
+    )?.[1];
     expect(watchKey).toBeDefined();
     expect(registryPrefix).toBeDefined();
     expect(noncePrefix).toBeDefined();
+    expect(aiRateLimitPrefix).toBeDefined();
 
     // BullMQ (prefix "bull"), the maintenance fan-out and station render locks, the watch key.
     expect(grantsKey(user('worker'), 'bull:cron-jobs:wait', 'rw')).toBe(true);
     expect(grantsKey(user('worker'), 'mfl:site-1', 'rw')).toBe(true);
     expect(grantsKey(user('worker'), 'sml:sta_1', 'rw')).toBe(true);
+    // Worker locks: a cron job, a fleet billing fan-out, the conformance run.
+    expect(grantsKey(user('worker'), 'wkl:cron:dashboard-snapshot', 'rw')).toBe(true);
+    expect(grantsKey(user('worker'), 'wkl:fleet-billing:flt_1', 'rw')).toBe(true);
+    expect(grantsKey(user('worker'), 'wkl:octt-run', 'rw')).toBe(true);
+    expect(grantsKey(user('api'), 'wkl:octt-run', 'r')).toBe(false);
     expect(grantsKey(user('worker'), watchKey as string, 'rw')).toBe(true);
     // The connection registry belongs to ocpp; the worker's offline sweep reads it.
     expect(grantsKey(user('ocpp'), `${registryPrefix as string}CS-1`, 'rw')).toBe(true);
@@ -165,11 +197,47 @@ describe('docker/redis/acl-rules.conf', () => {
     // Response cache and attestation nonces; the watch key read-only.
     expect(grantsKey(user('api'), 'rc:ver:stations', 'rw')).toBe(true);
     expect(grantsKey(user('api'), `${noncePrefix as string}abc`, 'rw')).toBe(true);
+    // AI per-minute counters (user and site windows); a missing grant fails open.
+    expect(grantsKey(user('api'), `${aiRateLimitPrefix as string}user:usr_1:1`, 'rw')).toBe(true);
+    expect(grantsKey(user('api'), `${aiRateLimitPrefix as string}site:sit_1:1`, 'rw')).toBe(true);
+    for (const name of ['ocpp', 'ocpi', 'worker', 'css']) {
+      expect(grantsKey(user(name), `${aiRateLimitPrefix as string}user:usr_1:1`, 'r'), name).toBe(
+        false,
+      );
+    }
     expect(grantsKey(user('api'), watchKey as string, 'r')).toBe(true);
     expect(grantsKey(user('api'), watchKey as string, 'rw')).toBe(false);
     // OCPI pull lock and its own BullMQ queue (ocpi-cdrs), no other queue.
     expect(grantsKey(user('ocpi'), 'opl:partner-1:locations', 'rw')).toBe(true);
     expect(grantsKey(user('ocpi'), 'bull:ocpi-cdrs:wait', 'rw')).toBe(true);
+    // api and ocpp add jobs straight to the worker queues whose requests must
+    // survive a stopped worker, and to no other queue.
+    const producerQueues = {
+      api: [
+        'fleet-billing-fanout',
+        'maintenance-fanout',
+        'member-invoices',
+        'payment-webhooks',
+        'station-messages',
+        'station-watch',
+      ],
+      ocpp: ['maintenance-fanout', 'payment-webhooks', 'station-messages', 'station-watch'],
+    };
+    for (const [name, queues] of Object.entries(producerQueues)) {
+      for (const queue of queues) {
+        expect(grantsKey(user(name), `bull:${queue}:wait`, 'rw'), `${name} ${queue}`).toBe(true);
+        expect(grantsKey(user(name), `bull:${queue}:id`, 'rw'), `${name} ${queue}`).toBe(true);
+        // Debounced station message jobs use BullMQ deduplication keys.
+        expect(grantsKey(user(name), `bull:${queue}:de:x`, 'rw'), `${name} ${queue}`).toBe(true);
+      }
+    }
+    for (const queue of ['fleet-invoices', 'reservations', 'reports', 'ai-insights']) {
+      expect(grantsKey(user('api'), `bull:${queue}:wait`, 'r'), queue).toBe(false);
+      expect(grantsKey(user('ocpp'), `bull:${queue}:wait`, 'r'), queue).toBe(false);
+    }
+    for (const queue of ['fleet-billing-fanout', 'member-invoices']) {
+      expect(grantsKey(user('ocpp'), `bull:${queue}:wait`, 'r'), queue).toBe(false);
+    }
 
     for (const name of ['api', 'ocpp', 'ocpi', 'css']) {
       expect(grantsKey(user(name), 'bull:cron-jobs:wait', 'r'), name).toBe(false);
@@ -179,6 +247,16 @@ describe('docker/redis/acl-rules.conf', () => {
     }
     expect(user('css').keys).toEqual([]);
     expect(user('css').readKeys).toEqual([]);
+  });
+
+  it('TC-AI-C-13 grants the api user the AI keys it writes, and the usage ledger needs none', () => {
+    // The only AI Redis keys are the per-minute counters (ai:rl:*). Budget sums are
+    // in-process caches and threshold notices are database claim rows, so the
+    // usage ledger adds no key and no wider ~ai:* grant is needed.
+    const ledger = readFileSync(join(ROOT, 'packages/database/src/lib/ai-usage.ts'), 'utf8');
+    expect(ledger).not.toMatch(/createRedisClient|ioredis/);
+    expect(grantsKey(user('api'), 'ai:rl:user:usr_1:1', 'rw')).toBe(true);
+    expect(grantsKey(user('worker'), 'ai:rl:user:usr_1:1', 'r')).toBe(false);
   });
 
   it('creates every Redis client through the TLS-aware factory', () => {

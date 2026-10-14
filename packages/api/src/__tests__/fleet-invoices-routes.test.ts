@@ -30,6 +30,17 @@ const siteAccess = vi.hoisted(() => ({ siteIds: null as string[] | null }));
 
 vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn(() => Promise.resolve(siteAccess.siteIds)),
+  requireAllSiteAccess: vi.fn(
+    async (
+      _request: unknown,
+      reply: { status: (code: number) => { send: (body: unknown) => Promise<unknown> } },
+      notFound: unknown,
+    ) => {
+      if (siteAccess.siteIds === null) return true;
+      await reply.status(404).send(notFound);
+      return false;
+    },
+  ),
 }));
 
 vi.mock('@evtivity/database', () => {
@@ -48,8 +59,9 @@ vi.mock('@evtivity/database', () => {
   return {
     db: { select: vi.fn(() => chain(() => listRows.rows)) },
     client: {},
-    invoices: { fleetId: { name: 'fleet_id' } },
+    invoices: { fleetId: { name: 'fleet_id' }, memberBilled: { name: 'member_billed' } },
     fleets: { __table: 'fleets', id: { name: 'id' } },
+    drivers: { __table: 'drivers', id: { name: 'id' } },
     invoiceStatusEnum: { enumValues: ['draft', 'issued', 'paid', 'void', 'credited'] },
     INVOICE_KINDS: ['invoice', 'credit_note'],
     invoiceAuditLog: { __table: 'invoice_audit_log' },
@@ -58,18 +70,20 @@ vi.mock('@evtivity/database', () => {
   };
 });
 
-vi.mock('drizzle-orm', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('drizzle-orm')>();
-  return { ...actual, isNull: vi.fn(actual.isNull) };
-});
-
 vi.mock('@evtivity/services/fleet-invoice.service', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@evtivity/services/fleet-invoice.service')>()),
   createFleetInvoice: vi.fn(),
+  createMemberInvoice: vi.fn(),
+  listMemberInvoiceDrivers: vi.fn(),
   previewFleetInvoice: vi.fn(),
 }));
+vi.mock('@evtivity/services/fleet-invoice-run', () => ({
+  enqueueMemberInvoiceBatch: vi.fn(),
+}));
+const memberQueue = { addBulk: vi.fn() };
+vi.mock('@evtivity/lib/job-queues', () => ({ jobQueue: () => memberQueue }));
 vi.mock('@evtivity/services/fleet-invoice-notice', () => ({
-  sendFleetInvoiceEmail: vi.fn(),
+  sendAccountInvoiceEmail: vi.fn(),
 }));
 vi.mock('@evtivity/services/invoice.service', () => ({
   createSessionInvoice: vi.fn(),
@@ -83,11 +97,16 @@ vi.mock('@evtivity/services/invoice-pdf.service', () => ({ generateInvoicePdf: v
 vi.mock('@evtivity/services/template-dirs', () => ({ ALL_TEMPLATES_DIRS: ['/t'] }));
 vi.mock('@evtivity/lib/pubsub-instance', () => ({ getPubSub: vi.fn() }));
 
-import { isNull } from 'drizzle-orm';
 import { AppError } from '@evtivity/lib';
-import { invoices, writeAudit } from '@evtivity/database';
-import { createFleetInvoice, previewFleetInvoice } from '@evtivity/services/fleet-invoice.service';
-import { sendFleetInvoiceEmail } from '@evtivity/services/fleet-invoice-notice';
+import { writeAudit } from '@evtivity/database';
+import {
+  createFleetInvoice,
+  createMemberInvoice,
+  listMemberInvoiceDrivers,
+  previewFleetInvoice,
+} from '@evtivity/services/fleet-invoice.service';
+import { enqueueMemberInvoiceBatch } from '@evtivity/services/fleet-invoice-run';
+import { sendAccountInvoiceEmail } from '@evtivity/services/fleet-invoice-notice';
 import { getInvoice } from '@evtivity/services/invoice.service';
 import { registerAuth } from '../plugins/auth.js';
 import { fleetInvoiceRoutes } from '../routes/fleet-invoices.js';
@@ -102,6 +121,7 @@ function invoiceRow(overrides: Record<string, unknown> = {}): Record<string, unk
     invoiceNumber: 'INV-202610-0009',
     driverId: null,
     fleetId: FLEET_ID,
+    memberBilled: false,
     periodStart: '2026-09-01',
     periodEnd: '2026-09-30',
     billTo: { name: 'Acme Logistics GmbH' },
@@ -189,7 +209,7 @@ beforeEach(() => {
     creditedInvoice: null,
     creditNote: null,
   } as never);
-  vi.mocked(sendFleetInvoiceEmail).mockResolvedValue({ status: 'sent', recipients: 2 });
+  vi.mocked(sendAccountInvoiceEmail).mockResolvedValue({ status: 'sent', recipients: 2 });
 });
 
 function generate(body: Record<string, unknown> = { period: '2026-09' }) {
@@ -227,6 +247,20 @@ describe('GET /fleets/:id/billing/unbilled', () => {
     ],
     excludedCount: 1,
     existingInvoice: null,
+    members: [
+      {
+        driverId: 'drv_000000000002',
+        driverName: 'Zoe Ng',
+        sessionCount: 1,
+        energyWh: 12000,
+        netCents: 1000,
+        taxCents: 190,
+        totalCents: 1190,
+        existingInvoice: null,
+        hasEmail: true,
+        hasAddress: false,
+      },
+    ],
   };
 
   it('previews the given period', async () => {
@@ -241,6 +275,7 @@ describe('GET /fleets/:id/billing/unbilled', () => {
     expect(res.json()).toMatchObject({
       totalCents: 2380,
       excluded: [{ reason: 'other_currency' }],
+      members: [{ driverId: 'drv_000000000002', hasEmail: true, hasAddress: false }],
     });
   });
 
@@ -297,16 +332,23 @@ describe('POST /fleets/:id/invoices', () => {
       expect.anything(),
       expect.anything(),
     );
-    expect(sendFleetInvoiceEmail).toHaveBeenCalledWith(INVOICE_ID, 'once', {
-      templatesDirs: ['/t'],
-    });
+    // The issue email is audited as invoice_sent by the operator who generated it.
+    expect(sendAccountInvoiceEmail).toHaveBeenCalledWith(
+      INVOICE_ID,
+      'once',
+      { templatesDirs: ['/t'] },
+      {
+        actor: expect.objectContaining({ actor: 'operator' }),
+        log: expect.anything(),
+      },
+    );
   });
 
   it('reports emailed false without billing contacts and when the email fails', async () => {
-    vi.mocked(sendFleetInvoiceEmail).mockResolvedValueOnce({ status: 'no_contacts' });
+    vi.mocked(sendAccountInvoiceEmail).mockResolvedValueOnce({ status: 'no_contacts' });
     expect((await generate()).json()).toMatchObject({ emailed: false });
 
-    vi.mocked(sendFleetInvoiceEmail).mockRejectedValueOnce(new Error('smtp down'));
+    vi.mocked(sendAccountInvoiceEmail).mockRejectedValueOnce(new Error('smtp down'));
     const res = await generate();
     expect(res.statusCode).toBe(201);
     expect(res.json()).toMatchObject({ emailed: false });
@@ -325,7 +367,7 @@ describe('POST /fleets/:id/invoices', () => {
     expect(res.statusCode).toBe(status);
     expect(res.json()).toMatchObject({ code });
     expect(writeAudit).not.toHaveBeenCalled();
-    expect(sendFleetInvoiceEmail).not.toHaveBeenCalled();
+    expect(sendAccountInvoiceEmail).not.toHaveBeenCalled();
   });
 
   it('needs payments:write and a YYYY-MM period', async () => {
@@ -333,6 +375,148 @@ describe('POST /fleets/:id/invoices', () => {
     heldPermissions = new Set(['payments:read']);
     expect((await generate()).statusCode).toBe(403);
     expect(createFleetInvoice).not.toHaveBeenCalled();
+  });
+});
+
+const DRIVER_ID = 'drv_000000000001';
+
+function generateMember(
+  body: Record<string, unknown> = { period: '2026-09', driverId: DRIVER_ID },
+) {
+  return app.inject({
+    method: 'POST',
+    url: `/fleets/${FLEET_ID}/member-invoices`,
+    headers: { authorization: `Bearer ${token}` },
+    payload: body,
+  });
+}
+
+function batchMembers(body: Record<string, unknown> = { period: '2026-09' }) {
+  return app.inject({
+    method: 'POST',
+    url: `/fleets/${FLEET_ID}/member-invoices/batch`,
+    headers: { authorization: `Bearer ${token}` },
+    payload: body,
+  });
+}
+
+describe('POST /fleets/:id/member-invoices', () => {
+  beforeEach(() => {
+    vi.mocked(createMemberInvoice).mockResolvedValue({
+      invoice: invoiceRow({ driverId: DRIVER_ID, memberBilled: true }),
+      lineItems: [{ sessionId: 'ses_000000000002' }],
+      drivers: [driverTotal],
+      excluded: [],
+      excludedCount: 0,
+    } as never);
+    vi.mocked(sendAccountInvoiceEmail).mockResolvedValue({ status: 'sent', recipients: 1 });
+  });
+
+  it("issues one driver's member invoice, audits it and sends it to the driver once", async () => {
+    const res = await generateMember();
+
+    expect(res.statusCode).toBe(201);
+    expect(createMemberInvoice).toHaveBeenCalledWith(FLEET_ID, DRIVER_ID, '2026-09');
+    expect(res.json()).toMatchObject({ emailed: true, drivers: [{ driverName: 'Anna Berg' }] });
+    expect(writeAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        entityId: INVOICE_ID,
+        action: 'invoice_generated',
+        notes: '2026-09',
+        after: expect.objectContaining({ sessionIds: ['ses_000000000002'] }),
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(sendAccountInvoiceEmail).toHaveBeenCalledWith(
+      INVOICE_ID,
+      'once',
+      { templatesDirs: ['/t'] },
+      expect.objectContaining({ actor: expect.objectContaining({ actor: 'operator' }) }),
+    );
+  });
+
+  it('reports emailed false for a driver without an email and when the send fails', async () => {
+    vi.mocked(sendAccountInvoiceEmail).mockResolvedValueOnce({ status: 'no_email' });
+    expect((await generateMember()).json()).toMatchObject({ emailed: false });
+    vi.mocked(sendAccountInvoiceEmail).mockRejectedValueOnce(new Error('smtp down'));
+    const res = await generateMember();
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ emailed: false });
+  });
+
+  it.each([
+    [409, 'FLEET_INVOICE_PERIOD_EXISTS'],
+    [409, 'FLEET_INVOICE_NOTHING_TO_BILL'],
+    [404, 'FLEET_NOT_FOUND'],
+    [404, 'DRIVER_NOT_FOUND'],
+  ])('answers %i %s without auditing or sending', async (status, code) => {
+    vi.mocked(createMemberInvoice).mockRejectedValueOnce(new AppError('Refused', status, code));
+    const res = await generateMember();
+    expect(res.statusCode).toBe(status);
+    expect(res.json()).toMatchObject({ code });
+    expect(writeAudit).not.toHaveBeenCalled();
+    expect(sendAccountInvoiceEmail).not.toHaveBeenCalled();
+  });
+
+  it('needs payments:write, a period and a driver id', async () => {
+    expect((await generateMember({ period: '2026-09' })).statusCode).toBe(400);
+    expect((await generateMember({ period: '2026-9', driverId: DRIVER_ID })).statusCode).toBe(400);
+    heldPermissions = new Set(['payments:read']);
+    expect((await generateMember()).statusCode).toBe(403);
+    expect(createMemberInvoice).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /fleets/:id/member-invoices/batch', () => {
+  it('queues one job per driver for the worker and answers 202 with the driver count', async () => {
+    vi.mocked(listMemberInvoiceDrivers).mockResolvedValue(['drv_000000000001', 'drv_000000000002']);
+
+    const res = await batchMembers();
+
+    expect(res.statusCode).toBe(202);
+    const body = res.json<{ batchId: string; memberCount: number }>();
+    expect(body.memberCount).toBe(2);
+    expect(body.batchId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(listMemberInvoiceDrivers).toHaveBeenCalledWith(FLEET_ID, '2026-09');
+    // Nothing is written in the request (P4): the worker issues the invoices.
+    expect(enqueueMemberInvoiceBatch).toHaveBeenCalledWith(memberQueue, {
+      fleetId: FLEET_ID,
+      period: '2026-09',
+      batchId: body.batchId,
+      actor: { actor: 'operator', actorUserId: 'usr_000000000001', actorApiKeyId: null },
+      driverIds: ['drv_000000000001', 'drv_000000000002'],
+    });
+    expect(createMemberInvoice).not.toHaveBeenCalled();
+    expect(writeAudit).not.toHaveBeenCalled();
+  });
+
+  it('answers 500 when the jobs cannot be queued, so the operator can try again', async () => {
+    vi.mocked(listMemberInvoiceDrivers).mockResolvedValue(['drv_000000000001']);
+    vi.mocked(enqueueMemberInvoiceBatch).mockRejectedValueOnce(new Error('redis down'));
+    const res = await batchMembers();
+    expect(res.statusCode).toBe(500);
+    expect(createMemberInvoice).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 FLEET_INVOICE_NOTHING_TO_BILL and queues nothing when no driver qualifies', async () => {
+    vi.mocked(listMemberInvoiceDrivers).mockResolvedValue([]);
+    const res = await batchMembers();
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'FLEET_INVOICE_NOTHING_TO_BILL' });
+    expect(enqueueMemberInvoiceBatch).not.toHaveBeenCalled();
+  });
+
+  it('passes the service refusals through and needs payments:write', async () => {
+    vi.mocked(listMemberInvoiceDrivers).mockRejectedValueOnce(
+      new AppError('Fleet not found', 404, 'FLEET_NOT_FOUND'),
+    );
+    expect((await batchMembers()).statusCode).toBe(404);
+    expect((await batchMembers({ period: 'x' })).statusCode).toBe(400);
+    heldPermissions = new Set(['payments:read']);
+    expect((await batchMembers()).statusCode).toBe(403);
+    expect(enqueueMemberInvoiceBatch).not.toHaveBeenCalled();
   });
 });
 
@@ -350,16 +534,23 @@ describe('site-restricted users (a fleet invoice spans sites)', () => {
 
       const preview = await get(`/fleets/${FLEET_ID}/billing/unbilled?period=2026-09`);
       const generated = await generate();
+      const member = await generateMember();
+      const batch = await batchMembers();
       const listed = await get(`/fleets/${FLEET_ID}/invoices`);
       const filtered = await get(`/invoices?fleetId=${FLEET_ID}`);
 
-      for (const res of [preview, generated, listed, filtered]) {
+      for (const res of [preview, generated, member, batch, listed]) {
         expect(res.statusCode).toBe(404);
         expect(res.json()).toMatchObject({ code: 'FLEET_NOT_FOUND' });
       }
+      // The invoice list spans sites whatever the filter.
+      expect(filtered.statusCode).toBe(404);
+      expect(filtered.json()).toMatchObject({ code: 'INVOICE_NOT_FOUND' });
       expect(previewFleetInvoice).not.toHaveBeenCalled();
       expect(createFleetInvoice).not.toHaveBeenCalled();
-      expect(sendFleetInvoiceEmail).not.toHaveBeenCalled();
+      expect(createMemberInvoice).not.toHaveBeenCalled();
+      expect(enqueueMemberInvoiceBatch).not.toHaveBeenCalled();
+      expect(sendAccountInvoiceEmail).not.toHaveBeenCalled();
     },
   );
 });
@@ -371,15 +562,15 @@ describe('GET /invoices without a fleetId filter', () => {
   it.each([
     ['assigned to some sites', ['sit_000000000001']],
     ['assigned to no site', []],
-  ])('leaves fleet invoices and credit notes out for a user %s', async (_label, ids) => {
+  ])('answers 404 INVOICE_NOT_FOUND for a user %s: invoices span sites', async (_label, ids) => {
     siteAccess.siteIds = ids;
-    listRows.rows = [];
-    listRows.total = 0;
+    listRows.rows = [{ ...invoiceRow(), fleetName: 'Acme Logistics' }];
+    listRows.total = 1;
 
     const res = await list();
 
-    expect(res.statusCode).toBe(200);
-    expect(isNull).toHaveBeenCalledWith(invoices.fleetId);
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'INVOICE_NOT_FOUND' });
   });
 
   it('lists every invoice for a user with access to every site', async () => {
@@ -390,13 +581,14 @@ describe('GET /invoices without a fleetId filter', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ total: 1, data: [{ id: INVOICE_ID, fleetId: FLEET_ID }] });
-    expect(isNull).not.toHaveBeenCalledWith(invoices.fleetId);
   });
 });
 
 describe('GET /fleets/:id/invoices', () => {
   it("lists the fleet's invoices and credit notes", async () => {
-    listRows.rows = [{ ...invoiceRow(), fleetName: 'Acme Logistics', sentAt: null }];
+    listRows.rows = [
+      { ...invoiceRow(), fleetName: 'Acme Logistics', driverName: null, sentAt: null },
+    ];
     listRows.total = 1;
     joined.tables = [];
     const res = await app.inject({
@@ -411,5 +603,33 @@ describe('GET /fleets/:id/invoices', () => {
     });
     // The list selects fleets.name, so the query must join fleets.
     expect(joined.tables).toContainEqual({ __table: 'fleets', id: { name: 'id' } });
+    // ...and the member invoice's driver name, so it joins drivers.
+    expect(joined.tables).toContainEqual({ __table: 'drivers', id: { name: 'id' } });
+  });
+
+  it('lists member invoices with the driver name and filters by recipient', async () => {
+    listRows.rows = [
+      {
+        ...invoiceRow({ driverId: DRIVER_ID, memberBilled: true }),
+        fleetName: 'Acme Logistics',
+        driverName: 'Anna Berg',
+      },
+    ];
+    listRows.total = 1;
+    const res = await app.inject({
+      method: 'GET',
+      url: `/fleets/${FLEET_ID}/invoices?recipient=member`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      data: [{ memberBilled: true, driverId: DRIVER_ID, driverName: 'Anna Berg' }],
+    });
+    const bad = await app.inject({
+      method: 'GET',
+      url: `/fleets/${FLEET_ID}/invoices?recipient=driver`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(bad.statusCode).toBe(400);
   });
 });

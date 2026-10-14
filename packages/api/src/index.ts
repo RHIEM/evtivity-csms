@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { FastifyServerOptions } from 'fastify';
-import { RedisPubSubClient, initSentry, logFormatOptions } from '@evtivity/lib';
-import { client, getSentryConfig } from '@evtivity/database';
+import { RedisPubSubClient, createLogger, initSentry, logFormatOptions } from '@evtivity/lib';
+import { client, getSentryConfig, guardPgConnectionRejections } from '@evtivity/database';
 import { createShutdownHandler } from './lib/process-shutdown.js';
+import { closeJobQueues, initJobQueues } from '@evtivity/lib/job-queues';
 import { buildApp } from './app.js';
 import { config } from './lib/config.js';
 import { setPubSub } from '@evtivity/lib/pubsub-instance';
@@ -14,8 +15,12 @@ import {
   stopMetricsCollector,
 } from './services/metrics-collector.service.js';
 import { startCacheInvalidateListener } from './services/cache-invalidate-listener.js';
+import { reportPricingGroupsWithoutDefault } from './lib/pricing-default-report.js';
 
 async function start(): Promise<void> {
+  // A backend terminated while postgres.js fetches its array types must not end
+  // the process (pg-connection-rejections.ts).
+  guardPgConnectionRejections(createLogger('api'));
   const sentryConfig = await getSentryConfig();
   initSentry('evtivity-api', sentryConfig);
 
@@ -42,6 +47,11 @@ async function start(): Promise<void> {
     };
   }
 
+  // Requests that must reach the worker even while it is stopped add their
+  // BullMQ jobs to its queues directly (the api Redis user may write only
+  // those queues), so the queues are ready before the first request.
+  initJobQueues(config.REDIS_URL);
+
   const app = await buildApp(opts);
 
   registerHttpMetrics(app);
@@ -57,15 +67,16 @@ async function start(): Promise<void> {
   // same TransactionStarted event and create duplicate payment_records.
   // dev:worker is required for guest charging in dev mode.
 
-  // Station screen renders (station_message_refresh / station_message_transaction)
-  // run in the worker through the station-messages queue, once per event across
-  // replicas (station-message-worker.ts), not in every API pod.
+  // Station screen renders run in the worker through the station-messages
+  // queue, once per event across replicas (station-message-worker.ts), not in
+  // every API pod.
   const cacheInvalidateSubscription = await startCacheInvalidateListener(app.log);
 
   app.addHook('onClose', async () => {
     stopMetricsCollector();
     await stopMetricsServer();
     await cacheInvalidateSubscription.unsubscribe();
+    await closeJobQueues();
     await pubsub.close();
   });
 
@@ -82,6 +93,7 @@ async function start(): Promise<void> {
 
   await app.listen({ port: config.API_PORT, host: config.API_HOST });
   app.log.info(`API server listening on ${config.API_HOST}:${String(config.API_PORT)}`);
+  await reportPricingGroupsWithoutDefault(client, app.log);
 }
 
 start().catch((err: unknown) => {
