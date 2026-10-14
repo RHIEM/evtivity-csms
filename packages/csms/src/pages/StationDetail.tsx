@@ -23,6 +23,9 @@ import { StationDisplayMessages } from '@/components/StationDisplayMessages';
 import { StationCertificates } from '@/components/StationCertificates';
 import { StationLocalAuthList } from '@/components/StationLocalAuthList';
 import { AuthorizeLogView } from '@/components/AuthorizeLogView';
+import { ExplainButton } from '@/components/ai/ExplainButton';
+import { RecordInsight } from '@/components/ai/insights/RecordInsight';
+import { RecordInsightsTab } from '@/components/ai/insights/RecordInsightsTab';
 import { MeterValuesTable } from '@/components/MeterValuesTable';
 import { StationEventsTab } from '@/components/StationEventsTab';
 import { StationConfigurationsTab } from '@/components/StationConfigurationsTab';
@@ -40,9 +43,12 @@ import { StationSimulatorConflict } from '@/components/station/StationSimulatorC
 import { api } from '@/lib/api';
 import { useFeatureFlags } from '@/hooks/use-feature-flags';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { DisableButton } from '@/components/disable-button';
+import { EnableButton } from '@/components/enable-button';
 import { useToast } from '@/components/ui/toast';
 import { getErrorMessage } from '@/lib/error-message';
 import { StationStatusBadge } from '@/components/StationStatusBadge';
+import { StationChargingNeedsTab } from '@/components/StationChargingNeedsTab';
 import { useHasPermission } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
 
@@ -120,8 +126,9 @@ export function StationDetail(): React.JSX.Element {
   });
 
   const {
-    flags: { guestChargingEnabled, reservationEnabled },
+    flags: { guestChargingEnabled, reservationEnabled, aiInsightsEnabled },
   } = useFeatureFlags();
+  const showInsightsTab = useHasPermission('aiInsights:read') && aiInsightsEnabled;
   const sites = sitesResponse?.data;
 
   const { data: station, isLoading } = useQuery({
@@ -185,14 +192,15 @@ export function StationDetail(): React.JSX.Element {
 
   const siteTimezone = sites?.find((s) => s.id === station.siteId)?.timezone ?? 'America/New_York';
   const availabilityActions = stationAvailabilityActions(station);
+  const explainContext = { kind: 'station' as const, id: station.id, label: station.stationId };
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
-        <div className="flex items-center gap-4">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
           <BackButton to="/stations" />
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold">{station.stationId}</h1>
+          <div className="min-w-0">
+            <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{station.stationId}</h1>
             <CopyableId id={station.id} />
           </div>
           <Badge variant={station.isOnline ? 'success' : 'destructive'}>
@@ -208,26 +216,28 @@ export function StationDetail(): React.JSX.Element {
             <Badge variant="destructive">{t('status.blocked')}</Badge>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        {/* items-start: the buttons line up with the Prev and Next buttons, not their labels. */}
+        <div className="flex flex-wrap items-start gap-2" data-testid="station-header-actions">
+          {(!station.isOnline || station.status === 'faulted') && (
+            <ExplainButton context={explainContext} size="header" />
+          )}
           {canWriteStations && availabilityActions.enable && (
-            <Button
-              variant="outline"
+            <EnableButton
+              label={t('stations.enableStation')}
+              size="header"
               onClick={() => {
                 setAvailabilityConfirm('available');
               }}
-            >
-              {t('stations.enableStation')}
-            </Button>
+            />
           )}
           {canWriteStations && availabilityActions.disable && (
-            <Button
-              variant="outline"
+            <DisableButton
+              label={t('stations.disableStation')}
+              size="header"
               onClick={() => {
                 setAvailabilityConfirm('unavailable');
               }}
-            >
-              {t('stations.disableStation')}
-            </Button>
+            />
           )}
           <EntityNavButtons resource="stations" basePath="/stations" currentId={id} />
         </div>
@@ -315,6 +325,15 @@ export function StationDetail(): React.JSX.Element {
         </Card>
       )}
 
+      {showInsightsTab && (
+        <RecordInsight
+          filter={{ stationId: station.id }}
+          onOpen={() => {
+            setDetailsTab('ai-insights');
+          }}
+        />
+      )}
+
       <Tabs value={detailsTab} onValueChange={setDetailsTab}>
         <TabsList>
           <TabsTrigger value="info">{t('common.details')}</TabsTrigger>
@@ -336,8 +355,11 @@ export function StationDetail(): React.JSX.Element {
             <TabsTrigger value="events">{t('stations.events')}</TabsTrigger>
           )}
           <TabsTrigger value="configurations">{t('stations.configurations')}</TabsTrigger>
-          <TabsTrigger value="firmware-history">{t('stations.firmwareHistory')}</TabsTrigger>
+          <TabsTrigger value="firmware-history">{t('stations.firmwareUpdates')}</TabsTrigger>
           <TabsTrigger value="charging-profiles">{t('stations.chargingProfiles')}</TabsTrigger>
+          {station.ocppProtocol !== 'ocpp1.6' && (
+            <TabsTrigger value="charging-needs">{t('stations.chargingNeedsTab')}</TabsTrigger>
+          )}
           <TabsTrigger value="qr">{t('stations.qrCodes')}</TabsTrigger>
           <TabsTrigger value="pricing">{t('stations.pricing')}</TabsTrigger>
           <TabsTrigger value="local-auth">{t('stations.localAuthList')}</TabsTrigger>
@@ -346,6 +368,9 @@ export function StationDetail(): React.JSX.Element {
           )}
           {reservationEnabled && (
             <TabsTrigger value="reservations">{t('reservations.title')}</TabsTrigger>
+          )}
+          {showInsightsTab && (
+            <TabsTrigger value="ai-insights">{t('aiInsights.list.title')}</TabsTrigger>
           )}
           {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
@@ -447,6 +472,16 @@ export function StationDetail(): React.JSX.Element {
           />
         </TabsContent>
 
+        {station.ocppProtocol !== 'ocpp1.6' && (
+          <TabsContent value="charging-needs" className="space-y-6">
+            <StationChargingNeedsTab
+              stationId={station.id}
+              isOnline={station.isOnline}
+              timezone={siteTimezone}
+            />
+          </TabsContent>
+        )}
+
         <TabsContent value="qr">
           <StationQrTab
             stationId={id ?? ''}
@@ -499,6 +534,11 @@ export function StationDetail(): React.JSX.Element {
           </TabsContent>
         )}
 
+        {showInsightsTab && (
+          <TabsContent value="ai-insights">
+            <RecordInsightsTab filter={{ stationId: station.id }} />
+          </TabsContent>
+        )}
         <TabsContent value="history">
           <EntityHistoryTab entityType="station" entityId={station.id} />
         </TabsContent>

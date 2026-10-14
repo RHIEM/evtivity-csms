@@ -10,7 +10,7 @@ const { patchMock, getMock, toastMock, permission } = vi.hoisted(() => ({
   patchMock: vi.fn(),
   getMock: vi.fn(),
   toastMock: vi.fn(),
-  permission: { canWrite: true },
+  permission: { canWrite: true, allSites: true },
 }));
 
 vi.mock('react-i18next', () => ({
@@ -29,10 +29,15 @@ vi.mock('@/lib/api', () => {
       super(`API error ${String(status)}`);
     }
   }
-  return { api: { patch: patchMock, get: getMock, delete: vi.fn() }, ApiError };
+  const getApiErrorCode = (err: unknown): string | null =>
+    err instanceof ApiError ? ((err.body as { code?: string } | null)?.code ?? null) : null;
+  return { api: { patch: patchMock, get: getMock, delete: vi.fn() }, ApiError, getApiErrorCode };
 });
 
-vi.mock('@/lib/auth', () => ({ useHasPermission: () => permission.canWrite }));
+vi.mock('@/lib/auth', () => ({
+  useHasPermission: () => permission.canWrite,
+  useHasAllSiteAccess: () => permission.allSites,
+}));
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast: toastMock }) }));
 vi.mock('@/lib/timezone', () => ({
   useUserTimezone: () => 'UTC',
@@ -58,6 +63,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   permission.canWrite = true;
+  permission.allSites = true;
 });
 
 describe('FleetBillingTab', () => {
@@ -87,6 +93,70 @@ describe('FleetBillingTab', () => {
     expect(screen.getByText('fleets.billing.on')).toBeTruthy();
     fireEvent.click(screen.getByRole('switch', { name: 'fleets.billing.chargeOnAccount' }));
     expect(screen.getByText('fleets.billing.disableConfirm')).toBeTruthy();
+  });
+
+  it('switches the invoice recipient to each driver after confirmation', async () => {
+    patchMock.mockResolvedValueOnce({ id: 'flt_1', accountInvoiceRecipient: 'member' });
+    wrap(
+      <FleetBillingTab
+        fleet={{ id: 'flt_1', accountBillingEnabled: true, accountInvoiceRecipient: 'fleet' }}
+      />,
+    );
+    expect(screen.getByText('fleets.billing.recipientHelpFleet')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('fleets.billing.invoiceTo'), {
+      target: { value: 'member' },
+    });
+    expect(screen.getByText('fleets.billing.recipientConfirmMember')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'fleets.billing.recipientChange' }));
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith('/v1/fleets/flt_1/billing', {
+        accountInvoiceRecipient: 'member',
+      });
+    });
+  });
+
+  it('shows the old-release refusal inline instead of a toast', async () => {
+    const { ApiError } = await import('@/lib/api');
+    patchMock.mockRejectedValueOnce(
+      new ApiError(409, {
+        error: 'A process older than v0.1.46 is still connected.',
+        code: 'FLEET_BILLING_OLD_PODS_CONNECTED',
+      }),
+    );
+    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
+    fireEvent.change(screen.getByLabelText('fleets.billing.invoiceTo'), {
+      target: { value: 'member' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'fleets.billing.recipientChange' }));
+    expect(await screen.findByTestId('fleet-billing-upgrade-error')).toBeTruthy();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it('shows the stale version check refusal inline with its own message', async () => {
+    const { ApiError } = await import('@/lib/api');
+    patchMock.mockRejectedValueOnce(
+      new ApiError(409, {
+        error: "The worker's process version check has not run recently.",
+        code: 'FLEET_BILLING_VERSION_CHECK_STALE',
+      }),
+    );
+    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
+    fireEvent.change(screen.getByLabelText('fleets.billing.invoiceTo'), {
+      target: { value: 'member' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'fleets.billing.recipientChange' }));
+    const notice = await screen.findByTestId('fleet-billing-upgrade-error');
+    expect(notice.textContent).toContain('process version check has not run recently');
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it('disables the recipient select without fleets:write', () => {
+    permission.canWrite = false;
+    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountInvoiceRecipient: 'member' }} />);
+    const select = screen.getByLabelText<HTMLSelectElement>('fleets.billing.invoiceTo');
+    expect(select.disabled).toBe(true);
+    expect(select.value).toBe('member');
+    expect(screen.getByText('fleets.billing.recipientHelpMember')).toBeTruthy();
   });
 
   it('disables the switch without fleets:write', () => {
@@ -135,6 +205,17 @@ describe('FleetDriversTab member billing', () => {
     const toggle = await screen.findByTestId('member-billing-drv_1');
     expect(toggle.getAttribute('aria-checked')).toBe('false');
   });
+
+  it('hides member changes and disables the opt-out for a site-restricted user', async () => {
+    permission.allSites = false;
+    getMock.mockResolvedValue({ data: [member], total: 1 });
+    wrap(<FleetDriversTab fleetId="flt_1" accountBillingEnabled canManageMembers={false} />);
+
+    const toggle = await screen.findByTestId('member-billing-drv_1');
+    expect(toggle.hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText('fleets.membersAllSitesOnly')).toBeTruthy();
+    expect(screen.queryByText('fleets.addDriver')).toBeNull();
+  });
 });
 
 describe('DriverBillingCard', () => {
@@ -168,6 +249,23 @@ describe('DriverBillingCard', () => {
     expect(screen.getByTestId('driver-pricing-override').textContent).toBe(
       'drivers.billing.pricingDriverGroup',
     );
+  });
+
+  it('shows that an account driver is invoiced personally', () => {
+    wrap(
+      <DriverBillingCard
+        billing={{
+          mode: 'account',
+          billingFleet: { id: 'flt_1', name: 'Acme' },
+          pricingFleet: null,
+          invoicedTo: 'member',
+        }}
+      />,
+    );
+    expect(screen.getByTestId('driver-invoiced-to').textContent).toBe(
+      'drivers.billing.invoicedToMember',
+    );
+    expect(screen.getByText('drivers.billing.helpAccountMember')).toBeTruthy();
   });
 
   it('shows card without fleets', () => {

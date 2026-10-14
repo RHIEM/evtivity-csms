@@ -28,6 +28,7 @@ import {
   sites,
 } from '@evtivity/database';
 import { checkStationOnboarded } from '../../lib/onboarding-gate.js';
+import { publicStationListed } from '../../lib/public-station.js';
 import { zodSchema } from '../../lib/zod-schema.js';
 import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
@@ -35,6 +36,7 @@ import { scheduleGuestStartTimeout } from '../../lib/remote-start-timeout.js';
 import { successResponse, itemResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
+import { commandOutcome, recordStationCommandAudit } from '../../lib/station-command-audit.js';
 import { sendStatusCheckError, triggerAndWaitForStatus } from '../../lib/station-status-check.js';
 import {
   isStationCheckRateLimited,
@@ -49,6 +51,7 @@ import {
   guestHoldTerms,
   rollbackGuestStart,
 } from '@evtivity/payments';
+import type { PaymentActor } from '@evtivity/payments';
 import { activePaymentProvider, paymentContext } from '../../lib/payments.js';
 import { sessionLimitReached } from '../../lib/session-limit.js';
 import { config as apiConfig } from '../../lib/config.js';
@@ -60,6 +63,9 @@ import {
 import { isEvseInReservationBuffer } from '../../lib/reservation-buffer.js';
 import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
 import { validateQrCodeUrl } from '../../services/web-payment.service.js';
+
+/** Guests have no account: their payment writes name `system`, label `guest`. */
+const GUEST_PAYMENT_ACTOR: PaymentActor = { actor: 'system', actorLabel: 'guest' };
 
 const guestPricingInfo = z
   .object({
@@ -343,6 +349,44 @@ const qrValidateResponse = z
   })
   .passthrough();
 
+/**
+ * Records a guest start or stop on the station's audit log
+ * (`station.command_dispatched`, actor `system` labelled `guest`). A guest
+ * session names its station by OCPP identity, so the internal id is looked up.
+ * Fail-open: a failed lookup is logged and the command goes on.
+ */
+async function auditGuestCommand(
+  input: {
+    stationOcppId: string;
+    command: string;
+    sessionId: string | null;
+    evseId?: number;
+    outcome: string;
+  },
+  log: FastifyBaseLogger,
+): Promise<void> {
+  try {
+    const [station] = await db
+      .select({ id: chargingStations.id })
+      .from(chargingStations)
+      .where(eq(chargingStations.stationId, input.stationOcppId));
+    if (station == null) return;
+    await recordStationCommandAudit(
+      {
+        stationId: station.id,
+        actor: { actor: 'system', actorLabel: 'guest' },
+        command: input.command,
+        sessionId: input.sessionId,
+        ...(input.evseId != null ? { evseId: input.evseId } : {}),
+        outcome: input.outcome,
+      },
+      log,
+    );
+  } catch (err) {
+    log.warn({ err, stationOcppId: input.stationOcppId }, 'guest command audit failed');
+  }
+}
+
 interface GuestStartFailure {
   statusCode: 502 | 504;
   body: { error: string; code: string };
@@ -369,6 +413,16 @@ async function dispatchGuestStart(
       type: input.paymentId != null ? 'DirectPayment' : 'Central',
     },
   });
+  await auditGuestCommand(
+    {
+      stationOcppId: input.stationOcppId,
+      command: 'RequestStartTransaction',
+      sessionId: null,
+      evseId: input.evseId,
+      outcome: commandOutcome(cmdResult),
+    },
+    log,
+  );
   const cmdStatus = cmdResult.response?.['status'] as string | undefined;
   if (cmdResult.error == null && cmdStatus === 'Accepted') {
     // Closes the start if the guest never plugs in (no transaction by the
@@ -379,7 +433,7 @@ async function dispatchGuestStart(
 
   await rollbackGuestStart(
     { sessionToken: input.sessionToken, paymentId: input.paymentId },
-    paymentContext(log),
+    paymentContext(log, GUEST_PAYMENT_ACTOR),
   );
   if (cmdResult.error != null) {
     return { statusCode: 504, body: { error: 'Station did not respond', code: 'STATION_TIMEOUT' } };
@@ -465,7 +519,7 @@ export function portalGuestRoutes(app: FastifyInstance): void {
           ocppProtocol: chargingStations.ocppProtocol,
         })
         .from(chargingStations)
-        .where(eq(chargingStations.stationId, stationId));
+        .where(and(eq(chargingStations.stationId, stationId), publicStationListed()));
 
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
@@ -555,7 +609,7 @@ export function portalGuestRoutes(app: FastifyInstance): void {
         })
         .from(chargingStations)
         .leftJoin(sites, eq(chargingStations.siteId, sites.id))
-        .where(eq(chargingStations.stationId, params.stationId));
+        .where(and(eq(chargingStations.stationId, params.stationId), publicStationListed()));
 
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
@@ -625,7 +679,11 @@ export function portalGuestRoutes(app: FastifyInstance): void {
         };
       }
       const [terms, countryCode] = await Promise.all([
-        guestHoldTerms(paymentContext(request.log), station.siteId ?? null, params.stationId),
+        guestHoldTerms(
+          paymentContext(request.log, GUEST_PAYMENT_ACTOR),
+          station.siteId ?? null,
+          params.stationId,
+        ),
         getCompanyCountry(),
       ]);
       const clientConfig = provider.clientConfig();
@@ -718,12 +776,16 @@ export function portalGuestRoutes(app: FastifyInstance): void {
           onboardingStatus: chargingStations.onboardingStatus,
         })
         .from(chargingStations)
-        .where(eq(chargingStations.stationId, params.stationId));
+        // A pending or blocked station answers like an unknown one.
+        .where(and(eq(chargingStations.stationId, params.stationId), publicStationListed()));
 
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
+
+      // Second layer (P11): the onboarding gate runs before any other state.
+      if (!(await checkStationOnboarded(station, reply))) return;
 
       const guestActiveMaintenance = await getActiveMaintenanceForStation(station.id);
       if (guestActiveMaintenance != null) {
@@ -734,8 +796,6 @@ export function portalGuestRoutes(app: FastifyInstance): void {
         });
         return;
       }
-
-      if (!(await checkStationOnboarded(station, reply))) return;
 
       if (!station.isOnline) {
         await reply.status(400).send({ error: 'Station is offline', code: 'STATION_OFFLINE' });
@@ -937,7 +997,7 @@ export function portalGuestRoutes(app: FastifyInstance): void {
             maxTimeSeconds: body.maxTimeSeconds ?? null,
             expiresAt,
           },
-          paymentContext(request.log),
+          paymentContext(request.log, GUEST_PAYMENT_ACTOR),
         );
         if (hold.outcome === 'not_configured') {
           await reply.status(400).send({
@@ -1011,7 +1071,7 @@ export function portalGuestRoutes(app: FastifyInstance): void {
 
       const continued = await continueGuestHold(
         { sessionToken, details: body.details },
-        paymentContext(request.log),
+        paymentContext(request.log, GUEST_PAYMENT_ACTOR),
       );
       if (continued.outcome === 'not_configured') {
         await reply.status(400).send({
@@ -1222,6 +1282,16 @@ export function portalGuestRoutes(app: FastifyInstance): void {
           transactionId: session.transactionId,
         },
       });
+      await auditGuestCommand(
+        {
+          stationOcppId: guest.stationOcppId,
+          command: 'RequestStopTransaction',
+          sessionId: guest.chargingSessionId,
+          evseId: guest.evseId,
+          outcome: 'sent',
+        },
+        request.log,
+      );
 
       return { success: true };
     },

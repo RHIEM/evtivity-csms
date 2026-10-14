@@ -13,6 +13,7 @@ import { Toggle } from '@/components/ui/toggle';
 import { LanguageSelect } from '@/components/ui/language-select';
 import { TemplateEditPanel, type TemplateEditPanelHandle } from '@/components/TemplateEditPanel';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { TEMPLATE_VARIABLES, COMMON_VARIABLES } from '@/lib/template-variables';
 
@@ -84,6 +85,9 @@ export function EventSettingsLayout({
 }: EventSettingsLayoutProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // Template and event setting writes are company-wide: the API answers 404 to a
+  // site-restricted user. Templates stay readable.
+  const canWrite = useHasCompanyWidePermission('notifications:write');
 
   const [selectedEvent, setSelectedEvent] = useState('');
   const [channelChoice, setChannel] = useState<string>(channels[0] ?? 'email');
@@ -141,6 +145,7 @@ export function EventSettingsLayout({
     setSwitchSaving(true);
     try {
       await eventSwitch.onChange(et, enabled);
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'notification_template'] });
       setStatusMessage({
         success: enabled ? t('notifications.eventTurnedOn') : t('notifications.eventTurnedOff'),
         error: '',
@@ -175,7 +180,7 @@ export function EventSettingsLayout({
               {sections.map((section) => (
                 <div key={section.title}>
                   {
-                    <p className="text-xs font-semibold text-primary/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded bg-primary/5 border border-primary/10">
+                    <p className="text-xs font-semibold text-link/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded bg-primary/5 border border-primary/10">
                       {section.title}
                     </p>
                   }
@@ -256,23 +261,27 @@ export function EventSettingsLayout({
                     >
                       {t('notifications.preview')}
                     </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() => {
-                        templatePanelRef.current?.reset();
-                      }}
-                      disabled={templatePanelRef.current?.isPending}
-                    >
-                      {t('notifications.resetToDefault')}
-                    </Button>
-                    <Button
-                      onClick={() => {
-                        templatePanelRef.current?.save();
-                      }}
-                      disabled={!isDirty || templatePanelRef.current?.isPending}
-                    >
-                      {t('notifications.save')}
-                    </Button>
+                    {canWrite && (
+                      <Button
+                        variant="outline"
+                        onClick={() => {
+                          templatePanelRef.current?.reset();
+                        }}
+                        disabled={templatePanelRef.current?.isPending}
+                      >
+                        {t('notifications.resetToDefault')}
+                      </Button>
+                    )}
+                    {canWrite && (
+                      <Button
+                        onClick={() => {
+                          templatePanelRef.current?.save();
+                        }}
+                        disabled={!isDirty || templatePanelRef.current?.isPending}
+                      >
+                        {t('notifications.save')}
+                      </Button>
+                    )}
                   </div>
                 </div>
                 <Card>
@@ -300,8 +309,15 @@ export function EventSettingsLayout({
                               <div className="flex h-10 items-center">
                                 <Toggle
                                   id="event-switch"
+                                  // The visible label is the state (Active or Inactive); the
+                                  // name says what the switch controls.
+                                  aria-label={t('notifications.eventToggleLabel', {
+                                    event: selectedEvent,
+                                  })}
                                   checked={on}
-                                  disabled={required || !eventSwitch.canEdit || switchSaving}
+                                  disabled={
+                                    required || !eventSwitch.canEdit || !canWrite || switchSaving
+                                  }
                                   onCheckedChange={(next) => {
                                     void changeEventSwitch(selectedEvent, next);
                                   }}
@@ -340,27 +356,21 @@ export function EventSettingsLayout({
                             {isActive ? t('common.active') : t('common.inactive')}
                           </Label>
                           <div className="flex h-10 items-center">
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-checked={isActive}
-                              onClick={() => {
+                            <Toggle
+                              aria-label={t('notifications.channelToggleLabel', {
+                                event: selectedEvent,
+                                channel: CHANNEL_LABELS[channel] ?? channel,
+                              })}
+                              checked={isActive}
+                              disabled={!canWrite}
+                              onCheckedChange={() => {
                                 setLocalToggle((prev) => {
                                   const next = new Map(prev);
                                   next.set(toggleKey, !isActive);
                                   return next;
                                 });
                               }}
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
-                                isActive ? 'bg-primary' : 'bg-muted'
-                              }`}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-background shadow-lg ring-0 transition-transform ${
-                                  isActive ? 'translate-x-4' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
+                            />
                           </div>
                         </div>
                       )}
@@ -402,6 +412,9 @@ export function EventSettingsLayout({
                               `${toggleEndpoint}?eventType=${encodeURIComponent(selectedEvent)}&channel=${encodeURIComponent(channel)}`,
                             );
                             await queryClient.refetchQueries({ queryKey: toggleQueryKey });
+                            void queryClient.invalidateQueries({
+                              queryKey: ['audit', 'notification_template'],
+                            });
                             setStatusMessage({
                               success: t('notifications.templateDeactivated'),
                               error: '',

@@ -16,7 +16,9 @@ import { api, ApiError } from '@/lib/api';
 import { isRateLimited } from '@/lib/error-message';
 import { executeRecaptcha } from '@/lib/recaptcha';
 import { MfaChallenge } from '@/components/MfaChallenge';
+import { readSsoMfaFragment } from '@/lib/sso-mfa';
 import { API_BASE_URL } from '@/lib/config';
+import { rememberReturnTo, takeReturnTo } from '@/lib/return-to';
 
 const DEV_AUTO_LOGIN = import.meta.env.VITE_CSMS_AUTO_LOGIN;
 
@@ -43,6 +45,7 @@ export function Login(): React.JSX.Element {
   const navigate = useNavigate();
   const login = useAuth((s) => s.login);
   const mfaPending = useAuth((s) => s.mfaPending);
+  const setMfaPending = useAuth((s) => s.setMfaPending);
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -53,6 +56,15 @@ export function Login(): React.JSX.Element {
 
   const [searchParams] = useSearchParams();
   const { companyName, companyLogo, portalUrl, themeColor } = useAuthBranding();
+
+  // An SSO login of a user with MFA lands here with the MFA pending state in
+  // the URL fragment: show the MFA challenge and drop the token from the URL.
+  useEffect(() => {
+    const pending = readSsoMfaFragment(window.location.hash);
+    if (pending == null) return;
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    setMfaPending(pending);
+  }, [setMfaPending]);
 
   // Handle SSO error query params
   useEffect(() => {
@@ -73,9 +85,15 @@ export function Login(): React.JSX.Element {
     queryFn: () => api.get<SecurityPublic>('/v1/security/public'),
   });
 
+  // A protected deep link sent the user here with ?returnTo=; keep it across
+  // MFA and the SSO round trip (lib/return-to.ts).
+  useEffect(() => {
+    rememberReturnTo(searchParams);
+  }, [searchParams]);
+
   useEffect(() => {
     if (isAuthenticated) {
-      void navigate('/');
+      void navigate(takeReturnTo() ?? '/', { replace: true });
     }
   }, [isAuthenticated, navigate]);
 
@@ -214,10 +232,7 @@ export function Login(): React.JSX.Element {
               {loading ? t('auth.signingIn') : t('auth.signIn')}
             </Button>
             <div className="text-center">
-              <Link
-                to="/forgot-password"
-                className="text-sm font-medium text-primary hover:underline"
-              >
+              <Link to="/forgot-password" className="text-sm font-medium text-link hover:underline">
                 {t('auth.forgotPassword')}
               </Link>
             </div>

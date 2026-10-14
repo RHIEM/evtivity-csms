@@ -9,9 +9,10 @@ import {
   chargingStations,
   getStaleSessionTimeoutHours,
   writeReservationAudit,
-  closeOpenSegment,
+  closeSegmentsAt,
   faultUnbilledSession,
   sessionIdleMinutesAt,
+  writeCsmsSessionAudit,
 } from '@evtivity/database';
 import { publishOcppCommand } from '@evtivity/lib';
 import { cancelOpenSessionHold } from '@evtivity/payments';
@@ -70,16 +71,6 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       const endedAt = session.updatedAt;
       const energyWh = Number(session.energyDeliveredWh ?? 0);
 
-      // Close the open tariff segment at the last update, so the segment
-      // trail shows how long the session ran.
-      if (session.tariffId != null && session.startedAt != null) {
-        const idleMinutes = sessionIdleMinutesAt(
-          { idleStartedAt: session.idleStartedAt, idleMinutes: Number(session.idleMinutes) },
-          endedAt,
-        );
-        await closeOpenSegment(client, session.id, endedAt, energyWh, idleMinutes);
-      }
-
       // A stale session is faulted and not billed (owner decision, audit
       // N6): its cost is zeroed with the status, like the payment gate's stop
       // (P4). A session that ended meanwhile keeps its own end and cost (P5).
@@ -90,6 +81,17 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
         endedAt,
       });
 
+      // The tariff segments end at the last update, so the segment trail
+      // shows how long the session ran. Only when this run faulted it: a
+      // session that ended meanwhile keeps the segments its end closed.
+      if (faulted && session.tariffId != null && session.startedAt != null) {
+        const idleMinutes = sessionIdleMinutesAt(
+          { idleStartedAt: session.idleStartedAt, idleMinutes: Number(session.idleMinutes) },
+          endedAt,
+        );
+        await closeSegmentsAt(client, session.id, endedAt, energyWh, idleMinutes);
+      }
+
       // Its open hold (a portal start whose 1.6 ConnectionTimeOut expired, a
       // session the station lost) is cancelled now instead of staying held
       // until the provider expires it (P4). Only when this run faulted it.
@@ -97,7 +99,11 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       // at the provider.
       if (faulted) {
         try {
-          await cancelOpenSessionHold(session.id, 'Stale session faulted', paymentContext(log));
+          await cancelOpenSessionHold(
+            session.id,
+            'Stale session faulted',
+            paymentContext(log, 'stale-session-cleanup'),
+          );
         } catch (holdErr: unknown) {
           log.warn(
             { sessionId: session.id, err: holdErr },
@@ -129,6 +135,7 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       }
 
       // Send RequestStopTransaction to online stations to clear the station-side transaction
+      let stopSent = false;
       if (session.stationIsOnline) {
         try {
           await publishOcppCommand(getPubSub(), {
@@ -137,6 +144,7 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
             payload: { transactionId: session.transactionId },
             version: session.ocppProtocol,
           });
+          stopSent = true;
           log.info(
             { sessionId: session.id, transactionId: session.transactionId },
             'Sent RequestStopTransaction for stale session on online station',
@@ -147,6 +155,28 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
             'Failed to send RequestStopTransaction for stale session',
           );
         }
+      }
+
+      // Only the run whose fault changed the session audits it (P7).
+      if (faulted) {
+        await writeCsmsSessionAudit(
+          {
+            sessionId: session.id,
+            action: 'faulted',
+            actor: 'system',
+            actorLabel: 'stale-session-cleanup',
+            before: { status: 'active' },
+            after: { status: 'faulted', stoppedReason: 'StaleSession', finalCostCents: 0 },
+            notes: [
+              `No update since ${session.updatedAt.toISOString()} (timeout ${String(timeoutHours)} h)`,
+              ...(stopSent
+                ? [`RequestStopTransaction sent for transaction ${session.transactionId}`]
+                : []),
+            ].join('; '),
+          },
+          undefined,
+          log,
+        );
       }
 
       log.info(

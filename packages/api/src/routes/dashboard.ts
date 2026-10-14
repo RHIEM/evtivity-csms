@@ -4,7 +4,13 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { sql, eq, and, gte, lte, count, inArray } from 'drizzle-orm';
-import { db, getSystemTimezone, getCompanyCurrency } from '@evtivity/database';
+import {
+  client,
+  db,
+  getSystemTimezone,
+  getCompanyCurrency,
+  getOcppFleetHealth,
+} from '@evtivity/database';
 import {
   chargingStations,
   chargingSessions,
@@ -12,7 +18,6 @@ import {
   evses,
   sites,
   paymentRecords,
-  ocppServerHealth,
   dashboardSnapshots,
 } from '@evtivity/database';
 import { ValidationError } from '@evtivity/lib';
@@ -26,6 +31,7 @@ import {
   sumRevenue,
   EMPTY_REVENUE,
   paymentsKeptCentsSql,
+  profitCents,
 } from '@evtivity/services/session-revenue';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -178,14 +184,36 @@ const financialStatsResponse = z
       .number()
       .int()
       .describe(
-        'Total revenue excluding tax minus total electricity cost, in cents (may be negative)',
+        'Total revenue excluding tax minus total electricity cost, in cents (may be negative). Sessions without an electricity cost (totalCostMissingSessionCount) are left out.',
       ),
     dayProfitCents: z
       .number()
       .int()
       .describe(
-        "Today's revenue excluding tax minus today's electricity cost, in cents (may be negative)",
+        "Today's revenue excluding tax minus today's electricity cost, in cents (may be negative). Sessions without an electricity cost are left out.",
       ),
+    totalCostMissingSessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Ended billed sessions that delivered energy but have no electricity cost (their site has no matching rate period, or the station has no site). Left out of profit.',
+      ),
+    totalCostMissingRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Revenue of those sessions in cents, tax included. Left out of profit.'),
+    dayCostMissingSessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Sessions of today without an electricity cost, left out of today profit'),
+    dayCostMissingRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Revenue of those sessions in cents, tax included'),
     billedOnAccountCents: z
       .number()
       .int()
@@ -252,6 +280,28 @@ const uptimeResponse = z
   })
   .passthrough();
 
+const ocppInstanceHealth = z
+  .object({
+    instanceId: z
+      .string()
+      .describe('OCPP server process instance ID (pod name, ECS task ID or hostname)'),
+    connectedStations: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Stations connected to this process via WebSocket'),
+    avgPingLatencyMs: z.number().min(0).describe('Average ping latency of this process in ms'),
+    maxPingLatencyMs: z.number().min(0).describe('Maximum ping latency of this process in ms'),
+    pingSuccessRate: z
+      .number()
+      .min(0)
+      .max(100)
+      .describe('Percentage of successful pings of this process (0-100)'),
+    serverStartedAt: z.coerce.date().describe('Timestamp when this process started'),
+    updatedAt: z.coerce.date().describe('Timestamp of the last health report of this process'),
+  })
+  .passthrough();
+
 const ocppHealthResponse = z
   .object({
     connectedStations: z
@@ -264,38 +314,51 @@ const ocppHealthResponse = z
       .number()
       .min(0)
       .nullable()
-      .describe('Average OCPP ping latency in milliseconds'),
+      .describe(
+        'Average OCPP ping latency in milliseconds over all OCPP server processes, weighted by connected stations',
+      ),
     maxPingLatencyMs: z
       .number()
       .min(0)
       .nullable()
-      .describe('Maximum OCPP ping latency in milliseconds'),
+      .describe('Maximum OCPP ping latency in milliseconds over all OCPP server processes'),
     pingSuccessRate: z
       .number()
       .min(0)
       .max(100)
       .nullable()
-      .describe('Percentage of successful pings (0-100)'),
+      .describe('Percentage of successful pings (0-100) over all OCPP server processes'),
     totalPingsSent: z
       .number()
       .int()
       .min(0)
       .nullable()
-      .describe('Total number of pings sent since OCPP server started'),
+      .describe('Pings sent by all running OCPP server processes since each started'),
     totalPongsReceived: z
       .number()
       .int()
       .min(0)
       .nullable()
-      .describe('Total number of pong responses received since OCPP server started'),
+      .describe('Pong responses received by all running OCPP server processes since each started'),
     serverStartedAt: z.coerce
       .date()
       .nullable()
-      .describe('Timestamp when the OCPP server process started'),
+      .describe('Start of the longest running OCPP server process'),
     updatedAt: z.coerce
       .date()
       .nullable()
       .describe('Timestamp when the health metrics were last updated'),
+    instanceCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Running OCPP server processes (each reported within the last 90 seconds)'),
+    instances: z
+      .array(ocppInstanceHealth)
+      .optional()
+      .describe(
+        'Health of each running OCPP server process, sorted by instance ID. Omitted for a user restricted to some sites.',
+      ),
   })
   .passthrough();
 
@@ -906,6 +969,10 @@ export function dashboardRoutes(app: FastifyInstance): void {
         dayElectricityCostCents: 0,
         totalProfitCents: 0,
         dayProfitCents: 0,
+        totalCostMissingSessionCount: 0,
+        totalCostMissingRevenueCents: 0,
+        dayCostMissingSessionCount: 0,
+        dayCostMissingRevenueCents: 0,
         billedOnAccountCents: 0,
         billedOnAccountCount: 0,
         currency,
@@ -937,17 +1004,17 @@ export function dashboardRoutes(app: FastifyInstance): void {
       }
 
       // Revenue (session-revenue.ts): ended sessions and reservation fees,
-      // minus refunds, split by today and earlier.
-      const [[costs], revenueByDay] = await Promise.all([
+      // minus refunds, split by today and earlier. The key is "true" for today.
+      const [[costs], revenueByKey] = await Promise.all([
         costQuery,
         queryRevenue({
           companyCurrency: currency,
-          key: sql`date_trunc('day', ${revenueItem.occurredAt} AT TIME ZONE ${tz}) = date_trunc('day', now() AT TIME ZONE ${tz})`,
+          key: sql`(date_trunc('day', ${revenueItem.occurredAt} AT TIME ZONE ${tz}) = date_trunc('day', now() AT TIME ZONE ${tz}))::text`,
           where: siteIds != null ? [revenueAtSites(siteIds)] : [],
         }),
       ]);
-      const todayRevenue = revenueByDay.get('true') ?? EMPTY_REVENUE;
-      const totalRevenue = sumRevenue(revenueByDay.values());
+      const todayRevenue = revenueByKey.get('true') ?? EMPTY_REVENUE;
+      const totalRevenue = sumRevenue(revenueByKey.values());
 
       const totalElectricityCostCents = costs?.totalElectricityCostCents ?? 0;
       const dayElectricityCostCents = costs?.dayElectricityCostCents ?? 0;
@@ -966,8 +1033,12 @@ export function dashboardRoutes(app: FastifyInstance): void {
         totalTransactions: totalRevenue.itemCount,
         totalElectricityCostCents,
         dayElectricityCostCents,
-        totalProfitCents: totalRevenue.netCents - totalElectricityCostCents,
-        dayProfitCents: todayRevenue.netCents - dayElectricityCostCents,
+        totalProfitCents: profitCents(totalRevenue, totalElectricityCostCents),
+        dayProfitCents: profitCents(todayRevenue, dayElectricityCostCents),
+        totalCostMissingSessionCount: totalRevenue.costMissingCount,
+        totalCostMissingRevenueCents: totalRevenue.costMissingGrossCents,
+        dayCostMissingSessionCount: todayRevenue.costMissingCount,
+        dayCostMissingRevenueCents: todayRevenue.costMissingGrossCents,
         billedOnAccountCents: totalRevenue.billedOnAccountCents,
         billedOnAccountCount: totalRevenue.billedOnAccountCount,
         currency,
@@ -1191,6 +1262,8 @@ export function dashboardRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Dashboard'],
         summary: 'Get OCPP WebSocket server health metrics',
+        description:
+          "connectedStations counts the online stations of the user's sites. The server process fields (ping statistics, start time, instance count) cover every station of the company, so a user restricted to some sites gets their empty values and no instances list.",
         operationId: 'getDashboardOcppHealth',
         security: [{ bearerAuth: [] }],
         response: { 200: itemResponse(ocppHealthResponse) },
@@ -1201,6 +1274,8 @@ export function dashboardRoutes(app: FastifyInstance): void {
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
 
+      // A restricted user gets the empty process statistics and no
+      // instances list: the OCPP processes are company infrastructure.
       const emptyHealth = {
         connectedStations: 0,
         avgPingLatencyMs: 0,
@@ -1210,6 +1285,7 @@ export function dashboardRoutes(app: FastifyInstance): void {
         totalPongsReceived: 0,
         serverStartedAt: null,
         updatedAt: null,
+        instanceCount: 0,
       };
 
       if (siteIds != null && siteIds.length === 0) return emptyHealth;
@@ -1224,31 +1300,39 @@ export function dashboardRoutes(app: FastifyInstance): void {
         .from(chargingStations)
         .where(and(...connectedConditions));
 
-      const [[connectedRow], [healthRow]] = await Promise.all([
+      // The OCPP process statistics are measured over every connected
+      // station, whatever its site, and name the server instances: company
+      // infrastructure, all-site users only.
+      if (siteIds != null) {
+        const [connectedRow] = await connectedQuery;
+        return { ...emptyHealth, connectedStations: connectedRow?.count ?? 0 };
+      }
+
+      // Ping stats aggregate the fresh row of every OCPP process.
+      const [[connectedRow], health] = await Promise.all([
         connectedQuery,
-        db
-          .select({
-            avgPingLatencyMs: ocppServerHealth.avgPingLatencyMs,
-            maxPingLatencyMs: ocppServerHealth.maxPingLatencyMs,
-            pingSuccessRate: ocppServerHealth.pingSuccessRate,
-            totalPingsSent: ocppServerHealth.totalPingsSent,
-            totalPongsReceived: ocppServerHealth.totalPongsReceived,
-            serverStartedAt: ocppServerHealth.serverStartedAt,
-            updatedAt: ocppServerHealth.updatedAt,
-          })
-          .from(ocppServerHealth)
-          .where(eq(ocppServerHealth.id, 'singleton')),
+        getOcppFleetHealth(client),
       ]);
 
       return {
         connectedStations: connectedRow?.count ?? 0,
-        avgPingLatencyMs: healthRow?.avgPingLatencyMs ?? 0,
-        maxPingLatencyMs: healthRow?.maxPingLatencyMs ?? 0,
-        pingSuccessRate: healthRow?.pingSuccessRate ?? 100,
-        totalPingsSent: healthRow?.totalPingsSent ?? 0,
-        totalPongsReceived: healthRow?.totalPongsReceived ?? 0,
-        serverStartedAt: healthRow?.serverStartedAt ?? null,
-        updatedAt: healthRow?.updatedAt ?? null,
+        avgPingLatencyMs: health.avgPingLatencyMs,
+        maxPingLatencyMs: health.maxPingLatencyMs,
+        pingSuccessRate: health.pingSuccessRate,
+        totalPingsSent: health.totalPingsSent,
+        totalPongsReceived: health.totalPongsReceived,
+        serverStartedAt: health.serverStartedAt,
+        updatedAt: health.updatedAt,
+        instanceCount: health.instanceCount,
+        instances: health.instances.map((i) => ({
+          instanceId: i.instanceId,
+          connectedStations: i.connectedStations,
+          avgPingLatencyMs: i.avgPingLatencyMs,
+          maxPingLatencyMs: i.maxPingLatencyMs,
+          pingSuccessRate: i.pingSuccessRate,
+          serverStartedAt: i.serverStartedAt,
+          updatedAt: i.updatedAt,
+        })),
       };
     },
   );
@@ -1282,7 +1366,9 @@ export function dashboardRoutes(app: FastifyInstance): void {
           name: sites.name,
           latitude: sites.latitude,
           longitude: sites.longitude,
-          stationCount: sql<number>`(SELECT count(*)::int FROM charging_stations WHERE charging_stations.site_id = ${sites.id})`,
+          // "sites"."id" written out: a single-table select renders the column
+          // unqualified, which inside the subquery names charging_stations.id.
+          stationCount: sql<number>`(SELECT count(*)::int FROM charging_stations WHERE charging_stations.site_id = "sites"."id")`,
         })
         .from(sites)
         .where(and(...conditions));

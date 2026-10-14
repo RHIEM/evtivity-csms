@@ -30,12 +30,17 @@ import {
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
   PG_FOREIGN_KEY_VIOLATION,
+  toDate,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { auditStationChange } from '../lib/station-audit.js';
+import { assertProfileIdAllowed, maxExternalConstraintsIds } from '../lib/charging-profile-id.js';
+import { clearProfileSlotBeforePush } from '../lib/charging-profile-push.js';
 import { requestGhostSessionEnd } from '../lib/ghost-session-end.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
+import { listStationMessageLog } from '../lib/station-message-log.js';
 import {
   chargingStations,
   evses,
@@ -45,7 +50,6 @@ import {
   meterValues,
   sites,
   vendors,
-  ocppMessageLogs,
   meterPublicKeys,
   stationCertificates,
   pricingGroupStations,
@@ -57,6 +61,7 @@ import {
   firmwareCampaigns,
   chargingProfiles,
   evChargingNeeds,
+  evChargingSchedules,
   variableMonitoringRules,
   eventAlerts,
   chargingProfileTemplates,
@@ -80,12 +85,27 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { inCompanyCurrency, sessionCurrencySql } from '@evtivity/services/company-currency';
-import { queryRevenue, queryRevenueTotal, revenueItem } from '@evtivity/services/session-revenue';
+import {
+  profitCents,
+  queryRevenue,
+  queryRevenueTotal,
+  revenueItem,
+} from '@evtivity/services/session-revenue';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds, checkStationSiteAccess, userCanAccessSite } from '../lib/site-access.js';
+import { circuitIdAfterSiteChange } from '../lib/station-circuit.js';
+import { siteInScope } from '../lib/site-scope.js';
+import {
+  findScopedConfigTemplate,
+  findScopedChargingProfileTemplate,
+  chargingProfileTemplateInScopeSql,
+  isRestrictedCompanyWideWrite,
+  TEMPLATE_NOT_FOUND,
+} from '../lib/fleet-operation-scope.js';
 import { dateRangeQuery, parseDateRange } from '../lib/date-range.js';
 import { enumerateLocalDays, zeroFillDays } from '../lib/daily-series.js';
 import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
+import { monitorClearOutcome, monitorSetOutcome } from '../lib/variable-monitoring.js';
 import { sendStatusCheckError, triggerAndWaitForStatus } from '../lib/station-status-check.js';
 import {
   buildDerivedStatusSubquery,
@@ -102,8 +122,15 @@ import {
   rotateStationPassword,
 } from '../services/station-security.service.js';
 import { confirmRealStation } from '../services/station-simulator.service.js';
-import { mapConnectorTypeToCss, publishOcppCommand, validateStationPassword } from '@evtivity/lib';
+import {
+  mapConnectorTypeToCss,
+  publishOcppCommand,
+  STATION_PASSWORD_HASH_OPTIONS,
+  validateStationPassword,
+  CLEARABLE_PROFILE_PURPOSES,
+} from '@evtivity/lib';
 import { authorize } from '../middleware/rbac.js';
+import { assertNoCredentialVariables } from '../lib/station-credential-guard.js';
 import type { JwtPayload } from '../plugins/auth.js';
 
 // Statuses that mean a connector is actively in use and blocks deletion
@@ -725,8 +752,20 @@ const stationMetricsResponse = z
       .number()
       .int()
       .describe(
-        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative',
+        'Total profit in cents (revenue excluding tax minus electricity cost); may be negative. Sessions without an electricity cost (costMissingSessionCount) are left out.',
       ),
+    costMissingSessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Ended billed sessions in the period that delivered energy but have no electricity cost (no matching site rate period, or no site). Left out of profit.',
+      ),
+    costMissingRevenueCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Revenue of those sessions in cents, tax included. Left out of profit.'),
     periodMonths: z.number().describe('Number of months covered by these metrics'),
     currency: z
       .string()
@@ -776,8 +815,17 @@ const sessionItem = z
 
 const ocppLogItem = z
   .object({
-    id: z.number().describe('OCPP log row identifier'),
+    id: z
+      .number()
+      .describe(
+        'Row identifier: the OCPP log row when processed, the offline command queue row when queued',
+      ),
     stationId: z.string().describe('Internal station identifier (nanoid) the message belongs to'),
+    processingStatus: z
+      .enum(['processed', 'queued'])
+      .describe(
+        '`processed` for a message exchanged with the station, `queued` for a command held in the offline command queue until the station reconnects',
+      ),
     action: z
       .string()
       .nullable()
@@ -789,7 +837,9 @@ const ocppLogItem = z
     messageId: z
       .string()
       .nullable()
-      .describe('OCPP message id used to correlate request and response'),
+      .describe(
+        'OCPP message id used to correlate request and response (the command id for a queued command)',
+      ),
     payload: z.unknown().describe('Raw OCPP payload object'),
     errorCode: z.string().nullable().describe('OCPP error code (CALLERROR only)'),
     errorDescription: z
@@ -897,9 +947,8 @@ export function stationRoutes(app: FastifyInstance): void {
 
       const conditions = [];
       if (accessibleSiteIds != null) {
-        conditions.push(
-          or(isNull(chargingStations.siteId), inArray(chargingStations.siteId, accessibleSiteIds)),
-        );
+        // Stations without a site are visible to all-site users only.
+        conditions.push(inArray(chargingStations.siteId, accessibleSiteIds));
       }
       if (siteId != null) {
         conditions.push(eq(chargingStations.siteId, siteId));
@@ -1070,7 +1119,7 @@ export function stationRoutes(app: FastifyInstance): void {
       }
       const { userId } = request.user as JwtPayload;
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && station.siteId != null && !siteIds.includes(station.siteId)) {
+      if (!siteInScope(siteIds, station.siteId)) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
@@ -1213,7 +1262,8 @@ export function stationRoutes(app: FastifyInstance): void {
         });
         return;
       }
-      const basicAuthPasswordHash = password != null ? await hash(password) : undefined;
+      const basicAuthPasswordHash =
+        password != null ? await hash(password, { ...STATION_PASSWORD_HASH_OPTIONS }) : undefined;
 
       // The chargingStations INSERT and the css_stations pairing must commit
       // atomically. Without the transaction, a failure inside enableCssPair
@@ -1365,7 +1415,7 @@ export function stationRoutes(app: FastifyInstance): void {
           await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
           return;
         }
-        if (current.siteId != null && !siteIds.includes(current.siteId)) {
+        if (!siteInScope(siteIds, current.siteId)) {
           await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
           return;
         }
@@ -1373,8 +1423,10 @@ export function stationRoutes(app: FastifyInstance): void {
       const { password, securityProfile, availability, ...body } = request.body as z.infer<
         typeof updateStationBody
       >;
-      // Check access to the new siteId if being reassigned
-      if (body.siteId != null && !(await userCanAccessSite(userId, body.siteId))) {
+      // Check access to the new site when the station moves. A site-restricted
+      // user cannot remove a station from its site (siteId null): only
+      // all-site users manage stations without a site.
+      if (body.siteId !== undefined && !(await userCanAccessSite(userId, body.siteId))) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -1391,6 +1443,9 @@ export function stationRoutes(app: FastifyInstance): void {
       }
 
       const updates: Record<string, unknown> = { ...body, updatedAt: new Date() };
+      // A station that moves to another site leaves its circuit (a circuit
+      // belongs to one site's panel).
+      if (body.siteId !== undefined) updates.circuitId = circuitIdAfterSiteChange(body.siteId);
       // Setting the simulator flag either way settles a recorded conflict.
       if (body.isSimulator !== undefined) updates.simulatorConflictAt = null;
 
@@ -1574,11 +1629,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      if (
-        siteIds != null &&
-        beforeStation.siteId != null &&
-        !siteIds.includes(beforeStation.siteId)
-      ) {
+      if (!siteInScope(siteIds, beforeStation.siteId)) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
@@ -1882,6 +1933,19 @@ export function stationRoutes(app: FastifyInstance): void {
           });
       }
 
+      await auditStationChange(request, id, 'evse_changed', {
+        after: {
+          evseId: evse.evseId,
+          connectors: connectorRows.map((c) => ({
+            connectorId: c.connectorId,
+            connectorType: c.connectorType,
+            maxPowerKw: c.maxPowerKw,
+            maxCurrentAmps: c.maxCurrentAmps,
+          })),
+        },
+        notes: `EVSE ${String(evse.evseId)} added`,
+      });
+
       await reply.status(201).send({
         evseId: evse.evseId,
         connectors: connectorRows.map((c) => ({
@@ -1959,7 +2023,12 @@ export function stationRoutes(app: FastifyInstance): void {
       // some connectors had the new values and others did not.
       const requestedConnectorIds = body.connectors.map((c) => c.connectorId);
       const existingConnectors = await db
-        .select({ connectorId: connectors.connectorId })
+        .select({
+          connectorId: connectors.connectorId,
+          connectorType: connectors.connectorType,
+          maxPowerKw: connectors.maxPowerKw,
+          maxCurrentAmps: connectors.maxCurrentAmps,
+        })
         .from(connectors)
         .where(
           and(
@@ -2004,6 +2073,34 @@ export function stationRoutes(app: FastifyInstance): void {
         .from(connectors)
         .where(eq(connectors.evseId, evse.id))
         .orderBy(connectors.connectorId);
+
+      // Audit the changed connector fields only (before from the pre-check read).
+      const auditBefore: Record<string, unknown>[] = [];
+      const auditAfter: Record<string, unknown>[] = [];
+      for (const c of body.connectors) {
+        const prev = existingConnectors.find((e) => e.connectorId === c.connectorId);
+        const next = updatedConnectors.find((u) => u.connectorId === c.connectorId);
+        if (prev == null || next == null) continue;
+        const before: Record<string, unknown> = {};
+        const after: Record<string, unknown> = {};
+        for (const key of ['connectorType', 'maxPowerKw', 'maxCurrentAmps'] as const) {
+          if (String(prev[key]) !== String(next[key])) {
+            before[key] = prev[key];
+            after[key] = next[key];
+          }
+        }
+        if (Object.keys(after).length > 0) {
+          auditBefore.push({ connectorId: c.connectorId, ...before });
+          auditAfter.push({ connectorId: c.connectorId, ...after });
+        }
+      }
+      if (auditAfter.length > 0) {
+        await auditStationChange(request, id, 'evse_changed', {
+          before: { evseId: evse.evseId, connectors: auditBefore },
+          after: { evseId: evse.evseId, connectors: auditAfter },
+          notes: `EVSE ${String(evse.evseId)} connectors updated`,
+        });
+      }
 
       return {
         evseId: evse.evseId,
@@ -2189,14 +2286,35 @@ export function stationRoutes(app: FastifyInstance): void {
         transactionId: activeSession.transactionId,
       });
 
+      const status = cmdResult.response?.['status'] as string | undefined;
+      const statusInfo = cmdResult.response?.['statusInfo'] as { reasonCode?: string } | undefined;
+      const isGhost =
+        cmdResult.error == null && status === 'Rejected' && statusInfo?.reasonCode === 'TxNotFound';
+
+      // Like the generic command routes, the dispatch is audited with its
+      // outcome whether the station accepted, refused or never answered.
+      const stopOutcome =
+        cmdResult.error != null
+          ? cmdResult.timedOut === true
+            ? 'timeout'
+            : `error: ${cmdResult.error}`
+          : (status ?? 'unknown');
+      await auditStationChange(request, id, 'command_dispatched', {
+        after: {
+          action: 'RequestStopTransaction',
+          payload: { transactionId: activeSession.transactionId },
+          sessionId: activeSession.id,
+          evseId: ocppEvseId,
+          outcome: stopOutcome,
+          ghostRecovered: isGhost,
+        },
+        notes: `RequestStopTransaction (${stopOutcome})${isGhost ? ', ghost session end requested' : ''}`,
+      });
+
       if (cmdResult.error != null) {
         await reply.status(504).send({ error: 'Station did not respond', code: 'STATION_TIMEOUT' });
         return;
       }
-
-      const status = cmdResult.response?.['status'] as string | undefined;
-      const statusInfo = cmdResult.response?.['statusInfo'] as { reasonCode?: string } | undefined;
-      const isGhost = status === 'Rejected' && statusInfo?.reasonCode === 'TxNotFound';
 
       if (isGhost) {
         // Ghost session: ended completed and billed by the OCPP server.
@@ -2354,6 +2472,21 @@ export function stationRoutes(app: FastifyInstance): void {
           });
       }
 
+      await auditStationChange(request, id, 'evse_changed', {
+        after: {
+          evseId: ocppEvseId,
+          connectors: [
+            {
+              connectorId: connector.connectorId,
+              connectorType: connector.connectorType,
+              maxPowerKw: connector.maxPowerKw,
+              maxCurrentAmps: connector.maxCurrentAmps,
+            },
+          ],
+        },
+        notes: `Connector ${String(connector.connectorId)} added to EVSE ${String(ocppEvseId)}`,
+      });
+
       await reply.status(201).send({
         connectorId: connector.connectorId,
         connectorType: connector.connectorType,
@@ -2439,6 +2572,10 @@ export function stationRoutes(app: FastifyInstance): void {
         if (siteId != null) await recordRemovedOcpiEvses(siteId, [evse.id], tx);
         await tx.delete(evses).where(eq(evses.id, evse.id));
       });
+      await auditStationChange(request, id, 'evse_changed', {
+        before: { evseId: ocppEvseId },
+        notes: `EVSE ${String(ocppEvseId)} deleted`,
+      });
       if (siteId != null) await publishOcpiLocationPush(siteId, null, request.log);
       return { status: 'deleted' };
     },
@@ -2490,7 +2627,12 @@ export function stationRoutes(app: FastifyInstance): void {
 
       // Find the connector
       const [connector] = await db
-        .select({ id: connectors.id, status: connectors.status })
+        .select({
+          id: connectors.id,
+          status: connectors.status,
+          connectorType: connectors.connectorType,
+          maxPowerKw: connectors.maxPowerKw,
+        })
         .from(connectors)
         .where(and(eq(connectors.evseId, evse.id), eq(connectors.connectorId, ocppConnectorId)));
       if (connector == null) {
@@ -2508,6 +2650,19 @@ export function stationRoutes(app: FastifyInstance): void {
       }
 
       await db.delete(connectors).where(eq(connectors.id, connector.id));
+      await auditStationChange(request, id, 'evse_changed', {
+        before: {
+          evseId: ocppEvseId,
+          connectors: [
+            {
+              connectorId: ocppConnectorId,
+              connectorType: connector.connectorType,
+              maxPowerKw: connector.maxPowerKw,
+            },
+          ],
+        },
+        notes: `Connector ${String(ocppConnectorId)} deleted from EVSE ${String(ocppEvseId)}`,
+      });
       return { status: 'deleted' };
     },
   );
@@ -3094,7 +3249,9 @@ export function stationRoutes(app: FastifyInstance): void {
         totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
         totalNetRevenueCents: revenue.netCents,
         totalTaxCents: revenue.taxCents,
-        totalProfitCents: revenue.netCents - (financialStats?.totalElectricityCostCents ?? 0),
+        totalProfitCents: profitCents(revenue, financialStats?.totalElectricityCostCents ?? 0),
+        costMissingSessionCount: revenue.costMissingCount,
+        costMissingRevenueCents: revenue.costMissingGrossCents,
         periodMonths: months,
         currency,
       };
@@ -3225,56 +3382,7 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
       const query = request.query as z.infer<typeof ocppLogsQuery>;
-      const offset = (query.page - 1) * query.limit;
-
-      const conditions = [eq(ocppMessageLogs.stationId, id)];
-      if (query.action != null && query.action !== '') {
-        conditions.push(eq(ocppMessageLogs.action, query.action));
-      }
-      if (query.direction != null) {
-        conditions.push(eq(ocppMessageLogs.direction, query.direction));
-      }
-      const where = and(...conditions);
-
-      const [rows, countRows, actionRows] = await Promise.all([
-        db
-          .select()
-          .from(ocppMessageLogs)
-          .where(where)
-          .orderBy(desc(ocppMessageLogs.createdAt), desc(ocppMessageLogs.id))
-          .limit(query.limit)
-          .offset(offset),
-        db
-          .select({ count: sql<number>`count(*)::int` })
-          .from(ocppMessageLogs)
-          .where(where),
-        // Skip-scan emulation: a plain SELECT DISTINCT walks every log row for
-        // the station (~500ms at a few thousand rows, worse as the table
-        // grows); this recursive CTE probes the (station_id, action) index
-        // once per distinct action (~40 probes) regardless of row count.
-        db.execute<{ action: string | null }>(sql`
-          WITH RECURSIVE distinct_actions AS (
-            (SELECT action FROM ocpp_message_logs
-             WHERE station_id = ${id} AND action IS NOT NULL
-             ORDER BY action LIMIT 1)
-            UNION ALL
-            SELECT (
-              SELECT action FROM ocpp_message_logs
-              WHERE station_id = ${id} AND action > da.action
-              ORDER BY action LIMIT 1
-            )
-            FROM distinct_actions da
-            WHERE da.action IS NOT NULL
-          )
-          SELECT action FROM distinct_actions WHERE action IS NOT NULL
-        `),
-      ]);
-
-      return {
-        data: rows,
-        total: countRows[0]?.count ?? 0,
-        actions: actionRows.map((r) => r.action).filter((a): a is string => a != null),
-      };
+      return listStationMessageLog(id, query);
     },
   );
 
@@ -3514,7 +3622,7 @@ export function stationRoutes(app: FastifyInstance): void {
           severity: string | null;
           remote_address: string | null;
           metadata: Record<string, unknown> | null;
-          created_at: Date;
+          created_at: Date | string;
         }>(dataSql),
         db.execute<{ count: number }>(countSql),
       ]);
@@ -3526,7 +3634,7 @@ export function stationRoutes(app: FastifyInstance): void {
         severity: r.severity,
         remoteAddress: r.remote_address,
         metadata: r.metadata,
-        createdAt: r.created_at,
+        createdAt: toDate(r.created_at),
       }));
 
       return { data, total: countRows[0]?.count ?? 0 };
@@ -4062,6 +4170,7 @@ export function stationRoutes(app: FastifyInstance): void {
           onboardingStatus: chargingStations.onboardingStatus,
           stationId: chargingStations.stationId,
           isSimulator: chargingStations.isSimulator,
+          siteId: chargingStations.siteId,
         })
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
@@ -4102,7 +4211,7 @@ export function stationRoutes(app: FastifyInstance): void {
       const pubsub = getPubSub();
       await pubsub.publish(
         'csms_events',
-        JSON.stringify({ eventType: 'station.status', stationId: id }),
+        JSON.stringify({ eventType: 'station.status', stationId: id, siteId: station.siteId }),
       );
 
       // Nudge a simulator out of a stale Pending boot state. Real stations
@@ -4157,7 +4266,10 @@ export function stationRoutes(app: FastifyInstance): void {
       }
 
       const [station] = await db
-        .select({ onboardingStatus: chargingStations.onboardingStatus })
+        .select({
+          onboardingStatus: chargingStations.onboardingStatus,
+          siteId: chargingStations.siteId,
+        })
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
 
@@ -4195,7 +4307,7 @@ export function stationRoutes(app: FastifyInstance): void {
       const pubsub = getPubSub();
       await pubsub.publish(
         'csms_events',
-        JSON.stringify({ eventType: 'station.status', stationId: id }),
+        JSON.stringify({ eventType: 'station.status', stationId: id, siteId: station.siteId }),
       );
 
       return { success: true };
@@ -4227,7 +4339,10 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
       const [station] = await db
-        .select({ onboardingStatus: chargingStations.onboardingStatus })
+        .select({
+          onboardingStatus: chargingStations.onboardingStatus,
+          siteId: chargingStations.siteId,
+        })
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
 
@@ -4267,7 +4382,7 @@ export function stationRoutes(app: FastifyInstance): void {
       const pubsub = getPubSub();
       await pubsub.publish(
         'csms_events',
-        JSON.stringify({ eventType: 'station.status', stationId: id }),
+        JSON.stringify({ eventType: 'station.status', stationId: id, siteId: station.siteId }),
       );
 
       return { success: true };
@@ -4693,6 +4808,7 @@ export function stationRoutes(app: FastifyInstance): void {
       // rows. Only attempt the join for csms_set rows where the projection writes
       // a numeric id; null out template fields for everything else in JS.
       const profileIdExpr = sql<number>`CASE WHEN ${chargingProfiles.profileData} ->> 'id' ~ '^-?[0-9]+$' THEN (${chargingProfiles.profileData} ->> 'id')::int ELSE NULL END`;
+      const templateSiteIds = await getUserSiteIds(userId);
 
       const [rows, countResult] = await Promise.all([
         db
@@ -4702,7 +4818,17 @@ export function stationRoutes(app: FastifyInstance): void {
             templateName: chargingProfileTemplates.name,
           })
           .from(chargingProfiles)
-          .leftJoin(chargingProfileTemplates, eq(chargingProfileTemplates.profileId, profileIdExpr))
+          // A template that targets another site is hidden from a site-restricted
+          // user (a station that moved keeps profiles pushed from its old site).
+          .leftJoin(
+            chargingProfileTemplates,
+            and(
+              eq(chargingProfileTemplates.profileId, profileIdExpr),
+              templateSiteIds != null
+                ? chargingProfileTemplateInScopeSql(templateSiteIds)
+                : undefined,
+            ),
+          )
           .where(where)
           .orderBy(desc(chargingProfiles.createdAt), desc(chargingProfiles.id))
           .limit(limit)
@@ -4929,9 +5055,19 @@ export function stationRoutes(app: FastifyInstance): void {
       .int()
       .optional()
       .describe('Specific charging profile ID to clear'),
-    chargingProfilePurpose: z.string().optional().describe('Clear all profiles with this purpose'),
-    stackLevel: z.number().int().optional().describe('Stack level to clear'),
-    evseId: z.number().int().optional().describe('EVSE ID to clear profiles for'),
+    chargingProfilePurpose: z
+      .enum(CLEARABLE_PROFILE_PURPOSES)
+      .optional()
+      .describe(
+        'Clear the profiles with this OCPP 2.1 purpose. External constraints and local generation profiles cannot be cleared (OCPP 2.1 K10.FR.06). OCPP 1.6 stations get ChargePointMaxProfile for ChargingStationMaxProfile.',
+      ),
+    stackLevel: z.number().int().min(0).optional().describe('Stack level to clear'),
+    evseId: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe('EVSE ID to clear profiles for (0 for station-wide profiles)'),
   });
 
   // OCPP ClearChargingProfileResponse passes through. When the station never
@@ -4952,7 +5088,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Clear charging profiles from the station',
         description:
-          'Dispatches ClearChargingProfile with the supplied criteria (purpose, stackLevel, evseId) or a specific chargingProfileId. On Accepted, deletes the matching rows from the charging_profiles mirror and triggers a best-effort GetChargingProfiles refresh on OCPP 2.1 stations. Returns 502 OCPP_COMMAND_FAILED when the station answers with an OCPP error, the command cannot be delivered, or no answer comes in time.',
+          'Dispatches ClearChargingProfile with the supplied criteria (purpose, stackLevel, evseId) or a specific chargingProfileId. An empty body clears every profile the CSMS may clear: one ClearChargingProfile per purpose on OCPP 2.1 stations (a 2.1 clear must name an id or a criterion), one empty clear on OCPP 1.6. On Accepted, deletes the matching rows of this station from the charging_profiles mirror (external constraints and local generation profiles stay, the station keeps them) and triggers a best-effort GetChargingProfiles refresh on OCPP 2.1 stations. Returns 502 OCPP_COMMAND_FAILED when every command failed: the station answered with an OCPP error, the command could not be delivered, or no answer came in time.',
         operationId: 'clearStationChargingProfiles',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -4996,8 +5132,7 @@ export function stationRoutes(app: FastifyInstance): void {
 
       // Reshape API body into OCPP 2.1 ClearChargingProfileRequest. Criteria
       // (purpose/stackLevel/evseId) live under `chargingProfileCriteria`;
-      // `chargingProfileId` stays at the top level. Empty criteria object is
-      // omitted so "clear all" sends `{}` rather than an empty filter.
+      // `chargingProfileId` stays at the top level.
       const criteria: Record<string, unknown> = {};
       if (body.chargingProfilePurpose != null)
         criteria.chargingProfilePurpose = body.chargingProfilePurpose;
@@ -5007,69 +5142,72 @@ export function stationRoutes(app: FastifyInstance): void {
       if (body.chargingProfileId != null) ocppPayload.chargingProfileId = body.chargingProfileId;
       if (Object.keys(criteria).length > 0) ocppPayload.chargingProfileCriteria = criteria;
 
-      const result = await sendOcppCommandAndWait(
-        station.stationId,
-        'ClearChargingProfile',
-        ocppPayload,
-      );
+      // A 2.1 clear must name a profile id or at least one criterion
+      // (K10.FR.02), so "clear all" goes as one clear per purpose the CSMS may
+      // clear. A 1.6 clear without fields clears every profile.
+      const isOcpp21 = station.ocppProtocol !== 'ocpp1.6';
+      // The OCPP server's ClearChargingProfile projection removes the stored
+      // copies of the profiles each Accepted clear removed.
+      const payloads: Record<string, unknown>[] =
+        Object.keys(ocppPayload).length === 0 && isOcpp21
+          ? CLEARABLE_PROFILE_PURPOSES.map((purpose) => ({
+              chargingProfileCriteria: { chargingProfilePurpose: purpose },
+            }))
+          : [ocppPayload];
 
-      if (result.error != null) {
-        await reply.status(502).send({ error: result.error, code: 'OCPP_COMMAND_FAILED' });
+      let accepted = false;
+      let lastResponse: Record<string, unknown> | undefined;
+      let firstError: string | undefined;
+      for (const payload of payloads) {
+        const result = await sendOcppCommandAndWait(
+          station.stationId,
+          'ClearChargingProfile',
+          payload,
+        );
+        if (result.error != null) {
+          firstError ??= result.error;
+          continue;
+        }
+        const response = result.response;
+        if (response?.['status'] === 'Accepted') {
+          accepted = true;
+          lastResponse = response;
+        } else if (!accepted) {
+          lastResponse = response;
+        }
+      }
+
+      // Like the generic command routes, the dispatch is audited with its
+      // outcome whether the station accepted, refused or never answered.
+      const clearOutcome = accepted
+        ? 'Accepted'
+        : ((lastResponse?.['status'] as string | undefined) ?? firstError ?? 'unknown');
+      await auditStationChange(request, id, 'command_dispatched', {
+        after: { action: 'ClearChargingProfile', payload: payloads, outcome: clearOutcome },
+        notes: `ClearChargingProfile (${clearOutcome})`,
+      });
+
+      if (lastResponse == null && firstError != null) {
+        await reply.status(502).send({ error: firstError, code: 'OCPP_COMMAND_FAILED' });
         return;
       }
 
-      // Mirror the on-station deletion in the CSMS DB. The station's
-      // ClearChargingProfile is idempotent — Accepted means the matching
-      // profiles are gone (or no match found), so the prior rows in
-      // `charging_profiles` no longer reflect on-station state.
-      //
-      // profile_data is stored two shapes: csms_set rows are a single profile
-      // OBJECT, station_reported rows are an ARRAY of profile objects (per
-      // the OCPP ReportChargingProfiles payload). The match predicates need
-      // to handle both — `jsonb_path_exists` searches across either shape.
-      const response = result.response as { status?: string } | undefined;
-      if (response?.status === 'Accepted') {
-        const conditions = [eq(chargingProfiles.stationId, id)];
-        if (body.chargingProfileId != null) {
-          conditions.push(
-            sql`jsonb_path_exists(profile_data, ('$ ? (@.id == ' || ${body.chargingProfileId}::text || ')')::jsonpath)
-                OR jsonb_path_exists(profile_data, ('$[*] ? (@.id == ' || ${body.chargingProfileId}::text || ')')::jsonpath)`,
-          );
-        }
-        if (body.chargingProfilePurpose != null) {
-          conditions.push(
-            sql`jsonb_path_exists(profile_data, ('$ ? (@.chargingProfilePurpose == "' || ${body.chargingProfilePurpose} || '")')::jsonpath)
-                OR jsonb_path_exists(profile_data, ('$[*] ? (@.chargingProfilePurpose == "' || ${body.chargingProfilePurpose} || '")')::jsonpath)`,
-          );
-        }
-        if (body.stackLevel != null) {
-          conditions.push(
-            sql`jsonb_path_exists(profile_data, ('$ ? (@.stackLevel == ' || ${body.stackLevel}::text || ')')::jsonpath)
-                OR jsonb_path_exists(profile_data, ('$[*] ? (@.stackLevel == ' || ${body.stackLevel}::text || ')')::jsonpath)`,
-          );
-        }
-        if (body.evseId != null) {
-          conditions.push(eq(chargingProfiles.evseId, body.evseId));
-        }
-        await db.delete(chargingProfiles).where(and(...conditions));
-
-        // Auto-refresh station_reported rows on OCPP 2.1 stations. Fire-and-forget
-        // GetChargingProfiles so the projection re-mirrors the station's actual
-        // current state. 1.6 has no equivalent command (and no ReportChargingProfiles
-        // payload), so the explicit DELETE above is the only mechanism for 1.6.
-        if (station.ocppProtocol === '2.1' || station.ocppProtocol === 'ocpp2.1') {
-          void sendOcppCommandAndWait(
-            station.stationId,
-            'GetChargingProfiles',
-            { requestId: Math.floor(Math.random() * 2147483647), chargingProfile: {} },
-            '2.1',
-          ).catch(() => {
-            // Best-effort refresh; don't fail the clear response on transport issues.
-          });
-        }
+      // Auto-refresh station_reported rows on OCPP 2.1 stations. Fire-and-forget
+      // GetChargingProfiles so the projection re-mirrors the station's actual
+      // current state. 1.6 has no equivalent command (and no ReportChargingProfiles
+      // payload), so the explicit DELETE above is the only mechanism for 1.6.
+      if (accepted && isOcpp21) {
+        void sendOcppCommandAndWait(
+          station.stationId,
+          'GetChargingProfiles',
+          { requestId: Math.floor(Math.random() * 2147483647), chargingProfile: {} },
+          '2.1',
+        ).catch(() => {
+          // Best-effort refresh; don't fail the clear response on transport issues.
+        });
       }
 
-      return result.response ?? { success: true };
+      return lastResponse ?? { success: true };
     },
   );
 
@@ -5108,7 +5246,10 @@ export function stationRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          400: errorWith('Station offline', [ERROR_CODES.STATION_OFFLINE]),
+          400: errorWith('Station offline or profile id reserved by the station', [
+            ERROR_CODES.STATION_OFFLINE,
+            ERROR_CODES.CHARGING_PROFILE_ID_RESERVED,
+          ]),
           404: errorWith('Resource not found', [
             ERROR_CODES.STATION_NOT_FOUND,
             ERROR_CODES.TEMPLATE_NOT_FOUND,
@@ -5146,28 +5287,27 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const [template] = await db
-        .select()
-        .from(chargingProfileTemplates)
-        .where(eq(chargingProfileTemplates.id, body.templateId));
-
-      if (template == null) {
-        await reply.status(404).send({ error: 'Template not found', code: 'TEMPLATE_NOT_FOUND' });
+      // A template that targets another site or station is not found for a
+      // site-restricted user, and a company-wide one needs access to every
+      // site to push (owner decision 2026-10-09).
+      const profileSiteIds = await getUserSiteIds(userId);
+      const template = await findScopedChargingProfileTemplate(body.templateId, profileSiteIds);
+      if (template == null || isRestrictedCompanyWideWrite(profileSiteIds, template.targetFilter)) {
+        await reply.status(404).send(TEMPLATE_NOT_FOUND);
         return;
       }
 
       const version = station.ocppProtocol === 'ocpp1.6' ? '1.6' : '2.1';
 
+      // K01.FR.81: the station rejects an id at or below its MaxExternalConstraintsId.
+      if (version === '2.1') {
+        assertProfileIdAllowed(template.profileId, (await maxExternalConstraintsIds([id])).get(id));
+      }
+
       // Best-effort clear existing profile with same purpose/stackLevel/evseId.
       // OCPP 2.1 wants the criteria nested under `chargingProfileCriteria`.
       try {
-        await sendOcppCommandAndWait(station.stationId, 'ClearChargingProfile', {
-          chargingProfileCriteria: {
-            chargingProfilePurpose: template.profilePurpose,
-            stackLevel: template.stackLevel,
-            evseId: template.evseId,
-          },
-        });
+        await clearProfileSlotBeforePush(station.stationId, template);
       } catch (err) {
         request.log.warn(
           { err, stationId: station.stationId },
@@ -5256,7 +5396,7 @@ export function stationRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: 'Push a configuration template to this station',
         description:
-          'Iterates the template variables and dispatches SetVariables (OCPP 2.1, batched) or one ChangeConfiguration per variable (OCPP 1.6). Per-variable results are returned with the per-variable status. After a successful push, a refresh (GetBaseReport on 2.1, GetConfiguration on 1.6) updates the CSMS mirror. Returns success=true only when every variable was Accepted.',
+          'Iterates the template variables and dispatches SetVariables (OCPP 2.1, batched) or one ChangeConfiguration per variable (OCPP 1.6). Per-variable results are returned with the per-variable status. After a successful push, a refresh (GetBaseReport on 2.1, GetConfiguration on 1.6) updates the CSMS mirror. Returns success=true only when every variable was Accepted. A template that names a station credential (BasicAuthPassword, AuthorizationKey) is refused with 400 STATION_CREDENTIALS_ROUTE_REQUIRED: change station passwords with POST /v1/stations/{id}/credentials.',
         operationId: 'pushStationConfiguration',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -5288,7 +5428,10 @@ export function stationRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          400: errorWith('Station offline', [ERROR_CODES.STATION_OFFLINE]),
+          400: errorWith('Station offline or a station credential variable', [
+            ERROR_CODES.STATION_OFFLINE,
+            ERROR_CODES.STATION_CREDENTIALS_ROUTE_REQUIRED,
+          ]),
           404: errorWith('Resource not found', [
             ERROR_CODES.STATION_NOT_FOUND,
             ERROR_CODES.TEMPLATE_NOT_FOUND,
@@ -5326,13 +5469,18 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const [template] = await db
-        .select()
-        .from(configTemplates)
-        .where(eq(configTemplates.id, body.templateId));
-
-      if (template == null) {
-        await reply.status(404).send({ error: 'Template not found', code: 'TEMPLATE_NOT_FOUND' });
+      // A template bound to another site's station or site is not found for a
+      // site-restricted user. A company-wide template needs access to every
+      // site to push (owner decision 2026-10-09), and a template bound to a
+      // station is pushed to that station only.
+      const configSiteIds = await getUserSiteIds(userId);
+      const template = await findScopedConfigTemplate(body.templateId, configSiteIds);
+      if (
+        template == null ||
+        isRestrictedCompanyWideWrite(configSiteIds, template.targetFilter, template.stationId) ||
+        (template.stationId != null && template.stationId !== id)
+      ) {
+        await reply.status(404).send(TEMPLATE_NOT_FOUND);
         return;
       }
 
@@ -5345,6 +5493,8 @@ export function stationRoutes(app: FastifyInstance): void {
       if (variables.length === 0) {
         return { success: true, results: [] };
       }
+      // A template saved before v0.1.45 can still name a credential.
+      assertNoCredentialVariables(variables);
 
       const ocppVersion = station.ocppProtocol === 'ocpp1.6' ? '1.6' : '2.1';
       const results: Array<{ component: string; variable: string; status: string }> = [];
@@ -5475,6 +5625,12 @@ export function stationRoutes(app: FastifyInstance): void {
         .describe('Requested energy transfer mode (e.g., DC, AC_single_phase)'),
       controlMode: z.string().nullable().describe('Control mode (e.g., ScheduledControl)'),
       maxScheduleTuples: z.number().nullable().describe('Maximum number of schedule tuples'),
+      csmsChargingProfile: z
+        .record(z.unknown())
+        .nullable()
+        .describe(
+          'The ISO 15118 TxProfile the CSMS sent for these needs: { payload: SetChargingProfile payload, renegotiations }, null when none was sent',
+        ),
       createdAt: z.string().describe('Row creation timestamp'),
       updatedAt: z.string().describe('Row update timestamp'),
     })
@@ -5523,7 +5679,95 @@ export function stationRoutes(app: FastifyInstance): void {
     },
   );
 
+  const evChargingScheduleItem = z
+    .object({
+      id: z.number().describe('EV charging schedule row ID'),
+      stationId: z.string().describe('Station ID'),
+      evseId: z.number().describe('EVSE ID'),
+      timeBase: z
+        .string()
+        .nullable()
+        .describe('Time the schedule periods are relative to (ISO 8601)'),
+      chargingSchedule: z
+        .record(z.unknown())
+        .describe('The charging schedule the EV reported (OCPP ChargingScheduleType)'),
+      withinLimits: z
+        .boolean()
+        .nullable()
+        .describe(
+          'Whether the schedule stays within the schedule the CSMS sent (false: rejected and renegotiated); null when not checked',
+        ),
+      createdAt: z.string().describe('Time the CSMS received the schedule'),
+    })
+    .passthrough();
+
+  app.get(
+    '/stations/:id/ev-charging-schedules',
+    {
+      onRequest: [authorize('stations:read')],
+      schema: {
+        tags: ['Stations'],
+        summary: 'List the charging schedules EVs reported for a station',
+        operationId: 'listStationEvChargingSchedules',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(stationParams),
+        querystring: zodSchema(paginationQuery),
+        response: {
+          200: paginatedResponse(evChargingScheduleItem),
+          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof stationParams>;
+      const { userId } = request.user as JwtPayload;
+      if (!(await checkStationSiteAccess(id, userId))) {
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+      const [station] = await db
+        .select({ id: chargingStations.id })
+        .from(chargingStations)
+        .where(eq(chargingStations.id, id));
+      if (station == null) {
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+      const query = request.query as z.infer<typeof paginationQuery>;
+      const where = eq(evChargingSchedules.stationId, id);
+      const [data, countResult] = await Promise.all([
+        db
+          .select()
+          .from(evChargingSchedules)
+          .where(where)
+          .orderBy(desc(evChargingSchedules.createdAt), desc(evChargingSchedules.id))
+          .limit(query.limit)
+          .offset((query.page - 1) * query.limit),
+        db.select({ total: count() }).from(evChargingSchedules).where(where),
+      ]);
+      return { data, total: countResult[0]?.total ?? 0 } satisfies PaginatedResponse<
+        typeof data extends (infer U)[] ? U : never
+      >;
+    },
+  );
+
   // --- Variable Monitoring Rules ---
+
+  // OCPP 2.1 MonitorEnumType.
+  const MONITOR_TYPES = [
+    'UpperThreshold',
+    'LowerThreshold',
+    'Delta',
+    'Periodic',
+    'PeriodicClockAligned',
+    'TargetDelta',
+    'TargetDeltaRelative',
+  ] as const;
+  const MONITOR_POSITIVE_VALUE_TYPES = new Set<string>([
+    'Delta',
+    'Periodic',
+    'PeriodicClockAligned',
+  ]);
 
   const monitoringRuleItem = z
     .object({
@@ -5535,9 +5779,7 @@ export function stationRoutes(app: FastifyInstance): void {
         .describe('OCPP monitor ID assigned by the station, if any'),
       component: z.string().describe('OCPP component name being monitored'),
       variable: z.string().describe('OCPP variable name being monitored'),
-      type: z
-        .enum(['UpperThreshold', 'LowerThreshold', 'Delta', 'Periodic', 'PeriodicClockAligned'])
-        .describe('Monitor type (OCPP 2.1 MonitorEnumType)'),
+      type: z.enum(MONITOR_TYPES).describe('Monitor type (OCPP 2.1 MonitorEnumType)'),
       value: z.string().describe('Threshold or interval value (numeric stored as string)'),
       severity: z.number().describe('OCPP severity level 0-9'),
       status: z.enum(['pending', 'active', 'cleared', 'error']).describe('Rule status'),
@@ -5547,15 +5789,20 @@ export function stationRoutes(app: FastifyInstance): void {
     })
     .passthrough();
 
-  const createMonitoringRuleBody = z.object({
-    component: z.string().min(1).describe('OCPP component name'),
-    variable: z.string().min(1).describe('OCPP variable name'),
-    type: z
-      .enum(['UpperThreshold', 'LowerThreshold', 'Delta', 'Periodic', 'PeriodicClockAligned'])
-      .describe('Monitor type (OCPP 2.1 MonitorEnumType)'),
-    value: z.number().describe('Threshold value or interval'),
-    severity: z.number().int().min(0).max(9).default(0).describe('OCPP severity level 0-9'),
-  });
+  const createMonitoringRuleBody = z
+    .object({
+      component: z.string().min(1).max(50).describe('OCPP component name'),
+      variable: z.string().min(1).max(50).describe('OCPP variable name'),
+      type: z.enum(MONITOR_TYPES).describe('Monitor type (OCPP 2.1 MonitorEnumType)'),
+      value: z.number().describe('Threshold value or interval'),
+      severity: z.number().int().min(0).max(9).default(0).describe('OCPP severity level 0-9'),
+    })
+    // A Delta monitor with a negative or zero value is rejected by the station
+    // (N04.FR.14, N04.FR.20), and a periodic interval must be at least 1 second.
+    .refine((b) => !MONITOR_POSITIVE_VALUE_TYPES.has(b.type) || b.value > 0, {
+      message: 'value must be greater than 0 for Delta and periodic monitors',
+      path: ['value'],
+    });
 
   app.get(
     '/stations/:id/monitoring-rules',
@@ -5620,40 +5867,64 @@ export function stationRoutes(app: FastifyInstance): void {
       onRequest: [authorize('stations:write')],
       schema: {
         tags: ['Stations'],
-        summary: 'Create a variable monitoring rule and dispatch SetVariableMonitoring',
+        summary: 'Create a variable monitoring rule and send SetVariableMonitoring',
         description:
-          'Inserts a variable_monitoring_rules row in pending state and dispatches SetVariableMonitoring to the station via pub/sub. The station response is processed asynchronously and updates the rule status to active or rejected.',
+          'Inserts a variable_monitoring_rules row in pending state, sends SetVariableMonitoring to the station (OCPP 2.1 only, the station must be online) and waits for its reply. An Accepted result stores the monitor id the station assigned and sets the rule active. Any other result, a failed send or no reply sets the rule to error with the reason in errorInfo.',
         operationId: 'createStationMonitoringRule',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
         body: zodSchema(createMonitoringRuleBody),
         response: {
           201: itemResponse(monitoringRuleItem),
+          400: errorWith('Station offline or not OCPP 2.1', [
+            ERROR_CODES.STATION_OFFLINE,
+            ERROR_CODES.NOT_SUPPORTED,
+          ]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
-          502: errorWith('Station rejected the command', [ERROR_CODES.STATION_REJECTED]),
+          502: errorWith('Station rejected the monitor or the command failed', [
+            ERROR_CODES.STATION_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
           504: errorWith('Station did not respond within timeout', [ERROR_CODES.STATION_TIMEOUT]),
         },
       },
     },
     async (request, reply) => {
+      const body = parseZodRequest(createMonitoringRuleBody, request.body);
       const { id } = request.params as z.infer<typeof stationParams>;
       const { userId } = request.user as JwtPayload;
       if (!(await checkStationSiteAccess(id, userId))) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const body = request.body as z.infer<typeof createMonitoringRuleBody>;
 
       const [station] = await db
-        .select({ id: chargingStations.id, stationId: chargingStations.stationId })
+        .select({
+          id: chargingStations.id,
+          stationId: chargingStations.stationId,
+          isOnline: chargingStations.isOnline,
+          ocppProtocol: chargingStations.ocppProtocol,
+        })
         .from(chargingStations)
         .where(eq(chargingStations.id, id));
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
+      // Variable monitoring is OCPP 2.x device model only (use case N04).
+      if (station.ocppProtocol !== 'ocpp2.1') {
+        await reply
+          .status(400)
+          .send({ error: 'Not supported for OCPP 1.6', code: 'NOT_SUPPORTED' });
+        return;
+      }
+      // A monitor is only stored once the station confirms it: an offline
+      // station would leave the rule pending with no monitor id.
+      if (!station.isOnline) {
+        await reply.status(400).send({ error: 'Station is offline', code: 'STATION_OFFLINE' });
+        return;
+      }
 
-      // Insert the rule in pending state
       const [rule] = await db
         .insert(variableMonitoringRules)
         .values({
@@ -5666,42 +5937,80 @@ export function stationRoutes(app: FastifyInstance): void {
           status: 'pending',
         })
         .returning();
-
-      // Dispatch SetVariableMonitoring OCPP command
-      try {
-        await publishOcppCommand(getPubSub(), {
-          stationId: station.stationId,
-          action: 'SetVariableMonitoring',
-          payload: {
-            setMonitoringData: [
-              {
-                component: { name: body.component },
-                variable: { name: body.variable },
-                type: body.type,
-                value: body.value,
-                severity: body.severity,
-              },
-            ],
-          },
-        });
-      } catch (err) {
-        // The DB row is already inserted in 'pending' state and there is no
-        // retry-on-startup mechanism, so a silent dispatch failure means
-        // the rule sits stuck in 'pending' forever with no operator-visible
-        // signal. Log explicitly so the failure surfaces in alerts, and
-        // return 502 to match the declared response schema.
-        request.log.error(
-          { err, ruleId: rule?.id, stationId: station.stationId },
-          'Failed to dispatch SetVariableMonitoring command',
-        );
-        await reply.status(502).send({
-          error: 'Failed to dispatch SetVariableMonitoring to the OCPP command bus',
-          code: 'STATION_REJECTED',
-        });
-        return;
+      if (rule == null) {
+        throw new Error('Monitoring rule insert returned no row');
       }
 
-      return reply.status(201).send(rule);
+      const result = await sendOcppCommandAndWait(
+        station.stationId,
+        'SetVariableMonitoring',
+        {
+          setMonitoringData: [
+            {
+              component: { name: body.component },
+              variable: { name: body.variable },
+              type: body.type,
+              value: body.value,
+              severity: body.severity,
+            },
+          ],
+        },
+        '2.1',
+      );
+
+      const outcome = monitorSetOutcome(result);
+      const [stored] = await db
+        .update(variableMonitoringRules)
+        .set({
+          status: outcome.status,
+          monitoringId: outcome.monitoringId,
+          errorInfo: outcome.errorInfo,
+          updatedAt: new Date(),
+        })
+        // Only the pending row this request created: a concurrent delete wins.
+        .where(
+          and(
+            eq(variableMonitoringRules.id, rule.id),
+            eq(variableMonitoringRules.status, 'pending'),
+          ),
+        )
+        .returning();
+
+      // The rule row exists whatever the station answered (active or error).
+      await auditStationChange(request, id, 'monitoring_changed', {
+        after: {
+          ruleId: rule.id,
+          component: body.component,
+          variable: body.variable,
+          type: body.type,
+          value: String(body.value),
+          severity: body.severity,
+          status: outcome.status,
+          monitoringId: outcome.monitoringId,
+          errorInfo: outcome.errorInfo,
+        },
+        notes: `Monitoring rule ${String(rule.id)} created (${outcome.status})`,
+      });
+
+      if (outcome.status === 'active') {
+        return reply.status(201).send(stored ?? rule);
+      }
+      request.log.warn(
+        { ruleId: rule.id, stationId: station.stationId, errorInfo: outcome.errorInfo },
+        'SetVariableMonitoring did not create the monitor',
+      );
+      if (result.timedOut === true) {
+        await reply.status(504).send({ error: 'Station did not respond', code: 'STATION_TIMEOUT' });
+        return;
+      }
+      if (result.error != null) {
+        await reply.status(502).send({ error: result.error, code: 'OCPP_COMMAND_FAILED' });
+        return;
+      }
+      await reply.status(502).send({
+        error: `Station did not accept the monitor: ${outcome.errorInfo ?? 'unknown'}`,
+        code: 'STATION_REJECTED',
+      });
     },
   );
 
@@ -5716,15 +6025,24 @@ export function stationRoutes(app: FastifyInstance): void {
       onRequest: [authorize('stations:write')],
       schema: {
         tags: ['Stations'],
-        summary: 'Delete a variable monitoring rule and dispatch ClearVariableMonitoring',
+        summary: 'Clear a variable monitoring rule and send ClearVariableMonitoring',
         description:
-          'Dispatches ClearVariableMonitoring to the station and removes the rule row. The station may take a moment to acknowledge; the local row is removed eagerly so the rule no longer appears in lists.',
+          'Marks the rule cleared. An active rule (the station holds its monitor) needs an online station: the CSMS sends ClearVariableMonitoring and marks the rule cleared only when the station answers Accepted or NotFound. A rule the station never confirmed (pending or error) is cleared locally. Clearing a cleared rule does nothing.',
         operationId: 'deleteStationMonitoringRule',
         security: [{ bearerAuth: [] }],
         params: zodSchema(monitoringRuleIdParams),
         response: {
           204: { type: 'null' as const },
-          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          400: errorWith('Station offline', [ERROR_CODES.STATION_OFFLINE]),
+          404: errorWith('Station or rule not found', [
+            ERROR_CODES.STATION_NOT_FOUND,
+            ERROR_CODES.RULE_NOT_FOUND,
+          ]),
+          502: errorWith('Station kept the monitor or the command failed', [
+            ERROR_CODES.STATION_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
+          504: errorWith('Station did not respond within timeout', [ERROR_CODES.STATION_TIMEOUT]),
         },
       },
     },
@@ -5748,39 +6066,72 @@ export function stationRoutes(app: FastifyInstance): void {
           .send({ error: 'Monitoring rule not found', code: 'RULE_NOT_FOUND' });
         return;
       }
+      if (rule.status === 'cleared') {
+        return reply.status(204).send();
+      }
 
-      // If the rule has a monitoringId from the station, dispatch ClearVariableMonitoring
-      if (rule.monitoringId != null) {
+      // The station holds the monitor: clear it there first, so the stored
+      // state never says cleared while the station still monitors.
+      if (rule.status === 'active' && rule.monitoringId != null) {
         const [station] = await db
-          .select({ stationId: chargingStations.stationId })
+          .select({ stationId: chargingStations.stationId, isOnline: chargingStations.isOnline })
           .from(chargingStations)
           .where(eq(chargingStations.id, id));
-
-        if (station != null) {
-          try {
-            await publishOcppCommand(getPubSub(), {
-              stationId: station.stationId,
-              action: 'ClearVariableMonitoring',
-              payload: { id: [rule.monitoringId] },
+        if (station == null) {
+          await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          return;
+        }
+        if (!station.isOnline) {
+          await reply.status(400).send({ error: 'Station is offline', code: 'STATION_OFFLINE' });
+          return;
+        }
+        const result = await sendOcppCommandAndWait(
+          station.stationId,
+          'ClearVariableMonitoring',
+          { id: [rule.monitoringId] },
+          '2.1',
+        );
+        const outcome = monitorClearOutcome(result, rule.monitoringId);
+        if (outcome.kind !== 'cleared') {
+          request.log.warn(
+            { ruleId, monitoringId: rule.monitoringId, stationId: station.stationId, outcome },
+            'ClearVariableMonitoring did not clear the monitor',
+          );
+          if (outcome.kind === 'rejected') {
+            await reply.status(502).send({
+              error: `Station kept the monitor: ${outcome.errorInfo}`,
+              code: 'STATION_REJECTED',
             });
-          } catch (err) {
-            // Best-effort dispatch — the local row still flips to 'cleared'
-            // below so the operator's view is consistent. Log so the
-            // station-side orphan (CSMS thinks cleared, station still
-            // monitoring) doesn't go unnoticed in alerts.
-            request.log.warn(
-              { err, ruleId, monitoringId: rule.monitoringId, stationId: station.stationId },
-              'ClearVariableMonitoring dispatch failed; local row marked cleared anyway',
-            );
+          } else if (outcome.timedOut) {
+            await reply
+              .status(504)
+              .send({ error: 'Station did not respond', code: 'STATION_TIMEOUT' });
+          } else {
+            await reply.status(502).send({ error: outcome.errorInfo, code: 'OCPP_COMMAND_FAILED' });
           }
+          return;
         }
       }
 
-      // Mark as cleared
       await db
         .update(variableMonitoringRules)
         .set({ status: 'cleared', updatedAt: new Date() })
         .where(eq(variableMonitoringRules.id, ruleId));
+
+      await auditStationChange(request, id, 'monitoring_changed', {
+        before: {
+          ruleId: rule.id,
+          component: rule.component,
+          variable: rule.variable,
+          type: rule.type,
+          value: rule.value,
+          severity: rule.severity,
+          status: rule.status,
+          monitoringId: rule.monitoringId,
+        },
+        after: { ruleId: rule.id, status: 'cleared' },
+        notes: `Monitoring rule ${String(rule.id)} cleared`,
+      });
 
       return reply.status(204).send();
     },
@@ -5923,12 +6274,29 @@ export function stationRoutes(app: FastifyInstance): void {
           acknowledgedBy: userId,
         })
         .where(and(eq(eventAlerts.id, alertId), eq(eventAlerts.stationId, id)))
-        .returning({ id: eventAlerts.id });
+        .returning({
+          id: eventAlerts.id,
+          component: eventAlerts.component,
+          variable: eventAlerts.variable,
+          severity: eventAlerts.severity,
+          acknowledgedAt: eventAlerts.acknowledgedAt,
+        });
 
       if (updated == null) {
         await reply.status(404).send({ error: 'Alert not found', code: 'ALERT_NOT_FOUND' });
         return;
       }
+
+      await auditStationChange(request, id, 'alert_acknowledged', {
+        after: {
+          alertId: updated.id,
+          component: updated.component,
+          variable: updated.variable,
+          severity: updated.severity,
+          acknowledgedAt: updated.acknowledgedAt,
+        },
+        notes: `Event alert ${String(updated.id)} acknowledged`,
+      });
 
       return { success: true as const };
     },

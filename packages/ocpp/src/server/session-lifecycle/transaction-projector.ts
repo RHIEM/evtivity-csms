@@ -4,7 +4,6 @@
 import type postgres from 'postgres';
 import type { DomainEvent } from '@evtivity/lib';
 import {
-  writeReservationAudit,
   isSiteFreeVendEnabledByStation,
   getElectricityRatePeriodsForSite,
   getCompanyCurrency,
@@ -17,7 +16,8 @@ import {
   priceSessionAt,
   loadSessionPricing,
   storeFinalCost,
-  closeOpenSegment,
+  closeSegmentsAt,
+  eventTimeAtMostNow,
   sessionIdleMinutesAt,
   pgConnectionErrorKind,
   SESSION_END_FAILED_REASON,
@@ -25,19 +25,20 @@ import {
 import type { TariffPriceSnapshot } from '@evtivity/database';
 import type { ProjectionDeps } from '../projection-support/context.js';
 import type { ProjectionAttempt } from '../projection-retry.js';
+import { linkStartedReservation, markReservationUsed } from '../reservation-projections.js';
 import { runPaymentGate } from './payment-gate.js';
 import { noteCostLimitReached } from './payment-stop.js';
 import { settleTransactionEnded } from './settlement.js';
+import { recordStationCost } from './station-cost.js';
 import type { SessionLifecycleState } from './state.js';
 import { getString } from '../projection-support/payload.js';
 import { requestCsmsSessionEnd, SESSION_ENDED_BY_CSMS } from '../csms-session-end.js';
 import {
   generateId,
   calculateCo2AvoidedKg,
-  resolveElectricityRate,
-  calculateElectricityCostCents,
+  computeSessionElectricityCost,
   notificationMoney,
-  costIncludesTax,
+  costContainsTax,
   reconcileCostBreakdown,
   chargedCostBreakdown,
 } from '@evtivity/lib';
@@ -148,6 +149,21 @@ export class TransactionProjector {
     } else if (eventType === 'Ended') {
       await this.projectEnded(tx);
     }
+
+    // Local cost calculation (OCPP 2.1 I08, I11, I12): after the event's
+    // projection, so the Ended comparison reads the stored final cost.
+    const stationTariffId = getString(payload, 'stationTariffId');
+    if (stationTariffId != null || payload.costDetails != null) {
+      await attempt.once(`${eventType}:station-cost`, () =>
+        recordStationCost(this.deps.sql, this.deps.logger, {
+          stationUuid,
+          transactionId,
+          eventType,
+          stationTariffId,
+          costDetails: payload.costDetails,
+        }),
+      );
+    }
   }
 
   private async publishTransactionScreen(
@@ -190,9 +206,12 @@ export class TransactionProjector {
    * and the CSMS end (`csms-session-end.ts`, MAX(seq_no) + 1) never matches
    * the station's own Ended.
    *
-   * Race-safe without a unique key on the large table: every event of one
-   * transaction projects on its transaction lane, one at a time, so the
-   * first delivery wrote its row before the resend is checked. Memoized: a
+   * Every event of one transaction projects on its transaction lane, one at
+   * a time, so the first delivery wrote its row before the resend is
+   * checked. A resend projected on another OCPP pod while the first delivery
+   * is still projecting is not caught here, but the unique key
+   * `uq_transaction_events_event` (the same identity) and the inserts'
+   * ON CONFLICT DO NOTHING keep it to one row. Memoized: a
    * projection retry keeps the first answer although the first run has
    * since written this event's row.
    */
@@ -499,12 +518,13 @@ export class TransactionProjector {
         await this.deps.sql`
             INSERT INTO transaction_events (session_id, event_type, seq_no, timestamp, trigger_reason, payload)
             VALUES (${sessionId}, 'started', ${seqNo}, ${timestamp}, ${triggerReason}, ${payloadJson})
+            ON CONFLICT DO NOTHING
           `;
       } catch (txEvtErr: unknown) {
         // A statement that never reached the server goes to the projection
         // retry. One interrupted mid-statement may have committed, so the
-        // projection is not retried: it continues to the gate (P11), at the
-        // cost of a possible duplicate log row if the station resends.
+        // projection is not retried: it continues to the gate (P11). A
+        // committed row is never doubled: ON CONFLICT on the event identity.
         if (pgConnectionErrorKind(txEvtErr) === 'not-sent') throw txEvtErr;
         this.deps.logger.warn(
           { err: txEvtErr, sessionId, transactionId },
@@ -612,10 +632,18 @@ export class TransactionProjector {
       // The session is priced from these snapshots only (issue #33). The
       // payment gate decides free or paid from this same tariff. A rerun
       // keeps the tariff it resolved first; the snapshot UPDATE repeats
-      // safely, and the first segment is opened once.
+      // safely, and the first segment is opened once. The tariff is the one
+      // that applied when the transaction started (the event timestamp, at
+      // most now: a station clock ahead of the CSMS never selects a future
+      // tariff), so a Started replayed from an offline queue is priced from
+      // its own start (finding B5).
       const tariffDriverUuid = driverUuid;
+      const tariffAt = eventTimeAtMostNow(timestamp);
       const tariff = await tx.attempt.memo('started:tariff', () =>
-        resolveStationTariff({ stationUuid, driverUuid: tariffDriverUuid }, this.deps.sql),
+        resolveStationTariff(
+          { stationUuid, driverUuid: tariffDriverUuid, at: tariffAt },
+          this.deps.sql,
+        ),
       );
       sessionTariff = tariff;
       if (tariff != null) {
@@ -638,108 +666,30 @@ export class TransactionProjector {
       }
     }
 
-    // Link reservation to session if reservationId present
+    // Link the session to its reservation: the echoed reservation id, or the
+    // holder's live hold on this EVSE (G12). A start by someone else leaves
+    // the hold active with its fee waived (G13, reservation-projections.ts).
     let linkedReservationId: string | null = null;
-    const ocppReservationId = payload.reservationId as number | undefined;
-    if (ocppReservationId != null) {
-      try {
-        // The active reservation, or the one this session is already linked
-        // to: a rerun after the first run moved it to in_use, or a remote
-        // start the reservation activation linked before Started (that first
-        // run now passes reserved: true to the gate, so the holding fee is
-        // billed).
-        const reservationRows = await this.deps.sql`
-              SELECT r.id, r.token_id FROM reservations r
-              WHERE r.reservation_id = ${ocppReservationId}
-                AND r.station_id = ${stationUuid}
-                AND (
-                  r.status = 'active'
-                  OR r.id = (SELECT cs.reservation_id FROM charging_sessions cs WHERE cs.id = ${sessionId})
-                )
-              ORDER BY (r.status = 'active') ASC
-              LIMIT 1
-            `;
-        const reservationUuid = reservationRows[0]?.id as string | undefined;
-        const reservationTokenId = reservationRows[0]?.token_id as string | null | undefined;
-        if (reservationUuid != null) {
-          await this.deps.sql`
-                UPDATE charging_sessions SET reservation_id = ${reservationUuid}, updated_at = now()
-                WHERE id = ${sessionId}
-              `;
-          linkedReservationId = reservationUuid;
-          // Conditional UPDATE -- only one writer flips active→in_use. Audit
-          // the transition iff we won the race (RETURNING is empty when
-          // the row was already in_use/cancelled/expired).
-          const usedRows = await this.deps.sql`
-                UPDATE reservations SET status = 'in_use', updated_at = now()
-                WHERE id = ${reservationUuid} AND status = 'active'
-                RETURNING id, driver_id
-              `;
-          if (usedRows.length > 0) {
-            await writeReservationAudit({
-              reservationId: reservationUuid,
-              action: 'used',
-              actor: 'system',
-              driverIdBefore: (usedRows[0]?.driver_id as string | null) ?? null,
-              driverIdAfter: (usedRows[0]?.driver_id as string | null) ?? null,
-              statusBefore: 'active',
-              statusAfter: 'in_use',
-              notes: `session ${sessionId}`,
-            });
-            await this.deps.notify.notifyChange(
-              'reservation.changed',
-              stationUuid,
-              null,
-              sessionId,
-            );
-          }
-
-          // If the reservation was bound to a specific token, verify the
-          // session was started with that token. We log + persist a metadata
-          // marker rather than blocking the session: the OCPP transaction
-          // is already underway and tearing it down here would just leave
-          // the EV charging without a billable session record.
-          if (reservationTokenId != null) {
-            const sessionRow = await this.deps.sql`
-                  SELECT token_id FROM charging_sessions WHERE id = ${sessionId} LIMIT 1
-                `;
-            const actualTokenId = (sessionRow[0]?.token_id as string | null | undefined) ?? null;
-            if (actualTokenId !== reservationTokenId) {
-              this.deps.logger.warn(
-                {
-                  sessionId,
-                  reservationUuid,
-                  expectedTokenId: reservationTokenId,
-                  actualTokenId,
-                },
-                'Reservation fulfilled by different token than reserved',
-              );
-              await this.deps.sql`
-                    UPDATE charging_sessions
-                    SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
-                      'reservationTokenMismatch', jsonb_build_object(
-                        'expected', ${reservationTokenId},
-                        'actual', ${actualTokenId}
-                      )
-                    ),
-                    updated_at = now()
-                    WHERE id = ${sessionId}
-                  `;
-            }
-          }
-        }
-      } catch (err) {
-        // A lost connection goes to the projection retry. These statements
-        // run outside a `once` step, so even an interrupted one is retried,
-        // and the rerun finds the reservation through the session's link.
-        // On the last run it continues: the gate must still run (P11), at
-        // the cost of a missing reservation link.
-        if (pgConnectionErrorKind(err) != null && !tx.attempt.isLast) throw err;
-        this.deps.logger.debug(
-          { err, sessionId },
-          'Reservation linking failed; continuing session creation',
-        );
-      }
+    try {
+      linkedReservationId = await linkStartedReservation(this.deps, {
+        sessionId,
+        stationUuid,
+        stationOcppId: stationId,
+        ocppReservationId: typeof payload.reservationId === 'number' ? payload.reservationId : null,
+        idToken: (payload.idToken as string | null | undefined) ?? null,
+        attempt: tx.attempt,
+      });
+    } catch (err) {
+      // A lost connection goes to the projection retry. These statements run
+      // outside a `once` step, so even an interrupted one is retried, and the
+      // rerun finds the reservation through the session's link (the taken
+      // hold through its waiver guard). On the last run it continues: the
+      // gate must still run (P11), at the cost of a missing reservation link.
+      if (pgConnectionErrorKind(err) != null && !tx.attempt.isLast) throw err;
+      this.deps.logger.debug(
+        { err, sessionId },
+        'Reservation linking failed; continuing session creation',
+      );
     }
 
     return {
@@ -1457,6 +1407,7 @@ export class TransactionProjector {
           await this.deps.sql`
             INSERT INTO transaction_events (session_id, event_type, seq_no, timestamp, trigger_reason, payload)
             VALUES (${sessionId}, 'updated', ${seqNo}, ${timestamp}, ${triggerReason}, ${payloadJson})
+            ON CONFLICT DO NOTHING
           `;
         } catch (txEvtErr: unknown) {
           // Only a statement that never reached the server is retried; an
@@ -1556,7 +1507,7 @@ export class TransactionProjector {
             AND (last_update_notified_at IS NULL
               OR last_update_notified_at < now() - make_interval(secs => ${SESSION_UPDATE_THROTTLE_MS / 1000}))
           RETURNING driver_id, energy_delivered_wh, current_cost_cents, started_at,
-                    tariff_tax_rate, UPPER(currency) AS currency
+                    tax_cents, UPPER(currency) AS currency
         `,
       );
       const updatedSession = throttleResult[0];
@@ -1581,10 +1532,11 @@ export class TransactionProjector {
                   (updatedSession.current_cost_cents as number | null) ?? 0,
                   updatedSession.currency as string,
                 ),
-                // Templates label the cost "incl. tax" only when it contains tax.
-                costIncludesTax: costIncludesTax(
+                // Templates label the cost "incl. tax" only when it contains
+                // tax: the tax stored with the running cost, not a tariff rate.
+                costIncludesTax: costContainsTax(
                   updatedSession.current_cost_cents as number | null,
-                  updatedSession.tariff_tax_rate as string | null,
+                  updatedSession.tax_cents as number | null,
                 ),
                 currency: updatedSession.currency as string,
                 durationMinutes,
@@ -1708,10 +1660,14 @@ export class TransactionProjector {
             idle_started_at = NULL,
             stopped_reason = COALESCE(stopped_reason, ${stoppedReason}),
             meter_stop = COALESCE(${meterStopVal}, meter_stop),
+            -- A stop register below the newest projected register (a meter
+            -- reset or replacement) keeps the energy so far; above it, the
+            -- register offset of earlier drops applies (finding B10).
             energy_delivered_wh = CASE
               WHEN ${meterStopVal}::numeric IS NOT NULL AND meter_start IS NOT NULL
-                AND ${meterStopVal}::numeric >= meter_start
-              THEN GREATEST(COALESCE(energy_delivered_wh, 0), ${meterStopVal}::numeric - meter_start)
+                AND ${meterStopVal}::numeric >= COALESCE(meter_last_register_wh, meter_start)
+              THEN GREATEST(COALESCE(energy_delivered_wh, 0),
+                ${meterStopVal}::numeric + meter_register_offset_wh - meter_start)
               ELSE energy_delivered_wh
             END,
             updated_at = now()
@@ -1729,6 +1685,17 @@ export class TransactionProjector {
     if (sessionRow != null) {
       const sessionId = sessionRow.id as string;
       const endedEvseUuid = sessionRow.evse_id as string | null;
+
+      // The ISO 15118 charging needs belong to the EV of this transaction.
+      // Left in place, its departure time would steer the next session on the
+      // EVSE (load management priority) and show as current needs.
+      if (endedEvseUuid != null) {
+        await this.deps.sql`
+          DELETE FROM ev_charging_needs n
+          USING evses e
+          WHERE e.id = ${endedEvseUuid} AND n.station_id = e.station_id AND n.evse_id = e.evse_id
+        `;
+      }
 
       // OCPP 2.1: chargingState is on transactionInfo of the Ended event (e.g. EVConnected
       // when the cable is still plugged after a remote stop). Mirror the Updated-handler
@@ -1792,6 +1759,7 @@ export class TransactionProjector {
           await this.deps.sql`
             INSERT INTO transaction_events (session_id, event_type, seq_no, timestamp, trigger_reason, payload)
             VALUES (${sessionId}, 'ended', ${seqNo}, ${timestamp}, ${triggerReason}, ${payloadJson})
+            ON CONFLICT DO NOTHING
           `;
         } catch (txEvtErr: unknown) {
           // Only a statement that never reached the server is retried; an
@@ -1834,9 +1802,11 @@ export class TransactionProjector {
           endedAt,
         );
 
-        // Close the open tariff segment with the idle not yet attributed to
-        // closed segments.
-        await closeOpenSegment(this.deps.sql, sessionId, endedAt, energyWh, idleMinutes);
+        // End the tariff segments at the reported end (finding B6): a
+        // segment the boundary job opened at or after it is removed, and the
+        // latest remaining one closes at the end with the idle not yet
+        // attributed to the other segments.
+        await closeSegmentsAt(this.deps.sql, sessionId, endedAt, energyWh, idleMinutes);
 
         // The one cost assembly prices the session from its snapshots. The
         // OCPP 2.1 handler priced it the same way and returned the result to
@@ -1929,11 +1899,23 @@ export class TransactionProjector {
       // Electricity cost (operator's wholesale cost). Forward-only: computed
       // once at session end against the site's TOU rate periods, never
       // backfilled. Fail-open: a missing rate config or any error leaves the
-      // column null and never blocks session completion.
-      if (siteId != null) {
+      // column null and never blocks session completion. A null cost is
+      // logged at info with its reason; profit leaves such a session out
+      // (session-revenue.ts) unless it delivered no energy.
+      const logNoElectricityCost = (reason: string): void => {
+        this.deps.logger.info(
+          { sessionId, stationId: tx.stationId, siteId, reason },
+          'Electricity cost not recorded',
+        );
+      };
+      if (siteId == null) {
+        logNoElectricityCost('no_site');
+      } else {
         try {
           const periods = await getElectricityRatePeriodsForSite(siteId);
-          if (periods.length > 0) {
+          if (periods.length === 0) {
+            logNoElectricityCost('no_periods');
+          } else {
             const [ctxRow] = await this.deps.sql`
                 SELECT cs.ended_at, s.timezone
                 FROM charging_sessions cs
@@ -1943,16 +1925,18 @@ export class TransactionProjector {
             const timezone = (ctxRow?.['timezone'] as string | null) ?? undefined;
             const endedAtValue = ctxRow?.['ended_at'] as string | Date | null | undefined;
             const ratedAt = endedAtValue != null ? new Date(endedAtValue) : new Date();
-            const rate = resolveElectricityRate(periods, ratedAt, timezone);
-            const sessionEnergyWh = Number(sessionRow.energy_delivered_wh ?? 0);
-            if (rate != null && sessionEnergyWh > 0) {
-              const electricityCostCents = calculateElectricityCostCents(
-                sessionEnergyWh,
-                rate.ratePerKwh,
-              );
+            const cost = computeSessionElectricityCost({
+              periods,
+              endedAt: ratedAt,
+              energyWh: Number(sessionRow.energy_delivered_wh ?? 0),
+              timezone,
+            });
+            if (cost.costCents == null) {
+              logNoElectricityCost(cost.reason);
+            } else {
               await this.deps.sql`
                   UPDATE charging_sessions
-                  SET electricity_cost_cents = ${electricityCostCents}, updated_at = now()
+                  SET electricity_cost_cents = ${cost.costCents}, updated_at = now()
                   WHERE id = ${sessionId} AND electricity_cost_cents IS NULL
                 `;
             }
@@ -1971,18 +1955,19 @@ export class TransactionProjector {
       await this.deps.notify.notifyChange('session.ended', stationUuid, siteId, sessionId);
       await this.deps.notify.notifyOcpiPush('session', { sessionId });
 
-      // Transition in_use reservation to used when session ends
+      // The session of an in_use hold ended: in_use -> used, audited (G17).
       const reservationUuidForEnd = sessionRow.reservation_id as string | null;
       if (reservationUuidForEnd != null) {
-        await this.deps.sql`
-            UPDATE reservations SET status = 'used', updated_at = now()
-            WHERE id = ${reservationUuidForEnd} AND status = 'in_use'
-          `.catch((err: unknown) => {
+        await markReservationUsed(this.deps, {
+          reservationDbId: reservationUuidForEnd,
+          sessionId,
+          stationUuid,
+          siteId,
+        }).catch((err: unknown) => {
           // A lost connection goes to the projection retry (guarded UPDATE).
           if (pgConnectionErrorKind(err) != null && !tx.attempt.isLast) throw err;
           this.deps.logger.error({ err }, 'failed to transition reservation to used');
         });
-        await this.deps.notify.notifyChange('reservation.changed', stationUuid, siteId, sessionId);
       }
 
       // Notify guest session service for payment finalization
@@ -2026,13 +2011,17 @@ export class TransactionProjector {
   async endByCsms(event: DomainEvent, attempt: ProjectionAttempt): Promise<void> {
     const stationId = event.payload.stationId as string;
     const transactionId = event.payload.transactionId as string;
-    // Transaction ids are unique per station only (N4).
-    const [row] = await this.deps.sql`
-      SELECT cs.status FROM charging_sessions cs
-      JOIN charging_stations st ON st.id = cs.station_id
-      WHERE st.station_id = ${stationId} AND cs.transaction_id = ${transactionId}
-    `;
-    if (row?.status !== 'active') return;
+    // Transaction ids are unique per station only (N4). Memoized: a projection
+    // retry after the end committed keeps the first answer and still settles.
+    const status = await attempt.memo('csms-end:status', async () => {
+      const [row] = await this.deps.sql`
+        SELECT cs.status FROM charging_sessions cs
+        JOIN charging_stations st ON st.id = cs.station_id
+        WHERE st.station_id = ${stationId} AND cs.transaction_id = ${transactionId}
+      `;
+      return (row?.status as string | undefined) ?? null;
+    });
+    if (status !== 'active') return;
     await this.project(event, attempt);
     await settleTransactionEnded(this.deps, event, attempt);
   }

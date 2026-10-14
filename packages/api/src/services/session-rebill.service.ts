@@ -8,6 +8,7 @@ import {
   reconcileCostBreakdown,
   sessionReceiptVariables,
 } from '@evtivity/lib';
+import type { SessionCostBreakdown } from '@evtivity/lib';
 import {
   SESSION_END_FAILED_REASON,
   SESSION_REBILL_LEASE_SECONDS,
@@ -31,6 +32,7 @@ import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import type { AuditActorInfo } from '../lib/audit-actor.js';
 import { paymentContext } from '../lib/payments.js';
+import { siteInScope } from '../lib/site-scope.js';
 
 // The one path that re-bills a session the CSMS gave up ending (stopped
 // reason EndRequestFailed: faulted, cost zeroed, hold cancelled). It claims
@@ -132,6 +134,8 @@ interface RebillSession {
   billingMode: 'card' | 'account' | null;
   /** The fleet an account session is billed to. */
   billingFleetName: string | null;
+  /** The account session is invoiced to its driver (charging_sessions.member_billed). */
+  memberBilled: boolean;
 }
 
 interface RebillRecord {
@@ -152,7 +156,7 @@ async function loadSession(sessionId: string): Promise<RebillSession | null> {
            s.energy_delivered_wh, st.id AS station_uuid, st.station_id AS station_ocpp_id,
            st.site_id, si.name AS site_name,
            (t.prepaid_balance_cents IS NOT NULL) AS prepaid,
-           s.billing_mode, bf.name AS billing_fleet_name,
+           s.billing_mode, s.member_billed, bf.name AS billing_fleet_name,
            EXISTS (SELECT 1 FROM guest_sessions g WHERE g.charging_session_id = s.id) AS guest_session
     FROM charging_sessions s
     JOIN charging_stations st ON st.id = s.station_id
@@ -189,6 +193,7 @@ async function loadSession(sessionId: string): Promise<RebillSession | null> {
         ? (row.billing_mode as 'card' | 'account')
         : null,
     billingFleetName: (row.billing_fleet_name as string | null) ?? null,
+    memberBilled: row.member_billed === true,
   };
 }
 
@@ -353,7 +358,7 @@ async function takePayment(
     // The prepaid debit is the session's only record; another one (the hold
     // the give-up cancelled) leaves the balance alone.
     if (record != null) return manual('prepaid_record_exists', record.id);
-    const settled = await settlePrepaidSession(session.id, ctx.log, {
+    const settled = await settlePrepaidSession(session.id, paymentContext(ctx.log, ctx.actor), {
       costCents: grossCents,
       rebill: true,
     });
@@ -387,7 +392,7 @@ async function takePayment(
         currency: session.currency,
         taxRate: Number(session.tariffTaxRate ?? 0),
       },
-      paymentContext(ctx.log),
+      paymentContext(ctx.log, ctx.actor),
     );
     switch (charge.status) {
       case 'charged':
@@ -426,6 +431,7 @@ async function takePayment(
 async function notifyRebilled(
   session: RebillSession,
   response: RebillResponse,
+  breakdown: SessionCostBreakdown,
   ctx: SessionRebillContext,
 ): Promise<void> {
   try {
@@ -453,14 +459,22 @@ async function notifyRebilled(
         transactionId: session.transactionId,
         energyDeliveredWh: session.energyDeliveredWh,
         finalCostCents: response.finalCostCents,
+        // The split the session was completed with: the receipt labels tax
+        // from it and lists its tariff and tax lines.
+        netCents: breakdown.netCents,
+        taxCents: breakdown.taxCents,
+        costBreakdown: breakdown,
+        // The re-bill charges the whole cost or falls back to manual billing
+        // (no receipt), so nothing is left unpaid.
+        capturedCents: null,
         currency: response.currency,
-        tariffTaxRate: session.tariffTaxRate,
         startedAt: session.startedAt,
         endedAt: response.endedAt,
         notCharged: false,
         billingMode:
           response.result === 'account' ? 'account' : session.billingMode == null ? null : 'card',
         billedTo: response.result === 'account' ? session.billingFleetName : null,
+        billedToMember: response.result === 'account' && session.memberBilled,
       }),
       ALL_TEMPLATES_DIRS,
       getPubSub(),
@@ -485,7 +499,7 @@ export async function rebillSession(
 ): Promise<RebillResponse> {
   const session = await loadSession(sessionId);
   if (session == null) throw notFound();
-  if (ctx.siteIds != null && session.siteId != null && !ctx.siteIds.includes(session.siteId)) {
+  if (!siteInScope(ctx.siteIds, session.siteId)) {
     throw notFound();
   }
   const record = await loadRecord(sessionId);
@@ -528,6 +542,7 @@ export async function rebillSession(
     sessionId,
     breakdown,
     endedAt: pricing.endedAt,
+    energyWh: pricing.energyWh,
     outcome: rebillStatus,
   });
   if (!completed) {
@@ -574,6 +589,6 @@ export async function rebillSession(
     undefined,
     ctx.log,
   );
-  await notifyRebilled(session, response, ctx);
+  await notifyRebilled(session, response, breakdown, ctx);
   return response;
 }

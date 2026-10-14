@@ -204,13 +204,30 @@ vi.mock('@evtivity/services/session-revenue', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/site-access.js', () => ({
-  getUserSiteIds: vi.fn().mockResolvedValue(null),
-  invalidateSiteAccessCache: vi.fn(),
-}));
+vi.mock('../lib/site-access.js', () => {
+  const getUserSiteIds = vi.fn().mockResolvedValue(null);
+  return {
+    getUserSiteIds,
+    invalidateSiteAccessCache: vi.fn(),
+    // Mirrors the real guard on top of the mocked getUserSiteIds.
+    requireAllSiteAccess: vi.fn(
+      async (
+        _request: unknown,
+        reply: { status: (c: number) => { send: (b: unknown) => Promise<unknown> } },
+        notFound: unknown,
+      ) => {
+        if ((await getUserSiteIds()) == null) return true;
+        await reply.status(404).send(notFound);
+        return false;
+      },
+    ),
+  };
+});
 
 import { registerAuth } from '../plugins/auth.js';
 import { siteRoutes } from '../routes/sites.js';
+import * as databaseModule from '@evtivity/database';
+import { getUserSiteIds } from '../lib/site-access.js';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
 import * as sessionRevenueModule from '@evtivity/services/session-revenue';
 
@@ -263,6 +280,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         stationCount: 3,
@@ -332,6 +351,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         stationCount: 5,
@@ -384,6 +405,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
@@ -400,6 +423,21 @@ describe('Site routes - handler logic', () => {
 
       expect(response.statusCode).toBe(201);
       expect(response.json().name).toBe('New Site');
+    });
+
+    it('returns 404 to a site-restricted user and inserts nothing', async () => {
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce([VALID_SITE_ID]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/sites',
+        headers: { authorization: 'Bearer ' + token },
+        payload: { name: 'New Site' },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SITE_NOT_FOUND');
+      expect(vi.mocked(databaseModule.db.insert)).not.toHaveBeenCalled();
     });
 
     it('returns 400 for missing name', async () => {
@@ -442,6 +480,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
@@ -487,6 +527,8 @@ describe('Site routes - handler logic', () => {
         latitude: null,
         longitude: null,
         timezone: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         hoursOfOperation: null,
         metadata: null,
         createdAt: '2024-01-01T00:00:00.000Z',
@@ -527,6 +569,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: 'de',
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
@@ -588,6 +632,8 @@ describe('Site routes - handler logic', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        aiInsightsEnabled: true,
+        aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
@@ -855,7 +901,61 @@ describe('Site routes - handler logic', () => {
       // Profit is revenue excluding tax minus electricity cost.
       expect(body).toHaveProperty('totalProfitCents', 23500 - 5000);
       expect(body).toHaveProperty('periodMonths');
+      expect(body).toHaveProperty('costMissingSessionCount', 0);
       expect(body).toHaveProperty('currency', 'EUR');
+    });
+
+    it('leaves sessions without an electricity cost out of profit and reports them', async () => {
+      const { aggregateRevenueRows } = sessionRevenueModule;
+      mockQueryRevenue.mockResolvedValueOnce(
+        aggregateRevenueRows([
+          {
+            key: null,
+            taxRate: '0',
+            grossCents: 1000,
+            source: 'session',
+            costMissing: false,
+            count: 3,
+          },
+          {
+            key: null,
+            taxRate: '0.25',
+            grossCents: 1250,
+            source: 'session',
+            costMissing: true,
+            count: 2,
+          },
+          { key: null, taxRate: '0', grossCents: 200, source: 'fee', costMissing: false, count: 1 },
+        ]),
+      );
+      setupDbResults(
+        [
+          {
+            totalSessions: 5,
+            completedSessions: 5,
+            faultedSessions: 0,
+            totalEnergyWh: 1,
+            avgDurationMinutes: 1,
+          },
+        ],
+        [{ sessionHours: 1, portCount: 1 }],
+        [{ totalElectricityCostCents: 900 }],
+      );
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sites/${VALID_SITE_ID}/metrics`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      // Revenue keeps every session; profit only the sessions with a cost and the fee.
+      expect(body).toHaveProperty('totalRevenueCents', 3000 + 2500 + 200);
+      expect(body).toHaveProperty('totalNetRevenueCents', 3000 + 2000 + 200);
+      expect(body).toHaveProperty('totalProfitCents', 3000 + 200 - 900);
+      expect(body).toHaveProperty('costMissingSessionCount', 2);
+      expect(body).toHaveProperty('costMissingRevenueCents', 2500);
     });
   });
 
@@ -928,9 +1028,12 @@ describe('Site routes - handler logic', () => {
   // --- PUT /v1/sites/:id/layout ---
 
   describe('PUT /v1/sites/:id/layout', () => {
-    it('saves layout positions and returns ok', async () => {
+    it('saves layout positions, returns ok and audits the old and new positions', async () => {
+      vi.mocked(databaseModule.writeAudit).mockClear();
       setupDbResults(
         [{ id: VALID_SITE_ID }], // site exists
+        [{ id: VALID_STATION_ID }], // the station belongs to the site
+        [{ stationId: VALID_STATION_ID, positionX: '10', positionY: '20' }], // previous position
         [], // upsert result (for each position)
       );
 
@@ -945,6 +1048,40 @@ describe('Site routes - handler logic', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.json().ok).toBe(true);
+      const auditArgs = vi.mocked(databaseModule.writeAudit).mock.calls[0]?.[1];
+      expect(auditArgs).toMatchObject({
+        entityId: VALID_SITE_ID,
+        action: 'updated',
+        actor: 'operator',
+        before: {
+          layoutPositions: [{ stationId: VALID_STATION_ID, positionX: 10, positionY: 20 }],
+        },
+        after: {
+          layoutPositions: [{ stationId: VALID_STATION_ID, positionX: 50, positionY: 100 }],
+        },
+        notes: 'station layout updated',
+      });
+    });
+
+    it('returns 404 for a station of another site and writes nothing', async () => {
+      setupDbResults(
+        [{ id: VALID_SITE_ID }], // site exists
+        [], // the station is not in this site
+      );
+
+      const response = await app.inject({
+        method: 'PUT',
+        url: `/sites/${VALID_SITE_ID}/layout`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: {
+          positions: [{ stationId: VALID_STATION_ID, positionX: 1, positionY: 2 }],
+        },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('STATION_NOT_FOUND');
+      expect(vi.mocked(databaseModule.db.insert)).not.toHaveBeenCalled();
+      expect(vi.mocked(databaseModule.writeAudit)).not.toHaveBeenCalled();
     });
 
     it('returns 404 when site not found', async () => {

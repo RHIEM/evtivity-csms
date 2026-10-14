@@ -4,7 +4,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, desc, sql, and } from 'drizzle-orm';
-import { db, createCreditCdr, ocpiCdrs, ocpiPartners } from '@evtivity/database';
+import {
+  db,
+  createCreditCdr,
+  ocpiCdrs,
+  ocpiPartners,
+  sessionAuditLog,
+  writeAudit,
+} from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -12,6 +19,10 @@ import type { PaginatedResponse } from '../lib/pagination.js';
 import { paginatedResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
+import { getUserSiteIds } from '../lib/site-access.js';
+import { sessionInSites } from '../lib/ocpi-site-scope.js';
+import type { JwtPayload } from '../plugins/auth.js';
+import { getAuditActor } from '../lib/audit-actor.js';
 
 const cdrListItem = z
   .object({
@@ -83,8 +94,14 @@ export function ocpiCdrRoutes(app: FastifyInstance): void {
     async (request) => {
       const { page, limit, partnerId, pushStatus } = request.query as z.infer<typeof cdrQuery>;
       const offset = (page - 1) * limit;
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      if (siteIds != null && siteIds.length === 0) return { data: [], total: 0 };
 
       const conditions = [];
+      if (siteIds != null) {
+        conditions.push(sessionInSites(ocpiCdrs.chargingSessionId, siteIds));
+      }
       if (partnerId != null) {
         conditions.push(eq(ocpiCdrs.partnerId, partnerId));
       }
@@ -150,6 +167,29 @@ export function ocpiCdrRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const body = request.body as z.infer<typeof creditCdrBody>;
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      if (siteIds != null) {
+        // A site-restricted user credits only CDRs of sessions at its own
+        // sites. Any other CDR answers like an unknown one.
+        const [inScope] =
+          siteIds.length === 0
+            ? []
+            : await db
+                .select({ id: ocpiCdrs.id })
+                .from(ocpiCdrs)
+                .where(
+                  and(
+                    eq(ocpiCdrs.ocpiCdrId, body.originalCdrId),
+                    sessionInSites(ocpiCdrs.chargingSessionId, siteIds),
+                  ),
+                )
+                .limit(1);
+        if (inScope == null) {
+          await reply.status(404).send({ error: 'CDR not found', code: 'CDR_NOT_FOUND' });
+          return;
+        }
+      }
 
       // One credit CDR builder for the API and the OCPI server (OCPI 10.1.1:
       // only total_cost is negated, in the Price shape of the CDR's version).
@@ -169,6 +209,29 @@ export function ocpiCdrRoutes(app: FastifyInstance): void {
             .send({ error: 'The CDR has no total cost to credit', code: 'VALIDATION_ERROR' });
           return;
         case 'created':
+          // Only a new credit CDR is audited: 'existing' is a retry of a
+          // credit already recorded.
+          await writeAudit(
+            { table: sessionAuditLog, idColumn: 'session_id' },
+            {
+              entityId: result.chargingSessionId,
+              entityIdSnapshot: result.chargingSessionId,
+              action: 'cdr_credited',
+              ...getAuditActor(request),
+              before: null,
+              after: {
+                originalCdrId: body.originalCdrId,
+                creditCdrId: result.cdrId,
+                partnerId: result.partnerId,
+                totalCost: result.cdrData['total_cost'] ?? null,
+              },
+              notes: body.reason,
+            },
+            db,
+            request.log,
+          );
+          await reply.status(201).send({ cdrId: result.cdrId });
+          return;
         case 'existing':
           await reply.status(201).send({ cdrId: result.cdrId });
           return;

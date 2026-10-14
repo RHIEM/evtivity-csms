@@ -77,6 +77,29 @@ export default tseslint.config(
       'evtivity/handle-caught-error': 'error',
     },
   },
+  // Switches are the shared Toggle (frontend/ui.md, shared controls): no
+  // hand-rolled role="switch" element outside components/ui.
+  {
+    files: ['packages/csms/src/**/*.tsx', 'packages/portal/src/**/*.tsx'],
+    ignores: ['**/components/ui/**', '**/__tests__/**', '**/*.test.tsx'],
+    rules: {
+      'evtivity/no-raw-switch': 'error',
+    },
+  },
+  // Copying goes through the shared copy controls (frontend/ui.md, shared
+  // controls): no navigator.clipboard outside components/ui.
+  {
+    files: [
+      'packages/csms/src/**/*.ts',
+      'packages/csms/src/**/*.tsx',
+      'packages/portal/src/**/*.ts',
+      'packages/portal/src/**/*.tsx',
+    ],
+    ignores: ['**/components/ui/**', '**/__tests__/**', '**/*.test.ts', '**/*.test.tsx'],
+    rules: {
+      'evtivity/no-raw-clipboard': 'error',
+    },
+  },
   // Processes couple only through pub/sub and BullMQ (design principle P8).
   // Code shared by the API and the worker lives in lib, database, payments or
   // services, which import no app package. Integration tests may reuse the
@@ -84,7 +107,6 @@ export default tseslint.config(
   {
     files: [
       'packages/worker/src/**/*.ts',
-      'packages/lib/src/**/*.ts',
       'packages/database/src/**/*.ts',
       'packages/payments/src/**/*.ts',
       'packages/services/src/**/*.ts',
@@ -107,7 +129,56 @@ export default tseslint.config(
                 '@evtivity/worker/*',
               ],
               message:
-                'Do not import another process package (P8). Move shared code to @evtivity/lib, @evtivity/database, @evtivity/payments or @evtivity/services.',
+                'Do not import another process package (P8). Move shared code to @evtivity/lib, @evtivity/database, @evtivity/payments, @evtivity/services or @evtivity/ai.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // lib is the base of every package: it imports no app package and not @evtivity/ai,
+  // which depends on lib (an import back would be a cycle).
+  {
+    files: ['packages/lib/src/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: [
+                '@evtivity/api',
+                '@evtivity/api/*',
+                '@evtivity/ocpp',
+                '@evtivity/ocpp/*',
+                '@evtivity/ocpi',
+                '@evtivity/ocpi/*',
+                '@evtivity/worker',
+                '@evtivity/worker/*',
+                '@evtivity/ai',
+                '@evtivity/ai/*',
+              ],
+              message:
+                'Do not import another process package (P8), and not @evtivity/ai, which depends on lib. Move shared code to @evtivity/lib.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // @evtivity/ai (the provider-neutral AI core and the adapters) is shared by the
+  // API and the worker and depends on @evtivity/lib only (design principle P8).
+  {
+    files: ['packages/ai/src/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '^@evtivity/(?!lib(/|$))',
+              message:
+                '@evtivity/ai imports no other workspace package but @evtivity/lib (P8): the API and the worker both load it.',
             },
           ],
         },
@@ -196,10 +267,31 @@ export default tseslint.config(
       },
     },
   },
+  // AI provider SDKs load only inside their adapter folder (packages/ai/src/providers/<name>/);
+  // everything else talks to the neutral AiAdapter. TC-AI-PK-01 checks the per-folder mapping.
+  // The typescript-eslint variant of the rule is used so this ban does not replace the
+  // no-restricted-imports settings of the blocks above.
   {
-    files: ['packages/api/src/services/ai/anthropic-provider.ts'],
+    files: [
+      'packages/*/src/**/*.ts',
+      'packages/*/src/**/*.tsx',
+      'packages/*/e2e/**/*.ts',
+      'packages/*/scripts/**/*.ts',
+    ],
+    ignores: ['packages/ai/src/providers/**'],
     rules: {
-      '@typescript-eslint/no-deprecated': 'off',
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '^(@anthropic-ai/sdk|openai|@google/genai|@google/generative-ai)(/.*)?$',
+              message:
+                'Import AI provider SDKs only in packages/ai/src/providers/<name>/; use the AiAdapter from the provider registry (@evtivity/ai/providers).',
+            },
+          ],
+        },
+      ],
     },
   },
   {

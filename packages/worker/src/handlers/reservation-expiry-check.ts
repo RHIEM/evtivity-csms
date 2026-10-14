@@ -1,244 +1,90 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
-import {
-  alertStationWatchersIfAvailable,
-  client,
-  resolveStationTariff,
-  writeReservationAudit,
-} from '@evtivity/database';
-import { dispatchDriverNotification, publishOcppCommand } from '@evtivity/lib';
+import { client } from '@evtivity/database';
+import type { RawTimestamp } from '@evtivity/database';
 import type { Logger } from 'pino';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
-import { chargeReservationFee } from '@evtivity/payments';
+import { expireDueReservations, settleDueNoShowFees } from '@evtivity/services/reservation-expiry';
+import type { ReservationExpiryDeps } from '@evtivity/services/reservation-expiry';
+import { notifyReservationDriver } from '@evtivity/services/reservation-notify';
 import { paymentContext } from '../lib/payments.js';
+import { enqueueOverdueReservationActivation } from '../reservation-worker.js';
 
 const EXPIRY_WARNING_MINUTES = 15;
 
-// Timestamp columns arrive as raw strings: drizzle(client) in
-// @evtivity/database overrides the postgres-js date parsers with identity,
-// so raw client-tag queries never get Date objects back.
-interface ExpiredRow {
+/** Scheduled reservations past their start activated per run (G6). */
+export const OVERDUE_ACTIVATION_LIMIT = 100;
+
+// Raw rows: timestamps arrive as postgres text (database.md).
+type ExpiringRow = {
   id: string;
   driver_id: string | null;
-  prior_status: 'active' | 'scheduled';
   reservation_ocpp_id: number;
   station_ocpp_id: string;
-  station_uuid: string;
-  site_id: string | null;
-  starts_at: string | null;
-  expires_at: string;
-  created_at: string;
-  has_session: boolean;
-}
+  expires_at: RawTimestamp;
+};
 
-interface ExpiringRow {
-  id: string;
-  driver_id: string | null;
-  expires_at: string;
-}
-
+/**
+ * Each minute: expires the reservations past their end and charges the
+ * no-show fees they owe (shared with the station-reported expiry), activates
+ * the scheduled ones whose start passed without an activation (G6), settles
+ * the fees a crash left `due` (G10), and warns drivers whose hold ends soon.
+ */
 export async function reservationExpiryCheckHandler(log: Logger): Promise<void> {
-  const pubsub = getPubSub();
+  const deps: ReservationExpiryDeps = {
+    pubsub: getPubSub(),
+    payments: paymentContext(log, 'reservation-expiry-check'),
+    logger: log,
+  };
 
-  // Atomic UPDATE+RETURNING joined with charging_stations so we can also tell
-  // the station to release the connector AND determine whether to charge a
-  // no-show fee (active reservation that expired without a linked session).
-  // The status IN ('active','scheduled') guard makes concurrent runs safe --
-  // only one row is returned per expired reservation even if the job somehow
-  // fans out. 'scheduled' covers orphaned reservations whose worker activation
-  // never fired (BullMQ outage or job loss); they still need terminal cleanup.
-  // prior_status is captured so the audit reflects the actual transition.
-  const expired = await client<ExpiredRow[]>`
-    WITH updated AS (
-      UPDATE reservations r
-      SET status = 'expired', updated_at = now()
-      FROM (
-        SELECT id, status AS prior_status FROM reservations
-        WHERE status IN ('active', 'scheduled') AND expires_at < now()
-        FOR UPDATE SKIP LOCKED
-      ) pre
-      WHERE r.id = pre.id
-      RETURNING r.id, r.driver_id, pre.prior_status, r.reservation_id, r.station_id,
-                r.starts_at, r.expires_at, r.created_at
-    )
-    SELECT
-      updated.id,
-      updated.driver_id,
-      updated.prior_status,
-      updated.reservation_id AS reservation_ocpp_id,
-      charging_stations.station_id AS station_ocpp_id,
-      charging_stations.id AS station_uuid,
-      charging_stations.site_id,
-      updated.starts_at,
-      updated.expires_at,
-      updated.created_at,
-      EXISTS (
-        SELECT 1 FROM charging_sessions WHERE charging_sessions.reservation_id = updated.id
-      ) AS has_session
-    FROM updated
-    INNER JOIN charging_stations ON charging_stations.id = updated.station_id
+  const expired = await expireDueReservations(deps);
+  if (expired.length > 0) log.info({ count: expired.length }, 'Expired reservations');
+
+  await activateOverdueReservations(log);
+
+  await settleDueNoShowFees(deps);
+
+  await warnExpiringReservations(deps);
+}
+
+/**
+ * Activates `scheduled` reservations whose start passed while their hold is
+ * still ahead (G6): the reservation_schedule message rides non-durable
+ * pub/sub, so a lost one would leave the row scheduled until it expires. The
+ * job id is the bridge's, so a job already queued is not added twice.
+ */
+async function activateOverdueReservations(log: Logger): Promise<void> {
+  const overdue = await client<Array<{ id: string }>>`
+    SELECT id FROM reservations
+    WHERE status = 'scheduled' AND starts_at <= now() AND expires_at > now()
+    ORDER BY starts_at
+    LIMIT ${OVERDUE_ACTIVATION_LIMIT}
   `;
-
-  for (const row of expired) {
-    // Conditional UPDATE + FOR UPDATE SKIP LOCKED guarantees exactly one row
-    // per reservation here, so the audit row is never duplicated even if the
-    // cron job overlaps with itself.
-    await writeReservationAudit({
-      reservationId: row.id,
-      action: 'expired',
-      actor: 'system',
-      driverIdBefore: row.driver_id,
-      driverIdAfter: row.driver_id,
-      statusBefore: row.prior_status,
-      statusAfter: 'expired',
-    });
-
-    if (row.driver_id != null) {
-      void dispatchDriverNotification(
-        client,
-        'reservation.Expired',
-        row.driver_id,
-        { reservationId: row.id },
-        ALL_TEMPLATES_DIRS,
-        pubsub,
-      );
-    }
-
-    // Best-effort CancelReservation. CommandListener routes through
-    // sendVersionAwareCommand for protocol translation. Offline stations get
-    // the command queued via offline_command_queue and replayed on reconnect.
-    // Skip for prior_status='scheduled': the station never received ReserveNow,
-    // so CancelReservation would refer to an unknown id and the station would
-    // log an error.
-    if (row.prior_status === 'active') {
-      try {
-        await publishOcppCommand(pubsub, {
-          stationId: row.station_ocpp_id,
-          action: 'CancelReservation',
-          payload: { reservationId: row.reservation_ocpp_id },
-        });
-      } catch (err) {
-        log.warn(
-          { err, reservationId: row.id, stationOcppId: row.station_ocpp_id },
-          'Failed to publish CancelReservation for expired reservation',
-        );
-      }
-    }
-
-    // The reservation no longer holds the EVSE, which changes no connector
-    // status until the station reports one, so watching drivers are alerted
-    // here when the station is now free by the shared driver availability rule.
-    // Fail-open: the expiry is stored.
+  for (const row of overdue) {
     try {
-      await alertStationWatchersIfAvailable(client, pubsub, row.station_uuid);
+      await enqueueOverdueReservationActivation(row.id);
     } catch (err) {
-      log.warn(
-        { err, reservationId: row.id },
-        'Station-watch check after reservation expiry failed',
-      );
-    }
-
-    // No-show fee. Charge the holding rate * minutes the connector was held
-    // when the reservation expired without a linked session. Skip when:
-    //   - No driver attached (open / operator-comp reservation)
-    //   - Prior status is 'scheduled' (the connector was never actually held;
-    //     the worker activation never fired, so no-show is unjust)
-    //   - The driver actually charged (has_session)
-    //   - The resolved tariff has no holding rate
-    //   - The driver has no default payment method (charge helper no-ops)
-    if (row.driver_id != null && row.prior_status === 'active' && !row.has_session) {
-      try {
-        const tariff = await resolveStationTariff(
-          { stationUuid: row.station_uuid, driverUuid: row.driver_id },
-          client,
-        );
-        const ratePerMinute =
-          tariff?.reservationFeePerMinute != null ? Number(tariff.reservationFeePerMinute) : 0;
-        if (ratePerMinute > 0 && tariff != null) {
-          // Instant ReserveNow reservations have no starts_at; the spot was
-          // claimed at row.created_at. Falling back to expires_at (the prior
-          // behavior) made holdingMs = 0 and silently waived the no-show fee
-          // for every instant reservation -- the more common case. Match the
-          // session-end path in event-projections.ts which uses created_at as
-          // the same fallback so both paths bill consistent hold durations.
-          const referenceStart = row.starts_at ?? row.created_at;
-          const holdingMs = new Date(row.expires_at).getTime() - new Date(referenceStart).getTime();
-          const holdingMinutes = Math.max(0, Math.ceil(holdingMs / 60_000));
-          const amountCents = Math.round(holdingMinutes * ratePerMinute * 100);
-          if (amountCents > 0) {
-            // amountCents is net (tariff prices are net); the fee is taxed at
-            // the tariff rate, recorded as a payment record, and charged
-            // through the site's Stripe Connect account.
-            const result = await chargeReservationFee(
-              {
-                type: 'reservation_no_show',
-                reservationId: row.id,
-                driverId: row.driver_id,
-                stationId: row.station_uuid,
-                siteId: row.site_id,
-                netCents: amountCents,
-              },
-              paymentContext(log),
-            );
-            if (result.status === 'charged') {
-              log.info(
-                {
-                  reservationId: row.id,
-                  driverId: row.driver_id,
-                  netCents: result.netCents,
-                  grossCents: result.grossCents,
-                  holdingMinutes,
-                },
-                'Charged no-show reservation fee',
-              );
-            } else if (result.status === 'failed') {
-              log.warn(
-                { reservationId: row.id, paymentRecordId: result.paymentRecordId },
-                `No-show reservation fee declined: ${result.reason}`,
-              );
-            }
-          }
-        }
-      } catch (err) {
-        log.warn(
-          { err, reservationId: row.id, driverId: row.driver_id },
-          'Failed to charge no-show reservation fee',
-        );
-      }
+      // fail-open: the next run tries again, and the expiry ends the row (P9).
+      log.warn({ err, reservationId: row.id }, 'Adding an overdue reservation activation failed');
     }
   }
+}
 
-  if (expired.length > 0) {
-    log.info({ count: expired.length }, 'Expired reservations');
-    // Tell the CSMS so the Reservations page reloads itself. One per batch,
-    // best-effort.
-    void pubsub
-      .publish(
-        'csms_events',
-        JSON.stringify({
-          eventType: 'reservation.changed',
-          stationId: null,
-          siteId: null,
-          sessionId: null,
-        }),
-      )
-      .catch(() => {
-        /* best-effort */
-      });
-  }
-
-  // Warn drivers about reservations expiring within the warning window.
-  // Dedup: skip drivers who already got a reservation.Expiring within the last
-  // WARNING window. The cron fires every minute and the window is 15 minutes,
-  // so without dedup each driver would receive up to 15 duplicate notifications
-  // (one per cron tick). Driver-level dedup (not per-reservation) is the finest
-  // grain available: `notifications.metadata` only stores `driverId`. Multi-pod
-  // safe because the notifications table is shared.
+/**
+ * Warns drivers about holds ending within the warning window, once per
+ * reservation (G17): the notification log stores the reservation row id
+ * (`metadata.reservationId`). The cron runs each minute and the window is 15
+ * minutes, so the dedup look-back is the same window; a hold extended after
+ * its warning gets a new one once it nears its new end.
+ */
+async function warnExpiringReservations(deps: ReservationExpiryDeps): Promise<void> {
   const warningThreshold = new Date(Date.now() + EXPIRY_WARNING_MINUTES * 60 * 1000);
   const expiringSoon = await client<ExpiringRow[]>`
-    SELECT r.id, r.driver_id, r.expires_at FROM reservations r
+    SELECT r.id, r.driver_id, r.reservation_id AS reservation_ocpp_id,
+           cs.station_id AS station_ocpp_id, r.expires_at
+    FROM reservations r
+    INNER JOIN charging_stations cs ON cs.id = r.station_id
     WHERE r.status = 'active'
       AND r.expires_at > now()
       AND r.expires_at <= ${warningThreshold}
@@ -246,24 +92,23 @@ export async function reservationExpiryCheckHandler(log: Logger): Promise<void> 
       AND NOT EXISTS (
         SELECT 1 FROM notifications n
         WHERE n.event_type = 'reservation.Expiring'
-          AND n.metadata->>'driverId' = r.driver_id
-          AND n.created_at > now() - (${EXPIRY_WARNING_MINUTES} || ' minutes')::interval
+          AND n.metadata->>'reservationId' = r.id
+          AND n.created_at > now() - make_interval(mins => ${EXPIRY_WARNING_MINUTES})
       )
   `;
 
   for (const row of expiringSoon) {
-    if (row.driver_id != null) {
-      void dispatchDriverNotification(
-        client,
-        'reservation.Expiring',
-        row.driver_id,
-        {
-          reservationId: row.id,
-          expiresAt: new Date(row.expires_at).toISOString(),
-        },
-        ALL_TEMPLATES_DIRS,
-        pubsub,
-      );
-    }
+    await notifyReservationDriver(
+      'reservation.Expiring',
+      {
+        reservationDbId: row.id,
+        reservationOcppId: row.reservation_ocpp_id,
+        stationOcppId: row.station_ocpp_id,
+        driverId: row.driver_id,
+        expiresAt: row.expires_at,
+      },
+      {},
+      deps,
+    );
   }
 }

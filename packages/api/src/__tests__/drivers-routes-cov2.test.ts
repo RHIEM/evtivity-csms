@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -50,6 +54,7 @@ function pgError(code: string): Error {
 }
 
 vi.mock('@evtivity/database', () => ({
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   db: {
     select: vi.fn(() => makeChain('select')),
     selectDistinct: vi.fn(() => makeChain('selectDistinct')),

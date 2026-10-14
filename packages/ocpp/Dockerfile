@@ -7,6 +7,7 @@ COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
 COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
 COPY packages/v2g-exi/package.json packages/v2g-exi/
@@ -26,6 +27,7 @@ COPY scripts/build.mjs scripts/build.mjs
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
 COPY packages/payments/ packages/payments/
+COPY packages/services/ packages/services/
 COPY packages/ocpp/ packages/ocpp/
 COPY packages/v2g-exi/ packages/v2g-exi/
 
@@ -40,6 +42,7 @@ COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
 COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
 COPY packages/v2g-exi/package.json packages/v2g-exi/

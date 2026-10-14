@@ -64,6 +64,12 @@ vi.mock('@evtivity/lib/pubsub-instance', () => ({
   setPubSub: vi.fn(),
 }));
 
+// Jobs the routes add to the worker queues (station screen repushes).
+const mockAddJob = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('@evtivity/lib/job-queues', () => ({
+  jobQueue: () => ({ add: mockAddJob, addBulk: vi.fn() }),
+}));
+
 // -- DB mock helpers --
 
 let dbResults: unknown[][] = [];
@@ -115,7 +121,8 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => {
+vi.mock('@evtivity/database', async () => {
+  const rawTimestamp = await import('@evtivity/database/src/lib/raw-timestamp.js');
   const dbMock: Record<string, unknown> = {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -141,6 +148,7 @@ vi.mock('@evtivity/database', () => {
   // chained query helpers above continue to drive the test.
   dbMock['transaction'] = vi.fn((cb: (tx: unknown) => Promise<unknown>) => cb(dbMock));
   return {
+    ...rawTimestamp,
     db: dbMock,
     client: {},
     setStationDisabled: mockSetStationDisabled,
@@ -261,6 +269,14 @@ vi.mock('@evtivity/services/session-revenue', async (importOriginal) => {
       actual.EMPTY_REVENUE,
   };
 });
+
+const { mockListStationMessageLog } = vi.hoisted(() => ({ mockListStationMessageLog: vi.fn() }));
+
+// The message log SQL (logs plus the offline command queue) is covered by
+// the integration tests.
+vi.mock('../lib/station-message-log.js', () => ({
+  listStationMessageLog: mockListStationMessageLog,
+}));
 
 vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn().mockResolvedValue(null),
@@ -607,7 +623,7 @@ describe('Station routes - handler logic', () => {
       };
       const moved = { ...station, siteId: 'sit_000000000002' };
 
-      mockPublish.mockClear();
+      mockAddJob.mockClear();
       setupDbResults([station], [moved]);
       const response = await app.inject({
         method: 'PATCH',
@@ -616,10 +632,10 @@ describe('Station routes - handler logic', () => {
         payload: { siteId: 'sit_000000000002' },
       });
       expect(response.statusCode).toBe(200);
-      const repush = mockPublish.mock.calls.find((c) => c[0] === 'station_message_repush');
-      expect(JSON.parse(repush?.[1] as string)).toEqual({ stationId: VALID_STATION_ID });
+      const repush = mockAddJob.mock.calls.find((c) => c[0] === 'station-message-repush');
+      expect(repush?.[1]).toEqual({ stationId: VALID_STATION_ID });
 
-      mockPublish.mockClear();
+      mockAddJob.mockClear();
       setupDbResults([moved], [moved]);
       await app.inject({
         method: 'PATCH',
@@ -627,7 +643,7 @@ describe('Station routes - handler logic', () => {
         headers: { authorization: 'Bearer ' + token },
         payload: { siteId: 'sit_000000000002' },
       });
-      expect(mockPublish.mock.calls.some((c) => c[0] === 'station_message_repush')).toBe(false);
+      expect(mockAddJob.mock.calls.some((c) => c[0] === 'station-message-repush')).toBe(false);
     });
 
     it('updates and returns the station', async () => {
@@ -1713,37 +1729,62 @@ describe('Station routes - handler logic', () => {
   // --- GET /v1/stations/:id/ocpp-logs ---
 
   describe('GET /v1/stations/:id/ocpp-logs', () => {
-    it('returns paginated OCPP logs with actions list', async () => {
-      const logRow = {
-        id: 1,
+    it('returns the messages and the queued commands with their processing status', async () => {
+      const row = {
         stationId: VALID_STATION_ID,
-        action: 'Heartbeat',
-        direction: 'inbound',
-        messageType: 2,
-        messageId: 'msg-1',
-        payload: null,
         errorCode: null,
         errorDescription: null,
-        createdAt: '2024-01-01T00:00:00.000Z',
+        payload: {},
       };
-      // Promise.all: data rows, count rows, then distinct actions
-      setupDbResults(
-        [logRow],
-        [{ count: 1 }],
-        [{ action: 'Heartbeat' }, { action: 'BootNotification' }],
-      );
+      mockListStationMessageLog.mockResolvedValueOnce({
+        data: [
+          {
+            ...row,
+            id: 4,
+            action: 'ClearCache',
+            direction: 'outbound',
+            messageType: 2,
+            messageId: 'cmd-1',
+            createdAt: new Date('2024-01-01T00:01:00.000Z'),
+            processingStatus: 'queued',
+          },
+          {
+            ...row,
+            id: 1,
+            action: 'Heartbeat',
+            direction: 'inbound',
+            messageType: 2,
+            messageId: 'msg-1',
+            createdAt: new Date('2024-01-01T00:00:00.000Z'),
+            processingStatus: 'processed',
+          },
+        ],
+        total: 2,
+        actions: ['ClearCache', 'Heartbeat'],
+      });
 
       const response = await app.inject({
         method: 'GET',
-        url: `/stations/${VALID_STATION_ID}/ocpp-logs`,
+        url: `/stations/${VALID_STATION_ID}/ocpp-logs?page=2&limit=10&action=ClearCache`,
         headers: { authorization: 'Bearer ' + token },
       });
 
       expect(response.statusCode).toBe(200);
-      const body = response.json();
-      expect(body).toHaveProperty('data');
-      expect(body).toHaveProperty('total');
-      expect(body).toHaveProperty('actions');
+      expect(mockListStationMessageLog).toHaveBeenCalledWith(
+        VALID_STATION_ID,
+        expect.objectContaining({ page: 2, limit: 10, action: 'ClearCache' }),
+      );
+      const body = response.json<{
+        data: { processingStatus: string; messageId: string }[];
+        total: number;
+        actions: string[];
+      }>();
+      expect(body.total).toBe(2);
+      expect(body.actions).toEqual(['ClearCache', 'Heartbeat']);
+      expect(body.data.map((d) => [d.messageId, d.processingStatus])).toEqual([
+        ['cmd-1', 'queued'],
+        ['msg-1', 'processed'],
+      ]);
     });
   });
 
@@ -1819,7 +1860,8 @@ describe('Station routes - handler logic', () => {
             severity: null,
             remote_address: '1.2.3.4',
             metadata: { reason: 'Invalid password' },
-            created_at: new Date(),
+            // The shared client returns raw timestamps as postgres text.
+            created_at: '2026-10-10 10:49:38.215861+00',
           },
           {
             id: 'security:5',
@@ -1847,6 +1889,7 @@ describe('Station routes - handler logic', () => {
       expect(body.data[0].severity).toBeNull();
       expect(body.data[1].source).toBe('security');
       expect(body.data[1].severity).toBe('critical');
+      expect(body.data[0].createdAt).toBe('2026-10-10T10:49:38.215Z');
     });
   });
 
@@ -1940,7 +1983,61 @@ describe('Station routes - handler logic', () => {
       // Profit is revenue excluding tax minus electricity cost.
       expect(body).toHaveProperty('totalProfitCents', 8480 - 3000);
       expect(body).toHaveProperty('periodMonths');
+      expect(body).toHaveProperty('costMissingSessionCount', 0);
       expect(body).toHaveProperty('currency', 'EUR');
+    });
+
+    it('leaves sessions without an electricity cost out of profit and reports them', async () => {
+      const { aggregateRevenueRows } = await import('@evtivity/services/session-revenue');
+      mockQueryRevenue.mockResolvedValueOnce(
+        aggregateRevenueRows([
+          {
+            key: null,
+            taxRate: '0',
+            grossCents: 1000,
+            source: 'session',
+            costMissing: false,
+            count: 3,
+          },
+          {
+            key: null,
+            taxRate: '0.25',
+            grossCents: 1250,
+            source: 'session',
+            costMissing: true,
+            count: 2,
+          },
+          { key: null, taxRate: '0', grossCents: 200, source: 'fee', costMissing: false, count: 1 },
+        ]),
+      );
+      setupDbResults(
+        [
+          {
+            totalSessions: 5,
+            completedSessions: 5,
+            faultedSessions: 0,
+            totalEnergyWh: 1,
+            avgDurationMinutes: 1,
+          },
+        ],
+        [{ sessionHours: 1, portCount: 1 }],
+        [{ totalElectricityCostCents: 900 }],
+      );
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/stations/${VALID_STATION_ID}/metrics`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      // Revenue keeps every session; profit only the sessions with a cost and the fee.
+      expect(body).toHaveProperty('totalRevenueCents', 3000 + 2500 + 200);
+      expect(body).toHaveProperty('totalNetRevenueCents', 3000 + 2000 + 200);
+      expect(body).toHaveProperty('totalProfitCents', 3000 + 200 - 900);
+      expect(body).toHaveProperty('costMissingSessionCount', 2);
+      expect(body).toHaveProperty('costMissingRevenueCents', 2500);
     });
   });
 
@@ -2474,8 +2571,25 @@ describe('Station routes - handler logic', () => {
       updatedAt: '2026-01-01T00:00:00.000Z',
     };
 
-    it('publishes SetVariableMonitoring with the command message shape', async () => {
-      setupDbResults([{ id: VALID_STATION_ID, stationId: 'STATION-001' }], [ruleRow]);
+    it('sends SetVariableMonitoring as an OCPP 2.1 command and waits for the reply', async () => {
+      const { sendOcppCommandAndWait } = await import('@evtivity/services/ocpp-command');
+      const sendMock = vi.mocked(sendOcppCommandAndWait);
+      sendMock.mockResolvedValueOnce({
+        commandId: 'c',
+        response: { setMonitoringResult: [{ id: 42, status: 'Accepted' }] },
+      });
+      setupDbResults(
+        [
+          {
+            id: VALID_STATION_ID,
+            stationId: 'STATION-001',
+            isOnline: true,
+            ocppProtocol: 'ocpp2.1',
+          },
+        ],
+        [ruleRow],
+        [{ ...ruleRow, status: 'active' }],
+      );
 
       const response = await app.inject({
         method: 'POST',
@@ -2491,14 +2605,11 @@ describe('Station routes - handler logic', () => {
       });
 
       expect(response.statusCode).toBe(201);
-      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
-      expect(call).toBeDefined();
-      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
-      expect(Object.keys(message)).toEqual(['commandId', 'stationId', 'action', 'payload']);
-      expect(message).toMatchObject({
-        stationId: 'STATION-001',
-        action: 'SetVariableMonitoring',
-        payload: {
+      expect(response.json().status).toBe('active');
+      expect(sendMock).toHaveBeenCalledWith(
+        'STATION-001',
+        'SetVariableMonitoring',
+        {
           setMonitoringData: [
             {
               component: { name: 'EVSE' },
@@ -2509,27 +2620,22 @@ describe('Station routes - handler logic', () => {
             },
           ],
         },
-      });
-      expect(typeof message['commandId']).toBe('string');
+        '2.1',
+      );
     });
 
-    it('returns 502 STATION_REJECTED when the publish fails', async () => {
-      setupDbResults([{ id: VALID_STATION_ID, stationId: 'STATION-001' }], [ruleRow]);
-      mockPublish.mockRejectedValueOnce(new Error('redis down'));
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/stations/${VALID_STATION_ID}/monitoring-rules`,
-        headers: { authorization: 'Bearer ' + token },
-        payload: { component: 'EVSE', variable: 'Power', type: 'UpperThreshold', value: 1 },
+    it('sends ClearVariableMonitoring for an active rule', async () => {
+      const { sendOcppCommandAndWait } = await import('@evtivity/services/ocpp-command');
+      const sendMock = vi.mocked(sendOcppCommandAndWait);
+      sendMock.mockResolvedValueOnce({
+        commandId: 'c',
+        response: { clearMonitoringResult: [{ id: 42, status: 'Accepted' }] },
       });
-
-      expect(response.statusCode).toBe(502);
-      expect(response.json().code).toBe('STATION_REJECTED');
-    });
-
-    it('publishes ClearVariableMonitoring for a rule the station acknowledged', async () => {
-      setupDbResults([ruleRow], [{ stationId: 'STATION-001' }], []);
+      setupDbResults(
+        [{ ...ruleRow, status: 'active' }],
+        [{ stationId: 'STATION-001', isOnline: true }],
+        [],
+      );
 
       const response = await app.inject({
         method: 'DELETE',
@@ -2538,14 +2644,12 @@ describe('Station routes - handler logic', () => {
       });
 
       expect(response.statusCode).toBe(204);
-      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
-      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
-      expect(message).toMatchObject({
-        stationId: 'STATION-001',
-        action: 'ClearVariableMonitoring',
-        payload: { id: [42] },
-      });
-      expect(message).not.toHaveProperty('version');
+      expect(sendMock).toHaveBeenCalledWith(
+        'STATION-001',
+        'ClearVariableMonitoring',
+        { id: [42] },
+        '2.1',
+      );
     });
   });
 

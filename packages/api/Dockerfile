@@ -7,6 +7,7 @@ COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
 COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
 COPY packages/v2g-exi/package.json packages/v2g-exi/
@@ -23,10 +24,13 @@ FROM deps AS build
 
 COPY tsconfig.base.json tsconfig.json ./
 COPY scripts/build.mjs scripts/build.mjs
+# The bundle embeds the OCPP request schemas (embedOcppSchemasPlugin).
+COPY schemas/ schemas/
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
 COPY packages/payments/ packages/payments/
 COPY packages/services/ packages/services/
+COPY packages/ai/ packages/ai/
 COPY packages/api/ packages/api/
 COPY packages/ocpp/ packages/ocpp/
 COPY packages/v2g-exi/ packages/v2g-exi/
@@ -50,6 +54,7 @@ COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
 COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
 COPY packages/v2g-exi/package.json packages/v2g-exi/
@@ -62,8 +67,7 @@ COPY packages/ocpi-simulator/package.json packages/ocpi-simulator/
 
 RUN npm ci --omit=dev --ignore-scripts && npm rebuild argon2
 
-COPY schemas/ schemas/
-COPY docs-index.json* ./
+COPY docs-index.json* docs-passages.json* ./
 COPY --from=build /app/dist/api.mjs dist/api.mjs
 COPY --from=build /app/dist/api.mjs.map dist/api.mjs.map
 COPY packages/api/src/templates/ templates/api/

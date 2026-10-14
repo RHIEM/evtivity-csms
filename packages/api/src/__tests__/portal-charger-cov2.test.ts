@@ -49,11 +49,19 @@ function makeChain() {
   return chain;
 }
 
-const { mockRecordSessionEndRequest } = vi.hoisted(() => ({
+const { mockRecordSessionEndRequest, mockWriteCsmsSessionAudit } = vi.hoisted(() => ({
   mockRecordSessionEndRequest: vi.fn().mockResolvedValue(true),
+  mockWriteCsmsSessionAudit: vi.fn(),
 }));
 
 vi.mock('@evtivity/database', async () => ({
+  writeAudit: vi.fn(() => Promise.resolve()),
+  userAuditLog: { _table: 'user_audit_log' },
+  driverAuditLog: { _table: 'driver_audit_log' },
+  stationAuditLog: { _table: 'station_audit_log' },
+  sessionAuditLog: { _table: 'session_audit_log' },
+  apiKeyAuditLog: { _table: 'api_key_audit_log' },
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   // The shared driver availability rule builds SQL; drizzle is mocked here, so the fragments are stubs.
   availableEvseCountSql: vi.fn(() => 'available_evse_count'),
   evseAvailableSql: vi.fn(() => 'evse_available'),
@@ -61,6 +69,7 @@ vi.mock('@evtivity/database', async () => ({
   STARTABLE_CONNECTOR_STATUSES: ['available', 'occupied', 'preparing', 'ev_connected', 'finishing'],
   SESSION_END_REQUEST_CHANNEL: 'session_end_requests',
   recordSessionEndRequest: mockRecordSessionEndRequest,
+  writeCsmsSessionAudit: mockWriteCsmsSessionAudit,
   isStationLevelUnavailable: (
     await vi.importActual<typeof import('../../../database/src/lib/station-status.js')>(
       '../../../database/src/lib/station-status.js',
@@ -96,6 +105,18 @@ vi.mock('@evtivity/database', async () => ({
   stationImages: {},
   settings: {},
   driverTokens: {},
+  snapshotReservationFeeTerms: vi.fn().mockResolvedValue({
+    feeTaxBasis: 'gross',
+    feeTaxRate: '0.19',
+    feePerMinute: '0.10',
+    feeCancellationCents: 300,
+  }),
+  resolveReservationFeeTerms: vi.fn().mockResolvedValue({
+    basis: 'gross',
+    taxRate: '0.19',
+    feePerMinute: '0.10',
+    cancellationFeeCents: 300,
+  }),
   getReservationSettings: vi.fn().mockResolvedValue({
     enabled: true,
     bufferMinutes: 0,
@@ -211,17 +232,23 @@ vi.mock('@evtivity/services/maintenance.service', () => ({
   getActiveMaintenanceForStation: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('@evtivity/services/maintenance-check', () => ({
-  assertNoMaintenanceConflict: vi.fn().mockResolvedValue(undefined),
-  MaintenanceConflictError: class MaintenanceConflictError extends Error {
-    statusCode = 409;
-    code = 'RESERVATION_DURING_MAINTENANCE';
-    details: Record<string, unknown> = {};
-  },
+// Reservation create and cancel are covered in portal-charger-reservations.test.ts.
+vi.mock('@evtivity/services/reservation.service', () => ({
+  cancelReservationWithStation: vi.fn(),
+  createReservation: vi.fn(),
+  dispatchReservation: vi.fn(),
+  // The bound token of a held reservation (resolved from the token row).
+  reserveNowToken: vi.fn((r: { tokenId: string | null; driverId: string | null }) =>
+    Promise.resolve({
+      idToken:
+        r.tokenId != null
+          ? { idToken: 'RFID-0042', type: 'ISO14443' }
+          : { idToken: r.driverId ?? 'operator', type: 'Central' },
+    }),
+  ),
 }));
-
-vi.mock('../lib/reservation-eligibility.js', () => ({
-  assertReservationsAllowed: vi.fn().mockResolvedValue(undefined),
+vi.mock('@evtivity/services/reservation-notify', () => ({
+  notifyReservationDriver: vi.fn(),
 }));
 
 const { mockIsStationCheckRateLimited, mockGetCachedConnectorStatus } = vi.hoisted(() => ({
@@ -237,18 +264,9 @@ vi.mock('../lib/rate-limiters.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { portalChargerRoutes } from '../routes/portal/charger.js';
-import {
-  db,
-  getReservationSettings,
-  isStationChargingFree,
-  writeReservationAudit,
-} from '@evtivity/database';
+import { db, getReservationSettings, isStationChargingFree } from '@evtivity/database';
 import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
 import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
-import {
-  assertNoMaintenanceConflict,
-  MaintenanceConflictError,
-} from '@evtivity/services/maintenance-check';
 
 const STATION_UUID = 'sta_000000000001';
 const SESSION_ID = 'ses_000000000001';
@@ -275,26 +293,6 @@ const START_STATION = {
   firmwareState: null,
   reportedStatus: null,
   freeVendEnabled: false,
-};
-
-const RESERVATION_STATION = {
-  id: STATION_UUID,
-  siteId: null,
-  isOnline: true,
-  onboardingStatus: 'accepted',
-  reservationsEnabled: true,
-};
-
-const CREATED_RESERVATION = {
-  id: RESERVATION_ID,
-  reservationId: 6,
-  stationId: STATION_UUID,
-  evseId: null,
-  driverId: DRIVER_ID,
-  tokenId: null,
-  status: 'active',
-  expiresAt: '2030-01-01T00:00:00.000Z',
-  createdAt: '2026-01-01T00:00:00.000Z',
 };
 
 async function buildApp(): Promise<FastifyInstance> {
@@ -325,12 +323,6 @@ function insertValues(): unknown[] {
     .map(([values]) => values);
 }
 
-function publishedOn(channel: string): Array<Record<string, unknown>> {
-  return mockPublish.mock.calls
-    .filter((c) => c[0] === channel)
-    .map((c) => JSON.parse(c[1] as string) as Record<string, unknown>);
-}
-
 describe('Portal charger routes - remaining branches', () => {
   let app: FastifyInstance;
   let driverToken: string;
@@ -352,7 +344,6 @@ describe('Portal charger routes - remaining branches', () => {
     mockRenderMaintenanceMessage.mockResolvedValue('Closed for repairs');
     vi.mocked(isStationChargingFree).mockResolvedValue(true);
     vi.mocked(getActiveMaintenanceForStation).mockResolvedValue(null);
-    vi.mocked(assertNoMaintenanceConflict).mockResolvedValue(undefined);
     vi.mocked(getReservationSettings).mockResolvedValue(RESERVATION_SETTINGS);
     vi.mocked(sendOcppCommandAndWait).mockReset();
     vi.mocked(sendOcppCommandAndWait).mockResolvedValue({
@@ -397,7 +388,10 @@ describe('Portal charger routes - remaining branches', () => {
       expect(response.statusCode).toBe(200);
       const body = response.json();
       expect(body.evse.reservationExpiresAt).toBe('2030-05-01T12:00:00.000Z');
-      expect(body.evse.reservationDriverId).toBe('drv_000000000002');
+      expect(body.evse.reserved).toBe(true);
+      // Anonymous caller: never the holder, and the holder's id is not returned.
+      expect(body.evse.reservedByMe).toBe(false);
+      expect(body.evse).not.toHaveProperty('reservationDriverId');
       expect(body.maintenance).toEqual({
         active: true,
         plannedEndAt: '2030-05-02T00:00:00.000Z',
@@ -410,6 +404,46 @@ describe('Portal charger routes - remaining branches', () => {
       );
     });
 
+    it('reports reservedByMe for the driver holding the reservation', async () => {
+      const expiresAt = new Date('2030-05-01T12:00:00.000Z');
+      setupDbResults(
+        [station],
+        [{ id: 'evs_000000000001', evseId: 1 }],
+        [],
+        [{ expiresAt, driverId: 'drv_000000000002' }],
+      );
+      const holderToken = app.jwt.sign({ driverId: 'drv_000000000002', type: 'driver' });
+      const holder = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/evse/1',
+        headers: { authorization: `Bearer ${holderToken}` },
+      });
+      expect(holder.statusCode).toBe(200);
+      expect(holder.json().evse).toMatchObject({ reserved: true, reservedByMe: true });
+
+      setupDbResults(
+        [station],
+        [{ id: 'evs_000000000001', evseId: 1 }],
+        [],
+        [{ expiresAt, driverId: 'drv_000000000002' }],
+      );
+      const other = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/evse/1',
+        headers: auth(),
+      });
+      expect(other.json().evse).toMatchObject({ reserved: true, reservedByMe: false });
+    });
+
+    it('reports an unreserved EVSE', async () => {
+      setupDbResults([station], [{ id: 'evs_000000000001', evseId: 1 }], [], []);
+      const response = await app.inject({ method: 'GET', url: '/portal/chargers/CS-001/evse/1' });
+      expect(response.json().evse).toMatchObject({
+        reservationExpiresAt: null,
+        reserved: false,
+        reservedByMe: false,
+      });
+    });
     it('keeps the maintenance window without a message when rendering fails', async () => {
       vi.mocked(getActiveMaintenanceForStation).mockResolvedValue({
         siteId: 'sit_000000000001',
@@ -444,6 +478,9 @@ describe('Portal charger routes - remaining branches', () => {
         pricePerKwh: null,
         pricePerMinute: null,
         pricePerSession: null,
+        idleFeePricePerMinute: null,
+        // No holding fee, so the portal and the app show no no-show fee.
+        reservationFeePerMinute: null,
         taxBasis: 'net',
         isFreeVend: true,
         restrictions: null,
@@ -680,13 +717,15 @@ describe('Portal charger routes - remaining branches', () => {
             },
           ],
           reservationExpiresAt: '2030-01-01T10:00:00.000Z',
-          reservationDriverId: 'drv_000000000003',
+          reserved: true,
+          reservedByMe: false,
         },
         {
           evseId: 2,
           connectors: [],
           reservationExpiresAt: '2030-01-01T09:00:00.000Z',
-          reservationDriverId: 'drv_000000000002',
+          reserved: true,
+          reservedByMe: false,
         },
       ]);
     });
@@ -819,6 +858,70 @@ describe('Portal charger routes - remaining branches', () => {
       expect(response.json()).toEqual({ chargingSessionId: SESSION_ID });
     });
 
+    it("TC-RES-16: links the session to the holder's active reservation on the started EVSE", async () => {
+      setupDbResults(
+        [START_STATION],
+        [{ id: 'evs_000000000001' }],
+        [{ status: 'reserved' }],
+        [
+          {
+            id: RESERVATION_ID,
+            driverId: DRIVER_ID,
+            tokenId: 'dtk_000000000001',
+            status: 'active',
+          },
+        ],
+        [],
+        [],
+        [{ id: SESSION_ID }],
+      );
+      const response = await start();
+      expect(response.statusCode).toBe(200);
+      expect(insertValues()).toEqual([
+        expect.objectContaining({ driverId: DRIVER_ID, reservationId: RESERVATION_ID }),
+      ]);
+      // The start carries the token the hold was made for (OCPP H01).
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith(
+        'CS-001',
+        'RequestStartTransaction',
+        expect.objectContaining({ idToken: { idToken: 'RFID-0042', type: 'ISO14443' } }),
+      );
+      // A read only: the start never writes the reservation.
+      expect(updateSets()).toEqual([]);
+    });
+
+    it("TC-RES-16: links no reservation when the holder's hold is still scheduled", async () => {
+      setupDbResults(
+        [START_STATION],
+        [{ id: 'evs_000000000001' }],
+        [{ status: 'available' }],
+        [{ id: RESERVATION_ID, driverId: DRIVER_ID, status: 'scheduled' }],
+        [],
+        [],
+        [{ id: SESSION_ID }],
+      );
+      const response = await start();
+      expect(response.statusCode).toBe(200);
+      expect(insertValues()).toEqual([expect.objectContaining({ reservationId: null })]);
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith(
+        'CS-001',
+        'RequestStartTransaction',
+        expect.objectContaining({ idToken: { idToken: DRIVER_ID, type: 'Central' } }),
+      );
+    });
+
+    it('TC-RES-16: links no reservation without a current hold', async () => {
+      setupStartRows([{ id: SESSION_ID }]);
+      const response = await start();
+      expect(response.statusCode).toBe(200);
+      expect(insertValues()).toEqual([expect.objectContaining({ reservationId: null })]);
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith(
+        'CS-001',
+        'RequestStartTransaction',
+        expect.objectContaining({ idToken: { idToken: DRIVER_ID, type: 'Central' } }),
+      );
+    });
+
     it('returns 400 SESSION_ALREADY_ACTIVE when the driver is already charging', async () => {
       setupDbResults(
         [START_STATION],
@@ -883,6 +986,17 @@ describe('Portal charger routes - remaining branches', () => {
         code: 'STATION_TIMEOUT',
       });
       expect(updateSets()).toEqual([expect.objectContaining({ status: 'faulted' })]);
+      expect(mockWriteCsmsSessionAudit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: SESSION_ID,
+          action: 'faulted',
+          actor: 'system',
+          actorLabel: 'portal-start-timeout',
+          after: { status: 'faulted' },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
       expect(mockDispatchDriverNotification).toHaveBeenCalledWith(
         expect.anything(),
         'session.Faulted',
@@ -970,6 +1084,16 @@ describe('Portal charger routes - remaining branches', () => {
           'RequestStartTransaction',
         ]);
         expect(updateSets()).toEqual([expect.objectContaining({ status: 'faulted' })]);
+        expect(mockWriteCsmsSessionAudit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            sessionId: SESSION_ID,
+            action: 'faulted',
+            actorLabel: 'portal-start-rejected',
+            notes: 'Station rejected RequestStartTransaction: Rejected',
+          }),
+          expect.anything(),
+          expect.anything(),
+        );
         expect(mockCancelOpenSessionHold).toHaveBeenCalledWith(
           SESSION_ID,
           'Station rejected the start: Rejected',
@@ -1114,227 +1238,6 @@ describe('Portal charger routes - remaining branches', () => {
       const response = await get();
       expect(response.statusCode).toBe(200);
       expect(response.json()).toMatchObject({ evseId: null, sessionId: null });
-    });
-  });
-
-  describe('POST /portal/reservations', () => {
-    const inMs = (ms: number): string => new Date(Date.now() + ms).toISOString();
-
-    function create(payload: Record<string, unknown>) {
-      return app.inject({
-        method: 'POST',
-        url: '/portal/reservations',
-        headers: auth(),
-        payload: { stationId: 'CS-001', ...payload },
-      });
-    }
-
-    it('returns 403 STATION_PENDING for a station awaiting approval', async () => {
-      setupDbResults([{ ...RESERVATION_STATION, onboardingStatus: 'pending' }]);
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(403);
-      expect(response.json().code).toBe('STATION_PENDING');
-      expect(assertNoMaintenanceConflict).not.toHaveBeenCalled();
-    });
-
-    it('returns 409 with the maintenance details when the window overlaps maintenance', async () => {
-      setupDbResults([RESERVATION_STATION]);
-      // The module mock's error class takes a message, like Error.
-      const MockConflictError = MaintenanceConflictError as unknown as new (
-        message: string,
-      ) => Error;
-      const conflict = new MockConflictError('Reservation overlaps maintenance');
-      (conflict as unknown as { details: Record<string, unknown> }).details = {
-        maintenanceId: 'mnt_1',
-      };
-      vi.mocked(assertNoMaintenanceConflict).mockRejectedValueOnce(conflict);
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(409);
-      expect(response.json()).toEqual({
-        error: 'Reservation overlaps maintenance',
-        code: 'RESERVATION_DURING_MAINTENANCE',
-        maintenanceId: 'mnt_1',
-      });
-    });
-
-    it('answers 500 when the maintenance check fails for another reason', async () => {
-      setupDbResults([RESERVATION_STATION]);
-      vi.mocked(assertNoMaintenanceConflict).mockRejectedValueOnce(new Error('db down'));
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(500);
-      expect(insertValues()).toEqual([]);
-    });
-
-    it('returns 400 RESERVATION_WINDOW_TOO_SHORT for a window under a minute', async () => {
-      setupDbResults([RESERVATION_STATION]);
-      const response = await create({ expiresAt: inMs(30_000) });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('RESERVATION_WINDOW_TOO_SHORT');
-    });
-
-    it('returns 400 RESERVATION_STARTS_IN_PAST for a start beyond the slack', async () => {
-      setupDbResults([RESERVATION_STATION]);
-      const response = await create({ startsAt: inMs(-600_000), expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('RESERVATION_STARTS_IN_PAST');
-    });
-
-    it('returns 400 RESERVATION_EXPIRES_TOO_SOON when the end is under a minute away', async () => {
-      setupDbResults([RESERVATION_STATION]);
-      const response = await create({ startsAt: inMs(-45_000), expiresAt: inMs(30_000) });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('RESERVATION_EXPIRES_TOO_SOON');
-    });
-
-    it('returns 400 RESERVATION_TOO_LONG over the configured maximum', async () => {
-      vi.mocked(getReservationSettings).mockResolvedValue({
-        ...RESERVATION_SETTINGS,
-        maxHours: 1,
-      });
-      setupDbResults([RESERVATION_STATION]);
-      const response = await create({ expiresAt: inMs(2 * 3_600_000) });
-      expect(response.statusCode).toBe(400);
-      expect(response.json()).toEqual({
-        error: 'Reservation cannot exceed 1 hours',
-        code: 'RESERVATION_TOO_LONG',
-      });
-    });
-
-    it('returns 404 EVSE_NOT_FOUND for an unknown EVSE', async () => {
-      setupDbResults([RESERVATION_STATION], [{ id: 1 }], []);
-      const response = await create({ evseId: 9, expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(404);
-      expect(response.json()).toEqual({ error: 'EVSE not found', code: 'EVSE_NOT_FOUND' });
-    });
-
-    it('returns 409 EVSE_IN_USE when the EVSE is charging inside the check window', async () => {
-      vi.mocked(getReservationSettings).mockResolvedValue({
-        ...RESERVATION_SETTINGS,
-        activeSessionCheckHours: 3,
-      });
-      setupDbResults(
-        [RESERVATION_STATION],
-        [{ id: 1 }],
-        [{ id: 'evs_000000000001' }],
-        [{ id: SESSION_ID }],
-      );
-      const response = await create({ evseId: 1, expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(409);
-      expect(response.json()).toEqual({
-        error: 'EVSE has an active charging session that conflicts with this reservation',
-        code: 'EVSE_IN_USE',
-      });
-    });
-
-    it('returns 409 EVSE_IN_USE for a station-wide reservation on a charging station', async () => {
-      vi.mocked(getReservationSettings).mockResolvedValue({
-        ...RESERVATION_SETTINGS,
-        activeSessionCheckHours: 3,
-      });
-      setupDbResults([RESERVATION_STATION], [{ id: 1 }], [{ id: SESSION_ID }]);
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(409);
-      expect(response.json().error).toBe(
-        'Station has an active charging session that conflicts with this reservation',
-      );
-    });
-
-    it('returns 409 RESERVATION_CONFLICT when the window overlaps another reservation', async () => {
-      setupDbResults([RESERVATION_STATION], [{ id: 1 }], [{ id: 'rsv_000000000002' }]);
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(409);
-      expect(response.json()).toEqual({
-        error: 'An active reservation already exists for this station',
-        code: 'RESERVATION_CONFLICT',
-      });
-      expect(insertValues()).toEqual([]);
-    });
-
-    it('creates the reservation without a token when the token lookup fails', async () => {
-      setupDbResults([RESERVATION_STATION], [{ id: 1 }], [], [CREATED_RESERVATION]);
-      const realSelect = vi.mocked(db.select).getMockImplementation();
-      let calls = 0;
-      vi.mocked(db.select).mockImplementation(((...args: unknown[]) => {
-        calls++;
-        if (calls === 4) throw new Error('token lookup failed');
-        return (realSelect as (...a: unknown[]) => unknown)(...args);
-      }) as never);
-      try {
-        const response = await create({ expiresAt: inMs(3_600_000) });
-        expect(response.statusCode).toBe(200);
-        expect(insertValues()).toEqual([
-          expect.objectContaining({ tokenId: null, driverId: DRIVER_ID, status: 'active' }),
-        ]);
-      } finally {
-        vi.mocked(db.select).mockImplementation(realSelect as never);
-      }
-    });
-
-    it('answers 500 RESERVATION_CREATE_FAILED when the insert returns no row', async () => {
-      setupDbResults([RESERVATION_STATION], [{ id: 1 }], [], [], []);
-      const response = await create({ expiresAt: inMs(3_600_000) });
-      expect(response.statusCode).toBe(500);
-      expect(response.json()).toEqual({
-        error: 'Failed to create reservation',
-        code: 'RESERVATION_CREATE_FAILED',
-      });
-      expect(writeReservationAudit).not.toHaveBeenCalled();
-      expect(publishedOn('ocpp_commands')).toEqual([]);
-    });
-
-    it('schedules a future reservation through the worker instead of sending ReserveNow', async () => {
-      setupDbResults(
-        [{ ...RESERVATION_STATION, isOnline: false }],
-        [{ id: 1 }],
-        [],
-        [{ id: 'tkn_000000000001' }],
-        [{ ...CREATED_RESERVATION, status: 'scheduled', tokenId: 'tkn_000000000001' }],
-      );
-      const response = await create({
-        startsAt: inMs(2 * 3_600_000),
-        expiresAt: inMs(3 * 3_600_000),
-      });
-      expect(response.statusCode).toBe(200);
-      expect(insertValues()).toEqual([
-        expect.objectContaining({ status: 'scheduled', tokenId: 'tkn_000000000001' }),
-      ]);
-      const scheduled = publishedOn('reservation_schedule');
-      expect(scheduled).toHaveLength(1);
-      expect(scheduled[0]?.['reservationDbId']).toBe(RESERVATION_ID);
-      expect(scheduled[0]?.['delayMs']).toBeGreaterThan(2 * 3_600_000 - 60_000);
-      expect(scheduled[0]?.['delayMs']).toBeLessThanOrEqual(2 * 3_600_000);
-      expect(publishedOn('ocpp_commands')).toEqual([]);
-    });
-
-    it('sends ReserveNow with the EVSE for an EVSE reservation starting now', async () => {
-      setupDbResults(
-        [RESERVATION_STATION],
-        [{ id: 1 }],
-        [{ id: 'evs_000000000002' }],
-        [],
-        [],
-        [{ ...CREATED_RESERVATION, evseId: 'evs_000000000002' }],
-      );
-      const expiresAt = inMs(3_600_000);
-      const response = await create({ evseId: 2, expiresAt });
-      expect(response.statusCode).toBe(200);
-      expect(insertValues()).toEqual([expect.objectContaining({ evseId: 'evs_000000000002' })]);
-      const commands = publishedOn('ocpp_commands');
-      expect(commands).toHaveLength(1);
-      expect(commands[0]).toMatchObject({
-        stationId: 'CS-001',
-        action: 'ReserveNow',
-        payload: { evseId: 2, expiryDateTime: expiresAt, idToken: { idToken: DRIVER_ID } },
-      });
-      // The notification formats the ISO timestamp in the driver's language and time zone.
-      expect(mockDispatchDriverNotification).toHaveBeenCalledWith(
-        expect.anything(),
-        'reservation.Created',
-        DRIVER_ID,
-        expect.objectContaining({ expiresAt }),
-        [],
-        expect.anything(),
-      );
     });
   });
 });

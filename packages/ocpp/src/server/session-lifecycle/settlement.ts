@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { DomainEvent } from '@evtivity/lib';
-import { notificationMoney, receiptBilling, sessionReceiptVariables } from '@evtivity/lib';
+import {
+  centsFromMajorUnits,
+  notificationMoney,
+  receiptBilling,
+  receiptCapturedCents,
+  sessionReceiptVariables,
+} from '@evtivity/lib';
 import {
   dispatchPrepaidLowCreditNotice,
   isReleasedBelowMinimum,
   recordTerminalSettlement,
   settleSessionPayment,
+  withPaymentActor,
 } from '@evtivity/payments';
 import type { SettlementOutcome } from '@evtivity/payments';
 import { pgConnectionErrorKind } from '@evtivity/database';
@@ -34,7 +41,7 @@ export async function projectNotifySettlement(
   }
 
   const sessionRows = await sql`
-    SELECT cs.id, cs.driver_id, cs.station_id, UPPER(cs.currency) AS currency
+    SELECT cs.id, cs.driver_id, cs.station_id, st.site_id, UPPER(cs.currency) AS currency
     FROM charging_sessions cs
     JOIN charging_stations st ON st.id = cs.station_id
     WHERE st.station_id = ${event.aggregateId} AND cs.transaction_id = ${transactionId}
@@ -43,14 +50,17 @@ export async function projectNotifySettlement(
   if (session == null) return;
 
   // Convert settlement amount to cents (OCPP sends in major currency units)
-  const capturedAmountCents = Math.round(settlementAmount * 100);
+  const capturedAmountCents = centsFromMajorUnits(settlementAmount);
 
-  const recorded = await recordTerminalSettlement({
-    sessionId: session.id as string,
-    driverId: (session.driver_id as string | null) ?? null,
-    currency: session.currency as string,
-    capturedCents: capturedAmountCents,
-  });
+  const recorded = await recordTerminalSettlement(
+    {
+      sessionId: session.id as string,
+      driverId: (session.driver_id as string | null) ?? null,
+      currency: session.currency as string,
+      capturedCents: capturedAmountCents,
+    },
+    withPaymentActor(deps.payments, { actor: 'ocpp', actorLabel: 'NotifySettlement' }),
+  );
 
   if (!recorded) {
     logger.warn(
@@ -60,7 +70,12 @@ export async function projectNotifySettlement(
     return;
   }
 
-  await notify.notifyChange('payment.settled', null, null, session.id as string);
+  await notify.notifyChange(
+    'payment.settled',
+    session.station_id as string,
+    (session.site_id as string | null) ?? null,
+    session.id as string,
+  );
 
   // Driver notification: payment received
   if (session.driver_id != null) {
@@ -136,7 +151,8 @@ async function notifySessionEnded(
   const { sql, eventBus, pubsub, lookups } = deps;
   const [endedSession] = await sql`
     SELECT cs.driver_id, cs.energy_delivered_wh, cs.final_cost_cents, cs.started_at, cs.ended_at,
-           cs.status, cs.tariff_tax_rate, UPPER(cs.currency) AS currency, cs.billing_mode,
+           cs.status, cs.net_cents, cs.tax_cents, cs.cost_breakdown,
+           UPPER(cs.currency) AS currency, cs.billing_mode, cs.member_billed,
            f.name AS billing_fleet_name
     FROM charging_sessions cs
     LEFT JOIN fleets f ON f.id = cs.billing_fleet_id
@@ -145,7 +161,7 @@ async function notifySessionEnded(
   const status = endedSession.status as string;
   if (status === 'faulted' || status === 'failed' || status === 'active') return;
   const [record] = await sql`
-    SELECT status, failure_reason, pending_operation FROM payment_records
+    SELECT status, failure_reason, pending_operation, captured_amount_cents FROM payment_records
     WHERE session_id = ${sessionId}
     ORDER BY id LIMIT 1`;
   const captureFailed = record != null && record.status === 'failed';
@@ -165,8 +181,14 @@ async function notifySessionEnded(
     transactionId,
     energyDeliveredWh: endedSession.energy_delivered_wh as number,
     finalCostCents: endedSession.final_cost_cents as number | null,
+    netCents: (endedSession.net_cents as number | null) ?? null,
+    taxCents: (endedSession.tax_cents as number | null) ?? null,
+    costBreakdown: endedSession.cost_breakdown,
+    // A declined top-up leaves the record captured below the final cost: the
+    // receipt says what was charged and what is unpaid.
+    capturedCents:
+      record != null ? receiptCapturedCents(record.status, record.captured_amount_cents) : null,
     currency: endedSession.currency as string,
-    tariffTaxRate: endedSession.tariff_tax_rate as string | null,
     startedAt: endedSession.started_at as string,
     endedAt: endedSession.ended_at as string,
     notCharged,
@@ -177,6 +199,7 @@ async function notifySessionEnded(
       endedSession.billing_mode,
       (endedSession.billing_fleet_name as string | null) ?? null,
       record != null,
+      endedSession.member_billed,
     ),
   });
   const claims = {
@@ -249,10 +272,14 @@ export async function settleTransactionEnded(
     // keeps its behavior without retry. A rerun resumes an adjustment claim
     // the first run made but never got a provider reference for.
     const outcome = await attempt.memo('settle:outcome', () =>
-      settleSessionPayment(session.id as string, payments, {
-        rethrowConnectionErrors: !attempt.isLast,
-        resumeAdjustment: attempt.number > 1,
-      }),
+      settleSessionPayment(
+        session.id as string,
+        withPaymentActor(payments, { actor: 'ocpp', actorLabel: 'session-settlement' }),
+        {
+          rethrowConnectionErrors: !attempt.isLast,
+          resumeAdjustment: attempt.number > 1,
+        },
+      ),
     );
     try {
       await notifySessionEnded(

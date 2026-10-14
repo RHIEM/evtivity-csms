@@ -40,6 +40,7 @@ import { api } from '@/lib/api';
 import { TableSkeleton } from '@/components/TableSkeleton';
 import { formatDate, useUserTimezone } from '@/lib/timezone';
 import { formatNumber } from '@/lib/formatting';
+import { useHasAllSiteAccess } from '@/lib/auth';
 
 interface Site {
   id: string;
@@ -72,6 +73,7 @@ interface ImportResult {
 export function Sites(): React.JSX.Element {
   const timezone = useUserTimezone();
   const { t } = useTranslation();
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -219,12 +221,14 @@ export function Sites(): React.JSX.Element {
             className="hidden"
             onChange={handleImportFile}
           />
-          <CreateButton
-            label={t('sites.addSite')}
-            onClick={() => {
-              void navigate('/sites/new');
-            }}
-          />
+          {hasAllSiteAccess && (
+            <CreateButton
+              label={t('sites.addSite')}
+              onClick={() => {
+                void navigate('/sites/new');
+              }}
+            />
+          )}
         </div>
       </div>
 
@@ -388,7 +392,7 @@ export function Sites(): React.JSX.Element {
                   }}
                 >
                   <TableCell className="text-muted-foreground">{site.id}</TableCell>
-                  <TableCell className="font-medium text-primary" data-testid="row-click-target">
+                  <TableCell className="font-medium text-link" data-testid="row-click-target">
                     <span className="inline-flex items-center gap-2">
                       {site.name}
                       {site.underMaintenance && (

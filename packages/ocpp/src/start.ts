@@ -8,7 +8,12 @@ import { hostname } from 'node:os';
 import type { Redis } from 'ioredis';
 import { OcppServer } from './server/ocpp-server.js';
 import { CommandListener } from './server/command-listener.js';
-import { PgEventPersistence, client, getSentryConfig } from '@evtivity/database';
+import {
+  PgEventPersistence,
+  client,
+  getSentryConfig,
+  guardPgConnectionRejections,
+} from '@evtivity/database';
 import {
   RedisPubSubClient,
   RedisConnectionRegistry,
@@ -20,7 +25,9 @@ import { subscribeOcppEventSettingsInvalidation } from './server/notification-di
 import { subscribePncCommands } from './services/pki/root-certificate-refresh.js';
 import { startSessionEndSweep, subscribeSessionEndRequests } from './server/csms-session-end.js';
 import { setAuthorizeLogPubSub } from './authorization/authorize-log.js';
-import { setPaymentPubSub } from './lib/payments.js';
+import { setSimulatedEventSink } from './lib/payments.js';
+import { queueSimulatedSink } from '@evtivity/payments';
+import { closeJobQueues, initJobQueues } from '@evtivity/lib/job-queues';
 import { config } from './lib/config.js';
 import { connectionAuthLimitsFromConfig } from './server/connection-auth-limiter.js';
 
@@ -77,6 +84,7 @@ const server = new OcppServer({
 });
 let commandListener: CommandListener | null = null;
 let cacheInvalidateSub: { unsubscribe: () => Promise<void> } | null = null;
+let stationAuthInvalidateSub: { unsubscribe: () => Promise<void> } | null = null;
 let pncCommandsSub: { unsubscribe: () => Promise<void> } | null = null;
 let sessionEndSub: { unsubscribe: () => Promise<void> } | null = null;
 let stopSessionEndSweep: (() => void) | null = null;
@@ -86,20 +94,28 @@ let registryRedis: Redis | null = null;
 let shuttingDown = false;
 
 async function start(): Promise<void> {
+  // A backend terminated while postgres.js fetches its array types must not end
+  // the process (pg-connection-rejections.ts).
+  guardPgConnectionRejections(server.getLogger());
   const sentryConfig = await getSentryConfig();
   initSentry('evtivity-ocpp', sentryConfig);
 
   const instanceId = await deriveInstanceId();
 
+  // Station events add worker jobs (maintenance re-assert, station screens,
+  // station-watch alerts, simulated payment events) to the worker's queues
+  // directly, so the queues are ready before the first station connects.
+  initJobQueues(REDIS_URL);
+  setSimulatedEventSink(queueSimulatedSink());
+
   const tls =
     OCPP_TLS_CERT != null && OCPP_TLS_KEY != null
       ? { cert: OCPP_TLS_CERT, key: OCPP_TLS_KEY, ca: OCPP_TLS_CA, port: OCPP_TLS_PORT }
       : undefined;
-  await server.start({ port: OCPP_PORT, host: OCPP_HOST, tls });
+  await server.start({ port: OCPP_PORT, host: OCPP_HOST, tls, instanceId });
 
   pubsub = new RedisPubSubClient(REDIS_URL);
   setAuthorizeLogPubSub(pubsub);
-  setPaymentPubSub(pubsub);
 
   // Create a separate Redis client for the connection registry (not the pub/sub client)
   registryRedis = createRedisClient(REDIS_URL, 'connection-registry');
@@ -126,6 +142,9 @@ async function start(): Promise<void> {
   // operator updates OCPP event settings. The subscription keeps each pod&#39;s
   // in-memory dispatcher cache fresh without waiting for the 60s TTL.
   cacheInvalidateSub = await subscribeOcppEventSettingsInvalidation(pubsub);
+  // The API publishes a station auth invalidation after a station's password
+  // or security profile changes; every pod evicts its cached password check.
+  stationAuthInvalidateSub = await server.subscribeStationAuthInvalidation(pubsub);
   pncCommandsSub = await subscribePncCommands(pubsub);
 
   // The API ends a ghost session (TxNotFound) here, through the normal
@@ -218,6 +237,9 @@ async function shutdown(): Promise<void> {
   if (cacheInvalidateSub != null) {
     await cacheInvalidateSub.unsubscribe();
   }
+  if (stationAuthInvalidateSub != null) {
+    await stationAuthInvalidateSub.unsubscribe();
+  }
   if (pncCommandsSub != null) {
     await pncCommandsSub.unsubscribe();
   }
@@ -232,8 +254,9 @@ async function shutdown(): Promise<void> {
   // Those handlers use pub/sub, the connection registry and the database, so
   // the clients close only after it returns.
   await server.stop();
+  setSimulatedEventSink(null);
+  await closeJobQueues();
   if (pubsub != null) {
-    setPaymentPubSub(null);
     await pubsub.close();
   }
   if (registryRedis != null) {

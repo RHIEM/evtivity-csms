@@ -14,6 +14,7 @@ import {
   resolveDriverPricingSource,
 } from '@evtivity/database';
 import {
+  ACCOUNT_INVOICE_RECIPIENTS,
   drivers,
   driverTokens,
   vehicles,
@@ -38,8 +39,18 @@ import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
+import { getUserSiteIds, requireAllSiteAccess } from '../lib/site-access.js';
+import { reservationsAtSites, sessionsAtSites } from '../lib/session-site-scope.js';
 import * as tokenService from '../services/token.service.js';
 import { getPortalAccess, inviteDriverToPortal } from '../services/driver-portal-access.service.js';
+import {
+  getDriverBillingAddress,
+  updateDriverBillingAddress,
+} from '../services/driver-billing.service.js';
+import {
+  driverBillingAddressBody,
+  driverBillingAddressItem,
+} from '../lib/driver-billing-address-schema.js';
 import { OCPP_TOKEN_TYPES } from './tokens.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { isValidTimezone, UI_LANGUAGES } from '@evtivity/lib';
@@ -51,6 +62,14 @@ import {
 } from '../lib/response-schemas.js';
 
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { announceDriverDeactivated } from '../lib/driver-active.js';
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_PRICING_GROUP_NOT_FOUND = {
+  error: 'Pricing group not found',
+  code: 'PRICING_GROUP_NOT_FOUND',
+} as const;
 const driverItem = z
   .object({
     id: z.string().describe('Driver identifier'),
@@ -99,6 +118,12 @@ const driverBillingItem = z
       .nullable()
       .describe(
         'The fleet new sessions are billed to (the oldest membership in a fleet with account billing that the driver has not opted out of), or null for card',
+      ),
+    invoicedTo: z
+      .enum(ACCOUNT_INVOICE_RECIPIENTS)
+      .nullable()
+      .describe(
+        "Who gets the monthly invoice of the driver's new account sessions: fleet (billingFleet's invoice) or member (the driver's own invoice, via billingFleet); null for card",
       ),
     pricingFleet: fleetRefItem
       .nullable()
@@ -459,6 +484,7 @@ export function driverRoutes(app: FastifyInstance): void {
             billingFleet != null
               ? { id: billingFleet.fleetId, name: billingFleet.fleetName }
               : null,
+          invoicedTo: billingFleet?.recipient ?? null,
           pricingFleet:
             pricing?.source === 'fleet' ? { id: pricing.fleetId, name: pricing.fleetName } : null,
           pricingSource: pricing?.source ?? null,
@@ -495,6 +521,59 @@ export function driverRoutes(app: FastifyInstance): void {
     async (request) => {
       const { id } = request.params as z.infer<typeof driverParams>;
       return inviteDriverToPortal(id, { actor: getAuditActor(request), log: request.log });
+    },
+  );
+
+  app.get(
+    '/drivers/:id/billing-address',
+    {
+      onRequest: [authorize('drivers:read')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Get the driver billing address',
+        description:
+          'The bill-to block of the invoices a fleet addresses to each member. A null name prints the first and last name.',
+        operationId: 'getDriverBillingAddress',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        response: {
+          200: itemResponse(driverBillingAddressItem),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      return getDriverBillingAddress(id);
+    },
+  );
+
+  app.patch(
+    '/drivers/:id/billing-address',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Update the driver billing address',
+        description:
+          'Sets the bill-to block of the invoices a fleet addresses to each member. Fields left out keep their value; null or a blank string clears a field. A change is audited (billing_address_updated with the changed fields); a request that changes nothing is not. The driver can edit the same address in the portal.',
+        operationId: 'updateDriverBillingAddress',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        body: zodSchema(driverBillingAddressBody),
+        response: {
+          200: itemResponse(driverBillingAddressItem),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      const body = request.body as z.infer<typeof driverBillingAddressBody>;
+      return updateDriverBillingAddress(id, body, {
+        actor: getAuditActor(request),
+        log: request.log,
+      });
     },
   );
 
@@ -643,6 +722,8 @@ export function driverRoutes(app: FastifyInstance): void {
       if (before != null && body.isActive !== undefined && body.isActive !== before.isActive) {
         action = body.isActive ? 'activated' : 'deactivated';
       }
+      // A deactivated driver's open portal streams end on every pod.
+      if (body.isActive === false) announceDriverDeactivated(updated.id);
       // Reactivation does NOT auto-reactivate the driver's tokens. The DELETE
       // cascade flipped them off, but some may have been deliberately revoked
       // (stolen card, lost fob); blindly flipping them back would override that
@@ -1051,6 +1132,7 @@ export function driverRoutes(app: FastifyInstance): void {
         .update(drivers)
         .set({ isActive: false, updatedAt: new Date() })
         .where(eq(drivers.id, id));
+      announceDriverDeactivated(id);
 
       // Cascade: OCPP authorize handlers only check driverTokens.isActive,
       // not drivers.isActive. Deactivate every token the driver owns so the
@@ -1092,6 +1174,8 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'List charging sessions for a driver',
+        description:
+          "The driver's charging sessions, newest first. A user restricted to some sites sees only the sessions at those sites.",
         operationId: 'listDriverSessions',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
@@ -1107,7 +1191,12 @@ export function driverRoutes(app: FastifyInstance): void {
       const { page, limit } = request.query as z.infer<typeof sessionsQuery>;
       const offset = (page - 1) * limit;
 
-      const where = eq(chargingSessions.driverId, id);
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const where = and(
+        eq(chargingSessions.driverId, id),
+        siteIds != null ? sessionsAtSites(siteIds) : undefined,
+      );
 
       // Run the existence check in parallel with the data + count queries.
       // The existence check selects only id (not the full row, which would
@@ -1167,6 +1256,8 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'List reservations for a driver, with cancel metadata',
+        description:
+          "The driver's reservations, newest first. A user restricted to some sites sees only the reservations at those sites.",
         operationId: 'listDriverReservations',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
@@ -1182,7 +1273,12 @@ export function driverRoutes(app: FastifyInstance): void {
       const { page, limit } = request.query as z.infer<typeof paginationQuery>;
       const offset = (page - 1) * limit;
 
-      const where = eq(reservations.driverId, id);
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const where = and(
+        eq(reservations.driverId, id),
+        siteIds != null ? reservationsAtSites(siteIds) : undefined,
+      );
       // Existence check runs in parallel with data + count.
       const [driverRows, data, countRows] = await Promise.all([
         db.select({ id: drivers.id }).from(drivers).where(eq(drivers.id, id)),
@@ -1278,6 +1374,7 @@ export function driverRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_PRICING_GROUP_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof driverParams>;
       const body = request.body as z.infer<typeof addDriverPricingGroupBody>;
       // Pre-check pricing group existence so a typo'd id returns a clean
@@ -1374,12 +1471,14 @@ export function driverRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(driverPricingGroupRecordItem),
           404: errorWith('Pricing assignment not found', [
+            ERROR_CODES.PRICING_GROUP_NOT_FOUND,
             ERROR_CODES.PRICING_ASSIGNMENT_NOT_FOUND,
           ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_PRICING_GROUP_NOT_FOUND))) return;
       const { id, pricingGroupId } = request.params as z.infer<typeof driverPricingGroupParams>;
       const [record] = await db
         .delete(pricingGroupDrivers)

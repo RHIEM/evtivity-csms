@@ -13,23 +13,22 @@ const m = vi.hoisted(() => {
     db: { select: vi.fn(() => chain) },
     getCompanyCurrency: vi.fn(),
     getPlatformFeePercent: vi.fn(),
-    resolveStationTariff: vi.fn(),
     getSitePaymentConfig: vi.fn(),
     recordPendingCharge: vi.fn(),
     findReservationCharge: vi.fn(),
     markChargeCaptured: vi.fn(),
     markChargeFailed: vi.fn(),
     sitePayoutReadiness: vi.fn(),
+    writeReservationAudit: vi.fn(),
   };
 });
 
 vi.mock('@evtivity/database', () => ({
   db: m.db,
-  client: { __client: true },
   driverPaymentMethods: { __table: 'driver_payment_methods' },
   getCompanyCurrency: m.getCompanyCurrency,
   getPlatformFeePercent: m.getPlatformFeePercent,
-  resolveStationTariff: m.resolveStationTariff,
+  writeReservationAudit: m.writeReservationAudit,
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -52,7 +51,11 @@ vi.mock('../payment-records.js', () => ({
 
 import { chargeReservationFee } from '../reservation-fees.js';
 import type { ReservationFeeInput } from '../reservation-fees.js';
-import { PaymentProviderNotConfiguredError } from '../errors.js';
+import {
+  PaymentDeclinedError,
+  PaymentProviderNotConfiguredError,
+  PaymentProviderUnavailableError,
+} from '../errors.js';
 import type { PaymentContext } from '../context.js';
 import type { PaymentProviderRegistry } from '../registry.js';
 
@@ -68,16 +71,16 @@ const baseInput: ReservationFeeInput = {
   type: 'reservation_cancellation',
   reservationId: 'rsv_1',
   driverId: 'drv_1',
-  stationId: 'sta_1',
   siteId: 'site_1',
-  netCents: 500,
+  fee: { amountCents: 500 },
+  basis: 'net',
+  taxRate: '0.19',
 };
 
 beforeEach(() => {
   m.methodRows.value = [{ provider: 'stripe', customerId: 'cus_1', methodId: 'pm_1' }];
   m.getCompanyCurrency.mockResolvedValue('USD');
   m.getPlatformFeePercent.mockResolvedValue(10);
-  m.resolveStationTariff.mockResolvedValue({ taxRate: '0.19' });
   m.getSitePaymentConfig.mockResolvedValue({
     configId: 3,
     payoutAccountId: 'acct_site',
@@ -106,7 +109,7 @@ describe('chargeReservationFee', () => {
       reason: 'Payout account not ready',
     });
     expect(m.sitePayoutReadiness).toHaveBeenCalledWith('site_1', ctx);
-    expect(m.markChargeFailed).toHaveBeenCalledWith(7, 'Payout account not ready');
+    expect(m.markChargeFailed).toHaveBeenCalledWith(7, 'Payout account not ready', ctx);
     expect(provider.chargeSavedMethod).not.toHaveBeenCalled();
   });
 
@@ -127,7 +130,9 @@ describe('chargeReservationFee', () => {
   });
 
   it('skips without an amount', async () => {
-    await expect(chargeReservationFee({ ...baseInput, netCents: 0 }, ctx)).resolves.toEqual({
+    await expect(
+      chargeReservationFee({ ...baseInput, fee: { amountCents: 0 } }, ctx),
+    ).resolves.toEqual({
       status: 'skipped',
       reason: 'no_amount',
     });
@@ -162,26 +167,26 @@ describe('chargeReservationFee', () => {
     await expect(chargeReservationFee(baseInput, ctx)).rejects.toThrow('settings unreadable');
   });
 
-  it('taxes the net fee at the station tariff rate and records it before charging', async () => {
+  it('taxes the net fee at the given rate and records it before charging', async () => {
     const result = await chargeReservationFee(baseInput, ctx);
 
     expect(registry.getPaymentProvider).toHaveBeenCalledWith('stripe');
-    expect(m.resolveStationTariff).toHaveBeenCalledWith(
-      { stationUuid: 'sta_1', driverUuid: 'drv_1' },
-      { __client: true },
-    );
     expect(m.getSitePaymentConfig).toHaveBeenCalledWith('site_1');
-    expect(m.recordPendingCharge).toHaveBeenCalledWith({
-      chargeType: 'reservation_cancellation',
-      reservationId: 'rsv_1',
-      driverId: 'drv_1',
-      sitePaymentConfigId: 3,
-      provider: 'stripe',
-      customerId: 'cus_1',
-      methodId: 'pm_1',
-      currency: 'USD',
-      taxRate: 0.19,
-    });
+    expect(m.recordPendingCharge).toHaveBeenCalledWith(
+      {
+        chargeType: 'reservation_cancellation',
+        reservationId: 'rsv_1',
+        driverId: 'drv_1',
+        sitePaymentConfigId: 3,
+        provider: 'stripe',
+        customerId: 'cus_1',
+        methodId: 'pm_1',
+        currency: 'USD',
+        taxRate: 0.19,
+        feeRequest: { grossCents: 595, platformFeePercent: 10, payoutAccountId: 'acct_site' },
+      },
+      ctx,
+    );
     expect(m.recordPendingCharge.mock.invocationCallOrder[0]).toBeLessThan(
       provider.chargeSavedMethod.mock.invocationCallOrder[0] ?? 0,
     );
@@ -198,11 +203,15 @@ describe('chargeReservationFee', () => {
       metadata: { reservationId: 'rsv_1', type: 'reservation_cancellation_fee' },
       idempotencyKey: 'cancellation-fee-rsv_1',
     });
-    expect(m.markChargeCaptured).toHaveBeenCalledWith(7, {
-      provider: 'stripe',
-      paymentId: 'pi_fee',
-      amountCents: 595,
-    });
+    expect(m.markChargeCaptured).toHaveBeenCalledWith(
+      7,
+      {
+        provider: 'stripe',
+        paymentId: 'pi_fee',
+        amountCents: 595,
+      },
+      ctx,
+    );
     expect(result).toEqual({
       status: 'charged',
       paymentRecordId: 7,
@@ -229,12 +238,102 @@ describe('chargeReservationFee', () => {
     );
   });
 
-  it('charges the net amount when no tariff resolves', async () => {
-    m.resolveStationTariff.mockResolvedValue(null);
-
-    const result = await chargeReservationFee(baseInput, ctx);
+  it('charges the amount untaxed without a tax rate', async () => {
+    const result = await chargeReservationFee({ ...baseInput, taxRate: null }, ctx);
 
     expect(result).toMatchObject({ status: 'charged', grossCents: 500, taxCents: 0, taxRate: 0 });
+  });
+
+  it('TC-T3-22 cancellation fee on the net basis: 300 at 19 % charges 357', async () => {
+    const result = await chargeReservationFee(
+      { ...baseInput, fee: { amountCents: 300 }, basis: 'net', taxRate: '0.19' },
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      status: 'charged',
+      netCents: 300,
+      taxCents: 57,
+      grossCents: 357,
+    });
+    expect(provider.chargeSavedMethod).toHaveBeenCalledWith(
+      expect.objectContaining({ grossCents: 357, feeTaxRate: 0.19 }),
+    );
+    expect(m.markChargeCaptured).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ amountCents: 357 }),
+      ctx,
+    );
+  });
+
+  it('TC-T3-23 cancellation fee on the gross basis: 300 at 19 % charges 300, tax included once', async () => {
+    const result = await chargeReservationFee(
+      { ...baseInput, fee: { amountCents: 300 }, basis: 'gross', taxRate: '0.19' },
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      status: 'charged',
+      netCents: 252,
+      taxCents: 48,
+      grossCents: 300,
+    });
+    expect(provider.chargeSavedMethod).toHaveBeenCalledWith(
+      expect.objectContaining({ grossCents: 300 }),
+    );
+  });
+
+  it('TC-T3-20 no-show fee on the net basis: 30 minutes at 0.10 and 19 % charges 357', async () => {
+    const result = await chargeReservationFee(
+      {
+        ...baseInput,
+        type: 'reservation_no_show',
+        fee: { pricePerMinute: '0.10', minutes: 30 },
+        basis: 'net',
+        taxRate: '0.19',
+      },
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      status: 'charged',
+      netCents: 300,
+      taxCents: 57,
+      grossCents: 357,
+    });
+  });
+
+  it('TC-T3-21 no-show fee on the gross basis: 30 minutes at 0.10 and 19 % charges 300', async () => {
+    const result = await chargeReservationFee(
+      {
+        ...baseInput,
+        type: 'reservation_no_show',
+        fee: { pricePerMinute: '0.10', minutes: 30 },
+        basis: 'gross',
+        taxRate: '0.19',
+      },
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      status: 'charged',
+      netCents: 252,
+      taxCents: 48,
+      grossCents: 300,
+    });
+    expect(provider.chargeSavedMethod).toHaveBeenCalledWith(
+      expect.objectContaining({ grossCents: 300 }),
+    );
+  });
+
+  it('skips a no-show fee without a holding price', async () => {
+    await expect(
+      chargeReservationFee(
+        { ...baseInput, type: 'reservation_no_show', fee: { pricePerMinute: null, minutes: 30 } },
+        ctx,
+      ),
+    ).resolves.toEqual({ status: 'skipped', reason: 'no_amount' });
+    expect(m.recordPendingCharge).not.toHaveBeenCalled();
   });
 
   it('charges without a site config or payout account for a reservation without a site', async () => {
@@ -243,6 +342,7 @@ describe('chargeReservationFee', () => {
     expect(m.getSitePaymentConfig).not.toHaveBeenCalled();
     expect(m.recordPendingCharge).toHaveBeenCalledWith(
       expect.objectContaining({ sitePaymentConfigId: null }),
+      ctx,
     );
     expect(provider.chargeSavedMethod).toHaveBeenCalledWith(
       expect.objectContaining({ payoutAccountId: null }),
@@ -279,7 +379,7 @@ describe('chargeReservationFee', () => {
       paymentRecordId: 7,
       reason: 'Your card was declined.',
     });
-    expect(m.markChargeFailed).toHaveBeenCalledWith(7, 'Your card was declined.');
+    expect(m.markChargeFailed).toHaveBeenCalledWith(7, 'Your card was declined.', ctx);
     expect(m.markChargeCaptured).not.toHaveBeenCalled();
   });
 
@@ -311,5 +411,57 @@ describe('chargeReservationFee', () => {
       { paymentRecordId: 7, paymentId: 'pi_fee' },
       'Reservation fee charged but its record had moved on; manual reconciliation required',
     );
+  });
+});
+
+describe('TC-RES-22: reservation fee audit rows', () => {
+  function auditCall(): Record<string, unknown> {
+    return (m.writeReservationAudit.mock.calls[0]?.[0] ?? {}) as Record<string, unknown>;
+  }
+
+  it('audits fee_charged with the amount after a capture', async () => {
+    await chargeReservationFee({ ...baseInput, type: 'reservation_no_show' }, ctx);
+    expect(m.writeReservationAudit).toHaveBeenCalledTimes(1);
+    expect(auditCall()).toMatchObject({
+      reservationId: 'rsv_1',
+      action: 'fee_charged',
+      actor: 'system',
+    });
+    expect(String(auditCall()['notes'])).toContain('no-show fee 595 USD');
+  });
+
+  it('audits fee_failed declined for a declined card', async () => {
+    provider.chargeSavedMethod.mockRejectedValue(new PaymentDeclinedError('card declined'));
+    await chargeReservationFee(baseInput, ctx);
+    expect(auditCall()).toMatchObject({
+      reservationId: 'rsv_1',
+      action: 'fee_failed',
+      reason: 'declined',
+    });
+  });
+
+  it('audits fee_failed provider_error when the provider fails on its side', async () => {
+    provider.chargeSavedMethod.mockRejectedValue(new PaymentProviderUnavailableError('503'));
+    await chargeReservationFee(baseInput, ctx);
+    expect(auditCall()).toMatchObject({ action: 'fee_failed', reason: 'provider_error' });
+  });
+
+  it('audits fee_failed no_payment_method without a default card', async () => {
+    m.methodRows.value = [];
+    await chargeReservationFee(baseInput, ctx);
+    expect(auditCall()).toMatchObject({ action: 'fee_failed', reason: 'no_payment_method' });
+  });
+
+  it('audits fee_failed provider_error for a payout account that is not ready', async () => {
+    m.sitePayoutReadiness.mockResolvedValue('not_ready');
+    await chargeReservationFee(baseInput, ctx);
+    expect(auditCall()).toMatchObject({ action: 'fee_failed', reason: 'provider_error' });
+  });
+
+  it('audits nothing for a retry of a recorded fee or a fee without an amount', async () => {
+    m.recordPendingCharge.mockResolvedValue(null);
+    await chargeReservationFee(baseInput, ctx);
+    await chargeReservationFee({ ...baseInput, fee: { amountCents: 0 } }, ctx);
+    expect(m.writeReservationAudit).not.toHaveBeenCalled();
   });
 });

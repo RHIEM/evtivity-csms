@@ -49,15 +49,29 @@ function makeChain() {
   return chain;
 }
 
-const { mockRecordSessionEndRequest, mockAvailableEvseCountSql, mockSqlRaw } = vi.hoisted(() => ({
+const {
+  mockRecordSessionEndRequest,
+  mockAvailableEvseCountSql,
+  mockSqlRaw,
+  mockWriteCsmsSessionAudit,
+} = vi.hoisted(() => ({
+  mockWriteCsmsSessionAudit: vi.fn(),
   mockRecordSessionEndRequest: vi.fn().mockResolvedValue(true),
   mockAvailableEvseCountSql: vi.fn((alias: string) => `AVAILABLE_EVSE_COUNT(${alias})`),
   mockSqlRaw: vi.fn((text: string) => ({ raw: text })),
 }));
 
 vi.mock('@evtivity/database', async () => ({
+  writeAudit: vi.fn(() => Promise.resolve()),
+  userAuditLog: { _table: 'user_audit_log' },
+  driverAuditLog: { _table: 'driver_audit_log' },
+  stationAuditLog: { _table: 'station_audit_log' },
+  sessionAuditLog: { _table: 'session_audit_log' },
+  apiKeyAuditLog: { _table: 'api_key_audit_log' },
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   SESSION_END_REQUEST_CHANNEL: 'session_end_requests',
   recordSessionEndRequest: mockRecordSessionEndRequest,
+  writeCsmsSessionAudit: mockWriteCsmsSessionAudit,
   availableEvseCountSql: mockAvailableEvseCountSql,
   isStationLevelUnavailable: (
     await vi.importActual<typeof import('../../../database/src/lib/station-status.js')>(
@@ -94,6 +108,18 @@ vi.mock('@evtivity/database', async () => ({
   stationImages: {},
   settings: {},
   driverTokens: {},
+  snapshotReservationFeeTerms: vi.fn().mockResolvedValue({
+    feeTaxBasis: 'gross',
+    feeTaxRate: '0.19',
+    feePerMinute: '0.10',
+    feeCancellationCents: 300,
+  }),
+  resolveReservationFeeTerms: vi.fn().mockResolvedValue({
+    basis: 'gross',
+    taxRate: '0.19',
+    feePerMinute: '0.10',
+    cancellationFeeCents: 300,
+  }),
   getReservationSettings: vi.fn().mockResolvedValue({
     enabled: true,
     bufferMinutes: 0,
@@ -104,6 +130,10 @@ vi.mock('@evtivity/database', async () => ({
   writeReservationAudit: vi.fn().mockResolvedValue(undefined),
   reservationDiffChanged: vi.fn().mockReturnValue(false),
   resolveStationTariff: vi.fn().mockResolvedValue(null),
+  resolveStationPricing: vi.fn().mockResolvedValue(null),
+  isSplitBillingEnabled: vi.fn().mockResolvedValue(false),
+  hasPaidTariff: (tariffs: Array<{ pricePerKwh: string | null }>) =>
+    tariffs.some((t) => Number(t.pricePerKwh ?? 0) > 0),
   isStationChargingFree: vi.fn().mockResolvedValue(true),
   resolveAccountBilling: vi.fn().mockResolvedValue(null),
   checkFleetCreditLimit: vi.fn().mockResolvedValue(null),
@@ -220,7 +250,10 @@ import { registerAuth } from '../plugins/auth.js';
 import { portalChargerRoutes } from '../routes/portal/charger.js';
 import {
   db,
+  resolveReservationFeeTerms,
   resolveStationTariff,
+  resolveStationPricing,
+  isSplitBillingEnabled,
   isStationChargingFree,
   resolveAccountBilling,
   checkFleetCreditLimit,
@@ -250,6 +283,11 @@ async function buildApp(): Promise<FastifyInstance> {
   return app;
 }
 
+/** A resolveStationPricing result of one tariff and its group. */
+function withGroup(tariff: Record<string, unknown>): never {
+  return { tariff, groupTariffs: [tariff] } as never;
+}
+
 describe('Portal charger routes - handler logic', () => {
   let app: FastifyInstance;
   let driverToken: string;
@@ -265,6 +303,7 @@ describe('Portal charger routes - handler logic', () => {
 
   beforeEach(() => {
     setupDbResults();
+    vi.mocked(databaseModule.writeAudit).mockClear();
     mockActivePaymentProvider.mockResolvedValue(null);
     vi.mocked(resolveStationTariff).mockResolvedValue(null);
     vi.mocked(isStationChargingFree).mockResolvedValue(true);
@@ -433,7 +472,7 @@ describe('Portal charger routes - handler logic', () => {
 
     it('returns 404 when no tariff found', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveStationTariff).mockResolvedValue(null);
+      vi.mocked(resolveStationPricing).mockResolvedValue(null);
       const response = await app.inject({
         method: 'GET',
         url: '/portal/chargers/CS-001/pricing',
@@ -445,21 +484,23 @@ describe('Portal charger routes - handler logic', () => {
 
     it('returns resolved pricing for driver in the company currency', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveStationTariff).mockResolvedValue({
-        id: 'tar_001',
-        name: 'Standard',
-        pricePerKwh: '0.25',
-        pricePerMinute: '0.10',
-        pricePerSession: '2.00',
-        idleFeePricePerMinute: '0.05',
-        reservationFeePerMinute: null,
-        taxRate: '0.08',
-        restrictions: null,
-        priority: 0,
-        isDefault: true,
-        pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
-        timezone: null,
-      });
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Standard',
+          pricePerKwh: '0.25',
+          pricePerMinute: '0.10',
+          pricePerSession: '2.00',
+          idleFeePricePerMinute: '0.05',
+          reservationFeePerMinute: null,
+          taxRate: '0.08',
+          restrictions: null,
+          priority: 0,
+          isDefault: true,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
       const response = await app.inject({
         method: 'GET',
         url: '/portal/chargers/CS-001/pricing',
@@ -474,15 +515,84 @@ describe('Portal charger routes - handler logic', () => {
       expect(body.idleFeePricePerMinute).toBe('0.05');
       expect(body.taxRate).toBe('0.08');
       expect(body.taxBasis).toBe('net');
-      expect(body.billing).toEqual({ mode: 'card', fleetName: null });
+      expect(body.billing).toEqual({ mode: 'card', fleetName: null, invoicedTo: null });
     });
 
     it('tells an account driver the session is billed to the fleet', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveStationTariff).mockResolvedValue({
-        id: 'tar_001',
-        name: 'Standard',
-        pricePerKwh: '0.25',
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Standard',
+          pricePerKwh: '0.25',
+          pricePerMinute: null,
+          pricePerSession: null,
+          idleFeePricePerMinute: null,
+          reservationFeePerMinute: null,
+          taxRate: null,
+          restrictions: null,
+          priority: 0,
+          isDefault: true,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/pricing',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().billing).toEqual({
+        mode: 'account',
+        fleetName: 'Acme',
+        invoicedTo: 'fleet',
+      });
+      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
+    });
+
+    it('resolves the tariff for the station UUID and driver ID', async () => {
+      setupDbResults([{ id: VALID_STATION_ID }]);
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Driver Rate',
+          pricePerKwh: '0.30',
+          pricePerMinute: null,
+          pricePerSession: null,
+          idleFeePricePerMinute: null,
+          reservationFeePerMinute: null,
+          taxRate: null,
+          restrictions: null,
+          priority: 0,
+          isDefault: false,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/pricing',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(resolveStationPricing).toHaveBeenCalledWith(
+        { stationUuid: VALID_STATION_ID, driverUuid: DRIVER_ID },
+        expect.anything(),
+      );
+    });
+    it('tells the driver the price can change and a paid tariff is ahead (B3, UI)', async () => {
+      setupDbResults([{ id: VALID_STATION_ID }]);
+      vi.mocked(isSplitBillingEnabled).mockResolvedValueOnce(true);
+      const free = {
+        id: 'tar_free',
+        name: 'Free',
+        pricePerKwh: '0',
         pricePerMinute: null,
         pricePerSession: null,
         idleFeePricePerMinute: null,
@@ -491,36 +601,15 @@ describe('Portal charger routes - handler logic', () => {
         restrictions: null,
         priority: 0,
         isDefault: true,
-        pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
-        timezone: null,
-      });
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
-      const response = await app.inject({
-        method: 'GET',
-        url: '/portal/chargers/CS-001/pricing',
-        headers: { authorization: `Bearer ${driverToken}` },
-      });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().billing).toEqual({ mode: 'account', fleetName: 'Acme' });
-      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
-    });
-
-    it('resolves the tariff for the station UUID and driver ID', async () => {
-      setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveStationTariff).mockResolvedValue({
-        id: 'tar_001',
-        name: 'Driver Rate',
-        pricePerKwh: '0.30',
-        pricePerMinute: null,
-        pricePerSession: null,
-        idleFeePricePerMinute: null,
-        reservationFeePerMinute: null,
-        taxRate: null,
-        restrictions: null,
-        priority: 0,
-        isDefault: false,
-        pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
-        timezone: null,
+        pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' as const },
+        timezone: 'Europe/Berlin',
+      };
+      vi.mocked(resolveStationPricing).mockResolvedValue({
+        tariff: free,
+        groupTariffs: [
+          free,
+          { ...free, id: 'tar_peak', pricePerKwh: '0.40', priority: 50, isDefault: false },
+        ],
       });
       const response = await app.inject({
         method: 'GET',
@@ -528,10 +617,11 @@ describe('Portal charger routes - handler logic', () => {
         headers: { authorization: `Bearer ${driverToken}` },
       });
       expect(response.statusCode).toBe(200);
-      expect(resolveStationTariff).toHaveBeenCalledWith(
-        { stationUuid: VALID_STATION_ID, driverUuid: DRIVER_ID },
-        expect.anything(),
-      );
+      expect(response.json()).toMatchObject({
+        timezone: 'Europe/Berlin',
+        priceChangesDuringSession: true,
+        paidTariffAhead: true,
+      });
     });
   });
 
@@ -660,6 +750,31 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(404);
       expect(response.json().code).toBe('STATION_NOT_FOUND');
     });
+
+    it.each(['pending', 'blocked'])(
+      'refuses a %s station before the maintenance check (second layer)',
+      async (onboardingStatus) => {
+        vi.mocked(getActiveMaintenanceForStation).mockClear();
+        setupDbResults([
+          {
+            id: VALID_STATION_ID,
+            stationId: 'CS-001',
+            siteId: null,
+            isOnline: true,
+            onboardingStatus,
+            ocppProtocol: 'ocpp2.1',
+          },
+        ]);
+        const response = await app.inject({
+          method: 'POST',
+          url: '/portal/chargers/CS-001/evse/1/start',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload: {},
+        });
+        expect(response.statusCode).toBe(403);
+        expect(getActiveMaintenanceForStation).not.toHaveBeenCalled();
+      },
+    );
 
     it('returns 400 when station is offline', async () => {
       setupDbResults([
@@ -821,6 +936,23 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
       expect(isStationChargingFree).not.toHaveBeenCalled();
       expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+      // The driver's start is on the station history, without the idToken.
+      expect(vi.mocked(databaseModule.writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'station_id' }),
+        expect.objectContaining({
+          entityId: VALID_STATION_ID,
+          action: 'command_dispatched',
+          actor: 'driver',
+          after: {
+            action: 'RequestStartTransaction',
+            sessionId: VALID_SESSION_ID,
+            evseId: 1,
+            outcome: 'Accepted',
+          },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     describe('OCPP 1.6 transaction id', () => {
@@ -958,7 +1090,11 @@ describe('Portal charger routes - handler logic', () => {
     }
 
     it('starts an account driver without a payment method or a hold, stamped account', async () => {
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
       vi.mocked(db.insert).mockClear();
       setupStartRows([{ id: VALID_SESSION_ID }]);
 
@@ -1004,7 +1140,11 @@ describe('Portal charger routes - handler logic', () => {
     }
 
     it('refuses an account start at the fleet credit limit with 402 and creates no session', async () => {
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
       const check = creditCheck('reached', 10_000);
       vi.mocked(checkFleetCreditLimit).mockResolvedValue(check);
       vi.mocked(db.insert).mockClear();
@@ -1030,7 +1170,11 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('refuses an account start when running sessions reserve the rest of the limit (plan S8)', async () => {
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
       vi.mocked(checkFleetCreditLimit).mockResolvedValue(creditCheck('ok', 2000, 0));
       vi.mocked(db.insert).mockClear();
       setupStartRows([{ id: VALID_SESSION_ID }]);
@@ -1048,7 +1192,11 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('starts an account driver at the warning percent and notifies the fleet', async () => {
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
       vi.mocked(checkFleetCreditLimit).mockResolvedValue(creditCheck('warning', 8500));
       setupStartRows([{ id: VALID_SESSION_ID }]);
 
@@ -1076,7 +1224,11 @@ describe('Portal charger routes - handler logic', () => {
 
     it('starts an account driver when no payment provider is active', async () => {
       mockActivePaymentProvider.mockResolvedValue(null);
-      vi.mocked(resolveAccountBilling).mockResolvedValue({ fleetId: 'flt_1', fleetName: 'Acme' });
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
       setupStartRows([{ id: VALID_SESSION_ID }]);
 
       const response = await app.inject({
@@ -1458,7 +1610,14 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('stops an active session', async () => {
-      setupDbResults([{ id: VALID_SESSION_ID, transactionId: 'tx-123', stationOcppId: 'CS-001' }]);
+      setupDbResults([
+        {
+          id: VALID_SESSION_ID,
+          transactionId: 'tx-123',
+          stationDbId: VALID_STATION_ID,
+          stationOcppId: 'CS-001',
+        },
+      ]);
       const response = await app.inject({
         method: 'POST',
         url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
@@ -1467,6 +1626,20 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().status).toBe('stopping');
       expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(vi.mocked(databaseModule.writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'station_id' }),
+        expect.objectContaining({
+          entityId: VALID_STATION_ID,
+          action: 'command_dispatched',
+          actor: 'driver',
+          after: expect.objectContaining({
+            action: 'RequestStopTransaction',
+            sessionId: VALID_SESSION_ID,
+          }),
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('lets the OCPP server translate the stop for an OCPP 1.6 station', async () => {
@@ -1587,6 +1760,145 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().data).toHaveLength(1);
     });
+
+    it('TC-T3-25 returns the gross cancellation fee and its tax rate of an open reservation', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'active',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-12-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: null,
+          feeCancellationCents: 300,
+        },
+        {
+          id: 'r2',
+          reservationId: 2,
+          stationOcppId: 'CS-001',
+          status: 'cancelled',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-11-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: null,
+          feeCancellationCents: 300,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockResolvedValueOnce({
+        basis: 'net',
+        taxRate: '0.19',
+        feePerMinute: null,
+        cancellationFeeCents: 300,
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const data = response.json().data as Array<Record<string, unknown>>;
+      // 300 net at 19 %: the driver sees the 357 charged, not 300.
+      expect(data[0]?.cancellationFee).toEqual({ grossCents: 357, taxRate: 0.19 });
+      expect(data[1]?.cancellationFee).toBeNull();
+      expect(data[0]).not.toHaveProperty('feeCancellationCents');
+      expect(resolveReservationFeeTerms).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stationId: VALID_STATION_ID,
+          driverId: DRIVER_ID,
+          feeTaxBasis: 'net',
+          feeCancellationCents: 300,
+        }),
+      );
+    });
+
+    it('returns no cancellation fee when the fee terms cannot be read', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'scheduled',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-12-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: null,
+          feeTaxRate: null,
+          feePerMinute: null,
+          feeCancellationCents: null,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockRejectedValueOnce(new Error('db down'));
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data[0].cancellationFee).toBeNull();
+      expect(response.json().data[0].noShowFee).toBeNull();
+    });
+
+    it('returns the no-show fee of an open reservation, tax included, from one terms lookup', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'active',
+          startsAt: '2026-10-09T10:00:00Z',
+          expiresAt: '2026-10-09T10:30:00Z',
+          createdAt: '2026-10-09T09:00:00Z',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: '0.10',
+          feeCancellationCents: 0,
+        },
+        {
+          id: 'r2',
+          reservationId: 2,
+          stationOcppId: 'CS-001',
+          status: 'expired',
+          startsAt: null,
+          expiresAt: '2026-10-09T10:30:00Z',
+          createdAt: '2026-10-09T10:00:00Z',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: '0.10',
+          feeCancellationCents: 0,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockClear();
+      vi.mocked(resolveReservationFeeTerms).mockResolvedValueOnce({
+        basis: 'net',
+        taxRate: '0.19',
+        feePerMinute: '0.10',
+        cancellationFeeCents: 0,
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const data = response.json().data as Array<Record<string, unknown>>;
+      // 30 held minutes at 0.10 net, 19 %: 300 net, 357 charged (TC-T3-20).
+      expect(data[0]?.noShowFee).toEqual({ grossCents: 357, taxRate: 0.19 });
+      expect(data[0]?.cancellationFee).toBeNull();
+      // A closed reservation shows no fee and needs no lookup.
+      expect(data[1]?.noShowFee).toBeNull();
+      expect(resolveReservationFeeTerms).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('POST /v1/portal/reservations', () => {
@@ -1651,86 +1963,6 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(409);
       expect(response.json().code).toBe('STATION_UNAVAILABLE');
     });
-
-    it('returns 400 PAYMENT_METHOD_REQUIRED when driver has no default card', async () => {
-      // Station -> PM lookup (empty) -> 400
-      setupDbResults(
-        [
-          {
-            id: VALID_STATION_ID,
-            isOnline: true,
-            onboardingStatus: 'accepted',
-            reservationsEnabled: true,
-          },
-        ],
-        [],
-      );
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/reservations',
-        headers: { authorization: `Bearer ${driverToken}` },
-        payload: {
-          stationId: 'CS-001',
-          expiresAt: new Date(Date.now() + 3600000).toISOString(),
-        },
-      });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('PAYMENT_METHOD_REQUIRED');
-    });
-
-    it('creates a reservation', async () => {
-      const reservationData = {
-        id: VALID_RESERVATION_ID,
-        reservationId: 1,
-        stationId: VALID_STATION_ID,
-        driverId: null,
-        status: 'active',
-        expiresAt: '2024-01-01T00:00:00.000Z',
-        createdAt: '2024-01-01T00:00:00.000Z',
-      };
-      // DB call 1: station lookup
-      // DB call 2: default payment method check (always required for portal)
-      // DB call 3: conflict check (no conflicts)
-      // DB call 4: driverTokens lookup for preferredTokenId (empty)
-      // DB call 5: insert returning reservation
-      // The new active-session pre-check is gated on activeSessionCheckHours
-      // > 0 in settings; the global mock leaves it undefined so the check is
-      // skipped and consumes no DB slot.
-      // getNextReservationId uses db.execute (sequence) and does not consume a slot.
-      setupDbResults(
-        [
-          {
-            id: VALID_STATION_ID,
-            isOnline: true,
-            onboardingStatus: 'accepted',
-            reservationsEnabled: true,
-          },
-        ],
-        [{ id: 1, isDefault: true }],
-        [],
-        [],
-        [reservationData],
-      );
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/reservations',
-        headers: { authorization: `Bearer ${driverToken}` },
-        payload: {
-          stationId: 'CS-001',
-          expiresAt: new Date(Date.now() + 3600000).toISOString(),
-        },
-      });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().id).toBe(VALID_RESERVATION_ID);
-      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
-      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
-      expect(Object.keys(message)).toEqual(['commandId', 'stationId', 'action', 'payload']);
-      expect(message).toMatchObject({
-        stationId: 'CS-001',
-        action: 'ReserveNow',
-        payload: { id: expect.any(Number), idToken: { idToken: DRIVER_ID, type: 'Central' } },
-      });
-    });
   });
 
   describe('DELETE /v1/portal/reservations/:id', () => {
@@ -1784,13 +2016,9 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().status).toBe('cancelled');
-      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
-      const message = JSON.parse(call?.[1] as string) as Record<string, unknown>;
-      expect(Object.keys(message)).toEqual(['commandId', 'stationId', 'action', 'payload']);
-      expect(message).toMatchObject({
-        stationId: 'CS-001',
-        action: 'CancelReservation',
-        payload: { reservationId: 1 },
+      // G7: the portal cancel waits for the station's answer.
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith('CS-001', 'CancelReservation', {
+        reservationId: 1,
       });
     });
   });

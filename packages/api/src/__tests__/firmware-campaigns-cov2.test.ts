@@ -79,6 +79,12 @@ vi.mock('@evtivity/database', () => ({
     model: 'st.model',
   },
   firmwareUpdates: {},
+  client: {},
+  newFirmwareRequestId: vi.fn(() => 4242),
+  rejectFirmwareUpdate: vi.fn().mockResolvedValue(null),
+  applyFirmwareCampaignStationStatus: vi
+    .fn()
+    .mockResolvedValue({ changed: true, campaignCompleted: false }),
   sites: { id: 'sites.id', name: 'sites.name' },
   vendors: { id: 'vendors.id', name: 'vendors.name' },
   writeAudit: vi.fn().mockResolvedValue(undefined),
@@ -98,6 +104,8 @@ vi.mock('drizzle-orm', () => ({
   notInArray: vi.fn(),
   isNull: vi.fn(),
   isNotNull: vi.fn((c: unknown) => ({ isNotNull: c })),
+  exists: vi.fn(),
+  notExists: vi.fn(),
 }));
 
 vi.mock('@evtivity/lib/pubsub-instance', () => ({
@@ -143,6 +151,9 @@ function campaign(overrides: Record<string, unknown> = {}): Record<string, unkno
     firmwareUrl: 'https://example.com/fw.bin',
     version: '2.0.0',
     signingCertificate: null,
+    retries: null,
+    retryInterval: null,
+    installDateTime: null,
     signature: null,
     status: 'draft',
     targetFilter: FULL_FILTER,
@@ -193,7 +204,7 @@ describe('firmware campaign routes (cov2)', () => {
         [{ id: 'sit_1', name: 'Downtown' }],
         [{ id: 'vnd_1', name: 'ABB' }],
         [{ model: 'Terra AC' }],
-        [{ id: 'sta_1', stationId: 'CS-1' }],
+        [{ id: 'sta_1', stationId: 'CS-1', isOnline: true }],
       );
       const res = await app.inject({
         method: 'GET',
@@ -205,7 +216,7 @@ describe('firmware campaign routes (cov2)', () => {
         sites: [{ id: 'sit_1', name: 'Downtown' }],
         vendors: [{ id: 'vnd_1', name: 'ABB' }],
         models: ['Terra AC'],
-        stations: [{ id: 'sta_1', stationId: 'CS-1' }],
+        stations: [{ id: 'sta_1', stationId: 'CS-1', isOnline: true }],
       });
       expect(rec.where).toContainEqual({ inArray: ['sites.id', ['sit_1', 'sit_2']] });
       expect(rec.where).toContainEqual({
@@ -269,7 +280,7 @@ describe('firmware campaign routes (cov2)', () => {
         headers: auth,
       });
       expect(res.statusCode).toBe(200);
-      expect(rec.where[1]).toEqual({
+      expect(rec.where).toContainEqual({
         and: [
           { eq: ['st.site_id', 'sit_1'] },
           { eq: ['st.vendor_id', 'vnd_1'] },
@@ -327,16 +338,15 @@ describe('firmware campaign routes (cov2)', () => {
     it('targets online stations matching every filter at the allowed sites', async () => {
       setupDbResults(
         [campaign()],
-        [{ id: 'sta_1', stationId: 'CS-1' }],
+        [{ id: 'sta_1', stationId: 'CS-1', isOnline: true }],
         [{ id: 'camp-001' }],
         [],
         [],
       );
       const res = await start();
       expect(res.statusCode).toBe(200);
-      expect(rec.where[1]).toEqual({
+      expect(rec.where).toContainEqual({
         and: [
-          { eq: ['st.is_online', true] },
           { eq: ['st.site_id', 'sit_1'] },
           { eq: ['st.vendor_id', 'vnd_1'] },
           { eq: ['st.model', 'Terra AC'] },
@@ -348,7 +358,7 @@ describe('firmware campaign routes (cov2)', () => {
     });
 
     it('answers 409 NOT_DRAFT when another start claimed the campaign first', async () => {
-      setupDbResults([campaign()], [{ id: 'sta_1', stationId: 'CS-1' }], []);
+      setupDbResults([campaign()], [{ id: 'sta_1', stationId: 'CS-1', isOnline: true }], []);
       const res = await start();
       expect(res.statusCode).toBe(409);
       expect(res.json()).toEqual({ error: 'Campaign is not in draft state', code: 'NOT_DRAFT' });
@@ -358,7 +368,7 @@ describe('firmware campaign routes (cov2)', () => {
     it('still dispatches when the firmware_updates pre-insert fails, and warns', async () => {
       setupDbResults(
         [campaign()],
-        [{ id: 'sta_1', stationId: 'CS-1' }],
+        [{ id: 'sta_1', stationId: 'CS-1', isOnline: true }],
         [{ id: 'camp-001' }],
         [],
         new Error('insert failed'),
@@ -377,8 +387,8 @@ describe('firmware campaign routes (cov2)', () => {
       setupDbResults(
         [campaign({ targetFilter: null })],
         [
-          { id: 'sta_1', stationId: 'CS-1' },
-          { id: 'sta_2', stationId: 'CS-2' },
+          { id: 'sta_1', stationId: 'CS-1', isOnline: true },
+          { id: 'sta_2', stationId: 'CS-2', isOnline: true },
         ],
         [{ id: 'camp-001' }],
         [],

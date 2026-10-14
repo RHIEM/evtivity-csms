@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import pino from 'pino';
 import type { PubSubClient, Subscription, DomainEvent } from '@evtivity/lib';
 import { CommandListener } from '../server/command-listener.js';
+import { CommandTimeoutError } from '../server/message-correlator.js';
 
 vi.mock('../protocol/message-types.js', () => ({
   MESSAGE_TYPE_CALL: 2,
@@ -210,6 +211,57 @@ describe('CommandListener', () => {
     );
   });
 
+  it('publishes timedOut on the result when the station does not answer', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new CommandTimeoutError('ReserveNow', 'msg-1'),
+    );
+
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-to',
+        stationId: 'CS-001',
+        action: 'ReserveNow',
+        payload: {},
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockPublish).toHaveBeenCalledWith(
+      'ocpp_command_results',
+      JSON.stringify({
+        commandId: 'cmd-to',
+        error: 'Timeout waiting for response to ReserveNow (msg-1)',
+        timedOut: true,
+      }),
+    );
+  });
+
+  it('does not mark an error with timeout words as timedOut unless it is a CommandTimeoutError', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new Error('Timeout waiting for response to ReserveNow (msg-2)'),
+    );
+
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-nt',
+        stationId: 'CS-001',
+        action: 'ReserveNow',
+        payload: {},
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockPublish).toHaveBeenCalledWith(
+      'ocpp_command_results',
+      JSON.stringify({
+        commandId: 'cmd-nt',
+        error: 'Timeout waiting for response to ReserveNow (msg-2)',
+      }),
+    );
+  });
+
   it('handles invalid JSON gracefully', async () => {
     await createAndStart();
 
@@ -254,6 +306,53 @@ describe('CommandListener', () => {
     );
   });
 
+  it('publishes command.ClearChargingProfile with the request and the answer', async () => {
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-ccp',
+        stationId: 'CS-001',
+        action: 'ClearChargingProfile',
+        payload: { chargingProfileId: 3 },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'command.ClearChargingProfile',
+        aggregateId: 'CS-001',
+        payload: { request: { chargingProfileId: 3 }, response: { status: 'Accepted' } },
+      }),
+    );
+  });
+
+  it('publishes command.GetChargingProfiles with the request and the answer', async () => {
+    await createAndStart();
+    dispatcher.sendCommand.mockResolvedValueOnce({ status: 'NoProfiles' });
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-gcp',
+        stationId: 'CS-001',
+        action: 'GetChargingProfiles',
+        payload: { requestId: 7, chargingProfile: {} },
+        version: 'ocpp2.1',
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'command.GetChargingProfiles',
+        aggregateId: 'CS-001',
+        payload: {
+          request: { requestId: 7, chargingProfile: {} },
+          response: { status: 'NoProfiles' },
+        },
+      }),
+    );
+  });
+
   it('publishes command.Queued event when station is not connected and commandId present', async () => {
     dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
       new Error('Station CS-001 is not connected'),
@@ -282,6 +381,42 @@ describe('CommandListener', () => {
         }) as unknown,
       }),
     );
+  });
+
+  it('never queues a station credential change for an offline station', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new Error('Station CS-001 is not connected'),
+    );
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-pw',
+        stationId: 'CS-001',
+        action: 'SetVariables',
+        payload: {
+          setVariableData: [
+            {
+              component: { name: 'SecurityCtrlr' },
+              variable: { name: 'BasicAuthPassword' },
+              attributeValue: 'SeedStationPass1234',
+            },
+          ],
+        },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const types = eventBus.publish.mock.calls.map((c) => c[0].eventType);
+    expect(types).not.toContain('command.Queued');
+    expect(mockPublish).toHaveBeenCalledWith(
+      'ocpp_command_results',
+      JSON.stringify({
+        commandId: 'cmd-pw',
+        error: 'Station offline, a station credential change is not queued',
+      }),
+    );
+    // The outbound CALL row is logged masked.
+    expect(JSON.stringify(eventBus.publish.mock.calls)).not.toContain('SeedStationPass1234');
   });
 
   it('sends queued result via pubsub when station offline', async () => {
@@ -370,16 +505,16 @@ describe('CommandListener', () => {
     });
   });
 
-  // ---- Retry behavior ----
+  // ---- No retries ----
 
-  it('retries retryable commands on timeout error', async () => {
+  it('sends a timed-out command once and reports timedOut', async () => {
     dispatcher.sendCommand
-      .mockRejectedValueOnce(new Error('Command timed out'))
+      .mockRejectedValueOnce(new CommandTimeoutError('Reset', 'm1'))
       .mockResolvedValueOnce({ status: 'Accepted' });
 
     await createAndStart();
     const payload = JSON.stringify({
-      commandId: 'cmd-retry',
+      commandId: 'cmd-timeout',
       stationId: 'CS-001',
       action: 'Reset',
       payload: { type: 'Soft' },
@@ -387,31 +522,21 @@ describe('CommandListener', () => {
     });
 
     subscribeHandler!(payload);
-    // Wait for retry delay (exponential backoff)
-    await new Promise((r) => setTimeout(r, 2000));
+    // Longer than the old 1 s first retry delay.
+    await new Promise((r) => setTimeout(r, 1500));
 
-    expect(dispatcher.sendCommand).toHaveBeenCalledTimes(2);
+    expect(dispatcher.sendCommand).toHaveBeenCalledTimes(1);
+    expect(mockPublish).toHaveBeenCalledWith(
+      'ocpp_command_results',
+      JSON.stringify({
+        commandId: 'cmd-timeout',
+        error: 'Timeout waiting for response to Reset (m1)',
+        timedOut: true,
+      }),
+    );
   });
 
-  it('does not retry non-retryable commands on timeout', async () => {
-    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(new Error('Command timed out'));
-
-    await createAndStart();
-    const payload = JSON.stringify({
-      commandId: 'cmd-noretry',
-      stationId: 'CS-001',
-      action: 'RequestStartTransaction',
-      payload: {},
-    });
-
-    subscribeHandler!(payload);
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Non-retryable: should only be called once
-    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not retry on non-timeout errors even for retryable commands', async () => {
+  it('does not retry on non-timeout errors', async () => {
     dispatcher.sendCommand.mockRejectedValueOnce(new Error('Station rejected: NotImplemented'));
 
     await createAndStart();
@@ -639,6 +764,48 @@ describe('CommandListener', () => {
     );
   });
 
+  it('publishes command.UpdateFirmware with the error when the station answers with an error', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(new Error('NotSupported'));
+    await createAndStart();
+    const payload = { requestId: 9, firmware: { location: 'https://fw' } };
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-fw-err',
+        stationId: 'CS-001',
+        action: 'UpdateFirmware',
+        payload,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'command.UpdateFirmware',
+        payload: { request: payload, error: 'NotSupported' },
+      }),
+    );
+  });
+
+  it('does not end a firmware update whose command timed out', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new CommandTimeoutError('UpdateFirmware', 'm2'),
+    );
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-fw-to',
+        stationId: 'CS-001',
+        action: 'UpdateFirmware',
+        payload: { requestId: 10, firmware: { location: 'https://fw' } },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).not.toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'command.UpdateFirmware' }),
+    );
+  });
+
   it('publishes command.GetLog on GetLog success', async () => {
     await createAndStart();
     subscribeHandler!(
@@ -681,6 +848,29 @@ describe('CommandListener', () => {
       }),
     );
   });
+
+  it.each([
+    ['ClearDisplayMessage', { id: 3 }, { status: 'Accepted' }],
+    ['SetDisplayMessage', { message: { id: 3 } }, { status: 'Rejected' }],
+  ])(
+    'publishes command.%s with the station reply so the projection records it',
+    async (action, payload, response) => {
+      dispatcher.sendVersionAwareCommand.mockResolvedValueOnce(response);
+      await createAndStart();
+      subscribeHandler!(
+        JSON.stringify({ commandId: 'cmd-dm', stationId: 'CS-001', action, payload }),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(eventBus.publish).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: `command.${action}`,
+          aggregateId: 'CS-001',
+          payload: { request: payload, response },
+        }),
+      );
+    },
+  );
 
   it('publishes CALLERROR and error result for a non-offline failure with commandId', async () => {
     dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(

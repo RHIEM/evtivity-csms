@@ -28,7 +28,11 @@ import {
 } from '@/components/ui/table';
 import { MessageThread } from '@/components/support/MessageThread';
 import { CaseInfoSidebar } from '@/components/support/CaseInfoSidebar';
+import { SupportCaseAiBadge, SupportCaseAiCard } from '@/components/support/SupportCaseAiCard';
+import type { SupportCaseAiFields } from '@/components/support/SupportCaseAiCard';
+import { SupportCaseInsights } from '@/components/ai/insights/SupportCaseInsights';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
+import { parseMajorInputToCents } from '@evtivity/lib/currency';
 import { api } from '@/lib/api';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import { formatCents, formatNumber } from '@/lib/formatting';
@@ -45,7 +49,7 @@ interface Attachment {
 
 interface Message {
   id: number;
-  senderType: 'driver' | 'operator' | 'system';
+  senderType: 'driver' | 'operator' | 'system' | 'assistant';
   senderId: string | null;
   body: string;
   isInternal: boolean;
@@ -61,7 +65,7 @@ interface SessionRef {
   status: string | null;
 }
 
-interface CaseDetail {
+interface CaseDetail extends SupportCaseAiFields {
   id: string;
   caseNumber: string;
   subject: string;
@@ -132,7 +136,6 @@ export function SupportCaseDetail(): React.JSX.Element {
     api
       .post(`/v1/support-cases/${id}/read`, {})
       .then(() => {
-        void queryClient.invalidateQueries({ queryKey: ['support-cases-unread-count'] });
         void queryClient.invalidateQueries({ queryKey: ['support-cases'] });
       })
       .catch((err: unknown) => {
@@ -224,7 +227,9 @@ export function SupportCaseDetail(): React.JSX.Element {
   }
 
   if (caseDetail == null) {
-    return <p className="text-sm text-destructive">Case not found</p>;
+    // A 404 (missing case, or a case outside the operator's sites) leaves
+    // caseDetail undefined.
+    return <p className="text-sm text-destructive">{t('supportCases.notFound')}</p>;
   }
 
   function canRefundSession(sessionId: string): boolean {
@@ -236,8 +241,8 @@ export function SupportCaseDetail(): React.JSX.Element {
 
   function handleRefundConfirm(): boolean {
     if (refundSession == null) return false;
-    const cents = Math.round(parseFloat(refundAmount) * 100);
-    if (isNaN(cents) || cents <= 0) {
+    const cents = parseMajorInputToCents(refundAmount);
+    if (cents == null || cents <= 0) {
       setRefundError(t('supportCases.refundAmountRequired'));
       return false;
     }
@@ -259,13 +264,17 @@ export function SupportCaseDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/support-cases" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{caseDetail.caseNumber}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{caseDetail.caseNumber}</h1>
           <CopyableId id={caseDetail.id} />
         </div>
         <Badge>{t(`supportCases.statuses.${caseDetail.status}`, caseDetail.status)}</Badge>
+        <SupportCaseAiBadge
+          aiState={caseDetail.aiState ?? null}
+          resolutionSource={caseDetail.resolutionSource ?? null}
+        />
         <EntityNavButtons resource="support-cases" basePath="/support-cases" currentId={id} />
       </div>
 
@@ -284,7 +293,7 @@ export function SupportCaseDetail(): React.JSX.Element {
                 <Row label={t('supportCases.driver')}>
                   <Link
                     to={`/drivers/${caseDetail.driverId ?? ''}`}
-                    className="text-primary hover:underline"
+                    className="text-link hover:underline"
                   >
                     {caseDetail.driverName}
                   </Link>
@@ -402,7 +411,7 @@ export function SupportCaseDetail(): React.JSX.Element {
                               <TableCell>
                                 <Link
                                   to={`/sessions/${session.id}`}
-                                  className="text-primary hover:underline text-sm"
+                                  className="text-link hover:underline text-sm"
                                 >
                                   {session.id}
                                 </Link>
@@ -506,7 +515,11 @@ export function SupportCaseDetail(): React.JSX.Element {
         </div>
 
         {/* Sidebar controls */}
-        <CaseInfoSidebar caseDetail={caseDetail} operatorUsers={operatorUsers?.data} />
+        <div className="space-y-4">
+          <CaseInfoSidebar caseDetail={caseDetail} operatorUsers={operatorUsers?.data} />
+          <SupportCaseAiCard fields={caseDetail} timezone={timezone} />
+          <SupportCaseInsights caseId={caseDetail.id} />
+        </div>
       </div>
 
       <ConfirmDialog

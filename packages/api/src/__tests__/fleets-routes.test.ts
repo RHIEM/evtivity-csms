@@ -1,7 +1,11 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -29,6 +33,7 @@ const BILLING_PROFILE = {
 const mockFleetService = vi.hoisted(() => ({
   listFleets: vi.fn(),
   getFleet: vi.fn(),
+  fleetHasPricingGroup: vi.fn().mockResolvedValue(false),
   createFleet: vi.fn(),
   updateFleet: vi.fn(),
   deleteFleet: vi.fn(),
@@ -50,8 +55,8 @@ const mockFleetService = vi.hoisted(() => ({
   getFleetCreditLimit: vi.fn(),
   setFleetCreditLimit: vi.fn(),
   FleetBillingUpgradePendingError: class FleetBillingUpgradePendingError extends Error {
-    readonly details: unknown;
-    constructor(details: unknown) {
+    readonly details: { reason: string };
+    constructor(details: { reason: string }) {
       super('A process older than v0.1.41 is still connected.');
       this.details = details;
     }
@@ -62,6 +67,12 @@ const mockFleetService = vi.hoisted(() => ({
 }));
 
 vi.mock('../services/fleet.service.js', () => mockFleetService);
+
+const mockRefuseMembership = vi.hoisted(() => vi.fn());
+vi.mock('../lib/fleet-billing-access.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/fleet-billing-access.js')>()),
+  refuseSiteRestrictedFleetMembership: mockRefuseMembership,
+}));
 
 // Mock @evtivity/database so the FK pre-checks (POST drivers / stations /
 // pricing-groups) find their target rows. Each pre-check does
@@ -122,7 +133,8 @@ vi.mock('@evtivity/database', () => {
     drivers: {},
     chargingStations: {},
     pricingGroups: {},
-    fleetAuditLog: {},
+    fleetAuditLog: { name: 'fleet_audit_log' },
+    driverAuditLog: { name: 'driver_audit_log' },
     pricingAssignmentAuditLog: {},
     writeAudit: vi.fn().mockResolvedValue(undefined),
   };
@@ -146,6 +158,12 @@ vi.mock('../middleware/rbac.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { fleetRoutes } from '../routes/fleets.js';
+import { writeAudit } from '@evtivity/database';
+import {
+  resetSiteAccessMock,
+  setMockStationSites,
+  setMockUserSiteIds,
+} from './helpers/site-access-mock.js';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -228,6 +246,7 @@ describe('Fleet routes - handler logic', () => {
 
       expect(mockFleetService.listFleets).toHaveBeenCalledWith(
         expect.objectContaining({ search: 'test' }),
+        null,
       );
     });
 
@@ -442,9 +461,43 @@ describe('Fleet routes - handler logic', () => {
       expect(response.json().accountBillingEnabled).toBe(true);
       expect(mockFleetService.setFleetAccountBilling).toHaveBeenCalledWith(
         VALID_FLEET_ID,
-        true,
+        { enabled: true, recipient: undefined },
         expect.objectContaining({ actor: expect.objectContaining({ actorUserId: VALID_USER_ID }) }),
       );
+    });
+
+    it('sets the invoice recipient through the fleet service', async () => {
+      mockFleetService.setFleetAccountBilling.mockResolvedValue({
+        ...fleet,
+        accountInvoiceRecipient: 'member',
+      });
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}/billing`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { accountInvoiceRecipient: 'member' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().accountInvoiceRecipient).toBe('member');
+      expect(mockFleetService.setFleetAccountBilling).toHaveBeenCalledWith(
+        VALID_FLEET_ID,
+        { enabled: undefined, recipient: 'member' },
+        expect.anything(),
+      );
+    });
+
+    it('rejects an unknown recipient', async () => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}/billing`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { accountInvoiceRecipient: 'driver' },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockFleetService.setFleetAccountBilling).not.toHaveBeenCalled();
     });
 
     it('returns 404 for an unknown fleet', async () => {
@@ -462,7 +515,13 @@ describe('Fleet routes - handler logic', () => {
     });
 
     it('answers 409 FLEET_BILLING_OLD_PODS_CONNECTED with the guard details', async () => {
-      const details = { oldConnections: 1, hosts: [], lastOldSeenAt: null, watchCheckedAt: null };
+      const details = {
+        reason: 'old_processes',
+        oldConnections: 1,
+        hosts: [],
+        lastOldSeenAt: null,
+        watchCheckedAt: null,
+      };
       mockFleetService.setFleetAccountBilling.mockRejectedValue(
         new mockFleetService.FleetBillingUpgradePendingError(details),
       );
@@ -481,7 +540,33 @@ describe('Fleet routes - handler logic', () => {
       });
     });
 
-    it('rejects a body without the flag', async () => {
+    it('answers 409 FLEET_BILLING_VERSION_CHECK_STALE when only the worker watch is stale', async () => {
+      const details = {
+        reason: 'version_check_stale',
+        oldConnections: 0,
+        hosts: [],
+        lastOldSeenAt: null,
+        watchCheckedAt: null,
+      };
+      mockFleetService.setFleetAccountBilling.mockRejectedValue(
+        new mockFleetService.FleetBillingUpgradePendingError(details),
+      );
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/fleets/${VALID_FLEET_ID}/billing`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: { accountInvoiceRecipient: 'member' },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({
+        code: 'FLEET_BILLING_VERSION_CHECK_STALE',
+        details,
+      });
+    });
+
+    it('rejects a body without a field to change', async () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/fleets/${VALID_FLEET_ID}/billing`,
@@ -490,6 +575,7 @@ describe('Fleet routes - handler logic', () => {
       });
 
       expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
       expect(mockFleetService.setFleetAccountBilling).not.toHaveBeenCalled();
     });
   });
@@ -768,6 +854,22 @@ describe('Fleet routes - handler logic', () => {
       expect(response.json().code).toBe('FLEET_HAS_OPEN_BILLING');
     });
 
+    it('returns 409 FLEET_HAS_RESERVATIONS while fleet reservations name the fleet', async () => {
+      const { AppError } = await import('@evtivity/lib');
+      mockFleetService.deleteFleet.mockRejectedValue(
+        new AppError('The fleet has fleet reservations', 409, 'FLEET_HAS_RESERVATIONS'),
+      );
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: `/fleets/${VALID_FLEET_ID}`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('FLEET_HAS_RESERVATIONS');
+    });
+
     it('deletes fleet and returns it', async () => {
       const fleet = {
         id: VALID_FLEET_ID,
@@ -883,6 +985,17 @@ describe('Fleet routes - handler logic', () => {
 
       expect(response.statusCode).toBe(201);
       expect(response.json().driverId).toBe('drv_000000000001');
+      expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+        { table: { name: 'driver_audit_log' }, idColumn: 'driver_id' },
+        expect.objectContaining({
+          entityId: 'drv_000000000001',
+          action: 'fleet_assignment_changed',
+          before: null,
+          after: { fleetId: VALID_FLEET_ID },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('returns 400 for missing driverId', async () => {
@@ -922,6 +1035,17 @@ describe('Fleet routes - handler logic', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().driverId).toBe('drv_000000000001');
       expect(mockFleetService.notifyMemberLeft).toHaveBeenCalledWith(record, expect.anything());
+      expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+        { table: { name: 'driver_audit_log' }, idColumn: 'driver_id' },
+        expect.objectContaining({
+          entityId: 'drv_000000000001',
+          action: 'fleet_assignment_changed',
+          before: { fleetId: VALID_FLEET_ID },
+          after: null,
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('returns 404 when driver not found in fleet', async () => {
@@ -1145,7 +1269,7 @@ describe('Fleet routes - handler logic', () => {
         headers: { authorization: 'Bearer ' + token },
       });
 
-      expect(mockFleetService.getFleetSessions).toHaveBeenCalledWith(VALID_FLEET_ID, 2, 5);
+      expect(mockFleetService.getFleetSessions).toHaveBeenCalledWith(VALID_FLEET_ID, 2, 5, null);
     });
 
     it('returns empty data when no sessions', async () => {
@@ -1215,7 +1339,7 @@ describe('Fleet routes - handler logic', () => {
         headers: { authorization: 'Bearer ' + token },
       });
 
-      expect(mockFleetService.getFleetMetrics).toHaveBeenCalledWith(VALID_FLEET_ID, 6);
+      expect(mockFleetService.getFleetMetrics).toHaveBeenCalledWith(VALID_FLEET_ID, 6, null);
     });
   });
 
@@ -1251,7 +1375,7 @@ describe('Fleet routes - handler logic', () => {
         headers: { authorization: 'Bearer ' + token },
       });
 
-      expect(mockFleetService.getFleetEnergyHistory).toHaveBeenCalledWith(VALID_FLEET_ID, 30);
+      expect(mockFleetService.getFleetEnergyHistory).toHaveBeenCalledWith(VALID_FLEET_ID, 30, null);
     });
   });
 
@@ -1371,6 +1495,299 @@ describe('Fleet routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(401);
     });
+  });
+
+  // --- Site access: a user restricted to site OWN_SITE ---
+
+  describe('site-restricted users', () => {
+    const OWN_SITE = 'sit_000000000001';
+    const OWN_STATION = 'sta_000000000001';
+    const FOREIGN_STATION = 'sta_000000000002';
+    const auth = () => ({ authorization: 'Bearer ' + token });
+
+    beforeEach(() => {
+      setMockUserSiteIds([OWN_SITE]);
+      setMockStationSites({
+        [OWN_STATION]: OWN_SITE,
+        [FOREIGN_STATION]: 'sit_000000000002',
+        sta_000000000003: null,
+      });
+    });
+    afterEach(() => {
+      resetSiteAccessMock();
+    });
+
+    it.each([
+      ['PATCH', 'billing', { accountBillingEnabled: true }],
+      ['PATCH', 'billing-profile', { autoInvoice: false }],
+      ['GET', 'credit-limit', undefined],
+      ['PATCH', 'credit-limit', { creditLimitCents: 1000, warningPercent: 80 }],
+    ] as const)(
+      'answers 404 FLEET_NOT_FOUND on %s /fleets/:id/%s',
+      async (method, path, payload) => {
+        const response = await app.inject({
+          method,
+          url: `/fleets/${VALID_FLEET_ID}/${path}`,
+          headers: auth(),
+          ...(payload != null ? { payload } : {}),
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json().code).toBe('FLEET_NOT_FOUND');
+        expect(mockFleetService.setFleetAccountBilling).not.toHaveBeenCalled();
+        expect(mockFleetService.updateFleetBillingProfile).not.toHaveBeenCalled();
+        expect(mockFleetService.getFleetCreditLimit).not.toHaveBeenCalled();
+        expect(mockFleetService.setFleetCreditLimit).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([FOREIGN_STATION, 'sta_000000000003'])(
+      'answers 404 STATION_NOT_FOUND when adding station %s outside its sites',
+      async (stationId) => {
+        mockFleetService.getFleet.mockResolvedValue({ id: VALID_FLEET_ID, name: 'Fleet 1' });
+
+        const response = await app.inject({
+          method: 'POST',
+          url: `/fleets/${VALID_FLEET_ID}/stations`,
+          headers: auth(),
+          payload: { stationId },
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json().code).toBe('STATION_NOT_FOUND');
+        expect(mockFleetService.addStationToFleet).not.toHaveBeenCalled();
+      },
+    );
+
+    it('adds a station at its own site', async () => {
+      mockFleetService.getFleet.mockResolvedValue({ id: VALID_FLEET_ID, name: 'Fleet 1' });
+      mockFleetService.addStationToFleet.mockResolvedValue({
+        fleetId: VALID_FLEET_ID,
+        stationId: OWN_STATION,
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/fleets/${VALID_FLEET_ID}/stations`,
+        headers: auth(),
+        payload: { stationId: OWN_STATION },
+      });
+
+      expect(response.statusCode).toBe(201);
+    });
+
+    it('answers 404 STATION_NOT_FOUND when removing a station outside its sites', async () => {
+      const response = await app.inject({
+        method: 'DELETE',
+        url: `/fleets/${VALID_FLEET_ID}/stations/${FOREIGN_STATION}`,
+        headers: auth(),
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('STATION_NOT_FOUND');
+      expect(mockFleetService.removeStationFromFleet).not.toHaveBeenCalled();
+    });
+
+    it("scopes the stations, sessions, metrics and energy history to the user's sites", async () => {
+      mockFleetService.getFleetStations.mockResolvedValue([]);
+      mockFleetService.getFleetSessions.mockResolvedValue({ data: [], total: 0 });
+      mockFleetService.getFleetMetrics.mockResolvedValue({
+        totalSessions: 0,
+        completedSessions: 0,
+        faultedSessions: 0,
+        sessionSuccessPercent: 100,
+        totalEnergyWh: 0,
+        avgSessionDurationMinutes: 0,
+        activeDrivers: 0,
+        totalDrivers: 0,
+        totalVehicles: 0,
+        periodMonths: 6,
+      });
+      mockFleetService.getFleetEnergyHistory.mockResolvedValue([]);
+
+      for (const path of ['stations', 'sessions', 'metrics', 'energy-history']) {
+        const response = await app.inject({
+          method: 'GET',
+          url: `/fleets/${VALID_FLEET_ID}/${path}`,
+          headers: auth(),
+        });
+        expect(response.statusCode).toBe(200);
+      }
+
+      expect(mockFleetService.getFleetStations).toHaveBeenCalledWith(VALID_FLEET_ID, [OWN_SITE]);
+      expect(mockFleetService.getFleetSessions).toHaveBeenCalledWith(
+        VALID_FLEET_ID,
+        1,
+        expect.any(Number),
+        [OWN_SITE],
+      );
+      expect(mockFleetService.getFleetMetrics).toHaveBeenCalledWith(
+        VALID_FLEET_ID,
+        expect.any(Number),
+        [OWN_SITE],
+      );
+      expect(mockFleetService.getFleetEnergyHistory).toHaveBeenCalledWith(
+        VALID_FLEET_ID,
+        expect.any(Number),
+        [OWN_SITE],
+      );
+    });
+  });
+});
+
+describe('Fleet routes - site-restricted user (owner decision 2026-10-09)', () => {
+  let app: FastifyInstance;
+  let token: string;
+  const auth = () => ({ authorization: 'Bearer ' + token });
+  const fleet = {
+    id: VALID_FLEET_ID,
+    name: 'Fleet A',
+    description: null,
+    accountBillingEnabled: true,
+    ...BILLING_PROFILE,
+    creditLimitCents: 5000,
+    creditLimitWarningPercent: 80,
+    accountInvoiceRecipient: 'member',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  beforeAll(async () => {
+    app = await buildApp();
+    token = app.jwt.sign({ userId: VALID_USER_ID, roleId: VALID_ROLE_ID });
+  });
+  afterAll(async () => {
+    await app.close();
+  });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetSiteAccessMock();
+    mockRefuseMembership.mockResolvedValue(false);
+  });
+
+  it('GET /fleets passes the user sites so the station count is scoped', async () => {
+    setMockUserSiteIds(['sit_a']);
+    mockFleetService.listFleets.mockResolvedValue({ data: [], total: 0 });
+    await app.inject({ method: 'GET', url: '/fleets', headers: auth() });
+    expect(mockFleetService.listFleets).toHaveBeenCalledWith(expect.anything(), ['sit_a']);
+  });
+
+  it('GET /fleets/:id omits the billing profile and credit limit for a restricted user', async () => {
+    setMockUserSiteIds(['sit_a']);
+    mockFleetService.getFleet.mockResolvedValue(fleet);
+    mockFleetService.fleetHasPricingGroup.mockResolvedValue(true);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/fleets/${VALID_FLEET_ID}`,
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toMatchObject({
+      id: VALID_FLEET_ID,
+      accountBillingEnabled: true,
+      hasPricingGroup: true,
+    });
+    for (const key of [
+      'billingContactEmails',
+      'billingLegalName',
+      'billingTaxId',
+      'paymentTermsDays',
+      'autoInvoice',
+      'creditLimitCents',
+      'creditLimitWarningPercent',
+      'accountInvoiceRecipient',
+    ]) {
+      expect(body).not.toHaveProperty(key);
+    }
+  });
+
+  it('GET /fleets/:id keeps the billing fields for an all-site user', async () => {
+    mockFleetService.getFleet.mockResolvedValue(fleet);
+    mockFleetService.fleetHasPricingGroup.mockResolvedValue(false);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/fleets/${VALID_FLEET_ID}`,
+      headers: auth(),
+    });
+    expect(res.json()).toMatchObject({
+      creditLimitCents: 5000,
+      accountInvoiceRecipient: 'member',
+      hasPricingGroup: false,
+    });
+    expect(res.json()).toHaveProperty('billingContactEmails');
+  });
+
+  it('DELETE /fleets/:id answers 404 FLEET_NOT_FOUND and deletes nothing', async () => {
+    setMockUserSiteIds(['sit_a']);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/fleets/${VALID_FLEET_ID}`,
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().code).toBe('FLEET_NOT_FOUND');
+    expect(mockFleetService.deleteFleet).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /fleets/:id/drivers/:driverId (opt-out) answers 404 FLEET_NOT_FOUND', async () => {
+    setMockUserSiteIds(['sit_a']);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/fleets/${VALID_FLEET_ID}/drivers/${VALID_SECONDARY_ID}`,
+      headers: auth(),
+      payload: { accountBillingOptOut: true },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().code).toBe('FLEET_NOT_FOUND');
+    expect(mockFleetService.setMemberBillingOptOut).not.toHaveBeenCalled();
+  });
+
+  it('POST /fleets/:id/drivers stops when the membership guard refuses', async () => {
+    setMockUserSiteIds(['sit_a']);
+    mockRefuseMembership.mockImplementation(
+      async (
+        _req: unknown,
+        reply: { status: (c: number) => { send: (b: unknown) => unknown } },
+      ) => {
+        await reply.status(404).send({ error: 'Fleet not found', code: 'FLEET_NOT_FOUND' });
+        return true;
+      },
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: `/fleets/${VALID_FLEET_ID}/drivers`,
+      headers: auth(),
+      payload: { driverId: VALID_SECONDARY_ID },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().code).toBe('FLEET_NOT_FOUND');
+    expect(mockRefuseMembership).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      VALID_FLEET_ID,
+    );
+    expect(mockFleetService.addDriverToFleet).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /fleets/:id/drivers/:driverId stops when the membership guard refuses', async () => {
+    setMockUserSiteIds(['sit_a']);
+    mockRefuseMembership.mockImplementation(
+      async (
+        _req: unknown,
+        reply: { status: (c: number) => { send: (b: unknown) => unknown } },
+      ) => {
+        await reply.status(404).send({ error: 'Fleet not found', code: 'FLEET_NOT_FOUND' });
+        return true;
+      },
+    );
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/fleets/${VALID_FLEET_ID}/drivers/${VALID_SECONDARY_ID}`,
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(404);
+    expect(mockFleetService.removeDriverFromFleet).not.toHaveBeenCalled();
   });
 });
 

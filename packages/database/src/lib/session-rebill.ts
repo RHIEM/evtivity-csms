@@ -10,14 +10,18 @@
 // override, audited by the caller).
 
 import type postgres from 'postgres';
+import { computeSessionElectricityCost } from '@evtivity/lib';
 import type { SessionCostBreakdown } from '@evtivity/lib';
+import { getElectricityRatePeriodsForSite } from './electricity-rate.js';
 import {
-  closeOpenSegment,
+  closeSegmentsAt,
   loadSessionPricing,
   priceSession,
   sessionIdleMinutesAt,
 } from './session-pricing.js';
 import { SESSION_END_FAILED_REASON } from './session-end-request.js';
+import { toDateOrNull } from './raw-timestamp.js';
+import type { RawTimestamp } from './raw-timestamp.js';
 
 /** How long a re-bill claim holds before another request may take it over (a request that died). */
 export const SESSION_REBILL_LEASE_SECONDS = 300;
@@ -61,22 +65,16 @@ export interface RebillPricing {
   energyWh: number;
 }
 
-function toDate(value: unknown): Date | null {
-  if (value == null) return null;
-  return value instanceof Date ? value : new Date(value as string);
-}
-
 /**
  * Prices a session the CSMS gave up ending, as the Ended projection prices a
  * CSMS end: at its last update (the last meter value of the session, at most
- * the time it was faulted; its start without meter values; never before the
- * start of its latest tariff segment) with the energy metered so far. The
- * give-up closed the open tariff segment at the fault time without an end
- * reading, which the calculator counts as no energy, so that segment is
- * reopened and closed at the billed end with the energy, as the Ended
- * projection closes it. A retry finds the segment closed with its
- * reading and leaves it alone. Null for an unknown or unstarted session, or
- * one without a tariff snapshot.
+ * the time it was faulted; its start without meter values) with the energy
+ * metered so far. Its segments end there as the Ended projection ends them
+ * (closeSegmentsAt, finding B6): a segment a switch opened at or after the
+ * billed end is removed, and the latest remaining segment, which the give-up
+ * closed at the fault time without an end reading, is closed at the billed
+ * end with the energy. A retry closes it again with the same values. Null
+ * for an unknown or unstarted session, or one without a tariff snapshot.
  */
 export async function priceRebill(
   sql: postgres.Sql,
@@ -86,52 +84,62 @@ export async function priceRebill(
   if (session?.tariffId == null) return null;
   const [row] = await sql`
     SELECT s.ended_at, s.energy_delivered_wh,
-           (SELECT max(mv.timestamp) FROM meter_values mv WHERE mv.session_id = s.id) AS last_reading_at,
-           (SELECT max(seg.started_at) FROM session_tariff_segments seg
-            WHERE seg.session_id = s.id) AS last_segment_started_at
+           (SELECT max(mv.timestamp) FROM meter_values mv WHERE mv.session_id = s.id) AS last_reading_at
     FROM charging_sessions s
     WHERE s.id = ${sessionId}
   `;
   if (row == null) return null;
-  const faultedAt = toDate(row.ended_at);
-  let endedAt = toDate(row.last_reading_at) ?? session.startedAt;
+  const faultedAt = toDateOrNull(row.ended_at as RawTimestamp);
+  let endedAt = toDateOrNull(row.last_reading_at as RawTimestamp) ?? session.startedAt;
   if (faultedAt != null && endedAt > faultedAt) endedAt = faultedAt;
   if (endedAt < session.startedAt) endedAt = session.startedAt;
-  // The billed end closes the latest segment, so it is never before that
-  // segment's start (a tariff switch after the last meter value): the segment
-  // gets a duration of 0, never a negative one.
-  const lastSegmentStartedAt = toDate(row.last_segment_started_at);
-  if (lastSegmentStartedAt != null && endedAt < lastSegmentStartedAt) {
-    endedAt = lastSegmentStartedAt;
-  }
   const energyWh = Number(row.energy_delivered_wh ?? 0);
+  // Never negative: an idle period opened after the billed end adds nothing.
   const idleMinutes = sessionIdleMinutesAt(session, endedAt);
 
-  await sql.begin(async (tx) => {
-    const txSql = tx as unknown as postgres.Sql;
-    await txSql`
-      UPDATE session_tariff_segments
-      SET ended_at = NULL, duration_minutes = NULL
-      WHERE id = (
-        SELECT id FROM session_tariff_segments
-        WHERE session_id = ${sessionId}
-        ORDER BY started_at DESC, id DESC
-        LIMIT 1
-      ) AND energy_wh_end IS NULL
-    `;
-    await closeOpenSegment(txSql, sessionId, endedAt, energyWh, idleMinutes);
-  });
+  await closeSegmentsAt(sql, sessionId, endedAt, energyWh, idleMinutes);
 
   const breakdown = await priceSession(sql, session, endedAt, energyWh);
   return breakdown == null ? null : { breakdown, endedAt, energyWh };
 }
 
 /**
+ * The electricity cost of a re-billed session, as the session end projection
+ * computes it (computeSessionElectricityCost): the rate period of its station's
+ * site in force at the billed end, in the site timezone. Null without a site,
+ * a matching period or energy. The cached period reader fails open to no
+ * periods, so a rate lookup failure never blocks the re-bill.
+ */
+export async function rebillElectricityCostCents(
+  sql: postgres.Sql,
+  sessionId: string,
+  endedAt: Date,
+  energyWh: number,
+): Promise<number | null> {
+  const [row] = await sql`
+    SELECT st.site_id, si.timezone
+    FROM charging_sessions s
+    JOIN charging_stations st ON st.id = s.station_id
+    LEFT JOIN sites si ON si.id = st.site_id
+    WHERE s.id = ${sessionId}
+  `;
+  const siteId = row?.['site_id'] as string | null | undefined;
+  if (siteId == null) return null;
+  return computeSessionElectricityCost({
+    periods: await getElectricityRatePeriodsForSite(siteId),
+    endedAt,
+    energyWh,
+    timezone: row?.['timezone'] as string | null | undefined,
+  }).costCents;
+}
+
+/**
  * Completes a re-billed session (the P5 override): `faulted` to `completed`
  * only for a session with stopped reason EndRequestFailed whose re-bill claim
  * is held, with the billed end, the final (and running) cost and its split, as
- * storeFinalCost stores it, and `rebill_status` billed or manual. The stopped
- * reason stays. Returns whether the session changed.
+ * storeFinalCost stores it, the electricity cost when it has none
+ * (rebillElectricityCostCents), and `rebill_status` billed or manual. The
+ * stopped reason stays. Returns whether the session changed.
  */
 export async function completeRebilledSession(
   sql: postgres.Sql,
@@ -139,10 +147,18 @@ export async function completeRebilledSession(
     sessionId: string;
     breakdown: SessionCostBreakdown;
     endedAt: Date;
+    /** The billed energy (RebillPricing.energyWh). */
+    energyWh: number;
     outcome: SessionRebillOutcome;
   },
 ): Promise<boolean> {
   const { breakdown } = input;
+  const electricityCostCents = await rebillElectricityCostCents(
+    sql,
+    input.sessionId,
+    input.endedAt,
+    input.energyWh,
+  );
   const rows = await sql`
     UPDATE charging_sessions
     SET status = 'completed',
@@ -152,6 +168,7 @@ export async function completeRebilledSession(
         net_cents = ${breakdown.netCents},
         tax_cents = ${breakdown.taxCents},
         cost_breakdown = ${sql.json(breakdown as unknown as postgres.JSONValue)},
+        electricity_cost_cents = COALESCE(electricity_cost_cents, ${electricityCostCents}::integer),
         rebill_status = ${input.outcome},
         rebill_claimed_at = NULL,
         updated_at = now()

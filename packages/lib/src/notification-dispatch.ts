@@ -62,6 +62,23 @@ export interface RenderedTemplate {
   html?: string;
 }
 
+/** One message a dispatcher handed to the email or SMS provider, which accepted it. */
+export interface NotificationDelivery {
+  channel: 'email' | 'sms';
+  /** The email address or phone number it went to. */
+  recipient: string;
+}
+
+/**
+ * What a dispatch delivered: the email and SMS messages the provider accepted.
+ * Empty when the event is disabled, the recipient has no address, a provider
+ * is not configured, every send failed, or the dispatch threw (fail-open). The
+ * in-app push row is not a delivery.
+ */
+export interface NotificationDispatchResult {
+  delivered: NotificationDelivery[];
+}
+
 // --- Sensitive content redaction for notification history rows ---
 
 // Notification bodies and subjects sometimes contain secrets that should
@@ -795,6 +812,30 @@ export async function isDriverEventDisabled(
 
 // --- Driver notification dispatch ---
 
+/**
+ * Ids of the record a driver notice is about, kept in the notification log's
+ * metadata so a sender can find its earlier notices: `reservationId` from the
+ * `reservationDbId` variable of the reservation notices (the Expiring warning
+ * dedups per reservation, v0.1.45 G17).
+ */
+function subjectMetadata(variables: Record<string, unknown>): Record<string, string> {
+  const reservationDbId = variables['reservationDbId'];
+  return typeof reservationDbId === 'string' && reservationDbId !== ''
+    ? { reservationId: reservationDbId }
+    : {};
+}
+
+/** Per-call options of dispatchDriverNotification. */
+export interface DriverNotificationOptions {
+  /** Sent with the email only (the SMS and push ignore them), such as the PDF of an invoice. */
+  attachments?: EmailAttachment[];
+  /**
+   * `false` sends no SMS and records no SMS attempt; the SMS template still
+   * renders the push text. For notices that carry a document (member invoices).
+   */
+  sms?: false;
+}
+
 export async function dispatchDriverNotification(
   sql: postgres.Sql,
   eventType: string,
@@ -805,11 +846,13 @@ export async function dispatchDriverNotification(
   // "<event> Notification", body a dump of the variables).
   templatesDir: string | string[],
   pubsub?: PubSubClient,
-): Promise<void> {
+  options?: DriverNotificationOptions,
+): Promise<NotificationDispatchResult> {
+  const delivered: NotificationDelivery[] = [];
   try {
     if (await isDriverEventDisabled(sql, eventType)) {
       logger.debug({ eventType }, 'Driver event type disabled, skipping');
-      return;
+      return { delivered };
     }
 
     // Driver row, notification preferences, company settings, and SMTP/Twilio
@@ -828,7 +871,7 @@ export async function dispatchDriverNotification(
       getNotificationSettings(sql),
     ]);
     const driver = driverRows[0];
-    if (driver == null) return;
+    if (driver == null) return { delivered };
 
     const firstName = (driver.first_name as string | null) ?? '';
     const lastName = (driver.last_name as string | null) ?? '';
@@ -858,7 +901,8 @@ export async function dispatchDriverNotification(
     // reaches the driver on every channel they have, whatever their preferences say.
     const prefs = isRequiredDriverEventType(eventType) ? undefined : prefRows[0];
     const emailEnabled = prefs != null ? (prefs.email_enabled as boolean) : true;
-    const smsEnabled = prefs != null ? (prefs.sms_enabled as boolean) : true;
+    const smsEnabled =
+      options?.sms !== false && (prefs != null ? (prefs.sms_enabled as boolean) : true);
     const pushEnabled = prefs != null ? (prefs.push_enabled as boolean) : true;
 
     // Email path. Records a row for every attempt the dispatcher could have
@@ -902,8 +946,10 @@ export async function dispatchDriverNotification(
           rendered.subject,
           rendered.body,
           wrappedHtml,
+          options?.attachments,
         );
         status = ok ? 'sent' : 'failed';
+        if (ok) delivered.push({ channel: 'email', recipient: email });
         if (!ok) {
           failureReason =
             notificationSettings.smtp.credentialError === 'decrypt_failed'
@@ -915,7 +961,7 @@ export async function dispatchDriverNotification(
       }
 
       const recipientForRow = email != null && email !== '' ? email : '';
-      const metadata: Record<string, string> = { driverId };
+      const metadata: Record<string, string> = { driverId, ...subjectMetadata(variables) };
       if (failureReason != null) metadata['failureReason'] = failureReason;
       await recordNotificationAttempt(sql, {
         channel: 'email',
@@ -959,13 +1005,14 @@ export async function dispatchDriverNotification(
           language,
         });
         status = ok ? 'sent' : 'failed';
+        if (ok) delivered.push({ channel: 'sms', recipient: phone });
         if (!ok) failureReason = smsFailureReason(notificationSettings.twilio, testSink);
         storedSmsSubject = redactSensitiveNotificationContent(smsRendered.subject, eventType);
         storedSmsBody = redactSensitiveNotificationContent(smsRendered.body, eventType);
       }
 
       const recipientForRow = phone != null && phone !== '' ? phone : '';
-      const metadata: Record<string, string> = { driverId };
+      const metadata: Record<string, string> = { driverId, ...subjectMetadata(variables) };
       if (failureReason != null) metadata['failureReason'] = failureReason;
       await recordNotificationAttempt(sql, {
         channel: 'sms',
@@ -992,7 +1039,7 @@ export async function dispatchDriverNotification(
       body: pushBody,
       status: 'sent',
       eventType,
-      metadata: { driverId },
+      metadata: { driverId, ...subjectMetadata(variables) },
     });
 
     // Deliver native push to the driver's registered devices. The drawer row
@@ -1007,13 +1054,17 @@ export async function dispatchDriverNotification(
         if (tokenRows.length > 0) {
           const pushTitle = redactSensitiveNotificationContent(smsRendered.subject, eventType);
           const pushMessage = redactSensitiveNotificationContent(smsRendered.body, eventType);
-          // Carry stationId when present so the app can deep-link to the station
-          // from the push (e.g. the station-watch availability alert).
+          // Carry stationId and invoiceId when present so the app can deep-link
+          // from the push (the station-watch availability alert, a member invoice).
           const stationIdVar = variables['stationId'];
-          const pushData: Record<string, unknown> =
-            typeof stationIdVar === 'string' || typeof stationIdVar === 'number'
-              ? { eventType, stationId: String(stationIdVar) }
-              : { eventType };
+          const invoiceIdVar = variables['invoiceId'];
+          const pushData: Record<string, unknown> = { eventType };
+          if (typeof stationIdVar === 'string' || typeof stationIdVar === 'number') {
+            pushData['stationId'] = String(stationIdVar);
+          }
+          if (typeof invoiceIdVar === 'string' && invoiceIdVar !== '') {
+            pushData['invoiceId'] = invoiceIdVar;
+          }
           const results = await sendExpoPush(
             tokenRows.map((r) => ({
               to: r.token as string,
@@ -1056,6 +1107,7 @@ export async function dispatchDriverNotification(
   } catch (err) {
     logger.error({ err, eventType, driverId }, 'Driver notification dispatch failed');
   }
+  return { delivered };
 }
 
 /**
@@ -1106,13 +1158,14 @@ export async function dispatchSystemNotification(
   // Required, see dispatchDriverNotification.
   templatesDir: string | string[],
   attachments?: EmailAttachment[],
-): Promise<void> {
+): Promise<NotificationDispatchResult> {
+  const delivered: NotificationDelivery[] = [];
   try {
     // System events are always on. A driver event sent through this dispatcher
     // still honors the Driver Events switch.
     if (await isDriverEventDisabled(sql, eventType)) {
       logger.debug({ eventType }, 'Driver event type disabled, skipping');
-      return;
+      return { delivered };
     }
 
     // Company settings and SMTP/Twilio config are independent — fan them
@@ -1184,6 +1237,7 @@ export async function dispatchSystemNotification(
           attachments,
         );
         status = ok ? 'sent' : 'failed';
+        if (ok) delivered.push({ channel: 'email', recipient: email });
         if (!ok) {
           failureReason =
             notificationSettings.smtp.credentialError === 'decrypt_failed'
@@ -1252,6 +1306,7 @@ export async function dispatchSystemNotification(
           language,
         });
         status = ok ? 'sent' : 'failed';
+        if (ok) delivered.push({ channel: 'sms', recipient: phone });
         if (!ok) failureReason = smsFailureReason(notificationSettings.twilio, testSink);
         storedSmsSubject = redactSensitiveNotificationContent(rendered.subject, eventType);
         storedSmsBody = redactSensitiveNotificationContent(rendered.body, eventType);
@@ -1273,4 +1328,5 @@ export async function dispatchSystemNotification(
   } catch (err) {
     logger.error({ err, eventType }, 'System notification dispatch failed');
   }
+  return { delivered };
 }

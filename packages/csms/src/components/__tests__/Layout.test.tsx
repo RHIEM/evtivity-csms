@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, cleanup, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -30,7 +30,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('@/hooks/use-event-stream', () => ({ useEventStream: () => undefined }));
-vi.mock('@/components/AiAssistant', () => ({ AiAssistant: () => null }));
+vi.mock('@/components/ai/AiAssistantLauncher', () => ({ AiAssistantLauncher: () => null }));
 vi.mock('@/components/layout/UserDropdown', () => ({ UserDropdown: () => null }));
 
 import { Layout } from '../Layout';
@@ -54,6 +54,7 @@ const ALL_ROUTES = [
   ['/certificates', 'certificates:read'],
   ['/users', 'users:read'],
   ['/support-cases', 'support:read'],
+  ['/ai/insights', 'aiInsights:read'],
   ['/notifications', 'notifications:read'],
   ['/logs', 'logs:read'],
   ['/audit', 'audit:read'],
@@ -81,6 +82,8 @@ function expectedNav(settings: Settings, perms: string[]): string[] {
     if (to === '/reservations' && !reservation) return false;
     if (to === '/support-cases' && !support) return false;
     if (to === '/fleets' && !fleet) return false;
+    // Not a stored setting: the features answer derives it ('ai.insights' stands in here).
+    if (to === '/ai/insights' && settings?.['ai.insights'] !== true) return false;
     if (to === '/settings') return settingsReads.some((p) => has(perms, p));
     return has(perms, required);
   }).map(([to]) => to);
@@ -107,6 +110,8 @@ const SETTINGS_CASES: { name: string; settings: Settings }[] = [
     });
     return { name: FLAG_KEYS.map((k) => `${k}=${String(settings[k])}`).join(' '), settings };
   }),
+  // AI Insights are on: the AI Insights entry shows.
+  { name: 'AI Insights on', settings: { 'ai.insights': true } },
 ];
 
 const ALL = permissionCatalog.all();
@@ -142,6 +147,7 @@ function featuresFor(settings: Record<string, unknown>): Record<string, boolean>
     reservationEnabled: settings['reservation.enabled'] !== false,
     supportEnabled: settings['support.enabled'] !== false,
     fleetEnabled: settings['fleet.enabled'] !== false,
+    aiInsightsEnabled: settings['ai.insights'] === true,
   };
 }
 
@@ -156,7 +162,7 @@ async function renderLayout(
         : Promise.resolve(featuresFor(settings));
     }
     if (url === '/v1/portal/branding') return Promise.resolve(branding);
-    if (url === '/v1/support-cases/unread-count') return Promise.resolve({ count: 0 });
+    if (url === '/v1/support-cases/unassigned-count') return Promise.resolve({ count: 0 });
     return Promise.reject(new Error(`unexpected ${url}`));
   });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -177,10 +183,14 @@ async function renderLayout(
   return container;
 }
 
+beforeEach(() => {
+  useAuth.setState({ hasAllSiteAccess: true });
+});
+
 afterEach(() => {
   cleanup();
   getMock.mockReset();
-  useAuth.setState({ permissions: [] });
+  useAuth.setState({ permissions: [], hasAllSiteAccess: false });
 });
 
 describe('Layout navigation', () => {
@@ -231,5 +241,14 @@ describe('Layout navigation', () => {
       }
     }
     expect([...seen].sort()).toEqual(ALL_ROUTES.map(([to]) => to).sort());
+  });
+
+  it('hides the company-wide logs entry from a site-restricted user', async () => {
+    useAuth.setState({
+      permissions: ['dashboard:read', 'logs:read', 'audit:read'],
+      hasAllSiteAccess: false,
+    });
+    const container = await renderLayout({});
+    expect(navHrefs(container)).toEqual(['/', '/audit']);
   });
 });

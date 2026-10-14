@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, and, isNull, isNotNull } from 'drizzle-orm';
 import argon2 from 'argon2';
@@ -12,6 +12,8 @@ import {
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
   resolveAccountBilling,
+  writeAudit,
+  driverAuditLog,
 } from '@evtivity/database';
 import { drivers, userTokens } from '@evtivity/database';
 import {
@@ -38,6 +40,8 @@ import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { itemResponse, successResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { checkRecaptcha } from '../../lib/recaptcha-check.js';
+import { driverBillingAddressItem } from '../../lib/driver-billing-address-schema.js';
+import { driverBillingAddressColumns } from '../../services/driver-billing.service.js';
 import {
   isPhoneRegistrationLimited,
   registrationPhone,
@@ -52,6 +56,7 @@ import {
 } from '../../services/refresh-token.service.js';
 import { config as apiConfig } from '../../lib/config.js';
 import { driverBillingSchema, toDriverBilling } from '../../lib/portal-billing.js';
+import { recordAuthAudit } from '../../lib/auth-audit.js';
 import { activateDriverPortal } from '../../services/driver-portal-access.service.js';
 import {
   issueDriverSession,
@@ -97,6 +102,9 @@ const portalDriverMe = portalDriverItem
   .extend({
     billing: driverBillingSchema.describe(
       'How the driver pays a session they start: account (billed to a fleet, no payment method needed) or card. A free vend site bills nothing either way',
+    ),
+    billingAddress: driverBillingAddressItem.describe(
+      'The bill-to block of the invoices a fleet addresses to the driver (PATCH /v1/portal/driver/billing-address)',
     ),
   })
   .passthrough();
@@ -170,6 +178,34 @@ const driverSelect = {
   emailVerified: drivers.emailVerified,
   createdAt: drivers.createdAt,
 };
+
+/**
+ * Records a portal login refused by the active-account lookup on the driver the
+ * email names: an inactive driver, or one without portal access (no password).
+ * An unknown email writes no audit row; access_logs holds the request.
+ */
+async function recordRefusedDriverLogin(request: FastifyRequest, email: string): Promise<void> {
+  try {
+    const [existing] = await db
+      .select({
+        id: drivers.id,
+        isActive: drivers.isActive,
+      })
+      .from(drivers)
+      .where(emailEquals(drivers.email, email))
+      .limit(1);
+    if (existing == null) return;
+    await recordAuthAudit(request, {
+      kind: 'driver',
+      accountId: existing.id,
+      action: 'login_failed',
+      method: 'password',
+      reason: existing.isActive ? 'no_portal_access' : 'inactive',
+    });
+  } catch (err) {
+    request.log.warn({ err }, 'refused portal login audit failed');
+  }
+}
 
 export function portalAuthRoutes(app: FastifyInstance): void {
   app.post(
@@ -352,6 +388,20 @@ export function portalAuthRoutes(app: FastifyInstance): void {
           .send({ error: 'Failed to create driver', code: 'DRIVER_CREATE_FAILED' });
         return;
       }
+      await writeAudit(
+        { table: driverAuditLog, idColumn: 'driver_id' },
+        {
+          entityId: driver.id,
+          entityIdSnapshot: driver.id,
+          action: 'created',
+          actor: 'driver',
+          actorDriverId: driver.id,
+          after: driver,
+          notes: 'Registered in the driver portal',
+        },
+        db,
+        request.log,
+      );
       await issueDriverSession(app, request, reply, driver, { status: 201 });
 
       // Generate email verification token
@@ -451,12 +501,20 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         );
 
       if (driver == null || driver.passwordHash == null) {
+        await recordRefusedDriverLogin(request, email);
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
 
       const valid = await argon2.verify(driver.passwordHash, password);
       if (!valid) {
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'password',
+          reason: 'bad_password',
+        });
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
@@ -498,6 +556,14 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         };
       }
 
+      // Written before the session reply goes out, so the row exists when the
+      // client sees the login succeed.
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: driver.id,
+        action: 'login_succeeded',
+        method: 'password',
+      });
       await issueDriverSession(app, request, reply, {
         id: driver.id,
         firstName: driver.firstName,
@@ -645,16 +711,36 @@ export function portalAuthRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
 
-      const [driver] = await db.select(driverSelect).from(drivers).where(eq(drivers.id, driverId));
+      const [row] = await db
+        .select({ ...driverSelect, ...driverBillingAddressColumns })
+        .from(drivers)
+        .where(eq(drivers.id, driverId));
 
-      if (driver == null) {
+      if (row == null) {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
 
+      const {
+        billingName,
+        billingStreet,
+        billingCity,
+        billingState,
+        billingZip,
+        billingCountry,
+        ...driver
+      } = row;
       return {
         ...driver,
         billing: toDriverBilling(await resolveAccountBilling(client, driverId)),
+        billingAddress: {
+          billingName,
+          billingStreet,
+          billingCity,
+          billingState,
+          billingZip,
+          billingCountry,
+        },
       };
     },
   );
@@ -737,6 +823,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       // mfaToken JWT could complete and yield a real session for an
       // already-disabled account.
       if (!driver.isActive) {
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'inactive',
+        });
         await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
@@ -767,6 +860,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         if (challengeId != null) {
           recordMfaChallengeAttempt(challengeId);
         }
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'mfa_code_invalid',
+        });
         await reply
           .status(400)
           .send({ error: 'Invalid verification code', code: 'MFA_CODE_INVALID' });
@@ -778,6 +878,12 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         clearMfaChallengeAttempts(challengeId);
       }
 
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: driver.id,
+        action: 'login_succeeded',
+        method: 'mfa',
+      });
       await issueDriverSession(app, request, reply, {
         id: driver.id,
         firstName: driver.firstName,
@@ -1151,6 +1257,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       // the legitimate driver completes the reset.
       await revokeAllDriverRefreshTokens(tokenRow.driverId);
 
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: tokenRow.driverId,
+        action: 'password_reset',
+        method: 'reset_token',
+      });
+
       return { success: true };
     },
   );
@@ -1212,6 +1325,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         .update(drivers)
         .set({ emailVerified: true, updatedAt: new Date() })
         .where(eq(drivers.id, tokenRow.driverId));
+
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: tokenRow.driverId,
+        action: 'email_verified',
+        method: 'verification_token',
+      });
 
       await db
         .update(userTokens)

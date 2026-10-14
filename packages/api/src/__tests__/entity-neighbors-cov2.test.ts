@@ -5,14 +5,22 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
-const { state, inArrayMock, isNullMock, orMock, andMock, eqMock } = vi.hoisted(() => ({
-  state: { results: [] as unknown[][], index: 0, siteIds: null as string[] | null },
-  inArrayMock: vi.fn((col: unknown, values: unknown) => ({ inArray: [col, values] })),
-  isNullMock: vi.fn((col: unknown) => ({ isNull: col })),
-  orMock: vi.fn((...parts: unknown[]) => ({ or: parts })),
-  andMock: vi.fn((...parts: unknown[]) => ({ and: parts })),
-  eqMock: vi.fn((col: unknown, value: unknown) => ({ eq: [col, value] })),
-}));
+const { state, inArrayMock, isNullMock, orMock, andMock, eqMock, notInArrayMock } = vi.hoisted(
+  () => ({
+    state: {
+      results: [] as unknown[][],
+      index: 0,
+      siteIds: null as string[] | null,
+      reservationEnabled: true,
+    },
+    notInArrayMock: vi.fn((col: unknown, values: unknown) => ({ notInArray: [col, values] })),
+    inArrayMock: vi.fn((col: unknown, values: unknown) => ({ inArray: [col, values] })),
+    isNullMock: vi.fn((col: unknown) => ({ isNull: col })),
+    orMock: vi.fn((...parts: unknown[]) => ({ or: parts })),
+    andMock: vi.fn((...parts: unknown[]) => ({ and: parts })),
+    eqMock: vi.fn((col: unknown, value: unknown) => ({ eq: [col, value] })),
+  }),
+);
 
 function setupDbResults(...results: unknown[][]): void {
   state.results = results;
@@ -59,8 +67,23 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
+vi.mock('../lib/support-case-scope.js', () => ({
+  supportCaseSiteCondition: vi.fn((siteIds: string[]) => ({ supportCaseSiteCondition: siteIds })),
+}));
+
 vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn(() => Promise.resolve(state.siteIds)),
+  requireAllSiteAccess: vi.fn(
+    async (
+      _request: unknown,
+      reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+      notFound: unknown,
+    ) => {
+      if (state.siteIds == null) return true;
+      await reply.status(404).send(notFound);
+      return false;
+    },
+  ),
 }));
 
 vi.mock('@evtivity/database', () => {
@@ -86,11 +109,19 @@ vi.mock('@evtivity/database', () => {
     chargingProfileTemplates: fakeTable('charging_profile_templates'),
     firmwareCampaigns: fakeTable('firmware_campaigns'),
     octtRuns: fakeTable('octt_runs'),
+    aiInsights: {
+      ...fakeTable('ai_insights'),
+      siteId: { name: 'insight_site_id' },
+      kind: { name: 'insight_kind' },
+      status: { name: 'insight_status' },
+    },
+    isReservationEnabled: vi.fn(() => Promise.resolve(state.reservationEnabled)),
   };
 });
 
 vi.mock('drizzle-orm', () => ({
   eq: eqMock,
+  ne: vi.fn(() => ({})),
   and: andMock,
   or: orMock,
   sql: vi.fn(() => ({ sql: true })),
@@ -98,18 +129,22 @@ vi.mock('drizzle-orm', () => ({
   desc: vi.fn(() => ({})),
   inArray: inArrayMock,
   isNull: isNullMock,
+  notInArray: notInArrayMock,
 }));
 
 import { registerAuth } from '../plugins/auth.js';
 import { entityNeighborRoutes } from '../routes/entity-neighbors.js';
 import {
+  aiInsights,
   chargingSessions,
   chargingStations,
   invoices,
   reservations,
   sites,
-  supportCases,
 } from '@evtivity/database';
+import { INSIGHT_VISIBLE_STATUSES } from '@evtivity/lib/ai-insights';
+
+const visibleStatuses = { inArray: [aiInsights.status, [...INSIGHT_VISIBLE_STATUSES]] };
 
 describe('entity neighbor site scoping (cov2)', () => {
   let app: FastifyInstance;
@@ -130,7 +165,9 @@ describe('entity neighbor site scoping (cov2)', () => {
   beforeEach(() => {
     setupDbResults();
     state.siteIds = ['sit_a', 'sit_b'];
+    state.reservationEnabled = true;
     whereArgs.length = 0;
+    notInArrayMock.mockClear();
   });
 
   const get = (url: string) =>
@@ -143,6 +180,69 @@ describe('entity neighbor site scoping (cov2)', () => {
     );
   /** The scope condition the current-row query was filtered with. */
   const currentScope = (): unknown => mainWheres()[0]?.and[1];
+
+  it('pages AI insights with the list scope: the allowed sites only', async () => {
+    setupDbResults([{ id: 'ins_1' }], [{ id: 'ins_0' }], [{ id: 'ins_2' }]);
+    const res = await get('/ai/insights/ins_1/neighbors');
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ prevId: 'ins_0', nextId: 'ins_2' });
+    expect(currentScope()).toEqual({ inArray: [aiInsights.siteId, ['sit_a', 'sit_b']] });
+    expect(notInArrayMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves reservation insights out of the insight neighbors while reservations are off', async () => {
+    state.siteIds = null;
+    state.reservationEnabled = false;
+    setupDbResults([{ id: 'ins_1' }], [], []);
+    const res = await get('/ai/insights/ins_1/neighbors');
+    expect(res.statusCode).toBe(200);
+    const [col, kinds] = notInArrayMock.mock.calls.at(-1) ?? [];
+    expect(col).toBe(aiInsights.kind);
+    expect(kinds).toContain('reservation_no_show');
+    // The gate filters the siblings, with the visible statuses.
+    const gate = { notInArray: [aiInsights.kind, kinds] };
+    const siblings = { and: [{ and: [undefined, gate] }, visibleStatuses] };
+    expect(mainWheres()[1]?.and[1]).toEqual(siblings);
+    expect(mainWheres()[2]?.and[1]).toEqual(siblings);
+  });
+
+  it('skips internal statuses when paging insights, but finds the current row in any status', async () => {
+    setupDbResults([{ id: 'ins_analyzing' }], [{ id: 'ins_0' }], [{ id: 'ins_2' }]);
+    const res = await get('/ai/insights/ins_analyzing/neighbors');
+    expect(res.statusCode).toBe(200);
+    const scope = { inArray: [aiInsights.siteId, ['sit_a', 'sit_b']] };
+    // The current row: the site scope only.
+    expect(currentScope()).toEqual(scope);
+    // Prev and next: the scope and the visible statuses.
+    expect(mainWheres()[1]?.and[1]).toEqual({ and: [scope, visibleStatuses] });
+    expect(mainWheres()[2]?.and[1]).toEqual({ and: [scope, visibleStatuses] });
+  });
+
+  it('answers 404 for a reservation insight while reservations are off, like the detail route', async () => {
+    state.siteIds = ['sit_a'];
+    state.reservationEnabled = false;
+    // The gated current-row query finds no row.
+    setupDbResults([]);
+    const res = await get('/ai/insights/ins_rsv/neighbors');
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'Not found', code: 'AI_INSIGHT_NOT_FOUND' });
+    // The current-row query carries the site scope and the reservation gate.
+    expect(mainWheres()).toHaveLength(1);
+    expect(currentScope()).toEqual({
+      and: [
+        { inArray: [aiInsights.siteId, ['sit_a']] },
+        { notInArray: [aiInsights.kind, expect.arrayContaining(['reservation_no_show'])] },
+      ],
+    });
+  });
+
+  it('keeps the current-row query ungated while reservations are on', async () => {
+    state.siteIds = null;
+    setupDbResults([{ id: 'ins_rsv' }], [], []);
+    const res = await get('/ai/insights/ins_rsv/neighbors');
+    expect(res.statusCode).toBe(200);
+    expect(notInArrayMock).not.toHaveBeenCalled();
+  });
 
   it('limits sites to the allowed site ids', async () => {
     setupDbResults([{ id: 'sit_a' }], [{ id: 'sit_new' }], []);
@@ -176,41 +276,23 @@ describe('entity neighbor site scoping (cov2)', () => {
     expect(inArrayMock).toHaveBeenCalledWith(chargingStations.siteId, ['sit_a', 'sit_b']);
   });
 
-  it('keeps support cases without a station visible to restricted users', async () => {
+  it('pages support cases with the case list visibility (supportCaseSiteCondition)', async () => {
     setupDbResults([{ id: 'cas_1' }], [], []);
     const res = await get('/support-cases/cas_1/neighbors');
     expect(res.statusCode).toBe(200);
-    const scope = currentScope() as { or: Array<Record<string, unknown>> };
-    expect(scope.or[0]).toEqual({ isNull: supportCases.stationId });
-    expect((scope.or[1] as { inArray: unknown[] }).inArray[0]).toBe(supportCases.stationId);
+    expect(currentScope()).toEqual({ supportCaseSiteCondition: state.siteIds });
   });
 
-  it('skips fleet invoices for restricted users', async () => {
+  it.each([
+    ['assigned to some sites', ['sit_a']],
+    ['assigned to no site', []],
+  ])('404s every invoice for a restricted user %s', async (_label, ids) => {
+    state.siteIds = ids;
     setupDbResults([{ id: 'inv_1' }], [{ id: 'inv_0' }], [{ id: 'inv_2' }]);
     const res = await get('/invoices/inv_1/neighbors');
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ prevId: 'inv_0', nextId: 'inv_2' });
-    // The current, prev and next queries all leave fleet invoices out.
-    expect(mainWheres()).toHaveLength(3);
-    for (const where of mainWheres()) {
-      expect(where.and[1]).toEqual({ isNull: invoices.fleetId });
-    }
-  });
-
-  it('serves driver invoice neighbors to a restricted user with no site', async () => {
-    state.siteIds = [];
-    setupDbResults([{ id: 'inv_1' }], [], [{ id: 'inv_2' }]);
-    const res = await get('/invoices/inv_1/neighbors');
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ prevId: null, nextId: 'inv_2' });
-    expect(currentScope()).toEqual({ isNull: invoices.fleetId });
-  });
-
-  it('404s a fleet invoice for a restricted user as a missing invoice', async () => {
-    setupDbResults([]);
-    const res = await get('/invoices/inv_fleet/neighbors');
     expect(res.statusCode).toBe(404);
     expect(res.json()).toEqual({ error: 'Not found', code: 'INVOICE_NOT_FOUND' });
+    expect(mainWheres()).toHaveLength(0);
   });
 
   it('does not scope invoices for unrestricted users', async () => {

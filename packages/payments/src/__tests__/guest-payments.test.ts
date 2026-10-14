@@ -205,9 +205,12 @@ function chargedSession(finalCostCents: number | null): Record<string, unknown> 
 
 function receiptSession(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    transactionId: 'tx-guest',
     energyDeliveredWh: '12000',
     finalCostCents: 800,
-    tariffTaxRate: null,
+    netCents: 800,
+    taxCents: 0,
+    costBreakdown: null,
     currency: 'EUR',
     startedAt: '2026-01-01T10:00:00Z',
     endedAt: '2026-01-01T10:30:00Z',
@@ -270,14 +273,17 @@ describe('handleGuestSessionEvent: TransactionStarted', () => {
     expect(m.updates[0]?.table).toEqual(guestTable());
     expect(m.updates[0]?.values).toMatchObject({ chargingSessionId: 'ses_1', status: 'charging' });
     expect(m.holdTerms).toHaveBeenCalledWith(deps, 'site_1');
-    expect(m.recordGuestHold).toHaveBeenCalledWith({
-      sessionId: 'ses_1',
-      sitePaymentConfigId: 3,
-      provider: 'stripe',
-      paymentId: 'pi_1',
-      currency: 'GBP',
-      preAuthAmountCents: 5000,
-    });
+    expect(m.recordGuestHold).toHaveBeenCalledWith(
+      {
+        sessionId: 'ses_1',
+        sitePaymentConfigId: 3,
+        provider: 'stripe',
+        paymentId: 'pi_1',
+        currency: 'GBP',
+        preAuthAmountCents: 5000,
+      },
+      deps,
+    );
     expect(m.getCompanyCurrency).not.toHaveBeenCalled();
     expect(logger.info).toHaveBeenCalledWith(
       { guestSessionId: 21, chargingSessionId: 'ses_1' },
@@ -308,6 +314,7 @@ describe('handleGuestSessionEvent: TransactionStarted', () => {
     expect(m.holdTerms).toHaveBeenCalledWith(deps, null);
     expect(m.recordGuestHold).toHaveBeenCalledWith(
       expect.objectContaining({ currency: 'EUR', preAuthAmountCents: null }),
+      deps,
     );
   });
 
@@ -393,8 +400,12 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
     });
     expect(m.markCancelled).toHaveBeenCalledWith(
       11,
-      null,
-      'Capture below the provider minimum charge (50c EUR); 22c not collectable, hold released',
+      {
+        pendingRef: null,
+        failureReason:
+          'Capture below the provider minimum charge (50c EUR); 22c not collectable, hold released',
+      },
+      deps,
     );
     expect(m.markHoldFailed).not.toHaveBeenCalled();
     expect(m.updates.at(-1)?.values).toMatchObject({ status: 'completed' });
@@ -430,11 +441,15 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
       idempotencyKey: 'capture_pi_1',
     });
     expect(m.getPlatformFeePercent).toHaveBeenCalledWith('site_1');
-    expect(m.markCaptured).toHaveBeenCalledWith(11, {
-      capturedCents: 800,
-      failureReason: null,
-      pendingRef: null,
-    });
+    expect(m.markCaptured).toHaveBeenCalledWith(
+      11,
+      {
+        capturedCents: 800,
+        failureReason: null,
+        pendingRef: null,
+      },
+      deps,
+    );
     expect(guestUpdates().at(-1)?.values).toMatchObject({ status: 'completed' });
     expect(receiptClaims()).toHaveLength(1);
     expect(m.dispatchSystemNotification).toHaveBeenCalledWith(
@@ -444,9 +459,11 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
       expect.objectContaining({
         stationId: 'CS-1',
         energyDeliveredWh: 12000,
+        transactionId: 'tx-guest',
         finalCostCents: 800,
         currency: 'EUR',
         costIncludesTax: false,
+        partiallyPaid: false,
         durationMinutes: 30,
         startedAt: '2026-01-01T10:00:00.000Z',
         endedAt: '2026-01-01T10:30:00.000Z',
@@ -455,9 +472,18 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
     );
   });
 
-  it('captures at most the hold and records the uncollected rest as a guest shortfall', async () => {
-    m.findSessionRecord.mockResolvedValue(record({ preAuthAmountCents: 5000 }));
-    m.selectQueue.push([finalizeGuest()], [chargedSession(6000)], [receiptSession()]);
+  it('captures at most the hold and records the uncollected rest as a guest shortfall (TC-T3-33)', async () => {
+    m.findSessionRecord
+      .mockResolvedValueOnce(record({ preAuthAmountCents: 5000 }))
+      // The receipt reads the record as the capture left it.
+      .mockResolvedValueOnce(
+        record({ preAuthAmountCents: 5000, status: 'captured', capturedAmountCents: 5000 }),
+      );
+    m.selectQueue.push(
+      [finalizeGuest()],
+      [chargedSession(6000)],
+      [receiptSession({ finalCostCents: 6000, netCents: 5042, taxCents: 958 })],
+    );
 
     await end();
 
@@ -472,6 +498,20 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ finalCost: 6000, holdCents: 5000, shortfallCents: 1000 }),
       'Guest session cost exceeds the hold; captured the hold, shortfall uncollected',
+    );
+    expect(m.dispatchSystemNotification).toHaveBeenCalledWith(
+      expect.anything(),
+      'session.Receipt',
+      { email: 'guest@example.com' },
+      expect.objectContaining({
+        finalCostCents: 6000,
+        costIncludesTax: true,
+        taxCents: 958,
+        partiallyPaid: true,
+        chargedCents: 5000,
+        unpaidCents: 1000,
+      }),
+      ['/templates'],
     );
   });
 
@@ -499,11 +539,15 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
     await end();
 
     expect(provider.capture).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 265 }));
-    expect(m.markCaptured).toHaveBeenCalledWith(11, {
-      capturedCents: 265,
-      failureReason: null,
-      pendingRef: null,
-    });
+    expect(m.markCaptured).toHaveBeenCalledWith(
+      11,
+      {
+        capturedCents: 265,
+        failureReason: null,
+        pendingRef: null,
+      },
+      deps,
+    );
     expect(logger.info).toHaveBeenCalledWith(
       expect.objectContaining({ amountCents: 265, pricedCents: 266 }),
       'Captured guest payment at the hold; the tariff price above it was not billed',
@@ -517,11 +561,15 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
     await end();
 
     expect(provider.capture).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 9000 }));
-    expect(m.markCaptured).toHaveBeenCalledWith(11, {
-      capturedCents: 9000,
-      failureReason: null,
-      pendingRef: null,
-    });
+    expect(m.markCaptured).toHaveBeenCalledWith(
+      11,
+      {
+        capturedCents: 9000,
+        failureReason: null,
+        pendingRef: null,
+      },
+      deps,
+    );
   });
 
   it('cancels the hold at a cost of 0', async () => {
@@ -536,7 +584,7 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
       merchantReference: 'sess_ses_1',
       idempotencyKey: 'cancel_pi_1',
     });
-    expect(m.markCancelled).toHaveBeenCalledWith(11, null);
+    expect(m.markCancelled).toHaveBeenCalledWith(11, { pendingRef: null }, deps);
     expect(guestUpdates().at(-1)?.values).toMatchObject({ status: 'completed' });
   });
 
@@ -549,11 +597,15 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
 
     await end();
 
-    expect(m.markCaptured).toHaveBeenCalledWith(11, {
-      capturedCents: 800,
-      failureReason: null,
-      pendingRef: 'op_1',
-    });
+    expect(m.markCaptured).toHaveBeenCalledWith(
+      11,
+      {
+        capturedCents: 800,
+        failureReason: null,
+        pendingRef: 'op_1',
+      },
+      deps,
+    );
     expect(guestUpdates().at(-1)?.values).toMatchObject({ status: 'completed' });
     expect(receiptClaims()).toHaveLength(0);
     expect(m.dispatchSystemNotification).not.toHaveBeenCalled();
@@ -755,7 +807,7 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
 
     await end();
 
-    expect(m.markHoldFailed).toHaveBeenCalledWith(11, 'Card declined');
+    expect(m.markHoldFailed).toHaveBeenCalledWith(11, 'Card declined', deps);
     expect(m.markCaptured).not.toHaveBeenCalled();
     expect(m.updates).toHaveLength(1);
     expect(m.updates[0]?.table).toEqual(guestTable());
@@ -812,7 +864,8 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
         receiptSession({
           energyDeliveredWh: null,
           finalCostCents: 1190,
-          tariffTaxRate: '0.19',
+          netCents: 1000,
+          taxCents: 190,
           startedAt: null,
           endedAt: null,
         }),
@@ -825,10 +878,12 @@ describe('handleGuestSessionEvent: TransactionEnded', () => {
       expect.anything(),
       'session.Receipt',
       expect.anything(),
+      // TC-T3-33: the label comes from the stored tax.
       expect.objectContaining({
         energyDeliveredWh: 0,
         finalCostCents: 1190,
         costIncludesTax: true,
+        taxCents: 190,
         durationMinutes: 0,
       }),
       ['/templates'],
@@ -1131,6 +1186,7 @@ describe('failExhaustedGuestCapture', () => {
     expect(m.markHoldFailed).toHaveBeenCalledWith(
       11,
       'Capture worker exhausted retries: capture failed',
+      deps,
     );
     expect(provider.cancelHold).toHaveBeenCalledWith({
       paymentId: 'pi_1',
@@ -1439,16 +1495,20 @@ describe('guest 3DS round trip (P10a)', () => {
     registry.getPaymentProvider.mockResolvedValue(provider);
     m.selectQueue.push([finalizeGuest()], [chargedSession(800)], [receiptSession()]);
     await handleGuestSessionEvent({ type: 'TransactionEnded', sessionId: 'ses_1' }, deps);
-    expect(m.markCaptured).toHaveBeenCalledWith(11, {
-      capturedCents: 800,
-      failureReason: null,
-      pendingRef: 'CAP1',
-    });
+    expect(m.markCaptured).toHaveBeenCalledWith(
+      11,
+      {
+        capturedCents: 800,
+        failureReason: null,
+        pendingRef: 'CAP1',
+      },
+      deps,
+    );
 
     provider.cancelHold.mockResolvedValue({ state: 'pending', operationRef: 'CXL1' });
     m.selectQueue.push([finalizeGuest()], [chargedSession(0)], [receiptSession()]);
     await handleGuestSessionEvent({ type: 'TransactionEnded', sessionId: 'ses_1' }, deps);
-    expect(m.markCancelled).toHaveBeenCalledWith(11, 'CXL1');
+    expect(m.markCancelled).toHaveBeenCalledWith(11, { pendingRef: 'CXL1' }, deps);
   });
 });
 

@@ -109,6 +109,7 @@ export async function registerOpenApi(app: FastifyInstance): Promise<void> {
         { name: 'Portal Driver', description: 'Driver portal profile management' },
         { name: 'Portal Sessions', description: 'Driver portal session history' },
         { name: 'Portal Payments', description: 'Driver portal payment methods' },
+        { name: 'Portal Invoices', description: "Driver portal: the driver's own invoices" },
         { name: 'Portal Guest', description: 'Guest checkout flow' },
         { name: 'Portal Support', description: 'Driver portal support cases' },
         { name: 'Portal Roaming', description: 'Driver portal roaming charger search' },
@@ -117,7 +118,16 @@ export async function registerOpenApi(app: FastifyInstance): Promise<void> {
         { name: 'Portal Notifications', description: 'Driver portal notification history' },
         { name: 'Portal Access Logs', description: 'Driver portal access logs' },
         { name: 'API Keys', description: 'API key management' },
-        { name: 'AI Assistant', description: 'AI-powered operator assistant' },
+        {
+          name: 'AI Assistant',
+          description:
+            'AI-powered operator assistant. The conversation routes accept an API key with the aiAssistant scope as well as a session; confirming a proposed action needs a signed-in session (403 AI_CONFIRMATION_REQUIRES_SESSION for an API key).',
+        },
+        {
+          name: 'MCP',
+          description:
+            'Model Context Protocol server for AI agents, authenticated with an API key (aiMcp:read scope)',
+        },
         { name: 'CSS Management', description: 'Charging station simulator management' },
         { name: 'OCTT', description: 'OCPP conformance test runner' },
         {

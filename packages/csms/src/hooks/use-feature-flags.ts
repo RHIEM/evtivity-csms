@@ -11,6 +11,12 @@ export interface NavFeatureFlags {
   reservationEnabled: boolean;
   supportEnabled: boolean;
   fleetEnabled: boolean;
+  /**
+   * AI Insights are on (`opsAi.enabled` and an insight kind or a background
+   * worker job): the nav entry with its pending action count and the
+   * dashboard Active insights card.
+   */
+  aiInsightsEnabled: boolean;
 }
 
 /** Every flag of `GET /v1/portal/features` the CSMS reads. */
@@ -31,7 +37,7 @@ type FeaturesResponse = Partial<Record<keyof FeatureFlags, unknown>>;
 
 /**
  * The flags from `GET /v1/portal/features`. Until it answers (or when it
- * fails), roaming, Plug and Charge and the AI assistant count as off and the
+ * fails), roaming, Plug and Charge, the AI assistant and AI insights count as off and the
  * others as on.
  */
 export function resolveFeatureFlags(features: FeaturesResponse | undefined): FeatureFlags {
@@ -43,6 +49,7 @@ export function resolveFeatureFlags(features: FeaturesResponse | undefined): Fea
     fleetEnabled: features?.fleetEnabled !== false,
     guestChargingEnabled: features?.guestChargingEnabled !== false,
     chatbotAiEnabled: features?.chatbotAiEnabled === true,
+    aiInsightsEnabled: features?.aiInsightsEnabled === true,
   };
 }
 

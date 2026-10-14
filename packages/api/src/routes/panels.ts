@@ -10,6 +10,15 @@ import { itemResponse, arrayResponse, errorWith } from '../lib/response-schemas.
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
+import { siteInScope } from '../lib/site-scope.js';
+import { changedFields } from '../lib/audit-diff.js';
+import { writeSiteLoadManagementAudit } from '../lib/load-management-audit.js';
+import {
+  PANEL_VOLTAGES,
+  circuitConductorPhases,
+  computeMaxContinuousKw,
+  isPanelVoltageAllowed,
+} from '@evtivity/lib';
 
 // --- Schemas ---
 
@@ -29,8 +38,8 @@ const createPanelBody = z.object({
   voltageV: z
     .number()
     .int()
-    .refine((v) => [120, 208, 240, 277, 480].includes(v), {
-      message: 'Voltage must be one of: 120, 208, 240, 277, 480',
+    .refine((v) => (PANEL_VOLTAGES as readonly number[]).includes(v), {
+      message: `Voltage must be one of: ${PANEL_VOLTAGES.join(', ')}`,
     }),
   phases: z
     .number()
@@ -43,12 +52,12 @@ const createPanelBody = z.object({
 
 const updatePanelBody = z.object({
   name: z.string().min(1).max(255).optional(),
-  breakerRatingAmps: z.number().int().min(1).optional(),
+  breakerRatingAmps: z.number().int().min(1).max(10000).optional(),
   voltageV: z
     .number()
     .int()
-    .refine((v) => [120, 208, 240, 277, 480].includes(v), {
-      message: 'Voltage must be one of: 120, 208, 240, 277, 480',
+    .refine((v) => (PANEL_VOLTAGES as readonly number[]).includes(v), {
+      message: `Voltage must be one of: ${PANEL_VOLTAGES.join(', ')}`,
     })
     .optional(),
   phases: z
@@ -56,9 +65,9 @@ const updatePanelBody = z.object({
     .int()
     .refine((v) => [1, 3].includes(v), { message: 'Phases must be 1 or 3' })
     .optional(),
-  safetyMarginKw: z.number().min(0).optional(),
+  safetyMarginKw: z.number().min(0).max(10000).optional(),
   oversubscriptionRatio: z.number().min(1.0).max(3.0).optional(),
-  sortOrder: z.number().int().min(0).optional(),
+  sortOrder: z.number().int().min(0).max(10000).optional(),
 });
 
 const panelItem = z
@@ -157,13 +166,11 @@ const panelDetailItem = z
 
 // --- Helpers ---
 
-function computeMaxContinuousKw(
-  breakerRatingAmps: number,
-  voltageV: number,
-  phases: number,
-): number {
-  return (breakerRatingAmps * voltageV * phases * 0.8) / 1000;
-}
+const THREE_PHASE_VOLTAGE_ERROR = {
+  error:
+    'A three-phase panel takes its phase to neutral voltage (120 for 208Y/120, 277 for 480Y/277)',
+  code: 'VALIDATION_ERROR',
+} as const;
 
 // --- Routes ---
 
@@ -194,7 +201,7 @@ export function panelRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -211,6 +218,11 @@ export function panelRoutes(app: FastifyInstance): void {
             .send({ error: 'Parent panel not found in this site', code: 'INVALID_PARENT_PANEL' });
           return;
         }
+      }
+
+      if (!isPanelVoltageAllowed(body.voltageV, body.phases)) {
+        await reply.status(400).send(THREE_PHASE_VOLTAGE_ERROR);
+        return;
       }
 
       const maxContinuousKw = computeMaxContinuousKw(
@@ -240,6 +252,12 @@ export function panelRoutes(app: FastifyInstance): void {
         return;
       }
 
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: null,
+        after: { panel: created },
+        notes: `panel created: ${created.name}`,
+      });
+
       return reply.status(201).send({
         ...created,
         breakerRatingAmps: created.breakerRatingAmps,
@@ -266,16 +284,18 @@ export function panelRoutes(app: FastifyInstance): void {
         params: zodSchema(siteIdParam),
         response: {
           200: arrayResponse(panelItem),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
         },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { siteId } = request.params as z.infer<typeof siteIdParam>;
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
-        return [];
+      if (!siteInScope(siteIds, siteId)) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
       }
 
       const rows = await db
@@ -293,7 +313,9 @@ export function panelRoutes(app: FastifyInstance): void {
           sortOrder: panels.sortOrder,
           createdAt: panels.createdAt,
           updatedAt: panels.updatedAt,
-          circuitCount: sql<number>`(SELECT count(*)::int FROM circuits WHERE circuits.panel_id = ${panels.id})`,
+          // "panels"."id" written out: a single-table select renders the
+          // column unqualified, which inside the subquery names circuits.id.
+          circuitCount: sql<number>`(SELECT count(*)::int FROM circuits WHERE circuits.panel_id = "panels"."id")`,
         })
         .from(panels)
         .where(eq(panels.siteId, siteId))
@@ -330,7 +352,7 @@ export function panelRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Panel not found', code: 'PANEL_NOT_FOUND' });
         return;
       }
@@ -356,7 +378,10 @@ export function panelRoutes(app: FastifyInstance): void {
           sortOrder: circuits.sortOrder,
           createdAt: circuits.createdAt,
           updatedAt: circuits.updatedAt,
-          stationCount: sql<number>`(SELECT count(*)::int FROM charging_stations WHERE charging_stations.circuit_id = ${circuits.id})`,
+          // "circuits"."id" written out: a single-table select renders
+          // the circuits.id column unqualified, which inside the subquery would
+          // name charging_stations.id.
+          stationCount: sql<number>`(SELECT count(*)::int FROM charging_stations WHERE charging_stations.circuit_id = "circuits"."id" AND charging_stations.site_id = ${siteId})`,
         })
         .from(circuits)
         .where(eq(circuits.panelId, panelId))
@@ -398,6 +423,7 @@ export function panelRoutes(app: FastifyInstance): void {
         body: zodSchema(updatePanelBody),
         response: {
           200: itemResponse(panelItem),
+          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Panel not found', [ERROR_CODES.PANEL_NOT_FOUND]),
         },
       },
@@ -408,7 +434,7 @@ export function panelRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Panel not found', code: 'PANEL_NOT_FOUND' });
         return;
       }
@@ -426,6 +452,11 @@ export function panelRoutes(app: FastifyInstance): void {
       const newBreaker = body.breakerRatingAmps ?? existing.breakerRatingAmps;
       const newVoltage = body.voltageV ?? existing.voltageV;
       const newPhases = body.phases ?? existing.phases;
+
+      if (!isPanelVoltageAllowed(newVoltage, newPhases)) {
+        await reply.status(400).send(THREE_PHASE_VOLTAGE_ERROR);
+        return;
+      }
 
       const voltageOrPhasesChanged =
         body.voltageV != null || body.phases != null || body.breakerRatingAmps != null;
@@ -461,7 +492,7 @@ export function panelRoutes(app: FastifyInstance): void {
           const circuitMaxKw = computeMaxContinuousKw(
             circuit.breakerRatingAmps,
             newVoltage,
-            newPhases,
+            circuitConductorPhases(circuit.phaseConnections, newPhases),
           );
           await db
             .update(circuits)
@@ -469,6 +500,13 @@ export function panelRoutes(app: FastifyInstance): void {
             .where(eq(circuits.id, circuit.id));
         }
       }
+
+      const change = changedFields(existing, updated);
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: { panelId, ...change.before },
+        after: { panelId, ...change.after },
+        notes: `panel updated: ${updated.name}`,
+      });
 
       const circuitCount = await db
         .select({ count: sql<number>`count(*)::int` })
@@ -507,13 +545,13 @@ export function panelRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Panel not found', code: 'PANEL_NOT_FOUND' });
         return;
       }
 
       const [existing] = await db
-        .select({ id: panels.id })
+        .select()
         .from(panels)
         .where(and(eq(panels.id, panelId), eq(panels.siteId, siteId)));
 
@@ -532,11 +570,19 @@ export function panelRoutes(app: FastifyInstance): void {
         await db
           .update(chargingStations)
           .set({ circuitId: null, updatedAt: new Date() })
-          .where(eq(chargingStations.circuitId, circuit.id));
+          .where(
+            and(eq(chargingStations.circuitId, circuit.id), eq(chargingStations.siteId, siteId)),
+          );
       }
 
       // Delete the panel (cascades to circuits and unmanaged loads)
       await db.delete(panels).where(eq(panels.id, panelId));
+
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: { panel: existing, circuitIds: panelCircuits.map((c) => c.id) },
+        after: null,
+        notes: `panel deleted: ${existing.name}`,
+      });
 
       return { success: true as const };
     },

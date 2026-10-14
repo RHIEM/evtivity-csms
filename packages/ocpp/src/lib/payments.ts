@@ -4,22 +4,23 @@
 import { createLogger } from '@evtivity/lib';
 import {
   createPaymentRegistry,
+  PAYMENT_SYSTEM_ACTOR,
   deferredSimulatedSink,
-  pubsubSimulatedSink,
   resolveActiveProvider,
 } from '@evtivity/payments';
 import type {
+  PaymentActor,
   PaymentContext,
   PaymentLogger,
   PaymentProvider,
-  PaymentWebhookPublisher,
+  SimulatedEventSink,
 } from '@evtivity/payments';
 import { config } from './config.js';
 
 /**
- * Simulated provider events (the dispute card) go to the worker over the
- * `payment_webhook_deliveries` channel. The pub/sub client exists only after
- * startup, so the sink is connected by setPaymentPubSub.
+ * Simulated provider events (the dispute card) are added to the worker's
+ * `payment-webhooks` queue. The job queues exist only after startup, so the
+ * sink is connected by setSimulatedEventSink.
  */
 const simulatedEvents = deferredSimulatedSink();
 
@@ -34,8 +35,13 @@ export const paymentRegistry = createPaymentRegistry({
   simulated: { events: simulatedEvents, logger: createLogger('payments') },
 });
 
-export function paymentContext(logger: PaymentLogger): PaymentContext {
-  return { registry: paymentRegistry, logger };
+/**
+ * The payment context of one caller. `actor` is who the audit rows of the
+ * payment writes name: `ocpp` with the message or step for a station's
+ * message, `system` with the reason for a CSMS decision.
+ */
+export function paymentContext(logger: PaymentLogger, actor: PaymentActor): PaymentContext {
+  return { registry: paymentRegistry, logger, actor };
 }
 
 /**
@@ -43,10 +49,11 @@ export function paymentContext(logger: PaymentLogger): PaymentContext {
  * or the selected provider is not usable here (resolveActiveProvider).
  */
 export function activePaymentProvider(logger: PaymentLogger): Promise<PaymentProvider | null> {
-  return resolveActiveProvider(paymentContext(logger));
+  // A read: resolving the provider writes nothing.
+  return resolveActiveProvider(paymentContext(logger, PAYMENT_SYSTEM_ACTOR));
 }
 
-/** Connects the simulated provider's events to pub/sub at startup; null at shutdown. */
-export function setPaymentPubSub(pubsub: PaymentWebhookPublisher | null): void {
-  simulatedEvents.bind(pubsub == null ? null : pubsubSimulatedSink(pubsub));
+/** Connects the simulated provider's events at startup (queueSimulatedSink); null at shutdown. */
+export function setSimulatedEventSink(sink: SimulatedEventSink | null): void {
+  simulatedEvents.bind(sink);
 }

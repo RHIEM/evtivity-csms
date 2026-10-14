@@ -12,8 +12,36 @@
 export const ERROR_CODES = {
   ACCOUNT_DEACTIVATED: 'ACCOUNT_DEACTIVATED',
   ACCOUNT_DISABLED: 'ACCOUNT_DISABLED',
+  AI_ACTION_EXPIRED: 'AI_ACTION_EXPIRED',
+  AI_ACTION_INVALID: 'AI_ACTION_INVALID',
+  AI_ACTION_NOT_FOUND: 'AI_ACTION_NOT_FOUND',
+  AI_ATTACHMENT_REJECTED: 'AI_ATTACHMENT_REJECTED',
+  AI_ATTACHMENT_TOO_LARGE: 'AI_ATTACHMENT_TOO_LARGE',
+  AI_ATTACHMENT_TYPE_NOT_ALLOWED: 'AI_ATTACHMENT_TYPE_NOT_ALLOWED',
+  AI_ATTACHMENT_UNSUPPORTED: 'AI_ATTACHMENT_UNSUPPORTED',
+  AI_BASE_URL_INVALID: 'AI_BASE_URL_INVALID',
+  AI_BUDGET_EXCEEDED: 'AI_BUDGET_EXCEEDED',
+  AI_CONFIRMATION_REQUIRES_SESSION: 'AI_CONFIRMATION_REQUIRES_SESSION',
+  AI_CONTEXT_NOT_FOUND: 'AI_CONTEXT_NOT_FOUND',
+  AI_CONVERSATION_BUSY: 'AI_CONVERSATION_BUSY',
+  AI_CONVERSATION_NOT_FOUND: 'AI_CONVERSATION_NOT_FOUND',
   AI_ERROR: 'AI_ERROR',
+  AI_INSIGHT_COOLDOWN: 'AI_INSIGHT_COOLDOWN',
+  AI_INSIGHT_NOT_FOUND: 'AI_INSIGHT_NOT_FOUND',
+  AI_INSIGHTS_DISABLED: 'AI_INSIGHTS_DISABLED',
+  AI_MCP_RATE_LIMITED: 'AI_MCP_RATE_LIMITED',
+  AI_MODEL_UNAVAILABLE: 'AI_MODEL_UNAVAILABLE',
+  AI_MONTHLY_BUDGET_EXCEEDED: 'AI_MONTHLY_BUDGET_EXCEEDED',
   AI_NOT_CONFIGURED: 'AI_NOT_CONFIGURED',
+  AI_PROPOSAL_ALREADY_DECIDED: 'AI_PROPOSAL_ALREADY_DECIDED',
+  AI_PROPOSAL_EXPIRED: 'AI_PROPOSAL_EXPIRED',
+  AI_PROPOSAL_NOT_FOUND: 'AI_PROPOSAL_NOT_FOUND',
+  AI_PROPOSAL_STALE: 'AI_PROPOSAL_STALE',
+  AI_PROVIDER_AUTH_FAILED: 'AI_PROVIDER_AUTH_FAILED',
+  AI_PROVIDER_RATE_LIMITED: 'AI_PROVIDER_RATE_LIMITED',
+  AI_PROVIDER_UNAVAILABLE: 'AI_PROVIDER_UNAVAILABLE',
+  AI_RATE_LIMITED: 'AI_RATE_LIMITED',
+  AI_SITE_BUDGET_EXCEEDED: 'AI_SITE_BUDGET_EXCEEDED',
   ALERT_NOT_FOUND: 'ALERT_NOT_FOUND',
   ALREADY_FAVORITED: 'ALREADY_FAVORITED',
   ALREADY_VERIFIED: 'ALREADY_VERIFIED',
@@ -24,9 +52,11 @@ export const ERROR_CODES = {
   ATTESTATION_FAILED: 'ATTESTATION_FAILED',
   AUDIT_ENTITY_TYPE_INVALID: 'AUDIT_ENTITY_TYPE_INVALID',
   CA_CERT_NOT_FOUND: 'CA_CERT_NOT_FOUND',
+  CAMPAIGN_NOT_ACTIVE: 'CAMPAIGN_NOT_ACTIVE',
   CAMPAIGN_NOT_FOUND: 'CAMPAIGN_NOT_FOUND',
   CASE_NOT_FOUND: 'CASE_NOT_FOUND',
   CDR_NOT_FOUND: 'CDR_NOT_FOUND',
+  CHARGING_PROFILE_ID_RESERVED: 'CHARGING_PROFILE_ID_RESERVED',
   CIRCUIT_NOT_FOUND: 'CIRCUIT_NOT_FOUND',
   COMMAND_ERROR: 'COMMAND_ERROR',
   COMMAND_FAILED: 'COMMAND_FAILED',
@@ -43,10 +73,12 @@ export const ERROR_CODES = {
   CSS_ACTION_REJECTED: 'CSS_ACTION_REJECTED',
   CSS_ACTION_TIMEOUT: 'CSS_ACTION_TIMEOUT',
   DOWNTIME_NOT_FOUND: 'DOWNTIME_NOT_FOUND',
+  DRIVER_AI_NOTICE_OUTDATED: 'DRIVER_AI_NOTICE_OUTDATED',
   DRIVER_ALREADY_IN_FLEET: 'DRIVER_ALREADY_IN_FLEET',
   DRIVER_CREATE_FAILED: 'DRIVER_CREATE_FAILED',
   DRIVER_INACTIVE: 'DRIVER_INACTIVE',
   DRIVER_NOT_FOUND: 'DRIVER_NOT_FOUND',
+  DUPLICATE_ALERT_RULE: 'DUPLICATE_ALERT_RULE',
   DUPLICATE_API_KEY_NAME: 'DUPLICATE_API_KEY_NAME',
   DUPLICATE_CONNECTOR_ID: 'DUPLICATE_CONNECTOR_ID',
   DUPLICATE_EMAIL: 'DUPLICATE_EMAIL',
@@ -68,9 +100,11 @@ export const ERROR_CODES = {
   FAVORITE_NOT_FOUND: 'FAVORITE_NOT_FOUND',
   FLEET_BILLING_CONTACT_REQUIRED: 'FLEET_BILLING_CONTACT_REQUIRED',
   FLEET_BILLING_OLD_PODS_CONNECTED: 'FLEET_BILLING_OLD_PODS_CONNECTED',
+  FLEET_BILLING_VERSION_CHECK_STALE: 'FLEET_BILLING_VERSION_CHECK_STALE',
   FLEET_CREDIT_LIMIT_REACHED: 'FLEET_CREDIT_LIMIT_REACHED',
   FLEET_DISABLED: 'FLEET_DISABLED',
   FLEET_HAS_OPEN_BILLING: 'FLEET_HAS_OPEN_BILLING',
+  FLEET_HAS_RESERVATIONS: 'FLEET_HAS_RESERVATIONS',
   FLEET_INVOICE_NOTHING_TO_BILL: 'FLEET_INVOICE_NOTHING_TO_BILL',
   FLEET_INVOICE_PERIOD_EXISTS: 'FLEET_INVOICE_PERIOD_EXISTS',
   FLEET_NOT_FOUND: 'FLEET_NOT_FOUND',
@@ -103,6 +137,7 @@ export const ERROR_CODES = {
   INVOICE_CREATION_FAILED: 'INVOICE_CREATION_FAILED',
   INVOICE_IS_CREDIT_NOTE: 'INVOICE_IS_CREDIT_NOTE',
   INVOICE_NO_DRIVER: 'INVOICE_NO_DRIVER',
+  INVOICE_NO_DRIVER_EMAIL: 'INVOICE_NO_DRIVER_EMAIL',
   INVOICE_NO_SESSIONS: 'INVOICE_NO_SESSIONS',
   INVOICE_NOT_FOUND: 'INVOICE_NOT_FOUND',
   INVOICE_NOT_ISSUED: 'INVOICE_NOT_ISSUED',
@@ -189,6 +224,7 @@ export const ERROR_CODES = {
   PORTAL_REGISTRATION_DISABLED: 'PORTAL_REGISTRATION_DISABLED',
   PRE_AUTH_FAILED: 'PRE_AUTH_FAILED',
   PRICING_ASSIGNMENT_NOT_FOUND: 'PRICING_ASSIGNMENT_NOT_FOUND',
+  PRICING_GROUP_DEFAULT_EXISTS: 'PRICING_GROUP_DEFAULT_EXISTS',
   PRICING_GROUP_NOT_FOUND: 'PRICING_GROUP_NOT_FOUND',
   PRICING_GROUP_TARIFFS_IN_USE: 'PRICING_GROUP_TARIFFS_IN_USE',
   PRICING_NOT_FOUND: 'PRICING_NOT_FOUND',
@@ -245,6 +281,7 @@ export const ERROR_CODES = {
   START_REJECTED: 'START_REJECTED',
   STATION_ALREADY_AVAILABLE: 'STATION_ALREADY_AVAILABLE',
   STATION_ALREADY_IN_FLEET: 'STATION_ALREADY_IN_FLEET',
+  STATION_CREDENTIALS_ROUTE_REQUIRED: 'STATION_CREDENTIALS_ROUTE_REQUIRED',
   STATION_ID_EXISTS: 'STATION_ID_EXISTS',
   STATION_NOT_FOUND: 'STATION_NOT_FOUND',
   STATION_OFFLINE: 'STATION_OFFLINE',
@@ -259,8 +296,10 @@ export const ERROR_CODES = {
   STORAGE_CONNECTION_FAILED: 'STORAGE_CONNECTION_FAILED',
   STORAGE_NOT_CONFIGURED: 'STORAGE_NOT_CONFIGURED',
   SUPPORT_AI_NOT_CONFIGURED: 'SUPPORT_AI_NOT_CONFIGURED',
+  SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK: 'SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK',
   SUPPORT_CASE_NOT_FOUND: 'SUPPORT_CASE_NOT_FOUND',
   SUPPORT_DISABLED: 'SUPPORT_DISABLED',
+  TARIFF_DEFAULT_REQUIRED: 'TARIFF_DEFAULT_REQUIRED',
   TARIFF_IN_USE: 'TARIFF_IN_USE',
   TARIFF_NOT_FOUND: 'TARIFF_NOT_FOUND',
   TARIFF_OVERLAP: 'TARIFF_OVERLAP',
@@ -279,6 +318,7 @@ export const ERROR_CODES = {
   VENDOR_NOT_FOUND: 'VENDOR_NOT_FOUND',
   VERIFICATION_RESEND_LIMITED: 'VERIFICATION_RESEND_LIMITED',
   WEAK_PASSWORD: 'WEAK_PASSWORD',
+  WEB_PAYMENTS_NOT_SUPPORTED: 'WEB_PAYMENTS_NOT_SUPPORTED',
   WEBHOOK_NOT_CONFIGURED: 'WEBHOOK_NOT_CONFIGURED',
   WEBHOOK_SIGNATURE_INVALID: 'WEBHOOK_SIGNATURE_INVALID',
   WEBHOOK_SIGNATURE_MISSING: 'WEBHOOK_SIGNATURE_MISSING',
@@ -287,8 +327,36 @@ export const ERROR_CODES = {
 export type ErrorCode =
   | 'ACCOUNT_DEACTIVATED'
   | 'ACCOUNT_DISABLED'
+  | 'AI_ACTION_EXPIRED'
+  | 'AI_ACTION_INVALID'
+  | 'AI_ACTION_NOT_FOUND'
+  | 'AI_ATTACHMENT_REJECTED'
+  | 'AI_ATTACHMENT_TOO_LARGE'
+  | 'AI_ATTACHMENT_TYPE_NOT_ALLOWED'
+  | 'AI_ATTACHMENT_UNSUPPORTED'
+  | 'AI_BASE_URL_INVALID'
+  | 'AI_BUDGET_EXCEEDED'
+  | 'AI_CONFIRMATION_REQUIRES_SESSION'
+  | 'AI_CONTEXT_NOT_FOUND'
+  | 'AI_CONVERSATION_BUSY'
+  | 'AI_CONVERSATION_NOT_FOUND'
   | 'AI_ERROR'
+  | 'AI_INSIGHT_COOLDOWN'
+  | 'AI_INSIGHT_NOT_FOUND'
+  | 'AI_INSIGHTS_DISABLED'
+  | 'AI_MCP_RATE_LIMITED'
+  | 'AI_MODEL_UNAVAILABLE'
+  | 'AI_MONTHLY_BUDGET_EXCEEDED'
   | 'AI_NOT_CONFIGURED'
+  | 'AI_PROPOSAL_ALREADY_DECIDED'
+  | 'AI_PROPOSAL_EXPIRED'
+  | 'AI_PROPOSAL_NOT_FOUND'
+  | 'AI_PROPOSAL_STALE'
+  | 'AI_PROVIDER_AUTH_FAILED'
+  | 'AI_PROVIDER_RATE_LIMITED'
+  | 'AI_PROVIDER_UNAVAILABLE'
+  | 'AI_RATE_LIMITED'
+  | 'AI_SITE_BUDGET_EXCEEDED'
   | 'ALERT_NOT_FOUND'
   | 'ALREADY_FAVORITED'
   | 'ALREADY_VERIFIED'
@@ -299,9 +367,11 @@ export type ErrorCode =
   | 'ATTESTATION_FAILED'
   | 'AUDIT_ENTITY_TYPE_INVALID'
   | 'CA_CERT_NOT_FOUND'
+  | 'CAMPAIGN_NOT_ACTIVE'
   | 'CAMPAIGN_NOT_FOUND'
   | 'CASE_NOT_FOUND'
   | 'CDR_NOT_FOUND'
+  | 'CHARGING_PROFILE_ID_RESERVED'
   | 'CIRCUIT_NOT_FOUND'
   | 'COMMAND_ERROR'
   | 'COMMAND_FAILED'
@@ -318,10 +388,12 @@ export type ErrorCode =
   | 'CSS_ACTION_REJECTED'
   | 'CSS_ACTION_TIMEOUT'
   | 'DOWNTIME_NOT_FOUND'
+  | 'DRIVER_AI_NOTICE_OUTDATED'
   | 'DRIVER_ALREADY_IN_FLEET'
   | 'DRIVER_CREATE_FAILED'
   | 'DRIVER_INACTIVE'
   | 'DRIVER_NOT_FOUND'
+  | 'DUPLICATE_ALERT_RULE'
   | 'DUPLICATE_API_KEY_NAME'
   | 'DUPLICATE_CONNECTOR_ID'
   | 'DUPLICATE_EMAIL'
@@ -343,9 +415,11 @@ export type ErrorCode =
   | 'FAVORITE_NOT_FOUND'
   | 'FLEET_BILLING_CONTACT_REQUIRED'
   | 'FLEET_BILLING_OLD_PODS_CONNECTED'
+  | 'FLEET_BILLING_VERSION_CHECK_STALE'
   | 'FLEET_CREDIT_LIMIT_REACHED'
   | 'FLEET_DISABLED'
   | 'FLEET_HAS_OPEN_BILLING'
+  | 'FLEET_HAS_RESERVATIONS'
   | 'FLEET_INVOICE_NOTHING_TO_BILL'
   | 'FLEET_INVOICE_PERIOD_EXISTS'
   | 'FLEET_NOT_FOUND'
@@ -378,6 +452,7 @@ export type ErrorCode =
   | 'INVOICE_CREATION_FAILED'
   | 'INVOICE_IS_CREDIT_NOTE'
   | 'INVOICE_NO_DRIVER'
+  | 'INVOICE_NO_DRIVER_EMAIL'
   | 'INVOICE_NO_SESSIONS'
   | 'INVOICE_NOT_FOUND'
   | 'INVOICE_NOT_ISSUED'
@@ -464,6 +539,7 @@ export type ErrorCode =
   | 'PORTAL_REGISTRATION_DISABLED'
   | 'PRE_AUTH_FAILED'
   | 'PRICING_ASSIGNMENT_NOT_FOUND'
+  | 'PRICING_GROUP_DEFAULT_EXISTS'
   | 'PRICING_GROUP_NOT_FOUND'
   | 'PRICING_GROUP_TARIFFS_IN_USE'
   | 'PRICING_NOT_FOUND'
@@ -520,6 +596,7 @@ export type ErrorCode =
   | 'START_REJECTED'
   | 'STATION_ALREADY_AVAILABLE'
   | 'STATION_ALREADY_IN_FLEET'
+  | 'STATION_CREDENTIALS_ROUTE_REQUIRED'
   | 'STATION_ID_EXISTS'
   | 'STATION_NOT_FOUND'
   | 'STATION_OFFLINE'
@@ -534,8 +611,10 @@ export type ErrorCode =
   | 'STORAGE_CONNECTION_FAILED'
   | 'STORAGE_NOT_CONFIGURED'
   | 'SUPPORT_AI_NOT_CONFIGURED'
+  | 'SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK'
   | 'SUPPORT_CASE_NOT_FOUND'
   | 'SUPPORT_DISABLED'
+  | 'TARIFF_DEFAULT_REQUIRED'
   | 'TARIFF_IN_USE'
   | 'TARIFF_NOT_FOUND'
   | 'TARIFF_OVERLAP'
@@ -554,6 +633,7 @@ export type ErrorCode =
   | 'VENDOR_NOT_FOUND'
   | 'VERIFICATION_RESEND_LIMITED'
   | 'WEAK_PASSWORD'
+  | 'WEB_PAYMENTS_NOT_SUPPORTED'
   | 'WEBHOOK_NOT_CONFIGURED'
   | 'WEBHOOK_SIGNATURE_INVALID'
   | 'WEBHOOK_SIGNATURE_MISSING';
@@ -569,8 +649,40 @@ export const ALL_ERROR_CODES: readonly ErrorCode[] = Object.values(ERROR_CODES);
 export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   ACCOUNT_DEACTIVATED: 'Account deactivated',
   ACCOUNT_DISABLED: 'Account disabled',
+  AI_ACTION_EXPIRED: 'The AI action expired. Ask the assistant again',
+  AI_ACTION_INVALID: 'The AI action no longer matches or was already rejected',
+  AI_ACTION_NOT_FOUND: 'AI action not found',
+  AI_ATTACHMENT_REJECTED:
+    'The attachment was rejected: its content does not match its type or could not be processed',
+  AI_ATTACHMENT_TOO_LARGE: 'The attachment is too large, or the message has too many attachments',
+  AI_ATTACHMENT_TYPE_NOT_ALLOWED: 'This file type is not allowed',
+  AI_ATTACHMENT_UNSUPPORTED: 'The selected AI model cannot read this attachment type',
+  AI_BASE_URL_INVALID:
+    'The AI provider base URL must be an https URL without credentials on a public host',
+  AI_BUDGET_EXCEEDED: 'Your daily AI usage limit is reached',
+  AI_CONFIRMATION_REQUIRES_SESSION:
+    'Confirm this action while signed in to the dashboard, not with an API key',
+  AI_CONTEXT_NOT_FOUND: 'Explain context not found',
+  AI_CONVERSATION_BUSY:
+    'The assistant is still answering in this conversation. Wait for it to finish or stop it',
+  AI_CONVERSATION_NOT_FOUND: 'Conversation not found',
   AI_ERROR: 'Failed to process AI request',
+  AI_INSIGHT_COOLDOWN: 'This insight was regenerated recently. Try again later',
+  AI_INSIGHT_NOT_FOUND: 'Insight not found',
+  AI_INSIGHTS_DISABLED: 'Automatic insights are turned off',
+  AI_MCP_RATE_LIMITED: 'Too many MCP requests. Try again later',
+  AI_MODEL_UNAVAILABLE: 'The configured AI model does not exist or is retired',
+  AI_MONTHLY_BUDGET_EXCEEDED: 'The monthly AI usage limit is reached',
   AI_NOT_CONFIGURED: 'AI is not configured',
+  AI_PROPOSAL_ALREADY_DECIDED: 'This action was already decided',
+  AI_PROPOSAL_EXPIRED: 'This action has expired',
+  AI_PROPOSAL_NOT_FOUND: 'Action not found',
+  AI_PROPOSAL_STALE: 'This action no longer applies because the situation changed',
+  AI_PROVIDER_AUTH_FAILED: 'The AI provider refused the configured API key',
+  AI_PROVIDER_RATE_LIMITED: 'The AI provider is rate limiting requests. Try again shortly',
+  AI_PROVIDER_UNAVAILABLE: 'The AI provider is unavailable. Try again later',
+  AI_RATE_LIMITED: 'Too many AI requests. Try again in a minute',
+  AI_SITE_BUDGET_EXCEEDED: "The site's daily AI usage limit is reached",
   ALERT_NOT_FOUND: 'Alert not found',
   ALREADY_FAVORITED: 'Already favorited',
   ALREADY_VERIFIED: 'Email already verified',
@@ -581,9 +693,12 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   ATTESTATION_FAILED: 'Device attestation failed. Update the app and try again.',
   AUDIT_ENTITY_TYPE_INVALID: 'Unknown audit entity type',
   CA_CERT_NOT_FOUND: 'CA certificate not found',
+  CAMPAIGN_NOT_ACTIVE: 'Only active campaigns can be cancelled',
   CAMPAIGN_NOT_FOUND: 'Campaign not found',
   CASE_NOT_FOUND: 'Case not found',
   CDR_NOT_FOUND: 'CDR not found',
+  CHARGING_PROFILE_ID_RESERVED:
+    "The charging profile ID must be above the station's MaxExternalConstraintsId",
   CIRCUIT_NOT_FOUND: 'Circuit not found',
   COMMAND_ERROR: 'Command failed',
   COMMAND_FAILED: 'Command failed',
@@ -601,10 +716,12 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   CSS_ACTION_REJECTED: 'Charging Station Simulator rejected the action',
   CSS_ACTION_TIMEOUT: 'Simulator did not respond within 5s',
   DOWNTIME_NOT_FOUND: 'Excluded downtime record not found',
+  DRIVER_AI_NOTICE_OUTDATED: 'The AI notice has changed. Read it and choose again',
   DRIVER_ALREADY_IN_FLEET: 'Driver is already in this fleet',
   DRIVER_CREATE_FAILED: 'Failed to create driver',
   DRIVER_INACTIVE: 'Driver is inactive',
   DRIVER_NOT_FOUND: 'Driver not found',
+  DUPLICATE_ALERT_RULE: 'An alert rule for this component and variable already exists',
   DUPLICATE_API_KEY_NAME: 'An API key with this name already exists',
   DUPLICATE_CONNECTOR_ID: 'Connector ID ... already exists on this EVSE',
   DUPLICATE_EMAIL: 'Email already in use',
@@ -627,12 +744,16 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   FLEET_BILLING_CONTACT_REQUIRED:
     'The fleet needs at least one billing contact for automatic invoicing and invoice emails.',
   FLEET_BILLING_OLD_PODS_CONNECTED:
-    'A process older than v0.1.41 is still connected. Finish the upgrade, then turn on account billing.',
+    'A process of an older release is still connected. Finish the upgrade, then change the fleet billing.',
+  FLEET_BILLING_VERSION_CHECK_STALE:
+    "The worker's version check has not run recently, so the upgrade cannot be confirmed. Check that the worker is running, then change the fleet billing.",
   FLEET_CREDIT_LIMIT_REACHED:
     'The credit limit of the fleet your sessions are billed to is reached. Contact your fleet manager.',
   FLEET_DISABLED: 'Fleet is disabled',
   FLEET_HAS_OPEN_BILLING:
     'The fleet has sessions billed to its account and cannot be deleted. Turn off account billing instead.',
+  FLEET_HAS_RESERVATIONS:
+    'The fleet has fleet reservations and cannot be deleted. Reservations are kept as history.',
   FLEET_INVOICE_NOTHING_TO_BILL:
     'The fleet has no unbilled sessions with a cost to invoice for this period.',
   FLEET_INVOICE_PERIOD_EXISTS:
@@ -667,6 +788,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVOICE_CREATION_FAILED: 'Failed to create invoice',
   INVOICE_IS_CREDIT_NOTE: 'A credit note cannot be marked paid or credited',
   INVOICE_NO_DRIVER: 'This invoice has no driver to send to',
+  INVOICE_NO_DRIVER_EMAIL: 'The driver of this invoice has no email address',
   INVOICE_NO_SESSIONS: 'No uninvoiced sessions found for this driver in the selected date range',
   INVOICE_NOT_FOUND: 'Invoice not found',
   INVOICE_NOT_ISSUED: 'The invoice must be issued for this action',
@@ -750,7 +872,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PAYMENT_WEBHOOK_EXISTS: 'An EVtivity webhook already exists for this provider',
   PAYOUT_ACCOUNT_EXISTS: 'The site already has a payout account',
   PAYOUT_ACCOUNT_NOT_READY: "The site's payout account cannot receive payments yet",
-  PERMISSIONS_EXCEED_OWN: 'API key permissions must be a subset of your own permissions',
+  PERMISSIONS_EXCEED_OWN: 'Permissions must be a subset of your own permissions',
   PHONE_REGISTRATION_LIMITED:
     'Too many accounts were registered with this phone number. Try again later.',
   PKI_ROOT_REFRESH_FAILED: 'Root certificate refresh from the PKI provider failed',
@@ -761,6 +883,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
     'Driver self-registration is disabled. Contact your operator to be invited.',
   PRE_AUTH_FAILED: 'Payment pre-authorization failed',
   PRICING_ASSIGNMENT_NOT_FOUND: 'No pricing group is assigned to this entity',
+  PRICING_GROUP_DEFAULT_EXISTS: 'Another pricing group is already the default',
   PRICING_GROUP_NOT_FOUND: 'Pricing group not found',
   PRICING_GROUP_TARIFFS_IN_USE: 'Pricing group has tariffs referenced by charging sessions',
   PRICING_NOT_FOUND: 'No pricing found',
@@ -821,6 +944,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   START_REJECTED: 'Station rejected start request: ...',
   STATION_ALREADY_AVAILABLE: 'Station already has an available connector',
   STATION_ALREADY_IN_FLEET: 'Station is already in this fleet',
+  STATION_CREDENTIALS_ROUTE_REQUIRED:
+    'Station passwords are changed with POST /v1/stations/:id/credentials, not with a generic OCPP command',
   STATION_ID_EXISTS: 'A station with this ID already exists',
   STATION_NOT_FOUND: 'Station not found',
   STATION_OFFLINE: 'Station is offline',
@@ -837,8 +962,12 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   STORAGE_CONNECTION_FAILED: 'Storage connection test failed',
   STORAGE_NOT_CONFIGURED: 'Attachment storage not configured',
   SUPPORT_AI_NOT_CONFIGURED: 'Support AI is not configured',
+  SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK:
+    'This support case is not waiting for feedback on an automatic answer',
   SUPPORT_CASE_NOT_FOUND: 'Support case not found',
   SUPPORT_DISABLED: 'Support is disabled',
+  TARIFF_DEFAULT_REQUIRED:
+    'A pricing group with tariffs needs one active default tariff without restrictions',
   TARIFF_IN_USE: 'Tariff is referenced by charging sessions and cannot be deleted',
   TARIFF_NOT_FOUND: 'Tariff not found',
   TARIFF_OVERLAP: 'Tariff overlaps with an existing tariff',
@@ -857,6 +986,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   VENDOR_NOT_FOUND: 'Vendor not found',
   VERIFICATION_RESEND_LIMITED: 'Too many verification emails. Wait before you request another one.',
   WEAK_PASSWORD: 'Password does not meet complexity requirements',
+  WEB_PAYMENTS_NOT_SUPPORTED: 'The station does not support dynamic QR codes',
   WEBHOOK_NOT_CONFIGURED: 'Webhook not configured',
   WEBHOOK_SIGNATURE_INVALID: 'Invalid signature',
   WEBHOOK_SIGNATURE_MISSING: 'Missing webhook signature or credentials',

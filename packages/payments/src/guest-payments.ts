@@ -14,11 +14,11 @@ import {
   sessionFeeGrossCents,
 } from '@evtivity/database';
 import {
-  costIncludesTax,
   dispatchSystemNotification,
-  notificationMoney,
   parseSessionCostBreakdown,
+  receiptCapturedCents,
   sessionChargeTax,
+  sessionReceiptVariables,
 } from '@evtivity/lib';
 import type { PaymentContext } from './context.js';
 import { errorMessage, pendingRef } from './context.js';
@@ -554,14 +554,17 @@ async function linkGuestSession(
         .from(chargingSessions)
         .where(eq(chargingSessions.id, sessionId)),
     ]);
-    await recordGuestHold({
-      sessionId,
-      sitePaymentConfigId: terms.sitePaymentConfigId,
-      provider: guest.provider,
-      paymentId: guest.providerPaymentId,
-      currency: session?.currency ?? (await getCompanyCurrency()),
-      preAuthAmountCents: guest.preAuthAmountCents,
-    });
+    await recordGuestHold(
+      {
+        sessionId,
+        sitePaymentConfigId: terms.sitePaymentConfigId,
+        provider: guest.provider,
+        paymentId: guest.providerPaymentId,
+        currency: session?.currency ?? (await getCompanyCurrency()),
+        preAuthAmountCents: guest.preAuthAmountCents,
+      },
+      deps,
+    );
   }
   deps.logger.info(
     { guestSessionId: guest.id, chargingSessionId: sessionId },
@@ -703,8 +706,11 @@ async function finalizeGuestPayment(sessionId: string, deps: GuestEventDeps): Pr
       );
       await markCancelled(
         record.id,
-        pendingRef(cancelled),
-        belowMinimumCaptureReason(finalCost, minimumCents, record.currency),
+        {
+          pendingRef: pendingRef(cancelled),
+          failureReason: belowMinimumCaptureReason(finalCost, minimumCents, record.currency),
+        },
+        deps,
       );
       // Nothing was charged, so no receipt.
       await completeGuestSession(guest.id);
@@ -746,11 +752,11 @@ async function finalizeGuestPayment(sessionId: string, deps: GuestEventDeps): Pr
         );
       }
       const captureRef = pendingRef(captured);
-      await markCaptured(record.id, {
-        capturedCents: captureCents,
-        failureReason,
-        pendingRef: captureRef,
-      });
+      await markCaptured(
+        record.id,
+        { capturedCents: captureCents, failureReason, pendingRef: captureRef },
+        deps,
+      );
       await completeGuestSession(guest.id);
       // An async capture is not final until the provider confirms it: the
       // confirming webhook sends the receipt, a failure sends none (JB-3).
@@ -763,7 +769,7 @@ async function finalizeGuestPayment(sessionId: string, deps: GuestEventDeps): Pr
         idempotencyKey: cancelKey(paymentId),
       });
       deps.logger.info({ guestSessionId: guest.id }, 'Cancelled zero-cost guest payment intent');
-      await markCancelled(record.id, pendingRef(cancelled));
+      await markCancelled(record.id, { pendingRef: pendingRef(cancelled) }, deps);
     }
     await completeGuestSession(guest.id);
     await sendGuestReceipt(guest, sessionId, deps);
@@ -774,7 +780,7 @@ async function finalizeGuestPayment(sessionId: string, deps: GuestEventDeps): Pr
         { err, guestSessionId: guest.id },
         'Guest capture declined; failing the guest session and releasing the hold',
       );
-      await markHoldFailed(record.id, errorMessage(err, 'Capture declined'));
+      await markHoldFailed(record.id, errorMessage(err, 'Capture declined'), deps);
       await failGuestSessionAndReleaseHold(sessionId, record, deps);
       return;
     }
@@ -842,9 +848,12 @@ async function sendGuestReceipt(
     if (claimed.length === 0) return;
     const [session] = await db
       .select({
+        transactionId: chargingSessions.transactionId,
         energyDeliveredWh: chargingSessions.energyDeliveredWh,
         finalCostCents: chargingSessions.finalCostCents,
-        tariffTaxRate: chargingSessions.tariffTaxRate,
+        netCents: chargingSessions.netCents,
+        taxCents: chargingSessions.taxCents,
+        costBreakdown: chargingSessions.costBreakdown,
         currency: sql<string>`upper(${chargingSessions.currency})`,
         startedAt: chargingSessions.startedAt,
         endedAt: chargingSessions.endedAt,
@@ -854,22 +863,35 @@ async function sendGuestReceipt(
     if (session == null) return;
     const startedAt = session.startedAt != null ? new Date(session.startedAt) : new Date();
     const endedAt = session.endedAt != null ? new Date(session.endedAt) : new Date();
+    // The capture as recorded: a guest shortfall (a cost above the hold, no
+    // saved card for a top-up) leaves it below the final cost, so the receipt
+    // says what was charged and what is unpaid.
+    const paid = await findSessionRecord(sessionId);
     await dispatchSystemNotification(
       client,
       'session.Receipt',
       { email: guest.guestEmail },
-      {
+      sessionReceiptVariables({
+        siteName: null,
         stationId: guest.stationOcppId,
+        transactionId: session.transactionId,
         energyDeliveredWh:
           session.energyDeliveredWh != null ? Number(session.energyDeliveredWh) : 0,
         finalCostCents: session.finalCostCents ?? 0,
-        costFormatted: notificationMoney(session.finalCostCents ?? 0, session.currency),
-        costIncludesTax: costIncludesTax(session.finalCostCents, session.tariffTaxRate),
+        netCents: session.netCents,
+        taxCents: session.taxCents,
+        costBreakdown: session.costBreakdown,
+        capturedCents:
+          paid != null ? receiptCapturedCents(paid.status, paid.capturedAmountCents) : null,
         currency: session.currency,
-        durationMinutes: Math.round((endedAt.getTime() - startedAt.getTime()) / 60000),
         startedAt: startedAt.toISOString(),
         endedAt: endedAt.toISOString(),
-      },
+        // A release below the provider minimum sends no guest receipt.
+        notCharged: false,
+        billingMode: null,
+        billedTo: null,
+        billedToMember: false,
+      }),
       deps.templatesDirs,
     );
     deps.logger.info({ guestSessionId: guest.id }, 'Guest receipt notification sent');
@@ -893,7 +915,7 @@ export async function failExhaustedGuestCapture(
 ): Promise<void> {
   const record = await findSessionRecord(sessionId);
   if (record?.status === 'pre_authorized') {
-    await markHoldFailed(record.id, `Capture worker exhausted retries: ${reason}`);
+    await markHoldFailed(record.id, `Capture worker exhausted retries: ${reason}`, ctx);
   }
   await failGuestSessionAndReleaseHold(
     sessionId,

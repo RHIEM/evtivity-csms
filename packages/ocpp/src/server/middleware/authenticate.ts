@@ -3,12 +3,18 @@
 
 import type { IncomingMessage } from 'node:http';
 import type postgres from 'postgres';
-import { verify } from 'argon2';
+import { stationAuditLog, writeAudit } from '@evtivity/database';
 import type { Logger } from '@evtivity/lib';
 import { logConnectionEvent } from './connection-log.js';
 import { hasSimulatorMarker, reconcileSimulatorIdentity } from './simulator-identity.js';
 import { offeredSubprotocols, selectOcppSubprotocol } from '../subprotocol.js';
 import type { OcppSubprotocol } from '../subprotocol.js';
+import { StationPasswordVerifier } from './station-password-verifier.js';
+
+// Callers without their own verifier (tests, tools) check every password with
+// argon2, cache nothing and keep no failed-attempt backoff. OcppServer passes
+// its own, with a cache and the backoff.
+const uncachedVerifier = new StationPasswordVerifier({ cache: null, backoff: null });
 
 export type AuthFailure =
   | 'unknown_station'
@@ -16,6 +22,7 @@ export type AuthFailure =
   | 'tls_required'
   | 'client_certificate'
   | 'credentials'
+  | 'locked_out'
   | 'unavailable';
 
 export interface AuthResult {
@@ -24,6 +31,8 @@ export interface AuthResult {
   stationDbId: string | null;
   error?: string | undefined;
   failure?: AuthFailure | undefined;
+  /** 'locked_out' only: seconds until the station may try a password again. */
+  retryAfterSeconds?: number | undefined;
 }
 
 export interface AuthRejection {
@@ -52,6 +61,12 @@ export function rejectionFor(auth: AuthResult): AuthRejection {
       return { status: 404, message: 'Not Found' };
     case 'blocked':
       return { status: 403, message: 'Forbidden' };
+    case 'locked_out':
+      return {
+        status: 429,
+        message: 'Too Many Requests',
+        headers: { 'Retry-After': String(Math.max(1, auth.retryAfterSeconds ?? 1)) },
+      };
     case 'unavailable':
     case undefined:
       return serviceUnavailable();
@@ -88,6 +103,7 @@ export async function authenticateConnection(
   sql: postgres.Sql | null,
   clientIp: string | null = req.socket.remoteAddress ?? null,
   viaTls: boolean = 'encrypted' in req.socket && req.socket.encrypted === true,
+  verifier: StationPasswordVerifier = uncachedVerifier,
 ): Promise<AuthResult> {
   const stationId = extractStationId(req.url);
   if (stationId == null) {
@@ -169,7 +185,7 @@ export async function authenticateConnection(
   // Blocked stations are rejected here at the connection level.
 
   const remoteAddress = clientIp;
-  const ctx = { req, sql, logger, stationId, station, remoteAddress, viaTls };
+  const ctx = { req, sql, logger, stationId, station, remoteAddress, viaTls, verifier };
 
   // An upgrade sent to the station is pending until the station connects with
   // the new profile. Try it first; on success promote it, after which the old
@@ -265,6 +281,7 @@ interface ProfileAuthContext {
   remoteAddress: string | null;
   // TLS on the socket, or reported by a trusted load balancer that ended it.
   viaTls: boolean;
+  verifier: StationPasswordVerifier;
 }
 
 async function authenticateForProfile(
@@ -272,7 +289,7 @@ async function authenticateForProfile(
   ctx: ProfileAuthContext,
   logFailures: boolean,
 ): Promise<AuthResult> {
-  const { req, sql, logger, stationId, station, remoteAddress, viaTls } = ctx;
+  const { req, sql, logger, stationId, station, remoteAddress, viaTls, verifier } = ctx;
   const logEvent = logFailures ? logConnectionEvent : async (): Promise<void> => {};
 
   // SP0: no authentication required
@@ -531,9 +548,33 @@ async function authenticateForProfile(
     };
   }
 
+  const storedHash = station.basic_auth_password_hash;
+  let cached: boolean;
   try {
-    const valid = await verify(station.basic_auth_password_hash, password);
-    if (!valid) {
+    const check = await verifier.verify(station.id, storedHash, password);
+    cached = check.cached;
+    if (check.lockedForMs != null) {
+      // Repeated wrong passwords: refused without argon2 (StationAuthBackoff).
+      await logEvent(
+        sql,
+        station.id,
+        'auth_failed',
+        remoteAddress,
+        {
+          reason: 'Too many failed password attempts',
+        },
+        logger,
+      );
+      return {
+        authenticated: false,
+        stationId,
+        stationDbId: station.id,
+        error: 'Too many failed password attempts',
+        failure: 'locked_out',
+        retryAfterSeconds: Math.ceil(check.lockedForMs / 1000),
+      };
+    }
+    if (!check.valid) {
       await logEvent(
         sql,
         station.id,
@@ -566,8 +607,46 @@ async function authenticateForProfile(
     };
   }
 
-  logger.debug({ stationId }, 'Station authenticated via Basic Auth');
+  if (!cached && verifier.needsRehash(storedHash)) {
+    const stationDbId = station.id;
+    verifier.scheduleRehash(stationDbId, () =>
+      rehashStationPassword(sql, stationDbId, storedHash, password, verifier, logger),
+    );
+  }
+
+  logger.debug({ stationId, cached }, 'Station authenticated via Basic Auth');
   return { authenticated: true, stationId, stationDbId: station.id };
+}
+
+// A hash stored with other parameters (the argon2 default before
+// STATION_PASSWORD_HASH_OPTIONS) is replaced after the station proves the
+// password, the only time the plaintext is known. It runs in the verifier's
+// background lane, after the connection was accepted and outside the
+// connection admission limit, so a post-upgrade reconnect wave pays one
+// argon2 verify per station, not a verify plus a new hash. The update only
+// applies while the row still holds the hash just verified, so a password the
+// operator set in the meantime always wins, however late the rehash runs.
+// Fail-open: the station authenticated, and the next connection retries.
+async function rehashStationPassword(
+  sql: postgres.Sql,
+  stationDbId: string,
+  storedHash: string,
+  password: string,
+  verifier: StationPasswordVerifier,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const newHash = await verifier.rehash(password);
+    const updated = await sql`
+      UPDATE charging_stations
+      SET basic_auth_password_hash = ${newHash}, updated_at = now()
+      WHERE id = ${stationDbId} AND basic_auth_password_hash = ${storedHash}
+      RETURNING id
+    `;
+    if (updated.length > 0) verifier.remember(stationDbId, newHash, password);
+  } catch (err) {
+    logger.warn({ err, stationDbId }, 'Failed to rehash the station password');
+  }
 }
 
 async function promotePendingSecurityProfile(
@@ -580,16 +659,43 @@ async function promotePendingSecurityProfile(
 ): Promise<void> {
   // Fail open: the station authenticated with the new profile; a failed write
   // only delays the promotion to its next connection.
+  let promoted: boolean;
   try {
-    await sql`
+    const rows = await sql`
       UPDATE charging_stations
       SET security_profile = ${toProfile}, pending_security_profile = NULL, updated_at = now(),
         basic_auth_password_hash = CASE WHEN ${toProfile} = 3 THEN NULL ELSE basic_auth_password_hash END
       WHERE id = ${stationDbId} AND pending_security_profile = ${toProfile}
+      RETURNING id
     `;
+    promoted = rows.length > 0;
   } catch (err) {
     logger.warn({ err, stationDbId, toProfile }, 'Failed to promote pending security profile');
     return;
+  }
+  // The station audit row, only from the connection whose compare-and-set
+  // promoted it (a concurrent connection on another pod finds nothing).
+  // Fail-open (writeAudit).
+  if (promoted) {
+    await writeAudit(
+      { table: stationAuditLog, idColumn: 'station_id' },
+      {
+        entityId: stationDbId,
+        entityIdSnapshot: stationDbId,
+        action: 'updated',
+        actor: 'ocpp',
+        actorLabel: 'security_profile_upgraded',
+        before: { securityProfile: fromProfile, pendingSecurityProfile: toProfile },
+        after: {
+          securityProfile: toProfile,
+          pendingSecurityProfile: null,
+          ...(toProfile === 3 ? { basicAuthPasswordCleared: true } : {}),
+        },
+        notes: 'The station connected with the pending security profile',
+      },
+      undefined,
+      logger,
+    );
   }
   logger.info({ stationDbId, fromProfile, toProfile }, 'Security profile upgrade completed');
   await logConnectionEvent(
