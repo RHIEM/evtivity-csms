@@ -7,6 +7,8 @@ import { describe, it, expect } from 'vitest';
 import { translateCommand, translateResponse } from '../server/command-translation.js';
 import { validateSetChargingProfile } from '../generated/v1_6/validators/SetChargingProfile.validator.js';
 import { validateClearChargingProfile } from '../generated/v1_6/validators/ClearChargingProfile.validator.js';
+import { validateSendLocalList } from '../generated/v1_6/validators/SendLocalList.validator.js';
+import { validateCertificateSigned } from '../generated/v1_6/validators/CertificateSigned.validator.js';
 
 describe('command-translation', () => {
   describe('translateCommand', () => {
@@ -190,6 +192,18 @@ describe('command-translation', () => {
         });
       });
 
+      it('sends the 2.1 evseId as the 1.6 connectorId, not the connector within the EVSE', () => {
+        // A 1.6 connector is what 2.1 calls the EVSE: EVSE 2, connector 1 is 1.6 connector 2.
+        const result = translateCommand('UnlockConnector', 'ocpp1.6', {
+          evseId: 2,
+          connectorId: 1,
+        });
+        expect(result).toEqual({
+          action: 'UnlockConnector',
+          payload: { connectorId: 2 },
+        });
+      });
+
       it('defaults connectorId to 1 when no evse for ocpp1.6', () => {
         const result = translateCommand('UnlockConnector', 'ocpp1.6', {});
         expect(result).toEqual({
@@ -359,6 +373,189 @@ describe('command-translation', () => {
       });
     });
 
+    describe('CertificateSigned', () => {
+      const payload = {
+        certificateChain: 'PEM',
+        certificateType: 'ChargingStationCertificate',
+        requestId: 4,
+      };
+
+      it('sends only certificateChain to an ocpp1.6 station (schema has no other field)', () => {
+        const result = translateCommand('CertificateSigned', 'ocpp1.6', payload);
+        expect(result).toEqual({
+          action: 'CertificateSigned',
+          payload: { certificateChain: 'PEM' },
+        });
+        expect(validateCertificateSigned(result?.payload)).toBe(true);
+      });
+
+      it('keeps certificateType and requestId for ocpp2.1', () => {
+        const result = translateCommand('CertificateSigned', 'ocpp2.1', payload);
+        expect(result).toEqual({ action: 'CertificateSigned', payload });
+      });
+    });
+
+    describe('ISO 15118 Plug and Charge on ocpp1.6 (OCA application note)', () => {
+      const vendorId = 'org.openchargealliance.iso15118pnc';
+      const data = (result: { payload: Record<string, unknown> } | null): unknown =>
+        JSON.parse(String(result?.payload['data']));
+
+      it('wraps CertificateSigned of a V2G certificate in a DataTransfer', () => {
+        const result = translateCommand('CertificateSigned', 'ocpp1.6', {
+          certificateChain: 'PEM',
+          certificateType: 'V2GCertificate',
+          requestId: 3,
+        });
+        expect(result?.action).toBe('DataTransfer');
+        expect(result?.payload).toMatchObject({ vendorId, messageId: 'CertificateSigned' });
+        expect(data(result)).toEqual({ certificateChain: 'PEM' });
+        const request = { certificateChain: 'PEM', certificateType: 'V2GCertificate' };
+        expect(
+          translateResponse(
+            'CertificateSigned',
+            'ocpp1.6',
+            {
+              status: 'Accepted',
+              data: '{"status":"Accepted"}',
+            },
+            request,
+          ),
+        ).toEqual({ status: 'Accepted' });
+        expect(
+          translateResponse('CertificateSigned', 'ocpp1.6', { status: 'UnknownVendorId' }, request),
+        ).toEqual({ status: 'Rejected' });
+      });
+
+      it('keeps the Security Whitepaper message for the station certificate', () => {
+        const result = translateCommand('CertificateSigned', 'ocpp1.6', {
+          certificateChain: 'PEM',
+          certificateType: 'ChargingStationCertificate',
+        });
+        expect(result).toEqual({
+          action: 'CertificateSigned',
+          payload: { certificateChain: 'PEM' },
+        });
+      });
+
+      it('refuses ISO 15118-20 certificates on ocpp1.6', () => {
+        expect(() =>
+          translateCommand('CertificateSigned', 'ocpp1.6', {
+            certificateChain: 'PEM',
+            certificateType: 'V2G20Certificate',
+          }),
+        ).toThrow(/V2G20Certificate/);
+        expect(() =>
+          translateCommand('TriggerMessage', 'ocpp1.6', {
+            requestedMessage: 'SignV2G20Certificate',
+          }),
+        ).toThrow(/V2G20Certificate/);
+      });
+
+      it('wraps InstallCertificate of a V2G or MO root, not of a Central System root', () => {
+        const v2g = translateCommand('InstallCertificate', 'ocpp1.6', {
+          certificateType: 'MORootCertificate',
+          certificate: 'PEM',
+        });
+        expect(v2g?.action).toBe('DataTransfer');
+        expect(data(v2g)).toEqual({ certificateType: 'MORootCertificate', certificate: 'PEM' });
+        expect(
+          translateResponse(
+            'InstallCertificate',
+            'ocpp1.6',
+            { status: 'Accepted', data: '{"status":"Failed"}' },
+            { certificateType: 'MORootCertificate' },
+          ),
+        ).toEqual({ status: 'Failed' });
+        const csms = translateCommand('InstallCertificate', 'ocpp1.6', {
+          certificateType: 'CSMSRootCertificate',
+          certificate: 'PEM',
+        });
+        expect(csms?.action).toBe('InstallCertificate');
+      });
+
+      it('wraps DeleteCertificate of an ISO 15118 certificate (type hint never sent)', () => {
+        const hash = {
+          hashAlgorithm: 'SHA256',
+          issuerNameHash: 'a',
+          issuerKeyHash: 'b',
+          serialNumber: '1',
+        };
+        const wrapped = translateCommand('DeleteCertificate', 'ocpp1.6', {
+          certificateHashData: hash,
+          certificateType: 'V2GRootCertificate',
+        });
+        expect(wrapped?.action).toBe('DataTransfer');
+        expect(data(wrapped)).toEqual({ certificateHashData: hash });
+        const plain = translateCommand('DeleteCertificate', 'ocpp1.6', {
+          certificateHashData: hash,
+          certificateType: 'CSMSRootCertificate',
+        });
+        expect(plain).toEqual({
+          action: 'DeleteCertificate',
+          payload: { certificateHashData: hash },
+        });
+        expect(
+          translateCommand('DeleteCertificate', 'ocpp2.1', {
+            certificateHashData: hash,
+            certificateType: 'V2GRootCertificate',
+          }),
+        ).toEqual({ action: 'DeleteCertificate', payload: { certificateHashData: hash } });
+      });
+
+      it('wraps GetInstalledCertificateIds of ISO 15118 types and refuses a mix', () => {
+        const request = { certificateType: ['V2GRootCertificate', 'V2GCertificateChain'] };
+        const wrapped = translateCommand('GetInstalledCertificateIds', 'ocpp1.6', request);
+        expect(wrapped?.action).toBe('DataTransfer');
+        expect(data(wrapped)).toEqual(request);
+        const chain = [{ certificateType: 'V2GRootCertificate', certificateHashData: {} }];
+        expect(
+          translateResponse(
+            'GetInstalledCertificateIds',
+            'ocpp1.6',
+            {
+              status: 'Accepted',
+              data: JSON.stringify({ status: 'Accepted', certificateHashDataChain: chain }),
+            },
+            request,
+          ),
+        ).toEqual({ status: 'Accepted', certificateHashDataChain: chain });
+        expect(
+          translateResponse(
+            'GetInstalledCertificateIds',
+            'ocpp1.6',
+            { status: 'Rejected' },
+            request,
+          ),
+        ).toEqual({ status: 'NotFound' });
+        expect(() =>
+          translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {
+            certificateType: ['V2GRootCertificate', 'CSMSRootCertificate'],
+          }),
+        ).toThrow(/mix/);
+      });
+
+      it('wraps TriggerMessage SignV2GCertificate with no fields', () => {
+        const wrapped = translateCommand('TriggerMessage', 'ocpp1.6', {
+          requestedMessage: 'SignV2GCertificate',
+        });
+        expect(wrapped).toEqual({
+          action: 'DataTransfer',
+          payload: { vendorId, messageId: 'TriggerMessage', data: '{}' },
+        });
+        expect(
+          translateResponse(
+            'TriggerMessage',
+            'ocpp1.6',
+            { status: 'Accepted', data: '{"status":"Accepted"}' },
+            { requestedMessage: 'SignV2GCertificate' },
+          ),
+        ).toEqual({ status: 'Accepted' });
+        expect(
+          translateCommand('TriggerMessage', 'ocpp1.6', { requestedMessage: 'Heartbeat' }),
+        ).toEqual({ action: 'TriggerMessage', payload: { requestedMessage: 'Heartbeat' } });
+      });
+    });
+
     describe('ClearChargingProfile', () => {
       it('maps evseId to connectorId for ocpp1.6', () => {
         const result = translateCommand('ClearChargingProfile', 'ocpp1.6', {
@@ -466,12 +663,69 @@ describe('command-translation', () => {
         expect(list[1]).toHaveProperty('idTag', 'TAG002');
       });
 
-      it('passes payload through when no list for ocpp1.6', () => {
+      it('maps versionNumber to listVersion when there is no list for ocpp1.6', () => {
         const result = translateCommand('SendLocalList', 'ocpp1.6', {
           versionNumber: 1,
           updateType: 'Full',
         });
-        expect(result?.payload).toHaveProperty('versionNumber', 1);
+        expect(result?.payload).toEqual({ listVersion: 1, updateType: 'Full' });
+      });
+
+      it('maps a 2.1 list to the 1.6 schema shape for ocpp1.6', () => {
+        const result = translateCommand('SendLocalList', 'ocpp1.6', {
+          versionNumber: 7,
+          updateType: 'Full',
+          localAuthorizationList: [
+            {
+              idToken: { idToken: 'TAG-A', type: 'ISO14443' },
+              idTokenInfo: {
+                status: 'Accepted',
+                cacheExpiryDateTime: '2027-01-01T00:00:00.000Z',
+                groupIdToken: { idToken: 'GROUP-1', type: 'Central' },
+              },
+            },
+            { idToken: { idToken: 'TAG-B', type: 'ISO14443' }, idTokenInfo: { status: 'Blocked' } },
+            {
+              idToken: { idToken: 'TAG-C', type: 'ISO14443' },
+              idTokenInfo: { status: 'NoCredit' },
+            },
+            { idToken: { idToken: 'TAG-D', type: 'ISO14443' } },
+          ],
+        });
+        // SendLocalList.json (1.6): listVersion and updateType, each entry
+        // only idTag and idTagInfo { status, expiryDate, parentIdTag }.
+        expect(validateSendLocalList(result?.payload)).toBe(true);
+        expect(result?.payload).toEqual({
+          listVersion: 7,
+          updateType: 'Full',
+          localAuthorizationList: [
+            {
+              idTag: 'TAG-A',
+              idTagInfo: {
+                status: 'Accepted',
+                expiryDate: '2027-01-01T00:00:00.000Z',
+                parentIdTag: 'GROUP-1',
+              },
+            },
+            { idTag: 'TAG-B', idTagInfo: { status: 'Blocked' } },
+            // 1.6 has no NoCredit: a prepaid card without credit is Blocked.
+            { idTag: 'TAG-C', idTagInfo: { status: 'Blocked' } },
+            { idTag: 'TAG-D' },
+          ],
+        });
+      });
+
+      it('keeps a list already in the 1.6 shape for ocpp1.6', () => {
+        const result = translateCommand('SendLocalList', 'ocpp1.6', {
+          listVersion: 3,
+          updateType: 'Differential',
+          localAuthorizationList: [{ idTag: 'T', idTagInfo: { status: 'Accepted' } }],
+        });
+        expect(result?.payload).toEqual({
+          listVersion: 3,
+          updateType: 'Differential',
+          localAuthorizationList: [{ idTag: 'T', idTagInfo: { status: 'Accepted' } }],
+        });
       });
     });
 
@@ -937,7 +1191,8 @@ describe('command-translation', () => {
     });
 
     it('refuses certificate types without a 1.6 equivalent', () => {
-      for (const type of ['V2GRootCertificate', 'MORootCertificate', 'OEMRootCertificate']) {
+      // V2G and MO roots go in the ISO 15118 DataTransfer (tested above); an OEM root has no 1.6 form.
+      for (const type of ['OEMRootCertificate']) {
         expect(() =>
           translateCommand('InstallCertificate', 'ocpp1.6', {
             certificateType: type,
@@ -947,7 +1202,7 @@ describe('command-translation', () => {
       }
       expect(() =>
         translateCommand('GetInstalledCertificateIds', 'ocpp1.6', {
-          certificateType: ['V2GCertificateChain'],
+          certificateType: ['OEMRootCertificate'],
         }),
       ).toThrow('not supported on ocpp1.6 stations');
     });

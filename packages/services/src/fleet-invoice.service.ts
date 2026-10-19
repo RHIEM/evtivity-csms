@@ -10,6 +10,7 @@ import {
   pgConstraintName,
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
+  type InvoiceDateMode,
 } from '@evtivity/database';
 import {
   AppError,
@@ -87,6 +88,27 @@ export function fleetInvoicePeriod(period: string, timeZone: string): FleetInvoi
   };
 }
 
+/**
+ * The issue date of an account invoice of a period: now for `run_date`; for
+ * `period_end`, noon of the period's last day in the timezone, or now when
+ * that is still ahead (an on-demand invoice of the current month). Noon keeps
+ * the date on the last day in any display timezone within 11 hours and on a
+ * DST change day. The invoice number prefix (INV-YYYYMM) follows this date.
+ */
+export function accountInvoiceDate(
+  mode: InvoiceDateMode,
+  period: FleetInvoicePeriod,
+  timeZone: string,
+  now: Date,
+): Date {
+  if (mode !== 'period_end') return now;
+  const [year, month, day] = period.periodEnd.split('-').map(Number) as [number, number, number];
+  const noon = new Date(
+    zonedMidnight(year, month, day, periodZone(timeZone)).getTime() + 12 * 3_600_000,
+  );
+  return noon.getTime() < now.getTime() ? noon : now;
+}
+
 /** The calendar month (`YYYY-MM`) of an instant in a timezone. */
 export function periodOf(at: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -150,6 +172,7 @@ export interface FleetForInvoice {
   billingTaxId: string | null;
   invoiceLanguage: string;
   paymentTermsDays: number | null;
+  invoiceDateMode: InvoiceDateMode;
 }
 
 export function billToFromFleet(fleet: FleetForInvoice): FleetBillTo {
@@ -420,7 +443,8 @@ async function loadFleet(
 ): Promise<FleetForInvoice | null> {
   const rows = (await executor.execute(sql`
     SELECT id, name, billing_legal_name, billing_street, billing_city, billing_state,
-           billing_zip, billing_country, billing_tax_id, invoice_language, payment_terms_days
+           billing_zip, billing_country, billing_tax_id, invoice_language, payment_terms_days,
+           invoice_date_mode
     FROM fleets WHERE id = ${fleetId}
     ${lock ? sql`FOR UPDATE` : sql``}
   `)) as unknown as Array<Record<string, unknown>>;
@@ -442,6 +466,7 @@ async function loadFleet(
     billingTaxId: text('billing_tax_id'),
     invoiceLanguage: text('invoice_language') ?? 'en',
     paymentTermsDays: row['payment_terms_days'] == null ? null : Number(row['payment_terms_days']),
+    invoiceDateMode: row['invoice_date_mode'] === 'period_end' ? 'period_end' : 'run_date',
   };
 }
 
@@ -483,7 +508,9 @@ export async function loadFleetInvoiceCandidates(
     FROM charging_sessions cs
     LEFT JOIN drivers d ON d.id = cs.driver_id
     LEFT JOIN charging_stations st ON st.id = cs.station_id
-    LEFT JOIN sites si ON si.id = st.site_id
+    -- The site the session happened at (the station's current site only for
+    -- a row without one), so a moved station keeps its earlier sessions' site.
+    LEFT JOIN sites si ON si.id = COALESCE(cs.site_id, st.site_id)
     WHERE cs.billing_fleet_id = ${fleetId}
       AND cs.billing_mode = 'account'
       ${recipient}
@@ -1061,6 +1088,7 @@ async function issueAccountInvoice(
         chargedCents: plan.totalCents,
         status: 'issued',
         paymentTermsDays: fleet.paymentTermsDays,
+        issuedAt: accountInvoiceDate(fleet.invoiceDateMode, bounds, timeZone, now),
         fleet: {
           fleetId,
           periodStart: bounds.periodStart,
@@ -1080,13 +1108,9 @@ async function issueAccountInvoice(
       return result;
     });
   } catch (err) {
-    if (err instanceof AppError) throw err;
-    const periodIndex = target.kind === 'fleet' ? FLEET_PERIOD_INDEX : MEMBER_PERIOD_INDEX;
-    if (pgErrorCode(err) === PG_UNIQUE_VIOLATION && pgConstraintName(err) === periodIndex) {
-      const live = await findTargetPeriodInvoice(db, target, bounds.periodStart);
-      if (live != null) throw periodExistsError(target, live);
-    }
-    if (err instanceof Error && err.message === 'Session is already invoiced') {
+    // The claim in insertInvoiceInTransaction found a session another invoice
+    // took meanwhile (alreadyInvoicedError).
+    if (err instanceof AppError && err.code === 'SESSION_ALREADY_INVOICED') {
       throw new AppError(
         target.kind === 'fleet'
           ? 'A session of the fleet was billed while the invoice was being created; generate it again'
@@ -1094,6 +1118,12 @@ async function issueAccountInvoice(
         400,
         'INVOICE_CREATION_FAILED',
       );
+    }
+    if (err instanceof AppError) throw err;
+    const periodIndex = target.kind === 'fleet' ? FLEET_PERIOD_INDEX : MEMBER_PERIOD_INDEX;
+    if (pgErrorCode(err) === PG_UNIQUE_VIOLATION && pgConstraintName(err) === periodIndex) {
+      const live = await findTargetPeriodInvoice(db, target, bounds.periodStart);
+      if (live != null) throw periodExistsError(target, live);
     }
     throw err;
   }

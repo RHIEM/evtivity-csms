@@ -60,6 +60,16 @@ vi.mock('@evtivity/database', () => ({
   getCompanyTaxBasis: vi.fn(() => Promise.resolve('net')),
   getCompanyPriceDisplay: vi.fn(() => Promise.resolve('net')),
   clearSystemSettingsCache: vi.fn(),
+  clearGuestChargingCache: vi.fn(),
+  clearGuestVelocityCache: vi.fn(),
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY: 'guest.startsPerIpPerHour',
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY: 'guest.declinesPerIpPerHour',
+  MAX_GUEST_VELOCITY_LIMIT: 10_000,
+  parseGuestVelocityLimit: vi.fn((value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000
+      ? value
+      : null,
+  ),
   clearMobileAppConfigCache: vi.fn(),
   clearStationMessageSettingsCache: vi.fn(),
   clearWebhookSettingsCache: vi.fn(),
@@ -152,6 +162,7 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
     isStationMessageLanguage: actual.isStationMessageLanguage,
     STATION_MESSAGE_LANGUAGES: actual.STATION_MESSAGE_LANGUAGES,
     isTaxBasis: actual.isTaxBasis,
+    OCPI_TARIFF_SETTING_KEYS: actual.OCPI_TARIFF_SETTING_KEYS,
     TAX_BASES: actual.TAX_BASES,
     UI_LANGUAGES: actual.UI_LANGUAGES,
     isMobileAppSettingKey: actual.isMobileAppSettingKey,
@@ -183,6 +194,12 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
     COMPANY_INVOICE_EMAIL_KEY: actual.COMPANY_INVOICE_EMAIL_KEY,
     isInvoiceSellerSettingKey: actual.isInvoiceSellerSettingKey,
     normalizeInvoiceSellerSetting: actual.normalizeInvoiceSellerSetting,
+    COMPANY_BIC_KEY: actual.COMPANY_BIC_KEY,
+    COMPANY_IBAN_KEY: actual.COMPANY_IBAN_KEY,
+    INVOICE_EPC_QR_ENABLED_KEY: actual.INVOICE_EPC_QR_ENABLED_KEY,
+    INVOICE_PAYMENT_MAX_LENGTHS: actual.INVOICE_PAYMENT_MAX_LENGTHS,
+    isInvoicePaymentSettingKey: actual.isInvoicePaymentSettingKey,
+    normalizeInvoicePaymentSetting: actual.normalizeInvoicePaymentSetting,
   };
 });
 

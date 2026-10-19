@@ -3,6 +3,7 @@
 
 import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { invalidateAutochargeCaches } from '../lib/autocharge-invalidation.js';
 import { eq, like, or, inArray } from 'drizzle-orm';
 import {
   db,
@@ -13,12 +14,19 @@ import {
   isPncEnabled,
   isFleetEnabled,
   isGuestChargingEnabled,
+  isAutochargeOffered,
+  clearCompanyPortalUrlCache,
   isChatbotAiEnabled,
   isAiInsightsEnabled,
   clearRoamingCache,
   clearSupportCache,
   clearFleetCache,
   clearGuestChargingCache,
+  clearGuestVelocityCache,
+  parseGuestVelocityLimit,
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY,
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY,
+  MAX_GUEST_VELOCITY_LIMIT,
   clearAiSettingsCache,
   clearPncSettingsCache,
   writeAudit,
@@ -98,6 +106,12 @@ import {
   COMPANY_INVOICE_EMAIL_KEY,
   isInvoiceSellerSettingKey,
   normalizeInvoiceSellerSetting,
+  COMPANY_BIC_KEY,
+  COMPANY_IBAN_KEY,
+  INVOICE_EPC_QR_ENABLED_KEY,
+  INVOICE_PAYMENT_MAX_LENGTHS,
+  isInvoicePaymentSettingKey,
+  normalizeInvoicePaymentSetting,
 } from '@evtivity/lib';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
@@ -139,6 +153,7 @@ import { isAllSiteUser, requireAllSiteAccess } from '../lib/site-access.js';
 import { config as apiConfig } from '../lib/config.js';
 import { storedSystemPrompt } from '../services/ai/engine/prompt-defaults.js';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { publishOcpiTariffSettingChange } from '../lib/ocpi-tariff-push.js';
 import { readDriverAiAvailability } from '../lib/driver-ai-availability.js';
 import { DRIVER_AI_NOTICE_VERSION } from '@evtivity/lib/driver-ai';
 import { decryptForRead, encryptForWrite, isServerManagedSetting } from '../lib/settings-crypto.js';
@@ -161,7 +176,9 @@ function isCachedSystemSetting(key: string): boolean {
   return (
     key === COMPANY_CURRENCY_KEY ||
     key === COMPANY_PRICE_DISPLAY_KEY ||
-    key === COMPANY_TAX_BASIS_KEY
+    key === COMPANY_TAX_BASIS_KEY ||
+    key === INVOICE_EPC_QR_ENABLED_KEY ||
+    isInvoicePaymentSettingKey(key)
   );
 }
 
@@ -207,6 +224,10 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     const hosts = parseAllowedPrivateHosts(value);
     return hosts != null ? { value: hosts } : null;
   }
+  if (key === GUEST_STARTS_PER_IP_PER_HOUR_KEY || key === GUEST_DECLINES_PER_IP_PER_HOUR_KEY) {
+    const limit = parseGuestVelocityLimit(value);
+    return limit != null ? { value: limit } : null;
+  }
   if (key === PREPAID_LOW_CREDIT_THRESHOLD_KEY) {
     const cents = parsePrepaidLowCreditThresholdCents(value);
     return cents != null ? { value: cents } : null;
@@ -236,6 +257,11 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     const seller = normalizeInvoiceSellerSetting(key, value);
     return seller != null ? { value: seller } : null;
   }
+  if (isInvoicePaymentSettingKey(key)) {
+    const bank = normalizeInvoicePaymentSetting(key, value);
+    return bank != null ? { value: bank } : null;
+  }
+  if (key === INVOICE_EPC_QR_ENABLED_KEY) return typeof value === 'boolean' ? { value } : null;
   if (key !== COMPANY_CURRENCY_KEY) return { value };
   const code = typeof value === 'string' ? value.trim().toUpperCase() : value;
   return isSupportedCurrency(code) ? { value: code } : null;
@@ -277,6 +303,13 @@ const invalidWebhookAllowedHostsError = {
   code: 'VALIDATION_ERROR',
 };
 
+function invalidGuestVelocityLimitError(key: string): { error: string; code: string } {
+  return {
+    error: `${key} must be a whole number from 0 (no limit) to ${String(MAX_GUEST_VELOCITY_LIMIT)}`,
+    code: 'VALIDATION_ERROR',
+  };
+}
+
 const invalidPrepaidLowCreditThresholdError = {
   error: `${PREPAID_LOW_CREDIT_THRESHOLD_KEY} must be a whole number of cents from 0 to ${String(MAX_PREPAID_LOW_CREDIT_THRESHOLD_CENTS)}`,
   code: 'VALIDATION_ERROR',
@@ -301,6 +334,28 @@ const invalidPdfFooterError = {
   error: `${PDF_FOOTER_KEY} must be plain text of at most ${String(MAX_PDF_FOOTER_LENGTH)} characters and ${String(MAX_PDF_FOOTER_LINES)} lines`,
   code: 'VALIDATION_ERROR',
 };
+
+function invalidInvoicePaymentError(key: keyof typeof INVOICE_PAYMENT_MAX_LENGTHS): {
+  error: string;
+  code: string;
+} {
+  if (key === COMPANY_IBAN_KEY) {
+    return {
+      error: `${key} must be empty or a valid IBAN (ISO 13616 format and checksum)`,
+      code: 'VALIDATION_ERROR',
+    };
+  }
+  if (key === COMPANY_BIC_KEY) {
+    return {
+      error: `${key} must be empty or a BIC of 8 or 11 letters and digits`,
+      code: 'VALIDATION_ERROR',
+    };
+  }
+  return {
+    error: `${key} must be one line of text of at most ${String(INVOICE_PAYMENT_MAX_LENGTHS[key])} characters`,
+    code: 'VALIDATION_ERROR',
+  };
+}
 
 function invalidInvoiceSellerError(key: keyof typeof INVOICE_SELLER_MAX_LENGTHS): {
   error: string;
@@ -416,6 +471,9 @@ function invalidSettingError(key: string): { error: string; code: string } {
   const aiError = invalidAiSettingError(key);
   if (aiError != null) return aiError;
   if (key === WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY) return invalidWebhookAllowedHostsError;
+  if (key === GUEST_STARTS_PER_IP_PER_HOUR_KEY || key === GUEST_DECLINES_PER_IP_PER_HOUR_KEY) {
+    return invalidGuestVelocityLimitError(key);
+  }
   if (key === PREPAID_LOW_CREDIT_THRESHOLD_KEY) return invalidPrepaidLowCreditThresholdError;
   if (key === INVOICE_PAYMENT_TERMS_DAYS_KEY) return invalidInvoicePaymentTermsError;
   if (key === FLEET_CREDIT_RESERVATION_KEY) return invalidFleetCreditReservationError;
@@ -423,6 +481,10 @@ function invalidSettingError(key: string): { error: string; code: string } {
   if (key === PDF_LOGO_KEY) return invalidPdfLogoError;
   if (key === PDF_FOOTER_KEY) return invalidPdfFooterError;
   if (isInvoiceSellerSettingKey(key)) return invalidInvoiceSellerError(key);
+  if (isInvoicePaymentSettingKey(key)) return invalidInvoicePaymentError(key);
+  if (key === INVOICE_EPC_QR_ENABLED_KEY) {
+    return { error: `${key} must be true or false`, code: 'VALIDATION_ERROR' };
+  }
   if (key === MOBILE_APP_URL_SCHEMES_KEY) return invalidMobileAppSchemesError;
   if (key === MOBILE_APP_ANDROID_PACKAGES_KEY) return invalidMobileAppPackagesError;
   if (key === COMPANY_PRICE_DISPLAY_KEY) return invalidPriceDisplayError;
@@ -473,6 +535,10 @@ function clearCachesForKey(key: string): void {
   if (key === 'support.enabled') clearSupportCache();
   if (key === 'fleet.enabled') clearFleetCache();
   if (key === 'guest.enabled') clearGuestChargingCache();
+  if (key === GUEST_STARTS_PER_IP_PER_HOUR_KEY || key === GUEST_DECLINES_PER_IP_PER_HOUR_KEY) {
+    clearGuestVelocityCache();
+  }
+  if (key === 'company.portalUrl') clearCompanyPortalUrlCache();
   if (key.startsWith('pnc.')) clearPncSettingsCache();
   if (isAiSettingKey(key)) clearAiSettingsCache();
 }
@@ -574,6 +640,11 @@ export function settingsRoutes(app: FastifyInstance): void {
                   .describe(
                     'Whether guest charging (pay at the station without an account) is enabled',
                   ),
+                autochargeEnabled: z
+                  .boolean()
+                  .describe(
+                    'Whether Autocharge (charge by plugging in) is on company-wide or at any site, so drivers can turn it on for a vehicle',
+                  ),
                 chatbotAiEnabled: z
                   .boolean()
                   .describe('Whether the AI assistant is enabled for CSMS users'),
@@ -630,6 +701,7 @@ export function settingsRoutes(app: FastifyInstance): void {
       const pncEnabled = await isPncEnabled();
       const fleetEnabled = await isFleetEnabled();
       const guestChargingEnabled = await isGuestChargingEnabled();
+      const autochargeEnabled = await isAutochargeOffered();
       const chatbotAiEnabled = await isChatbotAiEnabled();
       const aiInsightsEnabled = await isAiInsightsEnabled();
       const driverAi = await readDriverAiAvailability();
@@ -642,6 +714,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         pncEnabled,
         fleetEnabled,
         guestChargingEnabled,
+        autochargeEnabled,
         chatbotAiEnabled,
         aiInsightsEnabled,
         driverAiSupport: driverAi.available,
@@ -818,7 +891,9 @@ export function settingsRoutes(app: FastifyInstance): void {
       );
       clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
+      if (row.key === 'autocharge.enabled') await invalidateAutochargeCaches(request.log);
       await repushStationMessagesIfChanged(row.key, before?.value, row.value, request.log);
+      await publishOcpiTariffSettingChange(row.key, before?.value, row.value);
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
   );
@@ -894,7 +969,9 @@ export function settingsRoutes(app: FastifyInstance): void {
       );
       clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
+      if (row.key === 'autocharge.enabled') await invalidateAutochargeCaches(request.log);
       await repushStationMessagesIfChanged(row.key, before?.value, row.value, request.log);
+      await publishOcpiTariffSettingChange(row.key, before?.value, row.value);
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
   );
@@ -945,7 +1022,9 @@ export function settingsRoutes(app: FastifyInstance): void {
       );
       clearCachesForKey(row.key);
       if (affectsNotificationSettings(row.key)) await invalidateNotificationSettings();
+      if (row.key === 'autocharge.enabled') await invalidateAutochargeCaches(request.log);
       await repushStationMessagesIfChanged(row.key, row.value, undefined, request.log);
+      await publishOcpiTariffSettingChange(row.key, row.value, undefined);
       return { key: row.key, value: decryptForRead(row.key, row.value) };
     },
   );

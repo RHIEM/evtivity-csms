@@ -84,6 +84,7 @@ export interface Station {
   id: string;
   stationId: string;
   siteId?: string | null;
+  siteName?: string | null;
   vendorName?: string | null;
   model: string | null;
   securityProfile?: number | undefined;
@@ -96,6 +97,7 @@ export interface Station {
   isSimulator?: boolean;
   siteFreeVendEnabled?: boolean;
   underMaintenance?: boolean;
+  aiInsightsSuppressed?: boolean;
   lastHeartbeat: string | null;
   createdAt: string | null;
 }
@@ -456,6 +458,15 @@ export function StationsTable({
                         {t('nav.maintenance')}
                       </Badge>
                     )}
+                    {station.aiInsightsSuppressed === true && (
+                      <Badge
+                        variant="secondary"
+                        className="text-[10px] px-1.5 py-0"
+                        data-testid="station-ai-suppressed-badge"
+                      >
+                        {t('stations.aiInsights.listBadge')}
+                      </Badge>
+                    )}
                   </span>
                 </TableCell>
               )}
@@ -469,7 +480,7 @@ export function StationsTable({
                         e.stopPropagation();
                       }}
                     >
-                      {siteMap.get(station.siteId) ?? station.siteId}
+                      {station.siteName ?? siteMap.get(station.siteId) ?? station.siteId}
                     </Link>
                   ) : (
                     '-'

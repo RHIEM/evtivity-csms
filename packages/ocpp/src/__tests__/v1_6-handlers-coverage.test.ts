@@ -15,11 +15,12 @@ const executeFn = vi.fn();
 vi.mock('@evtivity/database', () => {
   limitFn.mockResolvedValue([]);
   whereFn.mockReturnValue({ limit: limitFn });
-  fromFn.mockReturnValue({ where: whereFn });
+  fromFn.mockReturnValue({ where: whereFn, leftJoin: () => ({ where: whereFn }) });
   selectFn.mockReturnValue({ from: fromFn });
 
   return {
     db: { select: selectFn, execute: executeFn },
+    drivers: { id: 'id', isActive: 'is_active' },
     driverTokens: {
       isActive: 'is_active',
       idToken: 'id_token',
@@ -35,6 +36,11 @@ vi.mock('@evtivity/database', () => {
     },
     chargingStations: { id: 'id', stationId: 'station_id', siteId: 'site_id' },
     sites: { id: 'id', freeVendEnabled: 'free_vend_enabled' },
+    resolveOcpiTokenOwner: async () => {
+      const { ocpiOwnerFromRows } = await import('./helpers/ocpi-token-owner.js');
+      const rows = (await selectFn().from({}).where({}).limit(1)) as unknown[];
+      return ocpiOwnerFromRows(rows);
+    },
     isRoamingEnabled: vi.fn().mockResolvedValue(false),
     isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
   };
@@ -103,7 +109,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   limitFn.mockResolvedValue([]);
   whereFn.mockReturnValue({ limit: limitFn });
-  fromFn.mockReturnValue({ where: whereFn });
+  fromFn.mockReturnValue({ where: whereFn, leftJoin: () => ({ where: whereFn }) });
   selectFn.mockReturnValue({ from: fromFn });
   executeFn.mockResolvedValue([{ nextval: '1' }]);
 });

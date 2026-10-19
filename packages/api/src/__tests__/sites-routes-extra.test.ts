@@ -41,6 +41,7 @@ function makeChain() {
     'returning',
     'onConflictDoUpdate',
     'as',
+    'for',
   ];
   for (const m of methods) {
     chain[m] = vi.fn(() => chain);
@@ -92,6 +93,8 @@ vi.mock('@evtivity/database', async () => {
     delete: vi.fn(() => makeChain()),
   };
   return {
+    ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+    ...(await import('@evtivity/database/src/lib/ai-insight-suppression.js')),
     ...rawTimestamp,
     getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
     db: {
@@ -210,17 +213,31 @@ vi.mock('../lib/pricing-group-lookup.js', () => ({
   pricingGroupExists: vi.fn().mockResolvedValue(true),
 }));
 
-vi.mock('../lib/config-push.js', () => ({
-  pushTemplateToSiteStations: vi.fn((templateId: string) => Promise.resolve(`push-${templateId}`)),
+vi.mock('../lib/ocpi-location-push.js', () => ({
+  publishOcpiLocationPush: vi.fn().mockResolvedValue(undefined),
+  captureDeletedSiteLocation: vi.fn().mockResolvedValue(null),
+  publishOcpiDeletedSiteLocation: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { db, writeAudit, clearFreeVendCache, clearElectricityRateCache } from '@evtivity/database';
+vi.mock('../services/site-ai-insights.service.js', () => ({
+  suppressSiteAiInsights: vi.fn(),
+  resumeSiteAiInsights: vi.fn(),
+}));
+
+vi.mock('../services/free-vend.service.js', () => ({
+  setSiteFreeVend: vi.fn().mockResolvedValue({ pushId21: 'push-21', pushId16: '' }),
+}));
+
+import { db, writeAudit, clearElectricityRateCache } from '@evtivity/database';
 import { ilike, sql, eq, isNotNull, inArray } from 'drizzle-orm';
-import { FREE_VEND_OCPP_21_VARIABLES } from '@evtivity/lib';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
-import { pushTemplateToSiteStations } from '../lib/config-push.js';
+import { setSiteFreeVend } from '../services/free-vend.service.js';
+import {
+  resumeSiteAiInsights,
+  suppressSiteAiInsights,
+} from '../services/site-ai-insights.service.js';
 import { registerAuth } from '../plugins/auth.js';
 import { siteRoutes } from '../routes/sites.js';
 
@@ -541,6 +558,7 @@ describe('Site routes - extra coverage', () => {
         hoursOfOperation: null,
         metadata: null,
         stationMessageLanguage: null,
+        autochargeEnabled: null,
         aiInsightsEnabled: true,
         aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
@@ -941,6 +959,8 @@ describe('Site routes - extra coverage', () => {
     });
   });
 
+  // The switch itself (templates, restore capture, pushes) is covered against a
+  // real database in 112-site-lifecycle.integration.test.ts.
   describe('POST /sites/:id/free-vend', () => {
     const url = `/sites/${SITE_ID}/free-vend`;
 
@@ -954,109 +974,20 @@ describe('Site routes - extra coverage', () => {
       });
       expect(res.statusCode).toBe(404);
       expect(res.json().code).toBe('SITE_NOT_FOUND');
-      expect(db.transaction).not.toHaveBeenCalled();
-      expect(clearFreeVendCache).not.toHaveBeenCalled();
+      expect(setSiteFreeVend).not.toHaveBeenCalled();
     });
 
-    it('disables free vend without pushing templates', async () => {
-      const before = { ...siteRow, freeVendEnabled: true };
-      setupDbResults([before], [{ ...before, freeVendEnabled: false }]);
-      const res = await app.inject({
-        method: 'POST',
-        url,
-        headers: auth(),
-        payload: { enabled: false },
-      });
+    it.each([true, false])('switches free vend to %s and returns the push ids', async (enabled) => {
+      setupDbResults([siteRow]);
+      const res = await app.inject({ method: 'POST', url, headers: auth(), payload: { enabled } });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ success: true });
-      expect(setWrites()[0]?.['freeVendEnabled']).toBe(false);
-      expect(auditCalls()[0]).toMatchObject({ action: 'updated', notes: 'free-vend disabled' });
-      expect(clearFreeVendCache).toHaveBeenCalledTimes(1);
-      expect(db.transaction).not.toHaveBeenCalled();
-      expect(pushTemplateToSiteStations).not.toHaveBeenCalled();
-    });
-
-    it('creates both templates on first enable and pushes each to the site', async () => {
-      setupDbResults([siteRow], [{ id: 'tpl-21' }], [{ id: 'tpl-16' }], [siteRow]);
-      const res = await app.inject({
-        method: 'POST',
-        url,
-        headers: auth(),
-        payload: { enabled: true },
-      });
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({
-        success: true,
-        pushId21: 'push-tpl-21',
-        pushId16: 'push-tpl-16',
-      });
-
-      const [tpl21, tpl16] = valuesWrites();
-      expect(tpl21).toMatchObject({
-        name: 'Free Vend - Main Street (OCPP 2.1)',
-        ocppVersion: '2.1',
-        variables: FREE_VEND_OCPP_21_VARIABLES,
-        targetFilter: { siteId: SITE_ID },
-      });
-      expect(tpl16).toMatchObject({
-        name: 'Free Vend - Main Street (OCPP 1.6)',
-        ocppVersion: '1.6',
-        targetFilter: { siteId: SITE_ID },
-      });
-      for (const v of (tpl16 as { variables: { component: string; variable: string }[] })
-        .variables) {
-        expect(v.component).toBe(v.variable);
-      }
-      expect(setWrites()[0]).toMatchObject({
-        freeVendEnabled: true,
-        freeVendTemplateId21: 'tpl-21',
-        freeVendTemplateId16: 'tpl-16',
-      });
-      expect(auditCalls().map((a) => a.notes)).toEqual([
-        `auto-created for free-vend on site ${SITE_ID}`,
-        `auto-created for free-vend on site ${SITE_ID}`,
-        'free-vend enabled',
-      ]);
-      expect(pushTemplateToSiteStations).toHaveBeenCalledWith('tpl-21', SITE_ID);
-      expect(pushTemplateToSiteStations).toHaveBeenCalledWith('tpl-16', SITE_ID);
-      expect(clearFreeVendCache).toHaveBeenCalledTimes(1);
-    });
-
-    it('reuses existing templates on re-enable without creating new ones', async () => {
-      const existing = {
-        ...siteRow,
-        freeVendTemplateId21: 'old-21',
-        freeVendTemplateId16: 'old-16',
-      };
-      setupDbResults([existing], [existing]);
-      const res = await app.inject({
-        method: 'POST',
-        url,
-        headers: auth(),
-        payload: { enabled: true },
-      });
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({
-        success: true,
-        pushId21: 'push-old-21',
-        pushId16: 'push-old-16',
-      });
-      expect(valuesWrites()).toHaveLength(0);
-      expect(auditCalls()).toHaveLength(1);
-    });
-
-    it('skips the push for a template the insert did not return', async () => {
-      setupDbResults([siteRow], [], [{ id: 'tpl-16' }], [siteRow]);
-      const res = await app.inject({
-        method: 'POST',
-        url,
-        headers: auth(),
-        payload: { enabled: true },
-      });
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ success: true, pushId21: '', pushId16: 'push-tpl-16' });
-      expect(pushTemplateToSiteStations).toHaveBeenCalledTimes(1);
-      expect(setWrites()[0]).toMatchObject({ freeVendTemplateId21: null });
+      expect(res.json()).toEqual({ success: true, pushId21: 'push-21', pushId16: '' });
+      expect(setSiteFreeVend).toHaveBeenCalledWith(
+        expect.objectContaining({ id: SITE_ID }),
+        enabled,
+        expect.objectContaining({ actor: 'operator' }),
+        expect.anything(),
+      );
     });
   });
 
@@ -1262,6 +1193,118 @@ describe('Site routes - extra coverage', () => {
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ success: true });
       expect(clearElectricityRateCache).toHaveBeenCalledWith(SITE_ID);
+    });
+  });
+
+  describe('AI insight suppression of a site', () => {
+    const suppression = {
+      suppressedAt: new Date('2026-10-15T10:00:00Z'),
+      suppressedUntil: null,
+      suppressedBy: USER_ID,
+      suppressedByName: 'Ada Lovelace',
+      reason: 'Rebuild',
+    };
+
+    it('filters the list to suppressed sites and to sites in scope', async () => {
+      setupDbResults([], [{ count: 0 }]);
+      await app.inject({ method: 'GET', url: '/sites?aiInsights=in_scope', headers: auth() });
+      expect(sqlTexts().some((t) => t.startsWith('NOT '))).toBe(true);
+      vi.clearAllMocks();
+      setupDbResults([], [{ count: 0 }]);
+      await app.inject({ method: 'GET', url: '/sites?aiInsights=suppressed', headers: auth() });
+      expect(sqlTexts().some((t) => t.startsWith('NOT '))).toBe(false);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/sites?aiInsights=maybe',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('suppresses until a date and returns the counts', async () => {
+      vi.mocked(suppressSiteAiInsights).mockResolvedValueOnce({
+        ...suppression,
+        suppressedUntil: new Date('2030-01-01T00:00:00Z'),
+        insightsDismissed: 3,
+        actionsExpired: 1,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/suppress`,
+        headers: auth(),
+        payload: { reason: ' Rebuild ', until: '2030-01-01T00:00:00Z' },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json<Record<string, unknown>>();
+      expect(body).toMatchObject({
+        aiInsightsSuppressedByName: 'Ada Lovelace',
+        aiInsightsSuppressedReason: 'Rebuild',
+        insightsDismissed: 3,
+        actionsExpired: 1,
+      });
+      const [siteId, input] = vi.mocked(suppressSiteAiInsights).mock.calls[0] ?? [];
+      expect(siteId).toBe(SITE_ID);
+      expect(input).toEqual({ reason: 'Rebuild', until: new Date('2030-01-01T00:00:00Z') });
+    });
+
+    it('refuses an end date in the past and an empty reason', async () => {
+      const past = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/suppress`,
+        headers: auth(),
+        payload: { reason: 'Rebuild', until: '2020-01-01T00:00:00Z' },
+      });
+      expect(past.statusCode).toBe(400);
+      expect(past.json<{ code: string }>().code).toBe('VALIDATION_ERROR');
+      const empty = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/suppress`,
+        headers: auth(),
+        payload: { reason: '  ' },
+      });
+      expect(empty.statusCode).toBe(400);
+      expect(suppressSiteAiInsights).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 for a site outside the user scope and for an unknown site', async () => {
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce([OTHER_SITE_ID]);
+      const hidden = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/suppress`,
+        headers: auth(),
+        payload: { reason: 'Rebuild' },
+      });
+      expect(hidden.statusCode).toBe(404);
+      expect(hidden.json<{ code: string }>().code).toBe('SITE_NOT_FOUND');
+      expect(suppressSiteAiInsights).not.toHaveBeenCalled();
+
+      vi.mocked(resumeSiteAiInsights).mockResolvedValueOnce(null);
+      const unknown = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/resume`,
+        headers: auth(),
+        payload: {},
+      });
+      expect(unknown.statusCode).toBe(404);
+    });
+
+    it('resumes the site', async () => {
+      vi.mocked(resumeSiteAiInsights).mockResolvedValueOnce({
+        suppressedAt: null,
+        suppressedUntil: null,
+        suppressedBy: null,
+        suppressedByName: null,
+        reason: null,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: `/sites/${SITE_ID}/ai-insights/resume`,
+        headers: auth(),
+        payload: {},
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json<Record<string, unknown>>().aiInsightsSuppressedAt).toBeNull();
+      expect(vi.mocked(resumeSiteAiInsights).mock.calls[0]?.[0]).toBe(SITE_ID);
     });
   });
 });

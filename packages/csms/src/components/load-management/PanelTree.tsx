@@ -40,6 +40,7 @@ interface CircuitStatus {
   currentDrawKw: number;
   availableKw: number;
   phaseConnections?: string | null;
+  voltageV?: number | null;
   stations: CircuitStation[];
   unmanagedLoads: UnmanagedLoad[];
 }
@@ -59,6 +60,7 @@ interface PanelStatus {
   maxContinuousKw: number;
   safetyMarginKw: number;
   oversubscriptionRatio: number;
+  phaseConnections?: string | null;
   currentDrawKw: number;
   availableKw: number;
   utilization: number;
@@ -215,6 +217,11 @@ function PanelNode({
               <span className="text-xs text-muted-foreground">
                 {panel.voltageV}V {panel.phases}ph
               </span>
+              {panel.phaseConnections != null && (
+                <Badge variant="outline" className="text-xs px-1.5 py-0">
+                  {panel.phaseConnections}
+                </Badge>
+              )}
               <span className="text-xs text-muted-foreground">
                 {formatNumber(panel.maxContinuousKw, 1)} kW max
               </span>
@@ -264,8 +271,7 @@ function PanelNode({
           <div className="flex items-center gap-1">
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.editPanel')}
               onClick={() => {
                 setEditPanelOpen(true);
@@ -275,8 +281,7 @@ function PanelNode({
             </Button>
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.addCircuit')}
               onClick={() => {
                 setAddCircuitOpen(true);
@@ -286,8 +291,7 @@ function PanelNode({
             </Button>
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.deletePanel')}
               onClick={() => {
                 setDeleteOpen(true);
@@ -481,6 +485,11 @@ function CircuitNode({
                 {circuit.phaseConnections}
               </Badge>
             )}
+            {circuit.voltageV != null && (
+              <Badge variant="outline" className="text-xs px-1.5 py-0">
+                {circuit.voltageV}V
+              </Badge>
+            )}
             <span className="text-xs text-muted-foreground">
               {formatNumber(circuit.maxContinuousKw, 1)} kW max
             </span>
@@ -497,8 +506,7 @@ function CircuitNode({
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.editCircuit')}
             onClick={() => {
               setEditOpen(true);
@@ -508,8 +516,7 @@ function CircuitNode({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.assignStation')}
             onClick={() => {
               setAssignOpen(true);
@@ -519,8 +526,7 @@ function CircuitNode({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.deleteCircuit')}
             onClick={() => {
               setDeleteOpen(true);
@@ -550,8 +556,8 @@ function CircuitNode({
               )}
               <Button
                 variant="ghost"
-                size="icon"
-                className="h-5 w-5 ml-auto"
+                size="icon-xs"
+                className="ml-auto"
                 aria-label={t('loadManagement.unassignStation')}
                 onClick={() => {
                   unassignMutation.mutate(station.id);
@@ -575,11 +581,10 @@ function CircuitNode({
       <div className="mt-2 pl-2">
         <Button
           variant="outline"
-          size="sm"
+          size="xs"
           onClick={() => {
             setAddLoadOpen(true);
           }}
-          className="text-xs h-6"
         >
           <Plus className="h-3 w-3" />
           {t('loadManagement.addUnmanagedLoad')}
@@ -663,8 +668,7 @@ function UnmanagedLoadItem({
       <span className="text-muted-foreground">({formatNumber(load.estimatedDrawKw, 1)} kW)</span>
       <Button
         variant="ghost"
-        size="icon"
-        className="h-5 w-5"
+        size="icon-xs"
         aria-label={t('loadManagement.deleteLoad', { name: load.name })}
         onClick={() => {
           deleteMutation.mutate();

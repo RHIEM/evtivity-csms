@@ -4,8 +4,8 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, and, count, sql, inArray, desc } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import { eq, and, or, count, sql, inArray, desc, isNull } from 'drizzle-orm';
+import { db, isOperatorStation } from '@evtivity/database';
 import {
   cssStations,
   cssEvses,
@@ -132,6 +132,17 @@ export const HIGH_LEVEL_ACTIONS = [
   'reservationReply',
 ] as const;
 
+// Plug and Charge EV actions, registered under both v16/ and v21/ prefixes: a 1.6
+// station runs them over DataTransfer (OCA application note "Using ISO 15118
+// Plug & Charge with OCPP 1.6", ISO 15118-2 EVs only).
+export const PNC_ACTIONS = [
+  'createPncEv',
+  'installPncContract',
+  'updatePncContract',
+  'authorizePnc',
+  'startPncCharging',
+] as const;
+
 // Station-initiated messages registered under both v16/ and v21/ prefixes
 export const STATION_MESSAGE_ACTIONS = [
   'sendBootNotification',
@@ -161,9 +172,6 @@ export const ACTION_VERSIONS: Record<string, 'all' | 'ocpp1.6' | 'ocpp2.1'> = {
   reservationReply: 'all',
 
   // OCPP 2.1 only
-  createPncEv: 'ocpp2.1',
-  installPncContract: 'ocpp2.1',
-  startPncCharging: 'ocpp2.1',
   sendTransactionEvent: 'ocpp2.1',
   sendLogStatusNotification: 'ocpp2.1',
   sendSecurityEventNotification: 'ocpp2.1',
@@ -316,6 +324,31 @@ const actionResponse = z
 
 const plugInBody = z.object({
   evseId: z.number().int().describe('EVSE ID'),
+  ev: z
+    .object({
+      evccid: z
+        .string()
+        .min(1)
+        .max(255)
+        .optional()
+        .describe(
+          'EVCCID of the EV charging controller (ISO 15118-2: the MAC address). A 2.1 transaction start on the EVSE carries it in idToken.additionalInfo (type EVCCID)',
+        ),
+      vin: z.string().min(1).max(17).optional().describe('VIN of the EV'),
+      autocharge: z
+        .enum(['MacAddress', 'EVCCID', 'VIN'])
+        .optional()
+        .describe(
+          'Autocharge: after the plug-in the station authorizes the EV by this id and starts the transaction when accepted (2.1 idToken type; 1.6 idTag). The result is in data.autocharge',
+        ),
+      idTagPrefix: z
+        .string()
+        .max(10)
+        .optional()
+        .describe('OCPP 1.6 idTag prefix (default VID: for a MAC address, none for a VIN)'),
+    })
+    .optional()
+    .describe('The EV plugged in (simulated vehicle ids)'),
 });
 
 const authorizeBody = z.object({
@@ -444,11 +477,21 @@ const createPncEvBody = z.object({
   edition: z
     .union([z.literal(2), z.literal(20)])
     .optional()
-    .describe('ISO 15118 edition of the EV: 2 (ISO 15118-2, default) or 20 (ISO 15118-20)'),
+    .describe(
+      'ISO 15118 edition of the EV: 2 (ISO 15118-2, default) or 20 (ISO 15118-20, OCPP 2.1 stations only)',
+    ),
 });
 
 const installPncContractBody = z.object({
   evseId: z.number().int().describe('EVSE ID of the EV created with createPncEv'),
+});
+
+const updatePncContractBody = z.object({
+  evseId: z.number().int().describe('EVSE ID of the ISO 15118-2 EV with an installed contract'),
+});
+
+const authorizePncBody = z.object({
+  evseId: z.number().int().describe('EVSE ID of the EV with an installed contract'),
 });
 
 const startPncChargingBody = z.object({
@@ -1412,8 +1455,11 @@ export function cssRoutes(app: FastifyInstance): void {
       // because some css_stations rows have no charging_stations pair (legacy
       // seeded fixtures). Rows without a pair or with siteId=null are visible
       // to all-site users only, per site-access-control.md.
-      const accessCondition =
-        siteIds == null ? undefined : inArray(chargingStations.siteId, siteIds);
+      // The simulators of conformance test stations are never listed.
+      const accessCondition = and(
+        or(isNull(chargingStations.id), isOperatorStation()),
+        siteIds == null ? undefined : inArray(chargingStations.siteId, siteIds),
+      );
 
       const [data, totalResult] = await Promise.all([
         db
@@ -1891,27 +1937,44 @@ export function cssRoutes(app: FastifyInstance): void {
     'Send SecurityEventNotification',
     sendSecurityEventNotificationBody,
   );
-  actionRoute(
-    app,
-    'createPncEv',
-    'ocpp2.1',
-    'Plug and Charge: create an EV with an OEM provisioning certificate (returns pcid and oemRootCertificate)',
-    createPncEvBody,
-  );
-  actionRoute(
-    app,
-    'installPncContract',
-    'ocpp2.1',
-    'Plug and Charge: the EV installs a contract through Get15118EVCertificate (returns emaid)',
-    installPncContractBody,
-  );
-  actionRoute(
-    app,
-    'startPncCharging',
-    'ocpp2.1',
-    'Plug and Charge: Authorize with the eMAID and certificate hash data, then start',
-    startPncChargingBody,
-  );
+  // --- Plug and Charge EV actions (both versions) ---
+  for (const ver of ['ocpp1.6', 'ocpp2.1'] as const) {
+    actionRoute(
+      app,
+      'createPncEv',
+      ver,
+      'Plug and Charge: create an EV with an OEM provisioning certificate (returns pcid and oemRootCertificate)',
+      createPncEvBody,
+    );
+    actionRoute(
+      app,
+      'installPncContract',
+      ver,
+      'Plug and Charge: the EV installs a contract through Get15118EVCertificate (returns emaid)',
+      installPncContractBody,
+    );
+    actionRoute(
+      app,
+      'updatePncContract',
+      ver,
+      'Plug and Charge: the EV updates its contract through Get15118EVCertificate Update (ISO 15118-2, returns emaid)',
+      updatePncContractBody,
+    );
+    actionRoute(
+      app,
+      'authorizePnc',
+      ver,
+      'Plug and Charge: Authorize with the eMAID and certificate hash data without starting (returns status and certificateStatus)',
+      authorizePncBody,
+    );
+    actionRoute(
+      app,
+      'startPncCharging',
+      ver,
+      'Plug and Charge: Authorize with the eMAID and certificate hash data, then start',
+      startPncChargingBody,
+    );
+  }
   actionRoute(app, 'sendNotifyEvent', 'ocpp2.1', 'Send NotifyEvent', sendNotifyEventBody);
   actionRoute(app, 'sendNotifyReport', 'ocpp2.1', 'Send NotifyReport', sendNotifyReportBody);
   actionRoute(

@@ -205,6 +205,23 @@ describe('docker/redis/acl-rules.conf', () => {
         false,
       );
     }
+    // Guest start velocity counters (per IP, one-hour windows); api only.
+    const guestVelocityPrefix = /GUEST_VELOCITY_KEY_PREFIX = '([^']+)'/.exec(
+      readFileSync(join(ROOT, 'packages/api/src/lib/guest-velocity.ts'), 'utf8'),
+    )?.[1];
+    expect(guestVelocityPrefix).toBeDefined();
+    expect(grantsKey(user('api'), `${guestVelocityPrefix as string}start:1.2.3.4:1`, 'rw')).toBe(
+      true,
+    );
+    expect(grantsKey(user('api'), `${guestVelocityPrefix as string}decline:1.2.3.4:1`, 'rw')).toBe(
+      true,
+    );
+    for (const name of ['ocpp', 'ocpi', 'worker', 'css']) {
+      expect(
+        grantsKey(user(name), `${guestVelocityPrefix as string}start:1.2.3.4:1`, 'r'),
+        name,
+      ).toBe(false);
+    }
     expect(grantsKey(user('api'), watchKey as string, 'r')).toBe(true);
     expect(grantsKey(user('api'), watchKey as string, 'rw')).toBe(false);
     // OCPI pull lock and its own BullMQ queue (ocpi-cdrs), no other queue.
@@ -221,7 +238,13 @@ describe('docker/redis/acl-rules.conf', () => {
         'station-messages',
         'station-watch',
       ],
-      ocpp: ['maintenance-fanout', 'payment-webhooks', 'station-messages', 'station-watch'],
+      ocpp: [
+        'maintenance-fanout',
+        'payment-stops',
+        'payment-webhooks',
+        'station-messages',
+        'station-watch',
+      ],
     };
     for (const [name, queues] of Object.entries(producerQueues)) {
       for (const queue of queues) {

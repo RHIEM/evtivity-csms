@@ -82,6 +82,15 @@ vi.mock('@evtivity/database', () => ({
   clearSupportCache: vi.fn(),
   clearFleetCache: vi.fn(),
   WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY: 'notifications.webhookAllowedPrivateHosts',
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY: 'guest.startsPerIpPerHour',
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY: 'guest.declinesPerIpPerHour',
+  MAX_GUEST_VELOCITY_LIMIT: 10_000,
+  parseGuestVelocityLimit: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000
+      ? value
+      : null,
+  clearGuestVelocityCache: vi.fn(),
+  clearGuestChargingCache: vi.fn(),
   PREPAID_LOW_CREDIT_THRESHOLD_KEY: 'prepaid.lowCreditThresholdCents',
   MAX_PREPAID_LOW_CREDIT_THRESHOLD_CENTS: 100_000_000,
   parsePrepaidLowCreditThresholdCents: (value: unknown) =>
@@ -187,6 +196,7 @@ import {
   clearStationMessageSettingsCache,
   invalidateReservationSettingsCache,
   clearPrepaidSettingsCache,
+  clearGuestVelocityCache,
   clearInvoiceSettingsCache,
   clearFleetCreditSettingsCache,
 } from '@evtivity/database';
@@ -496,6 +506,36 @@ describe('Settings routes', () => {
     expect(clearSystemSettingsCache).not.toHaveBeenCalled();
   });
 
+  it.each([-1, 2.5, '30', 10_001])(
+    'PUT /v1/settings/guest.startsPerIpPerHour rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/guest.startsPerIpPerHour',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('guest.startsPerIpPerHour');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it('PUT /v1/settings/guest.declinesPerIpPerHour stores 0 (no limit) and clears the cache', async () => {
+    vi.mocked(clearGuestVelocityCache).mockClear();
+    setupDbResults([], [{ key: 'guest.declinesPerIpPerHour', value: 0 }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/guest.declinesPerIpPerHour',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 0 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearGuestVelocityCache).toHaveBeenCalled();
+  });
+
   it.each([-1, 2.5, '500', 100_000_001])(
     'PUT /v1/settings/prepaid.lowCreditThresholdCents rejects %s',
     async (value) => {
@@ -716,6 +756,50 @@ describe('Settings routes', () => {
     ['company.invoiceEmail', 'billing'],
     ['company.invoicePhone', 'x'.repeat(41)],
   ])('PUT /v1/settings/%s rejects an invalid value', async (key, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain(key);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['company.iban', ' de89 3704 0044 0532 0130 00 ', 'DE89370400440532013000'],
+    ['company.bic', 'cobadeffxxx', 'COBADEFFXXX'],
+    ['company.bankAccountHolder', '  Acme Charging GmbH ', 'Acme Charging GmbH'],
+    ['company.iban', '', ''],
+    ['invoice.epcQrEnabled', false, false],
+  ])('PUT /v1/settings/%s stores the normalized value', async (key, value, stored) => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key, value: stored }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key, value: stored });
+  });
+
+  it.each([
+    ['company.iban', 'DE89370400440532013001'],
+    ['company.iban', 'DE89-3704'],
+    ['company.bic', 'COBADEF'],
+    ['company.bic', 'COBA1EFF'],
+    ['company.bankAccountHolder', 'x'.repeat(71)],
+    ['company.bankName', 'Bank\nName'],
+    ['invoice.epcQrEnabled', 'yes'],
+  ])('PUT /v1/settings/%s rejects %j', async (key, value) => {
     vi.mocked(db.insert).mockClear();
     const response = await app.inject({
       method: 'PUT',

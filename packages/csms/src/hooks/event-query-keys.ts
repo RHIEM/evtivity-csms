@@ -107,7 +107,6 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
         keys.push(['stations', stationId, 'energy-history']);
         keys.push(['stations', stationId, 'revenue-history']);
         keys.push(['stations', stationId, 'metrics']);
-        keys.push(['station-meter-values']);
       }
       if (siteId != null) {
         keys.push(['sites', siteId, 'meter-values']);
@@ -183,6 +182,13 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
 
     case 'ai.usage.threshold':
       keys.push(['ai', 'usage']);
+      // The company budget part of the AI alert banner.
+      keys.push(['ai', 'alerts']);
+      break;
+
+    // A provider quota alert started or cleared (AI alert banner).
+    case 'ai.alerts.changed':
+      keys.push(['ai', 'alerts']);
       break;
 
     case 'certificate.signed':

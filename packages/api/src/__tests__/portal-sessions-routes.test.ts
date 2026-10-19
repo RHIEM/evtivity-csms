@@ -51,7 +51,8 @@ function makeChain() {
 
 vi.mock('../lib/session-limit.js', () => ({ sessionLimitReached: vi.fn(async () => null) }));
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
@@ -167,6 +168,7 @@ describe('Portal sessions routes - handler logic', () => {
             siteState: 'TX',
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [{ count: 1 }],
@@ -202,6 +204,7 @@ describe('Portal sessions routes - handler logic', () => {
         siteState: null,
         co2AvoidedKg: null,
         reservationId: null,
+        autocharge: false,
       };
       setupDbResults(
         [
@@ -267,6 +270,19 @@ describe('Portal sessions routes - handler logic', () => {
       expect(body.total).toBe(0);
     });
 
+    it('never lists a session at a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.inOperatorStation).mockClear();
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/sessions',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.inOperatorStation)).toHaveBeenCalled();
+    });
+
     it('uses default pagination when no query params', async () => {
       setupDbResults([], [{ count: 0 }]);
       const response = await app.inject({
@@ -325,33 +341,17 @@ describe('Portal sessions routes - handler logic', () => {
       expect(response.json().code).toBe('SESSION_NOT_FOUND');
     });
 
-    it('returns 403 when session belongs to another driver', async () => {
-      setupDbResults([
-        {
-          id: VALID_SESSION_ID,
-          transactionId: 'tx-1',
-          status: 'completed',
-          startedAt: '2024-01-01T00:00:00Z',
-          endedAt: '2024-01-01T01:00:00Z',
-          energyDeliveredWh: 10000,
-          currentCostCents: null,
-          finalCostCents: 500,
-          currency: 'USD',
-          meterStart: 0,
-          meterStop: 10000,
-          stoppedReason: 'EVDisconnected',
-          stationName: 'CS-001',
-          siteName: 'Site A',
-          driverId: 'other-driver-id',
-        },
-      ]);
+    it('returns 404 when the session belongs to another driver (filtered by the query)', async () => {
+      // The driver id is part of the WHERE: another driver's session reads as
+      // no row, so its existence is not revealed.
+      setupDbResults([]);
       const response = await app.inject({
         method: 'GET',
         url: `/portal/sessions/${VALID_SESSION_ID}`,
         headers: { authorization: `Bearer ${driverToken}` },
       });
-      expect(response.statusCode).toBe(403);
-      expect(response.json().code).toBe('FORBIDDEN');
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SESSION_NOT_FOUND');
     });
 
     it('returns session detail with payment when session belongs to driver', async () => {
@@ -389,6 +389,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [
@@ -460,6 +461,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [],
@@ -503,6 +505,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [],
@@ -545,6 +548,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
             billingMode: 'account',
             billingFleetName: 'Acme',
             billingInvoiceStatus: 'paid',

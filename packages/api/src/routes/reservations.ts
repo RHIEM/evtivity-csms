@@ -8,7 +8,8 @@ import {
   reservationCancellationFeeView,
 } from '../lib/reservation-fee-view.js';
 import { eq, and, or, ilike, desc, sql, count, inArray } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import type { SQL } from 'drizzle-orm';
+import { db, isOperatorStation } from '@evtivity/database';
 import {
   reservations,
   reservationAuditLog,
@@ -318,7 +319,13 @@ const listReservationsQuery = paginationQuery.extend({
 
 const createReservationBody = z.object({
   stationId: z.string().describe('OCPP station identifier string'),
-  evseId: z.coerce.number().int().optional().describe('EVSE ID on the station'),
+  evseId: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(2147483647)
+    .optional()
+    .describe('EVSE ID on the station'),
   driverId: ID_PARAMS.driverId.optional().describe('Driver ID to associate with the reservation'),
   tokenId: ID_PARAMS.driverTokenId
     .optional()
@@ -331,7 +338,14 @@ const createReservationBody = z.object({
 
 const updateReservationBody = z.object({
   driverId: ID_PARAMS.driverId.nullable().optional().describe('Driver ID'),
-  evseId: z.coerce.number().int().nullable().optional().describe('EVSE ID on the station'),
+  evseId: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(2147483647)
+    .nullable()
+    .optional()
+    .describe('EVSE ID on the station'),
   expiresAt: z.string().datetime().optional().describe('ISO 8601 expiration date-time'),
   tokenId: ID_PARAMS.driverTokenId
     .nullable()
@@ -379,7 +393,8 @@ export function reservationRoutes(app: FastifyInstance): void {
       const limit = query.limit;
       const offset = (page - 1) * limit;
 
-      const conditions = [];
+      // Reservations of conformance test stations are never listed.
+      const conditions: (SQL | undefined)[] = [isOperatorStation()];
       if (query.search != null && query.search !== '') {
         const pattern = `%${query.search}%`;
         conditions.push(
@@ -406,7 +421,7 @@ export function reservationRoutes(app: FastifyInstance): void {
       if (siteIds != null && siteIds.length === 0) return { data: [], total: 0 };
       if (siteIds != null) conditions.push(inArray(chargingStations.siteId, siteIds));
 
-      const where = conditions.length > 0 ? and(...conditions) : undefined;
+      const where = and(...conditions);
 
       const [data, totalResult] = await Promise.all([
         db

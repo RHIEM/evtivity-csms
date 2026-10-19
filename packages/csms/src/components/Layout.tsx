@@ -9,6 +9,7 @@ import { Menu, X, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { AiAssistantLauncher } from '@/components/ai/AiAssistantLauncher';
+import { AiAlertsBanner } from '@/components/ai/alerts/AiAlertsBanner';
 import { SidebarNav } from '@/components/layout/SidebarNav';
 import { UserDropdown } from '@/components/layout/UserDropdown';
 import { useAuth, useHasAllSiteAccess } from '@/lib/auth';
@@ -50,8 +51,8 @@ function SidebarContent({
           {!collapsed && onToggleCollapse != null && (
             <Button
               variant="ghost"
-              size="icon"
-              className="ml-auto h-7 w-7 shrink-0"
+              size="icon-sm"
+              className="ml-auto shrink-0"
               onClick={onToggleCollapse}
               aria-label={t('nav.collapseSidebar')}
             >
@@ -65,8 +66,8 @@ function SidebarContent({
         {collapsed && onToggleCollapse != null && (
           <Button
             variant="ghost"
-            size="icon"
-            className="mt-2 mx-auto h-7 w-7"
+            size="icon-sm"
+            className="mt-2 mx-auto"
             onClick={onToggleCollapse}
             aria-label={t('nav.expandSidebar')}
           >
@@ -139,6 +140,9 @@ export function Layout(): React.JSX.Element {
   useEffect(() => {
     setMobileNavOpen(false);
   }, [location.pathname]);
+
+  const onAiSettings =
+    location.pathname === '/settings' && new URLSearchParams(location.search).get('tab') === 'ai';
 
   return (
     <div className="flex h-screen">
@@ -221,6 +225,8 @@ export function Layout(): React.JSX.Element {
           </div>
         </header>
         <main className="flex-1 overflow-auto bg-background px-4 py-4 lg:px-6 lg:py-6">
+          {/* Settings > AI shows the same alerts at its top. */}
+          {!onAiSettings && <AiAlertsBanner className="mb-4" />}
           <Outlet />
         </main>
       </div>

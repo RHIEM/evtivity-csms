@@ -27,8 +27,15 @@ describe('AI roadmap events (v0.1.44)', () => {
     expect(IMMEDIATE_EVENT_TYPES.has('ai.insight.updated')).toBe(true);
   });
 
-  it('ai.usage.threshold refreshes the usage views', () => {
-    expect(getQueryKeysForEvent(makeEvent('ai.usage.threshold'))).toEqual([['ai', 'usage']]);
+  it('ai.usage.threshold refreshes the usage views and the AI alert banner', () => {
+    expect(getQueryKeysForEvent(makeEvent('ai.usage.threshold'))).toEqual([
+      ['ai', 'usage'],
+      ['ai', 'alerts'],
+    ]);
+  });
+
+  it('ai.alerts.changed refreshes the AI alert banner', () => {
+    expect(getQueryKeysForEvent(makeEvent('ai.alerts.changed'))).toEqual([['ai', 'alerts']]);
   });
 });
 
@@ -168,7 +175,6 @@ describe('getQueryKeysForEvent', () => {
       makeEvent('meter.values', { stationId: 'CS-1', siteId: 'S-1' }),
     );
     expect(hasKey(keys, ['stations', 'CS-1', 'meter-values'])).toBe(true);
-    expect(hasKey(keys, ['station-meter-values'])).toBe(true);
     expect(hasKey(keys, ['sites', 'S-1', 'load-management'])).toBe(true);
     expect(hasKey(keys, ['sites', 'S-1', 'energy-history'])).toBe(true);
     expect(getQueryKeysForEvent(makeEvent('meter.values'))).toEqual([

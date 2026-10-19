@@ -25,6 +25,8 @@ import {
   firmwareCampaigns,
   octtRuns,
   aiInsights,
+  isOperatorStation,
+  inOperatorStation,
 } from '@evtivity/database';
 import { INSIGHT_VISIBLE_STATUSES } from '@evtivity/lib/ai-insights';
 import type { JwtPayload } from '../plugins/auth.js';
@@ -86,15 +88,6 @@ interface NeighborTarget {
   allSitesOnly?: boolean;
 }
 
-const stationSiteSubquery = (siteIds: string[]): SQL =>
-  inArray(
-    chargingSessions.stationId,
-    db
-      .select({ id: chargingStations.id })
-      .from(chargingStations)
-      .where(inArray(chargingStations.siteId, siteIds)),
-  );
-
 const TARGETS: NeighborTarget[] = [
   {
     path: '/ai/insights/:id/neighbors',
@@ -134,6 +127,8 @@ const TARGETS: NeighborTarget[] = [
     createdAtColumn: chargingStations.createdAt,
     // Stations with no site are visible to all-site users only, matching the list.
     scopeWhere: (siteIds) => inArray(chargingStations.siteId, siteIds),
+    // Conformance test stations are not in the list, so paging skips them.
+    baseWhere: isOperatorStation(),
   },
   {
     path: '/sessions/:id/neighbors',
@@ -143,7 +138,11 @@ const TARGETS: NeighborTarget[] = [
     notFoundCode: 'SESSION_NOT_FOUND',
     idColumn: chargingSessions.id,
     createdAtColumn: chargingSessions.createdAt,
-    scopeWhere: (siteIds) => stationSiteSubquery(siteIds),
+    // The site the session happened at, matching the list: a session without
+    // a site is visible to all-site users only.
+    scopeWhere: (siteIds) => inArray(chargingSessions.siteId, siteIds),
+    // Sessions of conformance test stations are not in the list.
+    baseWhere: inOperatorStation(chargingSessions.stationId),
   },
   {
     path: '/drivers/:id/neighbors',
@@ -201,6 +200,8 @@ const TARGETS: NeighborTarget[] = [
           .from(chargingStations)
           .where(inArray(chargingStations.siteId, siteIds)),
       ),
+    // Reservations of conformance test stations are not in the list.
+    baseWhere: inOperatorStation(reservations.stationId),
   },
   {
     path: '/invoices/:id/neighbors',

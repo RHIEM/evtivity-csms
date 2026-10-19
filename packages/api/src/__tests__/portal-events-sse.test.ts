@@ -17,12 +17,13 @@ const { subscribe, handlers, stationRows } = vi.hoisted(() => {
   return { subscribe, handlers, stationRows: { value: [] as unknown[] } };
 });
 
-vi.mock('@evtivity/database', () => {
+vi.mock('@evtivity/database', async () => {
   const chain: Record<string, unknown> = {};
   for (const m of ['select', 'from', 'where', 'limit']) chain[m] = vi.fn(() => chain);
   chain['then'] = (resolve: (v: unknown) => unknown) =>
     Promise.resolve(stationRows.value).then(resolve);
   return {
+    ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
     db: chain,
     client: {},
     refreshTokens: {},
@@ -185,7 +186,9 @@ describe('portal event streams', () => {
     const stream = await open(
       port,
       '/portal/events',
-      app.jwt.sign({ driverId: 'drv_exp', type: 'driver' }, { expiresIn: '1s' }),
+      // 2 s: the exp claim is whole seconds, so 1 s could expire before the
+      // request reached the route on a loaded machine (401 instead of 200).
+      app.jwt.sign({ driverId: 'drv_exp', type: 'driver' }, { expiresIn: '2s' }),
     );
     expect(stream.status).toBe(200);
     await stream.waitFor(': connected');

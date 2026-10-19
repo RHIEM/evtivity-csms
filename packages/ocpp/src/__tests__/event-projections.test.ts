@@ -26,6 +26,9 @@ function createSqlMock() {
     // The resend check (TransactionProjector.isResentEvent) answers by text,
     // outside the queued results: no event is a resend unless a test says so.
     if (strings.join('?').includes('AND te.seq_no = ?')) return Promise.resolve([]);
+    // The late Ended check (TransactionProjector.recordLateEnded) answers the
+    // same way: no session has ended through another Ended.
+    if (strings.join('?').includes("te.event_type = 'ended'")) return Promise.resolve([]);
     const result = sqlResults[sqlCallIndex] ?? [];
     sqlCallIndex++;
     const failure = sqlFailOn?.(strings.join(''));
@@ -108,9 +111,20 @@ vi.mock('../../../database/src/lib/audit.js', () => ({
 vi.mock('@evtivity/database', async () => ({
   // The session audit of a CSMS stop or fault (tested in payment-stop.test.ts).
   writeCsmsSessionAudit: vi.fn().mockResolvedValue(undefined),
+  // The session site sub-select (lib/session-site.ts), a plain value here.
+  sessionSiteIdSql: vi.fn(() => 'site-of-station'),
+  // The real OCPI token owner checks (one statement each), on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/ocpi-token-startable.js',
+  )),
   // The real firmware update and campaign progress writes, on the mocked client.
   ...(await vi.importActual<Record<string, unknown>>(
     '../../../database/src/lib/firmware-updates.js',
+  )),
+  // The real load management state writes (a station's reply to its load
+  // management limit, a resend after a clear or boot), on the mocked client.
+  ...(await vi.importActual<Record<string, unknown>>(
+    '../../../database/src/lib/load-management-state.js',
   )),
   // The session end request channel and reasons.
   ...(await vi.importActual<Record<string, unknown>>(
@@ -198,11 +212,16 @@ vi.mock('@evtivity/services/reservation-notify', () => ({
 // The payment service (@evtivity/payments): the gate's hold, the settlement on
 // Ended, and the NotifySettlement record. The mode classification stays real.
 const mockAuthorizeSessionHold = vi.fn();
+const mockLinkGuestSessionToCharging = vi.fn();
 const mockSettleSessionPayment = vi.fn();
 const mockRecordTerminalSettlement = vi.fn();
 vi.mock('@evtivity/payments', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   authorizeSessionHold: (...args: unknown[]) => mockAuthorizeSessionHold(...args) as unknown,
+  linkGuestSessionToCharging: (...args: unknown[]) => {
+    mockLinkGuestSessionToCharging(...args);
+    return Promise.resolve(null);
+  },
   settleSessionPayment: (...args: unknown[]) => mockSettleSessionPayment(...args) as unknown,
   recordTerminalSettlement: (...args: unknown[]) =>
     mockRecordTerminalSettlement(...args) as unknown,
@@ -503,14 +522,14 @@ describe('Event projections', () => {
       expect(fanoutCall).toBeUndefined();
     });
 
-    it('logs port status transitions for existing EVSEs', async () => {
+    it('logs each connector back at its stored status', async () => {
       await setup();
 
       setupSqlResults(
         [{ id: 'sta_000000000001' }], // resolveStationId
         [], // UPDATE charging_stations
         [], // INSERT connection_logs
-        [], // INSERT port_status_log ... SELECT FROM evses
+        [], // INSERT port_status_log ... SELECT FROM connectors
         [{ site_id: null }], // resolveSiteId
         [], // pg_notify
       );
@@ -520,12 +539,14 @@ describe('Event projections', () => {
         makeDomainEvent('station.Connected', 'CS-001', { ocppProtocol: 'ocpp2.1' }),
       );
 
-      // One statement logs every EVSE of the station, so a retry cannot log a part twice.
+      // One statement logs every connector of the station, so a retry cannot
+      // log a part twice. A connector returns to its stored status (a faulted
+      // one stays down), the mirror of the disconnect rows.
       const portLogs = sqlCalls.filter((c) => c.strings.join('?').includes('port_status_log'));
       expect(portLogs).toHaveLength(1);
-      expect(portLogs[0]?.strings.join('?')).toMatch(
-        /SELECT \?, evse_id, 'unavailable', 'available', now\(\)\s+FROM evses WHERE station_id = \?/,
-      );
+      const statement = portLogs[0]?.strings.join('?') ?? '';
+      expect(statement).toMatch(/'unavailable', c\.status, now\(\)\s+FROM connectors c/);
+      expect(statement).toMatch(/AND c\.status != 'unavailable'/);
     });
   });
 
@@ -1520,7 +1541,8 @@ describe('Event projections', () => {
         const inserts = sqlCalls.filter((c) =>
           c.strings.join('?').includes('INSERT INTO charging_sessions'),
         );
-        return inserts[inserts.length - 1]?.values[2];
+        // id, station, site, evse.
+        return inserts[inserts.length - 1]?.values[3];
       };
 
       await eventBus.emit('ocpp.TransactionEvent', started('tx-before-evse'));
@@ -2306,6 +2328,7 @@ describe('Event projections', () => {
             currency: 'USD',
             site_name: 'Test Site',
             guest_email: 'guest@example.com',
+            guest_language: 'de',
           },
         ], // dispatchDueIdlingNotification: the claim (no driver, period open for 60 s)
         [], // UPDATE idle_started_at (chargingState = SuspendedEV, already set)
@@ -2330,7 +2353,7 @@ describe('Event projections', () => {
       expect(mockDispatchSystem).toHaveBeenCalledWith(
         expect.anything(),
         'session.IdlingStarted',
-        { email: 'guest@example.com' },
+        { email: 'guest@example.com', language: 'de' },
         expect.objectContaining({
           stationId: 'CS-001',
           transactionId: 'tx-1',
@@ -2361,6 +2384,7 @@ describe('Event projections', () => {
             currency: 'USD',
             site_name: 'Test Site',
             guest_email: 'guest@example.com',
+            guest_language: 'de',
           },
         ], // dispatchDueIdlingNotification: the claim (no driver, period open for 60 s)
         [], // UPDATE idle_started_at (chargingState = SuspendedEV, already set)
@@ -2385,7 +2409,7 @@ describe('Event projections', () => {
       expect(mockDispatchSystem).toHaveBeenCalledWith(
         expect.anything(),
         'session.IdlingStarted',
-        { email: 'guest@example.com' },
+        { email: 'guest@example.com', language: 'de' },
         expect.objectContaining({
           stationId: 'CS-001',
           transactionId: 'tx-1',
@@ -4838,6 +4862,9 @@ describe('Event projections', () => {
         seqNo: 0,
         triggerReason,
         timestamp: '2024-01-01T00:00:00Z',
+        // F01.FR.25: the first event after a RequestStartTransaction carries
+        // its remoteStartId.
+        ...(triggerReason === 'RemoteStart' ? { remoteStartId: 77 } : {}),
       });
     }
 
@@ -4896,11 +4923,35 @@ describe('Event projections', () => {
       // A transactionId the station already holds links nothing.
       expect(text).toContain('holder.station_id = ?');
       expect(text).toContain('holder.transaction_id = ?');
-      expect(link.values.slice(0, 3)).toEqual([
-        'sta_000000000002',
-        'sta_000000000002',
-        'tx-shared',
-      ]);
+      expect(link.values[0]).toBe('sta_000000000002');
+      expect(link.values).toEqual(expect.arrayContaining(['sta_000000000002', 'tx-shared']));
+      // Only the remote start the event answers (F01.FR.25), never the newest of the station.
+      expect(text).toContain('pending.remote_start_id = ?');
+      expect(link.values).toContain(77);
+    });
+
+    it('links no remote start for a RemoteStart without a remoteStartId or an EVSE', async () => {
+      await setup();
+      setupSqlResults(
+        [{ id: 'sta_000000000002' }], // resolveStationUuid
+        [{ id: 'ses_000000000002' }], // INSERT ... RETURNING id
+      );
+
+      await eventBus.emit(
+        'ocpp.TransactionEvent',
+        makeDomainEvent('ocpp.TransactionEvent', 'CS-002', {
+          eventType: 'Started',
+          stationId: 'CS-002',
+          transactionId: 'tx-shared',
+          seqNo: 0,
+          triggerReason: 'RemoteStart',
+          timestamp: '2024-01-01T00:00:00Z',
+        }),
+      );
+
+      const texts = sqlCalls.map((c) => c.strings.join(''));
+      expect(texts.some((t) => t.includes('UPDATE charging_sessions cs'))).toBe(false);
+      expect(texts[1]).toContain('INSERT INTO charging_sessions');
     });
 
     it('records a repeated remote-start Started on the session holding its transactionId', async () => {
@@ -5081,9 +5132,9 @@ describe('Event projections', () => {
 
       // Every Ended statement that names the transaction also names the station
       // (the projection by its id, the settlement subscriber by its OCPP id,
-      // the resend check by its id).
+      // the resend and late Ended checks by its id).
       const byTransaction = sqlCalls.filter((c) => c.values.includes('tx-ooo-3'));
-      expect(byTransaction).toHaveLength(6);
+      expect(byTransaction).toHaveLength(7);
       for (const call of byTransaction) {
         expect(call.strings.join('')).toContain('station_id');
         expect(call.values.includes('sta_000000000001') || call.values.includes('CS-001')).toBe(

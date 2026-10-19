@@ -6,8 +6,11 @@
  * Reads need
  * `aiInsights:read`, regenerate, dismiss, feedback and the action decisions
  * `aiInsights:write`.
- * Feedback is one vote per user and insight (`ai_insight_feedback`); votes
- * and their notes never feed any prompt.
+ * Feedback is one vote per user and insight (`ai_insight_feedback`). Readers
+ * of an insight see its wrong votes and their notes (plain text; a
+ * site-restricted reader sees the names of the users it may manage only). A
+ * note reaches a model only when its author regenerates the insight (owner
+ * decision 2026-10-14); votes and other users' notes never feed any prompt.
  * Actions: a background worker suggestion is an insight that carries an
  * action (`action` on every item). It runs only when an operator confirms it
  * (`POST /ai/insights/:id/action/confirm`), in an interactive session, as
@@ -92,6 +95,7 @@ import {
   insightCoveredAttempts,
   insightTexts,
   listInsightRows,
+  listInsightWrongVotes,
   originalSummary,
   publishInsightRequest,
   publishInsightUpdated,
@@ -109,6 +113,7 @@ import { ERROR_CODES, ERROR_MESSAGES } from '../lib/error-codes.generated.js';
 import type { ErrorCode } from '../lib/error-codes.generated.js';
 import { authorize, requestHasPermission } from '../middleware/rbac.js';
 import { getUserSiteIds } from '../lib/site-access.js';
+import { visibleUserIds } from '../lib/user-management-scope.js';
 import { insightRowVisible } from '../lib/ai-insight-scope.js';
 import { supportCaseSiteCondition } from '../lib/support-case-scope.js';
 import { sessionIdsInSites } from '../lib/support-case-redaction.js';
@@ -227,6 +232,32 @@ const insightSchema = z
     scope: z
       .object({
         site: countsSchema.optional().describe('Counts at the subject site'),
+        stationOffline: z
+          .object({
+            since: z
+              .string()
+              .describe(
+                'Since when the station is offline (last disconnect, else last heartbeat or the session activity), ISO',
+              ),
+          })
+          .passthrough()
+          .optional()
+          .describe('A stuck session at an offline station'),
+        concurrentSession: z
+          .object({
+            sessionId: z.string().describe('The session the refused token already runs'),
+            stationId: z.string().describe('Internal id of that session station'),
+            station: z.string().describe('OCPP identity of that session station'),
+            startedAt: z.string().nullable().describe('When that session started, ISO'),
+            step: z
+              .enum(['wait', 'stop', 'restore', 'end'])
+              .describe(
+                'wait (the session is live), stop (stuck at an online station), restore (its station is offline), end (offline past the setting: end it in the CSMS)',
+              ),
+          })
+          .passthrough()
+          .optional()
+          .describe('A token refused because it already runs a session (concurrent_tx)'),
       })
       .passthrough()
       .describe(
@@ -299,8 +330,16 @@ const insightSchema = z
       })
       .optional()
       .describe(
-        'Detail with feedback=true only: the votes on the insight (one per user) and yours; notes are never returned',
+        'Detail with feedback=true only: the votes on the insight (one per user) and yours; the notes are listed by GET /ai/insights/{id}/feedback',
       ),
+    feedbackUsed: z
+      .boolean()
+      .describe(
+        "A regeneration whose model analysis read the regenerating user's note on the insight it replaced",
+      ),
+    feedbackFromYou: z
+      .boolean()
+      .describe('feedbackUsed, and you asked for the regeneration: the note was yours'),
   })
   .passthrough();
 
@@ -352,6 +391,24 @@ const listQuery = paginationQuery.extend({
 });
 
 const idParams = z.object({ id: z.string().describe('Insight id') });
+const wrongVotesQuery = paginationQuery.omit({ search: true });
+const wrongVoteSchema = z
+  .object({
+    userId: z
+      .string()
+      .nullable()
+      .describe('The voter; null for a user your site access does not let you see'),
+    userName: z
+      .string()
+      .nullable()
+      .describe('Name (else email) of the voter; null when userId is null'),
+    note: z
+      .string()
+      .nullable()
+      .describe('The note on the wrong vote (operator text, plain), or null when none was given'),
+    votedAt: z.string().describe('When the vote or its note was last given'),
+  })
+  .passthrough();
 const detailQuery = z.object({
   language: languageField,
   feedback: z
@@ -368,7 +425,7 @@ const feedbackBody = z
       .nullable()
       .optional()
       .describe(
-        'Wrong votes only: a short note on what is wrong (stored only, never sent to a model); omitted keeps the stored note, null or empty removes it',
+        'Wrong votes only: a short note on what is wrong, shown to readers of the insight; when you regenerate the insight, the new analysis reads your note as a claim to check; omitted keeps the stored note, null or empty removes it',
       ),
   })
   .refine((b) => !b.helpful || b.reason == null || b.reason.trim() === '', {
@@ -575,6 +632,7 @@ async function toView(
   request: FastifyRequest,
 ): Promise<Record<string, unknown>[]> {
   const canReadDrivers = await requestHasPermission(request, 'drivers:read');
+  const { userId } = request.user as JwtPayload;
   const [texts, stale, names, actions] = await Promise.all([
     insightTexts(rows, language),
     staleFlags(rows),
@@ -589,6 +647,7 @@ async function toView(
       // The action again with its display name (the DTO schema keeps known fields only).
       action,
       originalSummary: originalSummary(t),
+      feedbackFromYou: row.feedbackUsed && row.requestedBy === userId,
       ...recordFields(row, names),
     };
   });
@@ -766,18 +825,22 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
       const row = await insightInScope(id, siteIds);
       if (row == null) return reply.status(404).send(NOT_FOUND);
       const language = await viewerLanguage(userId, requested);
-      // A model summary is translated once per language and kept (decision D2).
+      // A model summary is translated once per language and kept (decision D2);
+      // a failed translation is tried again on a view after the retry window.
       if (
         (INSIGHT_LIVE_STATUSES as readonly string[]).includes(row.status) &&
         row.generatedBy === 'model' &&
-        language !== row.primaryLanguage &&
-        (await requestInsightTranslation(row.id, language))
+        language !== row.primaryLanguage
       ) {
-        await publishInsightRequest(getPubSub(), {
-          kind: 'translate',
-          insightId: row.id,
-          language,
-        });
+        const attempt = await requestInsightTranslation(row.id, language);
+        if (attempt != null) {
+          await publishInsightRequest(getPubSub(), {
+            kind: 'translate',
+            insightId: row.id,
+            language,
+            attempt,
+          });
+        }
       }
       const [rendered] = await toView([row], language, request);
       // Counts and the viewer's vote in one aggregate query, only when asked.
@@ -794,6 +857,8 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
       schema: {
         tags: ['AI Insights'],
         summary: 'Generate an automatic insight again from fresh evidence',
+        description:
+          'When you marked the insight wrong with a note, the new model analysis reads your note (only yours) as untrusted operator feedback to check against the evidence; the new insight then has feedbackUsed true. A rule insight makes no model call and ignores it.',
         operationId: 'regenerateAiInsight',
         security: [{ bearerAuth: [] }],
         params: zodSchema(idParams),
@@ -930,7 +995,7 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
         tags: ['AI Insights'],
         summary: 'Set or change your vote on an automatic insight: helpful or wrong',
         description:
-          'One vote per user and insight. Voting again replaces your vote; the same vote again changes nothing. A wrong vote can carry a short note, stored only and never sent to a model.',
+          'One vote per user and insight. Voting again replaces your vote; the same vote again changes nothing. A wrong vote can carry a short note: readers of the insight see it, and when you regenerate the insight the new analysis reads your own note as a claim to check against the evidence.',
         operationId: 'sendAiInsightFeedback',
         security: [{ bearerAuth: [] }],
         params: zodSchema(idParams),
@@ -977,6 +1042,77 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
       if (row == null) return reply.status(404).send(NOT_FOUND);
       await clearInsightFeedback(row.id, userId, getAuditActor(request));
       return reply.status(204).send();
+    },
+  );
+
+  app.get(
+    '/ai/insights/:id/feedback',
+    {
+      onRequest: [authorize('aiInsights:read')],
+      schema: {
+        tags: ['AI Insights'],
+        summary: 'List the wrong votes on an automatic insight, with their notes',
+        description:
+          'Newest first (by when the vote or its note was last given). A site-restricted caller sees the name of a voter only for users it may manage (itself and the users of its sites); any other voter has userId and userName null.',
+        operationId: 'listAiInsightWrongVotes',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        querystring: zodSchema(wrongVotesQuery),
+        response: {
+          200: paginatedResponse(wrongVoteSchema),
+          404: errorWith('Insight not found', [ERROR_CODES.AI_INSIGHT_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = parseZodRequest(idParams, request.params);
+      const { page, limit } = parseZodRequest(wrongVotesQuery, request.query);
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const row = await insightInScope(id, siteIds);
+      if (row == null) return reply.status(404).send(NOT_FOUND);
+      const { data, total } = await listInsightWrongVotes(row.id, {
+        limit,
+        offset: (page - 1) * limit,
+      });
+      // Voter names follow the audit actor rule: a site-restricted viewer
+      // sees only the users it may manage.
+      const visible = await visibleUserIds(
+        data.map((v) => v.userId),
+        userId,
+        siteIds,
+      );
+      const shown = distinct(data.map((v) => v.userId)).filter(
+        (u) => visible == null || visible.has(u),
+      );
+      const names = new Map<string, string>();
+      if (shown.length > 0) {
+        const rows = await db
+          .select({
+            id: users.id,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            email: users.email,
+          })
+          .from(users)
+          .where(inArray(users.id, shown));
+        for (const u of rows) {
+          const name = [u.firstName ?? '', u.lastName ?? ''].join(' ').trim();
+          names.set(u.id, name === '' ? u.email : name);
+        }
+      }
+      return {
+        data: data.map((v) => {
+          const named = visible == null || visible.has(v.userId);
+          return {
+            userId: named ? v.userId : null,
+            userName: named ? (names.get(v.userId) ?? null) : null,
+            note: v.reason,
+            votedAt: v.updatedAt.toISOString(),
+          };
+        }),
+        total,
+      };
     },
   );
 

@@ -9,6 +9,7 @@
  * response. Nothing here imports generated OCPP types.
  */
 
+import type { VehicleIdCapture } from '@evtivity/lib/vehicle-id';
 import type { AuthorizeOutcome } from './authorize-log.js';
 
 /** Why the token is checked: an Authorize request, a transaction start, or a later transaction event. */
@@ -33,6 +34,14 @@ export interface AuthorizeTokenInput {
    * session the projection already linked to the token.
    */
   transactionId?: string | null;
+  /**
+   * The vehicle id the message carries (@evtivity/lib/vehicle-id): a 2.1
+   * idToken of type VIN, EVCCID or MacAddress, a vehicle id in its
+   * additionalInfo, or a vehicle-shaped 1.6 idTag. Logged with the attempt;
+   * only a token that is itself the vehicle id (not additionalInfo) can be
+   * authorized by an Autocharge vehicle.
+   */
+  vehicleId?: VehicleIdCapture | null;
 }
 
 export type AuthorizeStatus =
@@ -51,6 +60,8 @@ export type AuthorizeSource =
   | 'ocpi'
   | 'no_lookup_type'
   | 'accept_when_not_found'
+  | 'issued_central'
+  | 'vehicle'
   | 'no_authorization'
   | 'not_found'
   | 'db_error';
@@ -64,6 +75,13 @@ export interface AuthorizeDecision {
   source: AuthorizeSource;
   matchedTokenId: string | null;
   matchedDriverId: string | null;
+  /**
+   * The Autocharge vehicle that authorized or refused the start (source
+   * `vehicle`). An accepted vehicle is never cached by the station: the
+   * adapters send a cache expiry of now, so turning Autocharge off or an
+   * operator block takes effect at the next start.
+   */
+  matchedVehicleId?: string | null;
   /**
    * The matched token's expiry, set when a usable driver token matched. It
    * stays set when a later step (ConcurrentTx, prepaid) changes the status, so
@@ -107,6 +125,12 @@ export interface AuthorizeContextRules {
   /** Typed tokens: the types accepted when no driver token matches (CSMS-issued or station-local tokens). */
   acceptWhenNotFound: ReadonlySet<string>;
   /**
+   * Typed tokens: accept an unknown Central token the CSMS issued to this
+   * station (RequestStartTransaction or ReserveNow idToken, see
+   * issued-central-tokens.ts).
+   */
+  acceptIssuedCentral: boolean;
+  /**
    * The drv_ driver id fallback, checked when no driver token matches: any 1.6
    * idTag, a 2.1 token of type Central (the type the CSMS sends a driver id as).
    */
@@ -149,6 +173,7 @@ const UNTYPED_BASE: Omit<
   // 2.1: the operator's revocation is the stronger, sticky state (P5).
   rejectPrecedence: 'blocked_first',
   acceptWhenNotFound: NONE,
+  acceptIssuedCentral: false,
   dbErrorLogLevel: 'error',
   concurrentTx: 'every_token',
 };
@@ -172,6 +197,7 @@ const TYPED_TX_START: AuthorizeContextRules = {
     'MasterPass',
     'NoAuthorization',
   ]),
+  acceptIssuedCentral: false,
   driverIdFallback: true,
   guestAcceptedStatuses: null,
   ocpi: true,
@@ -255,7 +281,11 @@ export const AUTHORIZE_CONTEXT_RULES: Readonly<
         ],
       ]),
       rejectPrecedence: 'blocked_first',
-      acceptWhenNotFound: new Set(['Central', 'Local']),
+      // Local needs no checking by the CSMS (IdTokenEnumStringType). An
+      // unknown Central token only when the CSMS issued it to this station:
+      // a station must not Authorize a Central token (C05.FR.01).
+      acceptWhenNotFound: new Set(['Local']),
+      acceptIssuedCentral: true,
       driverIdFallback: true,
       guestAcceptedStatuses: null,
       ocpi: true,

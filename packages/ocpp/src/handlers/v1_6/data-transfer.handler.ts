@@ -3,7 +3,9 @@
 
 import type { HandlerContext } from '../../server/middleware/pipeline.js';
 import type { DataTransfer } from '../../generated/v1_6/types/messages/DataTransfer.js';
+import { PNC16_VENDOR_ID } from '@evtivity/lib';
 import { isMeterConfiguration, parseMeterConfiguration } from '../../lib/meter-configuration.js';
+import { handlePnc16DataTransfer } from './iso15118-pnc.handler.js';
 
 export async function handleDataTransfer(ctx: HandlerContext): Promise<Record<string, unknown>> {
   const request = ctx.payload as unknown as DataTransfer;
@@ -29,6 +31,9 @@ export async function handleDataTransfer(ctx: HandlerContext): Promise<Record<st
       data: request.data,
     },
   });
+
+  // ISO 15118 Plug and Charge (OCA application note for OCPP 1.6).
+  if (request.vendorId === PNC16_VENDOR_ID) return handlePnc16DataTransfer(ctx, request);
 
   // Public key of the calibration-law meter; stored by the DataTransfer
   // projection. Other vendor messages are not supported.

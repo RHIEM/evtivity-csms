@@ -1,38 +1,35 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { ocpiTokenTypeOf as sharedOcpiTokenTypeOf } from '@evtivity/lib';
 import type { OcpiToken, OcpiTokenType, OcpiVersion } from '../types/ocpi.js';
 
-interface DriverTokenRow {
-  id: string;
+/**
+ * A driver token as the eMSP serves it, or a tombstone: a token value that no
+ * longer exists (deleted, or its value or type changed). OCPI cannot delete a
+ * Token (12.1.1), so a tombstone is served as valid = false, with
+ * last_updated = the time it stopped existing.
+ */
+export interface EmspTokenRow {
   idToken: string;
   tokenType: string;
   isActive: boolean;
   expiresAt: Date | null;
   revokedAt: Date | null;
   updatedAt: Date;
+  tombstone: boolean;
 }
 
 interface TokenTransformInput {
-  token: DriverTokenRow;
+  token: EmspTokenRow;
   countryCode: string;
   partyId: string;
   driverName?: string;
 }
 
-const TOKEN_TYPE_MAP: Record<string, OcpiTokenType> = {
-  ISO14443: 'RFID',
-  ISO15693: 'RFID',
-  eMAID: 'APP_USER',
-  Central: 'OTHER',
-  Local: 'OTHER',
-  MacAddress: 'OTHER',
-  NoAuthorization: 'AD_HOC_USER',
-  KeyCode: 'OTHER',
-};
-
-function mapTokenType(tokenType: string): OcpiTokenType {
-  return TOKEN_TYPE_MAP[tokenType] ?? 'RFID';
+/** The OCPI Token type of a driver token type (the `type` URL parameter of a push). */
+export function ocpiTokenTypeOf(tokenType: string): OcpiTokenType {
+  return sharedOcpiTokenTypeOf(tokenType);
 }
 
 export function transformToken(input: TokenTransformInput, version: OcpiVersion): OcpiToken {
@@ -45,6 +42,7 @@ export function transformToken(input: TokenTransformInput, version: OcpiVersion)
   // the OCPP layer — drivers see an inconsistent experience.
   const now = Date.now();
   const valid =
+    !token.tombstone &&
     token.isActive &&
     token.revokedAt == null &&
     (token.expiresAt == null || token.expiresAt.getTime() > now);
@@ -53,7 +51,7 @@ export function transformToken(input: TokenTransformInput, version: OcpiVersion)
     country_code: countryCode,
     party_id: partyId,
     uid: token.idToken,
-    type: mapTokenType(token.tokenType),
+    type: ocpiTokenTypeOf(token.tokenType),
     contract_id: token.idToken,
     issuer: partyId,
     valid,

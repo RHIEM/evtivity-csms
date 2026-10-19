@@ -48,6 +48,7 @@ export const AUDIT_ACTORS = ['operator', 'driver', 'api_key', 'system', 'ocpp'] 
 // packages/database/src/schema/audit.ts, sorted. Labels: audit.actions.<action>.
 // audit-labels.test.ts fails when an enum value is missing here or has no en label.
 export const AUDIT_ACTIONS = [
+  'account_locked',
   'action_confirmed',
   'action_rejected',
   'activated',
@@ -59,8 +60,13 @@ export const AUDIT_ACTIONS = [
   'assigned',
   'attachment_added',
   'attachment_deleted',
+  'autocharge_blocked',
+  'autocharge_disabled',
+  'autocharge_enabled',
+  'autocharge_unblocked',
   'availability_changed',
   'billing_address_updated',
+  'billing_reassigned',
   'billing_updated',
   'ca_certificate_added',
   'ca_certificate_deleted',
@@ -69,6 +75,8 @@ export const AUDIT_ACTIONS = [
   'carbon_region_changed',
   'category_changed',
   'cdr_credited',
+  'cdr_push_retried',
+  'cdr_reissued',
   'certificate_deleted',
   'certificate_installed',
   'command_dispatched',
@@ -119,6 +127,7 @@ export const AUDIT_ACTIONS = [
   'message_added',
   'mfa_disabled',
   'mfa_enabled',
+  'mfa_reset',
   'monitoring_changed',
   'nevi_data_changed',
   'onboarding_status_changed',
@@ -150,6 +159,8 @@ export const AUDIT_ACTIONS = [
   'renamed',
   'reordered',
   'report_deleted',
+  'report_downloaded',
+  'report_generated',
   'reservations_cancelled',
   'reset',
   'reset_triggered',
@@ -157,6 +168,7 @@ export const AUDIT_ACTIONS = [
   'resumed',
   'revoked',
   'roaming_session_started',
+  'erased',
   'role_changed',
   'root_certificates_refreshed',
   'session_failed',
@@ -186,6 +198,7 @@ export const AUDIT_ACTIONS = [
   'uploaded',
   'used',
   'vehicle_changed',
+  'vehicle_id_claimed',
   'voided',
 ] as const;
 

@@ -57,9 +57,10 @@ vi.mock('../services/charging-needs.js', () => ({
 vi.mock('@evtivity/database', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
   const select = vi.fn(() => ({
-    from: vi.fn(() => ({
-      where: vi.fn().mockResolvedValue([]),
-    })),
+    from: vi.fn(() => {
+      const where = vi.fn().mockResolvedValue([]);
+      return { where, leftJoin: vi.fn(() => ({ where })) };
+    }),
   }));
   return {
     ...actual,
@@ -85,6 +86,28 @@ vi.mock('../services/pki/index.js', () => ({
     }),
     getRootCertificates: vi.fn().mockResolvedValue([]),
   }),
+}));
+
+// The M07 status checks are covered in services/pki/certificate-chain-status.test.ts.
+vi.mock('../services/pki/certificate-chain-status.js', () => ({
+  getCertificateChainStatus: vi.fn((requests: Array<Record<string, unknown>>) =>
+    Promise.resolve(
+      requests.map((r) => ({
+        source: r['source'],
+        status: 'Good',
+        nextUpdate: '2026-10-15T00:00:00.000Z',
+        certificateHashData: r['certificateHashData'],
+      })),
+    ),
+  ),
+}));
+
+// CSR checks and recording (the handler's own DB writes) are covered in
+// v2_1-sign-certificate.test.ts and services/pki/csr-requests.test.ts.
+vi.mock('../services/pki/csr-requests.js', () => ({
+  isValidCsr: vi.fn().mockResolvedValue(true),
+  recordCsrRequest: vi.fn().mockResolvedValue(1),
+  markCsrFailed: vi.fn().mockResolvedValue(undefined),
 }));
 
 const logger = pino({ level: 'silent' });
@@ -220,7 +243,7 @@ describe('GetCertificateChainStatus handler', () => {
     expect(status).toHaveLength(1);
     expect(status[0]).toMatchObject({
       source: 'OCSP',
-      status: 'Unknown',
+      status: 'Good',
       certificateHashData: {
         hashAlgorithm: 'SHA256',
         issuerNameHash: 'abc',

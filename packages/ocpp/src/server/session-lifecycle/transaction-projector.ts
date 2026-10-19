@@ -23,6 +23,12 @@ import {
   SESSION_END_FAILED_REASON,
 } from '@evtivity/database';
 import type { TariffPriceSnapshot } from '@evtivity/database';
+import {
+  isStartableOcpiToken,
+  OCPI_START_CONTEXT_MINUTES,
+  sessionSiteIdSql,
+} from '@evtivity/database';
+import { linkGuestSessionToCharging, withPaymentActor } from '@evtivity/payments';
 import type { ProjectionDeps } from '../projection-support/context.js';
 import type { ProjectionAttempt } from '../projection-retry.js';
 import { linkStartedReservation, markReservationUsed } from '../reservation-projections.js';
@@ -45,6 +51,14 @@ import {
 import { dispatchDriverNotification, ALL_TEMPLATES_DIRS } from '../notification-dispatcher.js';
 import { projectionLane, sessionGatedKey, sessionPricedKey } from '../projection-queue.js';
 import { isUnbilledTimeoutEnd } from '../session-cost.js';
+import {
+  autochargeNoticeVariables,
+  linkAutochargeSession,
+  linkCapturedVehicle,
+  readVehicleCapture,
+  recordSessionVehicleCapture,
+  resolveAutochargeVehicle,
+} from './vehicle-capture.js';
 
 const CHARGING_STATE_TO_STATUS: Record<string, string> = {
   Charging: 'charging',
@@ -68,6 +82,12 @@ function getSessionId(rows: postgres.RowList<postgres.Row[]>): string | null {
 }
 
 /** The fields of a TransactionEvent every event type reads. */
+/** The OCPP 2.1 remoteStartId a transaction event carries, else null (1.6 has none). */
+function startedRemoteStartId(payload: DomainEvent['payload']): number | null {
+  const value = payload['remoteStartId'];
+  return typeof value === 'number' ? value : null;
+}
+
 interface TransactionEventContext {
   event: DomainEvent;
   /** The projection run, for the steps a rerun must not repeat. */
@@ -96,6 +116,7 @@ interface StartedContext {
   isRoamingSession: boolean;
   guestStatus: string | null;
   guestEmail: string | null;
+  guestLanguage: string | null;
   tokenLookup: {
     id: string;
     driverId: string | null;
@@ -104,6 +125,8 @@ interface StartedContext {
   } | null;
   sessionTariff: TariffPriceSnapshot | null;
   linkedReservationId: string | null;
+  /** The Autocharge vehicle that authorized the session (its driver is driverUuid). */
+  autochargeVehicleId: string | null;
 }
 
 /**
@@ -247,6 +270,51 @@ export class TransactionProjector {
     });
   }
 
+  /**
+   * An Ended for a session that has already ended through another Ended: the
+   * station's own Ended after the CSMS ended the session (csms-session-end.ts,
+   * superseded or ghost), whose end priced, settled and receipted it. Only
+   * the event row is recorded: running the end again would move the end time
+   * and energy, reprice the session and store a final cost other than the
+   * one settled. A session the payment gate faulted before the station's
+   * Ended has no ended row yet and takes the normal path. Memoized: a
+   * projection retry of an Ended whose first run ended the session keeps
+   * the first answer (false) and finishes its settlement.
+   */
+  private async recordLateEnded(tx: TransactionEventContext): Promise<boolean> {
+    const ended = await tx.attempt.memo('ended:late', async () => {
+      const [row] = await this.deps.sql`
+        SELECT cs.id, cs.status FROM charging_sessions cs
+        WHERE cs.station_id = ${tx.stationUuid}
+          AND cs.transaction_id = ${tx.transactionId}
+          AND cs.status <> 'active'
+          AND cs.ended_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM transaction_events te
+            WHERE te.session_id = cs.id AND te.event_type = 'ended'
+          )
+      `;
+      return row != null ? { id: row.id as string, status: row.status as string } : null;
+    });
+    if (ended == null) return false;
+    await this.deps.sql`
+      INSERT INTO transaction_events (session_id, event_type, seq_no, timestamp, trigger_reason, payload)
+      VALUES (${ended.id}, 'ended', ${tx.seqNo}, ${tx.timestamp}, ${tx.triggerReason}, ${tx.payloadJson})
+      ON CONFLICT DO NOTHING
+    `;
+    this.deps.logger.info(
+      {
+        stationId: tx.stationId,
+        transactionId: tx.transactionId,
+        sessionId: ended.id,
+        sessionStatus: ended.status,
+        seqNo: tx.seqNo,
+      },
+      'Ended for a session that already ended; event recorded, session left as settled',
+    );
+    return true;
+  }
+
   private async projectStarted(tx: TransactionEventContext): Promise<void> {
     const { event, payload, stationId, stationUuid, transactionId, triggerReason, timestamp } = tx;
     // For remote starts, link back to the session created by the portal/API
@@ -256,8 +324,27 @@ export class TransactionProjector {
     // EVSE with a single connector uses that one. Applied in the insert and
     // the remote-start link.
     const reportedConnector = typeof payload.connectorId === 'number' ? payload.connectorId : null;
+    const ocppEvseId =
+      typeof payload.evseId === 'number'
+        ? payload.evseId
+        : typeof payload.evseId === 'string'
+          ? parseInt(payload.evseId, 10)
+          : 0;
     let sessionId: string | null = null;
-    if (triggerReason === 'RemoteStart') {
+    // The session already holding this transaction id when it has ended (H4).
+    let endedHolder: { id: string; status: string } | null = null;
+    // F01.FR.25: the first event after a RequestStartTransaction carries its
+    // remoteStartId, which names the remote start it answers. Without one, a
+    // remote start waiting on the EVSE of the transaction is linked; never
+    // one on another EVSE or the newest of the station, so an operator start
+    // on one EVSE never takes a portal start waiting on another, and two
+    // portal starts answered in reverse order each link their own session.
+    const remoteStartId = typeof payload.remoteStartId === 'number' ? payload.remoteStartId : null;
+    const linkEvseUuid =
+      triggerReason === 'RemoteStart' && remoteStartId == null && ocppEvseId > 0
+        ? await this.deps.lookups.resolveEvseUuid(stationUuid, ocppEvseId)
+        : null;
+    if (triggerReason === 'RemoteStart' && (remoteStartId != null || linkEvseUuid != null)) {
       // Atomic pick-and-link in one statement so concurrent Started events
       // (different transactionIds, parallel projection queues) cannot both
       // claim the same pending row. Without FOR UPDATE SKIP LOCKED, two
@@ -275,6 +362,12 @@ export class TransactionProjector {
             SELECT pending.id FROM charging_sessions pending
             WHERE pending.station_id = ${stationUuid}
               AND pending.remote_start_id IS NOT NULL
+              AND (
+                (${remoteStartId}::integer IS NOT NULL
+                  AND pending.remote_start_id = ${remoteStartId})
+                OR (${remoteStartId}::integer IS NULL
+                  AND pending.evse_id = ${linkEvseUuid})
+              )
               AND pending.status = 'active'
               AND NOT EXISTS (
                 SELECT 1 FROM transaction_events te WHERE te.session_id = pending.id
@@ -309,12 +402,6 @@ export class TransactionProjector {
 
     if (sessionId == null) {
       const newSessionId = generateId('session');
-      const ocppEvseId =
-        typeof payload.evseId === 'number'
-          ? payload.evseId
-          : typeof payload.evseId === 'string'
-            ? parseInt(payload.evseId, 10)
-            : 0;
       let txEvseUuid = await this.deps.lookups.resolveEvseUuid(stationUuid, ocppEvseId);
       if (txEvseUuid == null && ocppEvseId > 0 && projectionLane(event) !== stationId) {
         // The EVSE is created by the projection of the station's first
@@ -344,12 +431,17 @@ export class TransactionProjector {
       let initialIsRoaming = false;
       if (earlyIdToken != null) {
         try {
-          const roamCheck = await this.deps.sql`
-              SELECT 1 FROM ocpi_external_tokens
-              WHERE uid = ${earlyIdToken} AND is_valid = true
-              LIMIT 1
-            `;
-          initialIsRoaming = roamCheck.length > 0;
+          // A token one connected partner owns at this station (its
+          // START_SESSION, else its one valid pushed token): an ambiguous
+          // uid starts no roaming session (resolveOcpiTokenOwner).
+          initialIsRoaming = await isStartableOcpiToken(
+            {
+              stationOcppId: stationId,
+              tokenUid: earlyIdToken,
+              remoteStartId: startedRemoteStartId(payload),
+            },
+            this.deps.sql,
+          );
         } catch (err) {
           // A lost connection goes to the projection retry: defaulting to
           // non-roaming would insert a roaming session the gate then stops.
@@ -372,24 +464,55 @@ export class TransactionProjector {
       // The session is billed in the company currency at its start.
       const initialCurrency = await getCompanyCurrency();
       const inserted = await this.deps.sql`
-          INSERT INTO charging_sessions (id, station_id, evse_id, connector_id, transaction_id, status, started_at, meter_start, is_roaming, currency)
-          VALUES (${newSessionId}, ${stationUuid}, ${txEvseUuid}, (
+          INSERT INTO charging_sessions (id, station_id, site_id, evse_id, connector_id, transaction_id, status, started_at, meter_start, is_roaming, currency)
+          VALUES (${newSessionId}, ${stationUuid}, ${sessionSiteIdSql(this.deps.sql, stationUuid)}, ${txEvseUuid}, (
             SELECT c.id FROM connectors c
             WHERE c.evse_id = ${txEvseUuid}
               AND (c.connector_id = ${reportedConnector}
                 OR (SELECT count(*) FROM connectors c2 WHERE c2.evse_id = ${txEvseUuid}) = 1)
             LIMIT 1
           ), ${transactionId}, 'active', ${timestamp}, ${meterStartVal}, ${initialIsRoaming}, ${initialCurrency})
-          ON CONFLICT (station_id, transaction_id) DO UPDATE SET updated_at = now()
-          RETURNING id
+          ON CONFLICT (station_id, transaction_id) DO UPDATE
+            SET updated_at = CASE
+              WHEN charging_sessions.status = 'active' THEN now()
+              ELSE charging_sessions.updated_at
+            END
+          RETURNING id, status, (status <> 'active' OR ended_at IS NOT NULL) AS ended
         `;
       sessionId = getSessionId(inserted);
+      const holder = inserted[0];
+      endedHolder =
+        holder?.ended === true
+          ? { id: holder.id as string, status: holder.status as string }
+          : null;
     }
     let gateFailure: { err: unknown } | null = null;
     if (sessionId != null && (await this.isResentEvent(tx, 'started'))) {
       // The first delivery ran the Started step: the session has its tariff
       // snapshot and gate decision, so a handler waiting to answer this
       // resend with the running cost or the ceiling goes on.
+      this.state.projectionQueue.signal(sessionPricedKey(stationId, transactionId));
+      this.state.projectionQueue.signal(sessionGatedKey(stationId, transactionId));
+      return;
+    }
+    if (endedHolder != null) {
+      // A new Started (not a resend: that returned above) whose transaction
+      // id the station already used for a session that has ended, such as a
+      // station that restarts its transaction counter. Merging it would
+      // reopen a settled session and bill the new charge on it, so the
+      // Started is not projected: the station id and transaction id are
+      // unique per station and the event stays in domain_events.
+      this.deps.logger.warn(
+        {
+          stationId,
+          transactionId,
+          sessionId: endedHolder.id,
+          sessionStatus: endedHolder.status,
+          seqNo: tx.seqNo,
+          timestamp,
+        },
+        'Started reuses the transaction id of an ended session; not linked to it',
+      );
       this.state.projectionQueue.signal(sessionPricedKey(stationId, transactionId));
       this.state.projectionQueue.signal(sessionGatedKey(stationId, transactionId));
       return;
@@ -536,6 +659,14 @@ export class TransactionProjector {
     // Check if site has free-vend enabled (skip driver resolution and payment gate)
     const isFreeVend = await isSiteFreeVendEnabledByStation(stationId);
 
+    // The vehicle id the start carried, stored on every session (free vend
+    // included) so the operator and the driver see the vehicle.
+    const vehicleCapture = readVehicleCapture(payload);
+    if (vehicleCapture != null) {
+      await recordSessionVehicleCapture(this.deps.sql, sessionId, vehicleCapture);
+    }
+    let autochargeVehicleId: string | null = null;
+
     let driverUuid: string | null = null;
     // Seed from the DB so a remote-start session (created by the API with
     // is_roaming already set) and a station-initiated session (where the
@@ -548,6 +679,7 @@ export class TransactionProjector {
     const isRoamingSession = initialRoamRows[0]?.is_roaming === true;
     let guestStatus: string | null = null;
     let guestEmail: string | null = null;
+    let guestLanguage: string | null = null;
     let tokenLookup: {
       id: string;
       driverId: string | null;
@@ -610,12 +742,27 @@ export class TransactionProjector {
               `;
         }
 
+        // Autocharge: the token is the vehicle id of a vehicle with
+        // Autocharge on (features/autocharge.md). The same checks as the
+        // authorize pipeline, from the database.
+        if (driverUuid == null && tokenLookup == null && !isRoamingSession) {
+          const autocharge = await tx.attempt.memo('started:autocharge', () =>
+            resolveAutochargeVehicle(stationId, vehicleCapture),
+          );
+          if (autocharge != null) {
+            await linkAutochargeSession(this.deps.sql, sessionId, autocharge);
+            driverUuid = autocharge.driverId;
+            autochargeVehicleId = autocharge.vehicleId;
+          }
+        }
+
         // If still unresolved and idToken present, check guest sessions
         if (driverUuid == null && !isRoamingSession && idTokenValue != null) {
-          const guest = await this.linkGuestSession(sessionId, idTokenValue);
+          const guest = await this.linkGuestSession(sessionId, stationId, idTokenValue);
           if (guest != null) {
             guestStatus = guest.status;
             guestEmail = guest.email;
+            guestLanguage = guest.language;
           }
         }
       }
@@ -623,8 +770,13 @@ export class TransactionProjector {
       // Auto-link the driver's most recent vehicle to this session so the
       // portal session detail page shows estimated miles without prompting.
       // The driver can override later via PATCH /v1/portal/sessions/:id/vehicle.
-      if (driverUuid != null) {
+      // The driver's vehicle with the captured id wins over the last one; an
+      // Autocharge session keeps the vehicle that authorized it.
+      if (driverUuid != null && autochargeVehicleId == null) {
         await this.linkLastVehicle(sessionId, driverUuid);
+        if (vehicleCapture != null) {
+          await linkCapturedVehicle(this.deps.sql, sessionId, driverUuid, vehicleCapture);
+        }
       }
 
       // Resolve the tariff for this station and snapshot its prices and the
@@ -699,9 +851,11 @@ export class TransactionProjector {
       isRoamingSession,
       guestStatus,
       guestEmail,
+      guestLanguage,
       tokenLookup,
       sessionTariff,
       linkedReservationId,
+      autochargeVehicleId,
     };
   }
 
@@ -738,27 +892,40 @@ export class TransactionProjector {
    * stops a 1.6 transaction at it. Stamped now, before the first running cost,
    * so the cost assembly never bills more than the ceiling (P4). Repeats
    * safely.
+   *
+   * The token matches only a guest checkout of this station (finding G6).
+   * The guest session is linked to the charging session and its hold
+   * recorded here, eagerly (finding G1, P4): the worker's link job is the
+   * backstop, so a lost or late job never leaves a hold the end cannot
+   * capture. The link is fail-open (P9): the worker and the finalization
+   * link again. A guest already linked to this session (an earlier attempt,
+   * or the worker) reports `payment_authorized`, so a rerun of the gate
+   * never stops it.
    */
   private async linkGuestSession(
     sessionId: string,
+    stationId: string,
     idToken: string,
-  ): Promise<{ status: string; email: string | null } | null> {
+  ): Promise<{ status: string; email: string | null; language: string | null } | null> {
     const guestRows = await this.deps.sql`
-      SELECT status, guest_email, pre_auth_amount_cents, provider_payment_id,
-             max_cost_cents
+      SELECT status, guest_email, language, pre_auth_amount_cents, provider_payment_id,
+             max_cost_cents, charging_session_id
       FROM guest_sessions
-      WHERE session_token = ${idToken}
+      WHERE session_token = ${idToken} AND station_ocpp_id = ${stationId}
       LIMIT 1
     `;
     const guest = guestRows[0];
     if (guest == null) return null;
-    const status = guest.status as string;
+    const storedStatus = guest.status as string;
+    const linkedHere =
+      storedStatus === 'charging' && (guest.charging_session_id as string | null) === sessionId;
+    const status = linkedHere ? 'payment_authorized' : storedStatus;
     const holdCents = guest.pre_auth_amount_cents as number | null;
     const maxCostCents = guest.max_cost_cents as number | null;
     if (
       holdCents != null &&
       guest.provider_payment_id != null &&
-      (status === 'payment_authorized' || status === 'charging')
+      (storedStatus === 'payment_authorized' || storedStatus === 'charging')
     ) {
       const ceilingCents = maxCostCents != null ? Math.min(holdCents, maxCostCents) : holdCents;
       await this.deps.sql`
@@ -767,14 +934,31 @@ export class TransactionProjector {
         WHERE id = ${sessionId}
       `;
     }
-    return { status, email: (guest.guest_email as string | null) ?? null };
+    if (status === 'payment_authorized') {
+      try {
+        await linkGuestSessionToCharging(
+          { token: idToken, stationOcppId: stationId, sessionId },
+          withPaymentActor(this.deps.payments, { actor: 'ocpp', actorLabel: 'guest-link' }),
+        );
+      } catch (err: unknown) {
+        this.deps.logger.warn(
+          { err, sessionId, stationId },
+          'Failed to link the guest session at the start; the worker links it',
+        );
+      }
+    }
+    return {
+      status,
+      email: (guest.guest_email as string | null) ?? null,
+      language: (guest.language as string | null | undefined) ?? null,
+    };
   }
 
   /**
    * Tells the guest session service the transaction started with this
-   * idToken, so linkGuestSession() in @evtivity/api links the guest checkout
-   * (the guest portal waits on guest_sessions.charging_session_id). Once per
-   * event; fail-open.
+   * idToken, so the worker's guest link (handleGuestSessionEvent in
+   * @evtivity/payments) links the guest checkout when the eager link above
+   * did not (free vend, a failed link). Once per event; fail-open.
    */
   private async publishGuestTransactionStarted(
     tx: TransactionEventContext,
@@ -864,6 +1048,12 @@ export class TransactionProjector {
     const remoteStartId =
       typeof tx.payload.remoteStartId === 'number' ? tx.payload.remoteStartId : null;
     if (idTokenValue == null && remoteStartId == null) return null;
+    // A vehicle id first sent after the start (or one Started lacked) is
+    // stored on the session; a session that already has one keeps it.
+    const vehicleCapture = readVehicleCapture(tx.payload);
+    if (vehicleCapture != null) {
+      await recordSessionVehicleCapture(this.deps.sql, sessionId, vehicleCapture);
+    }
     const pending = await tx.attempt.memo(`${stage}:first-token`, async () => {
       // Two kinds of waiting session: one the station started without any
       // driver (resolved from the idToken), and one a portal remote start
@@ -877,9 +1067,29 @@ export class TransactionProjector {
                cs.driver_id AS remote_start_driver_id,
                dt.id AS token_id, dt.driver_id AS token_driver_id,
                dt.prepaid_balance_cents IS NOT NULL AS prepaid,
-               cs.driver_id IS NULL AND EXISTS (
-                 SELECT 1 FROM ocpi_external_tokens ot
-                 WHERE ot.uid = ${idTokenValue} AND ot.is_valid = true
+               -- A token one connected partner owns at this station starts a
+               -- roaming session; the same rule as isStartableOcpiToken
+               -- (@evtivity/database ocpi-token-owner.ts), inline so the
+               -- step stays one statement.
+               cs.driver_id IS NULL AND COALESCE(
+                 (SELECT COALESCE(ot.is_valid, (oc.token_data->>'valid') IS DISTINCT FROM 'false')
+                  FROM ocpi_commands oc
+                  JOIN ocpi_partners op ON op.id = oc.partner_id AND op.status = 'connected'
+                  LEFT JOIN ocpi_external_tokens ot
+                    ON ot.partner_id = oc.partner_id AND ot.uid = oc.token_uid
+                  WHERE oc.command_type = 'START_SESSION'
+                    AND oc.station_id = ${tx.stationId}
+                    AND oc.token_uid = ${idTokenValue}
+                    AND oc.charging_session_id IS NULL
+                    AND oc.created_at > now() - make_interval(mins => ${OCPI_START_CONTEXT_MINUTES})
+                  ORDER BY (oc.remote_start_id IS NOT DISTINCT FROM ${remoteStartId}::integer) DESC,
+                           oc.created_at DESC
+                  LIMIT 1),
+                 (SELECT count(*) = 1
+                  FROM ocpi_external_tokens ot
+                  JOIN ocpi_partners op ON op.id = ot.partner_id AND op.status = 'connected'
+                  WHERE ot.uid = ${idTokenValue} AND ot.is_valid AND ot.whitelist <> 'NEVER'),
+                 false
                ) AS roaming
         FROM charging_sessions cs
         LEFT JOIN driver_tokens dt
@@ -930,9 +1140,22 @@ export class TransactionProjector {
     let tokenLookup: StartedContext['tokenLookup'] = null;
     let driverUuid: string | null = null;
     let isRoaming = false;
-    let guest: { status: string; email: string | null } | null = null;
+    let guest: { status: string; email: string | null; language: string | null } | null = null;
+    let autochargeVehicleId: string | null = null;
+    const autocharge =
+      pending.remoteStartDriverId == null && pending.token == null
+        ? await tx.attempt.memo(`${stage}:autocharge`, () =>
+            resolveAutochargeVehicle(stationId, vehicleCapture),
+          )
+        : null;
     if (pending.remoteStartDriverId != null) {
       driverUuid = pending.remoteStartDriverId;
+    } else if (autocharge != null) {
+      // Autocharge (features/autocharge.md): the vehicle authorizes the
+      // session as its driver.
+      await linkAutochargeSession(this.deps.sql, sessionId, autocharge);
+      driverUuid = autocharge.driverId;
+      autochargeVehicleId = autocharge.vehicleId;
     } else if (pending.token != null) {
       tokenLookup = await this.linkDriverToken(sessionId, pending.token);
       if (tokenLookup.driverId != null) {
@@ -948,9 +1171,9 @@ export class TransactionProjector {
         UPDATE charging_sessions SET is_roaming = true, updated_at = now()
         WHERE id = ${sessionId}
       `;
-      await this.deps.notify.linkCpoRoamingSession(sessionId, idTokenValue);
+      await this.deps.notify.linkCpoRoamingSession(sessionId, idTokenValue, remoteStartId);
     } else if (idTokenValue != null) {
-      guest = await this.linkGuestSession(sessionId, idTokenValue);
+      guest = await this.linkGuestSession(sessionId, stationId, idTokenValue);
     }
     if (driverUuid == null && !isRoaming && idTokenValue != null) {
       await this.publishGuestTransactionStarted(tx, sessionId, idTokenValue, stage);
@@ -978,26 +1201,48 @@ export class TransactionProjector {
         driverUuid,
         basis: await getCompanyTaxBasis(),
       });
-      await this.linkLastVehicle(sessionId, driverUuid);
+      if (autochargeVehicleId == null) {
+        await this.linkLastVehicle(sessionId, driverUuid);
+        if (vehicleCapture != null) {
+          await linkCapturedVehicle(this.deps.sql, sessionId, driverUuid, vehicleCapture);
+        }
+      }
       await this.clearStationWatch(stationUuid, sessionId);
       if (stage === 'updated') {
         const driverIdForNotify = driverUuid;
+        const noticeVehicleId = autochargeVehicleId;
         const siteName = await this.deps.lookups.resolveSiteName(stationUuid);
-        await tx.attempt.once(`${stage}:session-started-notification`, () =>
-          dispatchDriverNotification(
+        await tx.attempt.once(`${stage}:session-started-notification`, async () => {
+          const variables = {
+            siteName: siteName ?? '',
+            stationId,
+            transactionId,
+            startedAt: pending.startedAt,
+          };
+          if (noticeVehicleId != null) {
+            await dispatchDriverNotification(
+              this.deps.sql,
+              'session.AutochargeStarted',
+              driverIdForNotify,
+              {
+                ...variables,
+                ...(await autochargeNoticeVariables(this.deps.sql, noticeVehicleId)),
+              },
+              ALL_TEMPLATES_DIRS,
+              this.deps.pubsub,
+              { sms: false },
+            );
+            return;
+          }
+          await dispatchDriverNotification(
             this.deps.sql,
             'session.Started',
             driverIdForNotify,
-            {
-              siteName: siteName ?? '',
-              stationId,
-              transactionId,
-              startedAt: pending.startedAt,
-            },
+            variables,
             ALL_TEMPLATES_DIRS,
             this.deps.pubsub,
-          ),
-        );
+          );
+        });
       }
     }
 
@@ -1019,10 +1264,12 @@ export class TransactionProjector {
           idToken: idTokenValue ?? undefined,
           guestStatus: guest?.status ?? null,
           guestEmail: guest?.email ?? null,
+          guestLanguage: guest?.language ?? null,
           prepaidBalanceCents: tokenLookup?.prepaidCreditCents ?? null,
           reserved: pending.reserved,
           sessionTariff,
           transactionEnded: stage === 'ended',
+          startRefused: getString(tx.payload, 'startRefusal') === 'no_credit',
         }),
       );
     } catch (err: unknown) {
@@ -1193,9 +1440,11 @@ export class TransactionProjector {
       isRoamingSession,
       guestStatus,
       guestEmail,
+      guestLanguage,
       tokenLookup,
       sessionTariff,
       linkedReservationId,
+      autochargeVehicleId,
     } = started;
     // A payment gate failure, held until the rest of the Started step has run
     // and returned for projectStarted to rethrow after the buffer drain and
@@ -1210,7 +1459,11 @@ export class TransactionProjector {
     await this.deps.notify.notifyChange('session.started', stationUuid, siteId, sessionId);
     const roamingIdToken = payload.idToken as string | null | undefined;
     if (isRoamingSession && roamingIdToken != null) {
-      await this.deps.notify.linkCpoRoamingSession(sessionId, roamingIdToken);
+      await this.deps.notify.linkCpoRoamingSession(
+        sessionId,
+        roamingIdToken,
+        startedRemoteStartId(payload),
+      );
     }
     // Both repeat safely on a rerun: the link is ON CONFLICT DO NOTHING, and
     // the push sends the session's current state again.
@@ -1219,8 +1472,8 @@ export class TransactionProjector {
     // Notify guest session service for linking. Runs for both free-vend
     // and paid sessions: the guest portal polls /v1/portal/guest/status
     // and stays on "Starting charging" until guest_sessions.charging_session_id
-    // is set, which only happens when this event fires and is handled
-    // by linkGuestSession() in @evtivity/api.
+    // is set. The Started projection links a paid guest eagerly; the worker
+    // link this event triggers is the backstop (free vend, a failed link).
     const idTokenForGuest = payload.idToken as string | null;
     if (idTokenForGuest != null) {
       await this.publishGuestTransactionStarted(tx, sessionId, idTokenForGuest, 'started');
@@ -1229,24 +1482,43 @@ export class TransactionProjector {
     if (!isFreeVend) {
       // Driver notification: transaction started (awaited so it is recorded before the payment gate
       // can fire a PreAuthFailed notification, preserving chronological order in the portal drawer)
+      // An Autocharge start sends session.AutochargeStarted in its place: the
+      // same facts plus the vehicle and where to turn Autocharge off, so a
+      // driver notices a start they did not make (email and push, no SMS).
       const driverIdForNotify = driverUuid;
       if (driverIdForNotify != null) {
         const startedSiteName = await this.deps.lookups.resolveSiteName(stationUuid);
-        await tx.attempt.once('started:session-started-notification', () =>
-          dispatchDriverNotification(
+        await tx.attempt.once('started:session-started-notification', async () => {
+          const variables = {
+            siteName: startedSiteName ?? '',
+            stationId,
+            transactionId,
+            startedAt: timestamp,
+          };
+          if (autochargeVehicleId != null) {
+            await dispatchDriverNotification(
+              this.deps.sql,
+              'session.AutochargeStarted',
+              driverIdForNotify,
+              {
+                ...variables,
+                ...(await autochargeNoticeVariables(this.deps.sql, autochargeVehicleId)),
+              },
+              ALL_TEMPLATES_DIRS,
+              this.deps.pubsub,
+              { sms: false },
+            );
+            return;
+          }
+          await dispatchDriverNotification(
             this.deps.sql,
             'session.Started',
             driverIdForNotify,
-            {
-              siteName: startedSiteName ?? '',
-              stationId,
-              transactionId,
-              startedAt: timestamp,
-            },
+            variables,
             ALL_TEMPLATES_DIRS,
             this.deps.pubsub,
-          ),
-        );
+          );
+        });
       }
 
       // Payment gate: pre-authorize or stop session if payment not possible.
@@ -1290,6 +1562,7 @@ export class TransactionProjector {
               idToken: payload.idToken as string | undefined,
               guestStatus,
               guestEmail,
+              guestLanguage,
               prepaidBalanceCents: tokenLookup?.prepaidCreditCents ?? null,
               reserved: linkedReservationId != null,
               sessionTariff,
@@ -1573,6 +1846,7 @@ export class TransactionProjector {
     const stoppedReason = getString(payload, 'stoppedReason');
 
     if (await this.isResentEvent(tx, 'ended')) return;
+    if (await this.recordLateEnded(tx)) return;
 
     // An idToken (or a portal remote start's remoteStartId) first presented
     // in the Ended event (E03.FR.01: the event after authorization can be
@@ -1677,7 +1951,7 @@ export class TransactionProjector {
     const sessionRows = await this.deps.sql`
         SELECT id, evse_id, status, tariff_id, current_cost_cents, started_at, ended_at,
                energy_delivered_wh, currency, tariff_tax_rate, idle_started_at, idle_minutes,
-               reservation_id, free_vend
+               reservation_id, free_vend, site_id
         FROM charging_sessions
         WHERE station_id = ${stationUuid} AND transaction_id = ${transactionId}
       `;
@@ -1842,6 +2116,16 @@ export class TransactionProjector {
         }
       }
 
+      // The site the session happened at (charging_sessions.site_id) prices
+      // its electricity cost, sets its carbon region and scopes its end
+      // notice, so a station moved to another site later does not move the
+      // session's money (owner decision 2026-10-14). A session without one
+      // (inserted by an older pod during a rolling upgrade) uses the
+      // station's site, which is what the insert would have stamped.
+      const sessionSiteId =
+        (sessionRow.site_id as string | null) ??
+        (await this.deps.lookups.resolveSiteId(stationUuid));
+
       // Carbon footprint calculation. LEFT JOIN so we can distinguish
       // "site has no carbon region set" (silent skip, common default
       // state) from "site references a carbon region with no matching
@@ -1850,10 +2134,9 @@ export class TransactionProjector {
       try {
         const carbonRows = await this.deps.sql`
             SELECT s.carbon_region_code, cif.carbon_intensity_kg_per_kwh
-            FROM charging_stations cs
-            JOIN sites s ON s.id = cs.site_id
+            FROM sites s
             LEFT JOIN carbon_intensity_factors cif ON cif.region_code = s.carbon_region_code
-            WHERE cs.id = ${stationUuid}
+            WHERE s.id = ${sessionSiteId}
           `;
         const carbonRow = carbonRows[0];
         const regionCode = carbonRow?.['carbon_region_code'] as string | null | undefined;
@@ -1894,7 +2177,7 @@ export class TransactionProjector {
         this.deps.logger.warn({ err: carbonErr, sessionId }, 'Failed to compute CO2 avoided');
       }
 
-      const siteId = await this.deps.lookups.resolveSiteId(stationUuid);
+      const siteId = sessionSiteId;
 
       // Electricity cost (operator's wholesale cost). Forward-only: computed
       // once at session end against the site's TOU rate periods, never

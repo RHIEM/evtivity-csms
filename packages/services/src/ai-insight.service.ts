@@ -27,6 +27,8 @@ import {
   aiInsightTexts,
   client,
   db,
+  operatorStationSql,
+  siteInsightsSuppressedSql,
   writeAudit,
 } from '@evtivity/database';
 import type { AuditActor } from '@evtivity/database';
@@ -44,6 +46,7 @@ import {
 import type { AiProposalDto, AiProposalStatus } from '@evtivity/lib/ai-proposals';
 import type {
   AiInsightDto,
+  FixCode,
   InsightConfidence,
   InsightFeedbackFilter,
   InsightFeedbackRate,
@@ -179,6 +182,30 @@ export async function claimInsightCooldown(input: {
   return rows.length > 0;
 }
 
+/**
+ * Holds a subject's cooldown for `minutes` from now, whatever held it (a
+ * longer one stays): a stuck session whose action expired undecided gets no
+ * new insight until it passes.
+ */
+export async function holdInsightCooldown(input: {
+  subjectType: string;
+  subjectId: string;
+  kind: string;
+  minutes: number;
+  insightId: string;
+}): Promise<void> {
+  await client`
+    INSERT INTO ai_insight_cooldowns
+      (subject_type, subject_id, kind, next_allowed_at, claimed_by_insight_id, updated_at)
+    VALUES (${input.subjectType}, ${input.subjectId}, ${input.kind},
+      now() + make_interval(mins => ${input.minutes}), ${input.insightId}, now())
+    ON CONFLICT (subject_type, subject_id, kind) DO UPDATE
+      SET next_allowed_at = GREATEST(ai_insight_cooldowns.next_allowed_at, EXCLUDED.next_allowed_at),
+        claimed_by_insight_id = EXCLUDED.claimed_by_insight_id,
+        updated_at = now()
+  `;
+}
+
 /** When the subject's cooldown ends, null when none is running. */
 export async function insightCooldownUntil(input: {
   subjectType: string;
@@ -255,6 +282,11 @@ export interface InsightResult {
   model: string | null;
   basisAt: Date;
   basisFingerprint: string | null;
+  /**
+   * The model request carried the regenerating user's note on the insight
+   * this one replaced (`regenerationFeedbackNote`). False when omitted.
+   */
+  feedbackUsed?: boolean;
 }
 
 /**
@@ -280,6 +312,7 @@ export async function activateInsight(id: string, result: InsightResult): Promis
         generatedBy: result.generatedBy,
         provider: result.provider,
         model: result.model,
+        feedbackUsed: result.feedbackUsed ?? false,
         updatedAt: sql`now()`,
       })
       .where(and(eq(aiInsights.id, id), eq(aiInsights.status, 'analyzing')))
@@ -320,6 +353,21 @@ export async function resolveInsights(ids: readonly string[]): Promise<string[]>
 }
 
 /**
+ * Closes open one-off event insights `expired` (compare-and-set from `open`
+ * only: an insight whose action waits is never closed this way). Returns the
+ * ids that moved.
+ */
+export async function expireInsights(ids: readonly string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const rows = await db
+    .update(aiInsights)
+    .set({ status: 'expired', updatedAt: sql`now()` })
+    .where(and(inArray(aiInsights.id, [...ids]), eq(aiInsights.status, 'open')))
+    .returning({ id: aiInsights.id });
+  return rows.map((r) => r.id);
+}
+
+/**
  * Links analyzing station insights to their site incident: they end
  * `superseded` with the incident as parent and get no model call.
  */
@@ -351,6 +399,109 @@ export async function dismissInsight(id: string, actor: InsightAuditActor): Prom
   if (rows.length === 0) return false;
   await auditInsight(id, 'dismissed', actor, { status: 'dismissed' });
   return true;
+}
+
+/** Closes the open and analyzing insights matching `where` as dismissed, audited with `cause`. */
+async function dismissSuppressedInsights(
+  where: SQL,
+  cause: 'station_ai_insights_suppressed' | 'site_ai_insights_suppressed',
+  reason: string,
+  actor: InsightAuditActor,
+  pubsub: PubSubClient,
+): Promise<string[]> {
+  const rows = await db
+    .update(aiInsights)
+    .set({
+      status: 'dismissed',
+      dismissedAt: sql`now()`,
+      dismissedBy: actor.actorUserId ?? null,
+      updatedAt: sql`now()`,
+    })
+    .where(and(where, inArray(aiInsights.status, ['analyzing', 'open'])))
+    .returning({
+      id: aiInsights.id,
+      siteId: aiInsights.siteId,
+      stationId: aiInsights.stationId,
+      sessionId: aiInsights.sessionId,
+      kind: aiInsights.kind,
+    });
+  for (const row of rows) {
+    await writeAudit(
+      { table: aiInsightAuditLog, idColumn: 'ai_insight_id' },
+      {
+        entityId: row.id,
+        entityIdSnapshot: row.id,
+        action: 'dismissed',
+        actor: actor.actor,
+        actorUserId: actor.actorUserId ?? null,
+        actorApiKeyId: actor.actorApiKeyId ?? null,
+        before: null,
+        after: { status: 'dismissed', cause },
+        notes: reason,
+      },
+      db,
+      log,
+    );
+    await publishInsightUpdated(pubsub, { ...row, status: 'dismissed' });
+  }
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Closes the open and analyzing insights of a station whose AI insights an
+ * operator suppressed: `dismissed`, audited with the suppression reason
+ * (insights whose action waits end through their action instead,
+ * `expireStationAiProposals`). Publishes each change (fail-open inside).
+ * Returns the ids that moved.
+ */
+export async function dismissStationInsights(
+  stationId: string,
+  reason: string,
+  actor: InsightAuditActor,
+  pubsub: PubSubClient,
+): Promise<string[]> {
+  return dismissSuppressedInsights(
+    eq(aiInsights.stationId, stationId),
+    'station_ai_insights_suppressed',
+    reason,
+    actor,
+    pubsub,
+  );
+}
+
+/**
+ * Closes the open and analyzing insights of a site whose AI insights an
+ * operator suppressed: the site's own insights (site incidents, summaries,
+ * findings) and those of every station of the site, `dismissed` with the
+ * reason (insights whose action waits end through their action instead,
+ * `expireSiteAiProposals`). Returns the ids that moved.
+ */
+export async function dismissSiteInsights(
+  siteId: string,
+  reason: string,
+  actor: InsightAuditActor,
+  pubsub: PubSubClient,
+): Promise<string[]> {
+  return dismissSuppressedInsights(
+    sql`(${aiInsights.siteId} = ${siteId} OR ${aiInsights.stationId} IN (SELECT cs.id FROM charging_stations cs WHERE cs.site_id = ${siteId} AND ${sql.raw(operatorStationSql('cs'))}))`,
+    'site_ai_insights_suppressed',
+    reason,
+    actor,
+    pubsub,
+  );
+}
+
+/**
+ * Whether the site-level AI insights of a site are suppressed now
+ * (`siteInsightsSuppressedSql`): an operator suppressed the site, or an
+ * active maintenance event covers all of it. False for an unknown site.
+ */
+export async function siteInsightsSuppressed(siteId: string): Promise<boolean> {
+  const [row] = await client<{ suppressed: boolean }[]>`
+    SELECT ${client.unsafe(siteInsightsSuppressedSql('s'))} AS suppressed
+    FROM sites s WHERE s.id = ${siteId}
+  `;
+  return row?.suppressed === true;
 }
 
 export interface InsightFeedbackInput {
@@ -503,6 +654,88 @@ export async function insightFeedbackRates(
   );
 }
 
+/** One wrong vote on an insight, as the Marked Wrong list shows it. */
+export interface InsightWrongVote {
+  userId: string;
+  /** The note (untrusted operator text), or null when none was given. */
+  reason: string | null;
+  /** When the vote (or its note) was last given. */
+  updatedAt: Date;
+}
+
+/**
+ * The wrong votes on one insight, newest first (by when the vote or its note
+ * was last given), one page. Read only; the caller applies the insight
+ * visibility gate and resolves which voter names the viewer may see.
+ */
+export async function listInsightWrongVotes(
+  insightId: string,
+  page: { limit: number; offset: number },
+): Promise<{ data: InsightWrongVote[]; total: number }> {
+  const where = and(
+    eq(aiInsightFeedback.insightId, insightId),
+    eq(aiInsightFeedback.helpful, false),
+  );
+  const [rows, [count]] = await Promise.all([
+    db
+      .select({
+        userId: aiInsightFeedback.userId,
+        reason: aiInsightFeedback.reason,
+        updatedAt: aiInsightFeedback.updatedAt,
+      })
+      .from(aiInsightFeedback)
+      .where(where)
+      .orderBy(desc(aiInsightFeedback.updatedAt), desc(aiInsightFeedback.userId))
+      .limit(page.limit)
+      .offset(page.offset),
+    db
+      .select({ total: sql<number>`count(*)::int` })
+      .from(aiInsightFeedback)
+      .where(where),
+  ]);
+  return { data: rows, total: count?.total ?? 0 };
+}
+
+/** The wrong-vote note of one user on one insight, or null (no vote, a helpful vote, no note). */
+async function wrongVoteNote(
+  executor: Pick<typeof db, 'select'>,
+  insightId: string,
+  userId: string,
+): Promise<string | null> {
+  const [row] = await executor
+    .select({ reason: aiInsightFeedback.reason })
+    .from(aiInsightFeedback)
+    .where(
+      and(
+        eq(aiInsightFeedback.insightId, insightId),
+        eq(aiInsightFeedback.userId, userId),
+        eq(aiInsightFeedback.helpful, false),
+      ),
+    )
+    .limit(1);
+  return row?.reason ?? null;
+}
+
+/** `regenerate:<old insight id>:<ts>`: the insight a regeneration replaced. */
+const REGENERATION_KEY = /^regenerate:([^:]+):/;
+
+/**
+ * The note a regeneration reads (owner decision 2026-10-14): the wrong-vote
+ * note the user who asked for the regeneration left on the insight it
+ * replaced. Only that user's own note, never another user's; null for an
+ * insight the scan raised, a regeneration without a requester, or when the
+ * requester has no wrong vote with a note there (any more). Untrusted text:
+ * the caller frames and redacts it before a model reads it.
+ */
+export async function regenerationFeedbackNote(
+  row: Pick<AiInsightRow, 'triggerKey' | 'requestedBy'>,
+): Promise<string | null> {
+  if (row.requestedBy == null) return null;
+  const oldId = REGENERATION_KEY.exec(row.triggerKey)?.[1];
+  if (oldId == null) return null;
+  return wrongVoteNote(db, oldId, row.requestedBy);
+}
+
 async function auditInsight(
   id: string,
   action:
@@ -537,7 +770,8 @@ async function auditInsight(
 export const REGENERATABLE_STATUSES = ['open', 'resolved', 'skipped', 'failed'] as const;
 
 export type RegenerateResult =
-  | { status: 'created'; insightId: string }
+  /** `feedbackUsed`: the user's note on the old insight goes to the new analysis. */
+  | { status: 'created'; insightId: string; feedbackUsed: boolean }
   /** Not regeneratable: analyzing, dismissed, superseded or a site incident member. */
   | { status: 'not_allowed' }
   /** A generation of the same subject and kind is already analyzing. */
@@ -581,6 +815,9 @@ export async function regenerateInsight(
       )
       .limit(1);
     if (running != null) return { status: 'busy' };
+    // The regenerating user's own note on the old insight goes to the new
+    // analysis (`regenerationFeedbackNote`); the audit records only whether.
+    const note = await wrongVoteNote(tx, old.id, actor.actorUserId);
     const [created] = await tx
       .insert(aiInsights)
       .values({
@@ -610,10 +847,14 @@ export async function regenerateInsight(
       .update(aiInsights)
       .set({ status: 'superseded', updatedAt: sql`now()` })
       .where(and(eq(aiInsights.id, old.id), eq(aiInsights.status, 'open')));
-    return { status: 'created', insightId: created.id };
+    return { status: 'created', insightId: created.id, feedbackUsed: note != null };
   });
   if (result.status === 'created') {
-    await auditInsight(oldId, 'regenerated', actor, { newInsightId: result.insightId });
+    // Whether the user's note goes to the new analysis, never the note itself.
+    await auditInsight(oldId, 'regenerated', actor, {
+      newInsightId: result.insightId,
+      feedbackUsed: result.feedbackUsed,
+    });
   }
   return result;
 }
@@ -622,18 +863,34 @@ export async function regenerateInsight(
 // Texts (canonical summary and lazy translations, decision D2)
 // ---------------------------------------------------------------------------
 
+/** Minutes before a request tries an `unavailable` translation again. */
+export const INSIGHT_TRANSLATION_RETRY_MINUTES = 60;
+
 /**
- * Asks for the summary in `language`: inserts a `pending` text row. True when
- * this call created it (the caller then queues the translation job), false
- * when a row already exists (pending, ready or unavailable).
+ * Asks for the summary in `language`: inserts a `pending` text row, or sets an
+ * `unavailable` one older than the retry window back to `pending` (a provider
+ * error or an exhausted budget is not final). Returns the try's stamp (the
+ * row's `updated_at` in epoch ms, part of the job id) when this call started a
+ * try, so the caller queues the job; null when a row is pending, ready, or
+ * failed within the window.
  */
-export async function requestInsightTranslation(id: string, language: string): Promise<boolean> {
+export async function requestInsightTranslation(
+  id: string,
+  language: string,
+): Promise<number | null> {
   const rows = await db
     .insert(aiInsightTexts)
     .values({ insightId: id, language, summary: null, status: 'pending', source: 'translated' })
-    .onConflictDoNothing({ target: [aiInsightTexts.insightId, aiInsightTexts.language] })
-    .returning({ insightId: aiInsightTexts.insightId });
-  return rows.length > 0;
+    .onConflictDoUpdate({
+      target: [aiInsightTexts.insightId, aiInsightTexts.language],
+      set: { status: 'pending', summary: null, updatedAt: sql`now()` },
+      setWhere: sql`${aiInsightTexts.status} = 'unavailable'
+        AND ${aiInsightTexts.source} = 'translated'
+        AND ${aiInsightTexts.updatedAt} < now() - make_interval(mins => ${INSIGHT_TRANSLATION_RETRY_MINUTES})`,
+    })
+    .returning({ updatedAt: aiInsightTexts.updatedAt });
+  const at = rows[0]?.updatedAt;
+  return at == null ? null : at.getTime();
 }
 
 /**
@@ -747,7 +1004,7 @@ export async function publishInsightUpdated(
 
 export type AiInsightRequest =
   | { kind: 'generate'; insightId: string }
-  | { kind: 'translate'; insightId: string; language: string };
+  | { kind: 'translate'; insightId: string; language: string; attempt: number };
 
 /** Asks the worker for a generation or a translation (fail-open: the scan re-enqueues). */
 export async function publishInsightRequest(
@@ -1031,6 +1288,7 @@ export function toInsightDto(
     resolvedAt: row.resolvedAt?.toISOString() ?? null,
     dismissedAt: row.dismissedAt?.toISOString() ?? null,
     action: options.action ?? null,
+    feedbackUsed: row.feedbackUsed,
   };
   return aiInsightDtoSchema.parse(dto);
 }
@@ -1148,6 +1406,35 @@ export interface WorkerActionInsightInput {
    * an offline station); unset keeps the kind's fallback category.
    */
   rootCause?: { category: RootCauseCategory; confidence: InsightConfidence };
+  /** The worker's own fix steps (a stuck session at an offline station); unset keeps the kind's. */
+  fixes?: readonly FixCode[];
+  /** Facts the CSMS shows with the insight (`scope.stationOffline`). */
+  scope?: InsightScope;
+}
+
+/**
+ * Whether an insight of this kind, subject and trigger exists: a worker that
+ * makes one insight per trigger asks before paying for a model rationale.
+ */
+export async function insightTriggerExists(input: {
+  kind: InsightKind;
+  subjectType: 'station' | 'session';
+  subjectId: string;
+  triggerKey: string;
+}): Promise<boolean> {
+  const [row] = await db
+    .select({ id: aiInsights.id })
+    .from(aiInsights)
+    .where(
+      and(
+        eq(aiInsights.kind, input.kind),
+        eq(aiInsights.subjectType, input.subjectType),
+        eq(aiInsights.subjectId, input.subjectId),
+        eq(aiInsights.triggerKey, input.triggerKey.slice(0, 200)),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
 }
 
 /**
@@ -1191,9 +1478,9 @@ export async function storeWorkerActionInsight(
   const stored = await activateInsight(id, {
     category: rootCause.category,
     confidence: rootCause.confidence,
-    fixes: rule.fixes.map((code) => ({ code })),
+    fixes: (input.fixes ?? rule.fixes).map((code) => ({ code })),
     evidenceRefs: [],
-    scope: {},
+    scope: input.scope ?? {},
     summary: input.narrative?.text ?? null,
     language,
     generatedBy: input.narrative != null ? 'model' : 'rule',

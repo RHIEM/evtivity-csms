@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -16,6 +16,7 @@ import { ReportTypesLoadError } from '@/components/reports/ReportTypesLoadError'
 
 export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React.JSX.Element {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [name, setName] = useState('');
   const [reportType, setReportType] = useState('');
   const [format, setFormat] = useState('');
@@ -58,6 +59,8 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
       setSiteId('');
       setStationId('');
       setHasSubmitted(false);
+      // A generated report is listed in the page's History (report_schedule audit).
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'report_schedule'] });
       onGenerated();
     },
   });
@@ -123,7 +126,6 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
                 </Label>
                 <Select
                   id="report-type"
-                  className="h-9"
                   value={selectedType}
                   onChange={(e) => {
                     setReportType(e.target.value);
@@ -143,7 +145,6 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
                 </Label>
                 <Select
                   id="report-format"
-                  className="h-9"
                   value={selectedFormat}
                   onChange={(e) => {
                     setFormat(e.target.value);
@@ -189,7 +190,6 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
               </Label>
               <Select
                 id="report-site"
-                className="h-9"
                 value={siteId}
                 onChange={(e) => {
                   setSiteId(e.target.value);
@@ -211,7 +211,6 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
               </Label>
               <Select
                 id="report-station"
-                className="h-9"
                 value={stationId}
                 onChange={(e) => {
                   setStationId(e.target.value);

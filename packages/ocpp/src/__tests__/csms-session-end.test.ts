@@ -4,18 +4,27 @@
 import { describe, it, expect, vi } from 'vitest';
 import type postgres from 'postgres';
 import type { EventBus, Logger, PubSubClient } from '@evtivity/lib';
-const { mockCancelOpenSessionHold, mockNotifySessionEndFailed, mockSessionAudit } = vi.hoisted(
-  () => ({
-    mockCancelOpenSessionHold: vi.fn(),
-    mockNotifySessionEndFailed: vi.fn(),
-    mockSessionAudit: vi.fn(),
-  }),
-);
+const {
+  mockCancelOpenSessionHold,
+  mockFailGuestSessionOfFaultedSession,
+  mockNotifySessionEndFailed,
+  mockSessionAudit,
+} = vi.hoisted(() => ({
+  mockCancelOpenSessionHold: vi.fn(),
+  mockFailGuestSessionOfFaultedSession: vi.fn().mockResolvedValue(false),
+  mockNotifySessionEndFailed: vi.fn(),
+  mockSessionAudit: vi.fn(),
+}));
+const mockOcpiSessionPush = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock('@evtivity/database', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@evtivity/database')>()),
   writeCsmsSessionAudit: mockSessionAudit,
+  publishOcpiSessionPush: mockOcpiSessionPush,
 }));
-vi.mock('@evtivity/payments', () => ({ cancelOpenSessionHold: mockCancelOpenSessionHold }));
+vi.mock('@evtivity/payments', () => ({
+  cancelOpenSessionHold: mockCancelOpenSessionHold,
+  failGuestSessionOfFaultedSession: mockFailGuestSessionOfFaultedSession,
+}));
 vi.mock('../server/session-end-alert.js', () => ({
   notifySessionEndFailed: mockNotifySessionEndFailed,
 }));
@@ -124,6 +133,22 @@ describe('subscribeSessionEndRequests', () => {
     });
   });
 
+  it('ends a session an operator ended without its offline station', async () => {
+    const { send, bus } = await subscribed([claimedRow]);
+    send(JSON.stringify({ sessionId: 'ses_1', reason: 'OperatorEnded' }));
+    await vi.waitFor(() => {
+      expect(bus.publish).toHaveBeenCalledTimes(1);
+    });
+    expect(bus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          eventType: 'Ended',
+          stoppedReason: 'OperatorEnded',
+        }) as unknown,
+      }),
+    );
+  });
+
   it('logs and ignores a malformed request', async () => {
     const { send, bus, logger } = await subscribed([claimedRow]);
     send(JSON.stringify({ sessionId: 'ses_1', reason: 'StaleSession' }));
@@ -154,15 +179,16 @@ describe('sweepSessionEndRequests', () => {
       [
         { id: 'ses_1', end_request_reason: 'GhostRecovered' },
         { id: 'ses_2', end_request_reason: 'Superseded' },
+        { id: 'ses_3', end_request_reason: 'OperatorEnded' },
       ],
       [claimedRow],
     );
     const bus = makeBus();
-    expect(await sweepSessionEndRequests(sql, bus, makeLogger() as unknown as Logger)).toBe(2);
+    expect(await sweepSessionEndRequests(sql, bus, makeLogger() as unknown as Logger)).toBe(3);
     expect(calls[0]).toContain("status = 'active'");
     expect(calls[0]).toContain('end_request_reason IS NOT NULL');
     expect(calls[0]).toContain('end_claimed_at IS NULL');
-    expect(bus.publish).toHaveBeenCalledTimes(2);
+    expect(bus.publish).toHaveBeenCalledTimes(3);
   });
 
   it('skips an unknown reason and a request another pod claimed', async () => {
@@ -243,6 +269,24 @@ describe('giving up on a session end', () => {
     expect(mockNotifySessionEndFailed).toHaveBeenCalledWith(sql, 'ses_1', log);
   });
 
+  it('fails the guest session of the faulted session (finding G5)', async () => {
+    mockCancelOpenSessionHold.mockReset().mockResolvedValue({ status: 'cancelled' });
+    mockNotifySessionEndFailed.mockReset().mockResolvedValue(undefined);
+    mockFailGuestSessionOfFaultedSession.mockClear();
+    const { sql } = giveUpSql([{ id: 'ses_1' }]);
+    expect(await giveUpSessionEnd(sql, 'ses_1', makeLogger() as unknown as Logger)).toBe(true);
+    expect(mockFailGuestSessionOfFaultedSession).toHaveBeenCalledWith('ses_1', {
+      registry: 'registry',
+    });
+
+    mockFailGuestSessionOfFaultedSession.mockClear();
+    const ended = giveUpSql([]);
+    expect(await giveUpSessionEnd(ended.sql, 'ses_1', makeLogger() as unknown as Logger)).toBe(
+      false,
+    );
+    expect(mockFailGuestSessionOfFaultedSession).not.toHaveBeenCalled();
+  });
+
   it('audits the fault once as a system session-end-sweep row', async () => {
     mockCancelOpenSessionHold.mockReset().mockResolvedValue({ status: 'cancelled' });
     mockNotifySessionEndFailed.mockReset().mockResolvedValue(undefined);
@@ -263,6 +307,24 @@ describe('giving up on a session end', () => {
       undefined,
       log,
     );
+  });
+
+  it('pushes the faulted session to its roaming partner when given a pubsub', async () => {
+    mockCancelOpenSessionHold.mockReset().mockResolvedValue({ status: 'cancelled' });
+    mockNotifySessionEndFailed.mockReset().mockResolvedValue(undefined);
+    mockOcpiSessionPush.mockClear();
+    const pubsub = { publish: vi.fn() } as unknown as PubSubClient;
+    const log = makeLogger();
+    const { sql } = giveUpSql([{ id: 'ses_1' }]);
+    expect(await giveUpSessionEnd(sql, 'ses_1', log as unknown as Logger, pubsub)).toBe(true);
+    expect(mockOcpiSessionPush).toHaveBeenCalledWith(pubsub, 'ses_1', log);
+
+    mockOcpiSessionPush.mockClear();
+    const ended = giveUpSql([]);
+    expect(await giveUpSessionEnd(ended.sql, 'ses_1', log as unknown as Logger, pubsub)).toBe(
+      false,
+    );
+    expect(mockOcpiSessionPush).not.toHaveBeenCalled();
   });
 
   it('leaves a session that ended meanwhile alone and sends no alert (P5, P7)', async () => {

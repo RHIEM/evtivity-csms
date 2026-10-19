@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../lib/site-access.js', async () =>
   (await import('./helpers/site-access-mock.js')).siteAccessMock(),
@@ -33,6 +33,8 @@ function makeChain(kind: string): Chain {
     'groupBy',
     'values',
     'returning',
+    'for',
+    'onConflictDoNothing',
     'set',
     'onConflictDoUpdate',
   ];
@@ -53,7 +55,8 @@ function pgError(code: string): Error {
   return Object.assign(new Error('pg error'), { cause: { code } });
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   db: {
     select: vi.fn(() => makeChain('select')),
@@ -82,6 +85,24 @@ vi.mock('@evtivity/database', () => ({
   driverAuditLog: { name: 'driverAuditLog' },
   vehicleAuditLog: { name: 'vehicleAuditLog' },
   pricingAssignmentAuditLog: { name: 'pricingAssignmentAuditLog' },
+}));
+
+// Vehicle writes go through the vehicle service (vehicle-service-mapping is
+// checked here; the service itself runs against the database in
+// __integration__/118-autocharge-vehicles).
+const vehicleServiceMock = vi.hoisted(() => ({
+  createVehicle: vi.fn(),
+  updateVehicle: vi.fn(),
+  deleteVehicle: vi.fn(),
+  setVehicleBlocked: vi.fn(),
+}));
+vi.mock('../services/vehicle.service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/vehicle.service.js')>()),
+  ...vehicleServiceMock,
+}));
+vi.mock('../lib/vehicle-response.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/vehicle-response.js')>()),
+  vehicleLastSeen: vi.fn(() => Promise.resolve(new Map())),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -127,7 +148,21 @@ vi.mock('../lib/pricing-group-lookup.js', () => ({ pricingGroupExists: pricingGr
 
 vi.mock('../services/token.service.js', () => {
   class DuplicateTokenError extends Error {}
-  return { createToken: createTokenMock, bulkSetActive: bulkSetActiveMock, DuplicateTokenError };
+  class TokenDriverNotFoundError extends Error {}
+  class TokenDriverInactiveError extends Error {}
+  class PncContractTokenError extends Error {}
+  return {
+    createToken: createTokenMock,
+    bulkSetActive: bulkSetActiveMock,
+    DuplicateTokenError,
+    TokenDriverNotFoundError,
+    TokenDriverInactiveError,
+    PncContractTokenError,
+    tokenActorOf: (actor: { actorUserId: string | null }) => ({
+      type: 'operator',
+      userId: actor.actorUserId,
+    }),
+  };
 });
 
 vi.mock('../services/driver-portal-access.service.js', () => ({
@@ -135,9 +170,27 @@ vi.mock('../services/driver-portal-access.service.js', () => ({
   inviteDriverToPortal: vi.fn(),
 }));
 
-vi.mock('../routes/tokens.js', () => ({ OCPP_TOKEN_TYPES: ['ISO14443', 'ISO15693', 'Central'] }));
+const { applyDriverDeactivationMock, revokeDriverEmailLinksMock } = vi.hoisted(() => ({
+  applyDriverDeactivationMock: vi.fn(),
+  revokeDriverEmailLinksMock: vi.fn(),
+}));
+const { eraseDriverMock } = vi.hoisted(() => ({ eraseDriverMock: vi.fn() }));
+vi.mock('../services/driver-erasure.service.js', () => ({ eraseDriver: eraseDriverMock }));
 
-import { writeAudit } from '@evtivity/database';
+const { sendDriverEmailVerificationMock } = vi.hoisted(() => ({
+  sendDriverEmailVerificationMock: vi.fn(),
+}));
+vi.mock('../lib/driver-email-verification.js', () => ({
+  sendDriverEmailVerification: sendDriverEmailVerificationMock,
+}));
+
+vi.mock('../services/driver-status.service.js', () => ({
+  applyDriverDeactivation: applyDriverDeactivationMock,
+  revokeDriverEmailLinks: revokeDriverEmailLinksMock,
+}));
+
+import { inOperatorStation, writeAudit } from '@evtivity/database';
+import { resetSiteAccessMock, setMockUserSiteIds } from './helpers/site-access-mock.js';
 import { registerAuth } from '../plugins/auth.js';
 import { driverRoutes } from '../routes/drivers.js';
 import * as tokenService from '../services/token.service.js';
@@ -146,6 +199,35 @@ const DRIVER_ID = 'drv_000000000001';
 const VEHICLE_ID = 'veh_000000000001';
 const PG_ID = 'pgr_000000000001';
 const now = new Date().toISOString();
+
+// The full driver row PATCH reads first (email and phone guards, audit diff).
+const BEFORE_ROW = {
+  id: DRIVER_ID,
+  firstName: 'A',
+  lastName: 'B',
+  email: 'a@example.com',
+  phone: null,
+  language: 'en',
+  timezone: 'America/New_York',
+  isActive: true,
+  passwordHash: null,
+  mfaEnabled: false,
+  mfaMethod: null,
+};
+
+// The safe projection PATCH returns.
+const UPDATED_ROW = {
+  id: DRIVER_ID,
+  firstName: 'A',
+  lastName: 'B',
+  email: 'a@example.com',
+  phone: null,
+  language: 'en',
+  timezone: 'America/New_York',
+  isActive: true,
+  createdAt: now,
+  updatedAt: now,
+};
 
 function lastChain(kind: string): Chain | undefined {
   return chains.filter((c) => c.kind === kind).at(-1)?.chain;
@@ -177,6 +259,8 @@ describe('Driver routes (operator), uncovered paths', () => {
     chains.length = 0;
     publishPricingChangedMock.mockResolvedValue(undefined);
     bulkSetActiveMock.mockResolvedValue(undefined);
+    applyDriverDeactivationMock.mockResolvedValue({ tokensDeactivated: 0 });
+    revokeDriverEmailLinksMock.mockResolvedValue(undefined);
   });
 
   describe('GET /drivers status filter', () => {
@@ -256,8 +340,21 @@ describe('Driver routes (operator), uncovered paths', () => {
       expect(chains).toHaveLength(0);
     });
 
+    it('returns 404 before any write when the driver does not exist', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { firstName: 'Z' },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().code).toBe('DRIVER_NOT_FOUND');
+      expect(chains.filter((c) => c.kind === 'update')).toHaveLength(0);
+    });
+
     it('returns 409 when another driver has the email', async () => {
-      setupDbResults([{ id: 'drv_000000000002' }]);
+      setupDbResults([BEFORE_ROW], [{ id: 'drv_000000000002' }]);
       const res = await app.inject({
         method: 'PATCH',
         url: `/drivers/${DRIVER_ID}`,
@@ -269,7 +366,7 @@ describe('Driver routes (operator), uncovered paths', () => {
     });
 
     it('maps a unique violation on update to 409', async () => {
-      setupDbResults([], [{ id: DRIVER_ID }], pgError('23505'));
+      setupDbResults([BEFORE_ROW], [], pgError('23505'));
       const res = await app.inject({
         method: 'PATCH',
         url: `/drivers/${DRIVER_ID}`,
@@ -281,7 +378,7 @@ describe('Driver routes (operator), uncovered paths', () => {
     });
 
     it('rethrows other update errors as 500', async () => {
-      setupDbResults([{ id: DRIVER_ID }], pgError('XX000'));
+      setupDbResults([BEFORE_ROW], pgError('XX000'));
       const res = await app.inject({
         method: 'PATCH',
         url: `/drivers/${DRIVER_ID}`,
@@ -291,19 +388,9 @@ describe('Driver routes (operator), uncovered paths', () => {
       expect(res.statusCode).toBe(500);
     });
 
-    it('stores the timezone and audits a deactivation', async () => {
-      const before = { id: DRIVER_ID, isActive: true };
-      const updated = {
-        id: DRIVER_ID,
-        firstName: 'A',
-        lastName: 'B',
-        email: null,
-        phone: null,
-        language: 'en',
-        isActive: false,
-        createdAt: now,
-        updatedAt: now,
-      };
+    it('stores the timezone, audits the changed fields and applies the deactivation', async () => {
+      const before = { ...BEFORE_ROW, isActive: true };
+      const updated = { ...UPDATED_ROW, isActive: false, timezone: 'Europe/Berlin' };
       setupDbResults([before], [updated]);
       const res = await app.inject({
         method: 'PATCH',
@@ -317,10 +404,186 @@ describe('Driver routes (operator), uncovered paths', () => {
       );
       expect(writeAudit).toHaveBeenCalledWith(
         expect.objectContaining({ idColumn: 'driver_id' }),
-        expect.objectContaining({ action: 'deactivated', before, after: updated }),
+        expect.objectContaining({
+          action: 'deactivated',
+          before: { isActive: true, timezone: 'America/New_York' },
+          after: { isActive: false, timezone: 'Europe/Berlin' },
+        }),
         expect.anything(),
         expect.anything(),
       );
+      expect(applyDriverDeactivationMock).toHaveBeenCalledWith(
+        DRIVER_ID,
+        expect.objectContaining({
+          actor: expect.objectContaining({ actorUserId: 'usr_000000000001' }),
+        }),
+      );
+      expect(revokeDriverEmailLinksMock).not.toHaveBeenCalled();
+    });
+
+    it('applies the deactivation again for a driver already inactive, without an audit row', async () => {
+      const before = { ...BEFORE_ROW, isActive: false };
+      setupDbResults([before], [{ ...UPDATED_ROW, isActive: false }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { isActive: false },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(applyDriverDeactivationMock).toHaveBeenCalledWith(DRIVER_ID, expect.anything());
+      expect(writeAudit).not.toHaveBeenCalled();
+    });
+
+    it('writes no audit row when nothing changed', async () => {
+      setupDbResults([BEFORE_ROW], [UPDATED_ROW]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { firstName: 'A' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(writeAudit).not.toHaveBeenCalled();
+      expect(applyDriverDeactivationMock).not.toHaveBeenCalled();
+    });
+
+    it('revokes the emailed links when the email changes', async () => {
+      setupDbResults([BEFORE_ROW], [], [{ ...UPDATED_ROW, email: 'new@example.com' }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { email: 'New@Example.com' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
+        expect.objectContaining({ email: 'new@example.com' }),
+      );
+      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
+        expect.objectContaining({ emailVerified: false }),
+      );
+      expect(revokeDriverEmailLinksMock).toHaveBeenCalledWith(DRIVER_ID);
+      // No portal access: the invitation verifies the address, no link is sent now.
+      expect(sendDriverEmailVerificationMock).not.toHaveBeenCalled();
+      expect(writeAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: 'updated',
+          before: { email: 'a@example.com' },
+          after: { email: 'new@example.com' },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('emails a verification link to the new address of a driver with portal access', async () => {
+      setupDbResults(
+        [{ ...BEFORE_ROW, passwordHash: '$argon2id$x', emailVerified: true }],
+        [],
+        [{ ...UPDATED_ROW, email: 'new@example.com', emailVerified: false }],
+      );
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { email: 'new@example.com' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(sendDriverEmailVerificationMock).toHaveBeenCalledWith(
+        expect.objectContaining({ id: DRIVER_ID, email: 'new@example.com', firstName: 'A' }),
+        expect.anything(),
+      );
+      expect(writeAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          before: { email: 'a@example.com', emailVerified: true },
+          after: { email: 'new@example.com', emailVerified: false },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('keeps the emailed links when the email only changes case', async () => {
+      setupDbResults([BEFORE_ROW], [], [UPDATED_ROW]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { email: 'A@Example.com' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(revokeDriverEmailLinksMock).not.toHaveBeenCalled();
+      expect(lastChain('update')?.['set']).not.toHaveBeenCalledWith(
+        expect.objectContaining({ emailVerified: false }),
+      );
+      expect(sendDriverEmailVerificationMock).not.toHaveBeenCalled();
+    });
+
+    it('removes the phone with null or an empty string', async () => {
+      setupDbResults([{ ...BEFORE_ROW, phone: '+15550001' }], [UPDATED_ROW]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { phone: '' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
+        expect.objectContaining({ phone: null }),
+      );
+    });
+
+    it('refuses to remove the email of a driver with portal access', async () => {
+      setupDbResults([{ ...BEFORE_ROW, passwordHash: '$argon2id$x' }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { email: null },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+      expect(chains.filter((c) => c.kind === 'update')).toHaveLength(0);
+    });
+
+    it('removes the email of a driver without portal access and revokes the links', async () => {
+      setupDbResults([BEFORE_ROW], [{ ...UPDATED_ROW, email: null }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { email: null },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
+        expect.objectContaining({ email: null }),
+      );
+      expect(revokeDriverEmailLinksMock).toHaveBeenCalledWith(DRIVER_ID);
+    });
+
+    it('refuses to remove the phone of a driver signing in with SMS codes', async () => {
+      setupDbResults([{ ...BEFORE_ROW, phone: '+15550001', mfaEnabled: true, mfaMethod: 'sms' }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { phone: null },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+    });
+
+    it('rejects an empty first name', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { firstName: '' },
+      });
+      expect(res.statusCode).toBe(400);
     });
 
     it('audits an activation of an inactive driver', async () => {
@@ -335,7 +598,10 @@ describe('Driver routes (operator), uncovered paths', () => {
         createdAt: now,
         updatedAt: now,
       };
-      setupDbResults([{ id: DRIVER_ID, isActive: false }], [updated]);
+      setupDbResults(
+        [{ ...BEFORE_ROW, isActive: false }],
+        [{ ...updated, timezone: 'America/New_York' }],
+      );
       const res = await app.inject({
         method: 'PATCH',
         url: `/drivers/${DRIVER_ID}`,
@@ -353,6 +619,30 @@ describe('Driver routes (operator), uncovered paths', () => {
   });
 
   describe('POST /drivers/:id/tokens', () => {
+    it('returns 404 when the token service finds no driver', async () => {
+      createTokenMock.mockRejectedValueOnce(new tokenService.TokenDriverNotFoundError(DRIVER_ID));
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${DRIVER_ID}/tokens`,
+        headers: auth,
+        payload: { idToken: 'RFID-1', tokenType: 'ISO14443' },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
+    });
+
+    it('refuses a token for an inactive driver', async () => {
+      createTokenMock.mockRejectedValueOnce(new tokenService.TokenDriverInactiveError(DRIVER_ID));
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${DRIVER_ID}/tokens`,
+        headers: auth,
+        payload: { idToken: 'RFID-1', tokenType: 'ISO14443' },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toEqual({ error: 'Driver is inactive', code: 'DRIVER_INACTIVE' });
+    });
+
     it('returns 409 TOKEN_DUPLICATE when the token is already registered', async () => {
       createTokenMock.mockRejectedValueOnce(
         new tokenService.DuplicateTokenError('RFID-1', 'ISO14443'),
@@ -397,7 +687,10 @@ describe('Driver routes (operator), uncovered paths', () => {
     });
 
     it('maps a foreign key violation (driver deleted meanwhile) to 404', async () => {
-      setupDbResults([{ id: DRIVER_ID }], pgError('23503'));
+      // The service maps the violation to VehicleDriverNotFoundError.
+      const { VehicleDriverNotFoundError } = await import('../services/vehicle.service.js');
+      setupDbResults([{ id: DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockRejectedValueOnce(new VehicleDriverNotFoundError());
       const res = await app.inject({
         method: 'POST',
         url: `/drivers/${DRIVER_ID}/vehicles`,
@@ -410,7 +703,8 @@ describe('Driver routes (operator), uncovered paths', () => {
     });
 
     it('returns 500 for other insert errors', async () => {
-      setupDbResults([{ id: DRIVER_ID }], pgError('XX000'));
+      setupDbResults([{ id: DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockRejectedValueOnce(pgError('XX000'));
       const res = await app.inject({
         method: 'POST',
         url: `/drivers/${DRIVER_ID}/vehicles`,
@@ -422,42 +716,57 @@ describe('Driver routes (operator), uncovered paths', () => {
   });
 
   describe('PATCH /drivers/:id/vehicles/:vehicleId', () => {
-    it('sets only the given fields and audits before and after', async () => {
-      const before = { id: VEHICLE_ID, driverId: DRIVER_ID, vin: 'OLD' };
+    it('passes null removals and the new id fields to the vehicle service', async () => {
       const updated = {
         id: VEHICLE_ID,
         driverId: DRIVER_ID,
         make: 'BMW',
         model: 'i4',
-        year: '2023',
-        vin: 'NEWVIN',
-        licensePlate: 'XY1',
+        year: null,
+        vin: null,
+        licensePlate: null,
+        evccid: '92D50A693F80',
+        autochargeEnabled: true,
+        autochargeBlockedAt: null,
         createdAt: now,
         updatedAt: now,
       };
-      setupDbResults([before], [updated]);
+      vehicleServiceMock.updateVehicle.mockResolvedValueOnce(updated);
+      const payload = {
+        year: null,
+        vin: null,
+        licensePlate: null,
+        evccid: '92:d5:0a:69:3f:80',
+        autochargeEnabled: true,
+      };
       const res = await app.inject({
         method: 'PATCH',
         url: `/drivers/${DRIVER_ID}/vehicles/${VEHICLE_ID}`,
         headers: auth,
-        payload: { make: 'BMW', model: 'i4', year: '2023', vin: 'NEWVIN', licensePlate: 'XY1' },
+        payload,
       });
       expect(res.statusCode).toBe(200);
-      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
-        expect.objectContaining({
-          make: 'BMW',
-          model: 'i4',
-          year: '2023',
-          vin: 'NEWVIN',
-          licensePlate: 'XY1',
-        }),
-      );
-      expect(writeAudit).toHaveBeenCalledWith(
-        expect.objectContaining({ idColumn: 'vehicle_id' }),
-        expect.objectContaining({ action: 'updated', before, after: updated }),
+      expect(res.json()).toMatchObject({ evccid: '92D50A693F80', autochargeEnabled: true });
+      expect(vehicleServiceMock.updateVehicle).toHaveBeenCalledWith(
+        DRIVER_ID,
+        VEHICLE_ID,
+        payload,
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it('answers a bad VIN with 400 VALIDATION_ERROR', async () => {
+      const { VehicleIdInvalidError } = await import('../services/vehicle.service.js');
+      vehicleServiceMock.updateVehicle.mockRejectedValueOnce(new VehicleIdInvalidError('vin'));
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}/vehicles/${VEHICLE_ID}`,
+        headers: auth,
+        payload: { vin: 'NOT-A-VIN' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR', details: { field: 'vin' } });
     });
   });
 
@@ -498,27 +807,130 @@ describe('Driver routes (operator), uncovered paths', () => {
     });
   });
 
+  describe('POST /drivers/:id/erase', () => {
+    afterEach(() => {
+      resetSiteAccessMock();
+    });
+
+    it('refuses a confirmation that does not repeat the driver id', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${DRIVER_ID}/erase`,
+        headers: auth,
+        payload: { confirm: 'yes' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+      expect(eraseDriverMock).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 to a site-restricted user before anything else', async () => {
+      setMockUserSiteIds(['sit_000000000001']);
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${DRIVER_ID}/erase`,
+        headers: auth,
+        payload: { confirm: DRIVER_ID },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().code).toBe('DRIVER_NOT_FOUND');
+      expect(eraseDriverMock).not.toHaveBeenCalled();
+    });
+
+    it('erases the driver as the operator and returns the counts', async () => {
+      eraseDriverMock.mockResolvedValueOnce({
+        erasedAt: new Date(now),
+        paymentMethodsRemoved: 1,
+        vehiclesRemoved: 2,
+        tokensDeactivated: 3,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${DRIVER_ID}/erase`,
+        headers: auth,
+        payload: { confirm: DRIVER_ID },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({
+        paymentMethodsRemoved: 1,
+        vehiclesRemoved: 2,
+        tokensDeactivated: 3,
+      });
+      expect(eraseDriverMock).toHaveBeenCalledWith(
+        DRIVER_ID,
+        expect.objectContaining({
+          actor: expect.objectContaining({ actorUserId: 'usr_000000000001' }),
+        }),
+      );
+    });
+  });
+
+  describe('PATCH /drivers/:id on an erased driver', () => {
+    it('answers 409 DRIVER_ERASED and writes nothing', async () => {
+      setupDbResults([{ ...BEFORE_ROW, erasedAt: new Date(), isActive: false }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+        payload: { isActive: true },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().code).toBe('DRIVER_ERASED');
+      expect(chains.filter((c) => c.kind === 'update')).toHaveLength(0);
+    });
+  });
+
   describe('DELETE /drivers/:id', () => {
-    it('deactivates every token the driver owns', async () => {
-      const driver = { id: DRIVER_ID, isActive: true };
-      setupDbResults([driver], [], [{ id: 'dtk_000000000001' }, { id: 'dtk_000000000002' }]);
+    it('deactivates the driver, applies the deactivation and audits the delete', async () => {
+      setupDbResults([{ ...BEFORE_ROW, isActive: true }], [{ id: DRIVER_ID }]);
       const res = await app.inject({
         method: 'DELETE',
         url: `/drivers/${DRIVER_ID}`,
         headers: auth,
       });
       expect(res.statusCode).toBe(204);
-      expect(bulkSetActiveMock).toHaveBeenCalledWith(
-        ['dtk_000000000001', 'dtk_000000000002'],
-        false,
-        { type: 'operator', userId: 'usr_000000000001' },
+      expect(lastChain('update')?.['set']).toHaveBeenCalledWith(
+        expect.objectContaining({ isActive: false }),
+      );
+      expect(applyDriverDeactivationMock).toHaveBeenCalledWith(
+        DRIVER_ID,
+        expect.objectContaining({
+          actor: expect.objectContaining({ actor: 'operator', actorUserId: 'usr_000000000001' }),
+        }),
       );
       expect(writeAudit).toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({ action: 'deleted', before: driver }),
+        expect.objectContaining({
+          action: 'deleted',
+          before: expect.objectContaining({ isActive: true, email: 'a@example.com' }),
+          after: { isActive: false },
+        }),
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it('repeated on an inactive driver: still applies the deactivation, no second audit row', async () => {
+      setupDbResults([{ ...BEFORE_ROW, isActive: false }], []);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+      });
+      expect(res.statusCode).toBe(204);
+      expect(applyDriverDeactivationMock).toHaveBeenCalledWith(DRIVER_ID, expect.anything());
+      expect(writeAudit).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 for an unknown driver', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/drivers/${DRIVER_ID}`,
+        headers: auth,
+      });
+      expect(res.statusCode).toBe(404);
+      expect(applyDriverDeactivationMock).not.toHaveBeenCalled();
     });
   });
 
@@ -552,6 +964,7 @@ describe('Driver routes (operator), uncovered paths', () => {
         currency: 'EUR',
       };
       setupDbResults([{ id: DRIVER_ID }], [session], [{ count: 31 }]);
+      vi.mocked(inOperatorStation).mockClear();
       const res = await app.inject({
         method: 'GET',
         url: `/drivers/${DRIVER_ID}/sessions?page=2&limit=10`,
@@ -563,6 +976,8 @@ describe('Driver routes (operator), uncovered paths', () => {
       const dataChain = chains.filter((c) => c.kind === 'select')[1]?.chain;
       expect(dataChain?.['offset']).toHaveBeenCalledWith(10);
       expect(dataChain?.['limit']).toHaveBeenCalledWith(10);
+      // Sessions of conformance test stations are never listed.
+      expect(vi.mocked(inOperatorStation)).toHaveBeenCalledTimes(1);
     });
 
     it('returns total 0 when the count row is missing', async () => {
@@ -607,6 +1022,7 @@ describe('Driver routes (operator), uncovered paths', () => {
         cancellationFeeCents: 0,
       };
       setupDbResults([{ id: DRIVER_ID }], [row], [{ count: 1 }]);
+      vi.mocked(inOperatorStation).mockClear();
       const res = await app.inject({
         method: 'GET',
         url: `/drivers/${DRIVER_ID}/reservations`,
@@ -615,6 +1031,8 @@ describe('Driver routes (operator), uncovered paths', () => {
       expect(res.statusCode).toBe(200);
       expect(res.json().total).toBe(1);
       expect(res.json().data[0]).toMatchObject({ reservationId: 42, cancelNote: 'site closed' });
+      // Reservations of conformance test stations are never listed.
+      expect(vi.mocked(inOperatorStation)).toHaveBeenCalledTimes(1);
     });
 
     it('returns total 0 when the count row is missing', async () => {

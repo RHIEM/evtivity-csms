@@ -4,7 +4,15 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, sql, desc, and, asc } from 'drizzle-orm';
-import { db, getCompanyCurrency, writeAudit, sessionAuditLog } from '@evtivity/database';
+import type { SQL } from 'drizzle-orm';
+import {
+  db,
+  getCompanyCurrency,
+  inOperatorStation,
+  isAutochargeEnabledForStation,
+  writeAudit,
+  sessionAuditLog,
+} from '@evtivity/database';
 import {
   chargingSessions,
   chargingStations,
@@ -16,9 +24,15 @@ import {
   vehicles,
   vehicleEfficiencyLookup,
 } from '@evtivity/database';
-import { zodSchema } from '../../lib/zod-schema.js';
+import { parseZodRequest, zodSchema } from '../../lib/zod-schema.js';
+import * as vehicleService from '../../services/vehicle.service.js';
+import {
+  replyVehicleServiceError,
+  sessionVehicleCaptureItem,
+  vehicleClaimBody,
+} from '../../lib/vehicle-response.js';
 import { inCompanyCurrency, sessionCurrencySql } from '@evtivity/services/company-currency';
-import { storedSessionCostTax } from '@evtivity/lib';
+import { isValidTimezone, storedSessionCostTax } from '@evtivity/lib';
 import { sessionLimitReached } from '../../lib/session-limit.js';
 import { ID_PARAMS } from '../../lib/id-validation.js';
 import { getAuditActor } from '../../lib/audit-actor.js';
@@ -28,6 +42,7 @@ import { paginationQuery } from '../../lib/pagination.js';
 import type { PaginatedResponse } from '../../lib/pagination.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
 import {
+  billedToFleetSql,
   sessionAccountBillingColumns,
   sessionAccountBillingSchema,
   withAccountBilling,
@@ -180,6 +195,9 @@ const portalSessionDetail = portalSessionListItem
         make: z.string().nullable().describe('Vehicle make'),
         model: z.string().nullable().describe('Vehicle model'),
         year: z.string().nullable().describe('Vehicle year'),
+        vin: z.string().nullable().describe('VIN stored on the vehicle'),
+        evccid: z.string().nullable().describe('EVCCID (MAC address) stored on the vehicle'),
+        autochargeEnabled: z.boolean().describe('Autocharge is on for the vehicle'),
         efficiencyMiPerKwh: z
           .number()
           .min(0)
@@ -188,6 +206,15 @@ const portalSessionDetail = portalSessionListItem
       .passthrough()
       .nullable()
       .describe('Vehicle linked to this session for distance estimation'),
+    vehicleCapture: sessionVehicleCaptureItem,
+    autocharge: z
+      .boolean()
+      .describe('The session was started by an Autocharge vehicle (charge by plugging in)'),
+    autochargeAvailable: z
+      .boolean()
+      .describe(
+        "Autocharge is on at the session's site, so the driver can use the captured vehicle id for plug-in charging",
+      ),
   })
   .passthrough();
 
@@ -219,11 +246,13 @@ const sessionParams = z.object({
 const monthString = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/);
 
 const sessionListQuery = paginationQuery.extend({
-  month: monthString.optional().describe('Filter by month in YYYY-MM format'),
+  month: monthString
+    .optional()
+    .describe("Filter by month in YYYY-MM format, in the driver's timezone"),
 });
 
 const monthlySummaryQuery = z.object({
-  month: monthString.describe('Month in YYYY-MM format'),
+  month: monthString.describe("Month in YYYY-MM format, in the driver's timezone"),
 });
 
 const monthlySummaryResponse = z
@@ -233,7 +262,7 @@ const monthlySummaryResponse = z
       .int()
       .min(0)
       .describe(
-        'Total cost of completed sessions in the month, in cents. Sums only sessions billed in the company currency.',
+        'Total cost of completed sessions in the month, in cents. Sums only sessions billed in the company currency, and leaves out sessions invoiced to a fleet.',
       ),
     totalEnergyWh: z.number().min(0).describe('Total energy delivered across the month in Wh'),
     totalCo2AvoidedKg: z.number().describe('Total CO2 avoided across the month in kg'),
@@ -264,8 +293,17 @@ const monthlyStatementSessionItem = z
         'Tax contained in finalCostCents, in cents, as stored with it. Above 0 when the cost includes tax',
       ),
     currency: z.string().length(3).describe('Currency code (ISO 4217) the session was billed in'),
-    siteName: z.string().max(255).nullable().describe('Site name for the station'),
+    siteName: z
+      .string()
+      .max(255)
+      .nullable()
+      .describe('Name of the site the session happened at (else the station site)'),
     siteCity: z.string().max(100).nullable().describe('Site city'),
+    accountBilling: sessionAccountBillingSchema
+      .nullable()
+      .describe(
+        'Set when the session is billed to a fleet (charge on account). A session invoiced to the fleet (invoicedTo fleet) is not in totalCostCents',
+      ),
   })
   .passthrough();
 
@@ -276,12 +314,24 @@ const monthlyStatementTotals = z
       .int()
       .min(0)
       .describe(
-        'Total cost of the statement sessions in cents. Sums only sessions billed in the company currency.',
+        'Total cost of the statement sessions the driver pays, in cents. Sums only sessions billed in the company currency, and leaves out sessions invoiced to a fleet.',
       ),
     currency: z.string().length(3).describe('Company currency (ISO 4217) of totalCostCents'),
     totalEnergyWh: z.number().min(0).describe('Total energy delivered across the statement in Wh'),
     totalCo2AvoidedKg: z.number().describe('Total CO2 avoided across the statement in kg'),
     sessionCount: z.number().int().min(0).describe('Number of completed sessions in the statement'),
+    otherCurrencySessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Sessions billed in a currency other than the company currency (an earlier one), left out of totalCostCents',
+      ),
+    fleetBilledSessionCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Sessions invoiced to a fleet, left out of totalCostCents'),
   })
   .passthrough();
 
@@ -294,14 +344,36 @@ const monthlyStatementResponse = z
   })
   .passthrough();
 
-function monthRange(month: string): { start: string; end: string } {
-  const [yearStr, monthStr] = month.split('-');
-  const year = Number(yearStr);
-  const mon = Number(monthStr);
-  const start = new Date(Date.UTC(year, mon - 1, 1)).toISOString();
-  const end = new Date(Date.UTC(year, mon, 1)).toISOString();
-  return { start, end };
+/**
+ * The driver's timezone, in which a month starts and ends for the driver
+ * (owner decision 2026-10-14). The column is required; a value Postgres would
+ * not know falls back to UTC.
+ */
+async function driverTimezone(driverId: string): Promise<string> {
+  const [row] = await db
+    .select({ timezone: drivers.timezone })
+    .from(drivers)
+    .where(eq(drivers.id, driverId));
+  const tz = row?.timezone;
+  return tz != null && isValidTimezone(tz) ? tz : 'UTC';
 }
+
+/**
+ * Sessions started in `month` (YYYY-MM) as the driver's calendar shows it:
+ * from local midnight on the first day to local midnight on the first day of
+ * the next month, in the driver's timezone.
+ */
+function startedInMonth(month: string, timezone: string): SQL {
+  const firstDay = `${month}-01`;
+  return sql`${chargingSessions.startedAt} >= (${firstDay}::date::timestamp AT TIME ZONE ${timezone})
+    AND ${chargingSessions.startedAt} < ((${firstDay}::date + interval '1 month')::timestamp AT TIME ZONE ${timezone})`;
+}
+
+/**
+ * The site of a session: the site it happened at, else (a row from before the
+ * site history, or a deleted site) the station's current site.
+ */
+const sessionSiteJoin = sql`${sites.id} = COALESCE(${chargingSessions.siteId}, ${chargingStations.siteId})`;
 
 export function portalSessionRoutes(app: FastifyInstance): void {
   app.get(
@@ -323,10 +395,11 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       const { page, limit, month } = query;
       const offset = (page - 1) * limit;
 
-      let whereClause = sql`${chargingSessions.driverId} = ${driverId}`;
+      // Sessions at conformance (OCTT) stations are never listed.
+      let whereClause = sql`${chargingSessions.driverId} = ${driverId} AND ${inOperatorStation(chargingSessions.stationId)}`;
       if (month != null) {
-        const { start, end } = monthRange(month);
-        whereClause = sql`${chargingSessions.driverId} = ${driverId} AND ${chargingSessions.startedAt} >= ${start} AND ${chargingSessions.startedAt} < ${end}`;
+        const timezone = await driverTimezone(driverId);
+        whereClause = sql`${whereClause} AND ${startedInMonth(month, timezone)}`;
       }
 
       const [data, countRows] = await Promise.all([
@@ -352,7 +425,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           })
           .from(chargingSessions)
           .leftJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-          .leftJoin(sites, eq(chargingStations.siteId, sites.id))
+          .leftJoin(sites, sessionSiteJoin)
           .where(whereClause)
           .orderBy(desc(chargingSessions.createdAt), desc(chargingSessions.id))
           .limit(limit)
@@ -386,19 +459,21 @@ export function portalSessionRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
       const { month } = request.query as z.infer<typeof monthlySummaryQuery>;
-      const { start, end } = monthRange(month);
+      const timezone = await driverTimezone(driverId);
 
       const currency = await getCompanyCurrency();
       const [totals] = await db
         .select({
-          totalCostCents: sql<number>`COALESCE(SUM(${chargingSessions.finalCostCents}) FILTER (WHERE ${inCompanyCurrency(chargingSessions.currency, currency)}), 0)::int`,
+          // A session billed to a fleet is not the driver's to pay (owner
+          // decision 2026-10-14), so its cost stays out of the driver's total.
+          totalCostCents: sql<number>`COALESCE(SUM(${chargingSessions.finalCostCents}) FILTER (WHERE ${inCompanyCurrency(chargingSessions.currency, currency)} AND NOT ${billedToFleetSql()}), 0)::int`,
           totalEnergyWh: sql<string>`COALESCE(SUM(${chargingSessions.energyDeliveredWh}::numeric), 0)::numeric`,
           totalCo2AvoidedKg: sql<string>`COALESCE(SUM(${chargingSessions.co2AvoidedKg}::numeric), 0)::numeric`,
           sessionCount: sql<number>`count(*)::int`,
         })
         .from(chargingSessions)
         .where(
-          sql`${chargingSessions.driverId} = ${driverId} AND ${chargingSessions.status} = 'completed' AND ${chargingSessions.startedAt} >= ${start} AND ${chargingSessions.startedAt} < ${end}`,
+          sql`${chargingSessions.driverId} = ${driverId} AND ${chargingSessions.status} = 'completed' AND ${startedInMonth(month, timezone)} AND ${inOperatorStation(chargingSessions.stationId)}`,
         );
 
       return {
@@ -427,12 +502,17 @@ export function portalSessionRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
       const { month } = request.query as z.infer<typeof monthlySummaryQuery>;
-      const { start, end } = monthRange(month);
 
       const [driver] = await db
-        .select({ firstName: drivers.firstName, lastName: drivers.lastName })
+        .select({
+          firstName: drivers.firstName,
+          lastName: drivers.lastName,
+          timezone: drivers.timezone,
+        })
         .from(drivers)
         .where(eq(drivers.id, driverId));
+      const timezone =
+        driver?.timezone != null && isValidTimezone(driver.timezone) ? driver.timezone : 'UTC';
 
       const companyCurrency = await getCompanyCurrency();
       const sessions = await db
@@ -447,20 +527,30 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           currency: sessionCurrencySql(),
           siteName: sites.name,
           siteCity: sites.city,
+          ...sessionAccountBillingColumns(),
         })
         .from(chargingSessions)
         .leftJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-        .leftJoin(sites, eq(chargingStations.siteId, sites.id))
+        .leftJoin(sites, sessionSiteJoin)
         .where(
-          sql`${chargingSessions.driverId} = ${driverId} AND ${chargingSessions.status} = 'completed' AND ${chargingSessions.startedAt} >= ${start} AND ${chargingSessions.startedAt} < ${end}`,
+          sql`${chargingSessions.driverId} = ${driverId} AND ${chargingSessions.status} = 'completed' AND ${startedInMonth(month, timezone)} AND ${inOperatorStation(chargingSessions.stationId)}`,
         )
-        .orderBy(desc(chargingSessions.startedAt));
+        .orderBy(desc(chargingSessions.startedAt), desc(chargingSessions.id));
 
+      // The cost total holds what the driver pays in the company currency. A
+      // session billed to a fleet is listed as billed to it and left out
+      // (owner decision 2026-10-14); a session billed in an earlier currency
+      // is left out and counted, so the statement can say so (currency.md).
+      const items = sessions.map(withAccountBilling);
       let totalCostCents = 0;
       let totalEnergyWh = 0;
       let totalCo2AvoidedKg = 0;
-      for (const s of sessions) {
-        if (s.currency === companyCurrency) totalCostCents += s.finalCostCents ?? 0;
+      let otherCurrencySessionCount = 0;
+      let fleetBilledSessionCount = 0;
+      for (const s of items) {
+        if (s.accountBilling?.invoicedTo === 'fleet') fleetBilledSessionCount += 1;
+        else if (s.currency !== companyCurrency) otherCurrencySessionCount += 1;
+        else totalCostCents += s.finalCostCents ?? 0;
         totalEnergyWh += Number(s.energyDeliveredWh ?? 0);
         totalCo2AvoidedKg += Number(s.co2AvoidedKg ?? 0);
       }
@@ -468,13 +558,15 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       return {
         month,
         driverName: driver != null ? `${driver.firstName} ${driver.lastName}` : '--',
-        sessions,
+        sessions: items,
         totals: {
           totalCostCents,
           currency: companyCurrency,
           totalEnergyWh,
           totalCo2AvoidedKg,
-          sessionCount: sessions.length,
+          sessionCount: items.length,
+          otherCurrencySessionCount,
+          fleetBilledSessionCount,
         },
       };
     },
@@ -492,7 +584,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         params: zodSchema(sessionParams),
         response: {
           200: itemResponse(portalSessionDetail),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },
       },
@@ -532,22 +623,27 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           vehicleMake: vehicles.make,
           vehicleModel: vehicles.model,
           vehicleYear: vehicles.year,
+          vehicleVin: vehicles.vin,
+          vehicleEvccid: vehicles.evccid,
+          vehicleAutochargeEnabled: vehicles.autochargeEnabled,
+          vehicleIdValue: chargingSessions.vehicleIdValue,
+          vehicleIdType: chargingSessions.vehicleIdType,
+          vehicleIdSource: chargingSessions.vehicleIdSource,
+          autocharge: chargingSessions.autocharge,
+          ocppStationId: chargingStations.stationId,
           ...sessionAccountBillingColumns(),
         })
         .from(chargingSessions)
         .leftJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-        .leftJoin(sites, eq(chargingStations.siteId, sites.id))
+        .leftJoin(sites, sessionSiteJoin)
         .leftJoin(driverTokens, eq(chargingSessions.tokenId, driverTokens.id))
         .leftJoin(vehicles, eq(chargingSessions.vehicleId, vehicles.id))
-        .where(eq(chargingSessions.id, id));
+        // Another driver's session answers 404 like an unknown one, so a
+        // session id does not reveal that the session exists.
+        .where(and(eq(chargingSessions.id, id), eq(chargingSessions.driverId, driverId)));
 
       if (session == null) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
-        return;
-      }
-
-      if (session.driverId !== driverId) {
-        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
         return;
       }
 
@@ -612,9 +708,25 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         vehicleMake,
         vehicleModel,
         vehicleYear,
+        vehicleVin,
+        vehicleEvccid,
+        vehicleAutochargeEnabled,
+        vehicleIdValue,
+        vehicleIdType,
+        vehicleIdSource,
+        ocppStationId,
+        autocharge,
         costBreakdown,
         ...sessionRest
       } = withAccountBilling(session);
+      const vehicleCapture =
+        vehicleIdValue != null && vehicleIdType != null && vehicleIdSource != null
+          ? { value: vehicleIdValue, type: vehicleIdType, source: vehicleIdSource }
+          : null;
+      const autochargeAvailable =
+        vehicleCapture != null && ocppStationId != null
+          ? await isAutochargeEnabledForStation(ocppStationId)
+          : false;
       const costTax = storedSessionCostTax({
         costCents: session.finalCostCents ?? session.currentCostCents,
         costBreakdown,
@@ -636,13 +748,88 @@ export function portalSessionRoutes(app: FastifyInstance): void {
                 make: vehicleMake,
                 model: vehicleModel,
                 year: vehicleYear,
+                vin: vehicleVin ?? null,
+                evccid: vehicleEvccid ?? null,
+                autochargeEnabled: vehicleAutochargeEnabled === true,
                 efficiencyMiPerKwh:
                   vehicleEfficiency != null
                     ? Number(vehicleEfficiency.efficiencyMiPerKwh)
                     : DEFAULT_EFFICIENCY,
               }
             : null,
+        vehicleCapture,
+        autocharge,
+        autochargeAvailable,
       };
+    },
+  );
+
+  // "Use This Vehicle for Plug-In Charging": the vehicle id the charger sent
+  // for the driver's own session goes on a new or existing vehicle of the
+  // driver, with Autocharge on by default (vehicle.service.ts). Another
+  // driver's session answers like a missing one.
+  app.post(
+    '/portal/sessions/:id/vehicle-claim',
+    {
+      onRequest: [app.authenticateDriver],
+      schema: {
+        tags: ['Portal Sessions'],
+        summary: 'Use the vehicle id the charger sent for this session on a vehicle',
+        operationId: 'portalClaimSessionVehicleId',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(sessionParams),
+        body: zodSchema(vehicleClaimBody),
+        response: {
+          200: itemResponse(
+            z
+              .object({
+                vehicleId: z.string().describe('Vehicle that now holds the id'),
+                created: z.boolean().describe('A new vehicle was created'),
+                autochargeEnabled: z.boolean().describe('Autocharge is on for the vehicle'),
+              })
+              .passthrough(),
+          ),
+          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          403: errorWith('Blocked by the operator', [ERROR_CODES.VEHICLE_BLOCKED_BY_OPERATOR]),
+          404: errorWith('Not found', [
+            ERROR_CODES.SESSION_NOT_FOUND,
+            ERROR_CODES.VEHICLE_NOT_FOUND,
+            ERROR_CODES.DRIVER_NOT_FOUND,
+          ]),
+          409: errorWith('No vehicle id or the id is in use', [
+            ERROR_CODES.SESSION_NO_VEHICLE_ID,
+            ERROR_CODES.VEHICLE_ID_IN_USE,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { driverId } = request.user as DriverJwtPayload;
+      const { id } = request.params as z.infer<typeof sessionParams>;
+      const body = parseZodRequest(vehicleClaimBody, request.body);
+      try {
+        const result = await vehicleService.claimSessionVehicleId(
+          {
+            sessionId: id,
+            driverId,
+            target:
+              body.vehicleId != null
+                ? { vehicleId: body.vehicleId }
+                : { vehicle: body.vehicle ?? { make: '', model: '' } },
+            enableAutocharge: body.enableAutocharge,
+          },
+          getAuditActor(request),
+          request.log,
+        );
+        return {
+          vehicleId: result.vehicle.id,
+          created: result.created,
+          autochargeEnabled: result.vehicle.autochargeEnabled,
+        };
+      } catch (err) {
+        if (await replyVehicleServiceError(reply, err)) return;
+        throw err;
+      }
     },
   );
 
@@ -671,7 +858,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
           404: errorWith('Not found', [
             ERROR_CODES.SESSION_NOT_FOUND,
             ERROR_CODES.VEHICLE_NOT_FOUND,
@@ -687,28 +873,22 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       const [session] = await db
         .select({ driverId: chargingSessions.driverId, vehicleId: chargingSessions.vehicleId })
         .from(chargingSessions)
-        .where(eq(chargingSessions.id, id));
+        // Another driver's session answers 404 like an unknown one, so a
+        // session id does not reveal that the session exists.
+        .where(and(eq(chargingSessions.id, id), eq(chargingSessions.driverId, driverId)));
 
       if (session == null) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
         return;
       }
-      if (session.driverId !== driverId) {
-        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
-        return;
-      }
-
       if (vehicleId != null) {
         const [vehicle] = await db
           .select({ driverId: vehicles.driverId })
           .from(vehicles)
           .where(eq(vehicles.id, vehicleId));
-        if (vehicle == null) {
+        // Another driver's vehicle answers 404 like an unknown one.
+        if (vehicle?.driverId !== driverId) {
           await reply.status(404).send({ error: 'Vehicle not found', code: 'VEHICLE_NOT_FOUND' });
-          return;
-        }
-        if (vehicle.driverId !== driverId) {
-          await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
           return;
         }
       }
@@ -716,7 +896,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       await db
         .update(chargingSessions)
         .set({ vehicleId, updatedAt: new Date() })
-        .where(eq(chargingSessions.id, id));
+        .where(and(eq(chargingSessions.id, id), eq(chargingSessions.driverId, driverId)));
 
       if ((session.vehicleId ?? null) !== vehicleId) {
         await writeAudit(
@@ -756,7 +936,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },
       },
@@ -771,15 +950,12 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           startedAt: chargingSessions.startedAt,
         })
         .from(chargingSessions)
-        .where(eq(chargingSessions.id, id));
+        // Another driver's session answers 404 like an unknown one, so a
+        // session id does not reveal that the session exists.
+        .where(and(eq(chargingSessions.id, id), eq(chargingSessions.driverId, driverId)));
 
       if (session == null) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
-        return;
-      }
-
-      if (session.driverId !== driverId) {
-        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
         return;
       }
 
@@ -823,7 +999,6 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               })
               .passthrough(),
           ),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },
       },
@@ -839,15 +1014,12 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           startedAt: chargingSessions.startedAt,
         })
         .from(chargingSessions)
-        .where(eq(chargingSessions.id, id));
+        // Another driver's session answers 404 like an unknown one, so a
+        // session id does not reveal that the session exists.
+        .where(and(eq(chargingSessions.id, id), eq(chargingSessions.driverId, driverId)));
 
       if (session == null) {
         await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
-        return;
-      }
-
-      if (session.driverId !== driverId) {
-        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
         return;
       }
 

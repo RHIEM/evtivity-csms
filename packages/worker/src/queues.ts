@@ -9,6 +9,8 @@ import {
   FLEET_BILLING_FANOUT_QUEUE,
   MAINTENANCE_FANOUT_JOB_OPTIONS,
   MAINTENANCE_FANOUT_QUEUE,
+  PAYMENT_STOP_JOB_OPTIONS,
+  PAYMENT_STOP_QUEUE,
   PAYMENT_WEBHOOK_JOB_OPTIONS,
   PAYMENT_WEBHOOK_QUEUE,
   STATION_MESSAGE_JOB_OPTIONS,
@@ -33,6 +35,7 @@ export const QUEUE_NAMES = {
   MEMBER_INVOICES: MEMBER_INVOICE_QUEUE,
   STATION_WATCH: STATION_WATCH_QUEUE,
   PAYMENT_WEBHOOKS: PAYMENT_WEBHOOK_QUEUE,
+  PAYMENT_STOPS: PAYMENT_STOP_QUEUE,
   REMOTE_START_TIMEOUTS: 'remote-start-timeouts',
   STATION_MESSAGES: STATION_MESSAGE_QUEUE,
   REPORTS: 'reports',
@@ -49,6 +52,14 @@ export const AI_INSIGHT_JOB_BACKOFF_MS = 30_000;
 export const DRIVER_AI_JOB_ATTEMPTS = 3;
 export const DRIVER_AI_JOB_BACKOFF_MS = 30_000;
 
+/**
+ * Retries of one guest session job (link or capture): exponential from 5 s
+ * (5, 10, 20, 40 s), so a provider or database outage of about a minute
+ * does not exhaust a capture and release a hold that should be captured.
+ */
+export const GUEST_SESSION_JOB_ATTEMPTS = 5;
+export const GUEST_SESSION_JOB_BACKOFF = { type: 'exponential', delay: 5000 } as const;
+
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 export interface WorkerQueues {
@@ -63,6 +74,7 @@ export interface WorkerQueues {
   memberInvoiceQueue: Queue;
   stationWatchQueue: Queue;
   paymentWebhookQueue: Queue;
+  paymentStopQueue: Queue;
   remoteStartTimeoutQueue: Queue;
   stationMessageQueue: Queue;
   reportQueue: Queue;
@@ -99,8 +111,8 @@ export function createQueues(redisUrl: string): WorkerQueues {
       defaultJobOptions: {
         removeOnComplete: 200,
         removeOnFail: { count: 500 },
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 5000 },
+        attempts: GUEST_SESSION_JOB_ATTEMPTS,
+        backoff: GUEST_SESSION_JOB_BACKOFF,
       },
     }),
     reservationQueue: new Queue(QUEUE_NAMES.RESERVATIONS, {
@@ -164,6 +176,12 @@ export function createQueues(redisUrl: string): WorkerQueues {
     paymentWebhookQueue: new Queue(QUEUE_NAMES.PAYMENT_WEBHOOKS, {
       connection: createBullMQConnection(redisUrl),
       defaultJobOptions: PAYMENT_WEBHOOK_JOB_OPTIONS,
+    }),
+    // Delayed payment stops: the stop of a start the OCPP gate refused, after
+    // its grace period (OCPP).
+    paymentStopQueue: new Queue(QUEUE_NAMES.PAYMENT_STOPS, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: PAYMENT_STOP_JOB_OPTIONS,
     }),
     // Delayed close-out of accepted remote starts that never became a
     // transaction. Retrying is safe: the session update is status-guarded and

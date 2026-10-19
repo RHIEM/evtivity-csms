@@ -19,6 +19,8 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, client } from './config.js';
 import { sql, eq, and, inArray, isNotNull, isNull } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
+import { sessionSiteIdSql } from './lib/session-site.js';
 import { getCompanyCurrency, clearSystemSettingsCache } from './lib/system-settings.js';
 import {
   settings,
@@ -55,7 +57,6 @@ import {
   supportCaseMessages,
   ocpiPartners,
   ocpiPartnerEndpoints,
-  ocpiCredentialsTokens,
   pkiCaCertificates,
   stationCertificates,
   driverPaymentMethods,
@@ -91,6 +92,7 @@ import {
   invoiceLineItems,
 } from './schema/index.js';
 import { acceptPendingFixtureStations } from './lib/fixture-stations.js';
+import { issueOcpiRegistrationToken } from './lib/ocpi-registration-token.js';
 import { REBILL_DEMO_METHOD_ID } from './seed-demo-cards.js';
 import { insertDemoMeterValues, type DemoMeterValueRow } from './seed-meter-values.js';
 import {
@@ -603,6 +605,10 @@ async function seed(): Promise<void> {
     'company.registrationNumber': '',
     'company.invoiceEmail': '',
     'company.invoicePhone': '',
+    'company.bankAccountHolder': '',
+    'company.iban': '',
+    'company.bic': '',
+    'company.bankName': '',
     'company.logo': animatedLogoDataUri,
     'company.favicon': logoDataUri,
     qr_code_icon: logoSvg,
@@ -618,6 +624,7 @@ async function seed(): Promise<void> {
     'idling.gracePeriodMinutes': 30,
     'prepaid.lowCreditThresholdCents': 500,
     'invoice.paymentTermsDays': 30,
+    'invoice.epcQrEnabled': true,
     'fleet.invoiceRunDay': 1,
     // Every generated PDF: '' is the default EVtivity logo; '' as a footer prints none.
     'pdf.logo': '',
@@ -683,6 +690,9 @@ async function seed(): Promise<void> {
     'fleet.creditReservationCents': 5000,
     'support.enabled': true,
     'guest.enabled': true,
+    'guest.startsPerIpPerHour': 30,
+    'guest.declinesPerIpPerHour': 5,
+    'autocharge.enabled': false,
     'ocpp.commandRetryMaxAttempts': 3,
     'ocpp.commandRetryBaseDelayMs': 1000,
     'ocpp.commandRetryMaxDelayMs': 30000,
@@ -754,10 +764,12 @@ async function seed(): Promise<void> {
     'aiInsights.maxPerSitePerDay': 50,
     'aiInsights.primaryLanguage': 'en',
     'aiInsights.retentionDays': 90,
+    'aiInsights.expireAfterDays': 7,
     'aiWorkers.networkSummary.enabled': false,
     'aiWorkers.stuckSessions.enabled': false,
     'aiWorkers.stuckSessions.idleMinutes': 90,
     'aiWorkers.stuckSessions.useModel': false,
+    'aiWorkers.stuckSessions.offlineEndAfterHours': 24,
     'aiWorkers.tariffAnomalies.enabled': false,
     'aiWorkers.proposalTtlHours': 24,
     'sso.enabled': false,
@@ -1841,6 +1853,7 @@ async function seed(): Promise<void> {
   const sessionRows: Array<{
     currency: string;
     stationId: string;
+    siteId: SQL<string | null>;
     evseId: string;
     connectorId: string;
     driverId: string;
@@ -1875,6 +1888,9 @@ async function seed(): Promise<void> {
     const meterStop = status !== 'active' ? meterStart + energyWh : null;
     // Cost: ~$0.15-0.30/kWh, so cents = energyWh / 1000 * 15-30
     const costCents = Math.round((energyWh / 1000) * randomInt(15, 30));
+    // A faulted session is not billed: it costs nothing, as the payment gate
+    // and the stale-session cleanup leave a real one.
+    const billedCents = status === 'faulted' ? 0 : costCents;
     // Operator electricity cost from the site's rate periods, as the session
     // end projection computes it (the period in force at the end time).
     const stationSiteId = at(stationRows, stationIdx).siteId;
@@ -1891,6 +1907,7 @@ async function seed(): Promise<void> {
     sessionRows.push({
       currency: companyCurrency,
       stationId: at(createdStations, stationIdx).id,
+      siteId: sessionSiteIdSql(sql, at(createdStations, stationIdx).id),
       evseId: evse.id,
       connectorId: at(connectorRows, createdEvses.indexOf(evse)).evseId,
       driverId: driver.id,
@@ -1905,9 +1922,9 @@ async function seed(): Promise<void> {
       energyDeliveredWh: status !== 'active' ? String(energyWh) : null,
       stoppedReason: status === 'completed' ? pick(stopReasons) : null,
       currentCostCents: status === 'active' ? costCents : null,
-      finalCostCents: status !== 'active' ? costCents : null,
+      finalCostCents: status !== 'active' ? billedCents : null,
       // Demo sessions have no tariff snapshot, so no tax rate.
-      ...demoCostSplit(costCents, 0),
+      ...demoCostSplit(billedCents, 0),
       electricityCostCents,
     });
   }
@@ -2344,11 +2361,9 @@ async function seed(): Promise<void> {
 
   // ------ OCPI Simulator Partner ------
   // Pre-seeds a partner record for the ocpi-simulator (NL/SIM, eMSP role).
-  // The registration token 'ocpi-sim-reg-token' lets the simulator complete the
-  // credentials handshake. Set OCPI_REGISTRATION_TOKEN=ocpi-sim-reg-token in
-  // the simulator's env and point OCPI_TARGET_URL at the OCPI server.
-  const SIM_REG_TOKEN = 'ocpi-sim-reg-token';
-  const simTokenHash = await argon2.hash(SIM_REG_TOKEN);
+  // Its registration token is generated here, bound to the partner, and
+  // printed once: pass it to the simulator (OCPI_REGISTRATION_TOKEN or POST
+  // /sim/register). Roaming > Partners issues a new one at any time.
   const [simPartner] = await db
     .insert(ocpiPartners)
     .values({
@@ -2367,15 +2382,7 @@ async function seed(): Promise<void> {
 
   if (simPartner == null) throw new Error('Failed to create OCPI simulator partner');
 
-  // Registration token: partnerId is null until the handshake completes.
-  // handleRegistration will match the partner by country_code/party_id and deactivate this token.
-  await db.insert(ocpiCredentialsTokens).values({
-    partnerId: null,
-    tokenHash: simTokenHash,
-    tokenPrefix: SIM_REG_TOKEN.slice(0, 8),
-    direction: 'issued',
-    isActive: true,
-  });
+  const simRegToken = await issueOcpiRegistrationToken(simPartner.id, db);
 
   // Pre-seed the endpoints the simulator will advertise once registered
   const simBase = 'http://localhost:7105/ocpi/2.2.1';
@@ -2417,14 +2424,12 @@ async function seed(): Promise<void> {
       url: `${simBase}/credentials`,
     },
   ]);
-  console.log(`  OCPI simulator partner seeded (NL/SIM). Registration token: ${SIM_REG_TOKEN}`);
+  console.log(`  OCPI simulator partner seeded (NL/SIM). Registration token: ${simRegToken}`);
 
   // ------ OCPI CPO Simulator Partner ------
   // Pre-seeds a partner record for the CPO simulator (DE/CPO, CPO role).
   // Run with: npm run dev:ocpi-sim-cpo
   // OCPI_SIM_AUTO_SESSION=true triggers the auto-session loop after registration.
-  const CPO_SIM_REG_TOKEN = 'ocpi-cpo-sim-reg-token';
-  const cpoSimTokenHash = await argon2.hash(CPO_SIM_REG_TOKEN);
   const [cpoSimPartner] = await db
     .insert(ocpiPartners)
     .values({
@@ -2443,13 +2448,7 @@ async function seed(): Promise<void> {
 
   if (cpoSimPartner == null) throw new Error('Failed to create OCPI CPO simulator partner');
 
-  await db.insert(ocpiCredentialsTokens).values({
-    partnerId: null,
-    tokenHash: cpoSimTokenHash,
-    tokenPrefix: CPO_SIM_REG_TOKEN.slice(0, 8),
-    direction: 'issued',
-    isActive: true,
-  });
+  const cpoSimRegToken = await issueOcpiRegistrationToken(cpoSimPartner.id, db);
 
   const cpoSimBase = 'http://localhost:7106/ocpi/2.2.1';
   await db.insert(ocpiPartnerEndpoints).values([
@@ -2491,7 +2490,7 @@ async function seed(): Promise<void> {
     },
   ]);
   console.log(
-    `  OCPI CPO simulator partner seeded (DE/CPO). Registration token: ${CPO_SIM_REG_TOKEN}`,
+    `  OCPI CPO simulator partner seeded (DE/CPO). Registration token: ${cpoSimRegToken}`,
   );
 
   // ------ SP3 Test CA Certificate ------
@@ -2555,7 +2554,7 @@ async function seed(): Promise<void> {
   const portalDriverId = portalTestDriver.id;
   const portalSessionRows: Array<{
     stationId: string;
-    siteId: string;
+    siteId: SQL<string | null>;
     evseId: string;
     driverId: string;
     transactionId: string;
@@ -2608,7 +2607,7 @@ async function seed(): Promise<void> {
 
     portalSessionRows.push({
       stationId: station.id,
-      siteId: at(createdSites, stationIdx % createdSites.length).id,
+      siteId: sessionSiteIdSql(sql, station.id),
       evseId: evse.id,
       driverId: portalDriverId,
       transactionId: `txn_portal_${String(i + 1).padStart(3, '0')}`,
@@ -3925,9 +3924,7 @@ async function seed(): Promise<void> {
   console.log(
     `  ${String(createdConfigTemplates.length)} config templates (${String(totalPushes)} pushes, ${String(totalPushStations)} push stations)`,
   );
-  console.log(
-    '  2 OCPI simulator partners (NL/SIM token: ocpi-sim-reg-token, DE/CPO token: ocpi-cpo-sim-reg-token)',
-  );
+  console.log('  2 OCPI simulator partners (NL/SIM, DE/CPO; registration tokens printed above)');
   console.log('  Dashboard snapshots seeded for the last 14 days (see seedDashboardSnapshots).');
 
   await client.end();

@@ -7,7 +7,8 @@
  * to the authorize attempts log. Steps, in order: free vend, token types
  * accepted without lookup, identity resolution (driver tokens, then the drv_
  * driver id fallback where the context has it and, for an untyped 1.6 idTag,
- * the guest session fallback), OCPI external tokens, the concurrent
+ * the guest session fallback), Autocharge vehicles (a token that is a vehicle
+ * id), OCPI external tokens, the concurrent
  * transaction check, prepaid credit, the fleet credit limit of a driver who
  * charges on account. The per-context differences live in
  * AUTHORIZE_CONTEXT_RULES.
@@ -20,16 +21,21 @@ import {
   loadDriverAccountCredit,
   driverTokens,
   drivers,
-  ocpiExternalTokens,
+  resolveOcpiTokenOwner,
   chargingSessions,
   chargingStations,
   guestSessions,
   isRoamingEnabled,
   isSiteFreeVendEnabledByStation,
+  findAutochargeVehicle,
+  findBlockedVehicle,
+  isAutochargeEnabledForStation,
 } from '@evtivity/database';
+import type { OcpiTokenOwnerResult } from '@evtivity/database';
 import type { Logger } from '@evtivity/lib';
 import { logAuthorizeAttempt, parseOcpiValidThru } from './authorize-log.js';
 import { prepaidCredit } from './prepaid.js';
+import { isIssuedCentralToken } from './issued-central-tokens.js';
 import {
   authorizeContextRules,
   type AuthorizeContextRules,
@@ -115,6 +121,9 @@ export function recordAuthorizeDecision(
       outcome: decision.outcome,
       ocppVersion: input.ocppVersion,
       reason: decision.reason,
+      vehicleIdValue: input.vehicleId?.value ?? null,
+      vehicleIdType: input.vehicleId?.type ?? null,
+      matchedVehicleId: decision.matchedVehicleId ?? null,
     },
     logger,
   ).catch((err: unknown) => {
@@ -131,11 +140,13 @@ export function authorizeDecisionMessage(decision: AuthorizeDecision): string {
   if (decision.status === 'concurrent_tx') return 'Token rejected: concurrent transaction';
   if (decision.source === 'ocpi') return `OCPI external token ${decision.status}`;
   if (decision.source === 'not_found') return 'Token not found';
+  if (decision.source === 'issued_central') return 'Central token the CSMS issued, accepting';
   if (decision.source === 'db_error') return 'Token lookup failed, accepting by default';
   if (decision.source === 'driver_id') {
     return decision.status === 'accepted' ? 'Driver-id token accepted' : 'Driver-id token blocked';
   }
   if (decision.source === 'guest') return `Guest session token ${decision.status}`;
+  if (decision.source === 'vehicle') return `Autocharge vehicle ${decision.status}`;
   if (decision.reason === ACCOUNT_CREDIT_LIMIT_REASON) return 'Fleet credit limit reached';
   if (decision.status === 'no_credit') return 'Prepaid token without credit';
   if (decision.status !== 'accepted') return 'Token rejected by status';
@@ -233,6 +244,8 @@ const TOKEN_COLUMNS = {
   expiresAt: driverTokens.expiresAt,
   revokedAt: driverTokens.revokedAt,
   prepaidBalanceCents: driverTokens.prepaidBalanceCents,
+  // Null for a token without a driver (left join).
+  driverIsActive: drivers.isActive,
 };
 
 interface TokenRow {
@@ -242,19 +255,30 @@ interface TokenRow {
   expiresAt: Date | null;
   revokedAt: Date | null;
   prepaidBalanceCents: number | null;
+  driverIsActive: boolean | null;
 }
 
-/** `revoked` when the token was revoked, else `inactive`. */
+/**
+ * `revoked` when the token was revoked, `driver_inactive` when its driver
+ * account is deactivated, else `inactive`.
+ */
 function blockedReason(row: TokenRow | undefined): string {
-  return row?.revokedAt != null ? 'revoked' : 'inactive';
+  if (row?.revokedAt != null) return 'revoked';
+  if (row != null && row.isActive && row.driverIsActive === false) return 'driver_inactive';
+  return 'inactive';
 }
 
 function isExpired(row: TokenRow, now: Date): boolean {
   return row.expiresAt != null && row.expiresAt.getTime() <= now.getTime();
 }
 
+/**
+ * A token is refused when it is inactive or revoked, and when its driver
+ * account is deactivated: deactivating a driver deactivates the tokens, but a
+ * token reactivated or added later must not charge on a closed account.
+ */
 function isBlocked(row: TokenRow): boolean {
-  return !row.isActive || row.revokedAt != null;
+  return !row.isActive || row.revokedAt != null || row.driverIsActive === false;
 }
 
 /**
@@ -322,6 +346,7 @@ async function resolveUntyped(
   const tokens: TokenRow[] = await db
     .select(TOKEN_COLUMNS)
     .from(driverTokens)
+    .leftJoin(drivers, eq(driverTokens.driverId, drivers.id))
     .where(eq(driverTokens.idToken, idTag));
 
   if (tokens.length > 0) {
@@ -366,6 +391,9 @@ async function resolveUntyped(
     }
   }
 
+  const byVehicle = await resolveVehicle(input);
+  if (byVehicle != null) return byVehicle;
+
   return notFound(input, rules, logger);
 }
 
@@ -379,11 +407,28 @@ async function resolveTyped(
   const [token]: TokenRow[] = await db
     .select(TOKEN_COLUMNS)
     .from(driverTokens)
+    .leftJoin(drivers, eq(driverTokens.driverId, drivers.id))
     .where(and(eq(driverTokens.idToken, input.token.value), eq(driverTokens.tokenType, type)));
 
   if (token == null) {
     const byDriverId = await resolveDriverId(input, rules);
     if (byDriverId != null) return byDriverId;
+    const byVehicle = await resolveVehicle(input);
+    if (byVehicle != null) return byVehicle;
+    if (
+      rules.acceptIssuedCentral &&
+      type === DRIVER_ID_TOKEN_TYPE &&
+      isIssuedCentralToken(input.stationId, input.token.value)
+    ) {
+      return {
+        ...NO_MATCH,
+        status: 'accepted',
+        outcome: 'accepted',
+        reason: 'issued_central',
+        source: 'issued_central',
+        echoGroupId: true,
+      };
+    }
     if (!rules.acceptWhenNotFound.has(type)) return notFound(input, rules, logger);
     return {
       ...NO_MATCH,
@@ -442,11 +487,71 @@ async function resolveDriverId(
 }
 
 /**
- * No driver token matched: an OCPI external token when the context checks
- * them and roaming is on, else Invalid. OCPI 2.2.1 permits the token when
- * `is_valid`, `whitelist` is not NEVER (NEVER requires real-time
- * authorization, which the CSMS does not perform), and any `valid_thru` is in
- * the future.
+ * Autocharge: no driver token has the value and the token is itself a vehicle
+ * id (a 2.1 idToken of type VIN, EVCCID or MacAddress, or a vehicle-shaped
+ * 1.6 idTag; a vehicle id in additionalInfo only rides along with another
+ * token). The vehicle with Autocharge on that holds the id authorizes the
+ * start as its driver when Autocharge is on at the station's site, the
+ * vehicle is not blocked and the driver is active; the later steps
+ * (ConcurrentTx, the fleet credit limit) and the payment gate then apply as to
+ * a card. An operator block refuses the id like a blocked token, with
+ * Autocharge on or off. Null when no vehicle holds the id: the token goes on
+ * to OCPI and is Invalid when nothing knows it.
+ */
+async function resolveVehicle(input: AuthorizeTokenInput): Promise<AuthorizeDecision | null> {
+  const capture = input.vehicleId;
+  if (capture == null || capture.source === 'additional_info') return null;
+  const match = await findAutochargeVehicle(capture);
+  if (match == null) {
+    const blocked = await findBlockedVehicle(capture);
+    return blocked != null
+      ? vehicleDecision('blocked', 'vehicle_blocked', blocked.vehicleId, blocked.driverId)
+      : null;
+  }
+  if (match.blocked) {
+    return vehicleDecision('blocked', 'vehicle_blocked', match.vehicleId, match.driverId);
+  }
+  if (!(await isAutochargeEnabledForStation(input.stationId))) {
+    return vehicleDecision('invalid', 'autocharge_disabled', match.vehicleId, match.driverId);
+  }
+  if (!match.driverIsActive) {
+    return vehicleDecision('blocked', 'driver_inactive', match.vehicleId, match.driverId);
+  }
+  return {
+    ...vehicleDecision('accepted', 'autocharge', match.vehicleId, match.driverId),
+    echoGroupId: true,
+  };
+}
+
+function vehicleDecision(
+  status: 'accepted' | 'blocked' | 'invalid',
+  reason: string,
+  vehicleId: string,
+  driverId: string,
+): AuthorizeDecision {
+  return {
+    ...NO_MATCH,
+    status,
+    outcome: status,
+    reason,
+    source: 'vehicle',
+    matchedDriverId: driverId,
+    matchedVehicleId: vehicleId,
+  };
+}
+
+/**
+ * No driver token matched: an OCPI token when the context checks them and
+ * roaming is on, else Invalid. The owner is resolved per station
+ * (`resolveOcpiTokenOwner`): the START_SESSION a connected partner sent for
+ * this station and token, else the one connected partner holding a token
+ * with this uid. A uid that several connected partners hold as a valid token
+ * (uids are unique per eMSP only) and that no command names is refused, as
+ * the session could not be billed to one partner. The token is permitted when
+ * valid, its `whitelist` is not NEVER (NEVER requires a real-time
+ * authorization request, which the CSMS does not send; a StartSession is the
+ * eMSP's authorization), and any `valid_thru` is in the future. Partners that
+ * are not connected (suspended, disconnected) own no token.
  */
 async function notFound(
   input: AuthorizeTokenInput,
@@ -462,17 +567,12 @@ async function notFound(
   };
   if (!rules.ocpi || !(await isRoamingEnabled())) return invalid;
 
-  let external: { isValid: boolean; whitelist: string; tokenData: unknown } | undefined;
+  let resolved: OcpiTokenOwnerResult | undefined;
   try {
-    [external] = await db
-      .select({
-        isValid: ocpiExternalTokens.isValid,
-        whitelist: ocpiExternalTokens.whitelist,
-        tokenData: ocpiExternalTokens.tokenData,
-      })
-      .from(ocpiExternalTokens)
-      .where(eq(ocpiExternalTokens.uid, input.token.value))
-      .limit(1);
+    resolved = await resolveOcpiTokenOwner({
+      stationOcppId: input.stationId,
+      tokenUid: input.token.value,
+    });
   } catch (err) {
     // Expected on an install whose OCPI tables do not exist: debug, not warn.
     logger.debug(
@@ -480,6 +580,20 @@ async function notFound(
       'OCPI external token lookup failed; treating the token as not found',
     );
   }
+  if (resolved?.ambiguous === true) {
+    logger.warn(
+      { stationId: input.stationId, idToken: input.token.value },
+      'OCPI token uid held by several connected partners; refused',
+    );
+    return {
+      ...NO_MATCH,
+      status: 'invalid',
+      outcome: 'unknown',
+      reason: 'ocpi_external_ambiguous',
+      source: 'ocpi',
+    };
+  }
+  const external = resolved?.owner;
   if (external == null) return invalid;
 
   const validThru = parseOcpiValidThru(external.tokenData);
@@ -498,7 +612,7 @@ async function notFound(
         ...NO_MATCH,
         status: 'accepted',
         outcome: 'accepted',
-        reason: 'ocpi_external',
+        reason: external.authMethod === 'COMMAND' ? 'ocpi_command' : 'ocpi_external',
         source: 'ocpi',
       }
     : {
@@ -513,7 +627,8 @@ async function notFound(
 /**
  * A driver token already in an active session gets ConcurrentTx. Only an
  * accepted driver token is checked: the other sources do not write
- * `charging_sessions.token_id`. The session of the message's own transaction
+ * `charging_sessions.token_id`. An Autocharge vehicle is checked the same
+ * way against the active sessions it authorized itself. The session of the message's own transaction
  * at this station is not counted, matched by the station row id or, when the
  * context has none, by the station's OCPP id. A failed lookup keeps the
  * decision.
@@ -528,7 +643,7 @@ async function checkConcurrentTransaction(
     rules.concurrentTx === 'off' ||
     (rules.concurrentTx === 'prepaid_only' && decision.prepaidBalanceCents == null) ||
     decision.status !== 'accepted' ||
-    decision.matchedTokenId == null
+    (decision.matchedTokenId == null && decision.matchedVehicleId == null)
   ) {
     return decision;
   }
@@ -549,7 +664,12 @@ async function checkConcurrentTransaction(
       .from(chargingSessions)
       .where(
         and(
-          eq(chargingSessions.tokenId, decision.matchedTokenId),
+          decision.matchedTokenId != null
+            ? eq(chargingSessions.tokenId, decision.matchedTokenId)
+            : and(
+                eq(chargingSessions.vehicleId, decision.matchedVehicleId ?? ''),
+                eq(chargingSessions.autocharge, true),
+              ),
           eq(chargingSessions.status, 'active'),
           input.transactionId != null && ownStationDbId != null
             ? or(

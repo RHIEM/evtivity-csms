@@ -30,29 +30,42 @@ const mocks = vi.hoisted(() => ({
   pushCdr: vi.fn(),
   pushLegacyEvseRemoval: vi.fn(),
   isRoamingEnabled: vi.fn(),
+  inOperatorStation: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
-  db: {
-    select: vi.fn(() => makeChain()),
-    selectDistinct: vi.fn(() => makeChain()),
-    update: vi.fn(() => makeUpdateChain()),
-  },
-  chargingSessions: { id: {}, status: {}, endedAt: {} },
-  ocpiCdrBackfill: { id: {}, completedAt: {} },
-  ocpiCdrs: { ocpiCdrId: {}, isCredit: {}, chargingSessionId: {}, pushStatus: {}, createdAt: {} },
-  ocpiPartnerEndpoints: { partnerId: {}, module: {}, interfaceRole: {} },
-  ocpiPartners: { id: {}, status: {}, legacyEvseUidsRemovedAt: {} },
-  ocpiRoamingSessions: { chargingSessionId: {} },
-  isRoamingEnabled: mocks.isRoamingEnabled,
-  pruneRemovedOcpiEvses: vi.fn(async () => undefined),
-}));
+vi.mock('@evtivity/database', async () => {
+  const { sql } = await import('drizzle-orm');
+  mocks.inOperatorStation.mockImplementation(() => sql`true`);
+  return {
+    db: {
+      select: vi.fn(() => makeChain()),
+      selectDistinct: vi.fn(() => makeChain()),
+      update: vi.fn(() => makeUpdateChain()),
+    },
+    chargingSessions: { id: {}, status: {}, endedAt: {}, stationId: { name: 'station_id' } },
+    ocpiCdrBackfill: { id: {}, completedAt: {} },
+    ocpiCdrs: { ocpiCdrId: {}, isCredit: {}, chargingSessionId: {}, pushStatus: {}, createdAt: {} },
+    ocpiPartnerEndpoints: { partnerId: {}, module: {}, interfaceRole: {} },
+    ocpiPartners: { id: {}, status: {}, legacyEvseUidsRemovedAt: {} },
+    ocpiRoamingSessions: { chargingSessionId: {} },
+    isRoamingEnabled: mocks.isRoamingEnabled,
+    pruneRemovedOcpiEvses: vi.fn(async () => undefined),
+    inOperatorStation: mocks.inOperatorStation,
+  };
+});
 vi.mock('../services/cdr.service.js', () => ({
   issueSessionCdr: mocks.issueSessionCdr,
   pushCdr: mocks.pushCdr,
 }));
 vi.mock('../services/push.service.js', () => ({
   pushLegacyEvseRemoval: mocks.pushLegacyEvseRemoval,
+  isPushJobName: (name: string) => name.startsWith('push-'),
+  processPushJob: vi.fn(async () => undefined),
+  pushJobOptions: (id: string) => ({
+    deduplication: { id, keepLastIfActive: true },
+    attempts: 6,
+    removeOnComplete: true,
+  }),
 }));
 
 const {
@@ -181,6 +194,8 @@ describe('runCdrBackfillStep', () => {
       expect.objectContaining({ jobId: 'cdr-ses_2', delay: 5_000 }),
     );
     expect(updates).toEqual([{ cursorEndedAt: endedAt, cursorSessionId: 'ses_2' }]);
+    // Sessions at conformance test stations are never backfilled.
+    expect(mocks.inOperatorStation).toHaveBeenCalledWith({ name: 'station_id' });
   });
 
   it('marks the backfill completed when nothing is left', async () => {
@@ -202,7 +217,11 @@ describe('runCdrSweep', () => {
   it('schedules missing CDRs, unsent credit CDRs, and legacy removals', async () => {
     selectResults = [
       [DONE_BACKFILL],
-      [{ sessionId: 'ses_1' }, { sessionId: 'ses_2' }],
+      [
+        { sessionId: 'ses_1', generation: 0 },
+        // Reissued once: the new CDR job gets a new jobId.
+        { sessionId: 'ses_2', generation: 1 },
+      ],
       [{ ocpiCdrId: 'cdr-c1' }],
       [{ id: 'opr_1' }],
     ];
@@ -215,18 +234,20 @@ describe('runCdrSweep', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'cdr',
       { sessionId: 'ses_2' },
-      expect.objectContaining({ jobId: 'cdr-ses_2' }),
+      expect.objectContaining({ jobId: 'cdr-ses_2-r1' }),
     );
     expect(queue.add).toHaveBeenCalledWith(
       'cdr-push',
       { cdrId: 'cdr-c1' },
-      expect.objectContaining({ jobId: 'cdr-push-cdr-c1' }),
+      expect.objectContaining({ jobId: 'cdr-push-cdr-c1', removeOnComplete: true }),
     );
     expect(queue.add).toHaveBeenCalledWith(
       'legacy-evse-removal',
       { partnerId: 'opr_1' },
       expect.objectContaining({ jobId: 'legacy-evse-removal-opr_1' }),
     );
+    // Sessions at conformance test stations are never swept for a CDR.
+    expect(mocks.inOperatorStation).toHaveBeenCalledWith({ name: 'station_id' });
   });
 
   it('does nothing while roaming is off', async () => {

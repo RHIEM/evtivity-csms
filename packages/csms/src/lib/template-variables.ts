@@ -27,6 +27,7 @@ export const OCPP_EVENT_TYPES = OCPP_NOTIFICATION_EVENT_TYPES;
 // Driver-facing events: notifications sent to drivers
 export const DRIVER_SESSION_EVENTS = [
   'session.Started',
+  'session.AutochargeStarted',
   'session.Updated',
   'session.Completed',
   'session.Faulted',
@@ -44,10 +45,15 @@ export const DRIVER_ACCOUNT_EVENTS = [
   'driver.AccountVerification',
   'driver.MfaDisabled',
   'driver.PortalInvite',
+  'driver.RegistrationAttempt',
 ] as const;
 
-/** Driver events sent by email only. The verification link proves the email address, so it never goes to an unverified phone. */
-export const EMAIL_ONLY_DRIVER_EVENTS: readonly string[] = ['driver.AccountVerification'];
+/** Driver events sent by email only. Their links act on the email address (verification, password reset), so they never go to an unverified phone. */
+export const EMAIL_ONLY_DRIVER_EVENTS: readonly string[] = [
+  'driver.AccountVerification',
+  'driver.ForgotPassword',
+  'driver.RegistrationAttempt',
+];
 
 export const DRIVER_PAYMENT_EVENTS = [
   'payment.Complete',
@@ -152,7 +158,12 @@ export const FLEET_INVOICE_EVENTS = [
 ] as const;
 
 // AI: the daily digest of AI insight actions, sent to opted-in operators who can confirm them
-export const OPERATOR_AI_EVENTS = ['ai.ProposalDigest'] as const;
+export const OPERATOR_AI_EVENTS = [
+  'ai.ProposalDigest',
+  'ai.ProviderQuotaExceeded',
+  'ai.BudgetWarning',
+  'ai.BudgetExhausted',
+] as const;
 
 export const OPERATOR_EVENT_TYPES = [
   ...OPERATOR_ACCOUNT_EVENTS,
@@ -361,6 +372,20 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'startedAt', description: 'Start timestamp' },
   ],
+  'session.AutochargeStarted': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'siteName', description: 'Site name' },
+    { name: 'stationId', description: 'Station identifier' },
+    { name: 'transactionId', description: 'Transaction ID' },
+    { name: 'startedAt', description: 'Start timestamp' },
+    { name: 'vehicleName', description: 'Vehicle that started the session (year, make, model)' },
+    {
+      name: 'vehiclesUrl',
+      description: 'Portal page where the driver turns Autocharge off (empty without a portal URL)',
+    },
+  ],
   'session.Updated': [
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
@@ -509,6 +534,13 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'email', description: 'Driver email address' },
     { name: 'activateUrl', description: 'Link to set the portal password' },
     { name: 'expiresInDays', description: 'Days until the link expires' },
+  ],
+  'driver.RegistrationAttempt': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'signInUrl', description: 'Driver portal sign-in URL' },
+    { name: 'resetUrl', description: 'Driver portal password reset URL' },
   ],
   'driver.PasswordChanged': [
     { name: 'firstName', description: 'Driver first name' },
@@ -995,7 +1027,7 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     {
       name: 'endRequestReason',
-      description: 'Why the CSMS ended the session (Superseded, GhostRecovered)',
+      description: 'Why the CSMS ended the session (Superseded, GhostRecovered, OperatorEnded)',
     },
     { name: 'attempts', description: 'Number of failed end attempts' },
     { name: 'startedAt', description: 'Session start time' },
@@ -1118,6 +1150,33 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'siteCount', description: 'Number of sites with pending actions' },
     { name: 'siteNames', description: 'Sites with pending actions, comma-separated' },
     { name: 'insightsUrl', description: 'Link to the AI insights with a pending action' },
+  ],
+  'ai.ProviderQuotaExceeded': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'provider', description: 'AI provider id (anthropic, openai, gemini, deepseek)' },
+    { name: 'providerName', description: 'AI provider name' },
+    { name: 'since', description: 'When the provider first answered out of credit or quota' },
+  ],
+  'ai.BudgetWarning': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'scope', description: 'Budget scope: company or site' },
+    { name: 'siteName', description: 'Site name of a site budget (empty for the company budget)' },
+    { name: 'period', description: 'Month of the budget (YYYY-MM)' },
+    { name: 'percent', description: 'Share of the budget used, in percent' },
+    { name: 'usedTokens', description: 'Budget tokens used this month' },
+    { name: 'limitTokens', description: 'Monthly token budget' },
+  ],
+  'ai.BudgetExhausted': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'scope', description: 'Budget scope: company or site' },
+    { name: 'siteName', description: 'Site name of a site budget (empty for the company budget)' },
+    { name: 'period', description: 'Month of the budget (YYYY-MM)' },
+    { name: 'percent', description: 'Share of the budget used, in percent' },
+    { name: 'usedTokens', description: 'Budget tokens used this month' },
+    { name: 'limitTokens', description: 'Monthly token budget' },
   ],
   'site.PayoutOnboarding': [
     { name: 'siteName', description: 'Site name' },

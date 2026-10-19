@@ -19,6 +19,7 @@ import {
   MESSAGE_TYPE_CALLRESULT,
   MESSAGE_TYPE_CALLERROR,
 } from '../protocol/message-types.js';
+import { rememberIssuedCentralToken } from '../authorization/issued-central-tokens.js';
 
 const CHANNEL = OCPP_COMMANDS_CHANNEL;
 
@@ -30,6 +31,8 @@ interface CommandPayload {
   action: string;
   payload: Record<string, unknown>;
   version?: string;
+  /** Never queue for an offline station (publishOcppCommand `noQueue`). */
+  noQueue?: boolean;
 }
 
 export interface CommandListenerOptions {
@@ -107,6 +110,7 @@ export class CommandListener {
     }
 
     const { commandId, stationId, action, payload, version } = command;
+    const noQueue = command.noQueue === true;
     this.logger.info({ commandId, stationId, action }, 'Received command from event source');
 
     // In multi-instance mode, skip commands for stations owned by another instance
@@ -128,16 +132,25 @@ export class CommandListener {
       }
     }
 
-    // Log outbound CALL to station
+    // A Central idToken the CSMS sends (remote start, reservation) is one the
+    // station may present to Authorize (issued-central-tokens.ts).
+    rememberIssuedCentralToken(stationId, action, payload);
+
+    // Log the outbound CALL when it is sent: a CALL can wait behind the
+    // station's outstanding CALL, so the log follows the wire order.
     const messageId = commandId ?? crypto.randomUUID();
-    publishMessageLog(this.eventBus, {
-      stationId,
-      direction: 'outbound',
-      messageType: MESSAGE_TYPE_CALL,
-      messageId,
-      action,
-      payload,
-    });
+    const sendOptions = {
+      onSend: (): void => {
+        publishMessageLog(this.eventBus, {
+          stationId,
+          direction: 'outbound',
+          messageType: MESSAGE_TYPE_CALL,
+          messageId,
+          action,
+          payload,
+        });
+      },
+    };
 
     try {
       // When version is present, the frontend sent a version-native payload -- dispatch directly.
@@ -147,8 +160,8 @@ export class CommandListener {
       // gave up (a CommandTimeoutError goes back as timedOut).
       const response =
         version != null
-          ? await this.dispatcher.sendCommand(stationId, action, payload)
-          : await this.dispatcher.sendVersionAwareCommand(stationId, action, payload);
+          ? await this.dispatcher.sendCommand(stationId, action, payload, sendOptions)
+          : await this.dispatcher.sendVersionAwareCommand(stationId, action, payload, sendOptions);
       this.logger.info(
         { stationId, action, response: maskStationCredentials(response) },
         'Command completed',
@@ -171,6 +184,18 @@ export class CommandListener {
           aggregateType: 'ChargingStation',
           aggregateId: stationId,
           payload: { ...payload, status: response.status },
+        });
+      } else if (action === 'CertificateSigned') {
+        void this.eventBus.publish({
+          eventType: 'pnc.CertificateSignedResult',
+          aggregateType: 'ChargingStation',
+          aggregateId: stationId,
+          payload: {
+            certificateChain: payload['certificateChain'],
+            // The 1.6 message has no type: it carries the station certificate.
+            certificateType: payload['certificateType'] ?? 'ChargingStationCertificate',
+            status: response.status,
+          },
         });
       }
 
@@ -287,6 +312,20 @@ export class CommandListener {
         return;
       }
 
+      // A command its caller marked noQueue (an OCPI partner's command) is
+      // answered as failed: run on a later reconnect it would start or unlock
+      // with no one waiting for it.
+      if (errorMessage.includes('is not connected') && noQueue) {
+        this.logger.warn({ stationId, commandId, action }, 'Station offline, command not queued');
+        if (commandId != null) {
+          await this.pubsub.publish(
+            RESULTS_CHANNEL,
+            JSON.stringify({ commandId, error: 'Station offline, command not queued' }),
+          );
+        }
+        return;
+      }
+
       if (errorMessage.includes('is not connected') && commandId != null) {
         this.logger.warn({ stationId, commandId, action }, 'Station offline, queuing command');
         void this.eventBus.publish({
@@ -315,6 +354,9 @@ export class CommandListener {
         errorDescription: errorMessage,
       });
 
+      // A CommandQueueTimeoutError (the CALL waited behind an unanswered one
+      // and was never sent) is a plain failure, not a timeout: the station
+      // never saw the command.
       const timedOut = err instanceof CommandTimeoutError;
       // A firmware update the station answered with an error, or that could not
       // be sent, never starts: the projection ends it so its campaign can
@@ -322,6 +364,22 @@ export class CommandListener {
       if ((action === 'UpdateFirmware' || action === 'SignedUpdateFirmware') && !timedOut) {
         void this.eventBus.publish({
           eventType: 'command.UpdateFirmware',
+          aggregateType: 'ChargingStation',
+          aggregateId: stationId,
+          payload: { request: payload, error: errorMessage },
+        });
+      }
+      // A charging profile the station answered with a CALLERROR is refused like
+      // a Rejected reply: load management then treats the station as a fixed
+      // load. A send error (station not connected) or a timeout says nothing
+      // about the profile, so it is not published.
+      if (
+        action === 'SetChargingProfile' &&
+        err instanceof Error &&
+        err.message.startsWith('CALLERROR ')
+      ) {
+        void this.eventBus.publish({
+          eventType: 'command.SetChargingProfile',
           aggregateType: 'ChargingStation',
           aggregateId: stationId,
           payload: { request: payload, error: errorMessage },

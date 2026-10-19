@@ -361,12 +361,16 @@ const sessionNotOnAccount = sql`NOT (${chargingSessions.billingMode} IS NOT DIST
 
 /** Thrown when a session of the invoice is already on another invoice. */
 export function alreadyInvoicedError(): Error {
-  return new Error('Session is already invoiced');
+  return new AppError('Session is already invoiced', 409, 'SESSION_ALREADY_INVOICED');
 }
 
 /** Thrown when a reservation fee charge of the invoice is already on another invoice. */
 function feeAlreadyInvoicedError(): Error {
-  return new Error('Reservation fee is already invoiced');
+  return new AppError(
+    'Reservation fee is already invoiced',
+    409,
+    'RESERVATION_FEE_ALREADY_INVOICED',
+  );
 }
 
 /** What a fleet invoice adds to the invoice header (features/fleet-billing.md). */
@@ -396,6 +400,12 @@ export interface InsertInvoiceInput {
   status: 'paid' | 'issued';
   /** Days from issue to the due date; default the invoice.paymentTermsDays setting. */
   paymentTermsDays?: number | null;
+  /**
+   * The issue date; default now. A fleet with the `period_end` invoice date
+   * passes the last day of the billed month. The due date and the number
+   * prefix follow it.
+   */
+  issuedAt?: Date;
   /** Set on a fleet invoice. */
   fleet?: FleetInvoiceHeader;
   /**
@@ -440,7 +450,7 @@ export async function insertInvoiceInTransaction(
   assertLinesMatchCharged(lines, chargedCents);
   const totals = taxTotals(lines);
 
-  const now = new Date();
+  const now = input.issuedAt ?? new Date();
   const termsDays = input.paymentTermsDays ?? (await getInvoicePaymentTermsDays());
   const dueAt = new Date(now.getTime() + termsDays * DAY_MS);
   const sessionIds = [
@@ -534,15 +544,15 @@ export async function createSessionInvoice(sessionId: string): Promise<InvoiceWi
     .where(eq(chargingSessions.id, sessionId));
 
   if (row == null) {
-    throw new Error('Session not found');
+    throw new AppError('Session not found', 404, 'SESSION_NOT_FOUND');
   }
 
   if (row.status !== 'completed') {
-    throw new Error('Session is not completed');
+    throw new AppError('Session is not completed', 400, 'INVOICE_CREATION_FAILED');
   }
 
   if (row.billingMode === 'account' && row.paymentStatus == null) {
-    throw new Error('Session is billed to a fleet account');
+    throw new AppError('Session is billed to a fleet account', 400, 'INVOICE_CREATION_FAILED');
   }
 
   // A completed session with null finalCostCents indicates the cost-calc
@@ -551,8 +561,10 @@ export async function createSessionInvoice(sessionId: string): Promise<InvoiceWi
   // successful charge -- worse than failing loudly. The operator needs to
   // resolve the underlying cost-calc gap before an invoice can be issued.
   if (row.finalCostCents == null) {
-    throw new Error(
+    throw new AppError(
       `Session ${sessionId} has no finalCostCents; cannot invoice an uncosted session`,
+      400,
+      'INVOICE_CREATION_FAILED',
     );
   }
 

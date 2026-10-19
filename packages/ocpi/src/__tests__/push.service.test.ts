@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { inlinePushSink } from './helpers/inline-push-sink.js';
 
 // Each awaited select chain resolves to the next queued result.
 let selectResults: unknown[][] = [];
@@ -29,27 +30,33 @@ const mocks = vi.hoisted(() => ({
   syncCpoSessionRow: vi.fn(),
   loadSiteLocation: vi.fn(),
   connectorTariffIds: vi.fn(),
+  isOperatorStation: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
-  db: {
-    select: vi.fn(() => makeChain()),
-    selectDistinct: vi.fn(() => makeChain()),
-    insert: vi.fn(() => makeInsertChain()),
-  },
-  sites: {},
-  chargingStations: {},
-  chargingSessions: { id: {} },
-  evses: {},
-  connectors: {},
-  ocpiPartners: { id: {}, status: {} },
-  ocpiPartnerEndpoints: {},
-  ocpiLocationPublish: {},
-  ocpiLocationPublishPartners: {},
-  ocpiSyncLog: {},
-  maintenanceEvents: {},
-  isStationLevelUnavailable: vi.fn(),
-}));
+vi.mock('@evtivity/database', async () => {
+  const { sql } = await import('drizzle-orm');
+  mocks.isOperatorStation.mockImplementation(() => sql`true`);
+  return {
+    db: {
+      select: vi.fn(() => makeChain()),
+      selectDistinct: vi.fn(() => makeChain()),
+      insert: vi.fn(() => makeInsertChain()),
+    },
+    sites: {},
+    chargingStations: {},
+    chargingSessions: { id: {} },
+    evses: {},
+    connectors: {},
+    ocpiPartners: { id: {}, status: {} },
+    ocpiPartnerEndpoints: {},
+    ocpiLocationPublish: {},
+    ocpiLocationPublishPartners: {},
+    ocpiSyncLog: {},
+    maintenanceEvents: {},
+    isStationLevelUnavailable: vi.fn(),
+    isOperatorStation: mocks.isOperatorStation,
+  };
+});
 vi.mock('../lib/ocpi-client.js', () => ({
   OcpiClient: vi.fn(function OcpiClient() {
     return mocks.client;
@@ -92,7 +99,7 @@ const URL = 'https://partner.example/ocpi/2.3.0/tariffs';
 beforeEach(async () => {
   selectResults = [];
   vi.clearAllMocks();
-  await new OcpiPushListener(pubsub as never).start();
+  await new OcpiPushListener(pubsub as never, inlinePushSink()).start();
 });
 
 async function settle(): Promise<void> {
@@ -218,7 +225,7 @@ describe('session push', () => {
 
   it('schedules the CDR of a completed session', async () => {
     const onCompleted = vi.fn(async () => undefined);
-    await new OcpiPushListener(pubsub as never, onCompleted).start();
+    await new OcpiPushListener(pubsub as never, inlinePushSink(onCompleted)).start();
     mocks.cpoSessionLink.mockResolvedValue(link);
     mocks.renderCpoSession.mockResolvedValue({ ...ocpiSession, status: 'COMPLETED' });
     selectResults = [
@@ -235,7 +242,7 @@ describe('session push', () => {
 
   it.each(['active', 'faulted', 'failed'])('schedules no CDR for a %s session', async (status) => {
     const onCompleted = vi.fn(async () => undefined);
-    await new OcpiPushListener(pubsub as never, onCompleted).start();
+    await new OcpiPushListener(pubsub as never, inlinePushSink(onCompleted)).start();
     mocks.cpoSessionLink.mockResolvedValue(link);
     mocks.renderCpoSession.mockResolvedValue(ocpiSession);
     selectResults = [
@@ -294,6 +301,8 @@ describe('pushLegacyEvseRemoval', () => {
     ];
 
     expect(await pushLegacyEvseRemoval('opr_1')).toBe(3);
+    // Conformance test stations were never published: no legacy uids for them.
+    expect(mocks.isOperatorStation).toHaveBeenCalled();
 
     expect(mocks.client.put.mock.calls.map((c: unknown[]) => c[0])).toEqual([
       `${LOCATIONS}/US/EVT/LOC-1`,

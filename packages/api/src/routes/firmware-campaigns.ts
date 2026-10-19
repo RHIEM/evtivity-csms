@@ -15,6 +15,7 @@ import {
   client,
   applyFirmwareCampaignStationStatus,
   rejectFirmwareUpdate,
+  dropQueuedCampaignFirmwareUpdates,
   newFirmwareRequestId,
   firmwareCampaigns,
   firmwareCampaignStations,
@@ -25,6 +26,7 @@ import {
   vendors,
   writeAudit,
   firmwareCampaignAuditLog,
+  isOperatorStation,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -225,7 +227,8 @@ type CampaignTargetFilter = z.infer<typeof createCampaignBody>['targetFilter'];
  * start targets (the start adds the online check).
  */
 function targetFilterConditions(filter: CampaignTargetFilter | null): SQL[] {
-  const conditions: SQL[] = [];
+  // Conformance test stations are never a campaign target.
+  const conditions: SQL[] = [isOperatorStation()];
   if (filter?.siteId) conditions.push(eq(chargingStations.siteId, filter.siteId));
   if (filter?.vendorId) conditions.push(eq(chargingStations.vendorId, filter.vendorId));
   if (filter?.model) conditions.push(eq(chargingStations.model, filter.model));
@@ -273,14 +276,15 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
             accessibleSiteIds != null
               ? and(
                   isNotNull(chargingStations.model),
+                  isOperatorStation(),
                   inArray(chargingStations.siteId, accessibleSiteIds),
                 )
-              : isNotNull(chargingStations.model),
+              : and(isNotNull(chargingStations.model), isOperatorStation()),
           )
           .orderBy(asc(chargingStations.model)),
       ]);
 
-      const stationConds = [];
+      const stationConds = [isOperatorStation()];
       if (query.siteId) stationConds.push(eq(chargingStations.siteId, query.siteId));
       if (query.vendorId) stationConds.push(eq(chargingStations.vendorId, query.vendorId));
       if (query.model) stationConds.push(eq(chargingStations.model, query.model));
@@ -294,7 +298,7 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
           : await db
               .select({ id: chargingStations.id, stationId: chargingStations.stationId })
               .from(chargingStations)
-              .where(stationConds.length > 0 ? and(...stationConds) : undefined)
+              .where(and(...stationConds))
               .orderBy(asc(chargingStations.stationId))
               .limit(500);
 
@@ -583,25 +587,32 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
           signature: nextSignature,
           updatedAt: new Date(),
         })
-        .where(eq(firmwareCampaigns.id, id))
+        // Draft re-checked in the write: a Start that committed after the read
+        // above must not get its URL, filter or schedule rewritten while its
+        // updates are out (offline stations would get a different firmware).
+        .where(and(eq(firmwareCampaigns.id, id), eq(firmwareCampaigns.status, 'draft')))
         .returning();
-
-      if (updated != null) {
-        const actor = getAuditActor(request);
-        await writeAudit(
-          { table: firmwareCampaignAuditLog, idColumn: 'campaign_id' },
-          {
-            entityId: updated.id,
-            entityIdSnapshot: updated.id,
-            action: 'updated',
-            ...actor,
-            before: campaign,
-            after: updated,
-          },
-          db,
-          request.log,
-        );
+      if (updated == null) {
+        await reply
+          .status(409)
+          .send({ error: 'Only draft campaigns can be updated', code: 'NOT_DRAFT' });
+        return;
       }
+
+      const actor = getAuditActor(request);
+      await writeAudit(
+        { table: firmwareCampaignAuditLog, idColumn: 'campaign_id' },
+        {
+          entityId: updated.id,
+          entityIdSnapshot: updated.id,
+          action: 'updated',
+          ...actor,
+          before: campaign,
+          after: updated,
+        },
+        db,
+        request.log,
+      );
 
       return updated;
     },
@@ -642,7 +653,16 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         return;
       }
 
-      await db.delete(firmwareCampaigns).where(eq(firmwareCampaigns.id, id));
+      const deleted = await db
+        .delete(firmwareCampaigns)
+        .where(and(eq(firmwareCampaigns.id, id), eq(firmwareCampaigns.status, 'draft')))
+        .returning({ id: firmwareCampaigns.id });
+      if (deleted.length === 0) {
+        await reply
+          .status(409)
+          .send({ error: 'Only draft campaigns can be deleted', code: 'NOT_DRAFT' });
+        return;
+      }
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -807,30 +827,36 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
       // this CAS both would dispatch UpdateFirmware twice. CAS makes the
       // second caller's UPDATE return zero rows; we surface that as the same
       // 409 NOT_DRAFT the pre-check would have raised.
-      const claimed = await db
-        .update(firmwareCampaigns)
-        .set({ status: 'active', updatedAt: new Date() })
-        .where(and(eq(firmwareCampaigns.id, id), eq(firmwareCampaigns.status, 'draft')))
-        .returning({ id: firmwareCampaigns.id });
-      if (claimed.length === 0) {
+      //
+      // The campaign station rows are inserted in the same transaction, after
+      // the CAS, so only the winning operator's targets are recorded and a
+      // failed insert leaves the campaign a draft instead of an active
+      // campaign without stations, which would never complete.
+      // dispatchedAt marks the stations sent now; an offline station's row
+      // waits for its connect-time dispatch, which claims it once.
+      const now = new Date();
+      const claimed = await db.transaction(async (tx) => {
+        const won = await tx
+          .update(firmwareCampaigns)
+          .set({ status: 'active', updatedAt: now })
+          .where(and(eq(firmwareCampaigns.id, id), eq(firmwareCampaigns.status, 'draft')))
+          .returning({ id: firmwareCampaigns.id });
+        if (won.length === 0) return false;
+        await tx.insert(firmwareCampaignStations).values(
+          targets.map((t) => ({
+            campaignId: id,
+            stationId: t.id,
+            dispatchedAt: t.isOnline ? now : null,
+          })),
+        );
+        return true;
+      });
+      if (!claimed) {
         await reply
           .status(409)
           .send({ error: 'Campaign is not in draft state', code: 'NOT_DRAFT' });
         return;
       }
-
-      // Insert campaign station rows AFTER the CAS so only the winning
-      // operator's targets are recorded.
-      // dispatchedAt marks the stations sent now; an offline station's row
-      // waits for its connect-time dispatch, which claims it once.
-      const now = new Date();
-      await db.insert(firmwareCampaignStations).values(
-        targets.map((t) => ({
-          campaignId: id,
-          stationId: t.id,
-          dispatchedAt: t.isOnline ? now : null,
-        })),
-      );
       const online = targets.filter((t) => t.isOnline);
 
       const actor = getAuditActor(request);
@@ -1007,6 +1033,17 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         db,
         request.log,
       );
+
+      // Updates still queued for offline stations never reached them: drop them
+      // so a station does not install the firmware after the cancel.
+      try {
+        const dropped = await dropQueuedCampaignFirmwareUpdates(client, id);
+        if (dropped > 0) request.log.info({ campaignId: id, dropped }, 'Queued updates dropped');
+      } catch (err) {
+        // fail-open: the campaign is cancelled; a queued update still expires
+        // with the offline queue.
+        request.log.warn({ err, campaignId: id }, 'Dropping queued campaign updates failed');
+      }
 
       return { success: true };
     },

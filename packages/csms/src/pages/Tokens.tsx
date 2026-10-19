@@ -22,9 +22,18 @@ import { ColumnVisibilityToggle } from '@/components/ColumnVisibilityToggle';
 import { FilterPopover } from '@/components/FilterBar';
 import { useColumnVisibility } from '@/hooks/use-column-visibility';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
+import { getErrorMessage } from '@/lib/error-message';
 import { api } from '@/lib/api';
 import { useHasPermission } from '@/lib/auth';
 import { useUserTimezone } from '@/lib/timezone';
+
+interface TokenImportRow {
+  idToken: string;
+  tokenType: string;
+  driverEmail?: string;
+  isActive?: boolean;
+  expiresAt?: string;
+}
 
 export function Tokens(): React.JSX.Element {
   const { t } = useTranslation();
@@ -57,16 +66,21 @@ export function Tokens(): React.JSX.Element {
   const { visibility, setVisibility } = useColumnVisibility('tokens', TOKENS_COLUMNS);
 
   const importMutation = useMutation({
-    mutationFn: (
-      rows: Array<{ idToken: string; tokenType: string; driverEmail?: string; isActive?: boolean }>,
-    ) => api.post<{ imported: number; errors: string[] }>('/v1/tokens/import', { rows }),
+    mutationFn: (rows: TokenImportRow[]) =>
+      api.post<{ imported: number; errors: string[] }>('/v1/tokens/import', { rows }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['tokens'] });
     },
   });
 
   function handleExport(): void {
-    const params = search ? `?search=${encodeURIComponent(search)}` : '';
+    // The export holds what the list shows: the same search and filters.
+    const query = new URLSearchParams();
+    if (search) query.set('search', search);
+    if (filterType) query.set('tokenType', filterType);
+    if (filterStatus) query.set('status', filterStatus);
+    const queryString = query.toString();
+    const params = queryString !== '' ? `?${queryString}` : '';
     const url = `${API_BASE_URL}/v1/tokens/export${params}`;
     const link = document.createElement('a');
     link.href = url;
@@ -91,16 +105,19 @@ export function Tokens(): React.JSX.Element {
       const header = lines[0];
       if (!header) return;
 
+      // The export columns: idToken, tokenType, driverEmail, isActive, expiresAt.
       const rows = lines.slice(1).map((line) => {
         const parts = parseCsvLine(line);
-        const row: { idToken: string; tokenType: string; driverEmail?: string; isActive: boolean } =
-          {
-            idToken: parts[0] ?? '',
-            tokenType: parts[1] ?? '',
-            isActive: parts[3] !== 'false',
-          };
+        const row: TokenImportRow = {
+          idToken: parts[0] ?? '',
+          tokenType: parts[1] ?? '',
+          isActive: parts[3]?.trim().toLowerCase() !== 'false',
+        };
         if (parts[2]) {
           row.driverEmail = parts[2];
+        }
+        if (parts[4]) {
+          row.expiresAt = parts[4];
         }
         return row;
       });
@@ -154,6 +171,10 @@ export function Tokens(): React.JSX.Element {
         </div>
       </div>
 
+      {importMutation.isError && (
+        <p className="text-sm text-destructive">{getErrorMessage(importMutation.error, t)}</p>
+      )}
+
       {importMutation.isSuccess && (
         <div className="rounded-md border p-3 text-sm">
           <p>{t('tokens.imported', { count: importMutation.data.imported })}</p>
@@ -178,7 +199,7 @@ export function Tokens(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('tokens.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
@@ -187,7 +208,6 @@ export function Tokens(): React.JSX.Element {
               <Label className="leading-6">{t('tokens.type')}</Label>
               <Select
                 aria-label={t('tokens.type')}
-                className="h-10"
                 value={filterType}
                 onChange={(e) => {
                   setFilterType(e.target.value);
@@ -205,7 +225,6 @@ export function Tokens(): React.JSX.Element {
               <Label className="leading-6">{t('common.status')}</Label>
               <Select
                 aria-label={t('common.status')}
-                className="h-10"
                 value={filterStatus}
                 onChange={(e) => {
                   setFilterStatus(e.target.value);

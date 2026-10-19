@@ -50,6 +50,8 @@ function makeChain() {
 }
 
 vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  getGuestVelocityLimits: vi.fn(async () => ({ startsPerIpPerHour: 30, declinesPerIpPerHour: 5 })),
   isStationLevelUnavailable: (
     await vi.importActual<typeof import('../../../database/src/lib/station-status.js')>(
       '../../../database/src/lib/station-status.js',
@@ -91,6 +93,7 @@ vi.mock('@evtivity/database', async () => ({
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(),
   and: vi.fn(),
+  isNull: vi.fn(),
   or: vi.fn(),
   ilike: vi.fn(),
   sql: vi.fn(),
@@ -197,6 +200,20 @@ vi.mock('../lib/rate-limiters.js', () => ({
   isStationCheckRateLimited: mockIsStationCheckRateLimited,
   getCachedConnectorStatus: mockGetCachedConnectorStatus,
   setCachedConnectorStatus: mockSetCachedConnectorStatus,
+}));
+
+// The start protections have their own tests (portal-guest-routes.test.ts):
+// allow every start here and treat no station as a dynamic QR station.
+vi.mock('../services/web-payment.service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/web-payment.service.js')>()),
+  stationHasDynamicQr: vi.fn(async () => false),
+}));
+vi.mock('../lib/recaptcha-check.js', () => ({ checkRecaptcha: vi.fn(async () => true) }));
+vi.mock('../lib/guest-velocity.js', () => ({
+  countGuestStart: vi.fn(async () => null),
+  checkGuestDeclines: vi.fn(async () => null),
+  countGuestDecline: vi.fn(async () => undefined),
+  guestVelocityClientIp: vi.fn((request: { ip: string }) => request.ip),
 }));
 
 import { registerAuth } from '../plugins/auth.js';
@@ -477,6 +494,8 @@ describe('Portal guest routes - gates and history', () => {
       expect(response.statusCode).toBe(429);
       expect(response.json()).toEqual({ error: 'Too many requests', code: 'RATE_LIMITED' });
       expect(db.select).not.toHaveBeenCalled();
+      // Limited per IP and session token (finding G4).
+      expect(mockIsGuestSessionRateLimited).toHaveBeenCalledWith(expect.any(String), TOKEN);
     });
 
     it('includes the payment failure reason of a failed session', async () => {
