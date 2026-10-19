@@ -9,12 +9,14 @@ vi.mock('@evtivity/database', () => {
   const where = vi.fn().mockResolvedValue([{ isActive: true }]);
   const limit = vi.fn().mockReturnValue({ where });
   const innerJoin = vi.fn().mockReturnValue({ where, limit });
-  const from = vi.fn().mockReturnValue({ where, innerJoin, limit });
+  const leftJoin = vi.fn().mockReturnValue({ where, limit });
+  const from = vi.fn().mockReturnValue({ where, innerJoin, leftJoin, limit });
   return {
     db: {
       select: vi.fn().mockReturnValue({ from }),
       execute: vi.fn().mockResolvedValue([{ nextval: '12345' }]),
     },
+    drivers: { id: 'id', isActive: 'is_active' },
     driverTokens: { isActive: 'is_active', idToken: 'id_token', tokenType: 'token_type' },
     chargingStations: {
       id: 'id',
@@ -455,6 +457,22 @@ describe('OCPP 1.6 StopTransaction handler - transactionData', () => {
     expect(publishMock).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'ocpp.MeterValues' }),
     );
+  });
+
+  it('publishes the transactionData readings before the Ended, so they reach the active session', async () => {
+    const { ctx, publishMock } = makeCtx('StopTransaction', {
+      transactionId: 42,
+      timestamp: '2026-02-15T11:00:00Z',
+      meterStop: 5000,
+      transactionData: [{ timestamp: '2026-02-15T10:30:00Z', sampledValue: [{ value: '3000' }] }],
+    });
+
+    await handleStopTransaction(ctx);
+
+    const order = publishMock.mock.calls.map(
+      (call) => (call[0] as { eventType: string }).eventType,
+    );
+    expect(order).toEqual(['ocpp.MeterValues', 'ocpp.TransactionEvent']);
   });
 });
 

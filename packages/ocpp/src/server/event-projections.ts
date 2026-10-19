@@ -47,6 +47,8 @@ import {
   pgErrorCode,
   PG_FOREIGN_KEY_VIOLATION,
   alertStationWatchersIfAvailable,
+  markLoadManagementStale,
+  recordLoadManagementProfileReply,
 } from '@evtivity/database';
 import { getSecuritySeverity } from '../lib/security-severity.js';
 import { paymentContext } from '../lib/payments.js';
@@ -88,6 +90,12 @@ import {
 } from '@evtivity/lib';
 import { enqueueMaintenanceFanout } from '@evtivity/services/maintenance.service';
 import { enqueueStationRefresh } from '@evtivity/services/station-message.service';
+import {
+  LOAD_MANAGEMENT_PROFILE_ID,
+  LOAD_MANAGEMENT_STACK_LEVEL,
+  isLoadManagementProfile,
+  profileRateUnit,
+} from '@evtivity/services/load-management.service';
 import { dispatchOcppNotification } from './notification-dispatcher.js';
 import {
   projectReservationStatusUpdate,
@@ -100,6 +108,7 @@ import { projectionLane, projectionQueueFor } from './projection-queue.js';
 import { PROJECTION_RETRY_DEFAULTS, runProjectionWithRetry } from './projection-retry.js';
 import type { ProjectionAttempt } from './projection-retry.js';
 import { SERVER_SHUTDOWN_DISCONNECT_REASON } from './graceful-shutdown.js';
+import { drainOfflineCommandQueue } from './offline-queue-drain.js';
 import {
   DEFAULT_LOCATION,
   DEFAULT_MEASURAND,
@@ -527,13 +536,20 @@ export function registerProjections(
         return;
       }
 
-      // One row per EVSE in one statement, so a retry never logs a part twice.
+      // Back from offline: each connector the disconnect logged as unavailable
+      // returns to its stored status, the mirror of the disconnect rows. A
+      // connector that is faulted stays down in the history (uptime, NEVI):
+      // the station's post-boot report of an unchanged status logs nothing.
+      // One statement, so a retry never logs a part twice.
       await attempt.once(
         'port-status-log',
         () => sql`
-          INSERT INTO port_status_log (station_id, evse_id, previous_status, new_status, timestamp)
-          SELECT ${stationUuid}, evse_id, 'unavailable', 'available', now()
-          FROM evses WHERE station_id = ${stationUuid}
+          INSERT INTO port_status_log (station_id, evse_id, connector_id, previous_status, new_status, timestamp)
+          SELECT ${stationUuid}, e.evse_id, c.connector_id, 'unavailable', c.status, now()
+          FROM connectors c
+          INNER JOIN evses e ON c.evse_id = e.id
+          WHERE e.station_id = ${stationUuid}
+            AND c.status != 'unavailable'
         `,
       );
 
@@ -564,71 +580,12 @@ export function registerProjections(
     if (stationUuid == null) return;
     const ocppProtocol = (event.payload as { ocppProtocol?: string }).ocppProtocol ?? null;
 
-    // Drain offline command queue for this station
+    // Drain offline command queue for this station: each command claimed
+    // before it is published, so it is sent at most once.
     const stationOcppId = event.aggregateId;
     try {
-      // Only the newest queued screen message per display message id and cost
-      // update per transaction still matters; older ones would show stale content.
-      const superseded = await sql`
-        WITH keyed AS (
-          SELECT id, action, created_at,
-            CASE action
-              WHEN 'SetDisplayMessage' THEN payload -> 'message' ->> 'id'
-              WHEN 'ClearDisplayMessage' THEN payload ->> 'id'
-              WHEN 'CostUpdated' THEN payload ->> 'transactionId'
-            END AS target
-          FROM offline_command_queue
-          WHERE station_id = ${stationOcppId} AND status = 'pending'
-            AND action IN ('SetDisplayMessage', 'ClearDisplayMessage', 'CostUpdated')
-        ),
-        ranked AS (
-          SELECT id, row_number() OVER (
-            PARTITION BY action, target ORDER BY created_at DESC, id DESC
-          ) AS rn
-          FROM keyed
-          WHERE target IS NOT NULL
-        )
-        UPDATE offline_command_queue q
-        SET status = 'expired', failed_reason = 'Superseded by a newer queued command'
-        FROM ranked
-        WHERE q.id = ranked.id AND ranked.rn > 1
-      `;
-      const pendingCommands = await sql`
-        SELECT id, command_id, action, payload, version
-        FROM offline_command_queue
-        WHERE station_id = ${stationOcppId} AND status = 'pending' AND expires_at > now()
-        ORDER BY created_at ASC
-      `;
-      // Publish all queued commands, collect successful IDs, then batch-update
-      // their status in one query. Per-command try/catch ensures a transient
-      // publish failure on one command doesn't leave previously-published ones
-      // unmarked-as-sent (which would cause duplicate dispatch on next reconnect).
-      const sentIds: number[] = [];
-      for (const cmd of pendingCommands) {
-        try {
-          await publishOcppCommand(pubsub, {
-            commandId: cmd.command_id as string,
-            stationId: stationOcppId,
-            action: cmd.action as string,
-            payload: cmd.payload as Record<string, unknown>,
-            version: cmd.version as string | null,
-          });
-          sentIds.push(cmd.id as number);
-        } catch (publishErr) {
-          logger.warn(
-            { err: publishErr, stationOcppId, commandId: cmd.command_id },
-            'Offline queue drain: publish failed for command; leaving pending for next drain',
-          );
-        }
-      }
-      if (sentIds.length > 0) {
-        await sql`
-          UPDATE offline_command_queue
-          SET status = 'sent', sent_at = now()
-          WHERE id IN ${sql(sentIds)}
-        `;
-      }
-      if (superseded.count > 0 || sentIds.length > 0) {
+      const drained = await drainOfflineCommandQueue(sql, pubsub, stationOcppId, logger);
+      if (drained.superseded > 0 || drained.sent > 0) {
         await notify.notifyChange(
           'ocpp.message',
           stationUuid,
@@ -1081,6 +1038,22 @@ export function registerProjections(
       logger.warn(
         { stationId: event.aggregateId, error: err instanceof Error ? err.message : String(err) },
         'Failed to push OCPP configuration on boot',
+      );
+    }
+  });
+
+  // A rebooted station may have lost its load management limit: the next
+  // load management cycle sends it again instead of waiting for the refresh
+  // interval. Its own subscription, so the boot handler above keeps its
+  // config push last; one statement keyed by the OCPP identity.
+  safeSubscribe('ocpp.BootNotification', async (event: DomainEvent) => {
+    try {
+      await markLoadManagementStale(sql, event.aggregateId);
+    } catch (err) {
+      // fail-open: the cycle sends the limit again at the refresh interval.
+      logger.warn(
+        { err, stationId: event.aggregateId },
+        'Marking load management for a resend after a boot failed',
       );
     }
   });
@@ -2407,7 +2380,10 @@ export function registerProjections(
           () => sql`
             WITH prev AS (SELECT is_online FROM charging_stations WHERE id = ${loggedStationUuid})
             UPDATE charging_stations
-            SET last_heartbeat = now(), is_online = true
+            SET last_heartbeat = now(), is_online = true,
+              -- Coming back online changes the published OCPI EVSE status
+              -- (UNKNOWN while offline), so it moves last_updated.
+              updated_at = CASE WHEN is_online = false THEN now() ELSE updated_at END
             WHERE id = ${loggedStationUuid}
               AND (is_online = false OR last_heartbeat IS NULL
                 OR last_heartbeat < now() - make_interval(secs => ${LIVENESS_WRITE_INTERVAL_SECONDS}))
@@ -2549,6 +2525,8 @@ export function registerProjections(
       event.aggregateId,
       stationUuid,
       {
+        csrId: typeof payload.csrId === 'number' ? payload.csrId : null,
+        requestId: typeof payload.requestId === 'number' ? payload.requestId : null,
         certificateChain: payload.certificateChain as string,
         certificateType: payload.certificateType as string,
         providerReference: payload.providerReference as string,
@@ -2558,6 +2536,27 @@ export function registerProjections(
 
     const siteId = await lookups.resolveSiteId(stationUuid);
     await notify.notifyChange('certificate.signed', stationUuid, siteId);
+  });
+
+  safeSubscribe('pnc.CertificateSignedResult', async (event: DomainEvent) => {
+    const stationUuid = await lookups.getStationUuid(event);
+    if (stationUuid == null) return;
+
+    const payload = event.payload;
+    const { handleCertificateSignedResult } =
+      await import('../services/pki/certificate-projections.js');
+    await handleCertificateSignedResult(
+      sql,
+      stationUuid,
+      payload.certificateChain as string,
+      payload.certificateType as string,
+      payload.status as string,
+    );
+
+    if (payload.status === 'Accepted') {
+      const siteId = await lookups.resolveSiteId(stationUuid);
+      await notify.notifyChange('certificate.signed', stationUuid, siteId);
+    }
   });
 
   safeSubscribe('pnc.InstallCertificateResult', async (event: DomainEvent) => {
@@ -2935,6 +2934,35 @@ export function registerProjections(
 
   // ---- Command Tracking Projections ----
 
+  // The station's answer to its load management profile (the profile the
+  // load management cycle sends: the API refuses it from every other path).
+  // Fail-open: the cycle keeps sending, and the stored copy is written.
+  async function recordLoadManagementReply(
+    event: DomainEvent,
+    stationUuid: string,
+    accepted: boolean,
+  ): Promise<void> {
+    const request = (event.payload.request ?? {}) as Record<string, unknown>;
+    const profile = request.chargingProfile ?? request.csChargingProfiles;
+    if (!isLoadManagementProfile(profile)) return;
+    const unit = profileRateUnit(profile);
+    if (unit == null) return;
+    try {
+      const changed = await recordLoadManagementProfileReply(sql, stationUuid, { accepted, unit });
+      if (!accepted && changed) {
+        logger.warn(
+          { stationId: event.aggregateId, unit, response: event.payload.response },
+          'Station did not accept its load management limit, treating it as a fixed load',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err, stationId: event.aggregateId },
+        'Recording the reply to the load management limit failed',
+      );
+    }
+  }
+
   safeSubscribe('command.SetChargingProfile', async (event: DomainEvent) => {
     const stationUuid = await lookups.resolveStationUuid(event.aggregateId);
     if (stationUuid == null) return;
@@ -2943,7 +2971,13 @@ export function registerProjections(
     // included. Only persist (and dedupe) when the station Accepted the profile;
     // otherwise the on-station state is unchanged and we'd be lying about it.
     const response = event.payload.response as { status?: string } | undefined;
-    if (response?.status !== 'Accepted') return;
+    const accepted = response?.status === 'Accepted';
+    if (!accepted) {
+      // A rejected load management limit (or an error reply, published with
+      // `error`) makes the station a fixed load until it accepts one.
+      await recordLoadManagementReply(event, stationUuid, false);
+      return;
+    }
 
     // The request is the 2.1 payload (evseId, chargingProfile.id) unless it was
     // sent in native 1.6 form through the 1.6 command route (connectorId,
@@ -2978,6 +3012,7 @@ export function registerProjections(
     `;
     const siteId = await lookups.resolveSiteId(stationUuid);
     await notify.notifyChange('station.chargingProfiles', stationUuid, siteId);
+    await recordLoadManagementReply(event, stationUuid, true);
   });
 
   // The only writer that removes stored profiles after a clear: an Accepted
@@ -2990,7 +3025,8 @@ export function registerProjections(
     if (stationUuid == null) return;
 
     const request = (event.payload.request ?? {}) as Record<string, unknown>;
-    const filter = chargingProfileClearFilter(chargingProfileClearCriteria(request));
+    const criteria = chargingProfileClearCriteria(request);
+    const filter = chargingProfileClearFilter(criteria);
     await sql`
       DELETE FROM charging_profiles
       WHERE station_id = ${stationUuid}
@@ -2999,6 +3035,30 @@ export function registerProjections(
     `;
     const siteId = await lookups.resolveSiteId(stationUuid);
     await notify.notifyChange('station.chargingProfiles', stationUuid, siteId);
+
+    // A clear that can match the load management profile (by its id, or by
+    // criteria a station max profile at its stack level on EVSE 0 meets)
+    // may have removed the limit: the next load management cycle sends it
+    // again instead of waiting for the refresh interval.
+    const mayRemoveLoadManagement =
+      (criteria.chargingProfileId == null ||
+        criteria.chargingProfileId >= LOAD_MANAGEMENT_PROFILE_ID) &&
+      (criteria.chargingProfilePurpose == null ||
+        criteria.chargingProfilePurpose === 'ChargingStationMaxProfile' ||
+        criteria.chargingProfilePurpose === 'ChargePointMaxProfile') &&
+      (criteria.stackLevel == null || criteria.stackLevel === LOAD_MANAGEMENT_STACK_LEVEL) &&
+      (criteria.evseId == null || criteria.evseId === 0);
+    if (mayRemoveLoadManagement) {
+      try {
+        await markLoadManagementStale(sql, event.aggregateId);
+      } catch (err) {
+        // fail-open: the cycle sends the limit again at the refresh interval.
+        logger.warn(
+          { err, stationId: event.aggregateId },
+          'Marking load management for a resend after a clear failed',
+        );
+      }
+    }
   });
 
   // A GetChargingProfiles answer tells which stored station_reported rows are

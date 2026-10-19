@@ -3,6 +3,7 @@
 
 export * from './schema/index.js';
 export { db, client } from './config.js';
+export { sessionSiteIdSql } from './lib/session-site.js';
 export { toDate, toDateOrNull, toIsoOrNull } from './lib/raw-timestamp.js';
 export type { RawTimestamp } from './lib/raw-timestamp.js';
 export { PgEventPersistence } from './event-persistence.js';
@@ -61,10 +62,28 @@ export {
   runWithAuditViaAi,
   currentAuditViaAi,
 } from './lib/audit.js';
-export { createCreditCdr, creditCdrData, negateOcpiPrice } from './lib/ocpi-credit-cdr.js';
-export type { CreditCdrResult } from './lib/ocpi-credit-cdr.js';
+export {
+  claimCdrPushRetry,
+  createCreditCdr,
+  creditCdrData,
+  negateOcpiPrice,
+  supersedeCreditedSessionCdrs,
+} from './lib/ocpi-credit-cdr.js';
+export type {
+  CreditCdrResult,
+  ReissueCdrResult,
+  RetryCdrPushResult,
+} from './lib/ocpi-credit-cdr.js';
 export { ocpiLocationAudience } from './lib/ocpi-location-audience.js';
+export { issueOcpiRegistrationToken } from './lib/ocpi-registration-token.js';
 export type { OcpiLocationAudience } from './lib/ocpi-location-audience.js';
+export { resolveOcpiTokenOwner, publishOcpiSessionPush } from './lib/ocpi-token-owner.js';
+export { OCPI_START_CONTEXT_MINUTES, isStartableOcpiToken } from './lib/ocpi-token-startable.js';
+export type {
+  OcpiCpoAuthMethod,
+  OcpiTokenOwner,
+  OcpiTokenOwnerResult,
+} from './lib/ocpi-token-owner.js';
 export {
   OCPI_REMOVED_EVSE_RETENTION_DAYS,
   recordRemovedOcpiEvses,
@@ -136,8 +155,16 @@ export {
   stampSessionBilling,
   sessionBillingColumns,
   toSessionBilling,
+  moveSessionBillingRecipient,
+  listMovableFleetSessions,
 } from './lib/fleet-billing.js';
-export type { AccountBilling, BillingMembership, SessionBilling } from './lib/fleet-billing.js';
+export type {
+  AccountBilling,
+  BillingMembership,
+  SessionBilling,
+  SessionBillingMove,
+  SessionBillingMoveOutcome,
+} from './lib/fleet-billing.js';
 export {
   DEFAULT_CREDIT_LIMIT_WARNING_PERCENT,
   fleetCreditLevel,
@@ -256,6 +283,7 @@ export {
   completeFirmwareCampaignIfDone,
   rejectFirmwareUpdate,
   failCanceledFirmwareCampaignUpdates,
+  dropQueuedCampaignFirmwareUpdates,
 } from './lib/firmware-updates.js';
 export type {
   FirmwareCampaignStationStatus,
@@ -265,6 +293,11 @@ export {
   dispatchPendingFirmwareCampaigns,
   newFirmwareRequestId,
 } from './lib/firmware-campaign-dispatch.js';
+export {
+  markLoadManagementStale,
+  recordLoadManagementProfileReply,
+} from './lib/load-management-state.js';
+export type { LoadManagementRateUnit } from './lib/load-management-state.js';
 export { isFleetEnabled, clearFleetCache } from './lib/fleet-setting.js';
 export {
   guardVersion,
@@ -284,7 +317,35 @@ export type {
   ReleaseUpgradePending,
 } from './lib/process-versions.js';
 export { isPortalRegistrationEnabled } from './lib/portal-registration-setting.js';
-export { isGuestChargingEnabled, clearGuestChargingCache } from './lib/guest-setting.js';
+export { touchExpiredDriverTokens } from './lib/driver-token-expiry.js';
+export {
+  isGuestChargingEnabled,
+  clearGuestChargingCache,
+  getGuestVelocityLimits,
+  clearGuestVelocityCache,
+  parseGuestVelocityLimit,
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY,
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY,
+  DEFAULT_GUEST_STARTS_PER_IP_PER_HOUR,
+  DEFAULT_GUEST_DECLINES_PER_IP_PER_HOUR,
+  MAX_GUEST_VELOCITY_LIMIT,
+} from './lib/guest-setting.js';
+export type { GuestVelocityLimits } from './lib/guest-setting.js';
+export {
+  AUTOCHARGE_ENABLED_KEY,
+  clearAutochargeCache,
+  findAutochargeVehicle,
+  findBlockedVehicle,
+  isAutochargeEnabled,
+  isAutochargeEnabledForStation,
+  isAutochargeOffered,
+  type AutochargeVehicleMatch,
+} from './lib/autocharge.js';
+export {
+  COMPANY_PORTAL_URL_KEY,
+  clearCompanyPortalUrlCache,
+  getCompanyPortalUrl,
+} from './lib/portal-url-setting.js';
 export { getIdlingGracePeriodMinutes, clearIdlingSettingCache } from './lib/idling-setting.js';
 export {
   PREPAID_LOW_CREDIT_THRESHOLD_KEY,
@@ -307,13 +368,18 @@ export {
   getFleetInvoiceRunDay,
   clearInvoiceSettingsCache,
 } from './lib/invoice-settings.js';
-export { getStaleSessionTimeoutHours } from './lib/session-settings.js';
+export {
+  getStaleSessionTimeoutHours,
+  STALE_CLEANUP_IN_TRANSACTION_STATUSES,
+} from './lib/session-settings.js';
 export {
   REMOTE_START_TIMEOUT_CHANNEL,
   EV_CONNECTION_TIMEOUT_SETTING,
   DEFAULT_EV_CONNECTION_TIMEOUT_SECONDS,
   REMOTE_START_TIMEOUT_MARGIN_SECONDS,
   EV_CONNECT_TIMEOUT_REASON,
+  REMOTE_START_TIMEOUT_REASON,
+  REMOTE_START_REJECTED_REASON,
   getEvConnectionTimeoutDefaultSeconds,
   clearEvConnectionTimeoutCache,
   getStationConnectionTimeoutSeconds,
@@ -339,8 +405,11 @@ export {
   getCompanyPriceDisplay,
   getCompanyTaxBasis,
   getCompanyCountry,
+  getInvoicePaymentSettings,
+  readInvoicePaymentSettings,
   clearSystemSettingsCache,
 } from './lib/system-settings.js';
+export type { InvoicePaymentSettings } from './lib/system-settings.js';
 export {
   getRecaptchaConfig,
   getMfaConfig,
@@ -414,12 +483,15 @@ export {
   checkAiBudgets,
   clearAiUsageCache,
   evaluateAiBudgets,
+  getCompanyAiBudgetStatus,
   getSiteMonthlyTokenBudget,
   isAiUsageMonth,
   recordAiUsage,
 } from './lib/ai-usage.js';
 export type {
   AiBudgetContext,
+  AiBudgetNotice,
+  CompanyAiBudgetStatus,
   AiBudgetLimits,
   AiBudgetSumKey,
   AiUsageMonth,
@@ -427,8 +499,51 @@ export type {
   AiUsageRecord,
   AiUsageSums,
 } from './lib/ai-usage.js';
+export {
+  AI_PROVIDER_PROBE_INTERVAL_MS,
+  claimAiProviderAlertNotice,
+  claimAiProviderProbe,
+  clearAiProviderAlert,
+  clearAiProviderAlertsCache,
+  getActiveAiProviderAlerts,
+  recordAiProviderQuotaFailure,
+} from './lib/ai-provider-alerts.js';
+export type { AiProviderAlert } from './lib/ai-provider-alerts.js';
 export { getSsoConfig, clearSsoSettingsCache } from './lib/sso-settings.js';
 export type { SsoConfig } from './lib/sso-settings.js';
 export { getAttestationConfig, clearAttestationConfigCache } from './lib/attestation-settings.js';
 export type { AttestationConfig } from './lib/attestation-settings.js';
 export { getMobileAppConfig, clearMobileAppConfigCache } from './lib/mobile-app-settings.js';
+export {
+  CONFORMANCE_STATION_ID_PREFIX,
+  CONFORMANCE_CS_STATION_ID_PREFIX,
+  operatorStationSql,
+  operatorStationIdSql,
+  isOperatorStation,
+  inOperatorStation,
+  CONFORMANCE_DELETE_BATCH,
+  deleteConformanceStations,
+  deleteConformanceTestDriver,
+  conformanceTestDriverInUse,
+} from './lib/conformance-stations.js';
+export type {
+  ConformanceStationDeleteOptions,
+  ConformanceDriverDeleteResult,
+} from './lib/conformance-stations.js';
+export {
+  SITE_INSIGHT_SUPPRESSION_SOURCES,
+  STATION_INSIGHT_SUPPRESSION_SOURCES,
+  siteInsightsOperatorSuppressedSql,
+  siteInsightsSuppressedSql,
+  siteInsightSuppressionSourcesSql,
+  siteUnderActiveMaintenanceSql,
+  stationInsightsOperatorSuppressedSql,
+  stationInsightsSuppressedSql,
+  stationInsightSuppressionSourcesSql,
+  stationSiteInsightsSuppressedSql,
+  stationUnderActiveMaintenanceSql,
+} from './lib/ai-insight-suppression.js';
+export type {
+  SiteInsightSuppressionSource,
+  StationInsightSuppressionSource,
+} from './lib/ai-insight-suppression.js';

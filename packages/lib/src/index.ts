@@ -62,10 +62,10 @@ export { csvEscape, buildCsv, neutraliseSpreadsheetFormula } from './csv-escape.
 export { verifyRecaptcha } from './recaptcha.js';
 export type { RecaptchaResult } from './recaptcha.js';
 
-export { generateTotpSecret, generateTotpUri, verifyTotpCode } from './totp.js';
+export { generateTotpSecret, generateTotpUri, verifyTotpCode, matchTotpStep } from './totp.js';
 
-export { createMfaChallenge, verifyMfaChallenge } from './mfa.js';
-export type { CreateChallengeResult } from './mfa.js';
+export { createMfaChallenge, verifyMfaChallenge, MFA_CHALLENGE_MAX_ATTEMPTS } from './mfa.js';
+export type { CreateChallengeResult, MfaChallengeResult } from './mfa.js';
 
 export type { PubSubClient, Subscription } from './pubsub.js';
 export {
@@ -115,6 +115,7 @@ export {
   parseMajorInputToCents,
 } from './currency.js';
 export type { SupportedCurrency, TariffSummaryLabels, TariffSummaryPrices } from './currency.js';
+export { ISO3166_ALPHA2_TO_ALPHA3, toIso3166Alpha3, isKnownCountry } from './country.js';
 export {
   PRICE_DISPLAYS,
   DEFAULT_PRICE_DISPLAY,
@@ -186,8 +187,21 @@ export {
   stationAuthInvalidationPayload,
   parseStationAuthInvalidation,
   publishStationAuthInvalidation,
+  STATION_DISCONNECT_KIND,
+  stationDisconnectPayload,
+  parseStationDisconnect,
+  publishStationDisconnect,
 } from './station-auth-invalidation.js';
 export type { StationOcppProtocol, StationPasswordError } from './station-password.js';
+export {
+  PNC16_VENDOR_ID,
+  PNC16_MESSAGE_IDS,
+  isPnc16MessageId,
+  wrapPnc16,
+  unwrapPnc16Data,
+  unwrapPnc16Answer,
+  type Pnc16MessageId,
+} from './iso15118-pnc16.js';
 export {
   PASSWORD_MIN_LENGTH,
   PASSWORD_RULES,
@@ -214,10 +228,20 @@ export {
   circuitConductorPhases,
   computeMaxContinuousKw,
   conductorFactor,
+  isCircuitVoltageAllowed,
+  effectiveCircuitVoltageV,
+  SUB_PANEL_PHASE_CONNECTIONS,
+  isSubPanelPhaseConnectionAllowed,
 } from './load-allocation.js';
-export type { LoadAllocationStrategy } from './load-allocation.js';
-export { OCPI_PULL_MODULES } from './ocpi-modules.js';
+export type { LoadAllocationStrategy, SubPanelPhaseConnection } from './load-allocation.js';
+export { OCPI_PULL_MODULES, OCPI_TARIFF_SETTING_KEYS } from './ocpi-modules.js';
 export type { OcpiPullModule } from './ocpi-modules.js';
+export {
+  OCPI_TOKEN_TYPE_BY_DRIVER_TYPE,
+  isNewOcpiToken,
+  ocpiTokenTypeOf,
+} from './ocpi-token-types.js';
+export type { OcpiTokenTypeName } from './ocpi-token-types.js';
 export {
   FIRMWARE_SIGNING_CERTIFICATE_MAX_LENGTH,
   FIRMWARE_SIGNATURE_MAX_LENGTH,
@@ -417,8 +441,15 @@ export type { SentryConfig } from './sentry.js';
 
 export { calculateCo2AvoidedKg, GASOLINE_CO2_KG_PER_KWH } from './carbon.js';
 
-export { FREE_VEND_OCPP_21_VARIABLES, FREE_VEND_OCPP_16_KEYS } from './free-vend-defaults.js';
-export type { ConfigTemplateVariable } from './free-vend-defaults.js';
+export {
+  FREE_VEND_OCPP_21_VARIABLES,
+  FREE_VEND_OCPP_16_KEYS,
+  FREE_VEND_RESTORE_TX_START_POINT,
+  FREE_VEND_RESTORE_OCPP_16_DEFAULTS,
+  freeVendRestoreVariables21,
+  freeVendRestoreKeys16,
+} from './free-vend-defaults.js';
+export type { ConfigTemplateVariable, FreeVendRestoreKey16 } from './free-vend-defaults.js';
 
 export {
   renderStationMessage,
@@ -585,6 +616,29 @@ export {
   normalizeInvoiceSellerSetting,
 } from './invoice-seller.js';
 export type { InvoiceSellerSettingKey } from './invoice-seller.js';
+export {
+  COMPANY_BANK_ACCOUNT_HOLDER_KEY,
+  COMPANY_IBAN_KEY,
+  COMPANY_BIC_KEY,
+  COMPANY_BANK_NAME_KEY,
+  INVOICE_EPC_QR_ENABLED_KEY,
+  INVOICE_PAYMENT_MAX_LENGTHS,
+  INVOICE_PAYMENT_SETTING_KEYS,
+  isInvoicePaymentSettingKey,
+  normalizeInvoicePaymentSetting,
+  normalizeIban,
+  normalizeBic,
+  formatIban,
+} from './invoice-payment.js';
+export type { InvoicePaymentSettingKey } from './invoice-payment.js';
+export {
+  EPC_MAX_NAME_LENGTH,
+  EPC_MAX_REMITTANCE_LENGTH,
+  EPC_MAX_AMOUNT_CENTS,
+  EPC_MAX_PAYLOAD_BYTES,
+  buildEpcQrPayload,
+} from './epc-qr.js';
+export type { EpcQrInput } from './epc-qr.js';
 export type { DecodedPdfLogo } from './pdf-logo.js';
 export {
   CLEARABLE_PROFILE_PURPOSES,

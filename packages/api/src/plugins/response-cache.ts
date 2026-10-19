@@ -137,6 +137,14 @@ declare module 'fastify' {
   interface FastifyRequest {
     responseCacheCtx: CacheCtx | null;
   }
+  interface FastifyContextConfig {
+    /**
+     * Cache tags a successful write of this route busts besides its own
+     * resource's (tagsForWrite): a station route that ends a session also
+     * changes the session lists.
+     */
+    invalidatesCacheTags?: readonly string[];
+  }
 }
 
 export interface ResponseCacheRedis {
@@ -185,6 +193,70 @@ let realRedisClient: Redis | null = null;
 
 export function setResponseCacheRedis(redis: ResponseCacheRedis | null): void {
   cacheRedis = redis;
+}
+
+/**
+ * CSMS events that change dashboard figures. The CSMS refetches the
+ * dashboard on them, so the dashboard cache tag is bumped first and the
+ * refetch reads fresh data instead of a response cached before the event.
+ */
+export const DASHBOARD_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'station.status',
+  'session.started',
+  'session.ended',
+  'meter.values',
+  'payment.settled',
+  'ocpp.health',
+]);
+
+/**
+ * Shortest time between two bumps of the dashboard tag by one API process.
+ * Below the CSMS refetch delay for events (5 s), so the refetch an event
+ * triggers always comes after the bump that covers it.
+ */
+export const DASHBOARD_BUMP_INTERVAL_MS = 2_000;
+
+let lastDashboardBumpAt = 0;
+let trailingDashboardBump: ReturnType<typeof setTimeout> | null = null;
+
+function bumpDashboardTag(now: number): void {
+  lastDashboardBumpAt = now;
+  try {
+    void getCacheRedis()
+      .incr('rc:ver:dashboard')
+      .catch((err: unknown) => {
+        logger.debug({ err }, 'Dashboard cache bump failed, entries expire by TTL');
+      });
+  } catch (err) {
+    logger.debug({ err }, 'Dashboard cache bump skipped, no cache connection');
+  }
+}
+
+/**
+ * Bump the dashboard cache tag for a CSMS event, at most once per
+ * DASHBOARD_BUMP_INTERVAL_MS: an event inside the interval schedules one
+ * bump at its end, so the last event of a burst is always covered.
+ */
+export function noteDashboardEvent(eventType: unknown, now: number = Date.now()): void {
+  if (typeof eventType !== 'string' || !DASHBOARD_EVENT_TYPES.has(eventType)) return;
+  const wait = lastDashboardBumpAt + DASHBOARD_BUMP_INTERVAL_MS - now;
+  if (wait <= 0) {
+    bumpDashboardTag(now);
+    return;
+  }
+  if (trailingDashboardBump != null) return;
+  trailingDashboardBump = setTimeout(() => {
+    trailingDashboardBump = null;
+    bumpDashboardTag(Date.now());
+  }, wait);
+  trailingDashboardBump.unref();
+}
+
+/** Resets the bump throttle (tests). */
+export function resetDashboardBumpThrottle(): void {
+  if (trailingDashboardBump != null) clearTimeout(trailingDashboardBump);
+  trailingDashboardBump = null;
+  lastDashboardBumpAt = 0;
 }
 
 async function versionedKey(
@@ -275,10 +347,14 @@ export function registerResponseCache(app: FastifyInstance): void {
     const pathname = request.url.split('?')[0] ?? request.url;
     const resource = extractWriteResource(pathname);
     if (resource == null) return;
+    const tags = new Set([
+      ...tagsForWrite(resource),
+      ...(request.routeOptions.config.invalidatesCacheTags ?? []),
+    ]);
 
     try {
       const redis = getCacheRedis();
-      await Promise.all(tagsForWrite(resource).map((tag) => redis.incr(`rc:ver:${tag}`)));
+      await Promise.all([...tags].map((tag) => redis.incr(`rc:ver:${tag}`)));
     } catch (err) {
       logger.debug(
         { err, resource },

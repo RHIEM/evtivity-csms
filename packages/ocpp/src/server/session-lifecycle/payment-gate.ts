@@ -42,6 +42,8 @@ export interface PaymentGateInput {
   idToken: string | undefined;
   guestStatus: string | null;
   guestEmail: string | null;
+  /** UI language the guest chose at checkout, for its notices; null or absent for the company language. */
+  guestLanguage?: string | null;
   /** Balance of the session's prepaid token; null when the token is not prepaid. */
   prepaidBalanceCents: number | null;
   /** True when the session started from a reservation (its holding fee is billed). */
@@ -61,6 +63,14 @@ export interface PaymentGateInput {
    * station no RequestStopTransaction, the transaction is over.
    */
   transactionEnded?: boolean;
+  /**
+   * The CSMS refused the start itself for no fleet credit (a 1.6
+   * StartTransaction answered Blocked, `startRefusal: 'no_credit'` on the
+   * Started event). A credit limit stop then faults the session at once but
+   * leaves the station a grace period to end the transaction before the
+   * stop (stopSessionForPayment).
+   */
+  startRefused?: boolean;
 }
 
 interface PreAuthFailedNotice {
@@ -77,6 +87,8 @@ interface MissingPaymentMethodNotice {
 interface GuestPreAuthFailedNotice {
   kind: 'guestPreAuthFailed';
   email: string;
+  /** The guest's checkout language; absent for the company language. */
+  language?: string;
 }
 
 type GateNotice = PreAuthFailedNotice | MissingPaymentMethodNotice | GuestPreAuthFailedNotice;
@@ -248,7 +260,14 @@ export function planPaymentGate(
       kind: 'stop',
       why: 'guest_not_authorized',
       reason: 'GuestPaymentNotAuthorized',
-      notice: guestEmail != null ? { kind: 'guestPreAuthFailed', email: guestEmail } : null,
+      notice:
+        guestEmail != null
+          ? {
+              kind: 'guestPreAuthFailed',
+              email: guestEmail,
+              ...(input.guestLanguage != null ? { language: input.guestLanguage } : {}),
+            }
+          : null,
     };
   }
 
@@ -411,7 +430,10 @@ export async function runPaymentGate(
         stationDbId: input.stationDbId,
       },
       decision.reason,
-      { transactionEnded: input.transactionEnded === true },
+      {
+        transactionEnded: input.transactionEnded === true,
+        startRefused: decision.why === 'account_credit_limit' && input.startRefused === true,
+      },
     );
     if (decision.notice != null) await sendNotice(deps, input, decision.notice);
   }
@@ -592,7 +614,11 @@ async function sendNotice(
           dispatchSystemNotification(
             sql,
             'payment.PreAuthFailed',
-            { email: notice.email },
+            // The guest's checkout language; none leaves the company language.
+            {
+              email: notice.email,
+              ...(notice.language != null ? { language: notice.language } : {}),
+            },
             {
               stationId: ocppStationId,
               transactionId,

@@ -20,7 +20,7 @@ import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { tariffs } from './pricing.js';
-import { chargingStations, evses, connectors } from './assets.js';
+import { chargingStations, evses, connectors, sites } from './assets.js';
 import { drivers, driverTokens, vehicles, fleets } from './drivers.js';
 import { reservations } from './reservations.js';
 import { invoices } from './invoices.js';
@@ -56,6 +56,10 @@ export const chargingSessions = pgTable(
     stationId: text('station_id')
       .notNull()
       .references(() => chargingStations.id, { onDelete: 'cascade' }),
+    // The site the session happened at, stamped from its station at insert by
+    // the BEFORE INSERT trigger charging_sessions_stamp_site (migration 0475),
+    // so revenue and history stay with that site when the station moves.
+    siteId: text('site_id').references(() => sites.id, { onDelete: 'set null' }),
     evseId: text('evse_id').references(() => evses.id),
     connectorId: text('connector_id').references(() => connectors.id),
     driverId: text('driver_id').references(() => drivers.id),
@@ -142,7 +146,8 @@ export const chargingSessions = pgTable(
     completedNotifiedAt: timestamp('completed_notified_at', { withTimezone: true }),
     receiptNotifiedAt: timestamp('receipt_notified_at', { withTimezone: true }),
     // A durable request to end the session the normal way (completed and
-    // billed) because the station will not: 'GhostRecovered' or 'Superseded'.
+    // billed) because the station will not: 'GhostRecovered', 'Superseded' or
+    // 'OperatorEnded'.
     // end_claimed_at is the lease of the OCPP pod processing it (retried by the
     // OCPP sweep). See packages/ocpp/src/server/csms-session-end.ts.
     endRequestReason: varchar('end_request_reason', { length: 32 }),
@@ -177,6 +182,15 @@ export const chargingSessions = pgTable(
     // account_invoice_recipient at start and never rewritten (P5), so a later
     // recipient switch never moves a started session.
     memberBilled: boolean('member_billed').notNull().default(false),
+    // The vehicle id the charger sent at the start (@evtivity/lib/vehicle-id):
+    // the normalized value, its type (VIN, EVCCID, MacAddress) and source
+    // (id_token, additional_info, id_tag). Written once, by the first event
+    // that carries one.
+    vehicleIdValue: varchar('vehicle_id_value', { length: 255 }),
+    vehicleIdType: varchar('vehicle_id_type', { length: 20 }),
+    vehicleIdSource: varchar('vehicle_id_source', { length: 20 }),
+    // The session was authorized by an Autocharge vehicle (no card or app).
+    autocharge: boolean('autocharge').notNull().default(false),
     metadata: jsonb('metadata'),
     freeVend: boolean('free_vend').notNull().default(false),
     co2AvoidedKg: numeric('co2_avoided_kg'),
@@ -186,6 +200,7 @@ export const chargingSessions = pgTable(
   },
   (table) => [
     index('idx_sessions_station_id').on(table.stationId),
+    index('idx_sessions_site_started_at').on(table.siteId, table.startedAt),
     index('idx_sessions_status').on(table.status),
     uniqueIndex('uq_charging_sessions_station_transaction').on(
       table.stationId,
@@ -193,6 +208,12 @@ export const chargingSessions = pgTable(
     ),
     index('idx_sessions_started_at').on(table.startedAt),
     index('idx_sessions_driver_id').on(table.driverId),
+    // The portal session list (a driver's sessions, newest first).
+    index('idx_sessions_driver_created').on(
+      table.driverId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
     index('idx_sessions_reservation_id').on(table.reservationId),
     index('idx_sessions_status_idle').on(table.status, table.idleStartedAt),
     index('idx_sessions_created_at').on(table.createdAt),
@@ -327,6 +348,13 @@ export const meterValues = pgTable(
     index('idx_meter_values_station_standalone_ts')
       .on(table.stationId, table.timestamp)
       .where(sql`session_id IS NULL`),
+    // Deleting an EVSE (a station delete cascades to its EVSEs) checks the
+    // evse_id foreign key, a full scan of meter_values without this index:
+    // 355 ms per EVSE at 3.7M rows, so a conformance run's end-of-run delete
+    // of several hundred test stations took minutes, hours on a large table.
+    index('idx_meter_values_evse_id')
+      .on(table.evseId)
+      .where(sql`evse_id IS NOT NULL`),
     // Dedup retransmits: OCPP allows the station to resend a MeterValues batch
     // if the CALLRESULT is lost. Without this, duplicate rows inflate energy
     // sums in dashboards, cost calculations, and OCPI CDRs. The backing

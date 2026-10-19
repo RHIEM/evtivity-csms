@@ -67,6 +67,9 @@ export const drivers = pgTable(
     billingState: varchar('billing_state', { length: 100 }),
     billingZip: varchar('billing_zip', { length: 20 }),
     billingCountry: varchar('billing_country', { length: 100 }),
+    // When the driver's personal data was erased (POST /v1/drivers/:id/erase).
+    // The row stays as an anonymized stub for the sessions and invoices.
+    erasedAt: timestamp('erased_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -110,6 +113,9 @@ export const guestSessions = pgTable(
     provider: varchar('provider', { length: 32 }),
     providerPaymentId: varchar('provider_payment_id', { length: 255 }),
     guestEmail: varchar('guest_email', { length: 255 }).notNull(),
+    // UI language of the guest at checkout (en, de, es, ko, zh, zh-TW); guest
+    // notices use it. Null: the company language.
+    language: varchar('language', { length: 10 }),
     preAuthAmountCents: integer('pre_auth_amount_cents'),
     // Transaction limit returned in the OCPP 2.1 TransactionEventResponse when
     // the transaction starts (C24.FR.02, C25.FR.24). Null means no limit.
@@ -130,7 +136,8 @@ export const guestSessions = pgTable(
     index('idx_guest_sessions_station').on(table.stationOcppId, table.evseId),
     index('idx_guest_sessions_token').on(table.sessionToken),
     index('idx_guest_sessions_status').on(table.status),
-    index('idx_guest_sessions_charging_session').on(table.chargingSessionId),
+    // One guest checkout per charging session.
+    uniqueIndex('uq_guest_sessions_charging_session').on(table.chargingSessionId),
   ],
 );
 
@@ -147,6 +154,11 @@ export const driverTokens = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     revokedReason: varchar('revoked_reason', { length: 100 }),
+    // Who deactivated the token: 'operator', 'driver' or 'system'. Null while
+    // active. A driver may reactivate only a token the driver deactivated.
+    deactivatedBy: varchar('deactivated_by', { length: 10 }).$type<
+      'operator' | 'driver' | 'system'
+    >(),
     // Prepaid credit in cents of the company currency (OCPP 2.1 C17). Null
     // means the token is not prepaid. Zero or less is answered NoCredit.
     prepaidBalanceCents: integer('prepaid_balance_cents'),
@@ -157,6 +169,25 @@ export const driverTokens = pgTable(
     index('idx_driver_tokens_id_token').on(table.idToken),
     index('idx_driver_tokens_driver_id').on(table.driverId),
     index('idx_driver_tokens_expires_at').on(table.expiresAt),
+  ],
+);
+
+// A token value that no longer exists: the token was deleted, or its value or
+// type changed. OCPI cannot delete a Token (12.1.1): the eMSP Tokens sender
+// serves these as valid = false with last_updated = invalidated_at, so a CPO
+// that cached the token learns it on its next pull. Written only by the token
+// service. A live token with the same value and type supersedes it.
+export const driverTokenTombstones = pgTable(
+  'driver_token_tombstones',
+  {
+    id: serial('id').primaryKey(),
+    idToken: varchar('id_token', { length: 255 }).notNull(),
+    tokenType: varchar('token_type', { length: 20 }).notNull(),
+    invalidatedAt: timestamp('invalidated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_driver_token_tombstones_token').on(table.idToken, table.tokenType),
+    index('idx_driver_token_tombstones_invalidated_at').on(table.invalidatedAt),
   ],
 );
 
@@ -188,6 +219,13 @@ export const authorizeAttempts = pgTable(
     outcome: authorizeOutcomeEnum('outcome').notNull(),
     ocppVersion: varchar('ocpp_version', { length: 10 }),
     reason: varchar('reason', { length: 200 }),
+    // The vehicle id the start carried (the token itself, a 2.1 additionalInfo
+    // entry or a vehicle-shaped 1.6 idTag), normalized, refused starts included.
+    vehicleIdValue: varchar('vehicle_id_value', { length: 255 }),
+    vehicleIdType: varchar('vehicle_id_type', { length: 20 }),
+    // The Autocharge vehicle that authorized (or refused) the start. No foreign
+    // key, so the log survives a deleted vehicle.
+    matchedVehicleId: text('matched_vehicle_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -212,12 +250,38 @@ export const vehicles = pgTable(
     make: varchar('make', { length: 100 }),
     model: varchar('model', { length: 100 }),
     year: varchar('year', { length: 4 }),
+    // Stored normalized (uppercase, @evtivity/lib/vehicle-id).
     vin: varchar('vin', { length: 17 }),
     licensePlate: varchar('license_plate', { length: 20 }),
+    // The EV charging controller id (ISO 15118 EVCCID, the MAC address for
+    // ISO 15118-2 and DIN 70121) as normalized by @evtivity/lib/vehicle-id:
+    // a MAC address as 12 uppercase hex digits.
+    evccid: varchar('evccid', { length: 255 }),
+    // Autocharge (charge by plugging in): a start the charger sends with this
+    // vehicle's VIN or EVCCID is authorized as the vehicle's driver.
+    autochargeEnabled: boolean('autocharge_enabled').notNull().default(false),
+    // Set by an operator block: the vehicle's ids are refused like a blocked
+    // token and the driver cannot turn Autocharge back on.
+    autochargeBlockedAt: timestamp('autocharge_blocked_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index('idx_vehicles_driver_id').on(table.driverId)],
+  (table) => [
+    index('idx_vehicles_driver_id').on(table.driverId),
+    index('idx_vehicles_evccid').on(table.evccid),
+    index('idx_vehicles_vin').on(table.vin),
+    // One Autocharge vehicle per id, so a start resolves to one driver.
+    uniqueIndex('uq_vehicles_autocharge_evccid')
+      .on(table.evccid)
+      .where(sql`${table.autochargeEnabled} AND ${table.evccid} IS NOT NULL`),
+    uniqueIndex('uq_vehicles_autocharge_vin')
+      .on(table.vin)
+      .where(sql`${table.autochargeEnabled} AND ${table.vin} IS NOT NULL`),
+    check(
+      'vehicles_autocharge_id_check',
+      sql`NOT ${table.autochargeEnabled} OR ${table.evccid} IS NOT NULL OR ${table.vin} IS NOT NULL`,
+    ),
+  ],
 );
 
 /**
@@ -227,6 +291,14 @@ export const vehicles = pgTable(
  */
 export const ACCOUNT_INVOICE_RECIPIENTS = ['fleet', 'member'] as const;
 export type AccountInvoiceRecipient = (typeof ACCOUNT_INVOICE_RECIPIENTS)[number];
+
+/**
+ * The date of a fleet's account invoices (fleet and member invoices):
+ * `run_date` (the day it is issued) or `period_end` (the last day of the
+ * billed month, system timezone, when issued after it).
+ */
+export const INVOICE_DATE_MODES = ['run_date', 'period_end'] as const;
+export type InvoiceDateMode = (typeof INVOICE_DATE_MODES)[number];
 
 export const fleets = pgTable(
   'fleets',
@@ -263,6 +335,11 @@ export const fleets = pgTable(
     paymentTermsDays: integer('payment_terms_days'),
     // The monthly run invoices the fleet automatically (needs a billing contact).
     autoInvoice: boolean('auto_invoice').notNull().default(false),
+    // The invoice date of the fleet's account invoices (INVOICE_DATE_MODES).
+    invoiceDateMode: varchar('invoice_date_mode', { length: 16 })
+      .$type<InvoiceDateMode>()
+      .notNull()
+      .default('run_date'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     // Credit limit of the account billing (cents of the company currency, null:
@@ -292,6 +369,10 @@ export const fleets = pgTable(
     check(
       'fleets_account_invoice_recipient_check',
       sql`${table.accountInvoiceRecipient} IN ('fleet', 'member')`,
+    ),
+    check(
+      'fleets_invoice_date_mode_check',
+      sql`${table.invoiceDateMode} IN ('run_date', 'period_end')`,
     ),
   ],
 );

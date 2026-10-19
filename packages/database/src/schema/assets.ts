@@ -81,6 +81,12 @@ export const sites = pgTable(
     freeVendEnabled: boolean('free_vend_enabled').notNull().default(false),
     freeVendTemplateId21: text('free_vend_template_id_21'),
     freeVendTemplateId16: text('free_vend_template_id_16'),
+    // Config templates that push authorization back when free vend is turned
+    // off: the values the stations reported when free vend was turned on.
+    freeVendRestoreTemplateId21: text('free_vend_restore_template_id_21'),
+    freeVendRestoreTemplateId16: text('free_vend_restore_template_id_16'),
+    // Autocharge at this site; null follows the autocharge.enabled setting.
+    autochargeEnabled: boolean('autocharge_enabled'),
     carbonRegionCode: varchar('carbon_region_code', { length: 20 }),
     // Station display language of the site; null follows stationMessage.language.
     stationMessageLanguage: varchar('station_message_language', { length: 10 }),
@@ -88,6 +94,14 @@ export const sites = pgTable(
     aiInsightsEnabled: boolean('ai_insights_enabled').notNull().default(true),
     // Monthly AI token budget of the site; null follows ai.budget.siteMonthlyTokens, 0 is no limit.
     aiMonthlyTokenBudget: bigint('ai_monthly_token_budget', { mode: 'number' }),
+    // AI insight suppression of the whole site set by an operator
+    // (site-ai-insights.service.ts is the only writer): no new insight or
+    // worker action for the site or any of its stations while suppressed_at is
+    // set and suppressed_until is null or ahead.
+    aiInsightsSuppressedAt: timestamp('ai_insights_suppressed_at', { withTimezone: true }),
+    aiInsightsSuppressedUntil: timestamp('ai_insights_suppressed_until', { withTimezone: true }),
+    aiInsightsSuppressedBy: text('ai_insights_suppressed_by'),
+    aiInsightsSuppressedReason: varchar('ai_insights_suppressed_reason', { length: 500 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -137,6 +151,10 @@ export const chargingStations = pgTable(
     lastHeartbeat: timestamp('last_heartbeat', { withTimezone: true }),
     isOnline: boolean('is_online').notNull().default(false),
     isSimulator: boolean('is_simulator').notNull().default(false),
+    // A conformance test station (OCTT). The conformance runners set it when
+    // they create the station; every operator list, count, aggregate and
+    // target leaves it out (lib/conformance-stations.ts).
+    isConformance: boolean('is_conformance').notNull().default(false),
     // Last connection to this simulator-flagged station that the OCPP server
     // could not attribute to the simulator. The station page asks the
     // operator to confirm a real station. Cleared with the flag.
@@ -151,6 +169,13 @@ export const chargingStations = pgTable(
     pendingSecurityProfile: integer('pending_security_profile'),
     ocppProtocol: varchar('ocpp_protocol', { length: 20 }),
     basicAuthPasswordHash: varchar('basic_auth_password_hash', { length: 512 }),
+    // AI insight suppression set by an operator (station-ai-insights.service.ts
+    // is the only writer): no new insight or worker action for the station
+    // while suppressed_at is set and suppressed_until is null or ahead.
+    aiInsightsSuppressedAt: timestamp('ai_insights_suppressed_at', { withTimezone: true }),
+    aiInsightsSuppressedUntil: timestamp('ai_insights_suppressed_until', { withTimezone: true }),
+    aiInsightsSuppressedBy: text('ai_insights_suppressed_by'),
+    aiInsightsSuppressedReason: varchar('ai_insights_suppressed_reason', { length: 500 }),
     metadata: jsonb('metadata'),
     latitude: varchar('latitude', { length: 20 }),
     longitude: varchar('longitude', { length: 20 }),
@@ -163,6 +188,9 @@ export const chargingStations = pgTable(
     index('idx_charging_stations_onboarding_status').on(table.onboardingStatus),
     index('idx_charging_stations_is_online').on(table.isOnline),
     index('idx_charging_stations_is_simulator').on(table.isSimulator),
+    index('idx_charging_stations_is_conformance')
+      .on(table.id)
+      .where(sql`is_conformance`),
     index('idx_charging_stations_site_id').on(table.siteId),
     index('idx_charging_stations_vendor_id').on(table.vendorId),
   ],
@@ -179,6 +207,10 @@ export const evses = pgTable(
       .references(() => chargingStations.id, { onDelete: 'cascade' }),
     evseId: integer('evse_id').notNull(),
     autoCreated: boolean('auto_created').default(false).notNull(),
+    // Retired by an operator: hidden from drivers, roaming partners, new
+    // sessions and reservations, the derived status and uptime, with its
+    // history kept (station-evse-retire.ts). Null while in service.
+    retiredAt: timestamp('retired_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -206,6 +238,9 @@ export const connectors = pgTable(
     maxPowerKw: numeric('max_power_kw'),
     maxCurrentAmps: integer('max_current_amps'),
     autoCreated: boolean('auto_created').default(false).notNull(),
+    // Retired by an operator, like evses.retired_at; a connector of a retired
+    // EVSE is out of service too. Null while in service.
+    retiredAt: timestamp('retired_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

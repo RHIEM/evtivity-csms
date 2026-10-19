@@ -52,13 +52,18 @@ function makeChain(): Record<string, unknown> {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: {
     select: vi.fn(() => makeChain()),
     selectDistinct: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
     update: vi.fn(() => makeChain()),
     delete: vi.fn(() => makeChain()),
+    // The transaction runs on the same mocked db.
+    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn((await import('@evtivity/database')).db),
+    ),
   },
   firmwareCampaigns: { id: 'fc.id', createdAt: 'fc.created_at', status: 'fc.status' },
   firmwareCampaignStatusEnum: { enumValues: ['draft', 'active', 'completed', 'cancelled'] },
@@ -221,6 +226,7 @@ describe('firmware campaign routes (cov2)', () => {
       expect(rec.where).toContainEqual({ inArray: ['sites.id', ['sit_1', 'sit_2']] });
       expect(rec.where).toContainEqual({
         and: [
+          { conformancePredicate: 'isOperatorStation' },
           { eq: ['st.site_id', 'sit_1'] },
           { eq: ['st.vendor_id', 'vnd_1'] },
           { eq: ['st.model', 'Terra AC'] },
@@ -282,6 +288,7 @@ describe('firmware campaign routes (cov2)', () => {
       expect(res.statusCode).toBe(200);
       expect(rec.where).toContainEqual({
         and: [
+          { conformancePredicate: 'isOperatorStation' },
           { eq: ['st.site_id', 'sit_1'] },
           { eq: ['st.vendor_id', 'vnd_1'] },
           { eq: ['st.model', 'Terra AC'] },
@@ -301,7 +308,9 @@ describe('firmware campaign routes (cov2)', () => {
         headers: auth,
       });
       expect(res.statusCode).toBe(200);
-      expect(rec.where[1]).toEqual({ and: [{ eq: ['st.is_online', false] }] });
+      expect(rec.where[1]).toEqual({
+        and: [{ conformancePredicate: 'isOperatorStation' }, { eq: ['st.is_online', false] }],
+      });
     });
 
     it('returns an empty page for an operator with no sites', async () => {
@@ -347,6 +356,7 @@ describe('firmware campaign routes (cov2)', () => {
       expect(res.statusCode).toBe(200);
       expect(rec.where).toContainEqual({
         and: [
+          { conformancePredicate: 'isOperatorStation' },
           { eq: ['st.site_id', 'sit_1'] },
           { eq: ['st.vendor_id', 'vnd_1'] },
           { eq: ['st.model', 'Terra AC'] },

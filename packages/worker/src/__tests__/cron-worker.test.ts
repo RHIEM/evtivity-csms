@@ -99,9 +99,11 @@ const handlerMocks = {
   stationWatchPruneHandler: vi.fn().mockResolvedValue(undefined),
   maintenanceSchedulerHandler: vi.fn().mockResolvedValue(undefined),
   ocpiLocationSyncHandler: vi.fn().mockResolvedValue(undefined),
+  driverTokenExpiryHandler: vi.fn().mockResolvedValue(undefined),
   payoutAccountSyncHandler: vi.fn().mockResolvedValue(undefined),
   processVersionWatchHandler: vi.fn().mockResolvedValue(undefined),
   stationOfflineSweepHandler: vi.fn().mockResolvedValue(undefined),
+  conformanceStationSweepHandler: vi.fn().mockResolvedValue(undefined),
   fleetInvoiceRunHandler: vi.fn().mockResolvedValue(undefined),
   aiRetentionPruneHandler: vi.fn().mockResolvedValue(undefined),
   aiNetworkSummaryHandler: vi.fn().mockResolvedValue(undefined),
@@ -179,11 +181,18 @@ vi.mock('../handlers/maintenance-scheduler.js', () => ({
 vi.mock('../handlers/ocpi-location-sync.js', () => ({
   ocpiLocationSyncHandler: (...a: unknown[]) => handlerMocks.ocpiLocationSyncHandler(...a),
 }));
+vi.mock('../handlers/driver-token-expiry.js', () => ({
+  driverTokenExpiryHandler: (...a: unknown[]) => handlerMocks.driverTokenExpiryHandler(...a),
+}));
 vi.mock('../handlers/payout-account-sync.js', () => ({
   payoutAccountSyncHandler: (...a: unknown[]) => handlerMocks.payoutAccountSyncHandler(...a),
 }));
 vi.mock('../handlers/process-version-watch.js', () => ({
   processVersionWatchHandler: (...a: unknown[]) => handlerMocks.processVersionWatchHandler(...a),
+}));
+vi.mock('../handlers/conformance-station-sweep.js', () => ({
+  conformanceStationSweepHandler: (...a: unknown[]) =>
+    handlerMocks.conformanceStationSweepHandler(...a),
 }));
 vi.mock('../handlers/station-offline-sweep.js', () => ({
   stationOfflineSweepHandler: (...a: unknown[]) => handlerMocks.stationOfflineSweepHandler(...a),
@@ -359,6 +368,7 @@ describe('cron-worker processor dispatch', () => {
       ['payout-account-sync', 'payoutAccountSyncHandler'],
       ['process-version-watch', 'processVersionWatchHandler'],
       ['station-offline-sweep', 'stationOfflineSweepHandler'],
+      ['conformance-station-sweep', 'conformanceStationSweepHandler'],
       ['fleet-invoice-run', 'fleetInvoiceRunHandler'],
       ['ai-retention-prune', 'aiRetentionPruneHandler'],
       ['ai-network-summary', 'aiNetworkSummaryHandler'],

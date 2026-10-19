@@ -45,7 +45,8 @@ export const COMMON_MEASURANDS = [
 ];
 
 interface MeterValuesTableProps {
-  queryKey: string;
+  /** Query key prefix, such as ['sessions', id, 'meter-values']: live events invalidate it. */
+  queryKey: string | readonly unknown[];
   url: string;
   description: string;
 }
@@ -86,7 +87,7 @@ export function MeterValuesTable({
               setMeasurandFilter(e.target.value);
               setPage(1);
             }}
-            className="hidden h-9 w-64 md:block"
+            className="hidden w-64 md:block"
           >
             <option value="">{t('sessions.meterValueFilterMeasurand')}</option>
             {COMMON_MEASURANDS.map((m) => (
@@ -103,7 +104,7 @@ export function MeterValuesTable({
                 setMeasurandFilter(e.target.value);
                 setPage(1);
               }}
-              className="h-9 w-64"
+              className="w-64"
             >
               <option value="">{t('sessions.meterValueFilterMeasurand')}</option>
               {COMMON_MEASURANDS.map((m) => (

@@ -226,6 +226,7 @@ export {
 export type { ReconciliationDiscrepancy, ReconciliationResult } from './reconciliation.js';
 export {
   continueDriverMethodSetup,
+  eraseDriverMethods,
   listDriverMethods,
   removeDriverMethod,
   saveDriverMethod,
@@ -247,9 +248,11 @@ export {
   continueGuestHold,
   expireGuestSessions,
   failExhaustedGuestCapture,
+  failGuestSessionOfFaultedSession,
   GUEST_REFERENCE_PREFIX,
   guestHoldTerms,
   handleGuestSessionEvent,
+  linkGuestSessionToCharging,
   rollbackGuestStart,
 } from './guest-payments.js';
 export type {
@@ -258,6 +261,8 @@ export type {
   GuestEventDeps,
   GuestHoldInput,
   GuestHoldOutcome,
+  GuestLinkInput,
+  GuestLinkResult,
   GuestSessionEvent,
   GuestStartClaim,
 } from './guest-payments.js';

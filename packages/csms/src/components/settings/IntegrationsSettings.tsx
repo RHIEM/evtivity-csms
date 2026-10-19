@@ -4,6 +4,7 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTab } from '@/hooks/use-tab';
+import { AutochargeSettings } from '@/components/settings/AutochargeSettings';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Send, ChevronDown } from 'lucide-react';
 import { SaveButton } from '@/components/save-button';
@@ -55,6 +56,8 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const [supportEnabled, setSupportEnabled] = useState(true);
   const [fleetEnabled, setFleetEnabled] = useState(true);
   const [guestChargingEnabled, setGuestChargingEnabled] = useState(true);
+  const [guestStartsPerIp, setGuestStartsPerIp] = useState('30');
+  const [guestDeclinesPerIp, setGuestDeclinesPerIp] = useState('5');
 
   // Idling and session
   const [idlingGracePeriod, setIdlingGracePeriod] = useState('30');
@@ -152,6 +155,10 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setSupportEnabled(settings['support.enabled'] !== false);
     setFleetEnabled(settings['fleet.enabled'] !== false);
     setGuestChargingEnabled(settings['guest.enabled'] !== false);
+    const gsl = settings['guest.startsPerIpPerHour'];
+    setGuestStartsPerIp(typeof gsl === 'number' ? String(gsl) : '30');
+    const gdl = settings['guest.declinesPerIpPerHour'];
+    setGuestDeclinesPerIp(typeof gdl === 'number' ? String(gdl) : '5');
     const gp = settings['idling.gracePeriodMinutes'];
     setIdlingGracePeriod(gp != null ? Number(gp).toString() : '30');
     const sst = settings['session.staleTimeoutHours'];
@@ -311,6 +318,16 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     },
   });
 
+  const guestLimitsMutation = useMutation({
+    mutationFn: async (limits: { starts: number; declines: number }) => {
+      await api.put('/v1/settings/guest.startsPerIpPerHour', { value: limits.starts });
+      await api.put('/v1/settings/guest.declinesPerIpPerHour', { value: limits.declines });
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   const idlingGracePeriodMutation = useMutation({
     mutationFn: (minutes: number) =>
       api.put('/v1/settings/idling.gracePeriodMinutes', { value: minutes }),
@@ -409,6 +426,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
         <TabsTrigger value="ocppDefaults">{t('settings.ocppDefaults')}</TabsTrigger>
         <TabsTrigger value="roaming">{t('settings.roaming')}</TabsTrigger>
         <TabsTrigger value="pnc">{t('settings.pnc')}</TabsTrigger>
+        <TabsTrigger value="autocharge">{t('settings.autocharge')}</TabsTrigger>
         <TabsTrigger value="reservation">{t('settings.reservation')}</TabsTrigger>
         <TabsTrigger value="support">{t('settings.support')}</TabsTrigger>
         <TabsTrigger value="fleet">{t('settings.fleet')}</TabsTrigger>
@@ -697,7 +715,6 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                       onChange={(e) => {
                         setPncProvider(e.target.value);
                       }}
-                      className="h-9"
                     >
                       <option value="manual">{t('settings.pncProviderManual')}</option>
                       <option value="hubject">{t('settings.pncProviderHubject')}</option>
@@ -966,6 +983,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           </CardContent>
         </Card>
       </TabsContent>
+      <TabsContent value="autocharge" className="mt-4">
+        <AutochargeSettings settings={settings} />
+      </TabsContent>
       <TabsContent value="guest" className="mt-4">
         <Card>
           <CardHeader>
@@ -989,6 +1009,66 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                 }}
                 disabled={guestChargingMutation.isPending}
               />
+            </div>
+            <div className="mt-4 space-y-4">
+              <p className="text-sm text-muted-foreground">
+                {t('settings.guestLimitsDescription')}
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="guest-starts-per-ip">
+                    {t('settings.guestStartsPerIpPerHour')}
+                  </Label>
+                  <Input
+                    id="guest-starts-per-ip"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    step={1}
+                    value={guestStartsPerIp}
+                    onChange={(e) => {
+                      setGuestStartsPerIp(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.guestStartsPerIpPerHourHelp')}
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="guest-declines-per-ip">
+                    {t('settings.guestDeclinesPerIpPerHour')}
+                  </Label>
+                  <Input
+                    id="guest-declines-per-ip"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    step={1}
+                    value={guestDeclinesPerIp}
+                    onChange={(e) => {
+                      setGuestDeclinesPerIp(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.guestDeclinesPerIpPerHourHelp')}
+                  </p>
+                </div>
+              </div>
+              <SaveButton
+                isPending={guestLimitsMutation.isPending}
+                type="button"
+                onClick={() => {
+                  const starts = Number(guestStartsPerIp);
+                  const declines = Number(guestDeclinesPerIp);
+                  const valid = (n: number): boolean => Number.isInteger(n) && n >= 0 && n <= 10000;
+                  if (valid(starts) && valid(declines)) {
+                    guestLimitsMutation.mutate({ starts, declines });
+                  }
+                }}
+              />
+              {guestLimitsMutation.isSuccess && (
+                <p className="text-sm text-success">{t('common.saved')}</p>
+              )}
             </div>
           </CardContent>
         </Card>

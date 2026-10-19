@@ -2,7 +2,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { sql, and, gte, lte, eq, count, type AnyColumn, type SQL } from 'drizzle-orm';
-import { db, chargingSessions, chargingStations, sites, settings } from '@evtivity/database';
+import {
+  db,
+  chargingSessions,
+  chargingStations,
+  sites,
+  settings,
+  inOperatorStation,
+  isOperatorStation,
+  operatorStationSql,
+} from '@evtivity/database';
 import { buildCsv } from './csv-builder.js';
 import { buildXlsx } from './xlsx-builder.js';
 import { PdfReportBuilder } from './pdf-builder.js';
@@ -88,7 +97,13 @@ async function querySiteUtilization(
   totalHours: number,
   noSite: string,
 ): Promise<SiteUtilization[]> {
-  const sessionJoinConditions = [eq(chargingSessions.stationId, chargingStations.id)];
+  // Session hours of the sessions that happened at the site (site_id, kept
+  // when a station moves) over the stations the site has now. Conformance
+  // test stations and their sessions are left out.
+  const sessionJoinConditions = [
+    eq(chargingSessions.siteId, sites.id),
+    inOperatorStation(chargingSessions.stationId),
+  ];
   if (filters.dateFrom) {
     sessionJoinConditions.push(gte(chargingSessions.startedAt, new Date(filters.dateFrom)));
   }
@@ -101,11 +116,10 @@ async function querySiteUtilization(
   const rows = await db
     .select({
       siteName: sql<string>`coalesce(${sites.name}, ${noSite})`,
-      stationCount: sql<number>`count(distinct ${chargingStations.id})`,
+      stationCount: sql<number>`(select count(*)::int from ${chargingStations} st where st.site_id = ${sites.id} and ${sql.raw(operatorStationSql('st'))})`,
       sessionHours: sql<number>`coalesce(sum(extract(epoch from (coalesce(${chargingSessions.endedAt}, now()) - ${chargingSessions.startedAt})) / 3600), 0)`,
     })
     .from(sites)
-    .leftJoin(chargingStations, eq(chargingStations.siteId, sites.id))
     .leftJoin(chargingSessions, and(...sessionJoinConditions))
     .where(siteConditions(filters, sites.id))
     .groupBy(sites.id, sites.name)
@@ -142,12 +156,13 @@ async function queryStationUtilization(
       stationName: sql<string>`coalesce(${chargingStations.stationId}, ${chargingStations.id}::text)`,
       siteName: sql<string>`coalesce(${sites.name}, ${noSite})`,
       sessionHours: sql<number>`coalesce(sum(extract(epoch from (coalesce(${chargingSessions.endedAt}, now()) - ${chargingSessions.startedAt})) / 3600), 0)`,
-      sessionCount: count(),
+      // count(column): a station without sessions has one joined row of nulls.
+      sessionCount: count(chargingSessions.id),
     })
     .from(chargingStations)
     .leftJoin(sites, eq(chargingStations.siteId, sites.id))
     .leftJoin(chargingSessions, and(...sessionJoinConditions))
-    .where(siteConditions(filters, chargingStations.siteId))
+    .where(and(isOperatorStation(), siteConditions(filters, chargingStations.siteId)))
     .groupBy(chargingStations.id, chargingStations.stationId, sites.name)
     .orderBy(sql`3 desc`);
 
@@ -161,7 +176,8 @@ async function queryStationUtilization(
 }
 
 async function queryPeakUsage(filters: Filters, tz: string): Promise<PeakHour[]> {
-  const conditions: SQL[] = [];
+  // Sessions of conformance test stations are never reported.
+  const conditions: SQL[] = [inOperatorStation(chargingSessions.stationId)];
   if (filters.dateFrom) {
     conditions.push(gte(chargingSessions.startedAt, new Date(filters.dateFrom)));
   }
@@ -170,8 +186,9 @@ async function queryPeakUsage(filters: Filters, tz: string): Promise<PeakHour[]>
     to.setHours(23, 59, 59, 999);
     conditions.push(lte(chargingSessions.startedAt, to));
   }
-  // Peak usage honours the site filter and the site scope like the other sheets.
-  const atSites = siteConditions(filters, chargingStations.siteId);
+  // Peak usage honours the site filter and the site scope like the other
+  // sheets, by the site each session happened at.
+  const atSites = siteConditions(filters, chargingSessions.siteId);
   if (atSites != null) conditions.push(atSites);
 
   const rows = await db
@@ -181,7 +198,6 @@ async function queryPeakUsage(filters: Filters, tz: string): Promise<PeakHour[]>
       count: count(),
     })
     .from(chargingSessions)
-    .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .groupBy(sql`1`, sql`2`)
     .orderBy(sql`3 desc`);

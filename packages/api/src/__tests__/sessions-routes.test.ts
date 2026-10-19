@@ -21,6 +21,7 @@ function makeChain() {
     'orderBy',
     'limit',
     'offset',
+    '$dynamic',
     'innerJoin',
     'leftJoin',
     'groupBy',
@@ -55,6 +56,12 @@ const rebill = vi.hoisted(() => ({
   getSessionRebillState: vi.fn(),
 }));
 
+const billingMove = vi.hoisted(() => ({ moveSessionsBilling: vi.fn() }));
+vi.mock('../services/session-billing-recipient.service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/session-billing-recipient.service.js')>()),
+  moveSessionsBilling: billingMove.moveSessionsBilling,
+}));
+
 vi.mock('../services/session-rebill.service.js', async () => {
   const { AppError } = await import('@evtivity/lib');
   class SessionRebillRefusedError extends AppError {
@@ -70,6 +77,23 @@ vi.mock('../services/session-rebill.service.js', async () => {
     SessionRebillRefusedError,
   };
 });
+
+const sessionEnd = vi.hoisted(() => ({
+  requestSessionEnd: vi.fn(),
+  writeAudit: vi.fn(),
+}));
+
+const payments = vi.hoisted(() => ({
+  activePaymentProvider: vi.fn(),
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: payments.activePaymentProvider,
+}));
+
+vi.mock('../lib/session-end.js', () => ({
+  requestSessionEnd: sessionEnd.requestSessionEnd,
+}));
 
 vi.mock('../middleware/rbac.js', () => ({
   authorize: (...permissions: string[]) => {
@@ -88,7 +112,8 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
     select: vi.fn(() => makeChain()),
@@ -127,6 +152,8 @@ vi.mock('@evtivity/database', () => ({
   },
   SESSION_REBILL_STATUSES: ['in_progress', 'billed', 'manual'] as const,
   SESSION_END_FAILED_REASON: 'EndRequestFailed',
+  sessionAuditLog: {},
+  writeAudit: sessionEnd.writeAudit,
 }));
 
 vi.mock('drizzle-orm', () => {
@@ -213,6 +240,12 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: 'USD',
           freeVend: false,
+          vehicleId: null,
+          vehicleName: null,
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          vehicleIdSource: null,
+          autocharge: false,
           billingMode: null,
           billingFleetId: null,
           billingFleetName: null,
@@ -223,10 +256,9 @@ describe('Session routes', () => {
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
-          _total: 1,
         },
       ];
-      setupDbResults(sessions);
+      setupDbResults(sessions, [{ count: 1 }]);
 
       const response = await app.inject({
         method: 'GET',
@@ -243,6 +275,19 @@ describe('Session routes', () => {
       expect(body.data[0].siteName).toBe('Site A');
       expect(body.data[0].transactionId).toBe('txn-001');
       expect(body.data[0].status).toBe('active');
+    });
+
+    it('never lists a session at a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.inOperatorStation).mockClear();
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/sessions',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.inOperatorStation)).toHaveBeenCalled();
     });
 
     it('returns empty list when no sessions exist', async () => {
@@ -324,6 +369,12 @@ describe('Session routes', () => {
           finalCostCents: 750,
           currency: 'USD',
           freeVend: false,
+          vehicleId: null,
+          vehicleName: null,
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          vehicleIdSource: null,
+          autocharge: false,
           billingMode: null,
           billingFleetId: null,
           billingFleetName: null,
@@ -334,7 +385,6 @@ describe('Session routes', () => {
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
-          _total: 25,
         },
         {
           id: 'ses_000000000003',
@@ -353,6 +403,12 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: null,
           freeVend: false,
+          vehicleId: null,
+          vehicleName: null,
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          vehicleIdSource: null,
+          autocharge: false,
           billingMode: null,
           billingFleetId: null,
           billingFleetName: null,
@@ -363,10 +419,9 @@ describe('Session routes', () => {
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-02T08:00:00Z',
-          _total: 25,
         },
       ];
-      setupDbResults(sessions);
+      setupDbResults(sessions, [{ count: 25 }]);
 
       const response = await app.inject({
         method: 'GET',
@@ -436,6 +491,12 @@ describe('Session routes', () => {
           finalCostCents: 500,
           currency: 'EUR',
           freeVend: false,
+          vehicleId: null,
+          vehicleName: null,
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          vehicleIdSource: null,
+          autocharge: false,
           billingMode: null,
           billingFleetId: null,
           billingFleetName: null,
@@ -446,10 +507,9 @@ describe('Session routes', () => {
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
-          _total: 3,
         },
       ];
-      setupDbResults(sessions);
+      setupDbResults(sessions, [{ count: 3 }]);
 
       const response = await app.inject({
         method: 'GET',
@@ -484,6 +544,12 @@ describe('Session routes', () => {
           finalCostCents: null,
           currency: 'USD',
           freeVend: false,
+          vehicleId: null,
+          vehicleName: null,
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          vehicleIdSource: null,
+          autocharge: false,
           billingMode: null,
           billingFleetId: null,
           billingFleetName: null,
@@ -494,10 +560,9 @@ describe('Session routes', () => {
           co2AvoidedKg: null,
           electricityCostCents: null,
           createdAt: '2024-06-01T10:00:00Z',
-          _total: 1,
         },
       ];
-      setupDbResults(sessions);
+      setupDbResults(sessions, [{ count: 1 }]);
 
       const response = await app.inject({
         method: 'GET',
@@ -528,6 +593,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: 'Site A',
         siteId: null,
         driverId: null,
@@ -544,6 +611,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: null,
         billingFleetId: null,
         billingFleetName: null,
@@ -594,6 +665,8 @@ describe('Session routes', () => {
       const body = response.json();
       expect(body.id).toBe(VALID_SESSION_ID);
       expect(body.transactionId).toBe('txn-001');
+      // The OCPP EVSE number the CSMS session page stops the session on.
+      expect(body.evseId).toBe(1);
       expect(body.status).toBe('completed');
       expect(body.finalCostCents).toBe(1000);
       expect(body.stationTariffId).toBe('evt-1');
@@ -601,9 +674,144 @@ describe('Session routes', () => {
       expect(body.stationCostDifferenceCents).toBe(10);
       expect(body.currency).toBe('USD');
       expect(body.paymentRecord).toBeNull();
+      // No driver and no guest checkout.
+      expect(body.noPaymentReason).toBe('anonymous');
       expect(body.rebillable).toBe(false);
       expect(body.rebillBlockedReason).toBe('status');
       expect(rebill.getSessionRebillState).not.toHaveBeenCalled();
+    });
+
+    /** A completed session row of the detail query without a payment record. */
+    const detailRow = {
+      id: VALID_SESSION_ID,
+      stationId: VALID_STATION_ID,
+      stationName: 'Station-01',
+      evseId: 1,
+      stationOnline: true,
+      siteName: 'Site A',
+      siteId: null,
+      driverId: null,
+      driverName: null,
+      transactionId: 'txn-001',
+      status: 'completed',
+      startedAt: '2024-06-01T10:00:00Z',
+      endedAt: '2024-06-01T11:00:00Z',
+      idleStartedAt: null,
+      energyDeliveredWh: '20000',
+      currentCostCents: null,
+      finalCostCents: 1000,
+      currency: 'USD',
+      stoppedReason: null,
+      reservationId: null,
+      freeVend: false,
+      vehicleIdValue: null,
+      vehicleIdType: null,
+      vehicleIdSource: null,
+      autocharge: false,
+      billingMode: null,
+      billingFleetId: null,
+      billingFleetName: null,
+      invoiceId: null,
+      invoiceStatus: null,
+      rebillStatus: null,
+      rebillClaimedAt: null,
+      stationTariffId: 'evt-1',
+      stationCostCents: 1010,
+      stationCostDifferenceCents: 10,
+      co2AvoidedKg: null,
+      electricityCostCents: null,
+      metadata: null,
+      tokenId: null,
+      tokenIdToken: null,
+      tokenType: null,
+      vehicleId: null,
+      vehicleMake: null,
+      vehicleModel: null,
+      vehicleYear: null,
+      paymentId: null,
+      paymentStatus: null,
+      paymentSource: null,
+      paymentCurrency: null,
+      preAuthAmountCents: null,
+      capturedAmountCents: null,
+      refundedAmountCents: null,
+      failureReason: null,
+      guestSessionToken: null,
+      guestEmail: null,
+      guestStatus: null,
+      guestPreAuthAmountCents: null,
+      guestProvider: null,
+      guestProviderPaymentId: null,
+      guestExpiresAt: null,
+      guestCreatedAt: null,
+    };
+
+    it('explains a card session without a payment record when payments are off', async () => {
+      payments.activePaymentProvider.mockResolvedValueOnce(null);
+      setupDbResults([
+        {
+          ...detailRow,
+          driverId: 'drv_000000000001',
+          status: 'completed',
+          finalCostCents: 359,
+          currentCostCents: 359,
+          currency: 'USD',
+          stoppedReason: 'EVDisconnected',
+          freeVend: false,
+          isRoaming: false,
+          billingMode: 'card',
+          tokenPrepaid: false,
+          paymentId: null,
+          guestSessionToken: null,
+        },
+      ]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.paymentRecord).toBeNull();
+      expect(body.noPaymentReason).toBe('payments_off');
+      expect(payments.activePaymentProvider).toHaveBeenCalledOnce();
+    });
+
+    it('returns a null reason and skips the provider check when a payment record exists', async () => {
+      payments.activePaymentProvider.mockClear();
+      setupDbResults([
+        {
+          ...detailRow,
+          driverId: 'drv_000000000001',
+          status: 'completed',
+          finalCostCents: 359,
+          currentCostCents: 359,
+          currency: 'USD',
+          freeVend: false,
+          isRoaming: false,
+          tokenPrepaid: false,
+          paymentId: 7,
+          paymentStatus: 'captured',
+          paymentSource: 'web_portal',
+          paymentCurrency: 'USD',
+          refundedAmountCents: 0,
+          guestSessionToken: null,
+        },
+      ]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.paymentRecord.id).toBe('7');
+      expect(body.noPaymentReason).toBeNull();
+      expect(payments.activePaymentProvider).not.toHaveBeenCalled();
     });
 
     it('returns the billing stamp, billing fleet and invoice of an account session', async () => {
@@ -611,6 +819,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: 'Site A',
         siteId: null,
         driverId: null,
@@ -627,6 +837,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: 'account',
         billingFleetId: 'flt_000000000001',
         billingFleetName: 'Acme',
@@ -688,6 +902,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: 'Site A',
         siteId: null,
         driverId: null,
@@ -704,6 +920,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: null,
         billingFleetId: null,
         billingFleetName: null,
@@ -772,6 +992,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: 'Site A',
         siteId: null,
         driverId: null,
@@ -788,6 +1010,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: null,
         billingFleetId: null,
         billingFleetName: null,
@@ -890,6 +1116,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: null,
         siteId: null,
         driverId: null,
@@ -906,6 +1134,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: null,
         billingFleetId: null,
         billingFleetName: null,
@@ -968,6 +1200,8 @@ describe('Session routes', () => {
         id: VALID_SESSION_ID,
         stationId: VALID_STATION_ID,
         stationName: 'Station-01',
+        evseId: 1,
+        stationOnline: true,
         siteName: null,
         siteId: null,
         driverId: null,
@@ -984,6 +1218,10 @@ describe('Session routes', () => {
         stoppedReason: null,
         reservationId: null,
         freeVend: false,
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        vehicleIdSource: null,
+        autocharge: false,
         billingMode: null,
         billingFleetId: null,
         billingFleetName: null,
@@ -1170,6 +1408,135 @@ describe('Session routes', () => {
     });
   });
 
+  describe('POST /v1/sessions/:id/end', () => {
+    beforeEach(() => {
+      sessionEnd.requestSessionEnd.mockReset();
+      sessionEnd.requestSessionEnd.mockResolvedValue(true);
+      sessionEnd.writeAudit.mockReset();
+      sessionEnd.writeAudit.mockResolvedValue(undefined);
+    });
+
+    const end = () =>
+      app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/end`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+    it('requires sessions:write', () => {
+      expect(rebill.authorizeCalls).toContainEqual(['sessions:write']);
+    });
+
+    it('returns 401 without token', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/sessions/${VALID_SESSION_ID}/end`,
+      });
+      expect(response.statusCode).toBe(401);
+      expect(sessionEnd.requestSessionEnd).not.toHaveBeenCalled();
+    });
+
+    it('ends an active session of an offline station without the station, and audits it', async () => {
+      setupDbResults([
+        {
+          siteId: 'sit_000000000001',
+          status: 'active',
+          transactionId: 'tx-1',
+          stationOnline: false,
+        },
+      ]);
+      const response = await end();
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ sessionId: VALID_SESSION_ID, transactionId: 'tx-1' });
+      expect(sessionEnd.requestSessionEnd).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'OperatorEnded',
+        expect.anything(),
+      );
+      expect(sessionEnd.writeAudit).toHaveBeenCalledTimes(1);
+      expect(sessionEnd.writeAudit.mock.calls[0]?.[1]).toMatchObject({
+        entityId: VALID_SESSION_ID,
+        action: 'stopped_by_csms',
+        actor: 'operator',
+        actorUserId: 'test-id',
+        before: { status: 'active' },
+        after: { action: 'EndSession', endRequestReason: 'OperatorEnded', stationOnline: false },
+      });
+    });
+
+    it('answers 404 for an unknown session', async () => {
+      setupDbResults([]);
+      const response = await end();
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SESSION_NOT_FOUND');
+      expect(sessionEnd.requestSessionEnd).not.toHaveBeenCalled();
+    });
+
+    it("answers 404 for another site's session", async () => {
+      const { getUserSiteIds } = await import('../lib/site-access.js');
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce(['sit_000000000002']);
+      setupDbResults([
+        {
+          siteId: 'sit_000000000001',
+          status: 'active',
+          transactionId: 'tx-1',
+          stationOnline: false,
+        },
+      ]);
+      const response = await end();
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SESSION_NOT_FOUND');
+      expect(sessionEnd.requestSessionEnd).not.toHaveBeenCalled();
+    });
+
+    it('answers 409 SESSION_NOT_ACTIVE for an ended session', async () => {
+      setupDbResults([
+        {
+          siteId: 'sit_000000000001',
+          status: 'completed',
+          transactionId: 'tx-1',
+          stationOnline: false,
+        },
+      ]);
+      const response = await end();
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('SESSION_NOT_ACTIVE');
+      expect(sessionEnd.requestSessionEnd).not.toHaveBeenCalled();
+      expect(sessionEnd.writeAudit).not.toHaveBeenCalled();
+    });
+
+    it('answers 409 STATION_ONLINE when the station is connected', async () => {
+      setupDbResults([
+        {
+          siteId: 'sit_000000000001',
+          status: 'active',
+          transactionId: 'tx-1',
+          stationOnline: true,
+        },
+      ]);
+      const response = await end();
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('STATION_ONLINE');
+      expect(sessionEnd.requestSessionEnd).not.toHaveBeenCalled();
+    });
+
+    it('answers 409 SESSION_NOT_ACTIVE without an audit when the session ended meanwhile (P5)', async () => {
+      sessionEnd.requestSessionEnd.mockResolvedValueOnce(false);
+      setupDbResults([
+        {
+          siteId: 'sit_000000000001',
+          status: 'active',
+          transactionId: 'tx-1',
+          stationOnline: false,
+        },
+      ]);
+      const response = await end();
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('SESSION_NOT_ACTIVE');
+      expect(sessionEnd.writeAudit).not.toHaveBeenCalled();
+    });
+  });
+
   describe('POST /v1/sessions/:id/rebill', () => {
     const result = {
       sessionId: VALID_SESSION_ID,
@@ -1254,6 +1621,83 @@ describe('Session routes', () => {
       });
       expect(response.statusCode).toBe(400);
       expect(rebill.rebillSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('PATCH /v1/sessions/:id/billing-recipient', () => {
+    function patch(body: Record<string, unknown>) {
+      return app.inject({
+        method: 'PATCH',
+        url: `/sessions/${VALID_SESSION_ID}/billing-recipient`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: body,
+      });
+    }
+
+    beforeEach(() => {
+      billingMove.moveSessionsBilling.mockReset();
+    });
+
+    it('moves the session to the member invoice', async () => {
+      billingMove.moveSessionsBilling.mockResolvedValueOnce([
+        {
+          sessionId: VALID_SESSION_ID,
+          outcome: 'moved',
+          driverId: 'd',
+          fleetId: 'f',
+          from: 'fleet',
+        },
+      ]);
+      const response = await patch({ recipient: 'member' });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        sessionId: VALID_SESSION_ID,
+        recipient: 'member',
+        memberBilled: true,
+        moved: true,
+      });
+      expect(billingMove.moveSessionsBilling).toHaveBeenCalledWith(
+        [VALID_SESSION_ID],
+        'member',
+        expect.objectContaining({ actor: expect.anything() }),
+      );
+    });
+
+    it('answers moved false for a session already billed to the recipient', async () => {
+      billingMove.moveSessionsBilling.mockResolvedValueOnce([
+        {
+          sessionId: VALID_SESSION_ID,
+          outcome: 'unchanged',
+          driverId: 'd',
+          fleetId: 'f',
+          from: 'fleet',
+        },
+      ]);
+      const response = await patch({ recipient: 'fleet' });
+      expect(response.json()).toMatchObject({ moved: false, memberBilled: false });
+    });
+
+    it.each([
+      ['invoiced', 409, 'SESSION_ALREADY_INVOICED'],
+      ['not_member', 409, 'DRIVER_NOT_FLEET_MEMBER'],
+      ['billing_off', 409, 'FLEET_ACCOUNT_BILLING_OFF'],
+      ['not_on_account', 409, 'SESSION_NOT_ON_ACCOUNT'],
+      ['not_found', 404, 'SESSION_NOT_FOUND'],
+    ])('refuses a %s session with %i %s', async (outcome, status, code) => {
+      billingMove.moveSessionsBilling.mockResolvedValueOnce([
+        { sessionId: VALID_SESSION_ID, outcome, driverId: null, fleetId: null, from: null },
+      ]);
+      const response = await patch({ recipient: 'member' });
+      expect(response.statusCode).toBe(status);
+      expect(response.json().code).toBe(code);
+    });
+
+    it('answers 404 to a site-restricted user and 400 to an unknown recipient', async () => {
+      const { getUserSiteIds } = await import('../lib/site-access.js');
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce(['sit_1']);
+      expect((await patch({ recipient: 'member' })).statusCode).toBe(404);
+      expect((await patch({ recipient: 'driver' })).statusCode).toBe(400);
+      expect(billingMove.moveSessionsBilling).not.toHaveBeenCalled();
     });
   });
 });

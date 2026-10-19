@@ -3,6 +3,7 @@
 
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router';
 import { MessageSquare, RefreshCw, ThumbsDown, ThumbsUp, X } from 'lucide-react';
 import {
   INSIGHT_FEEDBACK_REASON_MAX_LENGTH,
@@ -22,6 +23,7 @@ import { useHasPermission } from '@/lib/auth';
 import { insightStatusVariant } from '@/lib/status-variants';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { formatDateTime, formatRelativeTime, useUserTimezone } from '@/lib/timezone';
+import { formatDurationMinutes } from '@/lib/formatting';
 import { cn } from '@/lib/utils';
 import { aiRequestErrorText } from '../ai-error-text';
 import { InsightActionSection } from './InsightAction';
@@ -61,8 +63,10 @@ interface InsightCardProps {
  * translation note, the helpful count and the actions. No provider or model
  * name (D14). Helpful and Wrong are one vote per user: the chosen thumb is
  * pressed (`aria-pressed`) and pressing it again removes the vote. Wrong
- * opens an optional note (stored only, never sent to a model) with
- * Regenerate and Dismiss right there.
+ * opens an optional note (shown on the insight page; sent to the model only
+ * when its author regenerates) with Regenerate and Dismiss right there;
+ * Regenerate saves a typed note first. A regeneration that read its
+ * requester's note says so under the summary.
  * Analyzing shows a skeleton of the same shape; skipped, failed or out of
  * date shows one muted line with Regenerate where allowed.
  */
@@ -172,8 +176,29 @@ export function InsightCard({
       },
     );
   };
+  // Regenerate from the Wrong panel saves a typed note first, so the new
+  // analysis reads it (the server sends only the requester's own note).
+  const regenerateWithNote = (): void => {
+    if (reason.trim() === '' || reasonSaved) {
+      regenerate.mutate({ id: insight.id });
+      return;
+    }
+    feedback.mutate(
+      { id: insight.id, body: { helpful: false, reason } },
+      {
+        onSuccess: () => {
+          setReasonSaved(true);
+          regenerate.mutate({ id: insight.id });
+        },
+      },
+    );
+  };
   const steps = stepsBesideAction(insight.fixes, insight.action);
-  const showWrongPanel = canWrite && wrongOpen && mine !== true && !pending && !brief;
+  const stationOffline = insight.scope.stationOffline ?? null;
+  const concurrent = insight.scope.concurrentSession ?? null;
+  // A stored Wrong vote keeps the panel open on a later visit, so Regenerate stays reachable.
+  const showWrongPanel =
+    canWrite && (wrongOpen || mine === false) && mine !== true && !pending && !brief;
 
   return (
     <Card
@@ -250,6 +275,13 @@ export function InsightCard({
               {summary}
             </p>
           )}
+          {insight.feedbackUsed && (
+            <p className="text-xs text-muted-foreground" data-testid="ai-insight-feedback-used">
+              {insight.feedbackFromYou === true
+                ? t('aiInsights.feedback.usedYours')
+                : t('aiInsights.feedback.usedOther')}
+            </p>
+          )}
           {category != null && (
             <DescriptionList>
               <DescriptionItem
@@ -263,7 +295,7 @@ export function InsightCard({
         </>
       )}
 
-      {!pending && (insight.action != null || steps.length > 0) && (
+      {!pending && (insight.action != null || steps.length > 0 || concurrent != null) && (
         // One Suggested Fix: the executable action first, then the other steps as plain text.
         <section
           aria-label={t('aiInsights.fixesLabel')}
@@ -286,6 +318,51 @@ export function InsightCard({
               </span>
             )}
           </div>
+          {stationOffline != null && insight.stationId != null && (
+            // A stuck session at an offline station leads with getting it back online.
+            <div className="space-y-1" data-testid="ai-insight-station-offline">
+              <p className="wrap-anywhere">
+                {t('aiInsights.stationOffline.advice', {
+                  station: insight.stationName ?? insight.stationId,
+                  duration: formatDurationMinutes(
+                    Math.max(
+                      0,
+                      Math.floor((Date.now() - Date.parse(stationOffline.since)) / 60_000),
+                    ),
+                  ),
+                  since: formatDateTime(stationOffline.since, timezone),
+                })}
+              </p>
+              <Link
+                to={`/stations/${insight.stationId}?tab=security`}
+                className="text-link hover:underline text-sm"
+                data-testid="ai-insight-connection-history"
+              >
+                {t('aiInsights.stationOffline.connectionHistory')}
+              </Link>
+            </div>
+          )}
+          {concurrent != null && (
+            // A token refused for a session it already runs: what to do depends on that session.
+            <div className="space-y-1" data-testid="ai-insight-concurrent-session">
+              <p className="wrap-anywhere">
+                {t(`aiInsights.concurrentSession.${concurrent.step}`, {
+                  station: concurrent.station,
+                  since:
+                    concurrent.startedAt != null
+                      ? formatDateTime(concurrent.startedAt, timezone)
+                      : t('common.na'),
+                })}
+              </p>
+              <Link
+                to={`/sessions/${concurrent.sessionId}`}
+                className="text-link hover:underline text-sm"
+                data-testid="ai-insight-concurrent-session-link"
+              >
+                {t('aiInsights.concurrentSession.viewSession')}
+              </Link>
+            </div>
+          )}
           {steps.length > 0 && (
             <ul className="list-disc space-y-1 pl-5" data-testid="ai-insight-fixes">
               {steps.map((fix) => (
@@ -341,9 +418,7 @@ export function InsightCard({
                 variant="outline"
                 disabled={busy}
                 data-testid="ai-insight-wrong-regenerate"
-                onClick={() => {
-                  regenerate.mutate({ id: insight.id });
-                }}
+                onClick={regenerateWithNote}
               >
                 {regenerate.isPending ? (
                   <Spinner className="h-4 w-4" />

@@ -65,7 +65,7 @@ function selectResolving(rows: unknown[]): { from: ReturnType<typeof vi.fn> } {
     then: (resolve: (v: unknown) => unknown): unknown => resolve(rows),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -76,7 +76,7 @@ function selectThrowing(err: unknown): { from: ReturnType<typeof vi.fn> } {
       reject(err),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -197,7 +197,11 @@ describe('OCPP 1.6 StartTransaction handler', () => {
       expect(claim.raw).toContain("pending.status = 'active'");
       expect(claim.raw).toContain('NOT EXISTS');
       expect(claim.raw).toContain('ORDER BY pending.started_at DESC');
-      expect(claim.values).toEqual(['sta_1', 2]);
+      // Only for the idTag the portal sent: the driver id, or the token of the
+      // held reservation (1.6 idTag compares without case).
+      expect(claim.raw).toContain('lower(pending.driver_id) = lower(?)');
+      expect(claim.raw).toContain('lower(dt.id_token) = lower(?)');
+      expect(claim.values).toEqual(['sta_1', 2, 'TAG-CLAIM', 'TAG-CLAIM']);
     });
 
     it('answers a resent StartTransaction with the transaction id it already has', async () => {
@@ -380,12 +384,15 @@ describe('OCPP 1.6 StartTransaction handler', () => {
         .mockReturnValueOnce(selectResolving([prepaidRow(5000)]))
         .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
         .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
-      const { ctx } = makeCtx(basePayload('PREPAID-TAG'));
+      const { ctx, publishMock } = makeCtx(basePayload('PREPAID-TAG'));
 
       const response = await handleStartTransaction(ctx);
       const info = response.idTagInfo as Record<string, unknown>;
 
       expect(info['status']).toBe('Accepted');
+      // An accepted start carries no refusal: the payment gate stops at once.
+      const event = publishMock.mock.calls[0]?.[0] as { payload: Record<string, unknown> };
+      expect(event.payload).not.toHaveProperty('startRefusal');
       expect(Math.abs(Date.parse(info['expiryDate'] as string) - Date.now())).toBeLessThan(5_000);
     });
 
@@ -394,12 +401,19 @@ describe('OCPP 1.6 StartTransaction handler', () => {
         .mockReturnValueOnce(selectResolving([prepaidRow(-10)]))
         .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
         .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
-      const { ctx } = makeCtx(basePayload('NOCREDIT-TAG'));
+      const { ctx, publishMock } = makeCtx(basePayload('NOCREDIT-TAG'));
 
       const response = await handleStartTransaction(ctx);
 
       expect((response.idTagInfo as Record<string, unknown>)['status']).toBe('Blocked');
       expect(lastAttemptRow()).toMatchObject({ outcome: 'no_credit', reason: 'no_credit' });
+      // The Started event carries the refusal, so the payment gate waits for
+      // the station to end the transaction before it stops it.
+      expect(publishMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({ eventType: 'Started', startRefusal: 'no_credit' }),
+        }),
+      );
     });
   });
 

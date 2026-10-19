@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, lte, isNull } from 'drizzle-orm';
+import { eq, and, lte, isNull, sql } from 'drizzle-orm';
 import {
   db,
   client,
@@ -12,10 +12,12 @@ import {
   closeSegmentsAt,
   faultUnbilledSession,
   sessionIdleMinutesAt,
+  publishOcpiSessionPush,
   writeCsmsSessionAudit,
+  STALE_CLEANUP_IN_TRANSACTION_STATUSES,
 } from '@evtivity/database';
 import { publishOcppCommand } from '@evtivity/lib';
-import { cancelOpenSessionHold } from '@evtivity/payments';
+import { cancelOpenSessionHold, failGuestSessionOfFaultedSession } from '@evtivity/payments';
 import type { Logger } from 'pino';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { paymentContext } from '../lib/payments.js';
@@ -28,8 +30,17 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
   }
 
   const cutoff = new Date(Date.now() - timeoutHours * 60 * 60 * 1000);
+  const cutoffIso = cutoff.toISOString();
+  const inTransactionStatuses = sql.join(
+    STALE_CLEANUP_IN_TRANSACTION_STATUSES.map((status) => sql`${status}`),
+    sql`, `,
+  );
 
-  // Find active sessions not updated since the cutoff
+  // Find active sessions not updated since the cutoff. A session whose station
+  // is online and still reports the transaction (its connector in a
+  // transaction status, or a transaction event received after the cutoff) is
+  // not stale (owner decision 2026-10-14): only sessions on an offline or
+  // silent station are faulted.
   const staleSessions = await db
     .select({
       id: chargingSessions.id,
@@ -46,6 +57,19 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       stationIsOnline: chargingStations.isOnline,
       stationOcppId: chargingStations.stationId,
       ocppProtocol: chargingStations.ocppProtocol,
+      stillReported: sql<boolean>`(${chargingStations.isOnline} AND (
+        EXISTS (
+          SELECT 1 FROM connectors c
+          WHERE (c.id = ${chargingSessions.connectorId}
+              OR (${chargingSessions.connectorId} IS NULL AND c.evse_id = ${chargingSessions.evseId}))
+            AND c.status::text IN (${inTransactionStatuses})
+        )
+        OR EXISTS (
+          SELECT 1 FROM transaction_events te
+          WHERE te.session_id = ${chargingSessions.id}
+            AND te.created_at > ${cutoffIso}::timestamptz
+        )
+      ))`,
     })
     .from(chargingSessions)
     .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
@@ -66,6 +90,18 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
   log.info({ count: staleSessions.length, timeoutHours }, 'Found stale sessions to clean up');
 
   for (const session of staleSessions) {
+    if (session.stillReported) {
+      log.info(
+        {
+          sessionId: session.id,
+          stationId: session.stationId,
+          transactionId: session.transactionId,
+          lastUpdate: session.updatedAt.toISOString(),
+        },
+        'Stale session skipped: the online station still reports its transaction',
+      );
+      continue;
+    }
     try {
       // Use the last updated_at as the session end time
       const endedAt = session.updatedAt;
@@ -79,6 +115,9 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
         sessionId: session.id,
         reason: 'StaleSession',
         endedAt,
+        // A meter value or event that refreshed the session after the list
+        // was read keeps it running.
+        notUpdatedSince: cutoff,
       });
 
       // The tariff segments end at the last update, so the segment trail
@@ -110,6 +149,12 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
             'Failed to cancel the hold of a stale session',
           );
         }
+        // A guest session of the faulted session fails with it, so the guest
+        // page stops showing it as charging (fail-open, logged inside).
+        await failGuestSessionOfFaultedSession(
+          session.id,
+          paymentContext(log, 'stale-session-cleanup'),
+        );
       }
 
       // Audit the reservation linkage so the reservation timeline shows why
@@ -156,6 +201,9 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
           );
         }
       }
+
+      // A roaming session's partner gets the INVALID session (fail-open).
+      if (faulted) await publishOcpiSessionPush(getPubSub(), session.id, log);
 
       // Only the run whose fault changed the session audits it (P7).
       if (faulted) {

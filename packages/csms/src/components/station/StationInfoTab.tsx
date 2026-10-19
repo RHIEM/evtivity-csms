@@ -22,8 +22,11 @@ import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { FileViewerDialog } from '@/components/FileViewerDialog';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { useToast } from '@/components/ui/toast';
 import { OCPP_BASE_URL } from '@/lib/config';
 import { formatDateTime } from '@/lib/timezone';
+import { StationAiInsightsRow } from './StationAiInsightsRow';
+import type { StationAiInsightsState } from './StationAiInsightsRow';
 
 interface Site {
   id: string;
@@ -31,7 +34,7 @@ interface Site {
   timezone: string;
 }
 
-interface Station {
+interface Station extends StationAiInsightsState {
   id: string;
   stationId: string;
   siteId: string | null;
@@ -90,6 +93,7 @@ export function StationInfoTab({
 }: StationInfoTabProps): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const { toast } = useToast();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [model, setModel] = useState('');
@@ -153,6 +157,9 @@ export function StationInfoTab({
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['stations'] });
       void navigate('/stations');
+    },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
     },
   });
 
@@ -231,7 +238,6 @@ export function StationInfoTab({
                   onChange={(e) => {
                     setSiteId(e.target.value);
                   }}
-                  className="h-9"
                 >
                   <option value="">{t('common.noSite')}</option>
                   {sites?.map((s) => (
@@ -406,6 +412,11 @@ export function StationInfoTab({
                   )}
                 </dd>
               </div>
+              <StationAiInsightsRow
+                stationId={station.id}
+                station={station}
+                timezone={siteTimezone}
+              />
             </dl>
           )}
         </CardContent>

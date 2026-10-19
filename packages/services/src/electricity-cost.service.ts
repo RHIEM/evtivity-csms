@@ -5,7 +5,7 @@ import { and, asc, count, eq, gt, isNotNull, isNull, sql, type SQL } from 'drizz
 import {
   db,
   chargingSessions,
-  chargingStations,
+  inOperatorStation,
   loadElectricityRatePeriodsForSite,
   sites,
 } from '@evtivity/database';
@@ -32,7 +32,8 @@ export const RECALCULATE_MAX_UPDATES = 5000;
  * the company currency, not an account session still unpaid, that delivered
  * energy and has no electricity cost. The dashboard notice counts these, the
  * sessions list filter (`costMissing=true`) shows them and the recalculation
- * fills them, so the three agree.
+ * fills them, so the three agree. Sessions of conformance test stations are
+ * not revenue, so never cost missing.
  */
 export function sessionCostMissing(companyCurrency: string): SQL {
   return and(
@@ -40,6 +41,7 @@ export function sessionCostMissing(companyCurrency: string): SQL {
     inCompanyCurrency(chargingSessions.currency, companyCurrency),
     isNull(chargingSessions.electricityCostCents),
     sql`coalesce(${chargingSessions.energyDeliveredWh}, 0) > 0`,
+    inOperatorStation(chargingSessions.stationId),
     // Billed on account and not paid yet: not revenue, so not cost missing.
     sql`NOT (${chargingSessions.billingMode} IS NOT DISTINCT FROM 'account'
       AND ${chargingSessions.finalCostCents} > 0
@@ -49,7 +51,10 @@ export function sessionCostMissing(companyCurrency: string): SQL {
   ) as SQL;
 }
 
-/** Sessions at the site without an electricity cost (sessionCostMissing). */
+/**
+ * Sessions that happened at the site (site_id, kept when a station moves)
+ * without an electricity cost (sessionCostMissing).
+ */
 export async function countSiteCostMissingSessions(
   siteId: string,
   companyCurrency: string,
@@ -57,8 +62,7 @@ export async function countSiteCostMissingSessions(
   const [row] = await db
     .select({ n: count() })
     .from(chargingSessions)
-    .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-    .where(and(eq(chargingStations.siteId, siteId), sessionCostMissing(companyCurrency)));
+    .where(and(eq(chargingSessions.siteId, siteId), sessionCostMissing(companyCurrency)));
   return row?.n ?? 0;
 }
 
@@ -110,10 +114,9 @@ export async function recalculateSiteElectricityCost(
         energyWh: chargingSessions.energyDeliveredWh,
       })
       .from(chargingSessions)
-      .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
       .where(
         and(
-          eq(chargingStations.siteId, siteId),
+          eq(chargingSessions.siteId, siteId),
           missing,
           isNotNull(chargingSessions.endedAt),
           cursor != null ? gt(chargingSessions.id, cursor) : undefined,

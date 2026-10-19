@@ -1639,6 +1639,13 @@
       "when": 1791000047703,
       "tag": "rhiem_0003_payment_mode_to_fleet_billing",
       "breakpoints": true
+    },
+    {
+      "idx": 234,
+      "version": "7",
+      "when": 1791000047800,
+      "tag": "0477_release_0_1_47",
+      "breakpoints": true
     }
   ]
 }

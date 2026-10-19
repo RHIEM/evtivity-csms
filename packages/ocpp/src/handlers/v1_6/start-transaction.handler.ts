@@ -12,6 +12,7 @@ import {
   logAuthorizeDecision,
   recordAuthorizeDecision,
 } from '../../authorization/authorize-token.js';
+import { vehicleIdFromIdTag } from '@evtivity/lib/vehicle-id';
 import { idTagInfoFor } from './id-tag-info.js';
 
 async function nextOcpp16TransactionId(ctx: HandlerContext): Promise<number> {
@@ -48,6 +49,7 @@ export async function handleStartTransaction(
   );
 
   let transactionId: number | null = null;
+  const vehicleId = vehicleIdFromIdTag(request.idTag);
 
   if (ctx.stationDbId != null) {
     // A resend (the station retries a StartTransaction whose response it did
@@ -77,10 +79,14 @@ export async function handleStartTransaction(
   if (ctx.stationDbId != null && transactionId == null) {
     // Claim a remote start the portal created on the EVSE of this connector
     // and that is still waiting for its transaction (no transaction_events
-    // row), the newest first, like the 2.1 remote-start link. A running
-    // session or one on another connector is never claimed. FOR UPDATE SKIP
-    // LOCKED keeps two concurrent StartTransactions from claiming the same
-    // session.
+    // row), the newest first. A running session or one on another connector
+    // is never claimed. The idTag must be the one the portal sent in its
+    // RemoteStartTransaction: the driver id, or for a held reservation the
+    // reservation's token (reserveNowToken). A start with another idTag (a
+    // card presented at the station while the portal start waits) is its own
+    // transaction. idTag is a CiString20 in 1.6, compared without case. FOR
+    // UPDATE SKIP LOCKED keeps two concurrent StartTransactions from
+    // claiming the same session.
     const claimed = await db.execute<{ transaction_id: string }>(
       dsql`UPDATE charging_sessions
            SET updated_at = now()
@@ -91,6 +97,15 @@ export async function handleStartTransaction(
                AND e.evse_id = ${request.connectorId}
                AND pending.remote_start_id IS NOT NULL
                AND pending.status = 'active'
+               AND (
+                 lower(pending.driver_id) = lower(${request.idTag})
+                 OR EXISTS (
+                   SELECT 1 FROM reservations r
+                   JOIN driver_tokens dt ON dt.id = r.token_id
+                   WHERE r.id = pending.reservation_id
+                     AND lower(dt.id_token) = lower(${request.idTag})
+                 )
+               )
                AND NOT EXISTS (
                  SELECT 1 FROM transaction_events te WHERE te.session_id = pending.id
                )
@@ -118,6 +133,29 @@ export async function handleStartTransaction(
     transactionId = await nextOcpp16TransactionId(ctx);
   }
 
+  // A station that skips Authorize (LocalAuthList, LocalPreAuthorize) comes
+  // straight here, so the idTag goes through the whole authorize pipeline:
+  // revocation, expiry, ConcurrentTx (OCPP 1.6 5.13, not counting this
+  // transaction's own session: a resent message's, or the one the projection
+  // may already have linked) and prepaid credit. The attempts log is the only
+  // record of the decision for those flows. The decision comes before the
+  // Started event, which carries a refusal for no fleet credit
+  // (`startRefusal`): the payment gate then gives the station a grace period
+  // to end the refused transaction itself before it sends a stop.
+  const input: AuthorizeTokenInput = {
+    stationId: ctx.stationId,
+    stationDbId: ctx.stationDbId,
+    evseId: request.connectorId,
+    token: { value: request.idTag, type: null },
+    context: 'tx_start',
+    ocppVersion: 'ocpp1.6',
+    transactionId: String(transactionId),
+    vehicleId,
+  };
+  const decision = await authorizeToken(input, ctx.logger);
+  logAuthorizeDecision(input, decision, ctx.logger);
+  recordAuthorizeDecision(input, decision, ctx.logger);
+
   await ctx.eventBus.publish({
     eventType: 'ocpp.TransactionEvent',
     aggregateType: 'Transaction',
@@ -135,27 +173,10 @@ export async function handleStartTransaction(
       connectorId: request.connectorId,
       meterStart: request.meterStart,
       reservationId: request.reservationId,
+      ...(vehicleId != null ? { vehicleId } : {}),
+      ...(decision.outcome === 'no_credit' ? { startRefusal: 'no_credit' } : {}),
     },
   });
-
-  // A station that skips Authorize (LocalAuthList, LocalPreAuthorize) comes
-  // straight here, so the idTag goes through the whole authorize pipeline:
-  // revocation, expiry, ConcurrentTx (OCPP 1.6 5.13, not counting this
-  // transaction's own session: a resent message's, or the one the projection
-  // may already have linked) and prepaid credit. The attempts log is the only
-  // record of the decision for those flows.
-  const input: AuthorizeTokenInput = {
-    stationId: ctx.stationId,
-    stationDbId: ctx.stationDbId,
-    evseId: request.connectorId,
-    token: { value: request.idTag, type: null },
-    context: 'tx_start',
-    ocppVersion: 'ocpp1.6',
-    transactionId: String(transactionId),
-  };
-  const decision = await authorizeToken(input, ctx.logger);
-  logAuthorizeDecision(input, decision, ctx.logger);
-  recordAuthorizeDecision(input, decision, ctx.logger);
 
   const response: StartTransactionResponse = { transactionId, idTagInfo: idTagInfoFor(decision) };
   return response as unknown as Record<string, unknown>;

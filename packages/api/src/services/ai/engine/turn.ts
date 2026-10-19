@@ -8,6 +8,7 @@
  * hold the conversation's turn lease around these calls.
  */
 
+import { aiProviderGate, dispatchAiBudgetNotices } from '@evtivity/services/ai-alerts';
 import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { createHash } from 'node:crypto';
 import { eq } from 'drizzle-orm';
@@ -21,6 +22,7 @@ import {
   appendMessage,
   completeToolCall,
   createPendingAction,
+  interruptConfirmedAction,
   listMessages,
   recordToolCall,
   replaceToolResult,
@@ -62,6 +64,11 @@ export interface TurnContext {
    * messages, and tool results stored under another one are hidden on replay.
    */
   accessScope: string;
+  /**
+   * The caller authenticated with an API key: assistant text written under
+   * another access is hidden from it on read and replay.
+   */
+  isApiKey?: boolean | undefined;
   /** Whether the caller holds a permission (API key scope included), as `authorize()` decides. */
   hasPermission: (permission: string) => Promise<boolean>;
   actor: AuditActorFields;
@@ -116,17 +123,19 @@ async function recordTurnUsage(
   },
 ): Promise<void> {
   try {
-    await recordAiUsage({
-      surface: conversation.surface === 'support' ? 'support' : 'chatbot',
-      userId: ctx.userId,
-      siteId,
-      conversationId: conversation.id,
-      aiMessageId: call.messageId,
-      provider: call.provider,
-      model: call.model,
-      usage: call.usage,
-      costMicros: call.costMicros,
-    });
+    await dispatchAiBudgetNotices(
+      await recordAiUsage({
+        surface: conversation.surface === 'support' ? 'support' : 'chatbot',
+        userId: ctx.userId,
+        siteId,
+        conversationId: conversation.id,
+        aiMessageId: call.messageId,
+        provider: call.provider,
+        model: call.model,
+        usage: call.usage,
+        costMicros: call.costMicros,
+      }),
+    );
   } catch (err) {
     ctx.log.warn(
       { err, conversationId: conversation.id },
@@ -166,6 +175,7 @@ function hooksFor(
         usage: input.usage,
         costMicros: input.costMicros,
         finishReason: input.finishReason,
+        accessScope: ctx.accessScope,
       });
     },
     saveToolCall({ messageId, call, entry, status }) {
@@ -387,7 +397,9 @@ export async function runChatMessageTurn(input: {
       parts: [{ type: 'text', text: input.text }, ...attachmentParts(input.attachments)],
     });
     await setTitleIfEmpty(conversation.id, input.text.replace(/\s+/g, ' ').trim().slice(0, 80));
-    const history = toAiMessages(await listMessages(conversation.id, ctx.accessScope));
+    const history = toAiMessages(
+      await listMessages(conversation.id, ctx.accessScope, { isApiKey: ctx.isApiKey }),
+    );
     const [system, routed] = await Promise.all([
       chatbotSystem(ctx, config, input.explain ?? null),
       routedChatbotToolset(ctx, conversation, config, history, stream.signal),
@@ -522,7 +534,9 @@ export async function runDecisionTurn(input: {
         return null;
       }
     }
-    const history = toAiMessages(await listMessages(conversation.id, ctx.accessScope));
+    const history = toAiMessages(
+      await listMessages(conversation.id, ctx.accessScope, { isApiKey: ctx.isApiKey }),
+    );
     const [system, routed] = await Promise.all([
       chatbotSystem(ctx, config, input.explain ?? null),
       routedChatbotToolset(ctx, conversation, config, history, stream.signal),
@@ -542,6 +556,18 @@ export async function runDecisionTurn(input: {
     });
   } catch (err) {
     ctx.log.error({ err, conversationId: conversation.id }, 'AI decision turn failed');
+    if (input.decision === 'confirmed') {
+      // A failure before the outcome was recorded leaves the call row
+      // pending: close it (a recorded outcome is kept, nothing runs again).
+      try {
+        await interruptConfirmedAction(action, ctx.accessScope);
+      } catch (closeErr) {
+        ctx.log.warn(
+          { err: closeErr, conversationId: conversation.id, actionId: action.id },
+          'Interrupted AI action could not be closed',
+        );
+      }
+    }
     failStream(stream, firstMessageId, turnErrorCode(err));
     return null;
   }
@@ -574,6 +600,13 @@ export async function runSupportAssistTurn(input: {
   const { ctx, conversation, config, stream } = input;
   const firstMessageId = generateId('aiMessage');
   sendStart(stream, conversation.id, firstMessageId, config);
+  // The company provider account is out of credit or quota: no draft until it
+  // answers again (one probe per interval still runs). A personal key is
+  // another account and is not paused.
+  if (config.source === 'system' && (await aiProviderGate(config.provider)) === 'paused') {
+    failStream(stream, firstMessageId, 'AI_PROVIDER_QUOTA_EXCEEDED');
+    return null;
+  }
   try {
     await appendMessage({
       conversationId: conversation.id,
@@ -597,7 +630,9 @@ export async function runSupportAssistTurn(input: {
       isInternalNote: input.isInternalNote,
       replyLanguage: input.driverLanguage,
     });
-    const history = toAiMessages(await listMessages(conversation.id, ctx.accessScope));
+    const history = toAiMessages(
+      await listMessages(conversation.id, ctx.accessScope, { isApiKey: ctx.isApiKey }),
+    );
     return await runLoop({
       ctx,
       conversation,

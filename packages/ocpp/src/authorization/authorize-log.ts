@@ -49,6 +49,9 @@ export async function logAuthorizeAttempt(
     outcome: AuthorizeOutcome;
     ocppVersion: 'ocpp1.6' | 'ocpp2.1';
     reason?: string | null;
+    vehicleIdValue?: string | null;
+    vehicleIdType?: string | null;
+    matchedVehicleId?: string | null;
   },
   logger: Logger,
 ): Promise<void> {
@@ -64,6 +67,9 @@ export async function logAuthorizeAttempt(
       outcome: args.outcome,
       ocppVersion: args.ocppVersion,
       reason: args.reason ?? null,
+      vehicleIdValue: args.vehicleIdValue ?? null,
+      vehicleIdType: args.vehicleIdType ?? null,
+      matchedVehicleId: args.matchedVehicleId ?? null,
     });
   } catch (err) {
     logger.warn({ err, ...args }, 'Failed to record authorize attempt');
@@ -76,13 +82,13 @@ export async function logAuthorizeAttempt(
     try {
       // The station's site scopes the event on the operator SSE stream: an
       // attempt at an unknown or unsited station reaches all-site operators
-      // only.
+      // only. stationId is the OCPP identity the station connected with.
       let siteId: string | null = null;
       if (args.stationId != null) {
         const [station] = await db
           .select({ siteId: chargingStations.siteId })
           .from(chargingStations)
-          .where(eq(chargingStations.id, args.stationId));
+          .where(eq(chargingStations.stationId, args.stationId));
         siteId = station?.siteId ?? null;
       }
       await pubsub.publish(

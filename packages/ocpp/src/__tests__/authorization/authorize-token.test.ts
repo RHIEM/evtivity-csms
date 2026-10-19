@@ -9,6 +9,10 @@ import type {
   AuthorizeDecision,
   AuthorizeTokenInput,
 } from '../../authorization/authorize-context.js';
+import {
+  clearIssuedCentralTokens,
+  rememberIssuedCentralToken,
+} from '../../authorization/issued-central-tokens.js';
 
 type Row = Record<string, unknown>;
 type Cond =
@@ -33,6 +37,15 @@ const h = vi.hoisted(() => {
     roaming: boolean;
     accountCredit: { fleetId: string; remainingCents: number } | null | Error;
     accountCreditCalls: string[];
+    vehicle: {
+      vehicleId: string;
+      driverId: string;
+      driverIsActive: boolean;
+      blocked: boolean;
+    } | null;
+    blockedVehicle: { vehicleId: string; driverId: string } | null;
+    autochargeOn: boolean;
+    vehicleLookups: { value: string; type: string }[];
     accountCreditExclusions: ({ stationId: string; transactionId: string } | undefined)[];
   } = {
     TABLE,
@@ -43,6 +56,10 @@ const h = vi.hoisted(() => {
     roaming: false,
     accountCredit: null,
     accountCreditCalls: [],
+    vehicle: null,
+    blockedVehicle: null,
+    autochargeOn: true,
+    vehicleLookups: [],
     accountCreditExclusions: [],
   };
   return state;
@@ -56,28 +73,50 @@ function matches(row: Row, cond: Cond): boolean {
   return row[cond.col] !== cond.val;
 }
 
+// A select, optionally with the one left join the pipeline makes (driver
+// tokens to drivers): each row gets the joined driver's isActive as
+// `driverIsActive`, null without a match. Recorded as one query.
+function whereFor(t: Record<string | symbol, unknown>, join?: { table: string; on: Cond }) {
+  return (cond: Cond) => {
+    let pending: Promise<Row[]> | null = null;
+    const run = (): Promise<Row[]> => {
+      if (pending == null) {
+        const name = t[h.TABLE] as string;
+        h.queries.push({ table: name, cond });
+        const data = h.tables[name] ?? [];
+        pending =
+          data instanceof Error
+            ? Promise.reject(data)
+            : Promise.resolve(
+                data
+                  .filter((r) => matches(r, cond))
+                  .map((r) => {
+                    const on = join?.on;
+                    if (join == null || on == null || on.op !== 'eq') return r;
+                    const joined = h.tables[join.table];
+                    const list = Array.isArray(joined) ? joined : [];
+                    const joinCol = (on.val as { col: string }).col;
+                    const match = list.find((j) => j[joinCol] === r[on.col]);
+                    return { ...r, driverIsActive: match == null ? null : match['isActive'] };
+                  }),
+              );
+      }
+      return pending;
+    };
+    return {
+      limit: () => run(),
+      then: (resolve: (v: Row[]) => unknown, reject: (e: unknown) => unknown): Promise<unknown> =>
+        run().then(resolve, reject),
+    };
+  };
+}
+
 const selectFn = vi.fn(() => ({
   from: (t: Record<string | symbol, unknown>) => ({
-    where: (cond: Cond) => {
-      let pending: Promise<Row[]> | null = null;
-      const run = (): Promise<Row[]> => {
-        if (pending == null) {
-          const name = t[h.TABLE] as string;
-          h.queries.push({ table: name, cond });
-          const data = h.tables[name] ?? [];
-          pending =
-            data instanceof Error
-              ? Promise.reject(data)
-              : Promise.resolve(data.filter((r) => matches(r, cond)));
-        }
-        return pending;
-      };
-      return {
-        limit: () => run(),
-        then: (resolve: (v: Row[]) => unknown, reject: (e: unknown) => unknown): Promise<unknown> =>
-          run().then(resolve, reject),
-      };
-    },
+    where: whereFor(t),
+    leftJoin: (j: Record<string | symbol, unknown>, on: Cond) => ({
+      where: whereFor(t, { table: j[h.TABLE] as string, on }),
+    }),
   }),
 }));
 
@@ -108,14 +147,31 @@ vi.mock('@evtivity/database', () => ({
   drivers: h.table('drivers', ['id', 'isActive']),
   guestSessions: h.table('guest_sessions', ['sessionToken', 'status', 'stationOcppId']),
   ocpiExternalTokens: h.table('ocpi_external_tokens', ['uid', 'isValid', 'whitelist', 'tokenData']),
+  resolveOcpiTokenOwner: async (input: { tokenUid: string }) => {
+    const { ocpiOwnerFromRows } = await import('../helpers/ocpi-token-owner.js');
+    const rows = await whereFor({ [h.TABLE]: 'ocpi_external_tokens' })({
+      op: 'eq',
+      col: 'uid',
+      val: input.tokenUid,
+    }).limit();
+    return ocpiOwnerFromRows(rows);
+  },
   chargingSessions: h.table('charging_sessions', [
     'id',
     'tokenId',
     'status',
     'stationId',
     'transactionId',
+    'vehicleId',
+    'autocharge',
   ]),
   chargingStations: h.table('charging_stations', ['id', 'stationId']),
+  findAutochargeVehicle: vi.fn((capture: { value: string; type: string }) => {
+    h.vehicleLookups.push(capture);
+    return Promise.resolve(h.vehicle);
+  }),
+  findBlockedVehicle: vi.fn(() => Promise.resolve(h.blockedVehicle)),
+  isAutochargeEnabledForStation: vi.fn(() => Promise.resolve(h.autochargeOn)),
   isRoamingEnabled: vi.fn(() => Promise.resolve(h.roaming)),
   isSiteFreeVendEnabledByStation: vi.fn(() =>
     h.freeVend instanceof Error ? Promise.reject(h.freeVend) : Promise.resolve(h.freeVend),
@@ -171,6 +227,10 @@ beforeEach(() => {
   h.queries = [];
   h.accountCredit = null;
   h.accountCreditCalls = [];
+  h.vehicle = null;
+  h.blockedVehicle = null;
+  h.autochargeOn = true;
+  h.vehicleLookups = [];
   h.accountCreditExclusions = [];
 });
 
@@ -331,6 +391,40 @@ describe('authorizeToken: untyped identity resolution', () => {
       prepaid: true,
       prepaidBalanceCents: 500,
       echoGroupId: false,
+    });
+  });
+
+  it.each(UNTYPED_CONTEXTS)(
+    '%s blocks an active token of a deactivated driver (driver_inactive)',
+    async (context) => {
+      h.tables['driver_tokens'] = [
+        token({ id: 'tok-1', idToken: 'TAG', tokenType: 'ISO14443', driverId: 'drv-off' }),
+      ];
+      h.tables['drivers'] = [{ id: 'drv-off', isActive: false }];
+      const d = await authorizeToken(input(context, 'TAG', null), logger);
+      expect(d).toMatchObject({
+        status: 'blocked',
+        outcome: 'blocked',
+        reason: 'driver_inactive',
+        matchedTokenId: 'tok-1',
+        matchedDriverId: 'drv-off',
+      });
+    },
+  );
+
+  it('accepts the token of an active driver and a token without a driver', async () => {
+    h.tables['driver_tokens'] = [
+      token({ id: 'tok-1', idToken: 'TAG', tokenType: 'ISO14443', driverId: 'drv-on' }),
+    ];
+    h.tables['drivers'] = [{ id: 'drv-on', isActive: true }];
+    expect(await authorizeToken(input('authorize', 'TAG', null), logger)).toMatchObject({
+      status: 'accepted',
+    });
+    h.tables['driver_tokens'] = [
+      token({ id: 'tok-2', idToken: 'TAG2', tokenType: 'ISO14443', driverId: null }),
+    ];
+    expect(await authorizeToken(input('authorize', 'TAG2', null), logger)).toMatchObject({
+      status: 'accepted',
     });
   });
 
@@ -498,14 +592,81 @@ describe('authorizeToken: typed identity resolution', () => {
     });
   });
 
-  it.each(['Central', 'Local'])('authorize accepts an unknown %s token', async (type) => {
-    const d = await authorizeToken(input('authorize', 'X', type), logger);
+  it('authorize accepts an unknown Local token (needs no checking by the CSMS)', async () => {
+    const d = await authorizeToken(input('authorize', 'X', 'Local'), logger);
     expect(d).toMatchObject({
       status: 'accepted',
       outcome: 'accepted',
       reason: 'accept_when_not_found',
       source: 'accept_when_not_found',
       echoGroupId: true,
+    });
+  });
+
+  describe('authorize and Central tokens (C05.FR.01)', () => {
+    beforeEach(() => {
+      clearIssuedCentralTokens();
+    });
+
+    it('answers an unknown Central token Invalid', async () => {
+      const d = await authorizeToken(input('authorize', 'X', 'Central'), logger);
+      expect(d).toMatchObject({ status: 'invalid', outcome: 'unknown', reason: 'token_not_found' });
+    });
+
+    it('accepts a Central token the CSMS sent this station in a remote start', async () => {
+      rememberIssuedCentralToken('CS-001', 'RequestStartTransaction', {
+        idToken: { idToken: 'RS-1', type: 'Central' },
+      });
+      const d = await authorizeToken(input('authorize', 'RS-1', 'Central'), logger);
+      expect(d).toMatchObject({
+        status: 'accepted',
+        reason: 'issued_central',
+        source: 'issued_central',
+        echoGroupId: true,
+      });
+    });
+
+    it('does not accept it at another station or after it aged out', async () => {
+      rememberIssuedCentralToken('CS-002', 'RequestStartTransaction', {
+        idToken: { idToken: 'RS-1', type: 'Central' },
+      });
+      expect(await authorizeToken(input('authorize', 'RS-1', 'Central'), logger)).toMatchObject({
+        status: 'invalid',
+      });
+      rememberIssuedCentralToken(
+        'CS-001',
+        'RequestStartTransaction',
+        { idToken: { idToken: 'RS-2', type: 'Central' } },
+        Date.now() - 16 * 60 * 1000,
+      );
+      expect(await authorizeToken(input('authorize', 'RS-2', 'Central'), logger)).toMatchObject({
+        status: 'invalid',
+      });
+    });
+
+    it('accepts the Central token of a ReserveNow until the reservation expires', async () => {
+      rememberIssuedCentralToken('CS-001', 'ReserveNow', {
+        idToken: { idToken: 'operator', type: 'Central' },
+        expiryDateTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      });
+      expect(await authorizeToken(input('authorize', 'operator', 'Central'), logger)).toMatchObject(
+        { status: 'accepted', reason: 'issued_central' },
+      );
+    });
+
+    it('ignores other commands and other token types', async () => {
+      rememberIssuedCentralToken('CS-001', 'SetVariables', {
+        idToken: { idToken: 'RS-3', type: 'Central' },
+      });
+      rememberIssuedCentralToken('CS-001', 'RequestStartTransaction', {
+        idToken: { idToken: 'RS-4', type: 'ISO14443' },
+      });
+      expect(await authorizeToken(input('authorize', 'RS-3', 'Central'), logger)).toMatchObject({
+        status: 'invalid',
+      });
+      expect(await authorizeToken(input('authorize', 'RS-4', 'Central'), logger)).toMatchObject({
+        status: 'invalid',
+      });
     });
   });
 
@@ -608,6 +769,29 @@ describe('authorizeToken: OCPI', () => {
     expect(d).toMatchObject({ status: 'invalid', source: 'not_found' });
     expect(logger.debug).toHaveBeenCalled();
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a uid two connected partners hold as valid tokens (ambiguous owner)', async () => {
+    h.tables['ocpi_external_tokens'] = [
+      { uid: 'SHARED', partnerId: 'opr_a', isValid: true, whitelist: 'ALWAYS', tokenData: {} },
+      { uid: 'SHARED', partnerId: 'opr_b', isValid: true, whitelist: 'ALLOWED', tokenData: {} },
+    ];
+    const d = await authorizeToken(input('authorize', 'SHARED', 'ISO14443'), logger);
+    expect(d).toMatchObject({
+      status: 'invalid',
+      reason: 'ocpi_external_ambiguous',
+      source: 'ocpi',
+    });
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it('accepts the one valid token when the other partner holds it as invalid', async () => {
+    h.tables['ocpi_external_tokens'] = [
+      { uid: 'SHARED', partnerId: 'opr_a', isValid: false, whitelist: 'ALWAYS', tokenData: {} },
+      { uid: 'SHARED', partnerId: 'opr_b', isValid: true, whitelist: 'ALLOWED', tokenData: {} },
+    ];
+    const d = await authorizeToken(input('authorize', 'SHARED', 'ISO14443'), logger);
+    expect(d).toMatchObject({ status: 'accepted', reason: 'ocpi_external' });
   });
 });
 
@@ -994,6 +1178,9 @@ describe('recordAuthorizeDecision', () => {
           outcome: 'accepted',
           ocppVersion: type == null ? 'ocpp1.6' : 'ocpp2.1',
           reason: 'r',
+          vehicleIdValue: null,
+          vehicleIdType: null,
+          matchedVehicleId: null,
         },
         logger,
       );
@@ -1113,9 +1300,9 @@ describe('driver id fallback for typed tokens', () => {
     },
   );
 
-  it('an unknown Central driver id falls through to accept-when-not-found', async () => {
+  it('an unknown Central driver id is Invalid on Authorize', async () => {
     const d = await authorizeToken(input('authorize', 'drv_abc', 'Central'), logger);
-    expect(d.source).toBe('accept_when_not_found');
+    expect(d.source).toBe('not_found');
     expect(tables()).toEqual(['driver_tokens', 'drivers']);
   });
 
@@ -1182,5 +1369,192 @@ describe('AUTHORIZE_CONTEXT_RULES', () => {
     expect(rules.authorizeContextRules(input('tx_update', 'X', 'Local'))).toBe(
       rules.AUTHORIZE_CONTEXT_RULES.tx_update.typed,
     );
+  });
+});
+
+describe('Autocharge vehicles', () => {
+  const MAC = { value: '92D50A693F80', type: 'MacAddress' as const, source: 'id_token' as const };
+  const VEHICLE = {
+    vehicleId: 'veh_1',
+    driverId: 'drv-car',
+    driverIsActive: true,
+    blocked: false,
+  };
+
+  it.each([
+    ['authorize', 'MacAddress', 'ocpp2.1'],
+    ['tx_start', 'EVCCID', 'ocpp2.1'],
+    ['authorize', null, 'ocpp1.6'],
+    ['tx_start', null, 'ocpp1.6'],
+  ] as const)(
+    '%s (%s, %s) accepts a vehicle with Autocharge on as its driver',
+    async (context, type, _version) => {
+      h.vehicle = VEHICLE;
+      const value = type == null ? 'VID:92D50A693F80' : '92:D5:0A:69:3F:80';
+      const d = await authorizeToken(
+        input(context, value, type, {
+          vehicleId: { ...MAC, source: type == null ? 'id_tag' : 'id_token' },
+        }),
+        logger,
+      );
+      expect(d).toMatchObject({
+        status: 'accepted',
+        outcome: 'accepted',
+        reason: 'autocharge',
+        source: 'vehicle',
+        matchedTokenId: null,
+        matchedDriverId: 'drv-car',
+        matchedVehicleId: 'veh_1',
+      });
+      // Driver tokens are checked first: a card with the value wins.
+      expect(tables()[0]).toBe('driver_tokens');
+      expect(h.vehicleLookups).toEqual([{ ...MAC, source: type == null ? 'id_tag' : 'id_token' }]);
+    },
+  );
+
+  it('a driver token with the same value wins over the vehicle', async () => {
+    h.vehicle = VEHICLE;
+    h.tables['driver_tokens'] = [
+      token({ id: 'tok-mac', idToken: '92D50A693F80', tokenType: 'MacAddress' }),
+    ];
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({ source: 'driver_token', matchedTokenId: 'tok-mac' });
+    expect(h.vehicleLookups).toEqual([]);
+  });
+
+  it('refuses the vehicle when Autocharge is off at the site', async () => {
+    h.vehicle = VEHICLE;
+    h.autochargeOn = false;
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({
+      status: 'invalid',
+      reason: 'autocharge_disabled',
+      source: 'vehicle',
+      matchedVehicleId: 'veh_1',
+    });
+  });
+
+  it('blocks a vehicle an operator blocked', async () => {
+    h.vehicle = { ...VEHICLE, blocked: true };
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({ status: 'blocked', reason: 'vehicle_blocked', source: 'vehicle' });
+  });
+
+  it('blocks a blocked vehicle id even with Autocharge off on the vehicle', async () => {
+    h.blockedVehicle = { vehicleId: 'veh_2', driverId: 'drv-other' };
+    const d = await authorizeToken(
+      input('authorize', 'VID:92D50A693F80', null, { vehicleId: { ...MAC, source: 'id_tag' } }),
+      logger,
+    );
+    expect(d).toMatchObject({
+      status: 'blocked',
+      reason: 'vehicle_blocked',
+      matchedVehicleId: 'veh_2',
+    });
+  });
+
+  it('blocks a vehicle whose driver is deactivated', async () => {
+    h.vehicle = { ...VEHICLE, driverIsActive: false };
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({ status: 'blocked', reason: 'driver_inactive', source: 'vehicle' });
+  });
+
+  it('an unknown vehicle id stays Invalid', async () => {
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({ status: 'invalid', source: 'not_found' });
+  });
+
+  it('never authorizes by a vehicle id in additionalInfo', async () => {
+    h.vehicle = VEHICLE;
+    const d = await authorizeToken(
+      input('authorize', 'CARD-1', 'ISO14443', {
+        vehicleId: { ...MAC, type: 'EVCCID', source: 'additional_info' },
+      }),
+      logger,
+    );
+    expect(d).toMatchObject({ status: 'invalid', source: 'not_found' });
+    expect(h.vehicleLookups).toEqual([]);
+  });
+
+  it('answers ConcurrentTx when the vehicle runs an Autocharge session elsewhere', async () => {
+    h.vehicle = VEHICLE;
+    h.tables['charging_sessions'] = [
+      {
+        id: 'ses-other',
+        tokenId: null,
+        vehicleId: 'veh_1',
+        autocharge: true,
+        status: 'active',
+        stationId: 'sta_db_2',
+        transactionId: 'TX-9',
+      },
+    ];
+    const d = await authorizeToken(
+      input('authorize', '92D50A693F80', 'MacAddress', { vehicleId: MAC }),
+      logger,
+    );
+    expect(d).toMatchObject({ status: 'concurrent_tx', matchedVehicleId: 'veh_1' });
+  });
+
+  it('logs the captured vehicle id and the matched vehicle with the attempt', () => {
+    recordAuthorizeDecision(
+      input('authorize', 'CARD-1', 'ISO14443', {
+        vehicleId: { value: '92D50A693F80', type: 'EVCCID', source: 'additional_info' },
+      }),
+      {
+        status: 'invalid',
+        outcome: 'invalid',
+        reason: 'autocharge_disabled',
+        source: 'vehicle',
+        matchedTokenId: null,
+        matchedDriverId: 'drv-car',
+        matchedVehicleId: 'veh_1',
+        expiresAt: null,
+        prepaid: false,
+        prepaidBalanceCents: null,
+        echoGroupId: false,
+      },
+      logger,
+    );
+    expect(logAuthorizeAttemptMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        vehicleIdValue: '92D50A693F80',
+        vehicleIdType: 'EVCCID',
+        matchedVehicleId: 'veh_1',
+      }),
+      logger,
+    );
+  });
+
+  it('names the vehicle in the decision message', () => {
+    expect(
+      authorizeDecisionMessage({
+        status: 'accepted',
+        outcome: 'accepted',
+        reason: 'autocharge',
+        source: 'vehicle',
+        matchedTokenId: null,
+        matchedDriverId: 'drv-car',
+        expiresAt: null,
+        prepaid: false,
+        prepaidBalanceCents: null,
+        echoGroupId: true,
+      }),
+    ).toBe('Autocharge vehicle accepted');
   });
 });

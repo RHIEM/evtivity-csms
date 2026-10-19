@@ -31,6 +31,11 @@ vi.mock('@evtivity/database', () => {
       stationOcppId: 'station_ocpp_id',
     },
     authorizeAttempts: { __table: 'authorize_attempts' },
+    resolveOcpiTokenOwner: async () => {
+      const { ocpiOwnerFromRows } = await import('../../helpers/ocpi-token-owner.js');
+      const rows = (await selectFn().from({}).where({}).limit(1)) as unknown[];
+      return ocpiOwnerFromRows(rows);
+    },
     isRoamingEnabled: vi.fn().mockResolvedValue(false),
     isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
   };
@@ -56,7 +61,7 @@ function selectResolving(rows: unknown[]): { from: ReturnType<typeof vi.fn> } {
     then: (resolve: (v: unknown) => unknown): unknown => resolve(rows),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -67,7 +72,7 @@ function selectThrowing(err: unknown): { from: ReturnType<typeof vi.fn> } {
       reject(err),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 

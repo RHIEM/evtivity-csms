@@ -81,6 +81,17 @@ vi.mock('@evtivity/database', () => ({
   clearSupportCache: mocks.clearSupportCache,
   clearFleetCache: mocks.clearFleetCache,
   clearGuestChargingCache: mocks.clearGuestChargingCache,
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY: 'guest.startsPerIpPerHour',
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY: 'guest.declinesPerIpPerHour',
+  MAX_GUEST_VELOCITY_LIMIT: 10_000,
+  parseGuestVelocityLimit: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000
+      ? value
+      : null,
+  clearGuestVelocityCache: vi.fn(),
+  clearAutochargeCache: vi.fn(),
+  clearCompanyPortalUrlCache: vi.fn(),
+  isAutochargeOffered: vi.fn(() => Promise.resolve(false)),
   clearPncSettingsCache: mocks.clearPncSettingsCache,
   clearAiSettingsCache: mocks.clearAiSettingsCache,
   clearSystemSettingsCache: vi.fn(),
@@ -252,6 +263,7 @@ describe('settings routes (cov2)', () => {
       pncEnabled: false,
       fleetEnabled: true,
       guestChargingEnabled: false,
+      autochargeEnabled: false,
       chatbotAiEnabled: true,
       aiInsightsEnabled: false,
       // TC-AI-DR-03: off by default.

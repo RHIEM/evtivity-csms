@@ -5,6 +5,10 @@ import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import pino from 'pino';
 import type { PubSubClient, Subscription, DomainEvent } from '@evtivity/lib';
 import { CommandListener } from '../server/command-listener.js';
+import {
+  clearIssuedCentralTokens,
+  isIssuedCentralToken,
+} from '../authorization/issued-central-tokens.js';
 import { CommandTimeoutError } from '../server/message-correlator.js';
 
 vi.mock('../protocol/message-types.js', () => ({
@@ -46,9 +50,19 @@ describe('CommandListener', () => {
       close: vi.fn().mockResolvedValue(undefined),
     };
 
+    // Like the real dispatcher, the CALL goes out (onSend) before the response.
+    const sendAndAccept = (
+      _stationId: string,
+      _action: string,
+      _payload: Record<string, unknown>,
+      options?: { onSend?: () => void },
+    ): Promise<Record<string, unknown>> => {
+      options?.onSend?.();
+      return Promise.resolve({ status: 'Accepted' });
+    };
     dispatcher = {
-      sendCommand: vi.fn().mockResolvedValue({ status: 'Accepted' }),
-      sendVersionAwareCommand: vi.fn().mockResolvedValue({ status: 'Accepted' }),
+      sendCommand: vi.fn(sendAndAccept),
+      sendVersionAwareCommand: vi.fn(sendAndAccept),
     };
     eventBus = {
       publish: vi.fn().mockResolvedValue(undefined),
@@ -81,9 +95,29 @@ describe('CommandListener', () => {
     subscribeHandler!(payload);
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith('CS-001', 'Reset', {
-      type: 'Soft',
-    });
+    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith(
+      'CS-001',
+      'Reset',
+      { type: 'Soft' },
+      { onSend: expect.any(Function) },
+    );
+  });
+
+  it('remembers the Central idToken of a remote start for Authorize', async () => {
+    clearIssuedCentralTokens();
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        stationId: 'CS-001',
+        action: 'RequestStartTransaction',
+        payload: { evseId: 1, remoteStartId: 7, idToken: { idToken: 'drv-x', type: 'Central' } },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(isIssuedCentralToken('CS-001', 'drv-x')).toBe(true);
+    expect(isIssuedCentralToken('CS-002', 'drv-x')).toBe(false);
+    clearIssuedCentralTokens();
   });
 
   it('dispatches direct command when version is present', async () => {
@@ -98,7 +132,12 @@ describe('CommandListener', () => {
     subscribeHandler!(payload);
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(dispatcher.sendCommand).toHaveBeenCalledWith('CS-001', 'Reset', { type: 'Soft' });
+    expect(dispatcher.sendCommand).toHaveBeenCalledWith(
+      'CS-001',
+      'Reset',
+      { type: 'Soft' },
+      { onSend: expect.any(Function) },
+    );
   });
 
   it('publishes outbound CALL message log', async () => {
@@ -123,6 +162,49 @@ describe('CommandListener', () => {
         }) as unknown,
       }),
     );
+  });
+
+  it('logs the outbound CALL when the dispatcher sends it, not when it is received', async () => {
+    let send: (() => void) | undefined;
+    let answer: ((response: Record<string, unknown>) => void) | undefined;
+    dispatcher.sendVersionAwareCommand.mockImplementationOnce(
+      (_s: string, _a: string, _p: unknown, options?: { onSend?: () => void }) => {
+        send = options?.onSend;
+        return new Promise((resolve) => {
+          answer = resolve;
+        });
+      },
+    );
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({ commandId: 'cmd-q', stationId: 'CS-001', action: 'Reset', payload: {} }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const callLogs = (): unknown[] =>
+      eventBus.publish.mock.calls.filter(
+        ([e]) =>
+          e.eventType === 'ocpp.MessageLog' &&
+          (e.payload as { messageType?: number }).messageType === 2,
+      );
+    // Still waiting behind the station's outstanding CALL: nothing on the wire yet.
+    expect(callLogs()).toHaveLength(0);
+
+    send?.();
+    expect(callLogs()).toHaveLength(1);
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'ocpp.MessageLog',
+        payload: expect.objectContaining({
+          direction: 'outbound',
+          messageType: 2,
+          messageId: 'cmd-q',
+          action: 'Reset',
+        }) as unknown,
+      }),
+    );
+    answer?.({ status: 'Accepted' });
+    await new Promise((r) => setTimeout(r, 10));
   });
 
   it('publishes inbound CALLRESULT on success', async () => {
@@ -419,6 +501,31 @@ describe('CommandListener', () => {
     expect(JSON.stringify(eventBus.publish.mock.calls)).not.toContain('SeedStationPass1234');
   });
 
+  it('never queues a noQueue command for an offline station and answers an error', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new Error('Station CS-001 is not connected'),
+    );
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-ocpi',
+        stationId: 'CS-001',
+        action: 'RequestStartTransaction',
+        payload: { idToken: { idToken: 'TOK', type: 'ISO14443' }, remoteStartId: 9 },
+        noQueue: true,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    // No command.Queued event: nothing reaches offline_command_queue.
+    const types = eventBus.publish.mock.calls.map((c) => c[0].eventType);
+    expect(types).not.toContain('command.Queued');
+    expect(mockPublish).toHaveBeenCalledWith(
+      'ocpp_command_results',
+      JSON.stringify({ commandId: 'cmd-ocpi', error: 'Station offline, command not queued' }),
+    );
+  });
+
   it('sends queued result via pubsub when station offline', async () => {
     dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
       new Error('Station CS-001 is not connected'),
@@ -500,9 +607,12 @@ describe('CommandListener', () => {
     subscribeHandler!(payload);
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith('CS-001', 'Reset', {
-      type: 'Soft',
-    });
+    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith(
+      'CS-001',
+      'Reset',
+      { type: 'Soft' },
+      { onSend: expect.any(Function) },
+    );
   });
 
   // ---- No retries ----
@@ -657,9 +767,12 @@ describe('CommandListener', () => {
     );
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith('CS-001', 'Reset', {
-      type: 'Soft',
-    });
+    expect(dispatcher.sendVersionAwareCommand).toHaveBeenCalledWith(
+      'CS-001',
+      'Reset',
+      { type: 'Soft' },
+      { onSend: expect.any(Function) },
+    );
   });
 
   it('publishes pnc.InstallCertificateResult on InstallCertificate success', async () => {
@@ -684,6 +797,57 @@ describe('CommandListener', () => {
         payload: expect.objectContaining({
           certificateType: 'V2GRootCertificate',
           status: 'Accepted',
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('publishes pnc.CertificateSignedResult with the chain, type and station answer', async () => {
+    dispatcher.sendVersionAwareCommand.mockResolvedValueOnce({ status: 'Accepted' });
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-signed',
+        stationId: 'CS-001',
+        action: 'CertificateSigned',
+        payload: { certificateChain: 'PEM', certificateType: 'V2GCertificate', requestId: 3 },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'pnc.CertificateSignedResult',
+        aggregateId: 'CS-001',
+        payload: {
+          certificateChain: 'PEM',
+          certificateType: 'V2GCertificate',
+          status: 'Accepted',
+        },
+      }),
+    );
+  });
+
+  it('types a 1.6 CertificateSigned result as the station certificate', async () => {
+    dispatcher.sendCommand.mockResolvedValueOnce({ status: 'Rejected' });
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-signed-16',
+        stationId: 'CS-001',
+        action: 'CertificateSigned',
+        payload: { certificateChain: 'PEM' },
+        version: 'ocpp1.6',
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'pnc.CertificateSignedResult',
+        payload: expect.objectContaining({
+          certificateType: 'ChargingStationCertificate',
+          status: 'Rejected',
         }) as unknown,
       }),
     );
@@ -783,6 +947,51 @@ describe('CommandListener', () => {
         eventType: 'command.UpdateFirmware',
         payload: { request: payload, error: 'NotSupported' },
       }),
+    );
+  });
+
+  it('publishes command.SetChargingProfile with the error when the station answers CALLERROR', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new Error('CALLERROR NotSupported: no smart charging'),
+    );
+    await createAndStart();
+    const payload = { evseId: 0, chargingProfile: { id: 1000000000, stackLevel: 1 } };
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-cp-err',
+        stationId: 'CS-001',
+        action: 'SetChargingProfile',
+        payload,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'command.SetChargingProfile',
+        payload: { request: payload, error: 'CALLERROR NotSupported: no smart charging' },
+      }),
+    );
+  });
+
+  it('does not report a charging profile refused when it could not be sent', async () => {
+    dispatcher.sendVersionAwareCommand.mockRejectedValueOnce(
+      new Error('Station CS-001 is not connected'),
+    );
+    await createAndStart();
+    subscribeHandler!(
+      JSON.stringify({
+        commandId: 'cmd-cp-send',
+        stationId: 'CS-001',
+        action: 'SetChargingProfile',
+        payload: { evseId: 0, chargingProfile: { id: 1000000000 } },
+        noQueue: true,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(eventBus.publish).not.toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'command.SetChargingProfile' }),
     );
   });
 

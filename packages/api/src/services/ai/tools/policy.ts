@@ -95,7 +95,9 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   // API Keys
   createApiKey: N,
   listApiKeys: N,
+  listUserApiKeys: N,
   revokeApiKey: N,
+  revokeUserApiKey: N,
   updateApiKey: N,
   // Access Logs
   createAccessLog: N,
@@ -128,6 +130,9 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   listCssStations: N,
   updateCssStation: N,
   // CSS OCPP 1.6 Actions
+  css_v16_authorizePnc: N,
+  css_v16_createPncEv: N,
+  css_v16_installPncContract: N,
   css_v16_sendAuthorize: N,
   css_v16_sendBootNotification: N,
   css_v16_sendDataTransfer: N,
@@ -138,7 +143,10 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   css_v16_sendStartTransaction: N,
   css_v16_sendStatusNotification: N,
   css_v16_sendStopTransaction: N,
+  css_v16_startPncCharging: N,
+  css_v16_updatePncContract: N,
   // CSS OCPP 2.1 Actions
+  css_v21_authorizePnc: N,
   css_v21_createPncEv: N,
   css_v21_installPncContract: N,
   css_v21_sendAuthorize: N,
@@ -179,6 +187,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   css_v21_sendTransactionEvent: N,
   css_v21_sendVatNumberValidation: N,
   css_v21_startPncCharging: N,
+  css_v21_updatePncContract: N,
   // Conformance
   getConformanceRunNeighbors: N,
   // Dashboard
@@ -188,6 +197,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   getDashboardSiteLocations: R,
   getDashboardSnapshot: R,
   getDashboardSnapshotAvailableDates: R,
+  getDashboardSnapshotDayOverDay: R,
   getDashboardSnapshotTrend: R,
   getDashboardUptime: R,
   listDashboardEnergyHistory: R,
@@ -207,12 +217,17 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   refreshDisplayMessages: W,
   // Drivers
   addDriverPricingGroup: N,
+  // Autocharge authorizes a vehicle as its driver (station security): the
+  // block, the unblock and the vehicle ids are operator decisions only.
+  blockDriverVehicle: N,
   createDriver: W,
   createDriverPncContract: N,
   createDriverToken: W,
-  createDriverVehicle: W,
+  createDriverVehicle: write({ omit: ['vin', 'evccid', 'autochargeEnabled'] }),
   deleteDriver: W,
   deleteDriverVehicle: W,
+  // Irreversible erasure of personal data: an operator decision only.
+  eraseDriver: N,
   getDriver: supportRead({ id: 'case.driverId' }),
   getDriverBillingAddress: N,
   getDriverNeighbors: N,
@@ -230,7 +245,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   revokePncContract: N,
   updateDriver: W,
   updateDriverBillingAddress: N,
-  updateDriverVehicle: W,
+  unblockDriverVehicle: N,
+  updateDriverVehicle: write({ omit: ['vin', 'evccid', 'autochargeEnabled'] }),
   // Event Alert Rules
   createEventAlertRule: W,
   deleteEventAlertRule: W,
@@ -271,6 +287,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   // Member invoices: money and personal data, never through the assistant.
   createMemberInvoice: N,
   createMemberInvoiceBatch: N,
+  // Moves sessions between the fleet and member invoices: billing, never through the assistant.
+  moveFleetBillingRecipient: N,
   deleteFleet: W,
   getFleet: R,
   getFleetCreditLimit: R,
@@ -372,6 +390,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   upsertNotificationTemplate: W,
   // OCPI
   createOcpiCreditCdr: N,
+  reissueOcpiCdr: N,
+  retryOcpiCdrPush: N,
   createOcpiPartner: N,
   createOcpiTariffMapping: N,
   deleteOcpiPartner: N,
@@ -380,6 +400,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   getOcpiPartner: R,
   getOcpiPartnerNeighbors: N,
   getOcpiTariffMapping: R,
+  issueOcpiPartnerRegistrationToken: N,
   listOcpiCdrs: R,
   listOcpiLocations: R,
   listOcpiPartners: R,
@@ -524,6 +545,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   updateStripeSettings: N,
   upsertSitePaymentConfig: N,
   // PnC
+  addPncLocalCpoSubCa: N,
   createPncLocalCa: N,
   deletePncCaCertificate: N,
   getPncLocalCa: N,
@@ -636,6 +658,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   portalGetSession: N,
   portalGetSessionEnergyHistory: N,
   portalGetSessionPowerHistory: N,
+  portalClaimSessionVehicleId: N,
   portalListSessions: N,
   portalSetSessionVehicle: N,
   // Portal Support
@@ -658,6 +681,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   portalGetVehicleEfficiency: N,
   portalListVehicles: N,
   portalLookupVehicles: N,
+  portalUpdateVehicle: N,
   // Pricing
   bulkCreatePricingHolidays: N,
   createGroupTariff: N,
@@ -703,6 +727,11 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   reassignReservation: W,
   updateReservation: W,
   // Sessions
+  // Turns Autocharge on for a vehicle (station security): operator only.
+  claimSessionVehicleId: N,
+  // Ends an offline station's session with its normal billing, as the
+  // station's stop would: proposed, runs only after the user confirms.
+  endSession: W,
   // The guest portal's session token is dropped by the redactor.
   getSession: supportRead({ id: 'case.sessionIds' }, { redactedFields: ['sessionToken'] }),
   getSessionNeighbors: N,
@@ -712,6 +741,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   listSessionTransactionEvents: supportRead({ id: 'case.sessionIds' }),
   listSessions: R,
   rebillSession: N,
+  moveSessionBillingRecipient: N,
   // Settings
   deleteSetting: N,
   flushResponseCache: N,
@@ -743,6 +773,10 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   updateStationMessageTemplate: N,
   upsertSetting: N,
   // Sites
+  // What the AI watches is the operator's call: suppressing or resuming a
+  // site's AI insights is never an AI tool.
+  suppressSiteAiInsights: N,
+  resumeSiteAiInsights: N,
   addSitePricingGroup: N,
   createSite: W,
   createSiteElectricityRate: W,
@@ -789,6 +823,10 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   updateChargingProfileTemplate: W,
   // Stations
   acknowledgeEventAlert: W,
+  // What the AI watches is the operator's call: suppressing or resuming a
+  // station's AI insights is never an AI tool.
+  suppressStationAiInsights: N,
+  resumeStationAiInsights: N,
   addStationConnector: W,
   addStationEvse: W,
   addStationPricingGroup: N,
@@ -849,6 +887,10 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   refreshStationChargingProfiles: W,
   refreshStationConfigurations: W,
   rejectStation: W,
+  restoreStationConnector: W,
+  restoreStationEvse: W,
+  retireStationConnector: W,
+  retireStationEvse: W,
   removeStationPricingGroup: N,
   reorderStationImages: W,
   rotateStationCredentials: N,
@@ -922,6 +964,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   resendMfa: N,
   resendUserInvite: N,
   resetPassword: N,
+  resetUserMfa: N,
   resetUserPassword: N,
   setupMfa: N,
   updateCurrentUser: N,
@@ -939,6 +982,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   // rebase: main had the routes without policy entries, so codegen failed).
   getAiSiteUsage: N,
   getAiUsage: N,
+  getAiAlerts: N,
   getMyAiUsage: N,
   // --- end R1 ---
   // --- R4 MCP (append-only lane block) ---
@@ -958,6 +1002,10 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   sendAiInsightFeedback: N,
   clearAiInsightFeedback: N,
   getAiInsightFeedbackSummary: N,
+  // The wrong votes and their notes (untrusted operator text) never reach a
+  // model through the assistant or MCP (owner decision 2026-10-14): only a
+  // regeneration reads its requester's own note, framed and redacted.
+  listAiInsightWrongVotes: N,
   // Deciding the action an insight carries is an operator's judgment in the
   // CSMS, never a tool (v0.1.45, the AI Inbox merged into insights).
   confirmAiInsightAction: N,
@@ -1014,6 +1062,7 @@ export const AI_MCP_EXPOSURE: Readonly<Record<string, boolean>> = {
   getDashboardSiteLocations: true,
   getDashboardSnapshot: true,
   getDashboardSnapshotAvailableDates: true,
+  getDashboardSnapshotDayOverDay: true,
   getDashboardSnapshotTrend: true,
   getDashboardUptime: true,
   listDashboardEnergyHistory: true,
@@ -1262,6 +1311,7 @@ export const AI_MCP_EXPOSURE: Readonly<Record<string, boolean>> = {
   reassignReservation: false,
   updateReservation: false,
   // Sessions
+  endSession: false,
   getSession: true,
   listSessionMeterValues: true,
   listSessions: true,
@@ -1347,6 +1397,10 @@ export const AI_MCP_EXPOSURE: Readonly<Record<string, boolean>> = {
   refreshStationChargingProfiles: false,
   refreshStationConfigurations: false,
   rejectStation: false,
+  restoreStationConnector: false,
+  restoreStationEvse: false,
+  retireStationConnector: false,
+  retireStationEvse: false,
   reorderStationImages: false,
   setMainStationImage: false,
   stopActiveEvseSession: false,

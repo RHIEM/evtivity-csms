@@ -4,7 +4,8 @@
 /**
  * The `ai-insights` queue (roadmap v0.1.44, item 1): `generate` jobs (job id
  * = the insight id, delayed by the debounce when the scan created the
- * insight) and `translate` jobs (job id `ins-tr.<insightId>.<language>`; a
+ * insight) and `translate` jobs (job id `ins-tr.<insightId>.<language>.<attempt>`,
+ * the try's stamp, so a retry after an unavailable translation is a new job; a
  * BullMQ job id cannot hold a colon). The scan adds generations directly;
  * the API publishes regenerations and translations on
  * `ai_insight_requests` and the bridge below adds them, so the same publish
@@ -34,6 +35,7 @@ import { generateInsight } from './ai-insights/generate.js';
 import type { InsightJobDeps } from './ai-insights/generate.js';
 import { translateInsight } from './ai-insights/translate.js';
 import { createOpsAdapter, resolveOpsAiConfig } from '@evtivity/services/ai-ops-config';
+import { aiProviderGate } from '@evtivity/services/ai-alerts';
 
 const log = createLogger('ai-insight-worker');
 
@@ -41,7 +43,7 @@ export const AI_INSIGHT_WORKER_CONCURRENCY = 2;
 
 export type AiInsightJobData =
   | { kind: 'generate'; insightId: string }
-  | { kind: 'translate'; insightId: string; language: string };
+  | { kind: 'translate'; insightId: string; language: string; attempt: number };
 
 const requestSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('generate'), insightId: z.string().min(1).max(64) }),
@@ -49,6 +51,7 @@ const requestSchema = z.discriminatedUnion('kind', [
     kind: z.literal('translate'),
     insightId: z.string().min(1).max(64),
     language: z.enum(['en', 'de', 'es', 'ko', 'zh', 'zh-TW']),
+    attempt: z.number().int().nonnegative(),
   }),
 ]);
 
@@ -58,7 +61,9 @@ function isFinalFailure(job: Pick<Job, 'attemptsMade' | 'opts' | 'finishedOn'>):
 }
 
 export function insightJobId(data: AiInsightJobData): string {
-  return data.kind === 'generate' ? data.insightId : `ins-tr.${data.insightId}.${data.language}`;
+  return data.kind === 'generate'
+    ? data.insightId
+    : `ins-tr.${data.insightId}.${data.language}.${String(data.attempt)}`;
 }
 
 let insightQueue: Queue | null = null;
@@ -110,6 +115,7 @@ export function defaultInsightJobDeps(pubsub: PubSubClient): InsightJobDeps {
       resolveOpsAiConfig(settings, config.SETTINGS_ENCRYPTION_KEY, nodeEnv === 'development'),
     createAdapter: createOpsAdapter,
     checkBudgets: checkAiBudgets,
+    providerGate: aiProviderGate,
     pubsub,
     now: () => new Date(),
     subjectSecret: config.SETTINGS_ENCRYPTION_KEY,

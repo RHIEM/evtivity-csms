@@ -49,7 +49,8 @@ function makeChain(): Record<string, unknown> {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -115,6 +116,7 @@ const panelRow = {
   maxContinuousKw: '38.4',
   safetyMarginKw: '0',
   oversubscriptionRatio: '1',
+  phaseConnections: null,
   sortOrder: 0,
   createdAt: created,
   updatedAt: created,
@@ -127,6 +129,7 @@ const circuitRow = {
   breakerRatingAmps: 40,
   maxContinuousKw: '7.68',
   phaseConnections: null,
+  voltageV: null,
   sortOrder: 0,
   createdAt: created,
   updatedAt: created,
@@ -271,6 +274,9 @@ describe('load management audit', () => {
       after: { circuitId: 'cir_a', breakerRatingAmps: 50, maxContinuousKw: '9.6' },
       notes: 'circuit updated: Bay 1',
     });
+    // The returned station count leaves out conformance test stations.
+    const { isOperatorStation } = await import('@evtivity/database');
+    expect(vi.mocked(isOperatorStation)).toHaveBeenCalled();
   });
 
   it('PATCH station circuit writes a station updated row with the circuit change', async () => {

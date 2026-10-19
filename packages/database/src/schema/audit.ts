@@ -141,6 +141,7 @@ export const driverAuditActionEnum = pgEnum('driver_audit_action', [
   'mfa_enabled',
   'mfa_disabled',
   'roaming_session_started',
+  'erased',
 ]);
 
 export const driverAuditLog = pgTable(
@@ -220,6 +221,9 @@ export const userAuditActionEnum = pgEnum('user_audit_action', [
   'login_failed',
   // Complete audit coverage (v0.1.46, 0475).
   'invite_resent',
+  // Operator access hardening (v0.1.46, 0475).
+  'mfa_reset',
+  'account_locked',
 ]);
 
 export const userAuditLog = pgTable(
@@ -251,6 +255,11 @@ export const vehicleAuditActionEnum = pgEnum('vehicle_audit_action', [
   'created',
   'updated',
   'deleted',
+  'autocharge_enabled',
+  'autocharge_disabled',
+  'autocharge_blocked',
+  'autocharge_unblocked',
+  'vehicle_id_claimed',
 ]);
 
 export const vehicleAuditLog = pgTable(
@@ -916,6 +925,12 @@ export const sessionAuditActionEnum = pgEnum('session_audit_action', [
   'faulted',
   'stopped_by_csms',
   'vehicle_changed',
+  // Operator CDR reissue and push retry (v0.1.46, 0475).
+  'cdr_reissued',
+  'cdr_push_retried',
+  // An operator moved an unbilled account session between the fleet invoice
+  // and the member invoice (v0.1.47, 0477).
+  'billing_reassigned',
 ]);
 
 export const sessionAuditLog = pgTable(
@@ -1227,13 +1242,16 @@ export const eventAlertRuleAuditLog = pgTable(
   ],
 );
 
-// Report schedule audit (v0.1.46, 0475): schedule changes, and a deleted
-// report as 'report_deleted' (the report id in notes).
+// Report schedule audit (v0.1.46, 0475): schedule changes, and a generated,
+// downloaded or deleted report as 'report_generated', 'report_downloaded' or
+// 'report_deleted' (the report id in notes).
 export const reportScheduleAuditActionEnum = pgEnum('report_schedule_audit_action', [
   'created',
   'updated',
   'deleted',
   'report_deleted',
+  'report_generated',
+  'report_downloaded',
 ]);
 
 export const reportScheduleAuditLog = pgTable(

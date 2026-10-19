@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/lib",
-  "version": "0.1.46-beta.3",
+  "version": "0.1.47-beta.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -43,6 +43,15 @@
     },
     "./station-password": {
       "import": "./src/station-password.ts"
+    },
+    "./id-token-types": {
+      "import": "./src/id-token-types.ts"
+    },
+    "./session-cost": {
+      "import": "./src/session-cost.ts"
+    },
+    "./vehicle-id": {
+      "import": "./src/vehicle-id.ts"
     },
     "./secret-config": {
       "import": "./src/secret-config.ts"
@@ -110,11 +119,17 @@
     "./notification-test-sink": {
       "import": "./src/notification-test-sink.ts"
     },
+    "./trust-proxy": {
+      "import": "./src/trust-proxy.ts"
+    },
     "./pdf-branding": {
       "import": "./src/pdf-branding.ts"
     },
     "./invoice-seller": {
       "import": "./src/invoice-seller.ts"
+    },
+    "./invoice-payment": {
+      "import": "./src/invoice-payment.ts"
     }
   },
   "scripts": {

@@ -111,7 +111,11 @@ describe('startGuestSessionBridge', () => {
     expect(add).toHaveBeenCalledWith(
       'guest-session-ended',
       { sessionId: 'ses_abc123' },
-      expect.objectContaining({ jobId: 'guest-session-ended-ses_abc123', attempts: 3 }),
+      expect.objectContaining({
+        jobId: 'guest-session-ended-ses_abc123',
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+      }),
     );
     expect(mockLog.info).toHaveBeenCalledWith('Guest session bridge started');
   });
@@ -136,8 +140,26 @@ describe('startGuestSessionBridge', () => {
     expect(add).toHaveBeenCalledWith(
       'guest-session-started',
       expect.objectContaining({ event: expect.objectContaining({ type: 'TransactionStarted' }) }),
-      expect.objectContaining({ jobId: 'guest-session-started-TOKEN123', attempts: 3 }),
+      expect.objectContaining({
+        jobId: 'guest-session-started-TOKEN123',
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+      }),
     );
+  });
+
+  it('builds a colon-free job id for an Autocharge vid: token', async () => {
+    const { enqueueGuestSessionStarted } = guestSessionWorkerModule;
+    const add = vi.fn().mockResolvedValue(undefined);
+
+    await enqueueGuestSessionStarted({ add } as never, {
+      type: 'TransactionStarted',
+      idToken: { idToken: 'vid:0a1b2c3d4e5f', type: 'Central' },
+    });
+
+    const jobId = (add.mock.calls[0]?.[2] as { jobId: string }).jobId;
+    expect(jobId).toBe('guest-session-started-vid%3A0a1b2c3d4e5f');
+    expect(jobId).not.toContain(':');
   });
 
   it('ignores unrelated events', async () => {

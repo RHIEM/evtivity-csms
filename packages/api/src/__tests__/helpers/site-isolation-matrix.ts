@@ -65,6 +65,8 @@ export interface SiteFixture {
   campaign: string;
   /** An active firmware campaign at the site, for the cancel route. */
   activeCampaign: string;
+  /** A draft firmware campaign at the site with no station rows yet, for the start control. */
+  startCampaign: string;
   profileTemplate: string;
   profilePush: string;
   maintenance: string;
@@ -117,6 +119,8 @@ export interface MatrixWorld {
   role: string;
   /** A Plug and Charge trust store CA certificate. */
   caCertificate: number;
+  /** Yesterday in the system timezone, the day of the newest snapshot rows. */
+  snapshotDay: string;
 }
 
 type UrlFn = (f: SiteFixture, w: MatrixWorld) => string;
@@ -509,6 +513,15 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'AI_INSIGHT_NOT_FOUND',
     { unsited: true },
   ),
+  // The wrong votes and their notes: the insight's own gate (404 outside the sites).
+  s(
+    'GET',
+    '/ai/insights/:id/feedback',
+    'aiInsights:read',
+    (f) => `/ai/insights/${f.insight}/feedback`,
+    'AI_INSIGHT_NOT_FOUND',
+    { unsited: true },
+  ),
   // Votes by kind, no ids in the answer: the dedicated case proves the site filter.
   l('/ai/insights/feedback-summary', 'aiInsights:read', undefined, {
     noLimit: true,
@@ -863,13 +876,17 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
   l('/dashboard/snapshots/trend', 'dashboard:read', undefined, {
     counts: [{ path: 'days.@sum:totalStations', all: 21, a: 1 }],
   }),
+  // Yesterday in the system timezone: A's one row against A's and B's.
+  l('/dashboard/snapshots/day-over-day', 'dashboard:read', undefined, {
+    counts: [{ path: 'current.totalStations', all: 11, a: 1 }],
+  }),
   l('/dashboard/snapshots/available-dates', 'dashboard:read', undefined, {
     counts: [{ path: 'length', all: 2, a: 1 }],
   }),
   l(
     '/dashboard/snapshots',
     'dashboard:read',
-    () => `/dashboard/snapshots?date=${iso(-24).slice(0, 10)}`,
+    (_f, w) => `/dashboard/snapshots?date=${w.snapshotDay}`,
     { counts: [{ path: 'totalStations', all: 11, a: 1 }] },
   ),
   l('/dashboard/carbon-stats', 'dashboard:read', undefined, {
@@ -952,6 +969,20 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     (_f, w) => `/drivers/${w.driver}/pricing-groups/${w.pricingGroup}`,
     'PRICING_GROUP_NOT_FOUND',
   ),
+  // The erasure reaches the driver's data at every site: all-site users only.
+  // The control sends a confirmation that does not match, so the shared
+  // fixture driver is never erased.
+  c(
+    'POST',
+    '/drivers/:id/erase',
+    'drivers:write',
+    (_f, w) => `/drivers/${w.driver}/erase`,
+    'DRIVER_NOT_FOUND',
+    {
+      body: () => ({ confirm: 'not-the-driver-id' }),
+      control: ctl(400, 'VALIDATION_ERROR', 'the confirmation does not repeat the driver id'),
+    },
+  ),
 
   // event alert rules (company-wide writes)
   c('POST', '/event-alert-rules', 'stations:write', () => '/event-alert-rules', 'RULE_NOT_FOUND', {
@@ -1030,7 +1061,9 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'CAMPAIGN_NOT_FOUND',
     {
       body: () => ({}),
-      control: ctl(409, 'NO_TARGETS', 'no station is connected, so none matches the campaign'),
+      // Every matching station is a target, online or not (an offline one
+      // gets the update when it connects), so A's own draft starts.
+      control: { url: (f) => `/firmware-campaigns/${f.startCampaign}/start` },
     },
   ),
   s(
@@ -1085,6 +1118,28 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
         'FLEET_INVOICE_NOTHING_TO_BILL',
         'the driver has no member-billed session of the fleet in the period',
       ),
+    },
+  ),
+  c(
+    'POST',
+    '/fleets/:id/billing-recipient',
+    'payments:write',
+    (_f, w) => `/fleets/${w.fleet}/billing-recipient`,
+    'FLEET_NOT_FOUND',
+    {
+      body: (_f, w) => ({ recipient: 'member', driverIds: [w.driver], period: '2026-01' }),
+      control: ctl(409, 'FLEET_ACCOUNT_BILLING_OFF', 'the seeded fleet does not bill on account'),
+    },
+  ),
+  c(
+    'PATCH',
+    '/sessions/:id/billing-recipient',
+    'payments:write',
+    (f) => `/sessions/${f.session}/billing-recipient`,
+    'SESSION_NOT_FOUND',
+    {
+      body: () => ({ recipient: 'member' }),
+      control: ctl(409, 'SESSION_NOT_ON_ACCOUNT', 'the seeded session is not billed on account'),
     },
   ),
   c(
@@ -1331,6 +1386,24 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'payments:read',
     (f) => `/invoices/${f.invoice}/neighbors`,
     'INVOICE_NOT_FOUND',
+  ),
+
+  // AI insight suppression of a site
+  s(
+    'POST',
+    '/sites/:id/ai-insights/suppress',
+    'sites:write',
+    (f) => `${sit(f)}/ai-insights/suppress`,
+    'SITE_NOT_FOUND',
+    { body: () => ({ reason: 'site isolation matrix' }) },
+  ),
+  s(
+    'POST',
+    '/sites/:id/ai-insights/resume',
+    'sites:write',
+    (f) => `${sit(f)}/ai-insights/resume`,
+    'SITE_NOT_FOUND',
+    { body: () => ({}) },
   ),
 
   // load management
@@ -1670,6 +1743,30 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     unsited: true,
     body: (f) => ({ originalCdrId: f.cdr, reason: 'Credit' }),
   }),
+  s(
+    'POST',
+    '/ocpi/cdrs/:id/reissue',
+    'roaming:write',
+    (f) => `/ocpi/cdrs/${f.cdr}/reissue`,
+    'CDR_NOT_FOUND',
+    { unsited: true, body: () => ({ reason: 'Reissue' }) },
+  ),
+  s(
+    'POST',
+    '/ocpi/cdrs/:id/push',
+    'roaming:write',
+    (f) => `/ocpi/cdrs/${f.cdr}/push`,
+    'CDR_NOT_FOUND',
+    {
+      unsited: true,
+      control: {
+        status: 409,
+        code: 'CDR_PUSH_NOT_FAILED',
+        reason:
+          'the test CDR was never pushed, so it cannot be retried; checked after the site check',
+      },
+    },
+  ),
   l('/ocpi/locations', 'roaming:read'),
   s(
     'GET',
@@ -1725,7 +1822,18 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'PARTNER_NOT_FOUND',
     {
       body: () => ({}),
-      control: ctl(400, 'MISSING_VERSION_URL', 'the seeded partner has no version URL'),
+      control: ctl(409, 'PARTNER_ALREADY_CONNECTED', 'the seeded partner is connected'),
+    },
+  ),
+  c(
+    'POST',
+    '/ocpi/partners/:id/registration-token',
+    'roaming:write',
+    (_f, w) => `/ocpi/partners/${w.partner}/registration-token`,
+    'PARTNER_NOT_FOUND',
+    {
+      body: () => ({}),
+      control: ctl(409, 'PARTNER_ALREADY_CONNECTED', 'the seeded partner is connected'),
     },
   ),
   c(
@@ -2297,6 +2405,18 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
   ),
   s(
     'POST',
+    '/sessions/:id/end',
+    'sessions:write',
+    (f) => `/sessions/${f.session}/end`,
+    'SESSION_NOT_FOUND',
+    {
+      unsited: true,
+      body: () => ({}),
+      control: ctl(409, 'SESSION_NOT_ACTIVE', 'the seeded session is not active'),
+    },
+  ),
+  s(
+    'POST',
     '/sessions/:id/rebill',
     'payments:write',
     (f) => `/sessions/${f.session}/rebill`,
@@ -2308,6 +2428,22 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
         409,
         'SESSION_REBILL_NOT_ELIGIBLE',
         'the seeded session is not eligible for re-billing',
+      ),
+    },
+  ),
+  s(
+    'POST',
+    '/sessions/:id/vehicle-claim',
+    'drivers:write',
+    (f) => `/sessions/${f.session}/vehicle-claim`,
+    'SESSION_NOT_FOUND',
+    {
+      unsited: true,
+      body: () => ({ vehicle: { make: 'Matrix', model: 'Vehicle' } }),
+      control: ctl(
+        409,
+        'SESSION_NO_VEHICLE_ID',
+        'the seeded session has no vehicle id from the charger',
       ),
     },
   ),
@@ -2878,6 +3014,54 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     '/stations/:id/evses/:evseId/connectors/:connectorId',
     'stations:write',
     (f) => `${st(f)}/evses/${String(f.evse)}/connectors/${String(f.connector)}`,
+    'STATION_NOT_FOUND',
+    { unsited: true },
+  ),
+  s(
+    'POST',
+    '/stations/:id/ai-insights/suppress',
+    'stations:write',
+    (f) => `${st(f)}/ai-insights/suppress`,
+    'STATION_NOT_FOUND',
+    { unsited: true, body: () => ({ reason: 'site isolation matrix' }) },
+  ),
+  s(
+    'POST',
+    '/stations/:id/ai-insights/resume',
+    'stations:write',
+    (f) => `${st(f)}/ai-insights/resume`,
+    'STATION_NOT_FOUND',
+    { unsited: true, body: () => ({}) },
+  ),
+  s(
+    'POST',
+    '/stations/:id/evses/:evseId/retire',
+    'stations:write',
+    (f) => `${st(f)}/evses/${String(f.evse)}/retire`,
+    'STATION_NOT_FOUND',
+    { unsited: true },
+  ),
+  s(
+    'POST',
+    '/stations/:id/evses/:evseId/connectors/:connectorId/retire',
+    'stations:write',
+    (f) => `${st(f)}/evses/${String(f.evse)}/connectors/${String(f.connector)}/retire`,
+    'STATION_NOT_FOUND',
+    { unsited: true },
+  ),
+  s(
+    'POST',
+    '/stations/:id/evses/:evseId/restore',
+    'stations:write',
+    (f) => `${st(f)}/evses/${String(f.evse)}/restore`,
+    'STATION_NOT_FOUND',
+    { unsited: true },
+  ),
+  s(
+    'POST',
+    '/stations/:id/evses/:evseId/connectors/:connectorId/restore',
+    'stations:write',
+    (f) => `${st(f)}/evses/${String(f.evse)}/connectors/${String(f.connector)}/restore`,
     'STATION_NOT_FOUND',
     { unsited: true },
   ),
@@ -3622,6 +3806,37 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     (f) => `/users/${f.user}/neighbors`,
     'USER_NOT_FOUND',
   ),
+  s(
+    'POST',
+    '/users/:id/mfa/reset',
+    'users:write',
+    (f) => `/users/${f.user}/mfa/reset`,
+    'USER_NOT_FOUND',
+    {
+      body: () => ({}),
+    },
+  ),
+  s(
+    'GET',
+    '/users/:id/api-keys',
+    'users:read',
+    (f) => `/users/${f.user}/api-keys`,
+    'USER_NOT_FOUND',
+  ),
+  s(
+    'DELETE',
+    '/users/:id/api-keys/:keyId',
+    'users:write',
+    (f) => `/users/${f.user}/api-keys/1`,
+    'USER_NOT_FOUND',
+    {
+      control: {
+        status: 404,
+        code: 'API_KEY_NOT_FOUND',
+        reason: 'the matrix users hold no API key: the user check passed, the key lookup refuses',
+      },
+    },
+  ),
   // system, security and SSO settings: all-site access only (REVIEW2 #1, #2)
   // REVIEW2 #2: generic settings hold the payment provider, currency, secrets and SMTP.
   // A restricted user gets only SITE_RESTRICTED_SETTING_KEYS.
@@ -3669,6 +3884,8 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     () => '/settings/ai/defaults',
     'SETTING_NOT_FOUND',
   ),
+  // The AI alerts (provider quota, company budget) are company-wide like Settings > AI.
+  c('GET', '/ai/alerts', 'settings.ai:read', () => '/ai/alerts', 'SETTING_NOT_FOUND'),
   c(
     'GET',
     '/settings/s3/status',
@@ -3809,6 +4026,21 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'SETTING_NOT_FOUND',
     { body: () => ({}) },
   ),
+  c(
+    'POST',
+    '/pnc/settings/local-ca/cpo-sub-ca',
+    'settings.integrations:write',
+    () => '/pnc/settings/local-ca/cpo-sub-ca',
+    'SETTING_NOT_FOUND',
+    {
+      body: () => ({}),
+      control: ctl(
+        409,
+        'LOCAL_CPO_SUB_CA_EXISTS',
+        'the CA created by the entry above already has its CPO Sub-CAs',
+      ),
+    },
+  ),
 
   // fleets: the records are company-wide, their station counts per site (REVIEW2 #15)
   l('/fleets', 'fleets:read', undefined, {
@@ -3945,6 +4177,8 @@ export const SITE_ISOLATION_ALLOWLIST: AllowlistEntry[] = [
       ['POST', '/drivers/:id/vehicles'],
       ['PATCH', '/drivers/:id/vehicles/:vehicleId'],
       ['DELETE', '/drivers/:id/vehicles/:vehicleId'],
+      ['POST', '/drivers/:id/vehicles/:vehicleId/block'],
+      ['POST', '/drivers/:id/vehicles/:vehicleId/unblock'],
       ['GET', '/vehicles/lookup'],
       ['GET', '/drivers/:id/pricing-groups'],
       ['GET', '/drivers/:id/neighbors'],

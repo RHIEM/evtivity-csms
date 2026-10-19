@@ -96,6 +96,7 @@ function makeChain() {
     'returning',
     'set',
     'onConflictDoUpdate',
+    'onConflictDoNothing',
     'delete',
     'insert',
     'update',
@@ -147,8 +148,11 @@ vi.mock('@evtivity/database', async () => {
   // db.transaction. Reuse the same mocked db inside the callback so the
   // chained query helpers above continue to drive the test.
   dbMock['transaction'] = vi.fn((cb: (tx: unknown) => Promise<unknown>) => cb(dbMock));
+  const suppression = await import('@evtivity/database/src/lib/ai-insight-suppression.js');
   return {
+    ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
     ...rawTimestamp,
+    ...suppression,
     db: dbMock,
     client: {},
     setStationDisabled: mockSetStationDisabled,
@@ -192,6 +196,7 @@ vi.mock('@evtivity/database', async () => {
     writeAudit: vi.fn().mockResolvedValue(undefined),
     siteAuditLog: {},
     stationAuditLog: {},
+    sessionAuditLog: {},
     driverAuditLog: {},
     fleetAuditLog: {},
     userAuditLog: {},
@@ -238,6 +243,11 @@ const { changeStationPasswordMock, changeSecurityProfileMock, rotateStationPassw
     changeSecurityProfileMock: vi.fn(),
     rotateStationPasswordMock: vi.fn(),
   }));
+
+vi.mock('../services/station-ai-insights.service.js', () => ({
+  suppressStationAiInsights: vi.fn(),
+  resumeStationAiInsights: vi.fn(),
+}));
 
 vi.mock('../services/station-security.service.js', () => ({
   changeStationPassword: changeStationPasswordMock,
@@ -315,6 +325,7 @@ vi.mock('../middleware/rbac.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { stationRoutes } from '../routes/stations.js';
+import { resumeStationAiInsights } from '../services/station-ai-insights.service.js';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -375,8 +386,10 @@ describe('Station routes - handler logic', () => {
         status: 'available',
         connectorCount: 2,
         connectorTypes: ['CCS2'],
+        siteName: null,
         siteFreeVendEnabled: false,
         underMaintenance: false,
+        aiInsightsSuppressed: false,
       };
       // First call: data query, second call: count subquery
       setupDbResults([stationRow], [{ count: 1 }]);
@@ -454,8 +467,18 @@ describe('Station routes - handler logic', () => {
         updatedAt: '2024-01-01T00:00:00.000Z',
         status: 'available',
         siteHoursOfOperation: null,
+        siteName: null,
+        siteTimezone: null,
         siteFreeVendEnabled: false,
         underMaintenance: false,
+        aiInsightsSuppressed: true,
+        aiInsightsSuppressedByMaintenance: false,
+        aiInsightsSuppressedSources: ['station'],
+        aiInsightsSuppressedAt: '2024-01-02T00:00:00.000Z',
+        aiInsightsSuppressedUntil: null,
+        aiInsightsSuppressedBy: 'usr_1',
+        aiInsightsSuppressedByName: 'Ada Lovelace',
+        aiInsightsSuppressedReason: 'Site works',
       };
       setupDbResults([station]);
 
@@ -624,7 +647,8 @@ describe('Station routes - handler logic', () => {
       const moved = { ...station, siteId: 'sit_000000000002' };
 
       mockAddJob.mockClear();
-      setupDbResults([station], [moved]);
+      // 1: the target site exists, 2: before SELECT, 3: UPDATE returning
+      setupDbResults([{ id: 'sit_000000000002' }], [station], [moved]);
       const response = await app.inject({
         method: 'PATCH',
         url: `/stations/${VALID_STATION_ID}`,
@@ -636,7 +660,7 @@ describe('Station routes - handler logic', () => {
       expect(repush?.[1]).toEqual({ stationId: VALID_STATION_ID });
 
       mockAddJob.mockClear();
-      setupDbResults([moved], [moved]);
+      setupDbResults([{ id: 'sit_000000000002' }], [moved], [moved]);
       await app.inject({
         method: 'PATCH',
         url: `/stations/${VALID_STATION_ID}`,
@@ -703,8 +727,10 @@ describe('Station routes - handler logic', () => {
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
-      // 1: before SELECT, 2: UPDATE returning, 3: the station's EVSEs
+      // 1: the target site exists, 2: before SELECT, 3: UPDATE returning,
+      // 4: the station's EVSEs
       setupDbResults(
+        [{ id: 'sit_000000000002' }],
         [{ ...base, siteId: 'sit_000000000001' }],
         [{ ...base, siteId: 'sit_000000000002' }],
         [{ id: 'evs_000000000001' }],
@@ -946,8 +972,8 @@ describe('Station routes - handler logic', () => {
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
-      // 1: before SELECT, 2: UPDATE returning
-      setupDbResults([station], [station]);
+      // 1: before SELECT, 2: active session check, 3: UPDATE returning
+      setupDbResults([station], [], [station]);
 
       const response = await app.inject({
         method: 'DELETE',
@@ -979,7 +1005,7 @@ describe('Station routes - handler logic', () => {
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
-      setupDbResults([station], [station]);
+      setupDbResults([station], [], [station]);
 
       const response = await app.inject({
         method: 'DELETE',
@@ -1013,7 +1039,7 @@ describe('Station routes - handler logic', () => {
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
-      setupDbResults([station], [station]);
+      setupDbResults([station], [], [station]);
       mockPublish.mockClear();
 
       const response = await app.inject({
@@ -1050,7 +1076,7 @@ describe('Station routes - handler logic', () => {
         updatedAt: '2024-01-01T00:00:00.000Z',
       };
       // 1: before SELECT, 2: UPDATE returning, 3: css_stations UPDATE
-      setupDbResults([station], [station], []);
+      setupDbResults([station], [], [station], []);
       const { db, cssStations } = await import('@evtivity/database');
       const updateMock = vi.mocked(db.update);
       updateMock.mockClear();
@@ -1091,23 +1117,27 @@ describe('Station routes - handler logic', () => {
         {
           evseId: 1,
           evseAutoCreated: false,
+          evseRetiredAt: null,
           connectorId: 1,
           connectorType: 'CCS2',
           maxPowerKw: '150',
           maxCurrentAmps: null,
           connectorStatus: 'available',
           connectorAutoCreated: false,
+          connectorRetiredAt: null,
           isIdling: false,
         },
         {
           evseId: 1,
           evseAutoCreated: false,
+          evseRetiredAt: null,
           connectorId: 2,
           connectorType: 'CHAdeMO',
           maxPowerKw: '50',
           maxCurrentAmps: null,
           connectorStatus: 'available',
           connectorAutoCreated: false,
+          connectorRetiredAt: null,
           isIdling: false,
         },
       ];
@@ -1556,6 +1586,43 @@ describe('Station routes - handler logic', () => {
       expect(response.json().code).toBe('STATION_TIMEOUT');
     });
 
+    it('returns 409 STATION_OFFLINE when the stop is queued for an offline station, audited as queued', async () => {
+      const { sendOcppCommandAndWait } = await import('@evtivity/services/ocpp-command');
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        error: 'Station offline, command queued',
+        queued: true,
+      });
+      const { writeAudit } = await import('@evtivity/database');
+      vi.mocked(writeAudit).mockClear();
+      mockPublish.mockClear();
+      setupDbResults(
+        [{ stationId: 'CS-001', ocppProtocol: 'ocpp2.1' }],
+        [{ id: 'evs_000000000001' }],
+        [{ id: 'ses_000000000001', transactionId: 'tx-abc' }],
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/stations/${VALID_STATION_ID}/evses/1/stop-active-session`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('STATION_OFFLINE');
+      // The station and session audits keep the queued outcome.
+      const audits = vi
+        .mocked(writeAudit)
+        .mock.calls.map((c) => c[1] as { action: string; after: { outcome: string } });
+      expect(audits.map((a) => [a.action, a.after.outcome])).toEqual([
+        ['command_dispatched', 'queued'],
+        ['stopped_by_csms', 'queued'],
+      ]);
+      // No session end: the station still holds the transaction.
+      expect(mockPublish).not.toHaveBeenCalledWith('session_end_requests', expect.anything());
+    });
+
     it('returns 404 when station not found', async () => {
       setupDbResults([]);
 
@@ -1891,6 +1958,44 @@ describe('Station routes - handler logic', () => {
       expect(body.data[1].severity).toBe('critical');
       expect(body.data[0].createdAt).toBe('2026-10-10T10:49:38.215Z');
     });
+
+    it('accepts a severity filter', async () => {
+      const { db } = (await import('@evtivity/database')) as unknown as {
+        db: { execute: ReturnType<typeof vi.fn> };
+      };
+      db.execute
+        .mockResolvedValueOnce([
+          {
+            id: 'security:5',
+            source: 'security',
+            event: 'TamperDetectionActivated',
+            severity: 'critical',
+            remote_address: null,
+            metadata: null,
+            created_at: new Date(),
+          },
+        ])
+        .mockResolvedValueOnce([{ count: 1 }]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/stations/${VALID_STATION_ID}/security-logs?severity=critical`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data[0].severity).toBe('critical');
+    });
+
+    it('rejects an unknown severity', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/stations/${VALID_STATION_ID}/security-logs?severity=urgent`,
+        headers: { authorization: 'Bearer ' + token },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
   });
 
   // --- GET /v1/stations/:id/meter-public-keys ---
@@ -2172,6 +2277,7 @@ describe('Station routes - handler logic', () => {
         [evse],
         [{ connectorId: 1 }], // pre-validation: all body connectorIds exist
         [], // tx.update inside transaction (no .returning(); chain still consumes one slot)
+        [], // paired simulator lookup: none
         updatedConnectors, // final select result
       );
 
@@ -2658,9 +2764,9 @@ describe('Station routes - handler logic', () => {
   describe('POST /v1/stations/:id/certificates/delete', () => {
     it('publishes DeleteCertificate command and returns success', async () => {
       const { db } = await import('@evtivity/database');
-      (db.execute as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
-        { station_id: 'STATION-001' },
-      ]);
+      (db.execute as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([{ station_id: 'STATION-001' }])
+        .mockResolvedValueOnce([]);
 
       const response = await app.inject({
         method: 'POST',
@@ -2682,6 +2788,30 @@ describe('Station routes - handler logic', () => {
         'ocpp_commands',
         expect.stringContaining('DeleteCertificate'),
       );
+    });
+
+    it('names the type of the stored certificate so a 1.6 station gets the right message', async () => {
+      const { db } = await import('@evtivity/database');
+      (db.execute as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([{ station_id: 'STATION-001' }])
+        .mockResolvedValueOnce([{ certificate_type: 'MORootCertificate' }]);
+      mockPublish.mockClear();
+      await app.inject({
+        method: 'POST',
+        url: `/stations/${VALID_STATION_ID}/certificates/delete`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: {
+          certificateHashData: {
+            hashAlgorithm: 'SHA256',
+            issuerNameHash: 'abc123',
+            issuerKeyHash: 'def456',
+            serialNumber: '789',
+          },
+        },
+      });
+      const call = mockPublish.mock.calls.find((c) => c[0] === 'ocpp_commands');
+      const message = JSON.parse(String(call?.[1])) as { payload: Record<string, unknown> };
+      expect(message.payload['certificateType']).toBe('MORootCertificate');
     });
 
     it('returns 404 when station not found', async () => {
@@ -2809,12 +2939,13 @@ describe('Station routes - handler logic', () => {
     });
   });
 
+  // The onboarding service: 1: compare-and-set UPDATE returning the moved
+  // station, and when it moved none, 2: does the station exist.
   describe('POST /stations/:id/approve', () => {
+    const moved = { stationId: 'STATION-001', isSimulator: false, siteId: null };
+
     it('approves a pending station', async () => {
-      setupDbResults(
-        [{ onboardingStatus: 'pending' }], // select station
-        [{ id: VALID_STATION_ID }], // update
-      );
+      setupDbResults([moved]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/approve`,
@@ -2824,29 +2955,31 @@ describe('Station routes - handler logic', () => {
     });
 
     it('returns 409 when station is not pending', async () => {
-      setupDbResults([{ onboardingStatus: 'accepted' }]);
+      setupDbResults([], [{ id: VALID_STATION_ID }]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/approve`,
         headers: { authorization: 'Bearer ' + token },
       });
       expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('NOT_PENDING');
     });
 
     it('returns 404 when station not found', async () => {
-      setupDbResults([]);
+      setupDbResults([], []);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/approve`,
         headers: { authorization: 'Bearer ' + token },
       });
       expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('STATION_NOT_FOUND');
     });
   });
 
   describe('POST /stations/:id/reject', () => {
     it('blocks a pending station', async () => {
-      setupDbResults([{ onboardingStatus: 'pending' }], [{ id: VALID_STATION_ID }]);
+      setupDbResults([{ stationId: 'STATION-001', isSimulator: false, siteId: null }]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/reject`,
@@ -2856,19 +2989,20 @@ describe('Station routes - handler logic', () => {
     });
 
     it('returns 409 when station is not pending', async () => {
-      setupDbResults([{ onboardingStatus: 'blocked' }]);
+      setupDbResults([], [{ id: VALID_STATION_ID }]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/reject`,
         headers: { authorization: 'Bearer ' + token },
       });
       expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('NOT_PENDING');
     });
   });
 
   describe('POST /stations/:id/unblock', () => {
     it('unblocks a blocked station back to pending', async () => {
-      setupDbResults([{ onboardingStatus: 'blocked' }], [{ id: VALID_STATION_ID }]);
+      setupDbResults([{ stationId: 'STATION-001', isSimulator: false, siteId: null }]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/unblock`,
@@ -2878,23 +3012,56 @@ describe('Station routes - handler logic', () => {
     });
 
     it('returns 409 when station is not blocked', async () => {
-      setupDbResults([{ onboardingStatus: 'pending' }]);
+      setupDbResults([], [{ id: VALID_STATION_ID }]);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/unblock`,
         headers: { authorization: 'Bearer ' + token },
       });
       expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('NOT_BLOCKED');
     });
 
     it('returns 404 when station not found', async () => {
-      setupDbResults([]);
+      setupDbResults([], []);
       const response = await app.inject({
         method: 'POST',
         url: `/stations/${VALID_STATION_ID}/unblock`,
         headers: { authorization: 'Bearer ' + token },
       });
       expect(response.statusCode).toBe(404);
+    });
+  });
+
+  describe('POST /v1/stations/:id/ai-insights/resume', () => {
+    it('answers 409 STATION_SITE_SUPPRESSED while the site of the station is suppressed', async () => {
+      vi.mocked(resumeStationAiInsights).mockResolvedValueOnce('site_suppressed');
+      const response = await app.inject({
+        method: 'POST',
+        url: `/stations/${VALID_STATION_ID}/ai-insights/resume`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json<{ code: string }>().code).toBe('STATION_SITE_SUPPRESSED');
+    });
+
+    it('resumes a station whose site is in scope', async () => {
+      vi.mocked(resumeStationAiInsights).mockResolvedValueOnce({
+        suppressedAt: null,
+        suppressedUntil: null,
+        suppressedBy: null,
+        suppressedByName: null,
+        reason: null,
+      });
+      const response = await app.inject({
+        method: 'POST',
+        url: `/stations/${VALID_STATION_ID}/ai-insights/resume`,
+        headers: { authorization: 'Bearer ' + token },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json<Record<string, unknown>>().aiInsightsSuppressedAt).toBeNull();
     });
   });
 });

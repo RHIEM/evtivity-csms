@@ -3,8 +3,14 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, and, ilike, sql, desc, gte, lte, inArray } from 'drizzle-orm';
-import { db, authorizeAttempts, chargingStations, chargingSessions } from '@evtivity/database';
+import { eq, and, or, ilike, sql, desc, gte, lte, inArray, isNull } from 'drizzle-orm';
+import {
+  db,
+  authorizeAttempts,
+  chargingStations,
+  chargingSessions,
+  isOperatorStation,
+} from '@evtivity/database';
 import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
 import { paginationQuery } from '../lib/pagination.js';
 import { paginatedResponse } from '../lib/response-schemas.js';
@@ -45,11 +51,25 @@ const attemptItem = z
       .string()
       .nullable()
       .describe(
-        'charging_sessions.id when this attempt resulted in a charging session (correlated by matched token + start within 10 minutes of the attempt). Null when no session followed.',
+        'charging_sessions.id when this attempt resulted in a charging session (correlated by matched token, the same station and a start within 10 minutes of the attempt). Null when no session followed.',
       ),
     outcome: z.string().describe('Outcome enum'),
     ocppVersion: z.string().nullable().describe('OCPP protocol version of the request'),
     reason: z.string().nullable().describe('Short machine-readable reason tag'),
+    vehicleIdValue: z
+      .string()
+      .nullable()
+      .describe(
+        'Vehicle id the start carried (the token itself, a 2.1 additionalInfo entry or a vehicle-shaped 1.6 idTag), normalized; refused starts included',
+      ),
+    vehicleIdType: z
+      .string()
+      .nullable()
+      .describe('Type of the vehicle id: VIN, EVCCID or MacAddress'),
+    matchedVehicleId: z
+      .string()
+      .nullable()
+      .describe('Autocharge vehicle that authorized or refused the start'),
     createdAt: z.coerce.date().describe('Timestamp of the attempt'),
   })
   .passthrough();
@@ -104,11 +124,20 @@ export function authorizeAttemptRoutes(app: FastifyInstance): void {
       // visible to all-site users only.
       if (siteIds != null && siteIds.length === 0) return { data: [], total: 0 };
 
-      const conditions = [];
+      // Attempts at a conformance test station are never listed (an attempt
+      // from an unknown station has no station row and stays).
+      const conditions = [or(isNull(chargingStations.id), isOperatorStation())];
       if (siteIds != null) conditions.push(inArray(chargingStations.siteId, siteIds));
       if (stationId != null) conditions.push(eq(authorizeAttempts.stationId, stationId));
       if (idToken != null && idToken.trim() !== '') {
-        conditions.push(ilike(authorizeAttempts.idToken, `%${idToken}%`));
+        // The token value, or the vehicle id a start carried (an EVCCID next
+        // to a card, a VID: prefixed idTag in its normalized form).
+        conditions.push(
+          or(
+            ilike(authorizeAttempts.idToken, `%${idToken}%`),
+            ilike(authorizeAttempts.vehicleIdValue, `%${idToken}%`),
+          ),
+        );
       }
       if (matchedTokenId != null) {
         conditions.push(eq(authorizeAttempts.matchedTokenId, matchedTokenId));
@@ -120,7 +149,7 @@ export function authorizeAttemptRoutes(app: FastifyInstance): void {
       if (from != null) conditions.push(gte(authorizeAttempts.createdAt, from));
       if (to != null) conditions.push(lte(authorizeAttempts.createdAt, to));
 
-      const where = conditions.length > 0 ? and(...conditions) : undefined;
+      const where = and(...conditions);
 
       // LEFT JOIN charging_stations on the OCPP path id so the UI can link
       // to /stations/:dbId. authorize_attempts.station_id stores the path
@@ -138,16 +167,21 @@ export function authorizeAttemptRoutes(app: FastifyInstance): void {
             matchedDriverId: authorizeAttempts.matchedDriverId,
             sessionId: sql<string | null>`(
               SELECT ${chargingSessions.id} FROM ${chargingSessions}
-              WHERE ${chargingSessions.tokenId} = ${authorizeAttempts.matchedTokenId}
+              WHERE (${chargingSessions.tokenId} = ${authorizeAttempts.matchedTokenId}
+                OR (${chargingSessions.autocharge}
+                  AND ${chargingSessions.vehicleId} = ${authorizeAttempts.matchedVehicleId}))
                 AND ${chargingSessions.startedAt} >= ${authorizeAttempts.createdAt}
                 AND ${chargingSessions.startedAt} <= ${authorizeAttempts.createdAt} + interval '10 minutes'
-                ${siteIds != null ? sql`AND ${chargingSessions.stationId} = ${chargingStations.id}` : sql``}
+                AND ${chargingSessions.stationId} = ${chargingStations.id}
               ORDER BY ${chargingSessions.startedAt} ASC
               LIMIT 1
             )`,
             outcome: authorizeAttempts.outcome,
             ocppVersion: authorizeAttempts.ocppVersion,
             reason: authorizeAttempts.reason,
+            vehicleIdValue: authorizeAttempts.vehicleIdValue,
+            vehicleIdType: authorizeAttempts.vehicleIdType,
+            matchedVehicleId: authorizeAttempts.matchedVehicleId,
             createdAt: authorizeAttempts.createdAt,
           })
           .from(authorizeAttempts)
