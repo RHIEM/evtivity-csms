@@ -18,6 +18,11 @@ import {
 import type { InvoiceDetail } from './invoice.service.js';
 import { INVOICE_LABELS, describeLineItem, isInvoiceLanguage } from './invoice-labels.js';
 import { invoicePaymentBlock } from './invoice-payment-block.js';
+import {
+  INVOICE_EVIDENCE_LABELS,
+  loadSessionEvidence,
+  sessionEvidenceLine,
+} from './invoice-evidence.js';
 import type { InvoicePaymentBlock } from './invoice-payment-block.js';
 import type { InvoiceLabels, InvoiceLanguage } from './invoice-labels.js';
 import { pdfCanRender, registerPdfFonts, registerPdfTextFonts } from './cjk-fonts.js';
@@ -388,11 +393,16 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
   const rate = (taxRate: number | string): string =>
     labels.taxRateValue.replace('{rate}', formatTaxRatePercent(Number(taxRate), labels.locale));
 
-  const [seller, branding, payment] = await Promise.all([
+  const sessionIds = [
+    ...new Set(lineItems.flatMap((item) => (item.sessionId != null ? [item.sessionId] : []))),
+  ];
+  const [seller, branding, payment, evidence] = await Promise.all([
     loadInvoiceSeller(),
     loadPdfBranding(),
     getInvoicePaymentSettings(),
+    loadSessionEvidence(sessionIds),
   ]);
+  const evidenceLabels = INVOICE_EVIDENCE_LABELS[language];
 
   const doc = new PDFDocument({
     margins: { top: MARGIN, left: MARGIN, right: MARGIN, bottom: MARGIN },
@@ -560,6 +570,31 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     );
   };
 
+  // The check line under a session's last line: the session id, and the
+  // signed begin and end readings when the station signed its meter data.
+  const drawSessionEvidence = (sessionId: string): void => {
+    const text = sessionEvidenceLine(
+      evidenceLabels,
+      labels.locale,
+      sessionId,
+      evidence.get(sessionId),
+    );
+    doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
+    const height = doc.heightOfString(text, { width: CONTENT_WIDTH });
+    y = ensure(y - 3, height + 4);
+    doc.text(text, MARGIN, y, { width: CONTENT_WIDTH });
+    y += height + 4;
+  };
+
+  const drawItems = (items: LineItem[]): void => {
+    items.forEach((item, i) => {
+      drawItem(item);
+      if (item.sessionId != null && items[i + 1]?.sessionId !== item.sessionId) {
+        drawSessionEvidence(item.sessionId);
+      }
+    });
+  };
+
   if (isFleetInvoice) {
     // A fleet invoice lists each driver's sessions under the driver, with a
     // net subtotal per driver; the tax summary below covers the whole invoice.
@@ -570,7 +605,7 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
         width: CONTENT_WIDTH,
       });
       y += 16;
-      for (const item of group.items) drawItem(item);
+      drawItems(group.items);
       y = ensure(y, 20);
       drawRule(doc, y - 2, MARGIN + CONTENT_WIDTH / 2);
       doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT);
@@ -583,7 +618,15 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
       y += 6;
     }
   } else {
-    for (const item of lineItems) drawItem(item);
+    drawItems(lineItems);
+  }
+
+  if (evidence.size > 0) {
+    doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
+    const height = doc.heightOfString(evidenceLabels.note, { width: CONTENT_WIDTH });
+    y = ensure(y + 4, height + 4);
+    doc.text(evidenceLabels.note, MARGIN, y, { width: CONTENT_WIDTH });
+    y += height + 4;
   }
 
   y += 10;

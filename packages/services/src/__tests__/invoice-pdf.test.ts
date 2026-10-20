@@ -5,9 +5,12 @@ import { inflateSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
-const { warn, settingsRows, paymentSettings } = vi.hoisted(() => ({
+const { warn, settingsRows, evidenceRows, paymentSettings } = vi.hoisted(() => ({
   warn: vi.fn(),
   settingsRows: { rows: [] as Array<{ key: string; value: unknown }> },
+  evidenceRows: {
+    rows: [] as Array<{ session_id: string; signed_data: string; meter_serial: string | null }>,
+  },
   paymentSettings: {
     value: {
       accountHolder: null as string | null,
@@ -20,7 +23,11 @@ const { warn, settingsRows, paymentSettings } = vi.hoisted(() => ({
 }));
 
 vi.mock('@evtivity/database', () => ({
-  client: vi.fn(() => Promise.resolve(settingsRows.rows)),
+  client: vi.fn((strings: TemplateStringsArray) =>
+    Promise.resolve(
+      strings.join('').includes('signed_meter_values') ? evidenceRows.rows : settingsRows.rows,
+    ),
+  ),
   getInvoicePaymentSettings: vi.fn(() => Promise.resolve(paymentSettings.value)),
 }));
 
@@ -246,6 +253,7 @@ const FULL_SELLER_ROWS = [
 beforeEach(() => {
   warn.mockClear();
   settingsRows.rows = [COMPANY_NAME_ROW];
+  evidenceRows.rows = [];
 });
 
 function settingsOf(rows: Array<{ key: string; value: unknown }>): Record<string, unknown> {
@@ -587,5 +595,45 @@ describe('generateInvoicePdf without the CJK fonts', () => {
       'CJK fonts not found, Korean and Chinese PDFs render in English',
     );
     vi.doUnmock('@evtivity/services/pdf-fonts');
+  });
+});
+
+describe('session check lines', () => {
+  const KEBA_RECORD =
+    'OCMF|{"FV":"1.1","GI":"KEBA_KCP30","GS":"12345678","PG":"T116","RD":[' +
+    '{"TM":"2026-09-20T12:56:51,000+0200 I","TX":"B","RV":2866.7280,"RI":"1-b:1.8.0","RU":"kWh"},' +
+    '{"TM":"2026-09-21T07:48:48,000+0200 I","TX":"E","RV":2908.2472,"RI":"1-b:1.8.0","RU":"kWh"}' +
+    ']}|{"SD":"3046"}';
+
+  it('names the session once under its last line', async () => {
+    const { text } = pdfContent(await generateInvoicePdf(detail('en')));
+    expect(text.split('Session ses_1')).toHaveLength(2);
+    expect(text.indexOf('Session ses_1')).toBeGreaterThan(text.indexOf('Segment 2'));
+    expect(text).not.toContain('Signed meter data');
+  });
+
+  it('prints the signed readings and the portal note in the invoice language', async () => {
+    evidenceRows.rows = [
+      { session_id: 'ses_1', signed_data: KEBA_RECORD, meter_serial: 'MTR-1' },
+      { session_id: 'ses_1', signed_data: 'not OCMF', meter_serial: null },
+    ];
+    const { text } = pdfContent(await generateInvoicePdf(detail('de')));
+    expect(text).toContain('Sitzung ses_1 · Datensatz T116 · Zähler MTR-1');
+    expect(text).toContain(
+      'Beginn 20.09.2026, 12:56:51: 2866,7280 kWh · Ende 21.09.2026, 07:48:48: 2908,2472 kWh',
+    );
+    expect(text).toContain('Signierte Messdaten (Eichrecht)');
+  });
+
+  it('prints the check lines in every invoice language', async () => {
+    evidenceRows.rows = [{ session_id: 'ses_1', signed_data: KEBA_RECORD, meter_serial: null }];
+    for (const language of INVOICE_LANGUAGES) {
+      const { text, missingGlyphs } = pdfContent(await generateInvoicePdf(detail(language)));
+      expect(text).toContain('ses_1');
+      expect(text).toContain('T116');
+      expect(text).toContain('2908');
+      // The CJK fixture fonts are subsets without the glyphs of these labels.
+      if (['en', 'de', 'es'].includes(language)) expect(missingGlyphs).toEqual([]);
+    }
   });
 });
