@@ -2573,6 +2573,8 @@
     "content": "Inhalt",
     "privacyPolicy": "Datenschutzerklärung",
     "termsOfService": "Nutzungsbedingungen",
+    "signedMeterData": "Messnachweis",
+    "signedMeterDataDescription": "Erscheint im Fahrerportal beim Download der signierten Messdaten einer Sitzung (Eichrecht): wie man sie mit der Transparenzsoftware prüft.",
     "language": "Sprache",
     "contentSaved": "Inhalt gespeichert.",
     "contentSaveFailed": "Inhalt konnte nicht gespeichert werden.",

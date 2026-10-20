@@ -738,6 +738,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   listSessionMeterValues: supportRead({ id: 'case.sessionIds' }),
   // Signed meter data is billing evidence (Eichrecht): not an assistant tool.
   listSessionSignedMeterValues: N,
+  portalListSessionSignedMeterData: N,
+  portalDownloadSessionSignedMeterData: N,
   listSessionTransactionEvents: supportRead({ id: 'case.sessionIds' }),
   listSessions: R,
   rebillSession: N,

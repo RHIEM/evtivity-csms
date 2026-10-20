@@ -148,6 +148,7 @@ import { successResponse, itemResponse, errorWith } from '../lib/response-schema
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { clearS3ConfigCache } from '../services/s3.service.js';
 import { DEFAULT_CONTENT } from './default-content.js';
+import { DEFAULT_SIGNED_METER_CONTENT } from './default-signed-meter-content.js';
 import { authorize } from '../middleware/rbac.js';
 import { isAllSiteUser, requireAllSiteAccess } from '../lib/site-access.js';
 import { config as apiConfig } from '../lib/config.js';
@@ -728,7 +729,9 @@ export function settingsRoutes(app: FastifyInstance): void {
   );
 
   const contentParams = z.object({
-    type: z.enum(['privacy-policy', 'terms-of-service']).describe('Content type'),
+    type: z
+      .enum(['privacy-policy', 'terms-of-service', 'signed-meter-data'])
+      .describe('Content type; signed-meter-data is the note on the signed meter data download'),
   });
   const contentQuery = z.object({
     lang: z.enum(UI_LANGUAGES).default('en').describe('Language code'),
@@ -756,9 +759,15 @@ export function settingsRoutes(app: FastifyInstance): void {
       const settingKey =
         type === 'privacy-policy'
           ? `content.privacyPolicy.${lang}`
-          : `content.termsOfService.${lang}`;
+          : type === 'terms-of-service'
+            ? `content.termsOfService.${lang}`
+            : `content.signedMeterData.${lang}`;
       const row = await db.select().from(settings).where(eq(settings.key, settingKey)).limit(1);
-      const html = (row[0]?.value as string | undefined) ?? DEFAULT_CONTENT[lang][type];
+      const html =
+        (row[0]?.value as string | undefined) ??
+        (type === 'signed-meter-data'
+          ? DEFAULT_SIGNED_METER_CONTENT[lang]
+          : DEFAULT_CONTENT[lang][type]);
       return { html };
     },
   );

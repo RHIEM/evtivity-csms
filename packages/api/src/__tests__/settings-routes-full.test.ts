@@ -344,6 +344,27 @@ describe('Settings routes - full coverage', () => {
       });
       expect(res.statusCode).toBe(400);
     });
+
+    it('returns the stored note on signed meter data', async () => {
+      setupDbResults([{ key: 'content.signedMeterData.de', value: '<p>Eigener Hinweis</p>' }]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/signed-meter-data?lang=de',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toBe('<p>Eigener Hinweis</p>');
+    });
+
+    it('falls back to the default note on signed meter data with the S.A.F.E. link', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/signed-meter-data?lang=de',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('Transparenzsoftware');
+      expect(res.json().html).toContain('https://safe-ev.org/de/transparenzsoftware.php');
+    });
   });
 
   // ----------------------------------------------------------------

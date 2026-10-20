@@ -57,6 +57,7 @@ import { portalDriverRoutes } from './routes/portal/driver.js';
 import { portalPaymentRoutes } from './routes/portal/payments.js';
 import { portalPaymentProviderRoutes } from './routes/portal/payment-provider.js';
 import { portalSessionRoutes } from './routes/portal/sessions.js';
+import { portalSignedMeterDataRoutes } from './routes/portal/signed-meter-data.js';
 import { portalChargerRoutes } from './routes/portal/charger.js';
 import { portalGuestRoutes } from './routes/portal/guest.js';
 import { portalPayoutOnboardingRoutes } from './routes/portal/payout-onboarding.js';
@@ -218,6 +219,7 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       await v1.register(portalPaymentRoutes);
       await v1.register(portalPaymentProviderRoutes);
       await v1.register(portalSessionRoutes);
+      await v1.register(portalSignedMeterDataRoutes);
       await v1.register(portalChargerRoutes);
       await v1.register(portalGuestRoutes);
       await v1.register(portalPayoutOnboardingRoutes);

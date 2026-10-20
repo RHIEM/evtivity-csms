@@ -21,6 +21,7 @@ export function ContentSettings(): React.JSX.Element {
   const [contentLang, setContentLang] = useState<UiLanguage>('en');
   const [privacyContent, setPrivacyContent] = useState('');
   const [termsContent, setTermsContent] = useState('');
+  const [signedMeterContent, setSignedMeterContent] = useState('');
   const [contentSubTab, setContentSubTab] = useTab('privacy', 'sub');
 
   const { data: privacyData } = useQuery({
@@ -34,9 +35,19 @@ export function ContentSettings(): React.JSX.Element {
       api.get<{ html: string }>(`/v1/portal/content/terms-of-service?lang=${contentLang}`),
   });
 
+  // The note the driver portal shows with the signed meter data download.
+  const { data: signedMeterData } = useQuery({
+    queryKey: ['settings', 'content.signedMeterData', contentLang],
+    queryFn: () =>
+      api.get<{ html: string }>(`/v1/portal/content/signed-meter-data?lang=${contentLang}`),
+  });
+
   useEffect(() => {
     setPrivacyContent(privacyData?.html ?? '');
   }, [privacyData]);
+  useEffect(() => {
+    setSignedMeterContent(signedMeterData?.html ?? '');
+  }, [signedMeterData]);
   useEffect(() => {
     setTermsContent(termsData?.html ?? '');
   }, [termsData]);
@@ -56,6 +67,16 @@ export function ContentSettings(): React.JSX.Element {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: ['settings', 'content.termsOfService', contentLang],
+      });
+    },
+  });
+
+  const signedMeterMutation = useMutation({
+    mutationFn: (html: string) =>
+      api.put(`/v1/settings/content.signedMeterData.${contentLang}`, { value: html }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ['settings', 'content.signedMeterData', contentLang],
       });
     },
   });
@@ -94,6 +115,7 @@ export function ContentSettings(): React.JSX.Element {
               <TabsList>
                 <TabsTrigger value="privacy">{t('settings.privacyPolicy')}</TabsTrigger>
                 <TabsTrigger value="terms">{t('settings.termsOfService')}</TabsTrigger>
+                <TabsTrigger value="signedMeterData">{t('settings.signedMeterData')}</TabsTrigger>
               </TabsList>
               <TabsContent value="privacy" className="mt-4 space-y-4">
                 <WysiwygEditor value={privacyContent} onChange={setPrivacyContent} />
@@ -124,6 +146,25 @@ export function ContentSettings(): React.JSX.Element {
                   <p className="text-sm text-green-600">{t('settings.contentSaved')}</p>
                 )}
                 {termsMutation.isError && (
+                  <p className="text-sm text-destructive">{t('settings.contentSaveFailed')}</p>
+                )}
+              </TabsContent>
+              <TabsContent value="signedMeterData" className="mt-4 space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  {t('settings.signedMeterDataDescription')}
+                </p>
+                <WysiwygEditor value={signedMeterContent} onChange={setSignedMeterContent} />
+                <SaveButton
+                  isPending={signedMeterMutation.isPending}
+                  type="button"
+                  onClick={() => {
+                    signedMeterMutation.mutate(signedMeterContent);
+                  }}
+                />
+                {signedMeterMutation.isSuccess && (
+                  <p className="text-sm text-green-600">{t('settings.contentSaved')}</p>
+                )}
+                {signedMeterMutation.isError && (
                   <p className="text-sm text-destructive">{t('settings.contentSaveFailed')}</p>
                 )}
               </TabsContent>

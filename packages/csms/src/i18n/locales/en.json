@@ -2573,6 +2573,8 @@
     "content": "Content",
     "privacyPolicy": "Privacy Policy",
     "termsOfService": "Terms of Service",
+    "signedMeterData": "Signed Meter Data",
+    "signedMeterDataDescription": "Shown in the driver portal with the download of a session's signed meter data (calibration law): how to check it with the transparency software.",
     "language": "Language",
     "contentSaved": "Content saved.",
     "contentSaveFailed": "Failed to save content.",

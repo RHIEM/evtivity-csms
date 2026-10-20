@@ -2573,6 +2573,8 @@
     "content": "Contenido",
     "privacyPolicy": "Política de privacidad",
     "termsOfService": "Términos del servicio",
+    "signedMeterData": "Datos de medición firmados",
+    "signedMeterDataDescription": "Se muestra en el portal del conductor junto a la descarga de los datos de medición firmados de una sesión (ley de metrología): cómo verificarlos con el software de transparencia.",
     "language": "Idioma",
     "contentSaved": "Contenido guardado.",
     "contentSaveFailed": "Error al guardar contenido.",

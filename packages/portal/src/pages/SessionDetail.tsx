@@ -27,6 +27,7 @@ import { ErrorCard } from '@/components/ui/error-card';
 import { useToast } from '@/components/ui/toast';
 import { SessionCharts } from '@/components/SessionCharts';
 import { SessionVehicleCard, type SessionVehicleCapture } from '@/components/SessionVehicleCard';
+import { SignedMeterDataCard } from '@/components/SignedMeterDataCard';
 import { ReportIssue } from '@/components/ReportIssue';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
@@ -567,6 +568,9 @@ export function SessionDetail(): React.JSX.Element {
           )}
         </CardContent>
       </Card>
+
+      {/* Signed meter data (calibration law) of a completed session */}
+      {!isActive && <SignedMeterDataCard sessionId={session.id} timezone={timezone} />}
 
       {/* Payment info */}
       {session.payment != null && (

@@ -2573,6 +2573,8 @@
     "content": "콘텐츠",
     "privacyPolicy": "개인정보처리방침",
     "termsOfService": "이용약관",
+    "signedMeterData": "서명된 계량 데이터",
+    "signedMeterDataDescription": "운전자 포털에서 세션의 서명된 계량 데이터(계량법)를 다운로드할 때 표시됩니다: 투명성 소프트웨어로 확인하는 방법.",
     "language": "언어",
     "contentSaved": "콘텐츠가 저장되었습니다.",
     "contentSaveFailed": "콘텐츠 저장에 실패했습니다.",
