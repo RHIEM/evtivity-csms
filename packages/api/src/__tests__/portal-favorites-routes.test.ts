@@ -49,7 +49,14 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+const { mockAvailableEvseCountSql, mockSqlRaw } = vi.hoisted(() => ({
+  mockAvailableEvseCountSql: vi.fn((alias: string) => `AVAILABLE_EVSE_COUNT(${alias})`),
+  mockSqlRaw: vi.fn((text: string) => ({ raw: text })),
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  availableEvseCountSql: mockAvailableEvseCountSql,
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -65,10 +72,13 @@ vi.mock('@evtivity/database', () => ({
 }));
 
 vi.mock('drizzle-orm', () => {
-  const sqlTag = (...args: unknown[]) => ({ __brand: 'SQL', args });
+  const sqlTag = Object.assign((...args: unknown[]) => ({ __brand: 'SQL', args }), {
+    raw: mockSqlRaw,
+  });
   return {
     eq: vi.fn(),
     and: vi.fn(),
+    isNull: vi.fn(),
     asc: vi.fn(),
     desc: vi.fn(),
     inArray: vi.fn(),
@@ -128,6 +138,19 @@ describe('Portal favorite routes', () => {
       expect(body).toEqual([]);
     });
 
+    it('never lists a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.isOperatorStation).mockClear();
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/favorites',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.isOperatorStation)).toHaveBeenCalled();
+    });
+
     it('returns favorites with station data', async () => {
       const now = new Date();
       // First DB call: select favorites with joins
@@ -143,6 +166,7 @@ describe('Portal favorite routes', () => {
             siteCity: 'Springfield',
             siteState: 'IL',
             isOnline: true,
+            availableCount: 2,
             createdAt: now,
           },
         ],
@@ -150,7 +174,6 @@ describe('Portal favorite routes', () => {
           {
             stationId: STATION_UUID,
             total: 4,
-            available: 2,
           },
         ],
       );
@@ -168,6 +191,20 @@ describe('Portal favorite routes', () => {
       expect(body[0].isOnline).toBe(true);
       expect(body[0].evseCount).toBe(4);
       expect(body[0].availableCount).toBe(2);
+    });
+
+    // An operator-disabled station whose connectors still report Available was
+    // counted as available. The count must come from the shared rule.
+    it('counts available EVSEs with the shared driver availability rule', async () => {
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/favorites',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mockAvailableEvseCountSql).toHaveBeenCalledWith('charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('AVAILABLE_EVSE_COUNT(charging_stations)');
     });
   });
 

@@ -8,18 +8,25 @@ import { EditButton } from '@/components/edit-button';
 import { RemoveButton } from '@/components/remove-button';
 import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { TabsContent } from '@/components/ui/tabs';
 import { Select } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
+import { LANGUAGES } from '@/components/ui/language-select';
 import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { HoursOfOperationField } from '@/components/site/HoursOfOperationField';
+import { SiteAiInsightsRow } from '@/components/site/SiteAiInsightsRow';
+import type { SiteAiInsightsState } from '@/components/site/SiteAiInsightsRow';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api } from '@/lib/api';
+import { useHasPermission } from '@/lib/auth';
+import { getErrorMessage } from '@/lib/error-message';
 import { TIMEZONE_OPTIONS, formatDateTime } from '@/lib/timezone';
 
-interface Site {
+interface Site extends SiteAiInsightsState {
   id: string;
   name: string;
   address: string | null;
@@ -40,6 +47,8 @@ interface Site {
   freeVendTemplateId21: string | null;
   freeVendTemplateId16: string | null;
   carbonRegionCode: string | null;
+  stationMessageLanguage: string | null;
+  autochargeEnabled?: boolean | null;
   stationCount: number;
   createdAt: string;
   updatedAt: string;
@@ -60,6 +69,8 @@ export interface SiteDetailsTabProps {
   googleMapsApiKey: string;
   onDelete: () => void;
   deleteIsPending: boolean;
+  /** The failed delete (409 when the site has stations or payments), shown in the dialog. */
+  deleteError?: unknown;
 }
 
 export function SiteDetailsTab({
@@ -68,9 +79,12 @@ export function SiteDetailsTab({
   googleMapsApiKey,
   onDelete,
   deleteIsPending,
+  deleteError,
 }: SiteDetailsTabProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const canWrite = useHasPermission('sites:write');
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
@@ -101,8 +115,24 @@ export function SiteDetailsTab({
     },
   });
 
+  const stationMessageLanguageMutation = useMutation({
+    mutationFn: (language: string | null) =>
+      api.patch<Site>(`/v1/sites/${siteId}`, { stationMessageLanguage: language }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['sites'] });
+    },
+  });
+
+  const autochargeMutation = useMutation({
+    mutationFn: (value: boolean | null) =>
+      api.patch<Site>(`/v1/sites/${siteId}`, { autochargeEnabled: value }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['sites'] });
+    },
+  });
+
   const updateMutation = useMutation({
-    mutationFn: (body: Record<string, string>) => api.patch<Site>(`/v1/sites/${siteId}`, body),
+    mutationFn: (body: Record<string, unknown>) => api.patch<Site>(`/v1/sites/${siteId}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['sites'] });
       setEditing(false);
@@ -125,6 +155,7 @@ export function SiteDetailsTab({
     setContactPhone(site.contactPhone ?? '');
     setContactIsPublic(site.contactIsPublic);
     setHoursOfOperation(site.hoursOfOperation ?? '');
+    updateMutation.reset();
     setEditing(true);
   }
 
@@ -142,22 +173,25 @@ export function SiteDetailsTab({
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(validationErrors).length > 0) return;
-    const body: Record<string, string> = {};
-    if (name !== '') body['name'] = name;
-    if (address !== '') body['address'] = address;
-    if (city !== '') body['city'] = city;
-    if (state !== '') body['state'] = state;
-    if (postalCode !== '') body['postalCode'] = postalCode;
-    if (country !== '') body['country'] = country;
-    if (latitude !== '') body['latitude'] = latitude;
-    if (longitude !== '') body['longitude'] = longitude;
+    // An emptied field is sent as null so the site forgets it (a removed
+    // contact email or phone must not stay public).
+    const orNull = (value: string): string | null => (value.trim() === '' ? null : value.trim());
+    const body: Record<string, unknown> = {
+      name,
+      address: orNull(address),
+      city: orNull(city),
+      state: orNull(state),
+      postalCode: orNull(postalCode),
+      country: orNull(country),
+      latitude: orNull(latitude),
+      longitude: orNull(longitude),
+      contactName: orNull(contactName),
+      contactEmail: orNull(contactEmail),
+      contactPhone: orNull(contactPhone),
+      contactIsPublic,
+      hoursOfOperation: orNull(hoursOfOperation),
+    };
     if (editTimezone !== '') body['timezone'] = editTimezone;
-    if (contactName !== '') body['contactName'] = contactName;
-    if (contactEmail !== '') body['contactEmail'] = contactEmail;
-    if (contactPhone !== '') body['contactPhone'] = contactPhone;
-    (body as Record<string, unknown>)['contactIsPublic'] = contactIsPublic;
-    (body as Record<string, unknown>)['hoursOfOperation'] =
-      hoursOfOperation.trim() !== '' ? hoursOfOperation.trim() : null;
     updateMutation.mutate(body);
   }
 
@@ -167,20 +201,26 @@ export function SiteDetailsTab({
         <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle>{t('common.details')}</CardTitle>
           <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-            {!editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
-            <RemoveButton
-              label={t('common.delete')}
-              onClick={onDelete}
-              disabled={deleteIsPending || site.stationCount > 0}
-              title={site.stationCount > 0 ? t('sites.removeStationsFirst') : ''}
-            />
+            {canWrite && !editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
+            {canWrite && (
+              <RemoveButton
+                label={t('common.delete')}
+                onClick={() => {
+                  setDeleteOpen(true);
+                }}
+                disabled={deleteIsPending || site.stationCount > 0}
+                title={site.stationCount > 0 ? t('sites.removeStationsFirst') : ''}
+              />
+            )}
           </div>
         </CardHeader>
         <CardContent>
           {editing ? (
             <form onSubmit={handleSave} noValidate className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-name">{t('common.name')}</Label>
+                <Label htmlFor="edit-name" className="leading-6">
+                  {t('common.name')}
+                </Label>
                 <Input
                   id="edit-name"
                   value={name}
@@ -194,7 +234,9 @@ export function SiteDetailsTab({
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-address">{t('sites.address')}</Label>
+                <Label htmlFor="edit-address" className="leading-6">
+                  {t('sites.address')}
+                </Label>
                 <Input
                   id="edit-address"
                   value={address}
@@ -205,7 +247,9 @@ export function SiteDetailsTab({
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-city">{t('sites.city')}</Label>
+                  <Label htmlFor="edit-city" className="leading-6">
+                    {t('sites.city')}
+                  </Label>
                   <Input
                     id="edit-city"
                     value={city}
@@ -215,7 +259,9 @@ export function SiteDetailsTab({
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-state">{t('sites.state')}</Label>
+                  <Label htmlFor="edit-state" className="leading-6">
+                    {t('sites.state')}
+                  </Label>
                   <Input
                     id="edit-state"
                     value={state}
@@ -227,7 +273,9 @@ export function SiteDetailsTab({
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-postal">{t('sites.postalCode')}</Label>
+                  <Label htmlFor="edit-postal" className="leading-6">
+                    {t('sites.postalCode')}
+                  </Label>
                   <Input
                     id="edit-postal"
                     value={postalCode}
@@ -237,7 +285,9 @@ export function SiteDetailsTab({
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-country">{t('sites.country')}</Label>
+                  <Label htmlFor="edit-country" className="leading-6">
+                    {t('sites.country')}
+                  </Label>
                   <Input
                     id="edit-country"
                     value={country}
@@ -249,29 +299,27 @@ export function SiteDetailsTab({
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-latitude">{t('sites.latitude')}</Label>
-                  <Input
+                  <Label htmlFor="edit-latitude" className="leading-6">
+                    {t('sites.latitude')}
+                  </Label>
+                  <DecimalInput
                     id="edit-latitude"
-                    type="number"
-                    step="any"
                     placeholder="e.g. 40.7128"
                     value={latitude}
-                    onChange={(e) => {
-                      setLatitude(e.target.value);
-                    }}
+                    onChange={setLatitude}
+                    allowNegative
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-longitude">{t('sites.longitude')}</Label>
-                  <Input
+                  <Label htmlFor="edit-longitude" className="leading-6">
+                    {t('sites.longitude')}
+                  </Label>
+                  <DecimalInput
                     id="edit-longitude"
-                    type="number"
-                    step="any"
                     placeholder="e.g. -74.0060"
                     value={longitude}
-                    onChange={(e) => {
-                      setLongitude(e.target.value);
-                    }}
+                    onChange={setLongitude}
+                    allowNegative
                   />
                 </div>
               </div>
@@ -284,14 +332,15 @@ export function SiteDetailsTab({
                 }}
               />
               <div className="space-y-2">
-                <Label htmlFor="edit-timezone">{t('sites.timezone')}</Label>
+                <Label htmlFor="edit-timezone" className="leading-6">
+                  {t('sites.timezone')}
+                </Label>
                 <Select
                   id="edit-timezone"
                   value={editTimezone}
                   onChange={(e) => {
                     setEditTimezone(e.target.value);
                   }}
-                  className="h-9"
                 >
                   {TIMEZONE_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -311,7 +360,9 @@ export function SiteDetailsTab({
                   <p className="text-xs text-muted-foreground">{t('sites.contactPublicNote')}</p>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-contact-name">{t('sites.contactName')}</Label>
+                  <Label htmlFor="edit-contact-name" className="leading-6">
+                    {t('sites.contactName')}
+                  </Label>
                   <Input
                     id="edit-contact-name"
                     value={contactName}
@@ -322,7 +373,9 @@ export function SiteDetailsTab({
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label htmlFor="edit-contact-email">{t('sites.contactEmail')}</Label>
+                    <Label htmlFor="edit-contact-email" className="leading-6">
+                      {t('sites.contactEmail')}
+                    </Label>
                     <Input
                       id="edit-contact-email"
                       type="email"
@@ -333,7 +386,9 @@ export function SiteDetailsTab({
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="edit-contact-phone">{t('sites.contactPhone')}</Label>
+                    <Label htmlFor="edit-contact-phone" className="leading-6">
+                      {t('sites.contactPhone')}
+                    </Label>
                     <Input
                       id="edit-contact-phone"
                       type="tel"
@@ -357,6 +412,11 @@ export function SiteDetailsTab({
                   </Label>
                 </div>
               </div>
+              {updateMutation.isError && (
+                <p className="text-sm text-destructive">
+                  {getErrorMessage(updateMutation.error, t)}
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <CancelButton
                   onClick={() => {
@@ -415,6 +475,7 @@ export function SiteDetailsTab({
                 <dt className="text-muted-foreground">{t('common.lastUpdated')}</dt>
                 <dd className="font-medium">{formatDateTime(site.updatedAt, site.timezone)}</dd>
               </div>
+              <SiteAiInsightsRow siteId={site.id} site={site} timezone={site.timezone} />
             </dl>
           )}
         </CardContent>
@@ -458,13 +519,14 @@ export function SiteDetailsTab({
           <CardContent className="space-y-4">
             <div className="flex items-center gap-4">
               <Select
-                aria-label="Carbon region"
+                aria-label={t('sites.carbonRegion')}
                 value={site.carbonRegionCode ?? ''}
                 onChange={(e) => {
                   const val = e.target.value;
                   carbonRegionMutation.mutate(val === '' ? null : val);
                 }}
-                className="h-9 max-w-sm"
+                disabled={!canWrite || carbonRegionMutation.isPending}
+                className="max-w-sm"
               >
                 <option value="">{t('sites.noCarbonRegion')}</option>
                 {(() => {
@@ -497,6 +559,72 @@ export function SiteDetailsTab({
                   ) : null;
                 })()}
             </div>
+            {carbonRegionMutation.isError && (
+              <p className="text-sm text-destructive">
+                {getErrorMessage(carbonRegionMutation.error, t)}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+      {!editing && (
+        <Card>
+          <CardHeader>
+            <CardTitle>{t('sites.stationMessageLanguage')}</CardTitle>
+            <CardDescription>{t('sites.stationMessageLanguageDescription')}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Select
+              aria-label={t('sites.stationMessageLanguage')}
+              value={site.stationMessageLanguage ?? ''}
+              onChange={(e) => {
+                const val = e.target.value;
+                stationMessageLanguageMutation.mutate(val === '' ? null : val);
+              }}
+              disabled={!canWrite || stationMessageLanguageMutation.isPending}
+              className="max-w-sm"
+            >
+              <option value="">{t('sites.stationMessageLanguageDefault')}</option>
+              {LANGUAGES.map((lang) => (
+                <option key={lang.code} value={lang.code}>
+                  {lang.label}
+                </option>
+              ))}
+            </Select>
+            {stationMessageLanguageMutation.isError && (
+              <p className="mt-2 text-sm text-destructive">
+                {getErrorMessage(stationMessageLanguageMutation.error, t)}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+      {!editing && (
+        <Card>
+          <CardHeader>
+            <CardTitle>{t('sites.autocharge')}</CardTitle>
+            <CardDescription>{t('sites.autochargeDescription')}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <Select
+              aria-label={t('sites.autocharge')}
+              value={site.autochargeEnabled == null ? '' : site.autochargeEnabled ? 'on' : 'off'}
+              onChange={(e) => {
+                const val = e.target.value;
+                autochargeMutation.mutate(val === '' ? null : val === 'on');
+              }}
+              disabled={autochargeMutation.isPending}
+              className="max-w-sm"
+            >
+              <option value="">{t('sites.autochargeDefault')}</option>
+              <option value="on">{t('vehicles.autochargeOn')}</option>
+              <option value="off">{t('vehicles.autochargeOff')}</option>
+            </Select>
+            {autochargeMutation.isError && (
+              <p className="text-sm text-destructive">
+                {getErrorMessage(autochargeMutation.error, t)}
+              </p>
+            )}
           </CardContent>
         </Card>
       )}
@@ -520,6 +648,22 @@ export function SiteDetailsTab({
           </CardContent>
         </Card>
       )}
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={t('sites.deleteSiteTitle')}
+        description={t('sites.deleteSiteDescription', { name: site.name })}
+        confirmLabel={t('common.delete')}
+        isPending={deleteIsPending}
+        onConfirm={() => {
+          onDelete();
+          return false;
+        }}
+      >
+        {deleteError != null && (
+          <p className="text-sm text-destructive">{getErrorMessage(deleteError, t)}</p>
+        )}
+      </ConfirmDialog>
     </TabsContent>
   );
 }

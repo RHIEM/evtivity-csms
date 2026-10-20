@@ -1,11 +1,20 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, and, isNull, ilike } from 'drizzle-orm';
+import { eq, and, gt, isNull, isNotNull } from 'drizzle-orm';
 import argon2 from 'argon2';
-import { db, client, isPortalRegistrationEnabled } from '@evtivity/database';
+import {
+  db,
+  client,
+  isPortalRegistrationEnabled,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+  resolveAccountBilling,
+  writeAudit,
+  driverAuditLog,
+} from '@evtivity/database';
 import { drivers, userTokens } from '@evtivity/database';
 import {
   dispatchDriverNotification,
@@ -15,15 +24,29 @@ import {
   verifyMfaChallenge,
   verifyTotpCode,
 } from '@evtivity/lib';
-import { setAuthCookies, clearAuthCookies, isSecureRequest } from '../../lib/auth-cookies.js';
+import {
+  setAuthCookies,
+  clearAuthCookies,
+  isSecureRequest,
+  readRefreshCookie,
+} from '../../lib/auth-cookies.js';
 import { zodSchema } from '../../lib/zod-schema.js';
+import { emailEquals } from '../../lib/email-match.js';
 import { generateUserToken, hashUserToken } from '../../lib/user-token.js';
 import { validatePasswordComplexity } from '../../lib/password-validation.js';
-import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
-import { getPubSub } from '../../lib/pubsub.js';
+import { PASSWORD_MIN_LENGTH } from '@evtivity/lib/password-policy';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { itemResponse, successResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { checkRecaptcha } from '../../lib/recaptcha-check.js';
+import { driverBillingAddressItem } from '../../lib/driver-billing-address-schema.js';
+import { driverBillingAddressColumns } from '../../services/driver-billing.service.js';
+import {
+  isPhoneRegistrationLimited,
+  registrationPhone,
+  verificationResendRetryAfter,
+} from '../../lib/signup-limits.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
 import {
   createRefreshToken,
@@ -32,6 +55,13 @@ import {
   revokeAllDriverRefreshTokens,
 } from '../../services/refresh-token.service.js';
 import { config as apiConfig } from '../../lib/config.js';
+import { driverBillingSchema, toDriverBilling } from '../../lib/portal-billing.js';
+import { recordAuthAudit } from '../../lib/auth-audit.js';
+import { activateDriverPortal } from '../../services/driver-portal-access.service.js';
+import { verifyAgainstDummyHash } from '../../lib/dummy-password-hash.js';
+import { verifyPassword } from '../../lib/password-verify.js';
+import { sendDriverEmailVerification } from '../../lib/driver-email-verification.js';
+import { mfaCodeRecipient } from '../../lib/mfa-contact.js';
 import {
   issueDriverSession,
   isMobileClient,
@@ -42,11 +72,6 @@ import {
   registerIosAttestation,
   verifyDeviceAttestation,
 } from '../../lib/device-attestation/index.js';
-import {
-  isMfaChallengeExhausted,
-  recordMfaChallengeAttempt,
-  clearMfaChallengeAttempts,
-} from '../../lib/rate-limiters.js';
 
 const portalDriverItem = z
   .object({
@@ -59,9 +84,27 @@ const portalDriverItem = z
     timezone: z.string().max(50).nullable(),
     themePreference: z.enum(['light', 'dark']),
     distanceUnit: z.enum(['miles', 'km']),
+    priceDisplay: z
+      .enum(['gross', 'net'])
+      .nullable()
+      .describe(
+        'Whether prices are shown including (gross) or excluding (net) tax. Null follows the company setting.',
+      ),
     isActive: z.boolean(),
     emailVerified: z.boolean(),
     createdAt: z.coerce.date(),
+  })
+  .passthrough();
+
+// GET /portal/auth/me also tells the portal and the app how the driver pays.
+const portalDriverMe = portalDriverItem
+  .extend({
+    billing: driverBillingSchema.describe(
+      'How the driver pays a session they start: account (billed to a fleet, no payment method needed) or card. A free vend site bills nothing either way',
+    ),
+    billingAddress: driverBillingAddressItem.describe(
+      'The bill-to block of the invoices a fleet addresses to the driver (PATCH /v1/portal/driver/billing-address)',
+    ),
   })
   .passthrough();
 
@@ -71,10 +114,6 @@ const mobileSessionFields = {
   refreshToken: z.string().optional().describe('Opaque refresh token, mobile clients only'),
   expiresIn: z.number().int().optional().describe('Access token lifetime in seconds'),
 };
-
-const portalAuthRegisterResponse = z
-  .object({ driver: portalDriverItem, ...mobileSessionFields })
-  .passthrough();
 
 const portalAuthLoginResponse = z
   .object({
@@ -97,8 +136,8 @@ const portalRefreshResponse = z
 const registerBody = z.object({
   firstName: z.string().min(1).max(100),
   lastName: z.string().min(1).max(100),
-  email: z.string().email(),
-  password: z.string().min(12),
+  email: z.string().email().max(255),
+  password: z.string().min(PASSWORD_MIN_LENGTH),
   phone: z.string().max(50).optional(),
   recaptchaToken: z.string().optional().describe('reCAPTCHA v3 token'),
 });
@@ -129,10 +168,73 @@ const driverSelect = {
   timezone: drivers.timezone,
   themePreference: drivers.themePreference,
   distanceUnit: drivers.distanceUnit,
+  priceDisplay: drivers.priceDisplay,
   isActive: drivers.isActive,
   emailVerified: drivers.emailVerified,
   createdAt: drivers.createdAt,
 };
+
+/**
+ * Records a portal login refused by the active-account lookup on the driver the
+ * email names: an inactive driver, or one without portal access (no password).
+ * An unknown email writes no audit row; access_logs holds the request.
+ */
+async function recordRefusedDriverLogin(request: FastifyRequest, email: string): Promise<void> {
+  try {
+    const [existing] = await db
+      .select({
+        id: drivers.id,
+        isActive: drivers.isActive,
+      })
+      .from(drivers)
+      .where(emailEquals(drivers.email, email))
+      .limit(1);
+    if (existing == null) return;
+    await recordAuthAudit(request, {
+      kind: 'driver',
+      accountId: existing.id,
+      action: 'login_failed',
+      method: 'password',
+      reason: existing.isActive ? 'no_portal_access' : 'inactive',
+    });
+  } catch (err) {
+    request.log.warn({ err }, 'refused portal login audit failed');
+  }
+}
+
+/**
+ * Tells the holder of an email that someone tried to register with it: the
+ * registration answers the same for a known email, so the owner learns of
+ * the attempt here instead. Email only, no account change, not awaited (the
+ * answer must not take longer for a known email), fail-open with a log.
+ */
+function notifyRegistrationAttempt(
+  driver: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email: string | null;
+    language: string;
+  },
+  request: FastifyRequest,
+): void {
+  if (driver.email == null) return;
+  void dispatchSystemNotification(
+    client,
+    'driver.RegistrationAttempt',
+    { email: driver.email, firstName: driver.firstName, language: driver.language },
+    {
+      firstName: driver.firstName,
+      lastName: driver.lastName,
+      email: driver.email,
+      signInUrl: `${apiConfig.PORTAL_URL}/login`,
+      resetUrl: `${apiConfig.PORTAL_URL}/forgot-password`,
+    },
+    ALL_TEMPLATES_DIRS,
+  ).catch((err: unknown) => {
+    request.log.warn({ err, driverId: driver.id }, 'Registration attempt notice failed');
+  });
+}
 
 export function portalAuthRoutes(app: FastifyInstance): void {
   app.post(
@@ -202,16 +304,24 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         tags: ['Portal Auth'],
         summary: 'Register a new driver account',
         description:
-          'Creates a driver row with registrationSource=portal, hashes the password with argon2, sends a verification email, and sets portal session and refresh cookies. Verifies the reCAPTCHA token when enabled. Returns 409 on duplicate email and 403 if portal registration is disabled by settings.',
+          'Answers 202 { success: true } for a new and for an existing email alike, so the answer does not reveal whether an account exists, and signs nobody in. A new email gets a driver row (registrationSource=portal, argon2 password) and a verification email; the driver signs in after opening the link. An existing email (active or not, with or without portal access) changes nothing and gets driver.RegistrationAttempt, an email with the sign-in and password reset links. Verifies the reCAPTCHA token when enabled (web) or the device attestation (mobile apps). Returns 400 WEAK_PASSWORD, 429 PHONE_REGISTRATION_LIMITED when the phone number was used in three portal registrations in the last 24 hours, and 403 if portal registration is disabled by settings.',
         operationId: 'portalRegister',
         security: [],
         body: zodSchema(registerBody),
         response: {
-          201: itemResponse(portalAuthRegisterResponse),
+          202: successResponse,
           400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
-          403: errorWith('Forbidden', [ERROR_CODES.PORTAL_REGISTRATION_DISABLED]),
-          409: errorWith('Email exists', [ERROR_CODES.EMAIL_EXISTS]),
-          500: errorWith('Internal server error', [ERROR_CODES.INTERNAL_ERROR]),
+          403: errorWith('Forbidden', [
+            ERROR_CODES.PORTAL_REGISTRATION_DISABLED,
+            ERROR_CODES.ATTESTATION_FAILED,
+          ]),
+          429: errorWith('Too many registrations with this phone number', [
+            ERROR_CODES.PHONE_REGISTRATION_LIMITED,
+          ]),
+          500: errorWith('Internal server error', [
+            ERROR_CODES.INTERNAL_ERROR,
+            ERROR_CODES.DRIVER_CREATE_FAILED,
+          ]),
         },
       },
       config: {
@@ -256,87 +366,89 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         if (!recaptchaOk) return;
       }
 
-      // Use ilike so jane@x.com cannot register again as Jane@x.com.
-      const [existing] = await db
-        .select({ id: drivers.id })
-        .from(drivers)
-        .where(ilike(drivers.email, body.email));
-
-      if (existing != null) {
-        await reply.status(409).send({ error: 'Email already registered', code: 'EMAIL_EXISTS' });
+      // Per-contact cap on top of the per-IP rate limit, so one phone number cannot seed many
+      // accounts. Stored normalized so formatting variants count as the same number. Checked
+      // before the email lookup, so its answer says nothing about the email.
+      const phone = registrationPhone(body.phone);
+      if (phone != null && (await isPhoneRegistrationLimited(phone))) {
+        await reply.status(429).send({
+          error: 'Too many accounts were registered with this phone number. Try again later.',
+          code: 'PHONE_REGISTRATION_LIMITED',
+        });
         return;
       }
 
+      // Hashed for a known email too, so both answers take the same time.
       const passwordHash = await argon2.hash(body.password);
 
-      let rows;
+      // Case-insensitive exact match so jane@x.com cannot register again as Jane@x.com.
+      const [existing] = await db
+        .select({
+          id: drivers.id,
+          firstName: drivers.firstName,
+          lastName: drivers.lastName,
+          email: drivers.email,
+          language: drivers.language,
+        })
+        .from(drivers)
+        .where(emailEquals(drivers.email, body.email));
+
+      if (existing != null) {
+        notifyRegistrationAttempt(existing, request);
+        await reply.status(202).send({ success: true });
+        return;
+      }
+
+      let driver;
       try {
-        rows = await db
+        [driver] = await db
           .insert(drivers)
           .values({
             firstName: body.firstName,
             lastName: body.lastName,
             email: body.email,
-            phone: body.phone,
+            phone,
             passwordHash,
             registrationSource: 'portal',
           })
           .returning(driverSelect);
       } catch (err) {
-        // The application-level ilike check above is non-transactional, so two
-        // concurrent registrations with the same email both reach this INSERT.
-        // The partial unique index on LOWER(email) (migration 0052) makes the
-        // loser 23505; map it back to 409 EMAIL_EXISTS instead of leaking 500.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
-          await reply.status(409).send({ error: 'Email already registered', code: 'EMAIL_EXISTS' });
+        // The email lookup above is non-transactional, so two concurrent
+        // registrations with the same email both reach this INSERT. The partial
+        // unique index on LOWER(email) (migration 0052) makes the loser 23505:
+        // it answers like any other existing email.
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
+          await reply.status(202).send({ success: true });
           return;
         }
         throw err;
       }
-
-      const driver = rows[0];
       if (driver == null) {
         await reply
           .status(500)
           .send({ error: 'Failed to create driver', code: 'DRIVER_CREATE_FAILED' });
         return;
       }
-      await issueDriverSession(app, request, reply, driver, { status: 201 });
 
-      // Generate email verification token
-      const { raw: rawVerifyToken, hash: verifyTokenHash } = generateUserToken();
-
-      await db.insert(userTokens).values({
-        driverId: driver.id,
-        tokenHash: verifyTokenHash,
-        type: 'email_verification',
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      });
-
-      const portalUrl = apiConfig.PORTAL_URL;
-      const verifyUrl = `${portalUrl}/verify-email?token=${rawVerifyToken}`;
-
-      void dispatchSystemNotification(
-        client,
-        'driver.AccountVerification',
+      await writeAudit(
+        { table: driverAuditLog, idColumn: 'driver_id' },
         {
-          email: driver.email ?? undefined,
-          phone: driver.phone ?? undefined,
-          firstName: driver.firstName,
-          language: driver.language,
+          entityId: driver.id,
+          entityIdSnapshot: driver.id,
+          action: 'created',
+          actor: 'driver',
+          actorDriverId: driver.id,
+          after: driver,
+          notes: 'Registered in the driver portal',
         },
-        {
-          firstName: driver.firstName,
-          lastName: driver.lastName,
-          email: driver.email ?? '',
-          verifyUrl,
-        },
-        ALL_TEMPLATES_DIRS,
+        db,
+        request.log,
       );
+
+      if (driver.email != null) {
+        await sendDriverEmailVerification({ ...driver, email: driver.email }, request.log);
+      }
+      await reply.status(202).send({ success: true });
     },
   );
 
@@ -387,27 +499,40 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         if (!recaptchaOk) return;
       }
 
-      // Use ilike so a driver who registered as Jane@x.com can log in
-      // typing jane@x.com. The register path already uses ilike for the
+      // Case-insensitive match so a driver who registered as Jane@x.com can log in
+      // typing jane@x.com. The register path uses the same match for the
       // duplicate check, so login must match for the round-trip to work.
+      // A driver an operator created has no password until they accept a
+      // portal invite.
       const [driver] = await db
         .select()
         .from(drivers)
         .where(
           and(
-            ilike(drivers.email, email),
-            eq(drivers.registrationSource, 'portal'),
+            emailEquals(drivers.email, email),
+            isNotNull(drivers.passwordHash),
             eq(drivers.isActive, true),
           ),
         );
 
       if (driver == null || driver.passwordHash == null) {
+        // Same time as a wrong password on a real account, so the response
+        // time does not tell whether the email has a portal account.
+        await verifyAgainstDummyHash(password);
+        await recordRefusedDriverLogin(request, email);
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
 
-      const valid = await argon2.verify(driver.passwordHash, password);
+      const valid = await verifyPassword(driver.passwordHash, password, request.log);
       if (!valid) {
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'password',
+          reason: 'bad_password',
+        });
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
@@ -430,12 +555,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
           await dispatchSystemNotification(
             client,
             'mfa.VerificationCode',
-            {
-              email: driver.email ?? undefined,
-              phone: driver.phone ?? undefined,
-              firstName: driver.firstName,
-              language: driver.language,
-            },
+            mfaCodeRecipient(driver.mfaMethod, driver),
             { code: challenge.code },
             ALL_TEMPLATES_DIRS,
           );
@@ -449,6 +569,14 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         };
       }
 
+      // Written before the session reply goes out, so the row exists when the
+      // client sees the login succeed.
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: driver.id,
+        action: 'login_succeeded',
+        method: 'password',
+      });
       await issueDriverSession(app, request, reply, {
         id: driver.id,
         firstName: driver.firstName,
@@ -459,6 +587,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         timezone: driver.timezone,
         themePreference: driver.themePreference,
         distanceUnit: driver.distanceUnit,
+        priceDisplay: driver.priceDisplay,
         isActive: driver.isActive,
         emailVerified: driver.emailVerified,
         createdAt: driver.createdAt,
@@ -483,9 +612,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const mobile = isMobileClient(request);
-      const rawRefreshToken = mobile
-        ? (request.body as { refreshToken?: string } | undefined)?.refreshToken
-        : request.cookies['portal_refresh'];
+      let rawRefreshToken: string | undefined;
+      if (mobile) {
+        rawRefreshToken = (request.body as { refreshToken?: string } | undefined)?.refreshToken;
+      } else {
+        const refreshCookie = readRefreshCookie('portal', request);
+        if (refreshCookie.status === 'valid') rawRefreshToken = refreshCookie.value;
+      }
       if (rawRefreshToken) {
         await revokeRefreshToken(rawRefreshToken);
       }
@@ -523,15 +656,23 @@ export function portalAuthRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const mobile = isMobileClient(request);
       const deviceId = mobile ? deviceIdFromRequest(request) : undefined;
-      const rawToken = mobile
-        ? (request.body as { refreshToken?: string } | undefined)?.refreshToken
-        : request.cookies['portal_refresh'];
-      if (!rawToken) {
+      let rawToken: string | undefined;
+      let invalidCookie = false;
+      if (mobile) {
+        rawToken = (request.body as { refreshToken?: string } | undefined)?.refreshToken;
+      } else {
+        const refreshCookie = readRefreshCookie('portal', request);
+        if (refreshCookie.status === 'valid') rawToken = refreshCookie.value;
+        invalidCookie = refreshCookie.status === 'invalid';
+      }
+      if (!rawToken && !invalidCookie) {
         await reply.status(401).send({ error: 'No refresh token', code: 'NO_REFRESH_TOKEN' });
         return;
       }
 
-      const result = await validateAndRotateRefreshToken(rawToken, { deviceId });
+      // A portal_refresh cookie whose signature does not verify is refused
+      // like an unknown token: 401 INVALID_REFRESH_TOKEN and cleared cookies.
+      const result = rawToken ? await validateAndRotateRefreshToken(rawToken, { deviceId }) : null;
       if (result == null || result.driverId == null) {
         if (!mobile) clearAuthCookies('portal', reply, isSecureRequest(request));
         await reply
@@ -575,7 +716,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         operationId: 'portalGetMe',
         security: [{ bearerAuth: [] }],
         response: {
-          200: itemResponse(portalDriverItem),
+          200: itemResponse(portalDriverMe),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
         },
       },
@@ -583,14 +724,37 @@ export function portalAuthRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
 
-      const [driver] = await db.select(driverSelect).from(drivers).where(eq(drivers.id, driverId));
+      const [row] = await db
+        .select({ ...driverSelect, ...driverBillingAddressColumns })
+        .from(drivers)
+        .where(eq(drivers.id, driverId));
 
-      if (driver == null) {
+      if (row == null) {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
 
-      return driver;
+      const {
+        billingName,
+        billingStreet,
+        billingCity,
+        billingState,
+        billingZip,
+        billingCountry,
+        ...driver
+      } = row;
+      return {
+        ...driver,
+        billing: toDriverBilling(await resolveAccountBilling(client, driverId)),
+        billingAddress: {
+          billingName,
+          billingStreet,
+          billingCity,
+          billingState,
+          billingZip,
+          billingCountry,
+        },
+      };
     },
   );
 
@@ -640,7 +804,8 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       let payload: { driverId: string; type: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -649,15 +814,6 @@ export function portalAuthRoutes(app: FastifyInstance): void {
 
       if (!payload.mfaPending || payload.type !== 'driver') {
         await reply.status(400).send({ error: 'Invalid MFA token', code: 'MFA_TOKEN_INVALID' });
-        return;
-      }
-
-      // Per-challengeId brute-force protection
-      if (challengeId != null && isMfaChallengeExhausted(challengeId)) {
-        await reply.status(400).send({
-          error: 'Too many failed attempts. Request a new code.',
-          code: 'MFA_CHALLENGE_EXHAUSTED',
-        });
         return;
       }
 
@@ -671,6 +827,13 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       // mfaToken JWT could complete and yield a real session for an
       // already-disabled account.
       if (!driver.isActive) {
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'inactive',
+        });
         await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
@@ -694,24 +857,41 @@ export function portalAuthRoutes(app: FastifyInstance): void {
           return;
         }
       } else if (challengeId != null) {
-        verified = await verifyMfaChallenge(client, challengeId, code, { driverId: driver.id });
+        // The tries are counted on the challenge row (single use, at most
+        // MFA_CHALLENGE_MAX_ATTEMPTS codes), shared by every API process.
+        const result = await verifyMfaChallenge(client, challengeId, code, {
+          driverId: driver.id,
+        });
+        if (result === 'exhausted') {
+          await reply.status(400).send({
+            error: 'Too many failed attempts. Request a new code.',
+            code: 'MFA_CHALLENGE_EXHAUSTED',
+          });
+          return;
+        }
+        verified = result === 'verified';
       }
 
       if (!verified) {
-        if (challengeId != null) {
-          recordMfaChallengeAttempt(challengeId);
-        }
+        await recordAuthAudit(request, {
+          kind: 'driver',
+          accountId: driver.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'mfa_code_invalid',
+        });
         await reply
           .status(400)
           .send({ error: 'Invalid verification code', code: 'MFA_CODE_INVALID' });
         return;
       }
 
-      // Clear attempt counter on success
-      if (challengeId != null) {
-        clearMfaChallengeAttempts(challengeId);
-      }
-
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: driver.id,
+        action: 'login_succeeded',
+        method: 'mfa',
+      });
       await issueDriverSession(app, request, reply, {
         id: driver.id,
         firstName: driver.firstName,
@@ -722,6 +902,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         timezone: driver.timezone,
         themePreference: driver.themePreference,
         distanceUnit: driver.distanceUnit,
+        priceDisplay: driver.priceDisplay,
         isActive: driver.isActive,
         emailVerified: driver.emailVerified,
         createdAt: driver.createdAt,
@@ -751,6 +932,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
             ERROR_CODES.MFA_TOTP_NO_RESEND,
           ]),
           401: errorWith('Unauthorized', [ERROR_CODES.UNAUTHORIZED, ERROR_CODES.MFA_TOKEN_EXPIRED]),
+          403: errorWith('Account disabled', [ERROR_CODES.ACCOUNT_DISABLED]),
         },
       },
       config: {
@@ -766,7 +948,8 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       let payload: { driverId: string; type: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -781,6 +964,12 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       const [driver] = await db.select().from(drivers).where(eq(drivers.id, payload.driverId));
       if (driver == null || !driver.mfaEnabled || driver.mfaMethod == null) {
         await reply.status(400).send({ error: 'MFA not configured', code: 'MFA_NOT_CONFIGURED' });
+        return;
+      }
+
+      // No code for a driver deactivated after the password step.
+      if (!driver.isActive) {
+        await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
 
@@ -799,12 +988,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       await dispatchSystemNotification(
         client,
         'mfa.VerificationCode',
-        {
-          email: driver.email ?? undefined,
-          phone: driver.phone ?? undefined,
-          firstName: driver.firstName,
-          language: driver.language,
-        },
+        mfaCodeRecipient(driver.mfaMethod, driver),
         { code: challenge.code },
         ALL_TEMPLATES_DIRS,
       );
@@ -861,8 +1045,10 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         if (!recaptchaOk) return;
       }
 
-      // Match register/login path: ilike so a driver who registered with
-      // Jane@x.com can recover via jane@x.com.
+      // Match register/login path: case-insensitive so a driver who registered with
+      // Jane@x.com can recover via jane@x.com. A driver without a password
+      // gets no reset email, so knowing their address cannot take over the
+      // record. The operator grants first access with a portal invite.
       const [driver] = await db
         .select({
           id: drivers.id,
@@ -875,8 +1061,8 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         .from(drivers)
         .where(
           and(
-            ilike(drivers.email, email),
-            eq(drivers.registrationSource, 'portal'),
+            emailEquals(drivers.email, email),
+            isNotNull(drivers.passwordHash),
             eq(drivers.isActive, true),
           ),
         );
@@ -908,37 +1094,82 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         const portalUrl = apiConfig.PORTAL_URL;
         const resetUrl = `${portalUrl}/reset-password?token=${rawToken}`;
 
-        try {
-          await dispatchSystemNotification(
-            client,
-            'driver.ForgotPassword',
-            {
-              email: driver.email ?? undefined,
-              phone: driver.phone ?? undefined,
-              firstName: driver.firstName,
-              language: driver.language,
-            },
-            {
-              firstName: driver.firstName,
-              lastName: driver.lastName,
-              email: driver.email ?? '',
-              resetUrl,
-            },
-            ALL_TEMPLATES_DIRS,
+        // Not awaited: waiting for the mail provider would make the answer
+        // for a known email slower than for an unknown one. The response is
+        // the same either way, so it does not reveal whether the driver exists.
+        // Email only: the request proves control of the email address, not of
+        // the phone, and drivers have no verified phone flag. An SMS with the
+        // link would hand the reset to whoever holds the stored number.
+        void dispatchSystemNotification(
+          client,
+          'driver.ForgotPassword',
+          {
+            email: driver.email ?? undefined,
+            firstName: driver.firstName,
+            language: driver.language,
+          },
+          {
+            firstName: driver.firstName,
+            lastName: driver.lastName,
+            email: driver.email ?? '',
+            resetUrl,
+          },
+          ALL_TEMPLATES_DIRS,
+        ).catch((err: unknown) => {
+          request.log.warn(
+            { err, driverId: driver.id },
+            'Password reset email dispatch failed, answering success anyway',
           );
-        } catch {
-          // Silently fail to not leak driver existence
-        }
+        });
       }
 
       return { success: true };
     },
   );
 
+  const activateBody = z.object({
+    token: z.string().min(1).describe('Invitation token from the portal invite email link'),
+    password: z.string().min(PASSWORD_MIN_LENGTH).describe('New portal password'),
+  });
+
+  app.post(
+    '/portal/auth/activate',
+    {
+      schema: {
+        tags: ['Portal Auth'],
+        summary: 'Activate driver portal access from an operator invitation',
+        description:
+          'Sets the first portal password on a driver an operator created, using the single-use token from the invitation email. Marks the email as verified. The driver then signs in through the normal login. Returns 400 INVALID_TOKEN for an unknown, used, replaced, or expired link.',
+        operationId: 'portalActivate',
+        security: [],
+        body: zodSchema(activateBody),
+        response: {
+          200: successResponse,
+          400: errorWith('Invalid invitation or weak password', [
+            ERROR_CODES.INVALID_TOKEN,
+            ERROR_CODES.WEAK_PASSWORD,
+          ]),
+        },
+      },
+      config: {
+        rateLimit: {
+          max: apiConfig.AUTH_RATE_LIMIT_MAX,
+          timeWindow: apiConfig.AUTH_RATE_LIMIT_WINDOW,
+        },
+      },
+    },
+    async (request) => {
+      const { token, password } = request.body as z.infer<typeof activateBody>;
+      await activateDriverPortal(token, password, request.log);
+      return { success: true as const };
+    },
+  );
+
   // Reset password with token
   const resetPasswordBody = z.object({
     token: z.string().min(1),
-    password: z.string().min(12),
+    password: z.string().min(PASSWORD_MIN_LENGTH),
+    recaptchaToken: z.string().optional().describe('reCAPTCHA v3 token'),
   });
 
   app.post(
@@ -948,11 +1179,21 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         tags: ['Portal Auth'],
         summary: 'Reset driver password using a token from the reset email',
         operationId: 'portalResetPassword',
+        description:
+          'Sets a new password with the single-use token from the reset email and revokes every refresh token. Verifies the reCAPTCHA token when enabled (web), or the device attestation (mobile apps).',
         security: [],
         body: zodSchema(resetPasswordBody),
         response: {
           200: successResponse,
-          400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
+          400: errorWith('Bad request', [
+            ERROR_CODES.WEAK_PASSWORD,
+            ERROR_CODES.INVALID_TOKEN,
+            ERROR_CODES.RECAPTCHA_REQUIRED,
+          ]),
+          403: errorWith('Forbidden', [
+            ERROR_CODES.RECAPTCHA_FAILED,
+            ERROR_CODES.ATTESTATION_FAILED,
+          ]),
         },
       },
       config: {
@@ -963,7 +1204,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const { token, password } = request.body as z.infer<typeof resetPasswordBody>;
+      const { token, password, recaptchaToken } = request.body as z.infer<typeof resetPasswordBody>;
 
       const complexityError = validatePasswordComplexity(password);
       if (complexityError != null) {
@@ -971,47 +1212,75 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const tokenHash = hashUserToken(token);
+      // Same bot check as login, register and forgot-password: reCAPTCHA on the web, device
+      // attestation for the native apps (which cannot produce a reCAPTCHA token).
+      if (isMobileClient(request)) {
+        const attested = await verifyDeviceAttestation(request);
+        if (!attested) {
+          await reply
+            .status(403)
+            .send({ error: 'Device attestation failed', code: 'ATTESTATION_FAILED' });
+          return;
+        }
+      } else {
+        const recaptchaOk = await checkRecaptcha(recaptchaToken, reply);
+        if (!recaptchaOk) return;
+      }
 
-      const [tokenRow] = await db
-        .select({
-          id: userTokens.id,
-          driverId: userTokens.driverId,
-          expiresAt: userTokens.expiresAt,
-        })
-        .from(userTokens)
-        .where(
-          and(
-            eq(userTokens.tokenHash, tokenHash),
-            eq(userTokens.type, 'password_reset'),
-            isNull(userTokens.revokedAt),
-          ),
-        );
+      // Hashed before the token lookup so a valid and an invalid token take
+      // the same time.
+      const passwordHash = await argon2.hash(password);
+      const now = new Date();
 
-      if (tokenRow == null || tokenRow.driverId == null || tokenRow.expiresAt < new Date()) {
+      const driverId = await db.transaction(async (tx) => {
+        // Consuming the token in the WHERE makes it single-use under
+        // concurrency: of two requests with the same link, one wins.
+        const [consumed] = await tx
+          .update(userTokens)
+          .set({ revokedAt: now })
+          .where(
+            and(
+              eq(userTokens.tokenHash, hashUserToken(token)),
+              eq(userTokens.type, 'password_reset'),
+              isNull(userTokens.revokedAt),
+              gt(userTokens.expiresAt, now),
+              isNotNull(userTokens.driverId),
+            ),
+          )
+          .returning({ driverId: userTokens.driverId });
+        if (consumed?.driverId == null) return null;
+
+        // A driver deactivated after the link went out gets the same answer
+        // as a bad link. The link proves the mailbox, so the email counts as
+        // verified.
+        const [updated] = await tx
+          .update(drivers)
+          .set({ passwordHash, emailVerified: true, updatedAt: now })
+          .where(and(eq(drivers.id, consumed.driverId), eq(drivers.isActive, true)))
+          .returning({ id: drivers.id });
+        // The link stays used: it was valid, the account is not.
+        return updated?.id ?? null;
+      });
+
+      if (driverId == null) {
         await reply
           .status(400)
           .send({ error: 'Invalid or expired reset link', code: 'INVALID_TOKEN' });
         return;
       }
 
-      const passwordHash = await argon2.hash(password);
-
-      await db
-        .update(drivers)
-        .set({ passwordHash, updatedAt: new Date() })
-        .where(eq(drivers.id, tokenRow.driverId));
-
-      await db
-        .update(userTokens)
-        .set({ revokedAt: new Date() })
-        .where(eq(userTokens.id, tokenRow.id));
-
       // Forgot-password is the recovery path after credential compromise.
       // Revoke every outstanding refresh token so an attacker holding a
       // stolen portal_refresh cookie cannot keep using the account after
       // the legitimate driver completes the reset.
-      await revokeAllDriverRefreshTokens(tokenRow.driverId);
+      await revokeAllDriverRefreshTokens(driverId);
+
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: driverId,
+        action: 'password_reset',
+        method: 'reset_token',
+      });
 
       return { success: true };
     },
@@ -1046,24 +1315,24 @@ export function portalAuthRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { token } = request.body as z.infer<typeof verifyEmailBody>;
 
-      const tokenHash = hashUserToken(token);
-
+      const now = new Date();
+      // Consuming the token in the WHERE makes it single-use: a double click
+      // verifies once and sends one welcome email.
       const [tokenRow] = await db
-        .select({
-          id: userTokens.id,
-          driverId: userTokens.driverId,
-          expiresAt: userTokens.expiresAt,
-        })
-        .from(userTokens)
+        .update(userTokens)
+        .set({ revokedAt: now })
         .where(
           and(
-            eq(userTokens.tokenHash, tokenHash),
+            eq(userTokens.tokenHash, hashUserToken(token)),
             eq(userTokens.type, 'email_verification'),
             isNull(userTokens.revokedAt),
+            gt(userTokens.expiresAt, now),
+            isNotNull(userTokens.driverId),
           ),
-        );
+        )
+        .returning({ driverId: userTokens.driverId });
 
-      if (tokenRow == null || tokenRow.driverId == null || tokenRow.expiresAt < new Date()) {
+      if (tokenRow?.driverId == null) {
         await reply
           .status(400)
           .send({ error: 'Invalid or expired verification link', code: 'INVALID_TOKEN' });
@@ -1072,13 +1341,15 @@ export function portalAuthRoutes(app: FastifyInstance): void {
 
       await db
         .update(drivers)
-        .set({ emailVerified: true, updatedAt: new Date() })
+        .set({ emailVerified: true, updatedAt: now })
         .where(eq(drivers.id, tokenRow.driverId));
 
-      await db
-        .update(userTokens)
-        .set({ revokedAt: new Date() })
-        .where(eq(userTokens.id, tokenRow.id));
+      await recordAuthAudit(request, {
+        kind: 'driver',
+        accountId: tokenRow.driverId,
+        action: 'email_verified',
+        method: 'verification_token',
+      });
 
       // Send the welcome email now that the driver is verified
       const [driver] = await db
@@ -1118,6 +1389,8 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Portal Auth'],
         summary: 'Resend email verification link',
+        description:
+          'Revokes the open verification link and emails a new one (email only, never SMS). Besides the per-IP rate limit, a driver gets at most one verification email a minute and five in 24 hours, the sign-up email included. Over the limit it returns 429 VERIFICATION_RESEND_LIMITED with a Retry-After header and retryAfterSeconds in the body.',
         operationId: 'portalResendVerification',
         security: [{ bearerAuth: [] }],
         response: {
@@ -1126,6 +1399,7 @@ export function portalAuthRoutes(app: FastifyInstance): void {
             ERROR_CODES.ALREADY_VERIFIED,
             ERROR_CODES.DRIVER_NOT_FOUND,
           ]),
+          429: errorWith('Too many verification emails', [ERROR_CODES.VERIFICATION_RESEND_LIMITED]),
         },
       },
       config: {
@@ -1144,7 +1418,6 @@ export function portalAuthRoutes(app: FastifyInstance): void {
           firstName: drivers.firstName,
           lastName: drivers.lastName,
           email: drivers.email,
-          phone: drivers.phone,
           language: drivers.language,
           emailVerified: drivers.emailVerified,
         })
@@ -1161,48 +1434,20 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Revoke existing email_verification tokens
-      await db
-        .update(userTokens)
-        .set({ revokedAt: new Date() })
-        .where(
-          and(
-            eq(userTokens.driverId, driverId),
-            eq(userTokens.type, 'email_verification'),
-            isNull(userTokens.revokedAt),
-          ),
-        );
+      // Per-account cap on top of the per-IP rate limit: one email a minute, five a day.
+      const retryAfterSeconds = await verificationResendRetryAfter(driverId);
+      if (retryAfterSeconds != null) {
+        await reply.header('Retry-After', String(retryAfterSeconds)).status(429).send({
+          error: 'Too many verification emails. Wait before you request another one.',
+          code: 'VERIFICATION_RESEND_LIMITED',
+          retryAfterSeconds,
+        });
+        return;
+      }
 
-      // Generate new token
-      const { raw: rawToken, hash: tokenHash } = generateUserToken();
-
-      await db.insert(userTokens).values({
-        driverId,
-        tokenHash,
-        type: 'email_verification',
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      });
-
-      const portalUrl = apiConfig.PORTAL_URL;
-      const verifyUrl = `${portalUrl}/verify-email?token=${rawToken}`;
-
-      void dispatchSystemNotification(
-        client,
-        'driver.AccountVerification',
-        {
-          email: driver.email ?? undefined,
-          phone: driver.phone ?? undefined,
-          firstName: driver.firstName,
-          language: driver.language,
-        },
-        {
-          firstName: driver.firstName,
-          lastName: driver.lastName,
-          email: driver.email ?? '',
-          verifyUrl,
-        },
-        ALL_TEMPLATES_DIRS,
-      );
+      if (driver.email != null) {
+        await sendDriverEmailVerification({ ...driver, email: driver.email }, request.log);
+      }
 
       return { success: true };
     },

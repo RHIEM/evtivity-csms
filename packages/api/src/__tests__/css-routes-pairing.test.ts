@@ -137,6 +137,11 @@ function setupDbResults(...results: unknown[][]) {
   state.dbCallIndex = 0;
 }
 
+const { mockAuditStationChange } = vi.hoisted(() => ({
+  mockAuditStationChange: vi.fn(() => Promise.resolve()),
+}));
+vi.mock('../lib/station-audit.js', () => ({ auditStationChange: mockAuditStationChange }));
+
 vi.mock('@evtivity/database', () => ({
   db: dbMock,
   cssStations: cssStationsRef,
@@ -158,7 +163,7 @@ vi.mock('drizzle-orm', () => ({
 
 const mockPublish = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: mockPublish,
     subscribe: vi.fn(),
@@ -189,6 +194,18 @@ vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn(async () => null),
 }));
 
+const { mockInitialStationPassword, mockChangeStationPassword } = vi.hoisted(() => ({
+  mockInitialStationPassword: vi.fn(),
+  mockChangeStationPassword: vi.fn(),
+}));
+
+vi.mock('../services/station-security.service.js', () => ({
+  initialStationPassword: mockInitialStationPassword,
+  changeStationPassword: mockChangeStationPassword,
+  changeSecurityProfile: vi.fn(),
+}));
+
+import { ValidationError } from '@evtivity/lib';
 import { registerAuth } from '../plugins/auth.js';
 import { cssRoutes } from '../routes/css.js';
 
@@ -222,6 +239,11 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
     updateCalls.length = 0;
     vi.clearAllMocks();
     mockPublish.mockResolvedValue(undefined);
+    mockInitialStationPassword.mockResolvedValue({
+      password: 'test-password-123456',
+      passwordHash: 'argon2-hash',
+    });
+    mockChangeStationPassword.mockResolvedValue({ appliedTo: 'stored' });
   });
 
   it('inserts a charging_stations row with isSimulator=true when none exists', async () => {
@@ -230,8 +252,8 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
       [],
       // 2) lookup chargingStations -> none
       [],
-      // 3) chargingStations insert (no returning) -> empty
-      [],
+      // 3) chargingStations insert returning the new id
+      [{ id: 'sta_new0000001' }],
       // 4) cssStations insert returning -> created station
       [
         {
@@ -264,12 +286,22 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
         ocppProtocol: 'ocpp2.1',
         securityProfile: 1,
         targetUrl: 'ws://ocpp:8080',
-        password: 'test-password',
+        password: 'test-password-123456',
         evses: [{ evseId: 1, connectorId: 1 }],
       },
     });
 
     expect(res.statusCode).toBe(201);
+    expect(mockInitialStationPassword).toHaveBeenCalledWith({
+      ocppProtocol: 'ocpp2.1',
+      securityProfile: 1,
+      password: 'test-password-123456',
+    });
+    expect(mockChangeStationPassword).not.toHaveBeenCalled();
+    const body = res.json<Record<string, unknown>>();
+    expect(body).not.toHaveProperty('password');
+    expect(body).not.toHaveProperty('clientKey');
+    expect(body).toMatchObject({ hasPassword: false, hasClientKey: false });
 
     // chargingStations insert with isSimulator=true was called
     const csInsert = insertCalls.find((c) => c.table === chargingStationsRef);
@@ -280,6 +312,7 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
     expect(csValues['ocppProtocol']).toBe('ocpp2.1');
     expect(csValues['securityProfile']).toBe(1);
     expect(csValues['onboardingStatus']).toBe('accepted');
+    expect(csValues['basicAuthPasswordHash']).toBe('argon2-hash');
 
     // cssStations insert was called
     const cssInsert = insertCalls.find((c) => c.table === cssStationsRef);
@@ -287,6 +320,7 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
     const cssValues = cssInsert?.values as Record<string, unknown>;
     expect(cssValues['stationId']).toBe(STATION_ID);
     expect(cssValues['targetUrl']).toBe('ws://ocpp:8080');
+    expect(cssValues['password']).toBe('test-password-123456');
     // Deduplicated columns are NOT on cssStations insert
     expect(cssValues['ocppProtocol']).toBeUndefined();
     expect(cssValues['securityProfile']).toBeUndefined();
@@ -294,6 +328,23 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
     expect(cssValues['serialNumber']).toBeUndefined();
     expect(cssValues['firmwareVersion']).toBeUndefined();
     expect(cssValues['vendorName']).toBeUndefined();
+
+    // station.created on the new charging station, without the password
+    expect(mockAuditStationChange).toHaveBeenCalledWith(
+      expect.anything(),
+      'sta_new0000001',
+      'created',
+      expect.objectContaining({
+        before: null,
+        after: expect.objectContaining({
+          stationId: STATION_ID,
+          isSimulator: true,
+          ocppProtocol: 'ocpp2.1',
+        }),
+      }),
+    );
+    const change = (mockAuditStationChange.mock.calls[0] as unknown[])[3];
+    expect(JSON.stringify(change)).not.toContain('test-password-123456');
   });
 
   it('flips isSimulator true on existing non-simulator charging_stations row', async () => {
@@ -302,7 +353,7 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
       // 1) duplicate check on cssStations -> none
       [],
       // 2) lookup chargingStations -> existing non-simulator
-      [{ id: existingCsId, isSimulator: false }],
+      [{ id: existingCsId, isSimulator: false, securityProfile: 1 }],
       // 3) chargingStations update (no returning) -> empty
       [],
       // 4) cssStations insert returning -> created station
@@ -353,8 +404,83 @@ describe('POST /v1/css/stations auto-creates charging_stations row', () => {
     const csInsert = insertCalls.find((c) => c.table === chargingStationsRef);
     expect(csInsert).toBeUndefined();
 
-    // cssStations insert was called
+    // The existing station gets a generated password through the security
+    // service, and the simulator row gets the same password.
+    expect(mockInitialStationPassword).not.toHaveBeenCalled();
+    expect(mockChangeStationPassword).toHaveBeenCalledTimes(1);
+    const [stationDbId, password] = mockChangeStationPassword.mock.calls[0] as [string, string];
+    expect(stationDbId).toBe(existingCsId);
+    expect(password).toMatch(/^[A-Za-z0-9]{20}$/);
     const cssInsert = insertCalls.find((c) => c.table === cssStationsRef);
-    expect(cssInsert).toBeDefined();
+    expect((cssInsert?.values as Record<string, unknown>)['password']).toBe(password);
+    expect(mockAuditStationChange).toHaveBeenCalledWith(
+      expect.anything(),
+      existingCsId,
+      'updated',
+      expect.objectContaining({
+        before: { isSimulator: false },
+        notes: 'Simulator paired to the station',
+      }),
+    );
+  });
+
+  it('sets no password on an existing profile 0 station when none is given', async () => {
+    setupDbResults(
+      [],
+      [{ id: 'sta_existing02', isSimulator: true, securityProfile: 0 }],
+      [
+        {
+          id: 'css_003',
+          stationId: STATION_ID,
+          targetUrl: 'ws://ocpp:8080',
+          password: null,
+          clientCert: null,
+          clientKey: null,
+          caCert: null,
+          enabled: true,
+          status: 'disconnected',
+          availabilityState: 'Operative',
+          bootReason: null,
+          lastHeartbeatAt: null,
+          lastBootAt: null,
+          sourceType: 'api',
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/css/stations',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { stationId: STATION_ID, targetUrl: 'ws://ocpp:8080', evses: [{ evseId: 1 }] },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(mockChangeStationPassword).not.toHaveBeenCalled();
+    const cssInsert = insertCalls.find((c) => c.table === cssStationsRef);
+    expect((cssInsert?.values as Record<string, unknown>)['password']).toBeNull();
+  });
+
+  it('creates nothing when the security service refuses the password', async () => {
+    mockChangeStationPassword.mockRejectedValue(new ValidationError('Password is too long'));
+    setupDbResults([], [{ id: 'sta_existing03', isSimulator: false, securityProfile: 1 }]);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/css/stations',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        stationId: STATION_ID,
+        targetUrl: 'ws://ocpp:8080',
+        password: 'x'.repeat(30),
+        evses: [{ evseId: 1 }],
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(insertCalls).toHaveLength(0);
+    expect(updateCalls).toHaveLength(0);
   });
 });

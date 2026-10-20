@@ -636,7 +636,1001 @@
       "idx": 90,
       "version": "7",
       "when": 1781230951115,
+      "tag": "0090_pending_security_profile",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1790830787969,
+      "tag": "0091_driver_portal_invite_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1790911526167,
+      "tag": "0092_station_reported_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1790913044003,
+      "tag": "0093_station_status_inputs",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1790917217500,
+      "tag": "0094_unique_evse_connector_numbers",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1790923188308,
+      "tag": "0095_station_configuration_instances",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1790923903396,
+      "tag": "0096_seed_pnc_ocsp_allowed_private_hosts",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1790928821181,
+      "tag": "0097_css_installed_certificate_pem",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1790930000000,
+      "tag": "0098_prepaid_balance_and_payment_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1790940000000,
+      "tag": "0099_station_web_payment_configs",
+      "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1790950000000,
+      "tag": "0100_firmware_campaign_signature",
+      "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1790966000000,
+      "tag": "0101_octt_test_status_not_applicable",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1790966100000,
+      "tag": "0102_octt_not_applicable_counts",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1790970000000,
+      "tag": "0103_drop_web_payment_and_qr_scan_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1790980000000,
+      "tag": "0104_driver_price_display",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1790980000001,
+      "tag": "0105_seed_company_price_display",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1790990000000,
+      "tag": "0106_invoice_line_item_tax_rate",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1791000000000,
+      "tag": "0107_station_message_template_language",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1791000000001,
+      "tag": "0108_seed_station_message_language",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1791000000002,
+      "tag": "0109_ocpi_tariff_mapping_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1791000000003,
+      "tag": "0110_payment_record_reservation_fees",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1791000010003,
+      "tag": "0111_session_cost_breakdown",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1791000010004,
+      "tag": "0112_seed_company_tax_basis",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1791000010005,
+      "tag": "0113_station_message_charging_power",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1791000010006,
+      "tag": "0114_collapse_queued_screen_and_cost_commands",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1791000010007,
+      "tag": "0115_seed_stripe_webhook_secret",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1791000010008,
+      "tag": "0116_seed_payment_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1791000010009,
+      "tag": "0117_seed_adyen_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1791000010010,
+      "tag": "0118_payment_webhooks_payout_onboarding",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1791000010011,
+      "tag": "0119_cron_payout_account_sync",
+      "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "7",
+      "when": 1791000010012,
+      "tag": "0120_payment_provider_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 121,
+      "version": "7",
+      "when": 1791000010013,
+      "tag": "0121_payment_records_provider_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 122,
+      "version": "7",
+      "when": 1791000010014,
+      "tag": "0122_payment_methods_customers_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 123,
+      "version": "7",
+      "when": 1791000010015,
+      "tag": "0123_payment_provider_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 124,
+      "version": "7",
+      "when": 1791000010016,
+      "tag": "0124_cron_process_version_watch",
+      "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1791000010017,
+      "tag": "0125_payment_settings_provider_neutral",
+      "breakpoints": true
+    },
+    {
+      "idx": 126,
+      "version": "7",
+      "when": 1791000010018,
+      "tag": "0126_payment_async_operations",
+      "breakpoints": true
+    },
+    {
+      "idx": 127,
+      "version": "7",
+      "when": 1791000010019,
+      "tag": "0127_guest_session_start_requested",
+      "breakpoints": true
+    },
+    {
+      "idx": 128,
+      "version": "7",
+      "when": 1791000010020,
+      "tag": "0128_seed_mobile_app_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 129,
+      "version": "7",
+      "when": 1791000010021,
+      "tag": "0129_seed_ev_connection_timeout",
+      "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1791000010022,
+      "tag": "0130_session_idle_notified_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1791000010023,
+      "tag": "0131_setting_audit_deleted",
+      "breakpoints": true
+    },
+    {
+      "idx": 132,
+      "version": "7",
+      "when": 1791000011022,
+      "tag": "0132_css_reconnect_back_off_defaults",
+      "breakpoints": true
+    },
+    {
+      "idx": 133,
+      "version": "7",
+      "when": 1791000012022,
+      "tag": "0133_css_drop_factory_tx_default_profiles",
+      "breakpoints": true
+    },
+    {
+      "idx": 134,
+      "version": "7",
+      "when": 1791000012023,
+      "tag": "0134_ocpi_partner_allow_private_network",
+      "breakpoints": true
+    },
+    {
+      "idx": 135,
+      "version": "7",
+      "when": 1791000012024,
+      "tag": "0135_seed_webhook_allowed_private_hosts",
+      "breakpoints": true
+    },
+    {
+      "idx": 136,
+      "version": "7",
+      "when": 1791000012025,
+      "tag": "0136_offline_command_queue_station_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 137,
+      "version": "7",
+      "when": 1791000012026,
+      "tag": "0137_invoice_paid_status_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 138,
+      "version": "7",
+      "when": 1791000012027,
+      "tag": "0138_station_message_site_language_brand_line",
+      "breakpoints": true
+    },
+    {
+      "idx": 139,
+      "version": "7",
+      "when": 1791000012028,
+      "tag": "0139_ocpi_partner_legacy_evse_uids",
+      "breakpoints": true
+    },
+    {
+      "idx": 140,
+      "version": "7",
+      "when": 1791000012029,
+      "tag": "0140_ocpi_removed_evses",
+      "breakpoints": true
+    },
+    {
+      "idx": 141,
+      "version": "7",
+      "when": 1791000012030,
+      "tag": "0141_ocpi_cdr_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 142,
+      "version": "7",
+      "when": 1791000012031,
+      "tag": "0142_session_end_request",
+      "breakpoints": true
+    },
+    {
+      "idx": 143,
+      "version": "7",
+      "when": 1791000012032,
+      "tag": "0143_session_transaction_unique_per_station",
+      "breakpoints": true
+    },
+    {
+      "idx": 144,
+      "version": "7",
+      "when": 1791000012033,
+      "tag": "0144_status_reported_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 145,
+      "version": "7",
+      "when": 1791000012034,
+      "tag": "0145_simulator_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 146,
+      "version": "7",
+      "when": 1791000012035,
+      "tag": "0146_pnc_local_contract_ca",
+      "breakpoints": true
+    },
+    {
+      "idx": 147,
+      "version": "7",
+      "when": 1791000012036,
+      "tag": "0147_session_transaction_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 148,
+      "version": "7",
+      "when": 1791000012040,
+      "tag": "0148_payment_provider_contract_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 149,
+      "version": "7",
+      "when": 1791000012041,
+      "tag": "0149_payment_provider_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 150,
+      "version": "7",
+      "when": 1791000012042,
+      "tag": "0150_payment_provider_check_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 151,
+      "version": "7",
+      "when": 1791000012050,
+      "tag": "0151_session_cost_ceiling",
+      "breakpoints": true
+    },
+    {
+      "idx": 152,
+      "version": "7",
+      "when": 1791000012058,
+      "tag": "0152_payment_pending_operation_check_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 153,
+      "version": "7",
+      "when": 1791000012066,
+      "tag": "0153_payment_provider_drop_stripe_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 154,
+      "version": "7",
+      "when": 1791000012074,
+      "tag": "0154_cron_station_offline_sweep",
+      "breakpoints": true
+    },
+    {
+      "idx": 155,
+      "version": "7",
+      "when": 1791000012082,
+      "tag": "0155_session_rebill",
+      "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1791000012090,
+      "tag": "0156_notification_switches",
+      "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1791000012098,
+      "tag": "0157_prepaid_session_cost_ceiling",
+      "breakpoints": true
+    },
+    {
+      "idx": 158,
+      "version": "7",
+      "when": 1791000012099,
+      "tag": "0158_drop_suffixless_secret_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 159,
+      "version": "7",
+      "when": 1791000012100,
+      "tag": "0159_drop_system_event_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 160,
+      "version": "7",
+      "when": 1791000012101,
+      "tag": "0160_operator_payment_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 161,
+      "version": "7",
+      "when": 1791000012102,
+      "tag": "0161_prepaid_notices",
+      "breakpoints": true
+    },
+    {
+      "idx": 162,
+      "version": "7",
+      "when": 1791000012103,
+      "tag": "0162_invoice_claim_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 163,
+      "version": "7",
+      "when": 1791000012104,
+      "tag": "0163_invoice_claim_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 164,
+      "version": "7",
+      "when": 1791000012105,
+      "tag": "0164_invoice_claim_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 165,
+      "version": "7",
+      "when": 1791000012106,
+      "tag": "0165_invoice_claim_fk_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 166,
+      "version": "7",
+      "when": 1791000012107,
+      "tag": "0166_seed_invoice_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 167,
+      "version": "7",
+      "when": 1791000012108,
+      "tag": "0167_invoice_credit_note_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 168,
+      "version": "7",
+      "when": 1791000012109,
+      "tag": "0168_invoice_credit_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 169,
+      "version": "7",
+      "when": 1791000012110,
+      "tag": "0169_fleet_account_billing_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 170,
+      "version": "7",
+      "when": 1791000012111,
+      "tag": "0170_fleet_account_billing_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 171,
+      "version": "7",
+      "when": 1791000012112,
+      "tag": "0171_fleet_account_billing_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 172,
+      "version": "7",
+      "when": 1791000012113,
+      "tag": "0172_fleet_account_billing_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 173,
+      "version": "7",
+      "when": 1791000012180,
+      "tag": "0180_fleet_billing_profile",
+      "breakpoints": true
+    },
+    {
+      "idx": 174,
+      "version": "7",
+      "when": 1791000020000,
+      "tag": "0200_fleet_credit_limit",
+      "breakpoints": true
+    },
+    {
+      "idx": 175,
+      "version": "7",
+      "when": 1791000022000,
+      "tag": "0220_fleet_credit_notice_bigint",
+      "breakpoints": true
+    },
+    {
+      "idx": 176,
+      "version": "7",
+      "when": 1791000022100,
+      "tag": "0210_fleet_invoice_enums",
+      "breakpoints": true
+    },
+    {
+      "idx": 177,
+      "version": "7",
+      "when": 1791000022200,
+      "tag": "0211_fleet_invoices",
+      "breakpoints": true
+    },
+    {
+      "idx": 178,
+      "version": "7",
+      "when": 1791000023000,
+      "tag": "0230_fleet_invoice_overdue_notice",
+      "breakpoints": true
+    },
+    {
+      "idx": 179,
+      "version": "7",
+      "when": 1791000023100,
+      "tag": "0231_seed_fleet_invoice_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 180,
+      "version": "7",
+      "when": 1791000023200,
+      "tag": "0232_fleet_invoice_run_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 181,
+      "version": "7",
+      "when": 1791000024000,
+      "tag": "0240_fleet_credit_reservation",
+      "breakpoints": true
+    },
+    {
+      "idx": 182,
+      "version": "7",
+      "when": 1791000025000,
+      "tag": "0250_session_end_notice_claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 183,
+      "version": "7",
+      "when": 1791000026000,
+      "tag": "0251_session_energy_rose_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1791000027000,
+      "tag": "0252_session_end_notice_claims_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 185,
+      "version": "7",
+      "when": 1791000028000,
+      "tag": "0270_invoice_claim_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1791000029000,
+      "tag": "0280_ocpp_server_health_per_process",
+      "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1791000030000,
+      "tag": "0290_invoice_number_seq_drop",
+      "breakpoints": true
+    },
+    {
+      "idx": 188,
+      "version": "7",
+      "when": 1791000032000,
+      "tag": "0310_report_site_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 189,
+      "version": "7",
+      "when": 1791000033000,
+      "tag": "0330_session_tariff_segment_open_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 190,
+      "version": "7",
+      "when": 1791000033100,
+      "tag": "0331_session_meter_register_offset",
+      "breakpoints": true
+    },
+    {
+      "idx": 191,
+      "version": "7",
+      "when": 1791000034000,
+      "tag": "0340_tariff_group_default",
+      "breakpoints": true
+    },
+    {
+      "idx": 192,
+      "version": "7",
+      "when": 1791000034100,
+      "tag": "0341_reservation_fee_snapshot",
+      "breakpoints": true
+    },
+    {
+      "idx": 193,
+      "version": "7",
+      "when": 1791000035000,
+      "tag": "0350_session_station_cost",
+      "breakpoints": true
+    },
+    {
+      "idx": 194,
+      "version": "7",
+      "when": 1791000036000,
+      "tag": "0360_ocpi_location_id_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 195,
+      "version": "7",
+      "when": 1791000036100,
+      "tag": "0361_station_circuit_site_cleanup",
+      "breakpoints": true
+    },
+    {
+      "idx": 196,
+      "version": "7",
+      "when": 1791000039500,
+      "tag": "0395_seed_pdf_branding",
+      "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "7",
+      "when": 1791000040000,
+      "tag": "0400_invoice_audit_sent",
+      "breakpoints": true
+    },
+    {
+      "idx": 198,
+      "version": "7",
+      "when": 1791000040100,
+      "tag": "0370_seed_ai_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 199,
+      "version": "7",
+      "when": 1791000040200,
+      "tag": "0371_ai_provider_keys_move",
+      "breakpoints": true
+    },
+    {
+      "idx": 200,
+      "version": "7",
+      "when": 1791000040300,
+      "tag": "0372_chatbot_ai_configs_effort",
+      "breakpoints": true
+    },
+    {
+      "idx": 201,
+      "version": "7",
+      "when": 1791000040400,
+      "tag": "0373_backfill_ai_assistant_permissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 202,
+      "version": "7",
+      "when": 1791000040500,
+      "tag": "0380_ai_attachments",
+      "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "7",
+      "when": 1791000040600,
+      "tag": "0381_cron_ai_retention_prune",
+      "breakpoints": true
+    },
+    {
+      "idx": 204,
+      "version": "7",
+      "when": 1791000040700,
+      "tag": "0375_ai_conversations",
+      "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "7",
+      "when": 1791000040800,
+      "tag": "0376_ai_messages",
+      "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "7",
+      "when": 1791000040900,
+      "tag": "0377_ai_tool_calls",
+      "breakpoints": true
+    },
+    {
+      "idx": 207,
+      "version": "7",
+      "when": 1791000041000,
+      "tag": "0378_ai_pending_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 208,
+      "version": "7",
+      "when": 1791000041100,
+      "tag": "0379_ai_conversation_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 209,
+      "version": "7",
+      "when": 1791000041200,
+      "tag": "0410_drop_plaintext_ai_provider_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 210,
+      "version": "7",
+      "when": 1791000041300,
+      "tag": "0405_ai_message_access_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 211,
+      "version": "7",
+      "when": 1791000041400,
+      "tag": "0415_seed_invoice_seller",
+      "breakpoints": true
+    },
+    {
+      "idx": 212,
+      "version": "7",
+      "when": 1791000042800,
+      "tag": "0428_ai_conversation_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 213,
+      "version": "7",
+      "when": 1791000044100,
+      "tag": "0441_seed_ai_ops_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 214,
+      "version": "7",
+      "when": 1791000044200,
+      "tag": "0442_backfill_ai_roadmap_permissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 215,
+      "version": "7",
+      "when": 1791000044300,
+      "tag": "0431_ai_proposals",
+      "breakpoints": true
+    },
+    {
+      "idx": 216,
+      "version": "7",
+      "when": 1791000044400,
+      "tag": "0432_ai_proposal_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "7",
+      "when": 1791000044500,
+      "tag": "0416_ai_usage_ledger",
+      "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "7",
+      "when": 1791000044600,
+      "tag": "0417_ai_usage_ledger_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1791000044700,
+      "tag": "0418_site_ai_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1791000044800,
+      "tag": "0419_ai_budget_notices",
+      "breakpoints": true
+    },
+    {
+      "idx": 221,
+      "version": "7",
+      "when": 1791000044900,
+      "tag": "0433_cron_ai_workers",
+      "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1791000045000,
+      "tag": "0434_ai_digest_email_preference",
+      "breakpoints": true
+    },
+    {
+      "idx": 223,
+      "version": "7",
+      "when": 1791000045100,
+      "tag": "0438_ai_mcp_calls",
+      "breakpoints": true
+    },
+    {
+      "idx": 224,
+      "version": "7",
+      "when": 1791000045200,
+      "tag": "0421_ai_insights",
+      "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "version": "7",
+      "when": 1791000045300,
+      "tag": "0422_ai_insight_scan_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "version": "7",
+      "when": 1791000045400,
+      "tag": "0423_ai_insight_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "version": "7",
+      "when": 1791000045500,
+      "tag": "0425_cron_ai_insight_scan",
+      "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "version": "7",
+      "when": 1791000047500,
+      "tag": "0474_release_0_1_45",
+      "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1791000047600,
+      "tag": "0475_release_0_1_46",
+      "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1791000047700,
+      "tag": "0476_release_0_1_46_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "version": "7",
+      "when": 1791000047702,
       "tag": "rhiem_0002_signed_meter_data",
+      "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1791000047800,
+      "tag": "0477_release_0_1_47",
       "breakpoints": true
     }
   ]

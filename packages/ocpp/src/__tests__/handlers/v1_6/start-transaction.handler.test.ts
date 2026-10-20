@@ -24,19 +24,31 @@ vi.mock('@evtivity/database', () => {
       status: 'status',
       stationOcppId: 'station_ocpp_id',
     },
-    chargingSessions: { id: 'id', tokenId: 'token_id', status: 'status' },
+    chargingSessions: {
+      id: 'id',
+      tokenId: 'token_id',
+      status: 'status',
+      stationId: 'stationId',
+      transactionId: 'transactionId',
+    },
+    chargingStations: { id: 'id', stationId: 'station_id' },
     authorizeAttempts: { __table: 'authorize_attempts' },
+    ocpiExternalTokens: { uid: 'uid', isValid: 'is_valid', whitelist: 'whitelist' },
     isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
+    isRoamingEnabled: vi.fn().mockResolvedValue(false),
   };
 });
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((a: unknown, b: unknown) => ({ type: 'eq', a, b })),
   and: vi.fn((...args: unknown[]) => ({ type: 'and', args })),
+  ne: vi.fn((a: unknown, b: unknown) => ({ type: 'ne', a, b })),
+  or: vi.fn((...args: unknown[]) => ({ type: 'or', args })),
   sql: Object.assign(
-    (strings: TemplateStringsArray, ..._values: unknown[]) => ({
+    (strings: TemplateStringsArray, ...values: unknown[]) => ({
       type: 'sql',
       raw: strings.join('?'),
+      values,
     }),
     { raw: (s: string) => ({ type: 'sql-raw', raw: s }) },
   ),
@@ -53,7 +65,7 @@ function selectResolving(rows: unknown[]): { from: ReturnType<typeof vi.fn> } {
     then: (resolve: (v: unknown) => unknown): unknown => resolve(rows),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -64,7 +76,7 @@ function selectThrowing(err: unknown): { from: ReturnType<typeof vi.fn> } {
       reject(err),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -85,13 +97,14 @@ function makeCtx(
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp1.6',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'StartTransaction',
     protocolVersion: 'ocpp1.6',
     payload,
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
     ...overrides,
@@ -155,30 +168,113 @@ describe('OCPP 1.6 StartTransaction handler', () => {
       );
     });
 
-    it('claims a pending session via UPDATE when one exists', async () => {
-      executeFn.mockResolvedValueOnce([{ transaction_id: '42' }]);
+    it('claims a waiting remote start via UPDATE when one exists', async () => {
+      executeFn.mockResolvedValueOnce([]).mockResolvedValueOnce([{ transaction_id: '42' }]);
       const { ctx, publishMock } = makeCtx(basePayload('TAG-CLAIM'), { stationDbId: 'sta_1' });
 
       const response = await handleStartTransaction(ctx);
 
       expect(response.transactionId).toBe(42);
-      // Only the UPDATE claim runs; no sequence call needed.
-      expect(executeFn).toHaveBeenCalledTimes(1);
+      // The resend lookup and the UPDATE claim run; no sequence call needed.
+      expect(executeFn).toHaveBeenCalledTimes(2);
       expect(publishMock).toHaveBeenCalledWith(expect.objectContaining({ aggregateId: '42' }));
     });
 
+    it('claims only a waiting remote start on the EVSE of the reported connector', async () => {
+      executeFn.mockResolvedValueOnce([]).mockResolvedValueOnce([{ transaction_id: '42' }]);
+      const { ctx } = makeCtx(
+        { ...basePayload('TAG-CLAIM'), connectorId: 2 },
+        {
+          stationDbId: 'sta_1',
+        },
+      );
+
+      await handleStartTransaction(ctx);
+
+      const claim = executeFn.mock.calls[1]?.[0] as { raw: string; values: unknown[] };
+      expect(claim.raw).toContain('e.evse_id = ?');
+      expect(claim.raw).toContain('pending.remote_start_id IS NOT NULL');
+      expect(claim.raw).toContain("pending.status = 'active'");
+      expect(claim.raw).toContain('NOT EXISTS');
+      expect(claim.raw).toContain('ORDER BY pending.started_at DESC');
+      // Only for the idTag the portal sent: the driver id, or the token of the
+      // held reservation (1.6 idTag compares without case).
+      expect(claim.raw).toContain('lower(pending.driver_id) = lower(?)');
+      expect(claim.raw).toContain('lower(dt.id_token) = lower(?)');
+      expect(claim.values).toEqual(['sta_1', 2, 'TAG-CLAIM', 'TAG-CLAIM']);
+    });
+
+    it('answers a resent StartTransaction with the transaction id it already has', async () => {
+      executeFn.mockResolvedValueOnce([{ session_id: 'ses_1', transaction_id: '55' }]);
+      const { ctx, publishMock } = makeCtx(basePayload('TAG-RESEND'), { stationDbId: 'sta_1' });
+
+      const response = await handleStartTransaction(ctx);
+
+      expect(response.transactionId).toBe(55);
+      // No claim and no sequence call for a resend.
+      expect(executeFn).toHaveBeenCalledTimes(1);
+      const lookup = executeFn.mock.calls[0]?.[0] as { raw: string; values: unknown[] };
+      expect(lookup.raw).toContain("te.event_type = 'started'");
+      expect(lookup.values).toEqual(['sta_1', '2026-02-15T10:00:00Z', '1', 'TAG-RESEND', '1000']);
+      expect(publishMock).toHaveBeenCalledWith(expect.objectContaining({ aggregateId: '55' }));
+    });
+
+    it('does not count the resent transaction as a concurrent one', async () => {
+      executeFn.mockResolvedValueOnce([{ session_id: 'ses_1', transaction_id: '55' }]);
+      selectFn
+        .mockReturnValueOnce(
+          selectResolving([
+            {
+              id: 'tok_1',
+              driverId: 'drv_1',
+              isActive: true,
+              expiresAt: null,
+              revokedAt: null,
+              prepaidBalanceCents: null,
+            },
+          ]),
+        )
+        .mockReturnValueOnce(selectResolving([]));
+      const { ctx } = makeCtx(basePayload('TAG-RESEND'), { stationDbId: 'sta_1' });
+
+      const response = await handleStartTransaction(ctx);
+
+      expect(response.transactionId).toBe(55);
+      expect(response.idTagInfo).toEqual({ status: 'Accepted' });
+      // The check skips the session of transaction 55 at this station.
+      const { ne } = await import('drizzle-orm');
+      expect(ne).toHaveBeenCalledWith('stationId', 'sta_1');
+      expect(ne).toHaveBeenCalledWith('transactionId', '55');
+    });
+
+    it('allocates a new id when the resend row has no numeric transaction id', async () => {
+      executeFn
+        .mockResolvedValueOnce([{ session_id: 'ses_1', transaction_id: 'abc' }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ nextval: '66' }]);
+      const { ctx } = makeCtx(basePayload('TAG-RESEND'), { stationDbId: 'sta_1' });
+
+      const response = await handleStartTransaction(ctx);
+
+      expect(response.transactionId).toBe(66);
+    });
+
     it('falls back to the sequence when the UPDATE claims no row', async () => {
-      executeFn.mockResolvedValueOnce([]).mockResolvedValueOnce([{ nextval: '77' }]);
+      executeFn
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ nextval: '77' }]);
       const { ctx } = makeCtx(basePayload('TAG-NOCLAIM'), { stationDbId: 'sta_2' });
 
       const response = await handleStartTransaction(ctx);
 
       expect(response.transactionId).toBe(77);
-      expect(executeFn).toHaveBeenCalledTimes(2);
+      expect(executeFn).toHaveBeenCalledTimes(3);
     });
 
     it('falls back to the sequence when the claimed transaction_id is not numeric', async () => {
       executeFn
+        .mockResolvedValueOnce([])
         .mockResolvedValueOnce([{ transaction_id: 'not-a-number' }])
         .mockResolvedValueOnce([{ nextval: '88' }]);
       const { ctx } = makeCtx(basePayload('TAG-NAN'), { stationDbId: 'sta_3' });
@@ -190,6 +286,7 @@ describe('OCPP 1.6 StartTransaction handler', () => {
 
     it('falls back to the sequence when the claimed transaction_id is a float', async () => {
       executeFn
+        .mockResolvedValueOnce([])
         .mockResolvedValueOnce([{ transaction_id: '3.14' }])
         .mockResolvedValueOnce([{ nextval: '99' }]);
       const { ctx } = makeCtx(basePayload('TAG-FLOAT'), { stationDbId: 'sta_4' });
@@ -200,7 +297,10 @@ describe('OCPP 1.6 StartTransaction handler', () => {
     });
 
     it('falls back to the sequence when the claim row is undefined', async () => {
-      executeFn.mockResolvedValueOnce([undefined]).mockResolvedValueOnce([{ nextval: '111' }]);
+      executeFn
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([undefined])
+        .mockResolvedValueOnce([{ nextval: '111' }]);
       const { ctx } = makeCtx(basePayload('TAG-UNDEF'), { stationDbId: 'sta_5' });
 
       const response = await handleStartTransaction(ctx);
@@ -208,24 +308,32 @@ describe('OCPP 1.6 StartTransaction handler', () => {
       expect(response.transactionId).toBe(111);
     });
 
-    it('defaults to 1 when the sequence query returns no row', async () => {
+    it('fails the message when the sequence query returns no row', async () => {
       executeFn.mockResolvedValueOnce([]);
-      const { ctx } = makeCtx(basePayload('TAG-DEFAULT'));
+      const errorSpy = vi.spyOn(logger, 'error');
+      const { ctx, publishMock } = makeCtx(basePayload('TAG-DEFAULT'));
 
-      const response = await handleStartTransaction(ctx);
-
-      expect(response.transactionId).toBe(1);
+      await expect(handleStartTransaction(ctx)).rejects.toThrow(
+        'ocpp16_transaction_id_seq returned no value',
+      );
+      expect(publishMock).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
 
-    it('uses a timestamp-based id when the sequence query throws', async () => {
+    it('fails the message, without a made-up id, when the sequence query throws', async () => {
       executeFn.mockRejectedValueOnce(new Error('db down'));
-      const { ctx } = makeCtx(basePayload('TAG-TS'));
+      const errorSpy = vi.spyOn(logger, 'error');
+      const { ctx, publishMock } = makeCtx(basePayload('TAG-TS'));
 
-      const response = await handleStartTransaction(ctx);
-
-      expect(typeof response.transactionId).toBe('number');
-      expect(Number.isInteger(response.transactionId)).toBe(true);
-      expect(response.transactionId as number).toBeGreaterThan(0);
+      await expect(handleStartTransaction(ctx)).rejects.toThrow('db down');
+      expect(publishMock).not.toHaveBeenCalled();
+      expect(insertFn).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ stationId: 'CS-001' }),
+        'StartTransaction (1.6): could not allocate a transaction id',
+      );
+      errorSpy.mockRestore();
     });
 
     it('forwards reservationId into the emitted event', async () => {
@@ -261,6 +369,54 @@ describe('OCPP 1.6 StartTransaction handler', () => {
     });
   });
 
+  describe('prepaid tokens (no NoCredit in 1.6)', () => {
+    const prepaidRow = (prepaidBalanceCents: number) => ({
+      id: 'dtk_pp',
+      driverId: 'drv_pp',
+      isActive: true,
+      expiresAt: null,
+      revokedAt: null,
+      prepaidBalanceCents,
+    });
+
+    it('Accepted with expiryDate now for a prepaid token with credit', async () => {
+      selectFn
+        .mockReturnValueOnce(selectResolving([prepaidRow(5000)]))
+        .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
+        .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
+      const { ctx, publishMock } = makeCtx(basePayload('PREPAID-TAG'));
+
+      const response = await handleStartTransaction(ctx);
+      const info = response.idTagInfo as Record<string, unknown>;
+
+      expect(info['status']).toBe('Accepted');
+      // An accepted start carries no refusal: the payment gate stops at once.
+      const event = publishMock.mock.calls[0]?.[0] as { payload: Record<string, unknown> };
+      expect(event.payload).not.toHaveProperty('startRefusal');
+      expect(Math.abs(Date.parse(info['expiryDate'] as string) - Date.now())).toBeLessThan(5_000);
+    });
+
+    it('Blocked with outcome no_credit when the balance is not positive', async () => {
+      selectFn
+        .mockReturnValueOnce(selectResolving([prepaidRow(-10)]))
+        .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
+        .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
+      const { ctx, publishMock } = makeCtx(basePayload('NOCREDIT-TAG'));
+
+      const response = await handleStartTransaction(ctx);
+
+      expect((response.idTagInfo as Record<string, unknown>)['status']).toBe('Blocked');
+      expect(lastAttemptRow()).toMatchObject({ outcome: 'no_credit', reason: 'no_credit' });
+      // The Started event carries the refusal, so the payment gate waits for
+      // the station to end the transaction before it stops it.
+      expect(publishMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({ eventType: 'Started', startRefusal: 'no_credit' }),
+        }),
+      );
+    });
+  });
+
   describe('driver_tokens validation matrix', () => {
     it('Accepted with expiryDate for an active future-expiry token', async () => {
       const future = new Date(Date.now() + 86_400_000);
@@ -276,6 +432,7 @@ describe('OCPP 1.6 StartTransaction handler', () => {
             },
           ]),
         )
+        .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
         .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
       const { ctx } = makeCtx(basePayload('GOOD-TAG'));
 
@@ -320,7 +477,7 @@ describe('OCPP 1.6 StartTransaction handler', () => {
       expect(response.idTagInfo).toEqual({ status: 'Blocked' });
       expect(lastAttemptRow()).toMatchObject({
         outcome: 'blocked',
-        reason: 'inactive_or_revoked',
+        reason: 'inactive',
         matchedTokenId: 'dtk_x',
       });
     });
@@ -458,6 +615,7 @@ describe('OCPP 1.6 StartTransaction handler', () => {
             },
           ]),
         )
+        .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
         .mockReturnValueOnce(selectResolving([{ id: 'ses_active' }]));
       const { ctx } = makeCtx(basePayload('BUSY-TAG'));
 
@@ -479,6 +637,7 @@ describe('OCPP 1.6 StartTransaction handler', () => {
             { id: 'dtk_w', driverId: 'drv_w', isActive: true, expiresAt: future, revokedAt: null },
           ]),
         )
+        .mockReturnValueOnce(selectResolving([])) // own station row lookup: none
         .mockReturnValueOnce(selectThrowing(new Error('session lookup failed')));
       const warnSpy = vi.spyOn(logger, 'warn');
       const { ctx } = makeCtx(basePayload('WARN-TAG'));
@@ -490,8 +649,8 @@ describe('OCPP 1.6 StartTransaction handler', () => {
         expiryDate: future.toISOString(),
       });
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ idTag: 'WARN-TAG' }),
-        'Concurrent-tx lookup failed (1.6 start)',
+        expect.objectContaining({ idToken: 'WARN-TAG' }),
+        'Concurrent transaction lookup failed; keeping the decision',
       );
       warnSpy.mockRestore();
     });

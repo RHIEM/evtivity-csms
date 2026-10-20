@@ -10,11 +10,12 @@ import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { formatDateTime, TIMEZONE_OPTIONS } from '@/lib/timezone';
-import { LANGUAGES } from '@/components/ui/language-select';
+import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
 import type { UserMe } from '@/pages/Profile';
 
 const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -97,7 +98,9 @@ export function ProfilePersonalInfo({ user }: ProfilePersonalInfoProps): React.J
           <form onSubmit={handleSave} className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-firstName">{t('users.firstName')}</Label>
+                <Label htmlFor="edit-firstName" className="leading-6">
+                  {t('users.firstName')}
+                </Label>
                 <Input
                   id="edit-firstName"
                   value={firstName}
@@ -107,7 +110,9 @@ export function ProfilePersonalInfo({ user }: ProfilePersonalInfoProps): React.J
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-lastName">{t('users.lastName')}</Label>
+                <Label htmlFor="edit-lastName" className="leading-6">
+                  {t('users.lastName')}
+                </Label>
                 <Input
                   id="edit-lastName"
                   value={lastName}
@@ -118,7 +123,9 @@ export function ProfilePersonalInfo({ user }: ProfilePersonalInfoProps): React.J
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="edit-phone">{t('users.phone')}</Label>
+              <Label htmlFor="edit-phone" className="leading-6">
+                {t('users.phone')}
+              </Label>
               <Input
                 id="edit-phone"
                 type="tel"
@@ -131,27 +138,21 @@ export function ProfilePersonalInfo({ user }: ProfilePersonalInfoProps): React.J
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-language">{t('profile.language')}</Label>
-                <select
+                <Label htmlFor="edit-language" className="leading-6">
+                  {t('profile.language')}
+                </Label>
+                <LanguageSelect
                   id="edit-language"
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                   value={editLanguage}
-                  onChange={(e) => {
-                    setEditLanguage(e.target.value);
-                  }}
-                >
-                  {LANGUAGES.map((lang) => (
-                    <option key={lang.code} value={lang.code}>
-                      {lang.label}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setEditLanguage}
+                />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-timezone">{t('profile.timezone')}</Label>
-                <select
+                <Label htmlFor="edit-timezone" className="leading-6">
+                  {t('profile.timezone')}
+                </Label>
+                <Select
                   id="edit-timezone"
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                   value={editTimezone}
                   onChange={(e) => {
                     setEditTimezone(e.target.value);
@@ -162,7 +163,7 @@ export function ProfilePersonalInfo({ user }: ProfilePersonalInfoProps): React.J
                       {opt.label}
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
             <div className="flex justify-end gap-2">

@@ -1,11 +1,21 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, ne, and, or, ilike, sql, desc, asc } from 'drizzle-orm';
-import { db } from '@evtivity/database';
 import {
+  db,
+  client,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+  PG_FOREIGN_KEY_VIOLATION,
+  resolveAccountBilling,
+  resolveDriverPricingSource,
+  inOperatorStation,
+} from '@evtivity/database';
+import {
+  ACCOUNT_INVOICE_RECIPIENTS,
   drivers,
   driverTokens,
   vehicles,
@@ -18,22 +28,32 @@ import {
   reservations,
   writeAudit,
   driverAuditLog,
-  vehicleAuditLog,
   pricingAssignmentAuditLog,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import { zodSchema } from '../lib/zod-schema.js';
-import { sessionCurrencySql } from '../lib/company-currency.js';
+import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
+import { getUserSiteIds, requireAllSiteAccess } from '../lib/site-access.js';
+import { reservationsAtSites, sessionsAtSites } from '../lib/session-site-scope.js';
 import * as tokenService from '../services/token.service.js';
-import { OCPP_TOKEN_TYPES } from './tokens.js';
+import { getPortalAccess, inviteDriverToPortal } from '../services/driver-portal-access.service.js';
+import {
+  getDriverBillingAddress,
+  updateDriverBillingAddress,
+} from '../services/driver-billing.service.js';
+import {
+  driverBillingAddressBody,
+  driverBillingAddressItem,
+} from '../lib/driver-billing-address-schema.js';
+import { OCPP_ID_TOKEN_TYPES } from '@evtivity/lib/id-token-types';
 import type { JwtPayload } from '../plugins/auth.js';
-import { isValidTimezone } from '@evtivity/lib';
+import { isValidTimezone, UI_LANGUAGES } from '@evtivity/lib';
 import {
   paginatedResponse,
   itemResponse,
@@ -42,6 +62,27 @@ import {
 } from '../lib/response-schemas.js';
 
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { emailEquals } from '../lib/email-match.js';
+import { eraseDriver } from '../services/driver-erasure.service.js';
+import { changedFields } from '../lib/audit-diff.js';
+import { sendDriverEmailVerification } from '../lib/driver-email-verification.js';
+import {
+  applyDriverDeactivation,
+  revokeDriverEmailLinks,
+} from '../services/driver-status.service.js';
+import * as vehicleService from '../services/vehicle.service.js';
+import {
+  replyVehicleServiceError,
+  vehicleAutochargeFields,
+  vehicleLastSeen,
+} from '../lib/vehicle-response.js';
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_PRICING_GROUP_NOT_FOUND = {
+  error: 'Pricing group not found',
+  code: 'PRICING_GROUP_NOT_FOUND',
+} as const;
 const driverItem = z
   .object({
     id: z.string().describe('Driver identifier'),
@@ -49,9 +90,93 @@ const driverItem = z
     lastName: z.string().max(100).nullable().describe('Driver last name'),
     email: z.string().email().max(255).nullable().describe('Driver email address'),
     phone: z.string().max(50).nullable().describe('Driver phone number in E.164 format'),
+    language: z
+      .string()
+      .describe('Preferred language of the portal, notifications and invoices (e.g. en, de)'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
+    erasedAt: z.coerce
+      .date()
+      .nullable()
+      .optional()
+      .describe(
+        'When the personal data was erased (POST /v1/drivers/:id/erase), or null. An erased driver is an anonymized stub that cannot change.',
+      ),
     createdAt: z.coerce.date().describe('Timestamp when the driver was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the driver was last updated'),
+  })
+  .passthrough();
+
+const portalAccessItem = z
+  .object({
+    status: z
+      .enum(['active', 'invited', 'none'])
+      .describe(
+        'Driver portal access: active (has a password), invited (open invitation), or none',
+      ),
+    inviteExpiresAt: z.coerce
+      .date()
+      .nullable()
+      .describe('When the open invitation expires, or null when there is none'),
+  })
+  .passthrough();
+
+const fleetRefItem = z
+  .object({
+    id: z.string().describe('Fleet identifier'),
+    name: z.string().max(255).describe('Fleet display name'),
+  })
+  .passthrough();
+
+const driverBillingItem = z
+  .object({
+    mode: z
+      .enum(['card', 'account'])
+      .describe(
+        "How the driver's new sessions are paid: account (billed to billingFleet, no card) or card",
+      ),
+    billingFleet: fleetRefItem
+      .nullable()
+      .describe(
+        'The fleet new sessions are billed to (the oldest membership in a fleet with account billing that the driver has not opted out of), or null for card',
+      ),
+    invoicedTo: z
+      .enum(ACCOUNT_INVOICE_RECIPIENTS)
+      .nullable()
+      .describe(
+        "Who gets the monthly invoice of the driver's new account sessions: fleet (billingFleet's invoice) or member (the driver's own invoice, via billingFleet); null for card",
+      ),
+    pricingFleet: fleetRefItem
+      .nullable()
+      .describe(
+        'The fleet whose pricing group prices the driver (the oldest membership in a fleet with a pricing group), or null, also when a driver pricing group overrides it. Can differ from billingFleet.',
+      ),
+    pricingSource: z
+      .enum(['driver', 'fleet'])
+      .nullable()
+      .describe(
+        'What prices the driver at every station: driver (a driver pricing group, which overrides fleet pricing), fleet (pricingFleet), or null (the station, site or default group)',
+      ),
+    pricingGroup: z
+      .object({
+        id: z.string().describe('Pricing group identifier'),
+        name: z.string().describe('Pricing group name'),
+      })
+      .passthrough()
+      .nullable()
+      .describe('The driver or fleet pricing group, null when pricingSource is null'),
+  })
+  .passthrough();
+
+const driverDetailItem = driverItem
+  .extend({
+    portalAccess: portalAccessItem.describe('Driver portal access state'),
+    billing: driverBillingItem.describe('Billing mode, billing fleet and pricing fleet'),
+  })
+  .passthrough();
+
+const portalInviteItem = z
+  .object({
+    expiresAt: z.coerce.date().describe('When the invitation link expires'),
   })
   .passthrough();
 
@@ -100,6 +225,25 @@ const driverParams = z.object({
   id: ID_PARAMS.driverId.describe('Driver ID'),
 });
 
+const eraseDriverBody = z.object({
+  confirm: z
+    .string()
+    .max(64)
+    .describe('The driver id, typed again to confirm the irreversible erasure'),
+});
+
+const driverErasureItem = z
+  .object({
+    erasedAt: z.coerce.date().describe('When the personal data was erased'),
+    paymentMethodsRemoved: z.number().int().min(0).describe('Saved payment methods removed'),
+    vehiclesRemoved: z.number().int().min(0).describe('Vehicles removed'),
+    tokensDeactivated: z.number().int().min(0).describe('Tokens deactivated'),
+  })
+  .passthrough();
+
+// A site-restricted user gets this before an erasure (requireAllSiteAccess).
+const DRIVER_NOT_FOUND_BODY = { error: 'Driver not found', code: 'DRIVER_NOT_FOUND' } as const;
+
 const driverReservationItem = z
   .object({
     id: z.string().describe('Internal reservation row id'),
@@ -133,30 +277,56 @@ const driverReservationItem = z
       .number()
       .int()
       .min(0)
-      .describe('Fee actually charged (cents, 0 when waived)'),
+      .describe('Fee actually charged (cents, tax included, 0 when waived)'),
   })
   .passthrough();
 
+const driverLanguage = z
+  .enum(UI_LANGUAGES)
+  .describe('Preferred language of the portal, notifications and invoices');
+
 const createDriverBody = z.object({
-  firstName: z.string().max(100),
-  lastName: z.string().max(100),
-  email: z.string().email().optional(),
+  firstName: z.string().min(1).max(100),
+  lastName: z.string().min(1).max(100),
+  email: z.string().email().max(255).optional(),
   phone: z.string().max(50).optional(),
+  language: driverLanguage.optional().describe('Preferred language (default en)'),
 });
 
 const updateDriverBody = z.object({
-  firstName: z.string().max(100).optional(),
-  lastName: z.string().max(100).optional(),
-  email: z.string().email().optional(),
-  phone: z.string().max(50).optional(),
-  isActive: z.boolean().optional().describe('Whether the driver account is active'),
+  firstName: z.string().min(1).max(100).optional(),
+  lastName: z.string().min(1).max(100).optional(),
+  email: z
+    .string()
+    .email()
+    .max(255)
+    .nullable()
+    .optional()
+    .describe(
+      'Email address. Null removes it, refused for a driver with portal access (the email is the sign-in). A change (not only of case) marks the email unverified, revokes the open invitation, password reset and verification links sent to the old address, and emails a verification link to the new address when the driver has portal access.',
+    ),
+  phone: z
+    .string()
+    .max(50)
+    .nullable()
+    .optional()
+    .describe(
+      'Phone number. Null or an empty string removes it, refused while the driver signs in with SMS codes.',
+    ),
+  language: driverLanguage.optional(),
+  isActive: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether the driver account is active. false also deactivates every active token of the driver, ends the portal sessions and revokes the open emailed links; true does not reactivate the tokens.',
+    ),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
 });
 
 const createTokenBody = z.object({
-  idToken: z.string().max(255).describe('Token identifier (e.g. RFID card UID)'),
+  idToken: z.string().min(1).max(255).describe('Token identifier (e.g. RFID card UID)'),
   tokenType: z
-    .enum(OCPP_TOKEN_TYPES)
+    .enum(OCPP_ID_TOKEN_TYPES)
     .describe('OCPP IdToken type (one of the OCPP 2.1 IdTokenEnumType values)'),
 });
 
@@ -210,12 +380,39 @@ const vehicleItem = z
       .regex(/^\d{4}$/)
       .nullable()
       .describe('Model year (4-digit)'),
-    vin: z.string().max(17).nullable().describe('Vehicle identification number (17 chars)'),
     licensePlate: z.string().max(20).nullable().describe('Vehicle license plate'),
+    ...vehicleAutochargeFields,
+    autochargeBlockedAt: z.coerce
+      .date()
+      .nullable()
+      .describe(
+        'When an operator blocked the vehicle: its ids are refused at every start and the driver cannot turn Autocharge on',
+      ),
     createdAt: z.coerce.date().describe('Timestamp when the vehicle was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the vehicle was last updated'),
   })
   .passthrough();
+
+const vehicleIdFields = {
+  vin: z
+    .string()
+    .max(17)
+    .nullable()
+    .optional()
+    .describe('VIN (17 characters, no I, O or Q; stored uppercase). Null or empty removes it.'),
+  evccid: z
+    .string()
+    .max(255)
+    .nullable()
+    .optional()
+    .describe(
+      'EVCCID or MAC address of the EV charging controller (any case and separators; stored normalized). Null or empty removes it.',
+    ),
+  autochargeEnabled: z
+    .boolean()
+    .optional()
+    .describe('Autocharge (charge by plugging in); needs a VIN or an EVCCID'),
+};
 
 const createVehicleBody = z.object({
   make: z.string().min(1).max(100).describe('Vehicle make (e.g. Tesla, BMW)'),
@@ -225,8 +422,8 @@ const createVehicleBody = z.object({
     .regex(/^\d{4}$/)
     .optional()
     .describe('Model year (4-digit)'),
-  vin: z.string().max(17).optional().describe('Vehicle Identification Number'),
   licensePlate: z.string().max(20).optional().describe('License plate number'),
+  ...vehicleIdFields,
 });
 
 const updateVehicleBody = z.object({
@@ -235,9 +432,16 @@ const updateVehicleBody = z.object({
   year: z
     .string()
     .regex(/^\d{4}$/)
-    .optional(),
-  vin: z.string().max(17).optional(),
-  licensePlate: z.string().max(20).optional(),
+    .nullable()
+    .optional()
+    .describe('Model year (4-digit). Null removes it.'),
+  licensePlate: z
+    .string()
+    .max(20)
+    .nullable()
+    .optional()
+    .describe('License plate. Null removes it.'),
+  ...vehicleIdFields,
 });
 
 const vehicleParams = z.object({
@@ -274,9 +478,26 @@ const driverSafeSelect = {
   isActive: drivers.isActive,
   emailVerified: drivers.emailVerified,
   lastNotificationReadAt: drivers.lastNotificationReadAt,
+  erasedAt: drivers.erasedAt,
   createdAt: drivers.createdAt,
   updatedAt: drivers.updatedAt,
 } as const;
+
+/** The driver fields an audit row records: no password, MFA secret or timestamps. */
+const DRIVER_AUDIT_KEYS = [
+  'firstName',
+  'lastName',
+  'email',
+  'phone',
+  'language',
+  'timezone',
+  'isActive',
+  'emailVerified',
+] as const;
+
+function pickPublic(row: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(DRIVER_AUDIT_KEYS.map((key) => [key, row[key] ?? null]));
+}
 
 export function driverRoutes(app: FastifyInstance): void {
   app.get(
@@ -347,7 +568,7 @@ export function driverRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
         response: {
-          200: itemResponse(driverItem),
+          200: itemResponse(driverDetailItem),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
         },
       },
@@ -359,7 +580,111 @@ export function driverRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
-      return driver;
+      const [portalAccess, billingFleet, pricing] = await Promise.all([
+        getPortalAccess(driver.id),
+        resolveAccountBilling(client, driver.id),
+        resolveDriverPricingSource(client, driver.id),
+      ]);
+      return {
+        ...driver,
+        portalAccess,
+        billing: {
+          mode: billingFleet != null ? 'account' : 'card',
+          billingFleet:
+            billingFleet != null
+              ? { id: billingFleet.fleetId, name: billingFleet.fleetName }
+              : null,
+          invoicedTo: billingFleet?.recipient ?? null,
+          pricingFleet:
+            pricing?.source === 'fleet' ? { id: pricing.fleetId, name: pricing.fleetName } : null,
+          pricingSource: pricing?.source ?? null,
+          pricingGroup:
+            pricing != null ? { id: pricing.pricingGroupId, name: pricing.pricingGroupName } : null,
+        },
+      };
+    },
+  );
+
+  app.post(
+    '/drivers/:id/portal-invite',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Invite a driver to the driver portal',
+        description:
+          'Emails the driver a single-use link to set a password on their existing record, so they keep their sessions, tokens, payment methods, and invoices. The link expires after 7 days. Sending again replaces the earlier link. Only for active drivers with an email address and no portal password yet.',
+        operationId: 'inviteDriverToPortal',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        response: {
+          200: itemResponse(portalInviteItem),
+          400: errorWith('Driver has no email address', [ERROR_CODES.EMAIL_REQUIRED]),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Driver is inactive or already has portal access', [
+            ERROR_CODES.DRIVER_INACTIVE,
+            ERROR_CODES.PORTAL_ALREADY_ACTIVE,
+          ]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      return inviteDriverToPortal(id, { actor: getAuditActor(request), log: request.log });
+    },
+  );
+
+  app.get(
+    '/drivers/:id/billing-address',
+    {
+      onRequest: [authorize('drivers:read')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Get the driver billing address',
+        description:
+          'The bill-to block of the invoices a fleet addresses to each member. A null name prints the first and last name.',
+        operationId: 'getDriverBillingAddress',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        response: {
+          200: itemResponse(driverBillingAddressItem),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      return getDriverBillingAddress(id);
+    },
+  );
+
+  app.patch(
+    '/drivers/:id/billing-address',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Update the driver billing address',
+        description:
+          'Sets the bill-to block of the invoices a fleet addresses to each member. Fields left out keep their value; null or a blank string clears a field. A change is audited (billing_address_updated with the changed fields); a request that changes nothing is not. The driver can edit the same address in the portal.',
+        operationId: 'updateDriverBillingAddress',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        body: zodSchema(driverBillingAddressBody),
+        response: {
+          200: itemResponse(driverBillingAddressItem),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Driver erased', [ERROR_CODES.DRIVER_ERASED]),
+        },
+      },
+    },
+    async (request) => {
+      const { id } = request.params as z.infer<typeof driverParams>;
+      const body = request.body as z.infer<typeof driverBillingAddressBody>;
+      return updateDriverBillingAddress(id, body, {
+        actor: getAuditActor(request),
+        log: request.log,
+      });
     },
   );
 
@@ -387,7 +712,7 @@ export function driverRoutes(app: FastifyInstance): void {
         const [existing] = await db
           .select({ id: drivers.id })
           .from(drivers)
-          .where(eq(drivers.email, body.email));
+          .where(emailEquals(drivers.email, body.email));
         if (existing != null) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
@@ -401,11 +726,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // The pre-check above is non-transactional, so two concurrent POSTs with the
         // same lowercased email can both pass it and race here. The partial unique
         // index uq_drivers_email_lower (migration 0052) raises 23505 on the loser.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
         }
@@ -445,7 +766,10 @@ export function driverRoutes(app: FastifyInstance): void {
           200: itemResponse(driverItem),
           400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
-          409: errorWith('Email already in use', [ERROR_CODES.DUPLICATE_EMAIL]),
+          409: errorWith('Email already in use or driver erased', [
+            ERROR_CODES.DUPLICATE_EMAIL,
+            ERROR_CODES.DRIVER_ERASED,
+          ]),
         },
       },
     },
@@ -458,12 +782,51 @@ export function driverRoutes(app: FastifyInstance): void {
         return;
       }
 
-      if (body.email !== undefined) {
-        body.email = body.email.toLowerCase();
+      // The full row: the password and MFA columns decide the email and phone
+      // guards below. The audit row holds changed public fields only.
+      const [before] = await db.select().from(drivers).where(eq(drivers.id, id));
+      if (before == null) {
+        await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
+        return;
+      }
+      if (before.erasedAt != null) {
+        await reply.status(409).send({ error: 'The driver was erased', code: 'DRIVER_ERASED' });
+        return;
+      }
+
+      const email =
+        body.email === undefined
+          ? undefined
+          : body.email === null
+            ? null
+            : body.email.toLowerCase();
+      const phone =
+        body.phone === undefined
+          ? undefined
+          : body.phone === null || body.phone.trim() === ''
+            ? null
+            : body.phone;
+
+      if (email === null && before.passwordHash != null) {
+        await reply.status(400).send({
+          error: 'A driver with portal access needs an email address to sign in',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      if (phone === null && before.mfaEnabled && before.mfaMethod === 'sms') {
+        await reply.status(400).send({
+          error: 'The driver signs in with SMS codes: the phone number cannot be removed',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+
+      if (email != null) {
         const [collision] = await db
           .select({ id: drivers.id })
           .from(drivers)
-          .where(and(eq(drivers.email, body.email), ne(drivers.id, id)));
+          .where(and(emailEquals(drivers.email, email), ne(drivers.id, id)));
         if (collision != null) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
@@ -473,16 +836,17 @@ export function driverRoutes(app: FastifyInstance): void {
       const fields: Record<string, unknown> = { updatedAt: new Date() };
       if (body.firstName !== undefined) fields['firstName'] = body.firstName;
       if (body.lastName !== undefined) fields['lastName'] = body.lastName;
-      if (body.email !== undefined) fields['email'] = body.email;
-      if (body.phone !== undefined) fields['phone'] = body.phone;
+      // A new address is unverified until the driver opens the link sent to
+      // it. A case-only change is the same address and stays verified.
+      const emailChanged =
+        email !== undefined && (email ?? '') !== (before.email ?? '').toLowerCase();
+      if (email !== undefined) fields['email'] = email;
+      if (emailChanged) fields['emailVerified'] = false;
+      if (phone !== undefined) fields['phone'] = phone;
+      if (body.language !== undefined) fields['language'] = body.language;
       if (body.isActive !== undefined) fields['isActive'] = body.isActive;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
 
-      // before is used only for the audit row — writeAudit's redactor masks
-      // sensitive fields, so it's safe to fetch the full row here. The
-      // returned `updated` row goes back to the operator, so we project it
-      // through driverSafeSelect to keep passwordHash/totpSecretEnc internal.
-      const [before] = await db.select().from(drivers).where(eq(drivers.id, id));
       let updated;
       try {
         [updated] = await db
@@ -491,14 +855,10 @@ export function driverRoutes(app: FastifyInstance): void {
           .where(eq(drivers.id, id))
           .returning(driverSafeSelect);
       } catch (err) {
-        // Same race as POST: the eq() collision pre-check is non-transactional,
-        // so a concurrent INSERT/UPDATE with the same lowercased email can
-        // happen between the check and this UPDATE.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23505'
-        ) {
+        // The collision pre-check is non-transactional, so a concurrent
+        // INSERT/UPDATE with the same lowercased email can happen between the
+        // check and this UPDATE (uq_drivers_email_lower).
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
           return;
         }
@@ -510,28 +870,51 @@ export function driverRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const actor = getAuditActor(request);
-      let action: string = 'updated';
-      if (before != null && body.isActive !== undefined && body.isActive !== before.isActive) {
-        action = body.isActive ? 'activated' : 'deactivated';
+      const ctx = { actor: getAuditActor(request), log: request.log };
+
+      // Links sent to the old address must not verify or take over the new one.
+      if (emailChanged) {
+        await revokeDriverEmailLinks(id);
+        // A driver with portal access gets a verification link at the new
+        // address; one without gets it with the portal invitation.
+        if (email != null && before.passwordHash != null) {
+          await sendDriverEmailVerification(
+            {
+              id,
+              firstName: updated.firstName,
+              lastName: updated.lastName,
+              email,
+              language: updated.language,
+            },
+            request.log,
+          );
+        }
       }
-      // Reactivation does NOT auto-reactivate the driver's tokens. The DELETE
-      // cascade flipped them off, but some may have been deliberately revoked
-      // (stolen card, lost fob); blindly flipping them back would override that
-      // intent. The operator reactivates individual tokens via the Tokens page.
-      await writeAudit(
-        { table: driverAuditLog, idColumn: 'driver_id' },
-        {
-          entityId: updated.id,
-          entityIdSnapshot: updated.id,
-          action,
-          ...actor,
-          before: before ?? null,
-          after: updated,
-        },
-        db,
-        request.log,
-      );
+
+      // Runs on every isActive: false, also for a driver already inactive, so
+      // a retry after a failed token step completes it.
+      if (body.isActive === false) await applyDriverDeactivation(id, ctx);
+
+      const diff = changedFields(pickPublic(before), pickPublic(updated));
+      if (Object.keys(diff.after).length > 0) {
+        let action = 'updated';
+        if (body.isActive !== undefined && body.isActive !== before.isActive) {
+          action = body.isActive ? 'activated' : 'deactivated';
+        }
+        await writeAudit(
+          { table: driverAuditLog, idColumn: 'driver_id' },
+          {
+            entityId: updated.id,
+            entityIdSnapshot: updated.id,
+            action,
+            ...ctx.actor,
+            before: diff.before,
+            after: diff.after,
+          },
+          db,
+          request.log,
+        );
+      }
 
       return updated;
     },
@@ -567,27 +950,48 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'Create a token for a driver',
+        description:
+          'Adds an active token to the driver. Refused with 409 DRIVER_INACTIVE for an inactive driver, whose tokens must stay off.',
         operationId: 'createDriverToken',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
         body: zodSchema(createTokenBody),
         response: {
           201: itemResponse(driverTokenItem),
-          409: errorWith('Duplicate token', [ERROR_CODES.TOKEN_DUPLICATE]),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Duplicate token, inactive driver, or a Plug and Charge contract token', [
+            ERROR_CODES.TOKEN_DUPLICATE,
+            ERROR_CODES.DRIVER_INACTIVE,
+            ERROR_CODES.PNC_CONTRACT_TOKEN_LOCKED,
+          ]),
         },
       },
     },
     async (request, reply) => {
-      const { userId } = request.user as JwtPayload;
       const { id } = request.params as z.infer<typeof driverParams>;
       const body = request.body as z.infer<typeof createTokenBody>;
       try {
         const token = await tokenService.createToken(
           { driverId: id, idToken: body.idToken, tokenType: body.tokenType },
-          { type: 'operator', userId },
+          tokenService.tokenActorOf(getAuditActor(request)),
         );
         await reply.status(201).send(token);
       } catch (err) {
+        if (err instanceof tokenService.TokenDriverNotFoundError) {
+          await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
+          return;
+        }
+        if (err instanceof tokenService.PncContractTokenError) {
+          await reply.status(409).send({
+            error: 'This token is the eMAID of a Plug and Charge contract',
+            code: 'PNC_CONTRACT_TOKEN_LOCKED',
+          });
+          return;
+        }
+        if (err instanceof tokenService.TokenDriverInactiveError) {
+          await reply.status(409).send({ error: 'Driver is inactive', code: 'DRIVER_INACTIVE' });
+          return;
+        }
         if (err instanceof tokenService.DuplicateTokenError) {
           await reply
             .status(409)
@@ -616,11 +1020,17 @@ export function driverRoutes(app: FastifyInstance): void {
     },
     async (request) => {
       const { id } = request.params as z.infer<typeof driverParams>;
-      return db
+      const rows = await db
         .select()
         .from(vehicles)
         .where(eq(vehicles.driverId, id))
         .orderBy(desc(vehicles.createdAt), desc(vehicles.id));
+      const { userId } = request.user as JwtPayload;
+      const lastSeen = await vehicleLastSeen(
+        rows.map((r) => r.id),
+        await getUserSiteIds(userId),
+      );
+      return rows.map((r) => ({ ...r, lastSeen: lastSeen.get(r.id) ?? null }));
     },
   );
 
@@ -650,7 +1060,9 @@ export function driverRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Vehicle not found', code: 'VEHICLE_NOT_FOUND' });
         return;
       }
-      return vehicle;
+      const { userId } = request.user as JwtPayload;
+      const lastSeen = await vehicleLastSeen([vehicle.id], await getUserSiteIds(userId));
+      return { ...vehicle, lastSeen: lastSeen.get(vehicle.id) ?? null };
     },
   );
 
@@ -667,7 +1079,15 @@ export function driverRoutes(app: FastifyInstance): void {
         body: zodSchema(createVehicleBody),
         response: {
           201: itemResponse(vehicleItem),
+          400: errorWith('Validation error', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.VEHICLE_ID_REQUIRED,
+          ]),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Driver erased or vehicle id in use', [
+            ERROR_CODES.DRIVER_ERASED,
+            ERROR_CODES.VEHICLE_ID_IN_USE,
+          ]),
         },
       },
     },
@@ -675,49 +1095,29 @@ export function driverRoutes(app: FastifyInstance): void {
       const { id } = request.params as z.infer<typeof driverParams>;
       const body = request.body as z.infer<typeof createVehicleBody>;
       const [driverRow] = await db
-        .select({ id: drivers.id })
+        .select({ id: drivers.id, erasedAt: drivers.erasedAt })
         .from(drivers)
         .where(eq(drivers.id, id));
       if (driverRow == null) {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
-      let vehicle;
-      try {
-        [vehicle] = await db
-          .insert(vehicles)
-          .values({ driverId: id, ...body })
-          .returning();
-      } catch (err) {
-        // Pre-check is non-transactional, so the driver can be deleted
-        // between the check and this INSERT. Map the FK violation back
-        // to the same 404 the pre-check would have produced.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
-          await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
-          return;
-        }
-        throw err;
+      if (driverRow.erasedAt != null) {
+        await reply.status(409).send({ error: 'The driver was erased', code: 'DRIVER_ERASED' });
+        return;
       }
-      if (vehicle != null) {
-        const actor = getAuditActor(request);
-        await writeAudit(
-          { table: vehicleAuditLog, idColumn: 'vehicle_id' },
-          {
-            entityId: vehicle.id,
-            entityIdSnapshot: vehicle.id,
-            action: 'created',
-            ...actor,
-            after: vehicle,
-          },
-          db,
+      try {
+        const vehicle = await vehicleService.createVehicle(
+          id,
+          body,
+          getAuditActor(request),
           request.log,
         );
+        await reply.status(201).send({ ...vehicle, lastSeen: null });
+      } catch (err) {
+        if (await replyVehicleServiceError(reply, err)) return;
+        throw err;
       }
-      await reply.status(201).send(vehicle);
     },
   );
 
@@ -734,7 +1134,12 @@ export function driverRoutes(app: FastifyInstance): void {
         body: zodSchema(updateVehicleBody),
         response: {
           200: itemResponse(vehicleItem),
+          400: errorWith('Validation error', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.VEHICLE_ID_REQUIRED,
+          ]),
           404: errorWith('Vehicle not found', [ERROR_CODES.VEHICLE_NOT_FOUND]),
+          409: errorWith('Vehicle id in use', [ERROR_CODES.VEHICLE_ID_IN_USE]),
         },
       },
     },
@@ -742,44 +1147,21 @@ export function driverRoutes(app: FastifyInstance): void {
       const { id, vehicleId } = request.params as z.infer<typeof vehicleParams>;
       const body = request.body as z.infer<typeof updateVehicleBody>;
 
-      const fields: Record<string, unknown> = { updatedAt: new Date() };
-      if (body.make !== undefined) fields['make'] = body.make;
-      if (body.model !== undefined) fields['model'] = body.model;
-      if (body.year !== undefined) fields['year'] = body.year;
-      if (body.vin !== undefined) fields['vin'] = body.vin;
-      if (body.licensePlate !== undefined) fields['licensePlate'] = body.licensePlate;
-
-      const [before] = await db
-        .select()
-        .from(vehicles)
-        .where(and(eq(vehicles.id, vehicleId), eq(vehicles.driverId, id)));
-      const [updated] = await db
-        .update(vehicles)
-        .set(fields)
-        .where(and(eq(vehicles.id, vehicleId), eq(vehicles.driverId, id)))
-        .returning();
-
-      if (updated == null) {
-        await reply.status(404).send({ error: 'Vehicle not found', code: 'VEHICLE_NOT_FOUND' });
-        return;
+      try {
+        const updated = await vehicleService.updateVehicle(
+          id,
+          vehicleId,
+          body,
+          getAuditActor(request),
+          request.log,
+        );
+        const { userId } = request.user as JwtPayload;
+        const lastSeen = await vehicleLastSeen([updated.id], await getUserSiteIds(userId));
+        return { ...updated, lastSeen: lastSeen.get(updated.id) ?? null };
+      } catch (err) {
+        if (await replyVehicleServiceError(reply, err)) return;
+        throw err;
       }
-
-      const actor = getAuditActor(request);
-      await writeAudit(
-        { table: vehicleAuditLog, idColumn: 'vehicle_id' },
-        {
-          entityId: updated.id,
-          entityIdSnapshot: updated.id,
-          action: 'updated',
-          ...actor,
-          before: before ?? null,
-          after: updated,
-        },
-        db,
-        request.log,
-      );
-
-      return updated;
     },
   );
 
@@ -802,32 +1184,75 @@ export function driverRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { id, vehicleId } = request.params as z.infer<typeof vehicleParams>;
 
-      const [deleted] = await db
-        .delete(vehicles)
-        .where(and(eq(vehicles.id, vehicleId), eq(vehicles.driverId, id)))
-        .returning();
-
-      if (deleted == null) {
-        await reply.status(404).send({ error: 'Vehicle not found', code: 'VEHICLE_NOT_FOUND' });
-        return;
+      try {
+        await vehicleService.deleteVehicle(id, vehicleId, getAuditActor(request), request.log);
+      } catch (err) {
+        if (await replyVehicleServiceError(reply, err)) return;
+        throw err;
       }
-
-      const actor = getAuditActor(request);
-      await writeAudit(
-        { table: vehicleAuditLog, idColumn: 'vehicle_id' },
-        {
-          entityId: null,
-          entityIdSnapshot: deleted.id,
-          action: 'deleted',
-          ...actor,
-          before: deleted,
-        },
-        db,
-        request.log,
-      );
-
       await reply.status(204).send();
     },
+  );
+
+  // Operator block: the vehicle's ids are refused at every start, with
+  // Autocharge on or off, and the driver cannot turn Autocharge back on.
+  const setBlocked =
+    (blocked: boolean) =>
+    async (request: FastifyRequest, reply: FastifyReply): Promise<unknown> => {
+      const { id, vehicleId } = request.params as z.infer<typeof vehicleParams>;
+      try {
+        const vehicle = await vehicleService.setVehicleBlocked(
+          id,
+          vehicleId,
+          blocked,
+          getAuditActor(request),
+          request.log,
+        );
+        const { userId } = request.user as JwtPayload;
+        const lastSeen = await vehicleLastSeen([vehicle.id], await getUserSiteIds(userId));
+        return { ...vehicle, lastSeen: lastSeen.get(vehicle.id) ?? null };
+      } catch (err) {
+        if (await replyVehicleServiceError(reply, err)) return;
+        throw err;
+      }
+    };
+
+  app.post(
+    '/drivers/:id/vehicles/:vehicleId/block',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Block a vehicle: its VIN and EVCCID are refused at every start',
+        operationId: 'blockDriverVehicle',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(vehicleParams),
+        response: {
+          200: itemResponse(vehicleItem),
+          404: errorWith('Vehicle not found', [ERROR_CODES.VEHICLE_NOT_FOUND]),
+        },
+      },
+    },
+    setBlocked(true),
+  );
+
+  app.post(
+    '/drivers/:id/vehicles/:vehicleId/unblock',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Unblock a vehicle',
+        operationId: 'unblockDriverVehicle',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(vehicleParams),
+        response: {
+          200: itemResponse(vehicleItem),
+          404: errorWith('Vehicle not found', [ERROR_CODES.VEHICLE_NOT_FOUND]),
+        },
+      },
+    },
+    setBlocked(false),
   );
 
   // --- Vehicle lookup catalog (typeahead source) ---
@@ -897,6 +1322,45 @@ export function driverRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.post(
+    '/drivers/:id/erase',
+    {
+      onRequest: [authorize('drivers:write')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Erase a driver (GDPR right to erasure)',
+        description:
+          "Irreversible. Anonymizes the driver: name, email, phone, billing address, password, MFA, notification preferences, vehicles, push tokens and emailed links are removed; saved payment methods are detached from the provider (best effort) and deleted; tokens are deactivated and portal sessions end. The driver row stays as an anonymized stub (erasedAt set), so sessions, payment records, invoices and credit notes keep their accounting history and snapshots, and earlier audit rows are kept. Writes one driver.erased audit row with counts only. The body must repeat the driver id in confirm. Needs access to every site, because the erasure reaches the driver's data at all sites (404 DRIVER_NOT_FOUND otherwise). 409 DRIVER_HAS_ACTIVE_SESSION while a session of the driver is active, 409 DRIVER_ERASED when already erased.",
+        operationId: 'eraseDriver',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(driverParams),
+        body: zodSchema(eraseDriverBody),
+        response: {
+          200: itemResponse(driverErasureItem),
+          400: errorWith('Confirmation does not match', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith('Driver erased or charging', [
+            ERROR_CODES.DRIVER_ERASED,
+            ERROR_CODES.DRIVER_HAS_ACTIVE_SESSION,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, DRIVER_NOT_FOUND_BODY))) return;
+      const { id } = request.params as z.infer<typeof driverParams>;
+      const body = request.body as z.infer<typeof eraseDriverBody>;
+      if (body.confirm !== id) {
+        await reply.status(400).send({
+          error: 'Type the driver id in confirm to erase the driver',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      return eraseDriver(id, { actor: getAuditActor(request), log: request.log });
+    },
+  );
+
   app.delete(
     '/drivers/:id',
     {
@@ -904,6 +1368,8 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'Deactivate a driver by ID',
+        description:
+          'Soft delete: sets the driver inactive and deactivates every active token, ends the portal sessions and revokes the open emailed links. Sessions, invoices, payment records and the audit history stay. Repeating it on an inactive driver deactivates any token left active and writes no second audit row.',
         operationId: 'deleteDriver',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
@@ -915,47 +1381,40 @@ export function driverRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof driverParams>;
-      const { userId } = request.user as JwtPayload;
 
-      const [driver] = await db.select().from(drivers).where(eq(drivers.id, id));
+      const [driver] = await db.select(driverSafeSelect).from(drivers).where(eq(drivers.id, id));
       if (driver == null) {
         await reply.status(404).send({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
         return;
       }
 
-      await db
+      // Soft delete: the driver row, sessions, invoices and payment records
+      // stay. Guarded so a repeated DELETE writes no second audit row.
+      const [changed] = await db
         .update(drivers)
         .set({ isActive: false, updatedAt: new Date() })
-        .where(eq(drivers.id, id));
+        .where(and(eq(drivers.id, id), eq(drivers.isActive, true)))
+        .returning({ id: drivers.id });
 
-      // Cascade: OCPP authorize handlers only check driverTokens.isActive,
-      // not drivers.isActive. Deactivate every token the driver owns so the
-      // soft-delete actually blocks future RFID taps and portal idTags.
-      const driverTokenRows = await db
-        .select({ id: driverTokens.id })
-        .from(driverTokens)
-        .where(eq(driverTokens.driverId, id));
-      if (driverTokenRows.length > 0) {
-        await tokenService.bulkSetActive(
-          driverTokenRows.map((t) => t.id),
-          false,
-          { type: 'operator', userId },
+      const ctx = { actor: getAuditActor(request), log: request.log };
+      // Also for a driver already inactive: deactivates tokens left active.
+      await applyDriverDeactivation(id, ctx);
+
+      if (changed != null) {
+        await writeAudit(
+          { table: driverAuditLog, idColumn: 'driver_id' },
+          {
+            entityId: driver.id,
+            entityIdSnapshot: driver.id,
+            action: 'deleted',
+            ...ctx.actor,
+            before: pickPublic(driver),
+            after: { isActive: false },
+          },
+          db,
+          request.log,
         );
       }
-
-      const actor = getAuditActor(request);
-      await writeAudit(
-        { table: driverAuditLog, idColumn: 'driver_id' },
-        {
-          entityId: driver.id,
-          entityIdSnapshot: driver.id,
-          action: 'deleted',
-          ...actor,
-          before: driver,
-        },
-        db,
-        request.log,
-      );
 
       await reply.status(204).send();
     },
@@ -968,6 +1427,8 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'List charging sessions for a driver',
+        description:
+          "The driver's charging sessions, newest first. A user restricted to some sites sees only the sessions at those sites.",
         operationId: 'listDriverSessions',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
@@ -983,7 +1444,14 @@ export function driverRoutes(app: FastifyInstance): void {
       const { page, limit } = request.query as z.infer<typeof sessionsQuery>;
       const offset = (page - 1) * limit;
 
-      const where = eq(chargingSessions.driverId, id);
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const where = and(
+        eq(chargingSessions.driverId, id),
+        siteIds != null ? sessionsAtSites(siteIds) : undefined,
+        // Sessions of conformance test stations are never listed.
+        inOperatorStation(chargingSessions.stationId),
+      );
 
       // Run the existence check in parallel with the data + count queries.
       // The existence check selects only id (not the full row, which would
@@ -1011,7 +1479,7 @@ export function driverRoutes(app: FastifyInstance): void {
           })
           .from(chargingSessions)
           .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-          .leftJoin(sites, eq(chargingStations.siteId, sites.id))
+          .leftJoin(sites, eq(chargingSessions.siteId, sites.id))
           .leftJoin(drivers, eq(chargingSessions.driverId, drivers.id))
           .where(where)
           .orderBy(desc(chargingSessions.createdAt), desc(chargingSessions.id))
@@ -1043,6 +1511,8 @@ export function driverRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Drivers'],
         summary: 'List reservations for a driver, with cancel metadata',
+        description:
+          "The driver's reservations, newest first. A user restricted to some sites sees only the reservations at those sites.",
         operationId: 'listDriverReservations',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
@@ -1058,7 +1528,14 @@ export function driverRoutes(app: FastifyInstance): void {
       const { page, limit } = request.query as z.infer<typeof paginationQuery>;
       const offset = (page - 1) * limit;
 
-      const where = eq(reservations.driverId, id);
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const where = and(
+        eq(reservations.driverId, id),
+        siteIds != null ? reservationsAtSites(siteIds) : undefined,
+        // Reservations of conformance test stations are never listed.
+        inOperatorStation(reservations.stationId),
+      );
       // Existence check runs in parallel with data + count.
       const [driverRows, data, countRows] = await Promise.all([
         db.select({ id: drivers.id }).from(drivers).where(eq(drivers.id, id)),
@@ -1154,6 +1631,7 @@ export function driverRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_PRICING_GROUP_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof driverParams>;
       const body = request.body as z.infer<typeof addDriverPricingGroupBody>;
       // Pre-check pricing group existence so a typo'd id returns a clean
@@ -1185,11 +1663,7 @@ export function driverRoutes(app: FastifyInstance): void {
         // The pre-check is non-transactional, so the pricing group can be
         // deleted between the lookup and this INSERT. Map the FK violation
         // back to 404 — same pattern as sites/stations/fleets.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
+        if (pgErrorCode(err) === PG_FOREIGN_KEY_VIOLATION) {
           await reply
             .status(404)
             .send({ error: 'Pricing group not found', code: 'PRICING_GROUP_NOT_FOUND' });
@@ -1254,12 +1728,14 @@ export function driverRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(driverPricingGroupRecordItem),
           404: errorWith('Pricing assignment not found', [
+            ERROR_CODES.PRICING_GROUP_NOT_FOUND,
             ERROR_CODES.PRICING_ASSIGNMENT_NOT_FOUND,
           ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_PRICING_GROUP_NOT_FOUND))) return;
       const { id, pricingGroupId } = request.params as z.infer<typeof driverPricingGroupParams>;
       const [record] = await db
         .delete(pricingGroupDrivers)

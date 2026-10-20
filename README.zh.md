@@ -7,8 +7,9 @@
 <p align="center">
   <a href="https://github.com/EVtivity/evtivity-csms/releases/latest"><img src="https://img.shields.io/github/v/release/EVtivity/evtivity-csms?label=Release&color=4ade80" alt="Release" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml"><img src="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FEVtivity%2Fevtivity-csms%2Fbadges%2Fcoverage.json" alt="Coverage" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-BUSL--1.1-blue.svg" alt="License: BUSL-1.1" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/TypeScript-6.x-3178C6.svg" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-339933.svg" alt="Node.js" />
   <img src="https://img.shields.io/badge/OCPP-1.6%20%7C%202.1-4ade80.svg" alt="OCPP" />
   <img src="https://img.shields.io/badge/OCPI-2.2.1%20%7C%202.3.0-4ade80.svg" alt="OCPI" />
@@ -23,9 +24,9 @@
   <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
-一套兼容 OCPP 1.6 和 2.1 的充电桩管理系统（CSMS），用于管理电动车充电基础设施。系统支持与充电桩的实时 WebSocket 通信、OCPI 2.2.1/2.3.0 漫游、ISO 15118 即插即充，并提供运营商 REST API 以及运营商和车主两个 React 前端。
+EVtivity 是一个 AI 驱动的电动汽车充电平台。其核心是一套兼容 OCPP 1.6 和 2.1 的充电桩管理系统（CSMS），用于电动汽车充电基础设施。系统支持与充电桩的实时 WebSocket 通信、OCPI 2.2.1/2.3.0 漫游、ISO 15118 即插即充，并提供运营商 REST API 以及面向运营商和驾驶员的两个 React 前端。
 
-EVtivity 在整个运营体验中集成了 AI。聊天助手通过将 API 端点作为工具来调用，回答关于充电桩、会话、营收和运营的自然语言问题。客服 AI 助手通过收集完整工单上下文来起草客户回复。两者均支持多种 LLM 服务商（Anthropic、OpenAI、Gemini），可在系统级和按用户配置参数，使用运营商首选语言进行回复，并通过安全防护避免泄露敏感数据。
+AI 内置于运营商控制台中。AI 助手回答关于充电桩、会话、营收和运营的问题，读取充电桩屏幕照片、PDF 或日志等附件，并提出只有在运营商确认后才会执行的更改。客服辅助以驾驶员的语言起草工单回复。两者均支持 Anthropic、OpenAI、Gemini 或 DeepSeek，密钥和个人数据在发送给模型前会被脱敏。
 
 ## 架构
 
@@ -68,6 +69,19 @@ graph TB
 ```
 
 ## 功能概览
+
+### AI 驱动的运营
+
+| 功能           | 描述                                                                                               |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| AI 助手        | 用自然语言询问充电桩、会话、营收和运营情况。回答以流式输出，对话会被保存，支持搜索、重命名和删除   |
+| 图片和文件分析 | 可附加图片（如充电桩屏幕照片）以及 PDF、CSV、文本、日志和 JSON 文件                                |
+| 确认后更改     | 助手通过 API 工具读取数据。它提出的更改会显示确认卡片，只有在运营商确认后才会执行                  |
+| 客服辅助       | 以驾驶员的语言起草工单回复，以运营商的语言起草内部备注，并列出参考的来源                           |
+| 服务商选择     | Anthropic、OpenAI、Google Gemini 或 DeepSeek，可按功能或按用户设置，并可调整推理强度               |
+| 脱敏与防护     | 密钥和个人数据在发送给模型前会从工具结果中脱敏。设置、密钥、用户、支付和充电桩安全不在其访问范围内 |
+| 六种语言       | 以运营商的语言回答：英语、德语、西班牙语、韩语、简体中文和繁体中文                                 |
+| 限额与审计     | 按用户和按站点的速率限制、每个用户的每日 token 预算，以及通过助手所做更改的审计记录                |
 
 ### OCPP 合规
 
@@ -146,20 +160,6 @@ graph TB
 | 工单       | 含会话关联、退款操作与 S3 附件的工单             |
 | 通知       | 会话、支付、预约与工单的邮件与短信通知           |
 
-### AI 驱动的运营
-
-| 功能         | 描述                                                                |
-| ------------ | ------------------------------------------------------------------- |
-| 聊天助手     | 通过自动生成的工具目录访问所有 API 端点的自然语言运营助手           |
-| 两级工具选择 | 按类别路由，使每次请求的工具数量低于供应商上限（128）               |
-| 客服 AI      | 基于完整工单上下文（消息、会话、桩、车主）起草客户回复与内部备注    |
-| 多供应商支持 | Anthropic Claude、OpenAI GPT、Google Gemini，可在系统级和用户级配置 |
-| LLM 参数     | 可在系统级和用户级配置 temperature、top-p、top-k、系统提示词与语气  |
-| 语言感知回复 | AI 以运营商首选语言（6 种地区）回复                                 |
-| 安全防护     | 阻止密码与 API 密钥泄露，数据修改前要求确认                         |
-| 自动生成工具 | OpenAPI 规范代码生成产出 500+ 个运营商端点的类型化工具定义          |
-| 可编辑聊天   | 可编辑并重发用户消息、复制助手回复、Markdown 渲染含可滚动表格       |
-
 ### 可持续性
 
 | 功能         | 描述                                                          |
@@ -206,22 +206,32 @@ graph TB
 
 ### 部署与运维
 
-| 功能           | 描述                                                                              |
-| -------------- | --------------------------------------------------------------------------------- |
-| 部署选项       | Docker Compose、Kubernetes Helm Chart（Istio/Envoy Gateway）与 AWS CDK（ECS）     |
-| 水平扩展       | 无状态服务，跨 Pod 使用基于 Redis 的 OCPP 连接注册                                |
-| 自动扩缩       | API 与 OCPP 的 Kubernetes HPA，缩容稳定化感知 WebSocket                           |
-| 限流           | 可配置全局与按端点限流，并对认证设独立限制                                        |
-| 可观测性       | Prometheus 指标、Grafana 仪表盘、Loki 日志聚合                                    |
-| 一致性测试     | 面向 CSMS 与充电桩 SUT 的内置 OCTT 1.6/2.1 测试运行器，提供仪表盘报告与按模块结果 |
-| 多语言 UI      | 6 种语言：英语、德语、西班牙语、韩语、简体与繁体中文                              |
-| 响应式筛选     | 所有列表页的筛选控件在平板与移动端折叠为下拉                                      |
-| 服务器宕机页面 | CSMS 与门户在 API 不可达时显示带重试的友好错误页                                  |
-| 发布管理       | 通过发布脚本自动提升所有包与 Helm Chart 的版本                                    |
+| 功能           | 描述                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------- |
+| 部署选项       | Docker Compose、Kubernetes Helm Chart（Istio/Envoy Gateway）与 AWS CDK（ECS）         |
+| 水平扩展       | 无状态服务，跨 Pod 使用基于 Redis 的 OCPP 连接注册                                    |
+| 自动扩缩       | API 与 OCPP 的 Kubernetes HPA，缩容稳定化感知 WebSocket                               |
+| 限流           | 可配置全局与按端点限流，并对认证设独立限制                                            |
+| 可观测性       | Prometheus 指标、Grafana 仪表盘、Loki 日志聚合                                        |
+| 一致性测试     | 面向 CSMS 与充电桩 SUT 的内置 OCTT 1.6/2.1 测试运行器，提供仪表盘报告与按模块结果     |
+| 多语言 UI      | 6 种语言：英语、德语、西班牙语、韩语、简体与繁体中文                                  |
+| 响应式筛选     | 所有列表页的筛选控件在平板与移动端折叠为下拉                                          |
+| 服务器宕机页面 | CSMS 与门户在 API 不可达时显示带重试的友好错误页                                      |
+| 发布管理       | stable、alpha 与 beta 渠道。每个 stable 版本将 Helm Chart 与 AWS CDK 应用提升到其版本 |
 
-## 服务
+## 部署
 
-通过 Helm Chart 部署时，每个服务通过 Gateway API 公开在各自子域名上：
+| 方式                  | 适用场景                                         | 源码                                                                          | 指南                                                                          |
+| --------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Docker Compose        | 本地开发与单主机安装                             | 本仓库中的 `docker-compose.yml`                                               | [Docker Compose](https://www.evtivity.com/zh/docs/deployment/docker-compose/) |
+| Kubernetes Helm Chart | Kubernetes 生产环境（Istio 或 Envoy Gateway）    | [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm) | [Helm Chart](https://www.evtivity.com/zh/docs/deployment/helm-chart/)         |
+| AWS CDK               | AWS 生产环境（ECS Fargate、Aurora、ElastiCache） | [EVtivity/evtivity-csms-cdk](https://github.com/EVtivity/evtivity-csms-cdk)   | [AWS](https://www.evtivity.com/zh/docs/deployment/aws/)                       |
+
+Helm Chart 与 AWS CDK 应用只跟随 stable 版本。每个 stable 版本会将两者提升到其版本。
+
+### 服务端点
+
+使用 Helm Chart 时，每个服务通过 Gateway API 公开在各自子域名上：
 
 | 服务               | URL                                | 公网端口 | 内部端口 |
 | ------------------ | ---------------------------------- | -------- | -------- |
@@ -237,9 +247,33 @@ graph TB
 
 所有主机名共享同一个负载均衡 IP。请将各主机名的 DNS 记录指向该 IP。OCPP TLS（端口 8443）作为独立的 `LoadBalancer` 服务以供使用 Security Profile 3（mTLS）的桩直连。
 
-## Helm Chart
+## Skills
 
-Kubernetes Helm Chart 在独立仓库中维护：[EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm)
+[EVtivity Agent Skills](https://github.com/EVtivity/evtivity-skills) 让你的 AI 编程助手学会使用 EVtivity。它们遵循开放标准 [Agent Skills](https://agentskills.io)，因此同一套技能可用于 Claude Code、Codex、GitHub Copilot、Gemini CLI、Cursor 等助手。
+
+| 技能                       | 用途                                                 |
+| -------------------------- | ---------------------------------------------------- |
+| `evtivity-getting-started` | 用 Docker 在本地安装并运行 EVtivity，然后登录        |
+| `evtivity-deployment`      | 用 Docker Compose、Helm 或 AWS CDK 部署和升级        |
+| `evtivity-configuration`   | 配置环境变量、密钥、认证、数据库和充电桩安全         |
+| `evtivity-csms`            | 使用运营后台：站点、充电桩、会话、驾驶员、定价、报表 |
+| `evtivity-portal`          | 使用驾驶员门户：查找充电桩、充电、支付、管理卡片     |
+| `evtivity-mobile-app`      | 构建、定制品牌并发布驾驶员移动应用                   |
+| `evtivity-guides`          | 按步骤操作，例如充电桩接入和卡住的会话               |
+| `evtivity-integrations`    | 配置 Stripe、Adyen、测试支付服务商和结算             |
+| `evtivity-api`             | 调用 REST API：API 密钥、错误码、OCPP 命令接口       |
+| `evtivity-simulator`       | 运行模拟的 OCPP 1.6 和 2.1 充电桩及充电会话          |
+| `evtivity-conformance`     | 发送 OCPP 命令、查看消息日志并运行 OCTT 一致性测试   |
+| `evtivity-troubleshoot`    | 定位并修复故障服务、充电桩连接或登录问题             |
+| `evtivity-report-issue`    | 收集版本和已脱敏的日志，起草 GitHub issue            |
+
+为任意助手安装：
+
+```bash
+npx skills add EVtivity/evtivity-skills
+```
+
+技能版本使用与 EVtivity 相同的标签。请安装与你的部署版本一致的标签。欢迎为新技能提交 pull request 和发起讨论。
 
 ## 许可证
 

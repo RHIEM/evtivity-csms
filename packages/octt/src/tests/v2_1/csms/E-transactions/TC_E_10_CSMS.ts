@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 
 /** TC_E_10_CSMS: Start transaction options - Authorized - Local */
 export const TC_E_10_CSMS: TestCase = {
@@ -25,7 +25,7 @@ export const TC_E_10_CSMS: TestCase = {
 
     // Step 1: Authorize
     const authRes = await ctx.client.sendCall('Authorize', {
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
     const authStatus = (authRes['idTokenInfo'] as Record<string, unknown>)?.['status'] as string;
     steps.push({
@@ -37,7 +37,7 @@ export const TC_E_10_CSMS: TestCase = {
     });
 
     // Step 2: TransactionEvent Started
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const txRes = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -45,7 +45,7 @@ export const TC_E_10_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
     pushSendAckStep(
       steps,
@@ -105,7 +105,7 @@ export const TC_E_26_CSMS: TestCase = {
     });
 
     // Start transaction (EnergyTransferStarted)
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -113,7 +113,7 @@ export const TC_E_26_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     // Move to SuspendedEV (EnergyTransferSuspended)

@@ -46,7 +46,46 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+const { mockRecompute, mockSetDisabled, mockSendAvailability, mockPublishStatus } = vi.hoisted(
+  () => ({
+    mockRecompute: vi.fn().mockResolvedValue({ availabilityChanged: false }),
+    mockSetDisabled: vi.fn().mockResolvedValue({ availabilityChanged: true }),
+    mockSendAvailability: vi.fn().mockResolvedValue({}),
+    mockPublishStatus: vi.fn().mockResolvedValue(undefined),
+  }),
+);
+
+vi.mock('@evtivity/services/availability-command', () => ({
+  sendAvailabilityCommand: mockSendAvailability,
+}));
+
+vi.mock('../lib/station-status-events.js', () => ({
+  publishStationStatusChanged: mockPublishStatus,
+}));
+
+const mockRepush = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('@evtivity/services/station-message.service', () => ({
+  requestStationMessageRepush: mockRepush,
+}));
+
+// New stations get their bound config template (the helper is covered by
+// the import integration test).
+const mockCreateTemplate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('../lib/station-config-template.js', () => ({
+  createStationConfigTemplate: mockCreateTemplate,
+}));
+
+const mockSiteMove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('../lib/ocpi-location-push.js', () => ({
+  publishOcpiStationSiteMove: mockSiteMove,
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  client: {},
+  recomputeStationAvailability: mockRecompute,
+  setStationDisabled: mockSetDisabled,
+  stationAuditLog: { stationId: 'station_id' },
   db: {
     select: vi.fn(() => makeChain()),
     transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
@@ -74,6 +113,8 @@ vi.mock('@evtivity/database', () => ({
     model: 'model',
     serialNumber: 'serialNumber',
     availability: 'availability',
+    disabledReason: 'disabledReason',
+    isOnline: 'isOnline',
     onboardingStatus: 'onboardingStatus',
     vendorId: 'vendorId',
     createdAt: 'createdAt',
@@ -109,6 +150,7 @@ import {
   importSitesCsv,
 } from '../services/site-import.service.js';
 import { writeAudit } from '@evtivity/database';
+import * as databaseModule from '@evtivity/database';
 
 beforeEach(() => {
   dbResults = [];
@@ -157,6 +199,31 @@ describe('exportSitesCsv', () => {
       'siteName,stationId,stationModel,stationSerialNumber,stationStatus,onboardingStatus,evseId,connectorId,connectorType,maxPowerKw,maxCurrentAmps,stationVendor',
     );
     expect(lines[1]).toBe('Site A,CS-001,Model X,SN-111,available,accepted,1,1,CCS2,150,200,ACME');
+  });
+
+  it('exports the operator choice as stationStatus, not the computed availability', async () => {
+    const { db } = databaseModule;
+    setupDbResults([]);
+
+    await exportSitesCsv();
+
+    const selection = vi.mocked(db.select).mock.calls[0]?.[0] as unknown as Record<
+      string,
+      { args: unknown[] }
+    >;
+    const strings = (selection['stationStatus']?.args[0] as string[]).join('?');
+    expect(strings).toContain("= 'operator' THEN 'unavailable'");
+    expect(strings).toContain("ELSE 'available'");
+    expect(selection['stationStatus']?.args).toContain('disabledReason');
+  });
+
+  it('leaves conformance test stations out of the export', async () => {
+    setupDbResults([]);
+    vi.mocked(databaseModule.isOperatorStation).mockClear();
+
+    await exportSitesCsv();
+
+    expect(vi.mocked(databaseModule.isOperatorStation)).toHaveBeenCalledTimes(1);
   });
 
   it('applies search filter', async () => {
@@ -276,6 +343,7 @@ describe('importSitesCsv', () => {
     expect(result.evsesCreated).toBe(1);
     expect(result.connectorsCreated).toBe(1);
     expect(result.errors).toEqual([]);
+    expect(mockCreateTemplate).toHaveBeenCalledWith(expect.anything(), { id: 'station-1' });
   });
 
   it('skips existing site when updateExisting is false', async () => {
@@ -309,7 +377,8 @@ describe('importSitesCsv', () => {
     // Transaction flow with updateExisting=true (post case-insensitive fix):
     // 1. tx.select (ilike duplicate-name pre-check) -> not found, so site is new
     // 2. tx.insert (site insert) -> returns new site
-    // 3. tx.insert (station upsert) -> returns station
+    // 3. tx.select (the station's previous site) -> not found
+    // 4. tx.insert (station upsert) -> returns station
     // 4. tx.select (EVSE lookup) -> not found
     // 5. tx.insert (EVSE create) -> returns EVSE
     // 6. tx.select (connector lookup) -> not found
@@ -317,6 +386,7 @@ describe('importSitesCsv', () => {
     setupDbResults(
       [], // ilike duplicate check: not found
       [{ id: 'site-1', createdAt: now, updatedAt: now }], // site insert (created)
+      [], // the station's previous site: none (new station)
       [{ id: 'station-1', createdAt: now, updatedAt: now }], // station upsert (created)
       [], // EVSE lookup: not found
       [{ id: 'evse-1' }], // EVSE insert
@@ -398,7 +468,8 @@ describe('importSitesCsv', () => {
     ]);
 
     expect(result.sitesCreated).toBe(0);
-    expect(result.errors[0]).toContain('insufficient site access to create new site');
+    // The same message as another site's name, so site names do not leak.
+    expect(result.errors).toEqual(['Row 1: no access to site "Blocked Site"']);
   });
 
   it('rejects mutating a site outside the restricted operator allow-list', async () => {
@@ -409,7 +480,76 @@ describe('importSitesCsv', () => {
     ]);
 
     expect(result.sitesUpdated).toBe(0);
-    expect(result.errors[0]).toContain('no access to site');
+    expect(result.errors).toEqual(['Row 1: no access to site "Other Site"']);
+  });
+
+  it.each([
+    ['update path', true],
+    ['no-update path', false],
+  ])(
+    'refuses a station of another site for a restricted operator (%s)',
+    async (_label, updateExisting) => {
+      const site = [{ id: 'sit_allowed', name: 'Mine' }];
+      const foreignStation = [{ id: 'station-b', siteId: 'sit_other' }];
+      // site lookup, the site update (update path only), the station lookup
+      if (updateExisting) setupDbResults(site, site, foreignStation);
+      else setupDbResults(site, foreignStation);
+
+      const result = await importSitesCsv(
+        [
+          { siteName: 'Mine', stationId: 'CS-B', evseId: 1, connectorId: 1 },
+          { siteName: 'Mine', stationId: 'CS-B', evseId: 2 },
+        ],
+        updateExisting,
+        undefined,
+        ['sit_allowed'],
+      );
+
+      expect(result.stationsCreated + result.stationsUpdated).toBe(0);
+      expect(result.evsesCreated + result.evsesUpdated).toBe(0);
+      expect(result.connectorsCreated + result.connectorsUpdated).toBe(0);
+      expect(result.errors).toContain('Row 1: station "CS-B" cannot be imported');
+      expect(result.errors).toContain('Row 2: station "CS-B" cannot be imported');
+      expect(mockSiteMove).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses an unsited station for a restricted operator', async () => {
+    setupDbResults([{ id: 'sit_allowed', name: 'Mine' }], [{ id: 'station-u', siteId: null }]);
+
+    const result = await importSitesCsv(
+      [{ siteName: 'Mine', stationId: 'CS-U', evseId: 1 }],
+      false,
+      undefined,
+      ['sit_allowed'],
+    );
+
+    expect(result.evsesCreated).toBe(0);
+    expect(result.errors).toEqual([
+      'Site "Mine" already exists, skipped',
+      'Row 1: station "CS-U" cannot be imported',
+    ]);
+  });
+
+  it('lets a restricted operator update its own station', async () => {
+    const created = new Date('2026-01-01T00:00:00Z');
+    const updated = new Date('2026-02-01T00:00:00Z');
+    setupDbResults(
+      [{ id: 'sit_allowed', name: 'Mine' }], // site lookup
+      [{ id: 'sit_allowed', name: 'Mine' }], // site update
+      [{ id: 'station-a', siteId: 'sit_allowed' }], // station in the allowed site
+      [{ id: 'station-a', createdAt: created, updatedAt: updated }], // upsert
+    );
+
+    const result = await importSitesCsv(
+      [{ siteName: 'Mine', stationId: 'CS-A' }],
+      true,
+      undefined,
+      ['sit_allowed'],
+    );
+
+    expect(result.stationsUpdated).toBe(1);
+    expect(result.errors).toEqual([]);
   });
 
   it('resolves a vendor by case-insensitive name and reuses the cache across stations', async () => {
@@ -460,12 +600,92 @@ describe('importSitesCsv', () => {
     expect(result.errors.some((e) => e.includes('vendor "Ghost Vendor" not found'))).toBe(true);
   });
 
+  it('pushes the OCPI locations of a station the import moves to another site', async () => {
+    const created = new Date('2026-01-01T00:00:00Z');
+    const updated = new Date('2026-02-01T00:00:00Z');
+    setupDbResults(
+      [], // site ilike pre-check: not found
+      [{ id: 'site-1', createdAt: created, updatedAt: created }], // site insert (created)
+      [{ siteId: 'site-0' }], // the station's previous site
+      [{ id: 'station-1', createdAt: created, updatedAt: updated }], // station upsert -> UPDATED
+    );
+
+    await importSitesCsv([{ siteName: 'Moved', stationId: 'CS-001' }], true);
+
+    expect(mockSiteMove).toHaveBeenCalledWith('station-1', 'site-0', 'site-1', undefined);
+  });
+
+  it('audits a moved station and re-renders its screens for the new site', async () => {
+    const created = new Date('2026-01-01T00:00:00Z');
+    const updated = new Date('2026-02-01T00:00:00Z');
+    const previous = { id: 'station-1', stationId: 'CS-001', siteId: 'site-0' };
+    const after = { ...previous, siteId: 'site-1', createdAt: created, updatedAt: updated };
+    setupDbResults(
+      [], // site ilike pre-check: not found
+      [{ id: 'site-1', createdAt: created, updatedAt: created }], // site insert (created)
+      [previous], // the station before the import
+      [after], // station upsert
+    );
+    const actor = { actor: 'operator' as const, actorUserId: 'usr_1' };
+    const log = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+
+    await importSitesCsv(
+      [{ siteName: 'Moved', stationId: 'CS-001' }],
+      true,
+      actor,
+      null,
+      log as never,
+    );
+
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.objectContaining({ idColumn: 'station_id' }),
+      expect.objectContaining({
+        entityId: 'station-1',
+        action: 'updated',
+        before: previous,
+        after,
+        notes: 'CSV import',
+      }),
+      expect.anything(),
+    );
+    expect(mockRepush).toHaveBeenCalledWith(log, { stationId: 'station-1' });
+  });
+
+  it('audits a station the import creates', async () => {
+    const now = new Date('2026-01-01T00:00:00Z');
+    const station = { id: 'station-9', stationId: 'CS-009', siteId: 'site-1' };
+    setupDbResults(
+      [], // site ilike pre-check: not found
+      [{ id: 'site-1', createdAt: now, updatedAt: now }], // site insert
+      [], // no station with that id yet
+      [station], // station insert
+    );
+
+    await importSitesCsv([{ siteName: 'New', stationId: 'CS-009' }], false, {
+      actor: 'operator',
+      actorUserId: 'usr_1',
+    });
+
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.objectContaining({ idColumn: 'station_id' }),
+      expect.objectContaining({
+        entityId: 'station-9',
+        action: 'created',
+        before: null,
+        after: station,
+      }),
+      expect.anything(),
+    );
+    expect(mockRepush).not.toHaveBeenCalled();
+  });
+
   it('counts a station as updated when the upsert returns differing timestamps', async () => {
     const created = new Date('2026-01-01T00:00:00Z');
     const updated = new Date('2026-02-01T00:00:00Z');
     setupDbResults(
       [], // site ilike pre-check: not found
       [{ id: 'site-1', createdAt: created, updatedAt: created }], // site insert (created)
+      [], // the station's previous site: none (new station)
       [{ id: 'station-1', createdAt: created, updatedAt: updated }], // station upsert -> UPDATED
     );
 
@@ -478,11 +698,106 @@ describe('importSitesCsv', () => {
     expect(result.stationsCreated).toBe(0);
   });
 
+  function stationImportResults(current: Record<string, unknown>): unknown[][] {
+    const now = new Date();
+    return [
+      [], // site ilike pre-check: not found
+      [{ id: 'site-1', createdAt: now, updatedAt: now }], // site insert
+      [], // the station's previous site: none (new station)
+      [{ id: 'station-1', createdAt: now, updatedAt: now }], // station upsert (created)
+      [
+        {
+          id: 'station-1',
+          stationId: 'CS-001',
+          siteId: 'site-1',
+          isOnline: true,
+          disabledReason: null,
+          ...current,
+        },
+      ], // stored state after the import commits
+    ];
+  }
+
+  it('recomputes availability when stationStatus does not change the disable', async () => {
+    mockRecompute.mockResolvedValueOnce({ availabilityChanged: true });
+    setupDbResults(...stationImportResults({}));
+
+    await importSitesCsv(
+      [{ siteName: 'On', stationId: 'CS-001', stationStatus: 'available' }],
+      true,
+    );
+
+    expect(mockRecompute).toHaveBeenCalledWith({}, 'station-1');
+    expect(mockSetDisabled).not.toHaveBeenCalled();
+    expect(mockSendAvailability).not.toHaveBeenCalled();
+    expect(mockPublishStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'station-1', siteId: 'site-1' }),
+      undefined,
+    );
+  });
+
+  it('disables through the status entry point, tells the station, audits, and publishes', async () => {
+    setupDbResults(...stationImportResults({}));
+
+    await importSitesCsv(
+      [{ siteName: 'Off', stationId: 'CS-001', stationStatus: 'unavailable' }],
+      true,
+      { actor: 'operator', actorUserId: 'usr_1' },
+    );
+
+    expect(mockSetDisabled).toHaveBeenCalledWith({}, 'station-1', 'operator');
+    expect(mockSendAvailability).toHaveBeenCalledWith('CS-001', 'Inoperative', undefined);
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'availability_changed',
+        before: { disabledReason: null },
+        after: { disabledReason: 'operator' },
+      }),
+      expect.anything(),
+      undefined,
+    );
+    expect(mockPublishStatus).toHaveBeenCalled();
+    expect(mockRecompute).not.toHaveBeenCalled();
+  });
+
+  it('enables an operator-disabled station and skips the command when offline', async () => {
+    setupDbResults(...stationImportResults({ disabledReason: 'operator', isOnline: false }));
+
+    await importSitesCsv([{ siteName: 'On', stationId: 'CS-001', stationStatus: 'faulted' }], true);
+
+    expect(mockSetDisabled).toHaveBeenCalledWith({}, 'station-1', null);
+    expect(mockSendAvailability).not.toHaveBeenCalled();
+    expect(mockPublishStatus).toHaveBeenCalled();
+  });
+
+  it('never clears or replaces a security disable', async () => {
+    for (const stationStatus of ['available', 'unavailable'] as const) {
+      mockSetDisabled.mockClear();
+      setupDbResults(...stationImportResults({ disabledReason: 'security' }));
+
+      await importSitesCsv([{ siteName: 'Sec', stationId: 'CS-001', stationStatus }], true);
+
+      expect(mockSetDisabled).not.toHaveBeenCalled();
+      expect(mockSendAvailability).not.toHaveBeenCalled();
+    }
+  });
+
+  it('leaves the disable alone when stationStatus is omitted', async () => {
+    setupDbResults(...stationImportResults({ disabledReason: 'operator' }));
+
+    await importSitesCsv([{ siteName: 'Keep', stationId: 'CS-001' }], true);
+
+    expect(mockSetDisabled).not.toHaveBeenCalled();
+    expect(mockRecompute).toHaveBeenCalledWith({}, 'station-1');
+  });
+
   it('updates an existing EVSE and connector with maxCurrentAmps when updateExisting is true', async () => {
     const now = new Date();
     setupDbResults(
       [], // site ilike pre-check: not found
       [{ id: 'site-1', createdAt: now, updatedAt: now }], // site insert
+      [], // the station's previous site: none (new station)
       [{ id: 'station-1', createdAt: now, updatedAt: now }], // station upsert (created)
       [{ id: 'evse-1' }], // EVSE lookup -> found
       [], // EVSE update (no returning needed)

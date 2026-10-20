@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 import type { RedisPubSubClient } from '@evtivity/lib';
 import type { RunConfig, RunSummary, TestCaseResult } from '@evtivity/octt';
+import * as octtRunnerModule from '../../handlers/octt-runner.js';
 
 // Capture the latest update().set() payload so tests can assert exact status
 // transitions in order.
@@ -56,6 +57,13 @@ vi.mock('drizzle-orm', () => ({
   eq: vi.fn((col: unknown, val: unknown) => ({ col, val })),
 }));
 
+const workerConfig = vi.hoisted(() => ({
+  OCPP_SERVER_URL: 'ws://localhost:7103',
+  API_BASE_URL: 'http://localhost:7102',
+  OCTT_OCSP_RESPONDER_URL: undefined as string | undefined,
+}));
+vi.mock('../../lib/config.js', () => ({ config: workerConfig }));
+
 const mockRunTests = vi.fn();
 vi.mock('@evtivity/octt', () => ({
   runTests: (...args: unknown[]) => mockRunTests(...args),
@@ -76,11 +84,12 @@ function makeLogger(): Logger {
 }
 
 const summary: RunSummary = {
-  total: 5,
+  total: 6,
   passed: 3,
   failed: 1,
   skipped: 1,
   errors: 0,
+  notApplicable: 1,
   durationMs: 4200,
 };
 
@@ -108,14 +117,14 @@ describe('octtRunnerHandler', () => {
     insertRejectError = new Error('insert boom');
     mockRunTests.mockReset();
     mockPublish.mockClear();
-    delete process.env['OCPP_SERVER_URL'];
-    delete process.env['API_BASE_URL'];
+    workerConfig.OCPP_SERVER_URL = 'ws://localhost:7103';
+    workerConfig.API_BASE_URL = 'http://localhost:7102';
   });
 
   it('marks the run running at start, then completed with summary counts on success', async () => {
     mockRunTests.mockResolvedValue(summary);
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     const log = makeLogger();
     await octtRunnerHandler({ runId: 7, ocppVersion: 'ocpp2.1', sutType: 'csms' }, log, pubsub);
 
@@ -125,11 +134,12 @@ describe('octtRunnerHandler', () => {
 
     expect(updateSets[1]).toMatchObject({
       status: 'completed',
-      totalTests: 5,
+      totalTests: 6,
       passed: 3,
       failed: 1,
       skipped: 1,
       errors: 0,
+      notApplicable: 1,
       durationMs: 4200,
     });
     expect(updateSets[1]?.['completedAt']).toBeInstanceOf(Date);
@@ -140,7 +150,7 @@ describe('octtRunnerHandler', () => {
   it('passes version undefined to runTests when ocppVersion is "all"', async () => {
     mockRunTests.mockResolvedValue(summary);
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler({ runId: 1, ocppVersion: 'all', sutType: 'cs' }, makeLogger(), pubsub);
 
     const config = mockRunTests.mock.calls[0]?.[0] as RunConfig;
@@ -149,14 +159,34 @@ describe('octtRunnerHandler', () => {
     expect(config.concurrency).toBe(3);
     expect(config.serverUrl).toBe('ws://localhost:7103');
     expect(config.apiUrl).toBe('http://localhost:7102');
+    // No responder configured: the OCSP tests are skipped.
+    expect(config.ocspResponderUrl).toBeUndefined();
   });
 
-  it('passes the concrete version and env-overridden urls to runTests', async () => {
-    process.env['OCPP_SERVER_URL'] = 'ws://ocpp.internal:9000';
-    process.env['API_BASE_URL'] = 'http://api.internal:8000';
+  it('starts the Test System OCSP responder at OCTT_OCSP_RESPONDER_URL', async () => {
+    workerConfig.OCTT_OCSP_RESPONDER_URL = 'http://worker:7110/ocsp';
+    mockRunTests.mockResolvedValue(summary);
+    try {
+      const { octtRunnerHandler } = octtRunnerModule;
+      await octtRunnerHandler(
+        { runId: 3, ocppVersion: 'ocpp2.1', sutType: 'csms' },
+        makeLogger(),
+        pubsub,
+      );
+    } finally {
+      workerConfig.OCTT_OCSP_RESPONDER_URL = undefined;
+    }
+
+    const config = mockRunTests.mock.calls[0]?.[0] as RunConfig;
+    expect(config.ocspResponderUrl).toBe('http://worker:7110/ocsp');
+  });
+
+  it('passes the concrete version and the configured urls to runTests', async () => {
+    workerConfig.OCPP_SERVER_URL = 'ws://ocpp.internal:9000';
+    workerConfig.API_BASE_URL = 'http://api.internal:8000';
     mockRunTests.mockResolvedValue(summary);
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler(
       { runId: 2, ocppVersion: 'ocpp1.6', sutType: 'csms' },
       makeLogger(),
@@ -181,7 +211,7 @@ describe('octtRunnerHandler', () => {
       },
     );
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler(
       { runId: 9, ocppVersion: 'ocpp2.1', sutType: 'csms' },
       makeLogger(),
@@ -199,6 +229,8 @@ describe('octtRunnerHandler', () => {
       durationMs: 120,
       steps: [{ name: 'boot', status: 'passed' }],
       error: null,
+      notApplicableItem: null,
+      notApplicableReason: null,
     });
 
     expect(mockPublish).toHaveBeenCalledWith(
@@ -210,6 +242,45 @@ describe('octtRunnerHandler', () => {
         status: 'passed',
       }),
     );
+  });
+
+  it('persists a notApplicable result with its PICS item and reason', async () => {
+    const result = makeResult({
+      testId: 'TC_M_26_CSMS',
+      result: {
+        status: 'notApplicable',
+        durationMs: 0,
+        steps: [],
+        notApplicable: {
+          item: 'ContractCertificateInstallationEV',
+          reason: 'PICS ContractCertificateInstallationEV not supported: no provisioning',
+        },
+      },
+    });
+    mockRunTests.mockImplementation(
+      async (_cfg: RunConfig, onResult: (r: TestCaseResult) => void) => {
+        onResult(result);
+        await Promise.resolve();
+        await Promise.resolve();
+        return summary;
+      },
+    );
+
+    const { octtRunnerHandler } = octtRunnerModule;
+    await octtRunnerHandler(
+      { runId: 5, ocppVersion: 'ocpp2.1', sutType: 'csms' },
+      makeLogger(),
+      pubsub,
+    );
+
+    expect(insertValues[0]).toMatchObject({
+      testId: 'TC_M_26_CSMS',
+      status: 'notApplicable',
+      durationMs: 0,
+      error: null,
+      notApplicableItem: 'ContractCertificateInstallationEV',
+      notApplicableReason: 'PICS ContractCertificateInstallationEV not supported: no provisioning',
+    });
   });
 
   it('coerces a missing result error to null on insert', async () => {
@@ -225,7 +296,7 @@ describe('octtRunnerHandler', () => {
       },
     );
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler(
       { runId: 3, ocppVersion: 'ocpp2.1', sutType: 'csms' },
       makeLogger(),
@@ -249,7 +320,7 @@ describe('octtRunnerHandler', () => {
       },
     );
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler({ runId: 4, ocppVersion: 'ocpp2.1', sutType: 'csms' }, log, pubsub);
 
     expect(log.warn).toHaveBeenCalledWith(
@@ -266,7 +337,7 @@ describe('octtRunnerHandler', () => {
     mockRunTests.mockRejectedValue(new Error('runner exploded'));
     const log = makeLogger();
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler({ runId: 11, ocppVersion: 'ocpp2.1', sutType: 'csms' }, log, pubsub);
 
     expect(updateSets).toHaveLength(2);
@@ -284,7 +355,7 @@ describe('octtRunnerHandler', () => {
     mockRunTests.mockRejectedValue('plain string failure');
     const log = makeLogger();
 
-    const { octtRunnerHandler } = await import('../../handlers/octt-runner.js');
+    const { octtRunnerHandler } = octtRunnerModule;
     await octtRunnerHandler({ runId: 12, ocppVersion: 'ocpp2.1', sutType: 'csms' }, log, pubsub);
 
     expect(log.error).toHaveBeenCalledWith(
@@ -292,5 +363,69 @@ describe('octtRunnerHandler', () => {
       'OCTT run failed',
     );
     expect(updateSets[1]).toMatchObject({ status: 'failed' });
+  });
+});
+
+describe('octtRunnerJob', () => {
+  beforeEach(() => {
+    mockRunTests.mockReset();
+  });
+
+  it('runs the conformance run while holding the OCTT run lock', async () => {
+    mockRunTests.mockResolvedValue({});
+    const lockRedis = { set: vi.fn().mockResolvedValue('OK'), eval: vi.fn().mockResolvedValue(1) };
+    const log = makeLogger();
+
+    const { octtRunnerJob, OCTT_RUN_LOCK_KEY } = octtRunnerModule;
+    await octtRunnerJob(
+      lockRedis as never,
+      { runId: 21, ocppVersion: 'ocpp2.1', sutType: 'csms' },
+      log,
+      pubsub,
+    );
+
+    expect(OCTT_RUN_LOCK_KEY).toBe('wkl:octt-run');
+    expect(lockRedis.set).toHaveBeenCalledWith(
+      'wkl:octt-run',
+      expect.any(String),
+      'PX',
+      60000,
+      'NX',
+    );
+    expect(mockRunTests).toHaveBeenCalledTimes(1);
+    // Released with the owner token after the run.
+    const token = lockRedis.set.mock.calls[0]?.[1] as string;
+    expect(lockRedis.eval.mock.calls.at(-1)).toEqual([
+      expect.stringContaining("redis.call('del'"),
+      1,
+      'wkl:octt-run',
+      token,
+    ]);
+  });
+
+  it('waits for a run in progress before starting', async () => {
+    vi.useFakeTimers();
+    try {
+      mockRunTests.mockResolvedValue({});
+      const lockRedis = {
+        set: vi.fn().mockResolvedValueOnce(null).mockResolvedValue('OK'),
+        eval: vi.fn().mockResolvedValue(1),
+      };
+      const { octtRunnerJob } = octtRunnerModule;
+      const done = octtRunnerJob(
+        lockRedis as never,
+        { runId: 22, ocppVersion: 'ocpp2.1', sutType: 'csms' },
+        makeLogger(),
+        pubsub,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockRunTests).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await done;
+      expect(lockRedis.set).toHaveBeenCalledTimes(2);
+      expect(mockRunTests).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

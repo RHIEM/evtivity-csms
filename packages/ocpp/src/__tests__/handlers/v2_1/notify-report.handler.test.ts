@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../../../server/middleware/pipeline.js';
+import * as notifyReportHandlerModule from '../../../handlers/v2_1/notify-report.handler.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -26,13 +27,14 @@ function makeCtx(payload: Record<string, unknown>): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'NotifyReport',
     protocolVersion: 'ocpp2.1',
     payload,
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: { sendCommand: sendCommandMock } as unknown as HandlerContext['dispatcher'],
   };
@@ -45,7 +47,7 @@ beforeEach(() => {
 
 describe('v2_1 NotifyReport handler', () => {
   it('publishes ocpp.NotifyReport with the report metadata and returns empty', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const reportData = [{ component: { name: 'X' }, variable: { name: 'Y' } }];
     const { ctx, publishMock } = makeCtx({
       requestId: 42,
@@ -74,7 +76,7 @@ describe('v2_1 NotifyReport handler', () => {
   });
 
   it('does not send a command when reportData is absent', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',
@@ -86,7 +88,7 @@ describe('v2_1 NotifyReport handler', () => {
   });
 
   it('does not send a command when MaxExternalConstraintsId is not in the report', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',
@@ -104,8 +106,8 @@ describe('v2_1 NotifyReport handler', () => {
     expect(sendCommandMock).not.toHaveBeenCalled();
   });
 
-  it('sends SetChargingProfile with the reported MaxExternalConstraintsId', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+  it('records MaxExternalConstraintsId and sends no charging profile (K01.FR.22, K01.FR.80)', async () => {
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',
@@ -120,21 +122,13 @@ describe('v2_1 NotifyReport handler', () => {
     });
     await handleNotifyReport(ctx);
 
-    expect(sendCommandMock).toHaveBeenCalledWith(
-      'CS-001',
-      'SetChargingProfile',
-      expect.objectContaining({
-        evseId: 0,
-        chargingProfile: expect.objectContaining({
-          id: 77,
-          chargingProfilePurpose: 'ChargingStationExternalConstraints',
-        }) as unknown,
-      }),
-    );
+    // A CSMS never sends ChargingStationExternalConstraints, and a profile id
+    // at or below MaxExternalConstraintsId would be rejected (K01.FR.81).
+    expect(sendCommandMock).not.toHaveBeenCalled();
   });
 
   it('does not send a command when MaxExternalConstraintsId is not a number', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',
@@ -153,7 +147,7 @@ describe('v2_1 NotifyReport handler', () => {
   });
 
   it('handles a report entry with no variableAttribute (value resolves null)', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',
@@ -170,29 +164,8 @@ describe('v2_1 NotifyReport handler', () => {
     expect(sendCommandMock).not.toHaveBeenCalled();
   });
 
-  it('swallows a dispatcher.sendCommand failure and still returns empty', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
-    const { ctx, sendCommandMock } = makeCtx({
-      requestId: 1,
-      generatedAt: '2026-06-04T00:00:00Z',
-      seqNo: 0,
-      reportData: [
-        {
-          component: { name: 'SmartChargingCtrlr' },
-          variable: { name: 'MaxExternalConstraintsId' },
-          variableAttribute: [{ value: '12' }],
-        },
-      ],
-    });
-    sendCommandMock.mockRejectedValue(new Error('station offline'));
-    const response = await handleNotifyReport(ctx);
-
-    expect(response).toEqual({});
-    expect(sendCommandMock).toHaveBeenCalledTimes(1);
-  });
-
   it('treats an empty reportData array as no constraints to apply', async () => {
-    const { handleNotifyReport } = await import('../../../handlers/v2_1/notify-report.handler.js');
+    const { handleNotifyReport } = notifyReportHandlerModule;
     const { ctx, sendCommandMock } = makeCtx({
       requestId: 1,
       generatedAt: '2026-06-04T00:00:00Z',

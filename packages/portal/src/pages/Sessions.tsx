@@ -9,9 +9,12 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { api } from '@/lib/api';
+import { costContainsTax } from '@evtivity/lib/price-display';
 import { formatCents, formatEnergy, formatDate } from '@/lib/utils';
 import { useDriverTimezone } from '@/lib/timezone';
 import { LoadingLogo } from '@/components/loading-logo';
+import type { SessionAccountBilling } from '@/lib/fleet-billing';
+import { isUnchargedSession, sessionDisplayCostCents } from '@evtivity/lib/session-cost';
 
 interface Session {
   id: string;
@@ -21,9 +24,12 @@ interface Session {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   finalCostCents: number | null;
+  taxCents: number | null;
   currency: string;
   stationName: string | null;
   siteName: string | null;
+  /** Set when the session is billed to a fleet (charge on account). */
+  accountBilling?: SessionAccountBilling | null;
 }
 
 interface SessionsResponse {
@@ -93,8 +99,27 @@ export function Sessions(): React.JSX.Element {
                   <Badge variant={statusVariant(session.status)}>{session.status}</Badge>
                   <p className="text-sm font-medium">{formatEnergy(session.energyDeliveredWh)}</p>
                   <p className="text-xs text-muted-foreground">
-                    {formatCents(session.finalCostCents, session.currency)}
+                    {isUnchargedSession(session)
+                      ? t('common.notCharged')
+                      : costContainsTax(session.finalCostCents, session.taxCents)
+                        ? t('common.amountInclTax', {
+                            amount: formatCents(session.finalCostCents, session.currency),
+                          })
+                        : formatCents(sessionDisplayCostCents(session), session.currency)}
                   </p>
+                  {session.accountBilling != null && (
+                    <p className="text-xs text-muted-foreground">
+                      {session.accountBilling.invoicedTo === 'member'
+                        ? t('fleetBilling.memberSessionLine', {
+                            fleet: session.accountBilling.fleetName,
+                            state: t(`fleetBilling.stateMember.${session.accountBilling.state}`),
+                          })
+                        : t('fleetBilling.sessionLine', {
+                            fleet: session.accountBilling.fleetName,
+                            state: t(`fleetBilling.state.${session.accountBilling.state}`),
+                          })}
+                    </p>
+                  )}
                 </div>
               </div>
             </CardContent>

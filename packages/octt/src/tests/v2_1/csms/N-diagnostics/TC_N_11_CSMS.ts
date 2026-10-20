@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../../types.js';
 import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 export const TC_N_105_CSMS: TestCase = {
   id: 'TC_N_105_CSMS',
@@ -27,23 +28,25 @@ export const TC_N_105_CSMS: TestCase = {
         },
       });
       pushSendAckStep(steps, 1, 'Send OpenPeriodicEventStreamRequest', resp1);
-    } catch {
+    } catch (err) {
       steps.push({
         step: 1,
         description: 'Send OpenPeriodicEventStreamRequest',
         status: 'failed',
         expected: 'Response received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
     let adjustReceived = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'AdjustPeriodicEventStream') {
-        adjustReceived = true;
-        return { status: 'Accepted' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'AdjustPeriodicEventStream') {
+          adjustReceived = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'AdjustPeriodicEventStream', {
         stationId: ctx.stationId,
@@ -63,13 +66,13 @@ export const TC_N_105_CSMS: TestCase = {
     try {
       const resp3 = await ctx.client.sendCall('ClosePeriodicEventStream', { id: 2 });
       pushSendAckStep(steps, 3, 'Send ClosePeriodicEventStreamRequest', resp3);
-    } catch {
+    } catch (err) {
       steps.push({
         step: 3,
         description: 'Send ClosePeriodicEventStreamRequest',
         status: 'failed',
         expected: 'Response received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
     return {

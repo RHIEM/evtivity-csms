@@ -28,6 +28,8 @@ function makeChain() {
     'returning',
     'set',
     'onConflictDoUpdate',
+    'onConflictDoNothing',
+    'for',
     'delete',
   ];
   for (const m of methods) {
@@ -47,7 +49,10 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  // The real SQLSTATE readers, so the token service maps errors as in production.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -141,7 +146,7 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
@@ -164,7 +169,6 @@ import {
   listStations,
   getStation,
   createStation,
-  updateStation,
   removeStation,
   getStationEvses,
   getEvseConnectors,
@@ -185,13 +189,10 @@ import {
   createTariff,
 } from '../services/pricing.service.js';
 
-import { resolveTariff, clearHolidayCache, isTariffFree } from '../services/tariff.service.js';
-
 beforeEach(() => {
   dbResults = [];
   dbCallIndex = 0;
   vi.clearAllMocks();
-  clearHolidayCache();
 });
 
 // ---------------------------------------------------------------------------
@@ -275,8 +276,9 @@ describe('Driver Service', () => {
   describe('createDriverToken', () => {
     it('creates and returns token', async () => {
       const token = { id: 't1', driverId: 'd1', idToken: 'ABC', tokenType: 'ISO14443' };
-      // tokenService.createToken: dup-check (empty), then insert returning
-      setupDbResults([], [token]);
+      // tokenService.createToken: dup-check (empty), the driver (active), then
+      // insert returning
+      setupDbResults([], [{ isActive: true }], [token]);
 
       const result = await createDriverToken('d1', { idToken: 'ABC', tokenType: 'ISO14443' });
 
@@ -350,25 +352,6 @@ describe('Station Service', () => {
       const result = await createStation({ stationId: 'CS002', model: 'Model X' });
 
       expect(result).toEqual(station);
-    });
-  });
-
-  describe('updateStation', () => {
-    it('returns updated station when found', async () => {
-      const station = { id: 's1', model: 'Updated Model' };
-      setupDbResults([station]);
-
-      const result = await updateStation('s1', { model: 'Updated Model' });
-
-      expect(result).toEqual(station);
-    });
-
-    it('returns null when not found', async () => {
-      setupDbResults([]);
-
-      const result = await updateStation('nonexistent', { model: 'X' });
-
-      expect(result).toBeNull();
     });
   });
 
@@ -507,9 +490,9 @@ describe('Transaction Service', () => {
   describe('getSessionByTransactionId', () => {
     it('returns session when found', async () => {
       const session = { id: 'sess1', transactionId: 'tx1' };
-      setupDbResults([session]);
+      setupDbResults([{ session }]);
 
-      const result = await getSessionByTransactionId('tx1');
+      const result = await getSessionByTransactionId('CS-001', 'tx1');
 
       expect(result).toEqual(session);
     });
@@ -517,7 +500,7 @@ describe('Transaction Service', () => {
     it('returns null when not found', async () => {
       setupDbResults([]);
 
-      const result = await getSessionByTransactionId('nonexistent');
+      const result = await getSessionByTransactionId('CS-001', 'nonexistent');
 
       expect(result).toBeNull();
     });
@@ -572,166 +555,6 @@ describe('Pricing Service', () => {
       const result = await createTariff('pg1', { name: 'Off-Peak', pricePerKwh: '0.15' });
 
       expect(result).toEqual(tariff);
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Tariff Service (resolveTariff)
-// ---------------------------------------------------------------------------
-describe('Tariff Service', () => {
-  // resolveTariffGroup uses a single db.execute() with a CTE returning
-  // { group_id, group_name } (snake_case raw SQL columns).
-  const mockExecuteGroup = { group_id: 'pgr_000000000001', group_name: 'Test Group' };
-  const mockTariffRow = {
-    id: 't1',
-    name: 'Test Tariff',
-    pricePerKwh: '0.25',
-    pricePerMinute: null,
-    pricePerSession: null,
-    idleFeePricePerMinute: null,
-    taxRate: null,
-    restrictions: null,
-    priority: 0,
-    isDefault: true,
-  };
-
-  // resolveTariff does:
-  // 1. resolveTariffGroup(): single db.execute() CTE that resolves driver/fleet/station/site/default
-  //    in one round-trip. Returns either zero rows (no match) or one row.
-  // 2. After group resolves, fans out 3 parallel queries via Promise.all: active tariffs,
-  //    holidays (cached after first call), and site timezone.
-  // 3. Calls resolveActiveTariff() from @evtivity/lib to pick the matching tariff.
-  //
-  // Mock consumption order with the sequential queue mock: execute -> holidays (inner
-  // await inside loadHolidays runs during Promise.all array construction) -> tariffs
-  // (thenable .then triggered by Promise.all iteration) -> timezone (same).
-
-  describe('resolveTariff', () => {
-    it('returns driver-specific tariff when found (priority 1)', async () => {
-      setupDbResults([mockExecuteGroup], [], [mockTariffRow], []);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toEqual(mockTariffRow);
-    });
-
-    it('returns fleet tariff when driver query returns empty (priority 2)', async () => {
-      setupDbResults([mockExecuteGroup], [], [mockTariffRow], []);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toEqual(mockTariffRow);
-    });
-
-    it('returns station tariff when driver and fleet return empty (priority 3)', async () => {
-      setupDbResults([mockExecuteGroup], [], [mockTariffRow], []);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toEqual(mockTariffRow);
-    });
-
-    it('returns null when no tariff matches any priority', async () => {
-      // execute returns no rows -> resolveTariffGroup returns null -> resolveTariff returns null.
-      setupDbResults([]);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toBeNull();
-    });
-
-    it('skips driver and fleet queries when driverId is null', async () => {
-      // The CTE still runs as one execute call; null driverId is passed as empty string
-      // and the driver/fleet sub-queries produce no rows. Station/site/default branches
-      // still resolve the group.
-      setupDbResults([mockExecuteGroup], [], [mockTariffRow], []);
-
-      const result = await resolveTariff('sta_000000000001', null);
-
-      expect(result).toEqual(mockTariffRow);
-    });
-
-    it('returns null when the group resolves but has no active tariffs', async () => {
-      // execute resolves the group, but the active-tariffs query is empty.
-      setupDbResults([mockExecuteGroup], [], [], []);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toBeNull();
-    });
-
-    it('returns null when no tariff matches the current time and there is no default', async () => {
-      // A single energy-threshold tariff (priority 50) that never matches at
-      // sessionEnergyKwh=0, and no default fallback, so resolveActiveTariff
-      // returns null.
-      const energyTariff = {
-        ...mockTariffRow,
-        id: 't-energy',
-        priority: 50,
-        isDefault: false,
-        restrictions: { energyThresholdKwh: 1000 },
-      };
-      setupDbResults([mockExecuteGroup], [], [energyTariff], []);
-
-      const result = await resolveTariff('sta_000000000001', 'drv_000000000001');
-
-      expect(result).toBeNull();
-    });
-
-    it('serves holidays from the in-process cache on a second call', async () => {
-      // First call populates the holiday cache (3rd queue slot consumed).
-      setupDbResults([mockExecuteGroup], [{ date: '2026-12-25' }], [mockTariffRow], []);
-      const first = await resolveTariff('sta_000000000001', 'drv_000000000001');
-      expect(first).toEqual(mockTariffRow);
-
-      // Second call: holidays come from cache, so only execute + tariffs +
-      // timezone are queued (no holidays query).
-      setupDbResults([mockExecuteGroup], [mockTariffRow], []);
-      const second = await resolveTariff('sta_000000000001', 'drv_000000000001');
-      expect(second).toEqual(mockTariffRow);
-    });
-  });
-
-  describe('isTariffFree', () => {
-    it('returns true for a null tariff', () => {
-      expect(isTariffFree(null)).toBe(true);
-    });
-
-    it('returns true when all price components are zero or null', () => {
-      expect(
-        isTariffFree({
-          id: 't1',
-          name: 'Free',
-          pricePerKwh: '0',
-          pricePerMinute: null,
-          pricePerSession: '0',
-          idleFeePricePerMinute: null,
-          reservationFeePerMinute: null,
-          taxRate: null,
-          restrictions: null,
-          priority: 0,
-          isDefault: true,
-        }),
-      ).toBe(true);
-    });
-
-    it('returns false when any price component is non-zero', () => {
-      expect(
-        isTariffFree({
-          id: 't2',
-          name: 'Paid',
-          pricePerKwh: '0.25',
-          pricePerMinute: null,
-          pricePerSession: null,
-          idleFeePricePerMinute: null,
-          reservationFeePerMinute: null,
-          taxRate: null,
-          restrictions: null,
-          priority: 0,
-          isDefault: true,
-        }),
-      ).toBe(false);
     });
   });
 });

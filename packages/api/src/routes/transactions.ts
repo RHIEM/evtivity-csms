@@ -7,7 +7,6 @@ import { eq } from 'drizzle-orm';
 import {
   db,
   chargingSessions,
-  chargingStations,
   transactionEventTypeEnum,
   sessionStatusEnum,
 } from '@evtivity/database';
@@ -23,6 +22,7 @@ import {
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds } from '../lib/site-access.js';
+import { siteInScope } from '../lib/site-scope.js';
 import { authorize } from '../middleware/rbac.js';
 
 const transactionEventItem = z
@@ -106,20 +106,28 @@ const transactionIdParams = z.object({
   transactionId: z.string().describe('OCPP transaction ID'),
 });
 
-/** Check if user has site access to a session's station. Returns true if allowed. */
+const transactionLookupQuery = z.object({
+  stationId: z
+    .string()
+    .min(1)
+    .describe(
+      'OCPP identity of the station that reported the transaction (a transaction ID is unique per station only)',
+    ),
+});
+
+/**
+ * True when the session exists and happened at one of the user's sites. A
+ * missing session is false for every user, so a foreign and an unknown
+ * session answer the same 404.
+ */
 async function checkSessionSiteAccess(sessionId: string, userId: string): Promise<boolean> {
-  const siteIds = await getUserSiteIds(userId);
-  if (siteIds == null) return true;
-
   const [session] = await db
-    .select({ siteId: chargingStations.siteId })
+    .select({ siteId: chargingSessions.siteId })
     .from(chargingSessions)
-    .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
     .where(eq(chargingSessions.id, sessionId));
-
-  if (session == null) return true;
-  if (session.siteId == null) return true;
-  return siteIds.includes(session.siteId);
+  if (session == null) return false;
+  const siteIds = await getUserSiteIds(userId);
+  return siteInScope(siteIds, session.siteId);
 }
 
 export function transactionRoutes(app: FastifyInstance): void {
@@ -182,9 +190,12 @@ export function transactionRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Transactions'],
         summary: 'Get session by OCPP transaction ID',
+        description:
+          'Returns the charging session of a transaction. OCPP 2.1 transaction IDs are unique per station only, so the station is required.',
         operationId: 'getTransactionById',
         security: [{ bearerAuth: [] }],
         params: zodSchema(transactionIdParams),
+        querystring: zodSchema(transactionLookupQuery),
         response: {
           200: itemResponse(transactionSessionItem),
           404: errorWith('Transaction not found', [ERROR_CODES.TRANSACTION_NOT_FOUND]),
@@ -193,7 +204,8 @@ export function transactionRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { transactionId } = request.params as z.infer<typeof transactionIdParams>;
-      const session = await transactionService.getSessionByTransactionId(transactionId);
+      const { stationId } = request.query as z.infer<typeof transactionLookupQuery>;
+      const session = await transactionService.getSessionByTransactionId(stationId, transactionId);
       if (session == null) {
         await reply
           .status(404)
@@ -201,19 +213,14 @@ export function transactionRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // The site the session happened at decides access, not the station's
+      // current site.
       const { userId } = request.user as { userId: string };
-      const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null) {
-        const [stationRow] = await db
-          .select({ siteId: chargingStations.siteId })
-          .from(chargingStations)
-          .where(eq(chargingStations.id, session.stationId));
-        if (stationRow?.siteId != null && !siteIds.includes(stationRow.siteId)) {
-          await reply
-            .status(404)
-            .send({ error: 'Transaction not found', code: 'TRANSACTION_NOT_FOUND' });
-          return;
-        }
+      if (!siteInScope(await getUserSiteIds(userId), session.siteId)) {
+        await reply
+          .status(404)
+          .send({ error: 'Transaction not found', code: 'TRANSACTION_NOT_FOUND' });
+        return;
       }
 
       return { ...session, currency: session.currency.toUpperCase() };

@@ -18,6 +18,8 @@ import {
 import { Pagination } from '@/components/ui/pagination';
 import { Badge } from '@/components/ui/badge';
 import { LoadingLogo } from '@/components/loading-logo';
+import { formatDateTime, useUserTimezone } from '@/lib/timezone';
+import { auditActionLabel, auditActorLabel } from '@/lib/audit-labels';
 
 export interface AuditEntry {
   id: number;
@@ -69,42 +71,45 @@ interface Props {
   entityType: string;
   /** When null, lists every audit row of `entityType` (uses /v1/audit?entityType=X). When set, lists rows for that specific entity (uses /v1/audit/:entityType/:entityId). */
   entityId: string | null;
+  /** Further entity types merged into the same list. Only with entityId null (uses /v1/audit?entityTypes=X,Y). The query key stays under `['audit', entityType]`, so a write to a related type invalidates `['audit', entityType]`. */
+  relatedEntityTypes?: string[];
   pageSize?: number;
   /** Entity-specific columns inserted between Actor and Notes. */
   extraColumns?: AuditExtraColumn[];
   /** When provided, renders a CardHeader/CardTitle above the audit table. Use when the History card stands alone (not inside a Tabs panel that already labels it). */
   title?: string;
+  /** Extra classes for the outer Card, such as removing its border inside another container. */
+  className?: string;
 }
 
-function actorBadge(actor: AuditEntry['actor']): React.ReactNode {
-  switch (actor) {
-    case 'operator':
-      return <Badge variant="info">operator</Badge>;
-    case 'driver':
-      return <Badge variant="secondary">driver</Badge>;
-    case 'api_key':
-      return <Badge variant="warning">api key</Badge>;
-    case 'system':
-      return <Badge variant="outline">system</Badge>;
-    case 'ocpp':
-      return <Badge variant="outline">ocpp</Badge>;
-    default:
-      return <Badge variant="outline">{actor}</Badge>;
-  }
+const ACTOR_VARIANTS: Record<string, 'info' | 'secondary' | 'warning' | 'outline'> = {
+  operator: 'info',
+  driver: 'secondary',
+  api_key: 'warning',
+  system: 'outline',
+  ocpp: 'outline',
+};
+
+export function AuditActorBadge({ actor }: { actor: string }): React.JSX.Element {
+  const { t } = useTranslation();
+  return <Badge variant={ACTOR_VARIANTS[actor] ?? 'outline'}>{auditActorLabel(t, actor)}</Badge>;
 }
 
-function formatTimestamp(iso: string): string {
+function formatTimestamp(iso: string, timezone: string): string {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  return Number.isNaN(d.getTime()) ? iso : formatDateTime(d, timezone);
 }
 
 export function EntityHistoryTab({
   entityType,
   entityId,
+  relatedEntityTypes = [],
   pageSize = 20,
   extraColumns = [],
   title,
+  className,
 }: Props): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const canReadAudit = useHasPermission('audit:read');
   // Default the header to the shared "History" label so every detail page
@@ -112,12 +117,16 @@ export function EntityHistoryTab({
   // to suppress when the surrounding container already labels the section.
   const resolvedTitle = title ?? t('audit.history');
   const [page, setPage] = useState(1);
+  const typeFilter =
+    relatedEntityTypes.length > 0
+      ? `entityTypes=${[entityType, ...relatedEntityTypes].map(encodeURIComponent).join(',')}`
+      : `entityType=${encodeURIComponent(entityType)}`;
   const auditUrl =
     entityId == null
-      ? `/v1/audit?entityType=${encodeURIComponent(entityType)}&page=${String(page)}&limit=${String(pageSize)}`
+      ? `/v1/audit?${typeFilter}&page=${String(page)}&limit=${String(pageSize)}`
       : `/v1/audit/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}?page=${String(page)}&limit=${String(pageSize)}`;
   const { data, isLoading, error } = useQuery<AuditPage>({
-    queryKey: ['audit', entityType, entityId ?? '__all__', page, pageSize],
+    queryKey: ['audit', entityType, entityId ?? '__all__', page, pageSize, relatedEntityTypes],
     queryFn: () => api.get<AuditPage>(auditUrl),
     // Refetch every time the History tab mounts so operators see new entries
     // without manually reloading the page.
@@ -140,7 +149,7 @@ export function EntityHistoryTab({
   if (!canReadAudit) return <></>;
 
   return (
-    <Card>
+    <Card className={className}>
       {resolvedTitle !== '' && (
         <CardHeader>
           <CardTitle>{resolvedTitle}</CardTitle>
@@ -176,12 +185,16 @@ export function EntityHistoryTab({
                 {rows.map((row) => (
                   <TableRow key={row.id}>
                     <TableCell className="whitespace-nowrap text-xs">
-                      {formatTimestamp(row.createdAt)}
+                      {formatTimestamp(row.createdAt, timezone)}
                     </TableCell>
                     <TableCell>
-                      <Badge variant="secondary">{row.action}</Badge>
+                      <Badge variant="secondary" title={row.action}>
+                        {auditActionLabel(t, row.action)}
+                      </Badge>
                     </TableCell>
-                    <TableCell>{actorBadge(row.actor)}</TableCell>
+                    <TableCell>
+                      <AuditActorBadge actor={row.actor} />
+                    </TableCell>
                     <TableCell className="text-sm">{actorDisplay(row)}</TableCell>
                     {extraColumns.map((col) => (
                       <TableCell key={col.header} className={col.className ?? 'text-xs'}>

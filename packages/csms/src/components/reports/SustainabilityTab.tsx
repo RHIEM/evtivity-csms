@@ -9,6 +9,7 @@ import type { ApexOptions } from 'apexcharts';
 import { Download, Leaf, Zap, Activity, TreePine } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import {
   Table,
@@ -22,7 +23,7 @@ import { FilterPopover } from '@/components/FilterBar';
 import { api } from '@/lib/api';
 import { API_BASE_URL } from '@/lib/config';
 import { useAuth } from '@/lib/auth';
-import { formatCo2, formatEnergy } from '@/lib/formatting';
+import { formatCo2, formatEnergy, formatNumber, uiLocale } from '@/lib/formatting';
 import { CHART_COLORS, getGridColor } from '@/lib/chart-theme';
 import { LoadingLogo } from '@/components/loading-logo';
 
@@ -54,7 +55,7 @@ interface SiteOption {
 }
 
 export function SustainabilityTab(): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
 
   const today = new Date();
@@ -101,24 +102,31 @@ export function SustainabilityTab(): React.JSX.Element {
         labels: {
           formatter: (val: string) => {
             const d = new Date(val + '-01');
-            return d.toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
+            return d.toLocaleDateString(uiLocale(), {
+              month: 'short',
+              year: '2-digit',
+              timeZone: 'UTC',
+            });
           },
         },
       },
       yaxis: {
         title: { text: 'kg CO₂' },
         labels: {
-          formatter: (val: number) => val.toFixed(0),
+          formatter: (val: number) => formatNumber(val, 0),
         },
       },
       tooltip: {
         y: {
-          formatter: (val: number) => `${val.toFixed(1)} kg`,
+          formatter: (val: number) => `${formatNumber(val, 1)} kg`,
         },
+      },
+      dataLabels: {
+        formatter: (val: number) => formatNumber(val, 1),
       },
       colors: [CHART_COLORS.success],
     }),
-    [isDark, report?.monthlySummary],
+    [isDark, report?.monthlySummary, i18n.language],
   );
 
   const chartSeries = useMemo(
@@ -155,29 +163,29 @@ export function SustainabilityTab(): React.JSX.Element {
     <div className="space-y-6">
       <Card>
         <CardContent className="flex flex-wrap items-center gap-2 pt-6">
-          <input
+          <Input
             type="date"
-            aria-label="Start date"
+            aria-label={t('common.startDate')}
             value={fromDate}
             onChange={(e) => {
               setFromDate(e.target.value);
             }}
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            className="w-auto"
             max={toDate}
           />
-          <span className="text-sm text-muted-foreground">to</span>
-          <input
+          <span className="text-sm text-muted-foreground">{t('dashboard.to')}</span>
+          <Input
             type="date"
-            aria-label="End date"
+            aria-label={t('common.endDate')}
             value={toDate}
             onChange={(e) => {
               setToDate(e.target.value);
             }}
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            className="w-auto"
             min={fromDate}
             max={today.toISOString().split('T')[0] ?? ''}
           />
-          <Button variant="outline" onClick={handleExportCsv} className="ml-auto gap-1.5">
+          <Button variant="outline" size="sm" onClick={handleExportCsv} className="ml-auto">
             <Download className="h-4 w-4" />
             {t('sustainability.exportCsv')}
           </Button>
@@ -187,7 +195,7 @@ export function SustainabilityTab(): React.JSX.Element {
             onChange={(e) => {
               setSiteId(e.target.value);
             }}
-            className="hidden h-9 w-auto md:block"
+            className="hidden w-auto md:block"
           >
             <option value="">{t('sessions.allSites')}</option>
             {sitesData?.data.map((s) => (
@@ -203,7 +211,7 @@ export function SustainabilityTab(): React.JSX.Element {
               onChange={(e) => {
                 setSiteId(e.target.value);
               }}
-              className="h-9 w-auto"
+              className="w-auto"
             >
               <option value="">{t('sessions.allSites')}</option>
               {sitesData?.data.map((s) => (
@@ -239,7 +247,7 @@ export function SustainabilityTab(): React.JSX.Element {
                 <CardTitle className="text-sm font-medium">
                   {t('dashboard.energyDelivered')}
                 </CardTitle>
-                <Zap className="h-4 w-4 text-primary" />
+                <Zap className="h-4 w-4 text-link" />
               </CardHeader>
               <CardContent>
                 <div className="text-lg sm:text-2xl font-bold">
@@ -256,7 +264,7 @@ export function SustainabilityTab(): React.JSX.Element {
               </CardHeader>
               <CardContent>
                 <div className="text-lg sm:text-2xl font-bold">
-                  {report.cumulativeTotal.sessionCount.toLocaleString()}
+                  {formatNumber(report.cumulativeTotal.sessionCount, 0)}
                 </div>
               </CardContent>
             </Card>
@@ -269,7 +277,7 @@ export function SustainabilityTab(): React.JSX.Element {
               </CardHeader>
               <CardContent>
                 <div className="text-lg sm:text-2xl font-bold text-success">
-                  {report.cumulativeTotal.treesEquivalent.toLocaleString()}
+                  {formatNumber(report.cumulativeTotal.treesEquivalent, 1)}
                 </div>
               </CardContent>
             </Card>
@@ -316,7 +324,7 @@ export function SustainabilityTab(): React.JSX.Element {
                         <TableCell>{site.siteName}</TableCell>
                         <TableCell className="text-right">{formatEnergy(site.energyWh)}</TableCell>
                         <TableCell className="text-right">
-                          {site.sessionCount.toLocaleString()}
+                          {formatNumber(site.sessionCount, 0)}
                         </TableCell>
                         <TableCell className="text-right text-success">
                           {formatCo2(site.co2AvoidedKg)}

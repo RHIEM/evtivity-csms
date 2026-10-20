@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 
 /**
  * TC_J_07_CSMS: Sampled Meter Values - EventType Started - EVSE known
@@ -33,7 +33,7 @@ export const TC_J_07_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const res = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -97,7 +97,7 @@ export const TC_J_08_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const res = await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -161,7 +161,7 @@ export const TC_J_09_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -169,7 +169,7 @@ export const TC_J_09_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     for (let i = 0; i < 3; i++) {
@@ -201,13 +201,13 @@ export const TC_J_09_CSMS: TestCase = {
           expected: 'TransactionEventResponse received',
           actual: res != null ? `Response keys: ${Object.keys(res).join(', ')}` : 'No response',
         });
-      } catch {
+      } catch (err) {
         steps.push({
           step: i + 1,
           description: `TransactionEvent Updated MeterValuePeriodic #${String(i + 1)}`,
           status: 'failed',
           expected: 'TransactionEventResponse received',
-          actual: 'Error or rejection',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -250,7 +250,7 @@ export const TC_J_10_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -258,7 +258,7 @@ export const TC_J_10_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     const endRes = await ctx.client.sendCall('TransactionEvent', {
@@ -335,7 +335,7 @@ export const TC_J_11_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -343,7 +343,7 @@ export const TC_J_11_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     const endRes = await ctx.client.sendCall('TransactionEvent', {

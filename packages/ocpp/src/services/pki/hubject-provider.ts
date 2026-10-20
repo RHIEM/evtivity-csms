@@ -1,18 +1,59 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { createLogger, isPrivateUrl } from '@evtivity/lib';
+import 'reflect-metadata';
+import { webcrypto } from 'node:crypto';
+import * as x509 from '@peculiar/x509';
+import { createLogger } from '@evtivity/lib';
 import type {
   PkiProvider,
   SignCsrResult,
+  ContractCertRequest,
   ContractCertResult,
   OcspRequestData,
   OcspResult,
 } from './pki-provider.js';
+import { getOcspResultForStation } from './ocsp.js';
 
 const logger = createLogger('hubject-provider');
 
-// Hubject endpoints and OCSP responders can hang under load. Without a
+x509.cryptoProvider.set(webcrypto as unknown as Crypto);
+
+/** The base64 body of a PEM block, without armor or line breaks. */
+function pemBody(pem: string): string {
+  return pem.replace(/-----(BEGIN|END) [A-Z ]+-----/g, '').replace(/\s+/g, '');
+}
+
+/** The PEM certificates of an EST response: certs-only PKCS#7 (base64) or PEM. */
+export function estCertificates(body: string): string[] {
+  if (body.includes('-----BEGIN CERTIFICATE-----')) {
+    return body.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) ?? [];
+  }
+  return [...new x509.X509Certificates(body.replace(/\s+/g, ''))].map((c) => c.toString('pem'));
+}
+
+/**
+ * Converts an EST simpleenroll response (base64 certs-only PKCS#7) to a PEM
+ * chain ordered from the leaf to the top issuer. A response that is already
+ * PEM certificates is kept in the same order.
+ */
+export function estResponseToPemChain(body: string): string {
+  if (body.includes('-----BEGIN CERTIFICATE-----')) return body.trim();
+  const all = [...new x509.X509Certificates(body.replace(/\s+/g, ''))];
+  if (all.length === 0) throw new Error('Hubject EST response holds no certificate');
+  // The leaf issues no other certificate of the response.
+  const leaf = all.find((c) => !all.some((o) => o !== c && o.issuer === c.subject)) ?? all[0];
+  const ordered: x509.X509Certificate[] = [];
+  let current: x509.X509Certificate | undefined = leaf;
+  while (current != null && !ordered.includes(current)) {
+    ordered.push(current);
+    const issuerName: string = current.issuer;
+    current = all.find((c) => c.subject === issuerName && !ordered.includes(c));
+  }
+  return ordered.map((c) => c.toString('pem')).join('\n');
+}
+
+// Hubject endpoints can hang under load. Without a
 // timeout the OCPP handler thread that initiated the certificate flow
 // blocks indefinitely, the station's response promise eventually rejects
 // with a timeout, and a slow upstream pins worker capacity.
@@ -82,22 +123,21 @@ export class HubjectProvider implements PkiProvider {
     return this.tokenCache.accessToken;
   }
 
-  private async authHeaders(): Promise<Record<string, string>> {
-    const token = await this.getAccessToken();
-    return {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/pkcs10',
-    };
-  }
-
   async signCsr(csr: string, certificateType: string): Promise<SignCsrResult> {
-    const headers = await this.authHeaders();
+    const token = await this.getAccessToken();
     const url = `${this.config.baseUrl}/.well-known/est/simpleenroll`;
 
+    // RFC 7030 4.2.1: the body is the DER PKCS#10 request, base64 encoded,
+    // with content type application/pkcs10 (the station sends PEM).
     const response = await fetchWithTimeout(url, {
       method: 'POST',
-      headers,
-      body: csr,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/pkcs10',
+        'Content-Transfer-Encoding': 'base64',
+        Accept: 'application/pkcs7-mime',
+      },
+      body: pemBody(csr),
     });
 
     if (!response.ok) {
@@ -105,7 +145,9 @@ export class HubjectProvider implements PkiProvider {
       throw new Error(`Hubject CSR signing failed: ${String(response.status)} ${text}`);
     }
 
-    const certificateChain = await response.text();
+    // RFC 7030 4.2.3: a certs-only PKCS#7 (CMS SignedData), base64 encoded.
+    // OCPP CertificateSigned needs a PEM chain starting at the leaf.
+    const certificateChain = estResponseToPemChain(await response.text());
     logger.info({ certificateType }, 'CSR signed via Hubject EST simpleenroll');
 
     return {
@@ -114,7 +156,7 @@ export class HubjectProvider implements PkiProvider {
     };
   }
 
-  async getContractCertificate(exiRequest: string): Promise<ContractCertResult> {
+  async getContractCertificate({ exiRequest }: ContractCertRequest): Promise<ContractCertResult> {
     const token = await this.getAccessToken();
     const url = `${this.config.baseUrl}/ccp/getSignedContractData`;
 
@@ -140,51 +182,21 @@ export class HubjectProvider implements PkiProvider {
   }
 
   async getOcspStatus(ocspRequestData: OcspRequestData): Promise<OcspResult> {
-    // OCSP responder URL is attested by the requesting station via its
-    // certificate's AIA extension. Reject private/internal addresses so a
-    // hostile station cannot weaponize the CSMS into an SSRF probe.
-    if (isPrivateUrl(ocspRequestData.responderURL)) {
-      logger.error(
-        { url: ocspRequestData.responderURL },
-        'Rejected OCSP responder URL pointing at a private/internal address',
-      );
-      return { status: 'Failed', ocspResult: '' };
-    }
-
-    const ocspRequest = Buffer.from(
-      JSON.stringify({
-        hashAlgorithm: ocspRequestData.hashAlgorithm,
-        issuerNameHash: ocspRequestData.issuerNameHash,
-        issuerKeyHash: ocspRequestData.issuerKeyHash,
-        serialNumber: ocspRequestData.serialNumber,
-      }),
-    ).toString('base64');
-
-    const response = await fetchWithTimeout(ocspRequestData.responderURL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/ocsp-request' },
-      body: Buffer.from(ocspRequest, 'base64'),
-    });
-
-    if (!response.ok) {
-      logger.error(
-        { status: response.status, url: ocspRequestData.responderURL },
-        'OCSP request failed',
-      );
-      return { status: 'Failed', ocspResult: '' };
-    }
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    return { status: 'Accepted', ocspResult: buffer.toString('base64') };
+    // OCSP is answered by the responder in the certificate's AIA extension,
+    // not by the Hubject API. The helper sends the RFC 6960 request and
+    // applies the SSRF guard (private addresses only when allowlisted).
+    // A failure is returned with its reason, not logged here: the caller logs
+    // it with the station that named the responder.
+    return getOcspResultForStation(ocspRequestData);
   }
 
   async getRootCertificates(type: string): Promise<string[]> {
-    const headers = await this.authHeaders();
+    const token = await this.getAccessToken();
     const url = `${this.config.baseUrl}/.well-known/est/cacerts`;
 
     const response = await fetchWithTimeout(url, {
       method: 'GET',
-      headers,
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/pkcs7-mime' },
     });
 
     if (!response.ok) {
@@ -192,11 +204,8 @@ export class HubjectProvider implements PkiProvider {
       throw new Error(`Hubject root cert fetch failed: ${String(response.status)} ${text}`);
     }
 
-    const pemBundle = await response.text();
-    const certs = pemBundle
-      .split('-----END CERTIFICATE-----')
-      .filter((c) => c.includes('-----BEGIN CERTIFICATE-----'))
-      .map((c) => c.trim() + '\n-----END CERTIFICATE-----');
+    // RFC 7030 4.1.3: a certs-only PKCS#7, base64 encoded (PEM also accepted).
+    const certs = estCertificates(await response.text());
 
     logger.info({ count: certs.length, type }, 'Root certificates fetched from Hubject');
     return certs;

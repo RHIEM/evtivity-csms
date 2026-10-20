@@ -8,13 +8,15 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { CopyableId } from '@/components/copyable-id';
 import { PORTAL_BASE_URL } from '@/lib/config';
 import { formatDateTime } from '@/lib/timezone';
+import { providerLabel } from '@/payments/provider-label';
 
 interface GuestSessionInfo {
   sessionToken: string;
   guestEmail: string;
   status: string;
   preAuthAmountCents: number | null;
-  stripePaymentIntentId: string | null;
+  provider: string | null;
+  providerPaymentId: string | null;
   expiresAt: string;
   createdAt: string;
 }
@@ -55,7 +57,7 @@ export function SessionGuestTab({
             href={portalUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-primary hover:underline break-all"
+            className="inline-flex items-center gap-1 text-link hover:underline break-all"
           >
             {portalUrl}
             <ExternalLink className="h-3 w-3 shrink-0" />
@@ -73,9 +75,16 @@ export function SessionGuestTab({
         <Row label={t('sessions.guestPreAuthAmount')}>
           {guest.preAuthAmountCents != null ? formatCents(guest.preAuthAmountCents, currency) : '-'}
         </Row>
-        <Row label={t('sessions.guestStripePaymentIntent')}>
-          {guest.stripePaymentIntentId != null && guest.stripePaymentIntentId !== '' ? (
-            <CopyableId id={guest.stripePaymentIntentId} variant="detail" />
+        <Row label={t('sessions.guestPaymentProvider')}>
+          {guest.provider != null && guest.provider !== '' ? (
+            <Badge variant="secondary">{providerLabel(guest.provider, t)}</Badge>
+          ) : (
+            '-'
+          )}
+        </Row>
+        <Row label={t('sessions.guestProviderPayment')}>
+          {guest.providerPaymentId != null && guest.providerPaymentId !== '' ? (
+            <CopyableId id={guest.providerPaymentId} variant="detail" />
           ) : (
             '-'
           )}

@@ -2,43 +2,72 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { createServer as createHttpsServer } from 'node:https';
+import type { Server as HttpsServer } from 'node:https';
 import { WebSocketServer } from 'ws';
 import type WebSocket from 'ws';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
 import type postgres from 'postgres';
-import { createLogger, InMemoryEventBus, OcppError } from '@evtivity/lib';
-import type { Logger, EventBus, EventPersistence } from '@evtivity/lib';
+import {
+  CACHE_INVALIDATE_CHANNEL,
+  createLogger,
+  InMemoryEventBus,
+  OcppError,
+  parseStationAuthInvalidation,
+  parseStationDisconnect,
+  tryParseJson,
+} from '@evtivity/lib';
+import { getHeartbeatIntervalSeconds } from '@evtivity/database';
+import type { Logger, EventBus, EventPersistence, PubSubClient, Subscription } from '@evtivity/lib';
 import { ConnectionManager } from './connection-manager.js';
 import { createSessionState } from './session-state.js';
+import { selectOcppSubprotocol } from './subprotocol.js';
 import type { SessionState } from './session-state.js';
 import { MessageCorrelator } from './message-correlator.js';
 import { MessageRouter } from './message-router.js';
-import { GracefulShutdown } from './graceful-shutdown.js';
+import { GracefulShutdown, SERVER_SHUTDOWN_DISCONNECT_REASON } from './graceful-shutdown.js';
 import { PingMonitor } from './ping-monitor.js';
-import { parseTrustedProxies, resolveClientIp } from './client-ip.js';
+import { isTlsConnection, parseTrustedProxies, resolveClientIp } from './client-ip.js';
 import { MiddlewarePipeline } from './middleware/pipeline.js';
 import type { HandlerContext } from './middleware/pipeline.js';
 import { logMiddleware } from './middleware/log.js';
 import { validateMiddleware } from './middleware/validate.js';
-import { createRateLimitMiddleware } from './middleware/rate-limit.js';
+import { consumeStationMessage } from './middleware/rate-limit.js';
 import { createDedupMiddleware } from './middleware/dedup.js';
 import { createBootGuardMiddleware } from './middleware/boot-guard.js';
-import { authenticateConnection } from './middleware/authenticate.js';
+import {
+  authenticateConnection,
+  rejectionFor,
+  serviceUnavailable,
+} from './middleware/authenticate.js';
+import type { AuthResult } from './middleware/authenticate.js';
+import {
+  StationAuthCache,
+  StationPasswordVerifier,
+} from './middleware/station-password-verifier.js';
+import type { StationPasswordVerifierStats } from './middleware/station-password-verifier.js';
+import {
+  ConnectionAuthBusyError,
+  ConnectionAuthLimiter,
+  DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
+  DEFAULT_CONNECTION_AUTH_MAX_WAIT_MS,
+  defaultConnectionAuthConcurrency,
+} from './connection-auth-limiter.js';
+import type { ConnectionAuthLimits, ConnectionAuthStats } from './connection-auth-limiter.js';
 import { MessageLifecycle } from './message-lifecycle.js';
 import { CommandDispatcher } from './command-dispatcher.js';
+import { MESSAGE_LOG_EVENT, publishMessageLog } from './message-log.js';
+import { InboundFrameStats, parseInboundFrame } from './inbound-frame.js';
 import { registerHandlers } from '../handlers/handler-registry.js';
 import {
-  isCall,
   isCallResult,
-  isCallError,
   createCallResult,
   createCallError,
   MESSAGE_TYPE_CALL,
   MESSAGE_TYPE_CALLRESULT,
   MESSAGE_TYPE_CALLERROR,
 } from '../protocol/message-types.js';
-import type { OcppMessage } from '../protocol/message-types.js';
-import { OcppErrorCode } from '../protocol/error-codes.js';
+import type { CallError, CallResult } from '../protocol/message-types.js';
+import { OcppErrorCode, errorCodeForProtocol } from '../protocol/error-codes.js';
 
 import { config } from '../lib/config.js';
 
@@ -47,6 +76,10 @@ const MAX_MESSAGES_PER_IP_PER_SECOND = config.OCPP_MAX_MESSAGES_PER_IP_PER_SECON
 const IP_MESSAGE_WINDOW_MS = 1000;
 
 const ipConnectionCounts = new Map<string, number>();
+// Upgrade requests per IP whose authentication is still running. They count
+// toward the per-IP connection limit, so one IP cannot queue unbounded station
+// lookups and argon2 verifications.
+const ipPendingAuthCounts = new Map<string, number>();
 const ipMessageCounters = new Map<string, { count: number; windowStart: number }>();
 
 // ipMessageCounters entries are only refreshed when the same IP sends
@@ -92,6 +125,38 @@ export interface OcppServerOptions {
   // Comma-separated CIDRs of load balancers whose X-Forwarded-For is trusted.
   trustedProxyCidrs?: string | undefined;
   tls?: TlsOptions | undefined;
+  // Fixed idle timeout (tests). By default it follows the heartbeat setting.
+  idleTimeoutMs?: number | undefined;
+  // Bounds on concurrent connection authentications. By default half the
+  // database pool, 1000 queued, 10 s wait (see connection-auth-limiter.ts).
+  connectionAuthLimits?: Partial<ConnectionAuthLimits> | undefined;
+  // This process's instance ID (the connection registry ID). Keys its
+  // ocpp_server_health row. Without one the ping monitor generates an ID.
+  instanceId?: string | undefined;
+  // Station password checks. By default a cache of successful checks and an
+  // argon2 concurrency gate (see station-password-verifier.ts).
+  passwordVerifier?: StationPasswordVerifier | undefined;
+}
+
+// Refused connection authentications are logged at most this often.
+const AUTH_BUSY_LOG_INTERVAL_MS = 5_000;
+
+// A connection with no OCPP message and no WebSocket ping or pong for this long
+// is closed. The default is twice the heartbeat interval handed out at boot,
+// never less than 5 minutes, so a station that heartbeats exactly on schedule
+// and does not answer pings is not closed as its heartbeat arrives.
+const MIN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const IDLE_TIMEOUT_REFRESH_MS = 60_000;
+
+// How long stop() waits, after the station sockets close, for event-bus
+// handlers to finish (station.Disconnected projections, notifications). The
+// caller closes pub/sub, Redis and the database after stop() returns. Socket
+// close (10 s) plus this stays inside the 30 s ECS stop timeout and the
+// Kubernetes termination grace period.
+export const EVENT_DRAIN_TIMEOUT_MS = 10_000;
+
+export function idleTimeoutForHeartbeat(heartbeatSeconds: number): number {
+  return Math.max(MIN_IDLE_TIMEOUT_MS, heartbeatSeconds * 2 * 1000);
 }
 
 export class OcppServer {
@@ -106,8 +171,20 @@ export class OcppServer {
   private readonly pingMonitor: PingMonitor;
   private readonly sql: postgres.Sql | null;
   private readonly trustedProxies: ReturnType<typeof parseTrustedProxies>;
+  private readonly fixedIdleTimeoutMs: number | null;
+  private readonly authLimiter: ConnectionAuthLimiter;
+  private readonly passwordVerifier: StationPasswordVerifier;
+  private readonly frameStats: InboundFrameStats;
+  private authBusyLoggedAt = 0;
+  private authBusySinceLog = 0;
+  private idleTimeoutMs = MIN_IDLE_TIMEOUT_MS;
+  private idleTimeoutRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private wss: WebSocketServer | null = null;
   private wssSecure: WebSocketServer | null = null;
+  private httpsServer: HttpsServer | null = null;
+  // Auth results from verifyClient, handed to handleConnection for the same
+  // upgrade request.
+  private readonly verifiedRequests = new WeakMap<IncomingMessage, AuthResult>();
   private shutdown: GracefulShutdown | null = null;
 
   constructor(options?: Partial<OcppServerOptions>) {
@@ -121,17 +198,29 @@ export class OcppServer {
         // (ocpp_message_logs, meter_values, charging_stations.last_heartbeat)
         // via projections; archiving it again in domain_events accounted for
         // ~87% of that table's rows with no readers.
-        persistDenylist: ['ocpp.MessageLog', 'ocpp.MeterValues', 'ocpp.Heartbeat'],
+        persistDenylist: [MESSAGE_LOG_EVENT, 'ocpp.MeterValues', 'ocpp.Heartbeat'],
       });
     this.lifecycle = new MessageLifecycle(this.logger);
     this.dispatcher = new CommandDispatcher(this.connectionManager, this.correlator, this.logger);
     this.pingMonitor = new PingMonitor(this.connectionManager, this.logger);
     this.sql = options?.sql ?? null;
     this.trustedProxies = parseTrustedProxies(options?.trustedProxyCidrs ?? '');
+    this.fixedIdleTimeoutMs = options?.idleTimeoutMs ?? null;
+    if (this.fixedIdleTimeoutMs != null) this.idleTimeoutMs = this.fixedIdleTimeoutMs;
+    const limits = options?.connectionAuthLimits;
+    this.authLimiter = new ConnectionAuthLimiter({
+      maxConcurrent:
+        limits?.maxConcurrent ?? defaultConnectionAuthConcurrency(this.sql?.options.max ?? 10),
+      maxQueued: limits?.maxQueued ?? DEFAULT_CONNECTION_AUTH_MAX_QUEUED,
+      maxWaitMs: limits?.maxWaitMs ?? DEFAULT_CONNECTION_AUTH_MAX_WAIT_MS,
+    });
+    this.passwordVerifier =
+      options?.passwordVerifier ?? new StationPasswordVerifier({ cache: new StationAuthCache() });
+    this.frameStats = new InboundFrameStats(this.logger);
 
-    // Set up middleware pipeline
+    // Set up middleware pipeline. The per-station rate limit runs in
+    // handleMessage, before any frame is logged.
     this.pipeline = new MiddlewarePipeline();
-    this.pipeline.use(createRateLimitMiddleware());
     this.pipeline.use(createDedupMiddleware());
     this.pipeline.use(logMiddleware);
     // Boot guard precedes validate: a non-booted (Pending/Rejected) station must get
@@ -151,11 +240,10 @@ export class OcppServer {
       port: options.port,
       host: options.host,
       maxPayload: 1 * 1024 * 1024,
-      handleProtocols: (protocols) => {
-        if (protocols.has('ocpp2.1')) return 'ocpp2.1';
-        if (protocols.has('ocpp1.6')) return 'ocpp1.6';
-        return false;
+      verifyClient: (info, callback) => {
+        this.verifyClient(info.req, callback);
       },
+      handleProtocols: (protocols) => selectOcppSubprotocol(protocols) ?? false,
     });
 
     // Wait for the WebSocket server to bind the port
@@ -173,7 +261,7 @@ export class OcppServer {
     );
 
     this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-      void this.handleConnection(ws, req);
+      this.handleConnection(ws, req);
     });
 
     this.wss.on('error', (err: Error) => {
@@ -188,23 +276,26 @@ export class OcppServer {
         key: options.tls.key,
         ...(options.tls.ca != null ? { ca: options.tls.ca } : {}),
         requestCert: true,
-        // Must be false: SP2 stations connect without client certs on the same port.
-        // SP3 client cert validation is handled by the auth middleware.
+        // Must be false: SP2 stations connect without a client certificate on the
+        // same port, and true would drop them during the handshake. Node still
+        // verifies any client certificate against `ca` and records the result in
+        // socket.authorized; the auth middleware (authenticate.ts) rejects an SP3
+        // station whose certificate is missing or not authorized.
         rejectUnauthorized: false,
       });
+      this.httpsServer = httpsServer;
 
       this.wssSecure = new WebSocketServer({
         server: httpsServer,
         maxPayload: 1 * 1024 * 1024,
-        handleProtocols: (protocols) => {
-          if (protocols.has('ocpp2.1')) return 'ocpp2.1';
-          if (protocols.has('ocpp1.6')) return 'ocpp1.6';
-          return false;
+        verifyClient: (info, callback) => {
+          this.verifyClient(info.req, callback);
         },
+        handleProtocols: (protocols) => selectOcppSubprotocol(protocols) ?? false,
       });
 
       this.wssSecure.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-        void this.handleConnection(ws, req);
+        this.handleConnection(ws, req);
       });
 
       this.wssSecure.on('error', (err: Error) => {
@@ -228,7 +319,15 @@ export class OcppServer {
       );
     }
 
-    this.pingMonitor.start(this.sql);
+    this.pingMonitor.start(this.sql, null, options.instanceId);
+
+    if (this.fixedIdleTimeoutMs == null && this.sql != null) {
+      await this.refreshIdleTimeout();
+      this.idleTimeoutRefreshTimer = setInterval(() => {
+        void this.refreshIdleTimeout();
+      }, IDLE_TIMEOUT_REFRESH_MS);
+      this.idleTimeoutRefreshTimer.unref();
+    }
 
     this.logger.info(
       { port: options.port, host: options.host ?? '0.0.0.0' },
@@ -236,7 +335,180 @@ export class OcppServer {
     );
   }
 
-  private async handleConnection(ws: WebSocket, req: IncomingMessage): Promise<void> {
+  // Authenticate before the WebSocket upgrade so a rejected station gets an
+  // HTTP status instead of an accepted upgrade followed by a close frame.
+  // Stations that send Basic auth only in response to a 401 challenge could
+  // not connect otherwise.
+  private verifyClient(
+    req: IncomingMessage,
+    callback: (
+      result: boolean,
+      code?: number,
+      message?: string,
+      headers?: OutgoingHttpHeaders,
+    ) => void,
+  ): void {
+    const remoteIp = resolveClientIp(req, this.trustedProxies) ?? 'unknown';
+
+    // Connections over the per-IP limit are closed right after the upgrade
+    // in handleConnection; skip the station lookup for them.
+    if ((ipConnectionCounts.get(remoteIp) ?? 0) >= MAX_CONNECTIONS_PER_IP) {
+      callback(true);
+      return;
+    }
+
+    const pendingCount = ipPendingAuthCounts.get(remoteIp) ?? 0;
+    if ((ipConnectionCounts.get(remoteIp) ?? 0) + pendingCount >= MAX_CONNECTIONS_PER_IP) {
+      this.logger.warn(
+        { remoteIp, pending: pendingCount },
+        'Per-IP pending authentication limit exceeded',
+      );
+      callback(false, 429, 'Too Many Requests');
+      return;
+    }
+    ipPendingAuthCounts.set(remoteIp, pendingCount + 1);
+    const releasePending = (): void => {
+      const count = ipPendingAuthCounts.get(remoteIp) ?? 1;
+      if (count <= 1) {
+        ipPendingAuthCounts.delete(remoteIp);
+      } else {
+        ipPendingAuthCounts.set(remoteIp, count - 1);
+      }
+    };
+
+    // A reconnect wave queues here instead of filling the database pool.
+    this.authLimiter
+      .run(() => {
+        // The station gave up while the request waited: skip the lookup.
+        if (req.socket.destroyed) {
+          return Promise.resolve<AuthResult>({
+            authenticated: false,
+            stationId: null,
+            stationDbId: null,
+            error: 'Connection closed while waiting for authentication',
+            failure: 'unavailable',
+          });
+        }
+        return authenticateConnection(
+          req,
+          this.logger,
+          this.sql,
+          remoteIp === 'unknown' ? null : remoteIp,
+          isTlsConnection(req, this.trustedProxies),
+          this.passwordVerifier,
+        );
+      })
+      .then((auth) => {
+        releasePending();
+        if (auth.authenticated && auth.stationId != null) {
+          this.verifiedRequests.set(req, auth);
+          callback(true);
+          return;
+        }
+        const rejection = rejectionFor(auth);
+        this.logger.warn(
+          { stationId: auth.stationId, error: auth.error, status: rejection.status },
+          'Connection rejected',
+        );
+        callback(false, rejection.status, rejection.message, rejection.headers);
+      })
+      .catch((err: unknown) => {
+        releasePending();
+        const unavailable = serviceUnavailable();
+        if (err instanceof ConnectionAuthBusyError) {
+          this.logAuthBusy(err);
+        } else {
+          this.logger.error(
+            { error: err instanceof Error ? err.message : String(err) },
+            'Connection authentication failed',
+          );
+        }
+        callback(false, unavailable.status, unavailable.message, unavailable.headers);
+      });
+  }
+
+  // One warning per interval with the number refused since the last one, so a
+  // reconnect wave does not log a line per station.
+  private logAuthBusy(err: ConnectionAuthBusyError): void {
+    this.authBusySinceLog++;
+    const now = Date.now();
+    if (now - this.authBusyLoggedAt < AUTH_BUSY_LOG_INTERVAL_MS) return;
+    this.logger.warn(
+      { ...this.authLimiter.stats(), reason: err.reason, refused: this.authBusySinceLog },
+      'Connection authentication busy: refused station connections with 503',
+    );
+    this.authBusyLoggedAt = now;
+    this.authBusySinceLog = 0;
+  }
+
+  /** Connection authentications running, queued, and refused (health endpoint). */
+  getConnectionAuthStats(): ConnectionAuthStats {
+    return this.authLimiter.stats();
+  }
+
+  /** Inbound frames dropped, refused or not logged since start, by reason. */
+  getInboundFrameStats(): Record<string, number> {
+    return this.frameStats.snapshot();
+  }
+
+  /** Cached station password checks and argon2 computations running and queued. */
+  getStationPasswordStats(): StationPasswordVerifierStats {
+    return this.passwordVerifier.stats();
+  }
+
+  /**
+   * Evicts a station's cached password check in this process when the API
+   * publishes a station auth invalidation (password or security profile
+   * changed). The cache entry also binds the stored hash, so a lost message
+   * never lets an old password through; this evicts the entry at once.
+   * A station disconnect (the station was blocked) closes the connection this
+   * process holds; the connection authentication refuses its reconnect.
+   */
+  subscribeStationAuthInvalidation(pubsub: PubSubClient): Promise<Subscription> {
+    return pubsub.subscribe(CACHE_INVALIDATE_CHANNEL, (payload: string) => {
+      const message = tryParseJson(payload);
+      const stationDbId = parseStationAuthInvalidation(message);
+      if (stationDbId != null) {
+        this.passwordVerifier.invalidate(stationDbId);
+        this.logger.debug({ stationDbId }, 'Station auth cache entry invalidated');
+        return;
+      }
+      const blockedStationId = parseStationDisconnect(message);
+      if (blockedStationId != null) this.closeBlockedStation(blockedStationId);
+    });
+  }
+
+  /** Closes a blocked station's connection when this process holds it (1008, policy violation). */
+  closeBlockedStation(stationId: string): void {
+    const connection = this.connectionManager.get(stationId);
+    if (connection == null) return;
+    this.logger.info({ stationId }, 'Closing the connection of a blocked station');
+    connection.ws.close(1008, 'Station is blocked');
+  }
+
+  // The CSMS sends a station queued commands and screen messages only once it
+  // may: after a BootNotification it answered Accepted, or, for a station that
+  // reconnected without rebooting (no BootNotification), after its first other
+  // message. Before that the station answers every CSMS call with SecurityError.
+  private announceReady(session: SessionState, action: string): void {
+    if (session.readyAnnounced) return;
+    const bootAccepted = session.bootStatus === 'Accepted';
+    const reconnectedWithoutBoot = session.bootStatus === null && action !== 'BootNotification';
+    if (!bootAccepted && !reconnectedWithoutBoot) return;
+    session.readyAnnounced = true;
+    void this.eventBus.publish({
+      eventType: 'station.Ready',
+      aggregateType: 'ChargingStation',
+      aggregateId: session.stationId,
+      payload: {
+        stationId: session.stationId,
+        stationDbId: session.stationDbId,
+        ocppProtocol: session.ocppProtocol,
+      },
+    });
+  }
+
+  private handleConnection(ws: WebSocket, req: IncomingMessage): void {
     const remoteIp = resolveClientIp(req, this.trustedProxies) ?? 'unknown';
 
     // Per-IP connection limit
@@ -257,81 +529,42 @@ export class OcppServer {
       }
     });
 
-    // Idle timeout: close connections with no messages for 5 minutes.
-    // OCPP heartbeat interval is typically 30-60 seconds, so 5 minutes is generous.
-    const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
-    let idleTimer = setTimeout(() => {
-      this.logger.info({ remoteIp }, 'Closing idle WebSocket connection (pre-auth)');
+    // Any OCPP message or WebSocket ping/pong restarts the idle timer. The
+    // ping monitor pings every station every 30s, so live connections answer.
+    const closeIdle = (): void => {
+      this.logger.info({ remoteIp }, 'Closing idle WebSocket connection');
       ws.close(1000, 'Idle timeout');
-    }, IDLE_TIMEOUT_MS);
-
-    // Register message listener before async auth to avoid losing messages
-    // that arrive while authenticateConnection queries the DB.
-    const pendingMessages: string[] = [];
-    let session: SessionState | null = null;
-
-    ws.on('message', (data: Buffer) => {
+    };
+    let armedIdleMs = this.idleTimeoutMs;
+    let idleTimer = setTimeout(closeIdle, armedIdleMs);
+    const restartIdleTimer = (): void => {
+      if (armedIdleMs === this.idleTimeoutMs) {
+        idleTimer.refresh();
+        return;
+      }
       clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        const sid = session?.stationId ?? remoteIp;
-        this.logger.info({ stationId: sid }, 'Closing idle WebSocket connection');
-        ws.close(1000, 'Idle timeout');
-      }, IDLE_TIMEOUT_MS);
-      // Per-IP message rate limit
-      const now = Date.now();
-      let ipCounter = ipMessageCounters.get(remoteIp);
-      if (ipCounter == null || now - ipCounter.windowStart >= IP_MESSAGE_WINDOW_MS) {
-        ipCounter = { count: 0, windowStart: now };
-        ipMessageCounters.set(remoteIp, ipCounter);
-      }
-      ipCounter.count++;
-      if (ipCounter.count > MAX_MESSAGES_PER_IP_PER_SECOND) {
-        this.logger.warn(
-          { remoteIp, count: ipCounter.count },
-          'Per-IP message rate limit exceeded',
-        );
-        ws.close(1008, 'Message rate limit exceeded');
-        return;
-      }
+      armedIdleMs = this.idleTimeoutMs;
+      idleTimer = setTimeout(closeIdle, armedIdleMs);
+    };
+    ws.on('ping', restartIdleTimer);
+    ws.on('pong', restartIdleTimer);
 
-      const raw = data.toString('utf-8');
-      if (session == null) {
-        pendingMessages.push(raw);
-        return;
-      }
-      void this.handleMessage(ws, session, raw);
-    });
-
-    const auth = await authenticateConnection(
-      req,
-      this.logger,
-      this.sql,
-      remoteIp === 'unknown' ? null : remoteIp,
-    );
-    if (!auth.authenticated || auth.stationId == null) {
-      // Surface buffered messages so operators can see what an unauthenticated
-      // client tried to send before being kicked. Silent drop here hid both
-      // misconfigured stations (legitimate but with bad creds) and probe
-      // traffic. Cap the logged payload to avoid log-flood from a flooder.
-      if (pendingMessages.length > 0) {
-        this.logger.warn(
-          {
-            stationId: auth.stationId,
-            droppedCount: pendingMessages.length,
-            firstMessagePreview: pendingMessages[0]?.slice(0, 200),
-            error: auth.error,
-          },
-          'Discarded buffered messages from unauthenticated connection',
-        );
-      }
-      this.logger.warn({ error: auth.error }, 'Connection rejected');
-      ws.close(1008, auth.error ?? 'Authentication failed');
+    const auth = this.verifiedRequests.get(req);
+    this.verifiedRequests.delete(req);
+    if (auth?.stationId == null) {
+      // verifyClient stores a result for every accepted upgrade under the limit.
+      this.logger.error({ remoteIp }, 'Upgraded connection without authentication result');
+      ws.close(1011, 'Authentication failed');
       return;
     }
 
     const stationId = auth.stationId;
-    session = createSessionState(stationId, ws.protocol || 'ocpp2.1');
+    const session = createSessionState(stationId, ws.protocol || 'ocpp2.1');
     session.authenticated = true;
+    // A station awaiting operator approval gets SecurityError for every CALL
+    // but BootNotification until a BootNotification is Accepted, even when it
+    // never sends one (boot-guard.ts).
+    if (auth.awaitingApproval === true) session.bootStatus = 'Pending';
     if (auth.stationDbId != null) {
       session.stationDbId = auth.stationDbId;
     }
@@ -356,15 +589,49 @@ export class OcppServer {
 
     this.pingMonitor.writeNow();
 
-    const confirmedSession = session;
+    ws.on('message', (data: Buffer) => {
+      restartIdleTimer();
+      // Per-IP message rate limit
+      const now = Date.now();
+      let ipCounter = ipMessageCounters.get(remoteIp);
+      if (ipCounter == null || now - ipCounter.windowStart >= IP_MESSAGE_WINDOW_MS) {
+        ipCounter = { count: 0, windowStart: now };
+        ipMessageCounters.set(remoteIp, ipCounter);
+      }
+      ipCounter.count++;
+      if (ipCounter.count > MAX_MESSAGES_PER_IP_PER_SECOND) {
+        this.logger.warn(
+          { remoteIp, count: ipCounter.count },
+          'Per-IP message rate limit exceeded',
+        );
+        ws.close(1008, 'Message rate limit exceeded');
+        return;
+      }
+
+      this.handleMessage(ws, session, data.toString('utf-8')).catch((err: unknown) => {
+        this.logger.error(
+          { stationId, error: err instanceof Error ? err.message : String(err) },
+          'Inbound message handling failed',
+        );
+      });
+    });
+
     ws.on('close', () => {
-      this.correlator.clearPending(confirmedSession);
-      this.connectionManager.remove(stationId);
+      this.correlator.clearPending(session);
+      // A connection replaced by a newer one is not a disconnect.
+      if (!this.connectionManager.remove(stationId, ws)) return;
+      // A socket closed by stop() is not a station failure: the projection
+      // still records the disconnect but sends no fault notices.
+      const serverShutdown = this.shutdown?.isShuttingDown() === true;
       void this.eventBus.publish({
         eventType: 'station.Disconnected',
         aggregateType: 'ChargingStation',
         aggregateId: stationId,
-        payload: { stationId, remoteAddress: remoteIp },
+        payload: {
+          stationId,
+          remoteAddress: remoteIp,
+          ...(serverShutdown ? { reason: SERVER_SHUTDOWN_DISCONNECT_REASON } : {}),
+        },
       });
 
       this.pingMonitor.writeNow();
@@ -378,11 +645,12 @@ export class OcppServer {
       this.logger.error({ stationId, error: err.message }, 'WebSocket error');
       ws.close(1011, 'WebSocket error');
     });
+  }
 
-    // Drain messages that arrived during authentication
-    for (const raw of pendingMessages) {
-      void this.handleMessage(ws, session, raw);
-    }
+  private async refreshIdleTimeout(): Promise<void> {
+    const heartbeatSeconds = await getHeartbeatIntervalSeconds();
+    this.idleTimeoutMs = idleTimeoutForHeartbeat(heartbeatSeconds);
+    this.pingMonitor.setHeartbeatIntervalSeconds(heartbeatSeconds);
   }
 
   private async resolveStationDbId(stationId: string, session: SessionState): Promise<void> {
@@ -402,100 +670,68 @@ export class OcppServer {
   }
 
   private async handleMessage(ws: WebSocket, session: SessionState, raw: string): Promise<void> {
-    let parsed: OcppMessage;
-    try {
-      parsed = JSON.parse(raw) as OcppMessage;
-    } catch {
-      this.logger.warn({ stationId: session.stationId }, 'Invalid JSON received');
+    // Every frame counts against the station's rate limit before it is logged.
+    const rate = consumeStationMessage(session.stationId);
+    const frame = parseInboundFrame(raw, session.ocppProtocol);
+
+    if (frame.kind === 'drop') {
+      this.frameStats.record(session.stationId, frame.reason);
       return;
     }
 
-    if (!Array.isArray(parsed) || parsed.length < 3) {
-      this.logger.warn({ stationId: session.stationId }, 'Invalid OCPP message format');
+    if (frame.kind === 'refuse') {
+      this.frameStats.record(session.stationId, frame.reason);
+      this.sendCallError(ws, session, {
+        messageId: frame.messageId,
+        action: null,
+        errorCode: frame.errorCode,
+        errorDescription: frame.description,
+        tracked: false,
+        log: rate.allowed,
+      });
       return;
     }
 
-    const messageType = parsed[0];
-
-    // Handle responses to our outgoing calls
-    if (messageType === MESSAGE_TYPE_CALLRESULT || messageType === MESSAGE_TYPE_CALLERROR) {
-      // Station is alive — it responded. Update liveness clock so
-      // PingMonitor.checkHeartbeats() doesn't disconnect stations that
-      // are actively responding to CSMS-initiated commands.
-      session.lastHeartbeat = new Date();
-      if (isCallResult(parsed)) {
-        // Log the inbound CALLRESULT so operators can see what the station
-        // returned for CSMS-initiated commands. Without this the OCPP log
-        // tab only carries the outbound CALL row (logged by
-        // command-listener.ts) and the response is invisible.
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'inbound',
-            messageType: MESSAGE_TYPE_CALLRESULT,
-            messageId: parsed[1],
-            action: null,
-            payload: parsed[2],
-          },
-        });
-        this.correlator.handleResponse(session, parsed);
-      } else if (isCallError(parsed)) {
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'inbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId: parsed[1],
-            action: null,
-            errorCode: parsed[2],
-            errorDescription: parsed[3],
-          },
-        });
-        this.correlator.handleResponse(session, parsed);
-      }
+    if (frame.kind === 'response') {
+      this.handleResponse(session, frame.message, rate.allowed);
       return;
     }
 
-    // Handle incoming calls
-    if (!isCall(parsed)) {
-      this.logger.warn({ stationId: session.stationId, messageType }, 'Unsupported message type');
+    const { messageId, action, payload } = frame;
+
+    if (!rate.allowed) {
+      // Answered but not logged, so a flooding station cannot fill the log.
+      this.frameStats.record(session.stationId, 'rate_limited');
+      this.sendCallError(ws, session, {
+        messageId,
+        action,
+        errorCode: OcppErrorCode.GenericError,
+        errorDescription: 'Rate limit exceeded',
+        tracked: false,
+        log: false,
+      });
       return;
     }
-
-    const [, messageId, action, payload] = parsed;
 
     this.lifecycle.received(messageId, session.stationId, action);
 
     // OCPP 2.1 G02.FR.04 and OCPP 1.6 section 4.6 both require the CSMS to
     // assume availability of a station whenever any message has been received
-    // from it — a station MAY skip the Heartbeat if another PDU was sent in
+    // from it: a station MAY skip the Heartbeat if another PDU was sent in
     // the interval. Reset the liveness clock on every inbound CALL so
     // PingMonitor.checkHeartbeats() doesn't close connections on stations
     // that are actively sending MeterValues, StatusNotifications, etc.
     session.lastHeartbeat = new Date();
 
     // Log inbound CALL from station
-    void this.eventBus.publish({
-      eventType: 'ocpp.MessageLog',
-      aggregateType: 'ChargingStation',
-      aggregateId: session.stationId,
-      payload: {
-        stationId: session.stationId,
-        stationDbId: session.stationDbId,
-        direction: 'inbound',
-        messageType: MESSAGE_TYPE_CALL,
-        messageId,
-        action,
-        payload,
-      },
+    publishMessageLog(this.eventBus, {
+      stationId: session.stationId,
+      stationDbId: session.stationDbId,
+      direction: 'inbound',
+      messageType: MESSAGE_TYPE_CALL,
+      messageId,
+      action,
+      payload,
     });
 
     const ctx: HandlerContext = {
@@ -515,86 +751,136 @@ export class OcppServer {
     try {
       this.lifecycle.processing(messageId);
       await this.pipeline.execute(ctx);
-
-      if (ctx.response != null) {
-        const result = createCallResult(messageId, ctx.response);
-        ws.send(JSON.stringify(result));
-        this.lifecycle.responded(messageId);
-
-        // Log outbound CALLRESULT to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLRESULT,
-            messageId,
-            action,
-            payload: ctx.response,
-          },
-        });
-      }
     } catch (err: unknown) {
       if (err instanceof OcppError) {
-        const error = createCallError(
+        this.sendCallError(ws, session, {
           messageId,
-          err.errorCode,
-          err.errorDescription,
-          err.errorDetails,
-        );
-        ws.send(JSON.stringify(error));
-        this.lifecycle.errored(messageId, err.errorCode);
-
-        // Log outbound CALLERROR to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId,
-            action,
-            errorCode: err.errorCode,
-            errorDescription: err.errorDescription,
-          },
+          action,
+          errorCode: err.errorCode,
+          errorDescription: err.errorDescription,
+          errorDetails: err.errorDetails,
+          tracked: true,
+          log: true,
         });
       } else {
         this.logger.error(
           { messageId, action, error: err instanceof Error ? err.message : String(err) },
           'Unhandled error in message processing',
         );
-        const error = createCallError(
+        this.sendCallError(ws, session, {
           messageId,
-          OcppErrorCode.InternalError,
-          'Internal server error',
-        );
-        ws.send(JSON.stringify(error));
-        this.lifecycle.errored(messageId, OcppErrorCode.InternalError);
-
-        // Log outbound CALLERROR to station
-        void this.eventBus.publish({
-          eventType: 'ocpp.MessageLog',
-          aggregateType: 'ChargingStation',
-          aggregateId: session.stationId,
-          payload: {
-            stationId: session.stationId,
-            stationDbId: session.stationDbId,
-            direction: 'outbound',
-            messageType: MESSAGE_TYPE_CALLERROR,
-            messageId,
-            action,
-            errorCode: OcppErrorCode.InternalError,
-            errorDescription: 'Internal server error',
-          },
+          action,
+          errorCode: OcppErrorCode.InternalError,
+          errorDescription: 'Internal server error',
+          tracked: true,
+          log: true,
         });
       }
+      return;
     }
+
+    if (ctx.response != null) {
+      const result = createCallResult(messageId, ctx.response);
+      ws.send(JSON.stringify(result));
+      this.lifecycle.responded(messageId);
+      this.announceReady(session, action);
+
+      // Log outbound CALLRESULT to station
+      publishMessageLog(this.eventBus, {
+        stationId: session.stationId,
+        stationDbId: session.stationDbId,
+        direction: 'outbound',
+        messageType: MESSAGE_TYPE_CALLRESULT,
+        messageId,
+        action,
+        payload: ctx.response,
+      });
+    }
+  }
+
+  // A CALLRESULT or CALLERROR answering one of this server's CALLs. Only a
+  // response to a pending CALL is logged. One for an unknown or timed-out
+  // message id is counted instead, so a station cannot fill the log with them.
+  private handleResponse(
+    session: SessionState,
+    message: CallResult | CallError,
+    withinRateLimit: boolean,
+  ): void {
+    // The station is alive: it responded. Update the liveness clock so
+    // PingMonitor.checkHeartbeats() doesn't disconnect stations that
+    // are actively responding to CSMS-initiated commands.
+    session.lastHeartbeat = new Date();
+    const messageId = message[1];
+    if (!session.pendingMessages.has(messageId)) {
+      this.frameStats.record(session.stationId, 'unknown_response');
+      return;
+    }
+    if (!withinRateLimit) {
+      // Still delivered to the waiting command, only not logged.
+      this.frameStats.record(session.stationId, 'rate_limited');
+    } else if (isCallResult(message)) {
+      // Log the inbound CALLRESULT so operators can see what the station
+      // returned for CSMS-initiated commands. Without this the OCPP log
+      // tab only carries the outbound CALL row (logged by
+      // command-listener.ts) and the response is invisible.
+      publishMessageLog(this.eventBus, {
+        stationId: session.stationId,
+        stationDbId: session.stationDbId,
+        direction: 'inbound',
+        messageType: MESSAGE_TYPE_CALLRESULT,
+        messageId,
+        action: null,
+        payload: message[2],
+      });
+    } else {
+      publishMessageLog(this.eventBus, {
+        stationId: session.stationId,
+        stationDbId: session.stationDbId,
+        direction: 'inbound',
+        messageType: MESSAGE_TYPE_CALLERROR,
+        messageId,
+        action: null,
+        errorCode: message[2],
+        errorDescription: message[3],
+      });
+    }
+    this.correlator.handleResponse(session, message);
+  }
+
+  // Sends a CALLERROR with the error code of the connection's OCPP version
+  // (OCPP-J 1.6 names some codes differently) and logs it when asked.
+  private sendCallError(
+    ws: WebSocket,
+    session: SessionState,
+    error: {
+      messageId: string;
+      action: string | null;
+      errorCode: string;
+      errorDescription: string;
+      errorDetails?: Record<string, unknown>;
+      /** The CALL went through MessageLifecycle.received. */
+      tracked: boolean;
+      log: boolean;
+    },
+  ): void {
+    const errorCode = errorCodeForProtocol(error.errorCode, session.ocppProtocol);
+    ws.send(
+      JSON.stringify(
+        createCallError(error.messageId, errorCode, error.errorDescription, error.errorDetails),
+      ),
+    );
+    if (error.tracked) this.lifecycle.errored(error.messageId, errorCode);
+    if (!error.log) return;
+    publishMessageLog(this.eventBus, {
+      stationId: session.stationId,
+      stationDbId: session.stationDbId,
+      direction: 'outbound',
+      messageType: MESSAGE_TYPE_CALLERROR,
+      messageId: error.messageId,
+      action: error.action,
+      errorCode,
+      errorDescription: error.errorDescription,
+    });
   }
 
   getEventBus(): EventBus {
@@ -634,17 +920,55 @@ export class OcppServer {
       clearInterval(ipMessageCleanupTimer);
       ipMessageCleanupTimer = null;
     }
-    await this.pingMonitor.stop();
-    if (this.wssSecure != null) {
-      const secure = this.wssSecure;
-      await new Promise<void>((resolve) => {
-        secure.close(() => {
-          resolve();
-        });
-      });
+    if (this.idleTimeoutRefreshTimer != null) {
+      clearInterval(this.idleTimeoutRefreshTimer);
+      this.idleTimeoutRefreshTimer = null;
     }
+    await this.pingMonitor.stop();
+    // Stop accepting TLS connections now, but await the close only after the
+    // station sockets are closed: ws emits 'close' for a server built on an
+    // external HTTPS server only once its last client is gone, so awaiting it
+    // first waited for as long as any TLS station stayed connected.
+    const secure = this.wssSecure;
+    const https = this.httpsServer;
+    const secureClosed =
+      secure == null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            secure.close(() => {
+              resolve();
+            });
+          });
+    const httpsClosed =
+      https == null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            https.close(() => {
+              resolve();
+            });
+          });
     if (this.shutdown != null) {
       await this.shutdown.shutdown();
+    }
+    // GracefulShutdown closed (or terminated) every station socket. A TLS
+    // socket never registered as a station, and plain HTTPS connections, would
+    // still hold the servers open.
+    if (secure != null) {
+      for (const client of secure.clients) {
+        client.terminate();
+      }
+    }
+    https?.closeAllConnections();
+    await Promise.all([secureClosed, httpsClosed]);
+    // Closing the sockets published station.Disconnected for each station.
+    // Wait for those projections (and anything still queued) before the
+    // caller ends the database client they write through.
+    const drained = await this.eventBus.drain(EVENT_DRAIN_TIMEOUT_MS);
+    if (!drained) {
+      this.logger.warn(
+        { timeoutMs: EVENT_DRAIN_TIMEOUT_MS },
+        'Event handlers still running at shutdown; closing anyway',
+      );
     }
   }
 }

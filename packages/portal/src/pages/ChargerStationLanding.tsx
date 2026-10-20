@@ -45,6 +45,7 @@ interface StationInfo {
   siteState: string | null;
   evses: EvseItem[];
   maintenance: { active: boolean; plannedEndAt: string | null; message: string | null } | null;
+  stationUnavailable: boolean;
 }
 
 export function ChargerStationLanding(): React.JSX.Element {
@@ -52,6 +53,8 @@ export function ChargerStationLanding(): React.JSX.Element {
   const { stationId } = useParams<{ stationId: string }>();
   const navigate = useNavigate();
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
+  // Signed-out visitors see times in the browser's time zone.
+  const timezone = useAuth((s) => s.driver?.timezone);
   const { companyName, companyLogo, branding } = useAuthBranding();
   useStationEvents(stationId);
 
@@ -115,7 +118,7 @@ export function ChargerStationLanding(): React.JSX.Element {
           {station.siteAddress != null && station.siteId != null ? (
             <Link
               to={`/location/${station.siteId}?from=${encodeURIComponent(`/charge/${stationId ?? ''}`)}`}
-              className="flex items-start gap-2 text-sm text-primary hover:underline transition-colors"
+              className="flex items-start gap-2 text-sm text-link hover:underline transition-colors"
             >
               <MapPin className="h-4 w-4 mt-0.5 text-muted-foreground" />
               <span>
@@ -135,13 +138,19 @@ export function ChargerStationLanding(): React.JSX.Element {
             </div>
           ) : null}
 
+          {station.stationUnavailable && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+              <p className="text-sm">{t('errors.STATION_UNAVAILABLE')}</p>
+            </div>
+          )}
+
           {station.maintenance?.active === true && (
             <div className="rounded-md border border-warning/40 bg-warning/10 p-3">
               <p className="font-semibold text-sm">{t('charger.maintenanceTitle')}</p>
               {station.maintenance.plannedEndAt != null && (
                 <p className="mt-1 text-xs">
                   {t('charger.maintenanceUntil', {
-                    time: new Date(station.maintenance.plannedEndAt).toLocaleString(),
+                    time: formatDate(station.maintenance.plannedEndAt, timezone),
                   })}
                 </p>
               )}
@@ -169,6 +178,7 @@ export function ChargerStationLanding(): React.JSX.Element {
                   const isReserved = evse.reservationExpiresAt != null;
                   const isAvailable =
                     !maintenanceBlocks &&
+                    !station.stationUnavailable &&
                     !isReserved &&
                     isStartable(connectorStatus) &&
                     station.isOnline;
@@ -219,7 +229,7 @@ export function ChargerStationLanding(): React.JSX.Element {
                           <p className="text-xs text-muted-foreground">
                             {evse.reservationExpiresAt != null
                               ? t('charger.reservedUntil', {
-                                  time: formatDate(evse.reservationExpiresAt),
+                                  time: formatDate(evse.reservationExpiresAt, timezone),
                                 })
                               : t('charger.reserved')}
                           </p>

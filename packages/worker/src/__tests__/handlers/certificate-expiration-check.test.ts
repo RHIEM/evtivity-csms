@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 
 // `client` is the postgres tagged-template fn. Each tagged-template call in the
@@ -9,18 +9,24 @@ import type { Logger } from 'pino';
 // queued in call order: settings SELECT, expired-station UPDATE, expired-CA
 // UPDATE, critical-certs SELECT, warning-certs SELECT.
 const mockClient = vi.fn();
+const mockWriteAudit = vi.fn().mockResolvedValue(undefined);
 vi.mock('@evtivity/database', () => ({
   client: (...args: unknown[]) => mockClient(...args),
+  certificateAuditLog: 'certificate_audit_log',
+  writeAudit: (...args: unknown[]) => mockWriteAudit(...args) as unknown,
 }));
 
 const mockPublish = vi.fn().mockResolvedValue(undefined);
-vi.mock('@evtivity/api/src/lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: () => ({ publish: mockPublish }),
 }));
 
-vi.mock('node:crypto', () => ({
-  randomUUID: () => 'fixed-uuid',
-}));
+// publishOcppCommand (@evtivity/lib) draws the command id from node:crypto.
+vi.mock('node:crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:crypto')>();
+  const randomUUID = () => 'fixed-uuid' as const;
+  return { ...actual, randomUUID, default: { ...actual, randomUUID } };
+});
 
 const log = {
   info: vi.fn(),
@@ -41,6 +47,14 @@ function settingsRows(
   return rows;
 }
 
+// The module is imported after the mocks above are initialized. The first import loads the
+// whole module graph, which under coverage on a busy machine took longer than one test's
+// 5 s timeout, so it happens once here with its own timeout instead of inside the first test.
+let mod: typeof import('../../handlers/certificate-expiration-check.js');
+beforeAll(async () => {
+  mod = await import('../../handlers/certificate-expiration-check.js');
+}, 30_000);
+
 describe('certificateExpirationCheckHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -49,28 +63,52 @@ describe('certificateExpirationCheckHandler', () => {
     mockPublish.mockResolvedValue(undefined);
   });
 
-  it('returns early without touching the DB when PnC is disabled', async () => {
-    mockClient.mockResolvedValueOnce(settingsRows(false));
+  it('checks station TLS certificates only when PnC is disabled', async () => {
+    mockClient
+      .mockResolvedValueOnce(settingsRows(false))
+      .mockResolvedValueOnce([{ id: 'sc_1', certificate_type: 'ChargingStationCertificate' }])
+      .mockResolvedValueOnce([
+        {
+          id: 'sc_2',
+          station_id: 'sta_2',
+          certificate_type: 'ChargingStationCertificate',
+          valid_to: new Date('2026-06-10T00:00:00Z'),
+          station_ocpp_id: 'CS-2',
+          ocpp_protocol: 'ocpp2.1',
+        },
+      ])
+      .mockResolvedValueOnce([]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
-    // Only the settings SELECT ran. No expiry UPDATE/SELECT, no publishes.
-    expect(mockClient).toHaveBeenCalledTimes(1);
-    expect(mockPublish).not.toHaveBeenCalled();
+    // Settings, expired station certificates, critical, warning: no CA UPDATE.
+    expect(mockClient).toHaveBeenCalledTimes(4);
+    const texts = mockClient.mock.calls.map((c) => (c[0] as string[]).join('?'));
+    expect(texts.some((t) => t.includes('UPDATE pki_ca_certificates'))).toBe(false);
+    // Each station query limits itself to the TLS certificate while PnC is off.
+    for (const i of [1, 2, 3]) {
+      expect(texts[i]).toContain('? OR');
+      expect(texts[i]).toMatch(/certificate_type = 'ChargingStationCertificate'/);
+      expect(mockClient.mock.calls[i]).toContain(false);
+    }
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(mockPublish.mock.calls[0]?.[1] as string)).toMatchObject({
+      stationId: 'CS-2',
+      action: 'TriggerMessage',
+      payload: { requestedMessage: 'SignChargingStationCertificate' },
+    });
   });
 
-  it('returns early when pnc.enabled is missing entirely', async () => {
-    // No pnc.enabled row at all -> Map.get returns undefined !== true.
-    mockClient.mockResolvedValueOnce([]);
+  it('treats a missing pnc.enabled as disabled', async () => {
+    mockClient.mockResolvedValue([]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
-    expect(mockClient).toHaveBeenCalledTimes(1);
-    expect(mockPublish).not.toHaveBeenCalled();
+    expect(mockClient).toHaveBeenCalledTimes(4);
+    expect(mockClient.mock.calls[1]).toContain(false);
+    mockClient.mockReset();
   });
 
   it('marks expired station and CA certs and logs counts', async () => {
@@ -81,14 +119,65 @@ describe('certificateExpirationCheckHandler', () => {
       .mockResolvedValueOnce([]) // critical certs
       .mockResolvedValueOnce([]); // warning certs
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
     expect(mockClient).toHaveBeenCalledTimes(5);
     expect(log.info).toHaveBeenCalledWith({ count: 2 }, 'Marked expired station certificates');
     expect(log.info).toHaveBeenCalledWith({ count: 1 }, 'Marked expired CA certificates');
     expect(mockPublish).not.toHaveBeenCalled();
+    expect(mockWriteAudit).toHaveBeenCalledTimes(3);
+  });
+
+  it('audits each certificate it marked expired as a system row, without the body', async () => {
+    const validTo = new Date('2026-10-01T00:00:00.000Z');
+    mockClient
+      .mockResolvedValueOnce(settingsRows(true))
+      .mockResolvedValueOnce([
+        {
+          id: 11,
+          station_id: 'sta_1',
+          certificate_type: 'V2GCertificate',
+          serial_number: 'AB01',
+          valid_to: validTo,
+        },
+      ])
+      .mockResolvedValueOnce([
+        { id: 3, certificate_type: 'CSMSRootCertificate', serial_number: null, valid_to: validTo },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await mod.certificateExpirationCheckHandler(log);
+
+    expect(mockWriteAudit).toHaveBeenNthCalledWith(
+      1,
+      { table: 'certificate_audit_log', idColumn: 'certificate_id' },
+      {
+        entityId: '11',
+        entityIdSnapshot: '11',
+        action: 'expired',
+        actor: 'system',
+        actorLabel: 'certificate-expiration-check',
+        before: { status: 'active' },
+        after: {
+          status: 'expired',
+          table: 'station_certificates',
+          certificateType: 'V2GCertificate',
+          serialNumber: 'AB01',
+          validTo: '2026-10-01T00:00:00.000Z',
+          stationId: 'sta_1',
+        },
+      },
+      undefined,
+      log,
+    );
+    expect(mockWriteAudit.mock.calls[1]?.[1]).toMatchObject({
+      entityId: '3',
+      action: 'expired',
+      after: { table: 'pki_ca_certificates', certificateType: 'CSMSRootCertificate' },
+    });
+    expect(mockWriteAudit.mock.calls[1]?.[1]).not.toHaveProperty('after.stationId');
   });
 
   it('does not log expiry counts when no certs are expired', async () => {
@@ -99,8 +188,7 @@ describe('certificateExpirationCheckHandler', () => {
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
     expect(log.info).not.toHaveBeenCalledWith(
@@ -110,7 +198,7 @@ describe('certificateExpirationCheckHandler', () => {
     expect(log.info).not.toHaveBeenCalledWith(expect.anything(), 'Marked expired CA certificates');
   });
 
-  it('publishes a TriggerMessage auto-renewal command per critical cert', async () => {
+  it('triggers the renewal message of each certificate type and protocol', async () => {
     mockClient
       .mockResolvedValueOnce(settingsRows(true))
       .mockResolvedValueOnce([])
@@ -122,42 +210,105 @@ describe('certificateExpirationCheckHandler', () => {
           certificate_type: 'V2GCertificate',
           valid_to: new Date('2026-06-10T00:00:00Z'),
           station_ocpp_id: 'CS-A',
+          ocpp_protocol: 'ocpp2.1',
         },
         {
           id: 'sc_b',
           station_id: 'sta_b',
-          certificate_type: 'V2GCertificate',
+          certificate_type: 'ChargingStationCertificate',
           valid_to: new Date('2026-06-11T00:00:00Z'),
           station_ocpp_id: 'CS-B',
+          ocpp_protocol: 'ocpp2.1',
+        },
+        {
+          id: 'sc_c',
+          station_id: 'sta_c',
+          certificate_type: 'V2G20Certificate',
+          valid_to: new Date('2026-06-11T00:00:00Z'),
+          station_ocpp_id: 'CS-C',
+          ocpp_protocol: 'ocpp2.1',
+        },
+        {
+          id: 'sc_d',
+          station_id: 'sta_d',
+          certificate_type: 'ChargingStationCertificate',
+          valid_to: new Date('2026-06-12T00:00:00Z'),
+          station_ocpp_id: 'CS-D',
+          ocpp_protocol: 'ocpp1.6',
+        },
+        {
+          id: 'sc_e',
+          station_id: 'sta_e',
+          certificate_type: 'V2GCertificate',
+          valid_to: new Date('2026-06-12T00:00:00Z'),
+          station_ocpp_id: 'CS-E',
+          ocpp_protocol: 'ocpp1.6',
         },
       ])
       .mockResolvedValueOnce([]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
-    expect(mockPublish).toHaveBeenCalledTimes(2);
-    expect(mockPublish).toHaveBeenNthCalledWith(
-      1,
-      'ocpp_commands',
-      JSON.stringify({
+    const sent = mockPublish.mock.calls.map((c) => JSON.parse(c[1] as string) as unknown);
+    expect(sent).toEqual([
+      {
         commandId: 'fixed-uuid',
         stationId: 'CS-A',
         action: 'TriggerMessage',
-        payload: { requestedMessage: 'SignChargingStationCertificate' },
-      }),
-    );
-    expect(mockPublish).toHaveBeenNthCalledWith(
-      2,
-      'ocpp_commands',
-      JSON.stringify({
+        payload: { requestedMessage: 'SignV2GCertificate' },
+      },
+      {
         commandId: 'fixed-uuid',
         stationId: 'CS-B',
         action: 'TriggerMessage',
         payload: { requestedMessage: 'SignChargingStationCertificate' },
-      }),
+      },
+      {
+        commandId: 'fixed-uuid',
+        stationId: 'CS-C',
+        action: 'TriggerMessage',
+        payload: { requestedMessage: 'SignV2G20Certificate' },
+      },
+      {
+        commandId: 'fixed-uuid',
+        stationId: 'CS-D',
+        action: 'ExtendedTriggerMessage',
+        payload: { requestedMessage: 'SignChargePointCertificate' },
+      },
+      {
+        commandId: 'fixed-uuid',
+        stationId: 'CS-E',
+        action: 'TriggerMessage',
+        payload: { requestedMessage: 'SignV2GCertificate' },
+      },
+    ]);
+  });
+
+  it('renews only station-keyed certificates not already replaced or awaiting a CSR', async () => {
+    mockClient
+      .mockResolvedValueOnce(settingsRows(true))
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    const { certificateExpirationCheckHandler } = mod;
+    await certificateExpirationCheckHandler(log);
+
+    const text = (mockClient.mock.calls[3]?.[0] as string[]).join('?');
+    // Root certificates the CSMS installed are never "renewed" by a CSR.
+    expect(text).toContain(
+      "sc.certificate_type IN ('ChargingStationCertificate', 'V2GCertificate', 'V2G20Certificate')",
     );
+    expect(text).toContain(
+      "sc.certificate_type IN ('ChargingStationCertificate', 'V2GCertificate'))",
+    );
+    // A newer certificate of the type replaced it.
+    expect(text).toContain('n.valid_to > ?');
+    // A renewal CSR is still open.
+    expect(text).toContain("r.status IN ('pending', 'submitted')");
+    expect(text).toContain('DISTINCT ON (sc.station_id, sc.certificate_type)');
   });
 
   it('publishes a certificate.expiring SSE event per warning cert and logs the count', async () => {
@@ -171,8 +322,7 @@ describe('certificateExpirationCheckHandler', () => {
         { station_id: 'sta_2', station_ocpp_id: 'CS-2', site_id: null },
       ]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
     expect(mockPublish).toHaveBeenCalledTimes(2);
@@ -207,8 +357,7 @@ describe('certificateExpirationCheckHandler', () => {
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
 
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
 
     expect(log.info).not.toHaveBeenCalledWith(
@@ -226,8 +375,7 @@ describe('certificateExpirationCheckHandler', () => {
       .mockResolvedValueOnce([]);
 
     const before = Date.now();
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
     const after = Date.now();
 
@@ -259,8 +407,7 @@ describe('certificateExpirationCheckHandler', () => {
       .mockResolvedValueOnce([]);
 
     const before = Date.now();
-    const { certificateExpirationCheckHandler } =
-      await import('../../handlers/certificate-expiration-check.js');
+    const { certificateExpirationCheckHandler } = mod;
     await certificateExpirationCheckHandler(log);
     const after = Date.now();
 

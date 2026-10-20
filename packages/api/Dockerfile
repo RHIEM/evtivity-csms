@@ -1,12 +1,20 @@
 FROM node:24-slim AS deps
+# A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
+COPY packages/payments/package.json packages/payments/
+COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
+COPY packages/v2g-exi/package.json packages/v2g-exi/
 COPY packages/ocpi/package.json packages/ocpi/
 COPY packages/csms/package.json packages/csms/
 COPY packages/portal/package.json packages/portal/
@@ -20,22 +28,44 @@ FROM deps AS build
 
 COPY tsconfig.base.json tsconfig.json ./
 COPY scripts/build.mjs scripts/build.mjs
+# The bundle embeds the OCPP request schemas (embedOcppSchemasPlugin).
+COPY schemas/ schemas/
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
+COPY packages/payments/ packages/payments/
+COPY packages/services/ packages/services/
+COPY packages/ai/ packages/ai/
 COPY packages/api/ packages/api/
 COPY packages/ocpp/ packages/ocpp/
+COPY packages/v2g-exi/ packages/v2g-exi/
 
 RUN node scripts/build.mjs api
 
 FROM node:24-slim
+# A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
+
+# Noto Sans CJK (Regular and Bold collections) for Korean and Chinese invoice
+# and report PDFs (packages/services/src/pdf-fonts.ts). The dpkg exclude
+# skips the package's serif collections, which the PDFs do not use.
+RUN echo 'path-exclude=/usr/share/fonts/opentype/noto/NotoSerifCJK-*' > /etc/dpkg/dpkg.cfg.d/exclude-noto-serif-cjk \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
+COPY packages/payments/package.json packages/payments/
+COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
+COPY packages/v2g-exi/package.json packages/v2g-exi/
 COPY packages/ocpi/package.json packages/ocpi/
 COPY packages/csms/package.json packages/csms/
 COPY packages/portal/package.json packages/portal/
@@ -45,15 +75,14 @@ COPY packages/ocpi-simulator/package.json packages/ocpi-simulator/
 
 RUN npm ci --omit=dev --ignore-scripts && npm rebuild argon2
 
-COPY schemas/ schemas/
-COPY docs-index.json* ./
+COPY docs-index.json* docs-passages.json* ./
 COPY --from=build /app/dist/api.mjs dist/api.mjs
 COPY --from=build /app/dist/api.mjs.map dist/api.mjs.map
 COPY packages/api/src/templates/ templates/api/
 COPY packages/ocpp/src/templates/ templates/ocpp/
 
 LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
-LABEL org.opencontainers.image.license="LicenseRef-EVtivity-EULA"
+LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/evtivity-entrypoint

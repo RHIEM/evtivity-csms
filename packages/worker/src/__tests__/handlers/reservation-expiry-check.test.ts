@@ -4,445 +4,194 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 
-const mockClient = vi.fn();
-vi.mock('@evtivity/database', () => ({
-  client: (...args: unknown[]) => mockClient(...args),
-  pricingGroups: {},
-  pricingGroupStations: {},
-  pricingGroupSites: {},
-  pricingGroupDrivers: {},
-  pricingGroupFleets: {},
-  tariffs: {},
-  pricingHolidays: {},
-  fleetMembers: {},
-  driverPaymentMethods: {},
-  writeReservationAudit: vi.fn().mockResolvedValue(undefined),
-  reservationDiffChanged: vi.fn().mockReturnValue(false),
+// Raw client mock: each tagged-template call records its SQL text and
+// resolves with the next queued result.
+const { queries, results, mockClient } = vi.hoisted(() => {
+  const queries: string[] = [];
+  const results: unknown[][] = [];
+  const mockClient = vi.fn((strings: TemplateStringsArray, ..._values: unknown[]) => {
+    queries.push(strings.join('?'));
+    return Promise.resolve(results.shift() ?? []);
+  });
+  return { queries, results, mockClient };
+});
+
+vi.mock('@evtivity/database', () => ({ client: mockClient }));
+
+const { mockPubSub } = vi.hoisted(() => ({
+  mockPubSub: { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn() },
+}));
+vi.mock('@evtivity/lib/pubsub-instance', () => ({ getPubSub: () => mockPubSub }));
+
+const { paymentCtx } = vi.hoisted(() => ({ paymentCtx: { registry: {}, logger: {} } }));
+vi.mock('../../lib/payments.js', () => ({ paymentContext: vi.fn(() => paymentCtx) }));
+
+const calls: string[] = [];
+const mockExpire = vi.fn(async (..._args: unknown[]) => {
+  calls.push('expire');
+  return [] as unknown[];
+});
+const mockSettle = vi.fn(async (..._args: unknown[]) => {
+  calls.push('settle');
+  return 0;
+});
+vi.mock('@evtivity/services/reservation-expiry', () => ({
+  expireDueReservations: (...args: unknown[]) => mockExpire(...args),
+  settleDueNoShowFees: (...args: unknown[]) => mockSettle(...args),
+}));
+const mockNotify = vi.fn().mockResolvedValue(undefined);
+vi.mock('@evtivity/services/reservation-notify', () => ({
+  notifyReservationDriver: (...args: unknown[]) => mockNotify(...args),
+}));
+const mockEnqueue = vi.fn(async (..._args: unknown[]) => {
+  calls.push('activate');
+});
+vi.mock('../../reservation-worker.js', () => ({
+  enqueueOverdueReservationActivation: (...args: unknown[]) => mockEnqueue(...args),
 }));
 
-const mockPublish = vi.fn().mockResolvedValue(undefined);
-vi.mock('@evtivity/api/src/lib/pubsub.js', () => ({
-  getPubSub: () => ({ publish: mockPublish }),
-}));
+import {
+  OVERDUE_ACTIVATION_LIMIT,
+  reservationExpiryCheckHandler,
+} from '../../handlers/reservation-expiry-check.js';
 
-const mockResolveTariff = vi.fn();
-vi.mock('@evtivity/api/src/services/tariff.service.js', () => ({
-  resolveTariff: (...args: unknown[]) => mockResolveTariff(...args),
-}));
+function makeLog(): Logger {
+  return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+}
 
-const mockChargeNoShow = vi.fn().mockResolvedValue(undefined);
-vi.mock('@evtivity/api/src/lib/reservation-fees.js', () => ({
-  chargeReservationNoShowFee: (...args: unknown[]) => mockChargeNoShow(...args),
-}));
+// The handler's raw queries in order: overdue scheduled rows, then expiring rows.
+function queue(overdue: unknown[], expiring: unknown[]): void {
+  results.push(overdue, expiring);
+}
 
-const mockDispatchDriver = vi.fn();
-vi.mock('@evtivity/lib', () => ({
-  dispatchDriverNotification: (...args: unknown[]) => mockDispatchDriver(...args),
-}));
+beforeEach(() => {
+  queries.length = 0;
+  results.length = 0;
+  calls.length = 0;
+  mockClient.mockClear();
+  mockExpire.mockClear();
+  mockSettle.mockClear();
+  mockNotify.mockClear();
+  mockEnqueue.mockClear();
+});
 
 describe('reservationExpiryCheckHandler', () => {
-  const log = {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  } as unknown as Logger;
+  it('expires through the shared expiry with the worker pub/sub, payment context and logger', async () => {
+    queue([], []);
+    const log = makeLog();
+    await reservationExpiryCheckHandler(log);
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockClient.mockReset();
-    mockResolveTariff.mockReset();
-    mockChargeNoShow.mockReset();
-    mockChargeNoShow.mockResolvedValue(undefined);
+    expect(mockExpire).toHaveBeenCalledWith({
+      pubsub: mockPubSub,
+      payments: paymentCtx,
+      logger: log,
+    });
   });
 
-  it('charges no-show fee for active reservation that expired without a session', async () => {
-    // 1st client call: expired CTE -- one row, no linked session, has driver
-    // 2nd client call: expiringSoon SELECT -- empty
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_1',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 42,
-          station_ocpp_id: 'CS-001',
-          station_uuid: 'sta_1',
-          site_id: 'site_1',
-          starts_at: '2026-01-01T10:00:00Z',
-          expires_at: '2026-01-01T11:00:00Z',
-          created_at: '2026-01-01T10:00:00Z',
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({
-      id: 't_1',
-      reservationFeePerMinute: '0.05',
-      pricePerKwh: null,
-      pricePerMinute: null,
-      pricePerSession: null,
-      idleFeePricePerMinute: null,
-      taxRate: null,
+  it('logs how many reservations expired', async () => {
+    queue([], []);
+    mockExpire.mockResolvedValueOnce([{ id: 'r1' }, { id: 'r2' }]);
+    const log = makeLog();
+    await reservationExpiryCheckHandler(log);
+    expect(log.info).toHaveBeenCalledWith({ count: 2 }, 'Expired reservations');
+  });
+
+  it('TC-RES-14: settles the due no-show fees each run, after the expiry', async () => {
+    queue([], []);
+    const log = makeLog();
+    await reservationExpiryCheckHandler(log);
+
+    expect(mockSettle).toHaveBeenCalledTimes(1);
+    expect(mockSettle).toHaveBeenCalledWith({
+      pubsub: mockPubSub,
+      payments: paymentCtx,
+      logger: log,
+    });
+    expect(calls.indexOf('expire')).toBeLessThan(calls.indexOf('settle'));
+  });
+
+  describe('overdue activation (G6)', () => {
+    it('TC-RES-08: adds the activation job of each scheduled row whose start passed', async () => {
+      queue([{ id: 'rsv_a' }, { id: 'rsv_b' }], []);
+      await reservationExpiryCheckHandler(makeLog());
+
+      expect(mockEnqueue).toHaveBeenCalledTimes(2);
+      expect(mockEnqueue).toHaveBeenNthCalledWith(1, 'rsv_a');
+      expect(mockEnqueue).toHaveBeenNthCalledWith(2, 'rsv_b');
+      const sql = queries[0]!;
+      expect(sql).toContain("status = 'scheduled'");
+      expect(sql).toContain('starts_at <= now()');
+      expect(sql).toContain('expires_at > now()');
+      expect(mockClient.mock.calls[0]).toContain(OVERDUE_ACTIVATION_LIMIT);
+      // Expired rows go first, so a lapsed row is expired, never activated.
+      expect(calls.indexOf('expire')).toBeLessThan(calls.indexOf('activate'));
     });
 
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    // 60 min * $0.05 = $3.00 = 300 cents.
-    expect(mockChargeNoShow).toHaveBeenCalledWith('drv_1', 'site_1', 300, 'rsv_1');
-    expect(mockPublish).toHaveBeenCalledWith(
-      'ocpp_commands',
-      expect.stringContaining('"action":"CancelReservation"'),
-    );
-    expect(mockDispatchDriver).toHaveBeenCalledWith(
-      expect.anything(),
-      'reservation.Expired',
-      'drv_1',
-      expect.objectContaining({ reservationId: 'rsv_1' }),
-      expect.anything(),
-      expect.anything(),
-    );
-  });
-
-  it('skips no-show fee when reservation had a linked session', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_2',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 43,
-          station_ocpp_id: 'CS-001',
-          station_uuid: 'sta_1',
-          site_id: 'site_1',
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          has_session: true,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({ reservationFeePerMinute: '0.10' });
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-  });
-
-  it('skips no-show fee when reservation has no driver', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_3',
-          driver_id: null,
-          prior_status: 'active',
-          reservation_ocpp_id: 44,
-          station_ocpp_id: 'CS-001',
-          station_uuid: 'sta_1',
-          site_id: 'site_1',
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-    expect(mockResolveTariff).not.toHaveBeenCalled();
-  });
-
-  it('skips no-show fee when tariff has zero holding rate', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_4',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 45,
-          station_ocpp_id: 'CS-001',
-          station_uuid: 'sta_1',
-          site_id: 'site_1',
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({ reservationFeePerMinute: '0' });
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-  });
-
-  it('publishes CancelReservation for every expired reservation', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_a',
-          driver_id: null,
-          prior_status: 'active',
-          reservation_ocpp_id: 1,
-          station_ocpp_id: 'CS-A',
-          station_uuid: 'sta_a',
-          site_id: null,
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          has_session: true,
-        },
-        {
-          id: 'rsv_b',
-          driver_id: 'drv_b',
-          prior_status: 'active',
-          reservation_ocpp_id: 2,
-          station_ocpp_id: 'CS-B',
-          station_uuid: 'sta_b',
-          site_id: null,
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          has_session: true,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    const cancelCalls = mockPublish.mock.calls.filter((c) =>
-      String(c[1]).includes('"action":"CancelReservation"'),
-    );
-    expect(cancelCalls).toHaveLength(2);
-  });
-
-  it('skips CancelReservation and no-show fee for scheduled reservations', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_sched',
-          driver_id: 'drv_1',
-          prior_status: 'scheduled',
-          reservation_ocpp_id: 50,
-          station_ocpp_id: 'CS-SCHED',
-          station_uuid: 'sta_sched',
-          site_id: 'site_sched',
-          starts_at: '2026-01-01T10:00:00Z',
-          expires_at: '2026-01-01T11:00:00Z',
-          created_at: '2026-01-01T09:00:00Z',
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    const cancelCalls = mockPublish.mock.calls.filter((c) =>
-      String(c[1]).includes('"action":"CancelReservation"'),
-    );
-    expect(cancelCalls).toHaveLength(0);
-    expect(mockResolveTariff).not.toHaveBeenCalled();
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-  });
-
-  it('skips no-show fee when tariff has a null holding rate', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_nullrate',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 51,
-          station_ocpp_id: 'CS-NULLRATE',
-          station_uuid: 'sta_nr',
-          site_id: 'site_nr',
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({ reservationFeePerMinute: null });
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockResolveTariff).toHaveBeenCalledWith('sta_nr', 'drv_1');
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-  });
-
-  it('uses created_at as the hold start for instant reservations with no starts_at', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_instant',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 52,
-          station_ocpp_id: 'CS-INSTANT',
-          station_uuid: 'sta_inst',
-          site_id: 'site_inst',
-          starts_at: null,
-          expires_at: '2026-01-01T10:30:00Z',
-          created_at: '2026-01-01T10:00:00Z',
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({
-      reservationFeePerMinute: '0.05',
+    it('TC-RES-08: adds nothing when no scheduled row is overdue (a second run after activation)', async () => {
+      queue([], []);
+      await reservationExpiryCheckHandler(makeLog());
+      expect(mockEnqueue).not.toHaveBeenCalled();
     });
 
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
+    it('TC-RES-08: keeps going when one job cannot be added (fail-open)', async () => {
+      queue([{ id: 'rsv_a' }, { id: 'rsv_b' }], []);
+      mockEnqueue.mockRejectedValueOnce(new Error('redis down'));
+      const log = makeLog();
+      await reservationExpiryCheckHandler(log);
 
-    // 30 min from created_at to expires_at * $0.05 = $1.50 = 150 cents.
-    expect(mockChargeNoShow).toHaveBeenCalledWith('drv_1', 'site_inst', 150, 'rsv_instant');
+      expect(mockEnqueue).toHaveBeenCalledTimes(2);
+      expect(log.warn).toHaveBeenCalledTimes(1);
+      expect(mockSettle).toHaveBeenCalledTimes(1);
+    });
   });
 
-  it('does not charge when computed hold duration rounds to zero minutes', async () => {
-    const sameInstant = '2026-01-01T10:00:00Z';
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_zero',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 53,
-          station_ocpp_id: 'CS-ZERO',
-          station_uuid: 'sta_zero',
-          site_id: 'site_zero',
-          starts_at: sameInstant,
-          expires_at: sameInstant,
-          created_at: sameInstant,
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({
-      reservationFeePerMinute: '0.05',
+  describe('Expiring warning', () => {
+    it('TC-RES-23: dedups the warning per reservation on metadata.reservationId, not per driver', async () => {
+      queue([], []);
+      await reservationExpiryCheckHandler(makeLog());
+
+      const sql = queries[1]!;
+      expect(sql).toContain("n.event_type = 'reservation.Expiring'");
+      expect(sql).toContain("n.metadata->>'reservationId' = r.id");
+      expect(sql).not.toContain("'driverId'");
+      expect(sql).toContain("r.status = 'active'");
+      expect(sql).toContain('r.driver_id IS NOT NULL');
     });
 
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
+    it('TC-RES-23: sends reservation.Expiring with the OCPP id, station and expiresAt', async () => {
+      queue(
+        [],
+        [
+          {
+            id: 'rsv_1',
+            driver_id: 'drv_1',
+            reservation_ocpp_id: 42,
+            station_ocpp_id: 'CS-001',
+            expires_at: '2026-10-11 12:00:00+00',
+          },
+        ],
+      );
+      await reservationExpiryCheckHandler(makeLog());
 
-    expect(mockChargeNoShow).not.toHaveBeenCalled();
-  });
-
-  it('skips expiring notification dispatch for upcoming reservations with no driver', async () => {
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    mockClient
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: 'rsv_nodriver', driver_id: null, expires_at: expiresAt }]);
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockDispatchDriver).not.toHaveBeenCalled();
-  });
-
-  it('logs a warning but continues when CancelReservation publish fails', async () => {
-    mockClient
-      .mockResolvedValueOnce([
+      expect(mockNotify).toHaveBeenCalledTimes(1);
+      expect(mockNotify).toHaveBeenCalledWith(
+        'reservation.Expiring',
         {
-          id: 'rsv_pubfail',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 99,
-          station_ocpp_id: 'CS-PUBFAIL',
-          station_uuid: 'sta_pf',
-          site_id: 'site_pf',
-          starts_at: null,
-          expires_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
-          has_session: true,
+          reservationDbId: 'rsv_1',
+          reservationOcppId: 42,
+          stationOcppId: 'CS-001',
+          driverId: 'drv_1',
+          expiresAt: '2026-10-11 12:00:00+00',
         },
-      ])
-      .mockResolvedValueOnce([]);
-    mockPublish.mockRejectedValueOnce(new Error('redis down'));
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(log.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reservationId: 'rsv_pubfail',
-        stationOcppId: 'CS-PUBFAIL',
-      }),
-      'Failed to publish CancelReservation for expired reservation',
-    );
-  });
-
-  it('logs a warning but continues when no-show fee charging throws', async () => {
-    mockClient
-      .mockResolvedValueOnce([
-        {
-          id: 'rsv_feefail',
-          driver_id: 'drv_1',
-          prior_status: 'active',
-          reservation_ocpp_id: 100,
-          station_ocpp_id: 'CS-FEEFAIL',
-          station_uuid: 'sta_ff',
-          site_id: 'site_ff',
-          starts_at: '2026-01-01T10:00:00Z',
-          expires_at: '2026-01-01T11:00:00Z',
-          created_at: '2026-01-01T10:00:00Z',
-          has_session: false,
-        },
-      ])
-      .mockResolvedValueOnce([]);
-    mockResolveTariff.mockResolvedValue({
-      reservationFeePerMinute: '0.05',
+        {},
+        expect.objectContaining({ pubsub: mockPubSub }),
+      );
     });
-    mockChargeNoShow.mockRejectedValueOnce(new Error('stripe error'));
 
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockChargeNoShow).toHaveBeenCalledWith('drv_1', 'site_ff', 300, 'rsv_feefail');
-    expect(log.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reservationId: 'rsv_feefail',
-        driverId: 'drv_1',
-      }),
-      'Failed to charge no-show reservation fee',
-    );
-  });
-
-  it('dispatches reservation.Expiring notification for upcoming reservations', async () => {
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    mockClient
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: 'rsv_soon', driver_id: 'drv_x', expires_at: expiresAt }]);
-
-    const { reservationExpiryCheckHandler } =
-      await import('../../handlers/reservation-expiry-check.js');
-    await reservationExpiryCheckHandler(log);
-
-    expect(mockDispatchDriver).toHaveBeenCalledWith(
-      expect.anything(),
-      'reservation.Expiring',
-      'drv_x',
-      expect.objectContaining({ reservationId: 'rsv_soon' }),
-      expect.anything(),
-      expect.anything(),
-    );
+    it('sends no warning when nothing is expiring', async () => {
+      queue([], []);
+      await reservationExpiryCheckHandler(makeLog());
+      expect(mockNotify).not.toHaveBeenCalled();
+    });
   });
 });

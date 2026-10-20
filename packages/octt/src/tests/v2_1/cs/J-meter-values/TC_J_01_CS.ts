@@ -7,6 +7,7 @@ import {
   startAndWaitForCharging,
   drainMessages,
 } from '../../../../cs-test-helpers.js';
+import { signedTxEndedMeterValues } from './signed-shared.js';
 
 function setupHandler(ctx: {
   server: {
@@ -135,28 +136,25 @@ export const TC_J_02_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const trigger = (msg as Record<string, unknown>).triggerReason;
-        if (trigger === 'MeterValueClock') {
-          const txMeterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const txSampledValue = txMeterValue?.[0]?.sampledValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const txContext = txSampledValue?.[0]?.context;
-          steps.push({
-            step: 1,
-            description: 'TransactionEventRequest with MeterValueClock and Sample.Clock context',
-            status: txContext === 'Sample.Clock' ? 'passed' : 'failed',
-            expected: 'triggerReason MeterValueClock, context Sample.Clock',
-            actual: `trigger: ${String(trigger)}, context: ${String(txContext)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const trigger = (msg as Record<string, unknown>).triggerReason;
+      if (trigger === 'MeterValueClock') {
+        const txMeterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const txSampledValue = txMeterValue?.[0]?.sampledValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const txContext = txSampledValue?.[0]?.context;
+        steps.push({
+          step: 1,
+          description: 'TransactionEventRequest with MeterValueClock and Sample.Clock context',
+          status: txContext === 'Sample.Clock' ? 'passed' : 'failed',
+          expected: 'triggerReason MeterValueClock, context Sample.Clock',
+          actual: `trigger: ${String(trigger)}, context: ${String(txContext)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -209,24 +207,21 @@ export const TC_J_03_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const eventType = (msg as Record<string, unknown>).eventType;
-        if (eventType === 'Ended') {
-          const meterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          steps.push({
-            step: 1,
-            description: 'TransactionEventRequest Ended with meterValue',
-            status: meterValue != null && meterValue.length > 0 ? 'passed' : 'failed',
-            expected: 'eventType Ended with meterValue field',
-            actual: `eventType: ${String(eventType)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const eventType = (msg as Record<string, unknown>).eventType;
+      if (eventType === 'Ended') {
+        const meterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        steps.push({
+          step: 1,
+          description: 'TransactionEventRequest Ended with meterValue',
+          status: meterValue != null && meterValue.length > 0 ? 'passed' : 'failed',
+          expected: 'eventType Ended with meterValue field',
+          actual: `eventType: ${String(eventType)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -249,8 +244,6 @@ export const TC_J_03_CS: CsTestCase = {
 /**
  * TC_J_04_CS: Clock-aligned Meter Values - Signed
  * Use case: J01 (J01.FR.21)
- *
- * Skipped: CSS does not support signed meter values (no metering PKI).
  */
 export const TC_J_04_CS: CsTestCase = {
   id: 'TC_J_04_CS',
@@ -261,17 +254,7 @@ export const TC_J_04_CS: CsTestCase = {
   description: 'The Charging Station provides signed clock-aligned meter values.',
   purpose:
     'To verify if the Charging Station is able to send signed clock-aligned Meter Values when a transaction ends.',
-  execute: async () => {
-    const steps: StepResult[] = [];
-    steps.push({
-      step: 1,
-      description: 'Signed meter values not supported by CSS (no metering PKI)',
-      status: 'skipped',
-      expected: 'signedMeterValue present',
-      actual: 'Test skipped: CSS does not support signed meter values',
-    });
-    return { status: 'skipped', durationMs: 0, steps };
-  },
+  execute: async (ctx) => signedTxEndedMeterValues(ctx, 'aligned'),
 };
 
 /**

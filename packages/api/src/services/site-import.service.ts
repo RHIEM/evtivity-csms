@@ -1,8 +1,16 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import type { FastifyBaseLogger } from 'fastify';
 import { eq, or, ilike, and, asc, inArray, sql } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import {
+  db,
+  client,
+  recomputeStationAvailability,
+  setStationDisabled,
+  isOperatorStation,
+  siteInsightsSuppressedSql,
+} from '@evtivity/database';
 import { siteNameEq } from '../lib/site-lookup.js';
 import {
   sites,
@@ -12,8 +20,18 @@ import {
   vendors,
   writeAudit,
   siteAuditLog,
+  stationAuditLog,
+  siteLoadManagement,
 } from '@evtivity/database';
 import { csvEscape } from '@evtivity/lib';
+import { sendAvailabilityCommand } from '@evtivity/services/availability-command';
+import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
+import { publishStationStatusChanged } from '../lib/station-status-events.js';
+import { publishOcpiStationSiteMove } from '../lib/ocpi-location-push.js';
+import { siteInScope } from '../lib/site-scope.js';
+import { circuitIdAfterSiteChange } from '../lib/station-circuit.js';
+import { createStationConfigTemplate } from '../lib/station-config-template.js';
+import { applyStationSiteMove } from '@evtivity/services/maintenance.service';
 
 interface ImportActor {
   actor: 'operator' | 'driver' | 'api_key' | 'system' | 'ocpp';
@@ -65,13 +83,42 @@ export interface ImportResult {
   errors: string[];
 }
 
-export async function exportSitesCsv(search?: string, siteIds?: string[]): Promise<string> {
+/** The site list filters the export applies, as `GET /v1/sites` does. */
+export interface SiteExportFilters {
+  city?: string | undefined;
+  state?: string | undefined;
+  loadManagement?: 'true' | 'false' | undefined;
+  aiInsights?: 'in_scope' | 'suppressed' | undefined;
+}
+
+export async function exportSitesCsv(
+  search?: string,
+  siteIds?: string[],
+  filters: SiteExportFilters = {},
+): Promise<string> {
   const conditions = [];
   if (search) {
     const pattern = `%${search}%`;
     conditions.push(
-      or(ilike(sites.name, pattern), ilike(sites.city, pattern), ilike(sites.state, pattern)),
+      or(
+        ilike(sites.id, pattern),
+        ilike(sites.name, pattern),
+        ilike(sites.city, pattern),
+        ilike(sites.state, pattern),
+      ),
     );
+  }
+  if (filters.city) conditions.push(ilike(sites.city, filters.city));
+  if (filters.state) conditions.push(ilike(sites.state, filters.state));
+  if (filters.loadManagement != null) {
+    const enabled = sql`coalesce((SELECT ${siteLoadManagement.isEnabled} FROM ${siteLoadManagement} WHERE ${siteLoadManagement.siteId} = ${sites.id}), false)`;
+    conditions.push(
+      filters.loadManagement === 'true' ? sql`${enabled} = true` : sql`${enabled} = false`,
+    );
+  }
+  if (filters.aiInsights != null) {
+    const suppressed = sql`${sql.raw(siteInsightsSuppressedSql('sites'))}`;
+    conditions.push(filters.aiInsights === 'suppressed' ? suppressed : sql`NOT ${suppressed}`);
   }
   if (siteIds != null) {
     if (siteIds.length === 0) return CSV_HEADER;
@@ -85,7 +132,14 @@ export async function exportSitesCsv(search?: string, siteIds?: string[]): Promi
       stationId: chargingStations.stationId,
       stationModel: chargingStations.model,
       stationSerialNumber: chargingStations.serialNumber,
-      stationStatus: chargingStations.availability,
+      // The operator's choice, not the computed availability: a firmware,
+      // station-reported, or connector state must not come back as an
+      // operator disable when the file is imported again.
+      stationStatus: sql<string | null>`CASE
+        WHEN ${chargingStations.id} IS NULL THEN NULL
+        WHEN ${chargingStations.disabledReason} = 'operator' THEN 'unavailable'
+        ELSE 'available'
+      END`,
       onboardingStatus: chargingStations.onboardingStatus,
       evseId: evses.evseId,
       connectorId: connectors.connectorId,
@@ -95,7 +149,8 @@ export async function exportSitesCsv(search?: string, siteIds?: string[]): Promi
       vendorName: vendors.name,
     })
     .from(sites)
-    .leftJoin(chargingStations, eq(chargingStations.siteId, sites.id))
+    // Conformance test stations are never exported.
+    .leftJoin(chargingStations, and(eq(chargingStations.siteId, sites.id), isOperatorStation()))
     .leftJoin(vendors, eq(vendors.id, chargingStations.vendorId))
     .leftJoin(evses, eq(evses.stationId, chargingStations.id))
     .leftJoin(connectors, eq(connectors.evseId, evses.id))
@@ -138,6 +193,7 @@ export async function importSitesCsv(
   // null means full site access (admin). An array restricts the import to
   // updating sites already in the list; new-site creation is rejected per-row.
   allowedSiteIds?: string[] | null,
+  logger?: FastifyBaseLogger,
 ): Promise<ImportResult> {
   const result: ImportResult = {
     sitesCreated: 0,
@@ -189,9 +245,13 @@ export async function importSitesCsv(
     siteGroups.set(key, group);
   }
 
+  const stationUuidByStationId = new Map<string, string>();
+  // stationStatus per written station: true disables it, false enables it.
+  const operatorDisableByUuid = new Map<string, boolean>();
+  // Existing stations the import moves to another site (OCPI location push).
+  const siteMoves: Array<{ stationUuid: string; fromSiteId: string | null; toSiteId: string }> = [];
   await db.transaction(async (tx) => {
     const siteIdByName = new Map<string, string>();
-    const stationUuidByStationId = new Map<string, string>();
     const evseUuidByKey = new Map<string, string>();
     const vendorIdByName = new Map<string, string>();
 
@@ -203,22 +263,14 @@ export async function importSitesCsv(
       // Restricted operators (allowedSiteIds is an array, not null) cannot
       // create new sites and cannot mutate sites they don't have access to.
       // Reject the whole site group up front so a single CSV upload can't be
-      // used to escalate beyond the user's site assignments.
-      if (allowedSiteIds != null) {
-        if (existing == null) {
-          for (const entry of siteRows) {
-            result.errors.push(
-              `Row ${String(entry.index + 1)}: insufficient site access to create new site "${siteName}"`,
-            );
-          }
-          continue;
+      // used to escalate beyond the user's site assignments. A missing site
+      // and another site's name get the same message, so the import does not
+      // tell which site names exist.
+      if (allowedSiteIds != null && (existing == null || !allowedSiteIds.includes(existing.id))) {
+        for (const entry of siteRows) {
+          result.errors.push(`Row ${String(entry.index + 1)}: no access to site "${siteName}"`);
         }
-        if (!allowedSiteIds.includes(existing.id)) {
-          for (const entry of siteRows) {
-            result.errors.push(`Row ${String(entry.index + 1)}: no access to site "${siteName}"`);
-          }
-          continue;
-        }
+        continue;
       }
 
       if (existing != null) {
@@ -317,7 +369,6 @@ export async function importSitesCsv(
           model?: string;
           serialNumber?: string;
           vendorId?: string;
-          availability?: 'available' | 'unavailable' | 'faulted';
         } = {
           stationId,
           siteId,
@@ -332,8 +383,24 @@ export async function importSitesCsv(
         if (vendorId) {
           stationValues.vendorId = vendorId;
         }
-        if (firstStationRow.row.stationStatus != null) {
-          stationValues.availability = firstStationRow.row.stationStatus;
+        const requestedStatus = firstStationRow.row.stationStatus;
+
+        // A station ID is unique across sites. For a restricted operator an
+        // existing station outside its sites (or an unsited one) is refused
+        // in both paths, so the import can neither move it nor add EVSEs
+        // and connectors to it. The message is the same whatever the reason,
+        // so it does not say where the station is.
+        const [previous] = await tx
+          .select()
+          .from(chargingStations)
+          .where(eq(chargingStations.stationId, stationId));
+        if (previous != null && !siteInScope(allowedSiteIds ?? null, previous.siteId)) {
+          for (const entry of stationRows) {
+            result.errors.push(
+              `Row ${String(entry.index + 1)}: station "${stationId}" cannot be imported`,
+            );
+          }
+          continue;
         }
 
         if (updateExisting) {
@@ -342,15 +409,30 @@ export async function importSitesCsv(
             .values(stationValues)
             .onConflictDoUpdate({
               target: chargingStations.stationId,
-              set: { ...stationValues, updatedAt: new Date() },
+              // A station that moves to another site leaves its circuit.
+              set: {
+                ...stationValues,
+                circuitId: circuitIdAfterSiteChange(siteId),
+                updatedAt: new Date(),
+              },
             })
-            .returning({
-              id: chargingStations.id,
-              createdAt: chargingStations.createdAt,
-              updatedAt: chargingStations.updatedAt,
-            });
+            .returning();
           if (station != null) {
             stationUuidByStationId.set(stationId, station.id);
+            await auditImportedStation(tx, actor, previous ?? null, station);
+            // A new station gets its bound config template, like POST /v1/stations
+            // (idempotent for one that already has it).
+            if (previous == null) await createStationConfigTemplate(tx, station);
+            if (previous != null && previous.siteId !== siteId) {
+              siteMoves.push({
+                stationUuid: station.id,
+                fromSiteId: previous.siteId,
+                toSiteId: siteId,
+              });
+            }
+            if (requestedStatus != null) {
+              operatorDisableByUuid.set(station.id, requestedStatus === 'unavailable');
+            }
             if (station.createdAt.getTime() === station.updatedAt.getTime()) {
               result.stationsCreated++;
             } else {
@@ -358,20 +440,18 @@ export async function importSitesCsv(
             }
           }
         } else {
-          const [existing] = await tx
-            .select({ id: chargingStations.id })
-            .from(chargingStations)
-            .where(eq(chargingStations.stationId, stationId));
-          if (existing != null) {
-            stationUuidByStationId.set(stationId, existing.id);
+          if (previous != null) {
+            stationUuidByStationId.set(stationId, previous.id);
             result.errors.push(`Station "${stationId}" already exists, skipped`);
           } else {
-            const [station] = await tx
-              .insert(chargingStations)
-              .values(stationValues)
-              .returning({ id: chargingStations.id });
+            const [station] = await tx.insert(chargingStations).values(stationValues).returning();
             if (station != null) {
               stationUuidByStationId.set(stationId, station.id);
+              await auditImportedStation(tx, actor, null, station);
+              await createStationConfigTemplate(tx, station);
+              if (requestedStatus != null) {
+                operatorDisableByUuid.set(station.id, requestedStatus === 'unavailable');
+              }
               result.stationsCreated++;
             }
           }
@@ -519,5 +599,127 @@ export async function importSitesCsv(
     }
   });
 
+  await applyImportedAvailability(
+    [...stationUuidByStationId.values()],
+    operatorDisableByUuid,
+    actor,
+    logger,
+  );
+  for (const move of siteMoves) {
+    await publishOcpiStationSiteMove(move.stationUuid, move.fromSiteId, move.toSiteId, logger);
+    // The site sets the station's display language and can change its tariff.
+    if (logger != null) {
+      await requestStationMessageRepush(logger, { stationId: move.stationUuid });
+    }
+    // The old site's active maintenance window releases the station and the
+    // new site's applies (fail-open: the move is stored).
+    try {
+      await applyStationSiteMove(move.stationUuid, move.fromSiteId, move.toSiteId, {
+        type: actor?.actor === 'operator' ? 'operator' : 'system',
+        userId: actor?.actorUserId ?? null,
+        label: 'CSV import',
+      });
+    } catch (err) {
+      logger?.warn(
+        { err, stationId: move.stationUuid },
+        'Maintenance hand-off of a moved station failed',
+      );
+    }
+  }
+
   return result;
+}
+
+type StationRow = typeof chargingStations.$inferSelect;
+type ImportTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+// A station the import created or changed gets its station audit row, as the
+// station routes write one (writeAudit redacts the password hash).
+async function auditImportedStation(
+  tx: ImportTx,
+  actor: ImportActor | undefined,
+  before: StationRow | null,
+  after: StationRow,
+): Promise<void> {
+  if (actor == null) return;
+  await writeAudit(
+    { table: stationAuditLog, idColumn: 'station_id' },
+    {
+      entityId: after.id,
+      entityIdSnapshot: after.id,
+      action: before == null ? 'created' : 'updated',
+      ...actor,
+      before,
+      after,
+      notes: 'CSV import',
+    },
+    tx,
+  );
+}
+
+// After the import commits: apply each station's stationStatus through the
+// station status entry point, tell online stations, and publish the change.
+// `unavailable` is an operator disable and `available` (or `faulted`, which is
+// computed) removes it. A security disable is never changed here, and a
+// station whose disable already matches is left alone, so an exported file
+// imports without side effects. Other stations get a recompute for their new
+// connectors.
+async function applyImportedAvailability(
+  stationUuids: string[],
+  operatorDisableByUuid: Map<string, boolean>,
+  actor: ImportActor | undefined,
+  logger: FastifyBaseLogger | undefined,
+): Promise<void> {
+  if (stationUuids.length === 0) return;
+  const current = await db
+    .select({
+      id: chargingStations.id,
+      stationId: chargingStations.stationId,
+      siteId: chargingStations.siteId,
+      isOnline: chargingStations.isOnline,
+      disabledReason: chargingStations.disabledReason,
+    })
+    .from(chargingStations)
+    .where(inArray(chargingStations.id, stationUuids));
+
+  for (const station of current) {
+    const wantDisabled = operatorDisableByUuid.get(station.id);
+    const disableChanges =
+      wantDisabled != null &&
+      station.disabledReason !== 'security' &&
+      wantDisabled !== (station.disabledReason === 'operator');
+
+    if (!disableChanges) {
+      const { availabilityChanged } = await recomputeStationAvailability(client, station.id);
+      if (availabilityChanged) await publishStationStatusChanged(station, logger);
+      continue;
+    }
+
+    const nextReason = wantDisabled ? 'operator' : null;
+    await setStationDisabled(client, station.id, nextReason);
+    if (station.isOnline) {
+      void sendAvailabilityCommand(
+        station.stationId,
+        wantDisabled ? 'Inoperative' : 'Operative',
+        logger,
+      );
+    }
+    if (actor != null) {
+      await writeAudit(
+        { table: stationAuditLog, idColumn: 'station_id' },
+        {
+          entityId: station.id,
+          entityIdSnapshot: station.id,
+          action: 'availability_changed',
+          ...actor,
+          before: { disabledReason: station.disabledReason },
+          after: { disabledReason: nextReason },
+          notes: 'CSV import',
+        },
+        db,
+        logger,
+      );
+    }
+    await publishStationStatusChanged(station, logger);
+  }
 }

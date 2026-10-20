@@ -5,7 +5,15 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { Plus, Minus, Clock } from 'lucide-react';
-import { currencySymbol } from '@/lib/utils';
+import {
+  priceForDisplay,
+  resolveTaxBasis,
+  type PriceDisplay,
+  type TaxBasis,
+} from '@evtivity/lib/price-display';
+import { isTariffFree } from '@evtivity/lib/payment-helpers';
+import { formatFlatPrice, formatTaxPercent, formatUnitPrice } from '@/lib/utils';
+import type { DriverBilling } from '@/lib/fleet-billing';
 
 export interface TariffRestrictionsLite {
   timeRange?: { startTime: string; endTime: string };
@@ -21,9 +29,21 @@ export interface PricingInfo {
   pricePerMinute: string | null;
   pricePerSession: string | null;
   idleFeePricePerMinute: string | null;
+  /** Reservation holding fee per minute (the no-show fee of a reservation made now). */
+  reservationFeePerMinute?: string | null;
   taxRate: string | null;
+  /** How the prices are entered: excluding ('net') or including ('gross') tax. */
+  taxBasis?: TaxBasis;
   isFreeVend?: boolean;
   restrictions?: TariffRestrictionsLite | null;
+  /** How the driver pays a session started here; null at a free vend site. */
+  billing?: DriverBilling | null;
+  /** IANA timezone of the site, the one time and day restrictions are evaluated in. */
+  timezone?: string | null;
+  /** True when the price can switch mid-session (split billing with restricted tariffs). */
+  priceChangesDuringSession?: boolean;
+  /** Split billing can move a free start to a paid tariff (needs a payment method). */
+  paidTariffAhead?: boolean;
 }
 
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
@@ -55,20 +75,53 @@ function formatRestrictions(
   }
   if (r.timeRange != null) {
     parts.push(`${r.timeRange.startTime}–${r.timeRange.endTime}`);
+  } else if (parts.length > 0) {
+    // Days without a time window apply for the whole day.
+    parts.push(t('charger.restrictionAllDay'));
   }
   return parts.length > 0 ? parts.join(' ') : null;
 }
 
-export function PricingDisplay({ pricing }: { pricing: PricingInfo }): React.JSX.Element {
+/** True when the restriction depends on the time of day or the day of week. */
+function hasTimeOrDayRestriction(r: TariffRestrictionsLite | null | undefined): boolean {
+  if (r == null) return false;
+  return r.timeRange != null || (r.daysOfWeek != null && r.daysOfWeek.length > 0);
+}
+
+// Tariff prices are entered in the company tax basis (net by default). Every
+// price is shown as the driver's price display asks, with the tax rate added
+// or taken out; the note below the price says which one it is.
+export function PricingDisplay({
+  pricing,
+  priceDisplay,
+}: {
+  pricing: PricingInfo;
+  priceDisplay: PriceDisplay;
+}): React.JSX.Element {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-  const sym = currencySymbol(pricing.currency);
   const perKwh = pricing.pricePerKwh != null ? Number(pricing.pricePerKwh) : 0;
   const perMin = pricing.pricePerMinute != null ? Number(pricing.pricePerMinute) : 0;
   const perSession = pricing.pricePerSession != null ? Number(pricing.pricePerSession) : 0;
   const idleFee = pricing.idleFeePricePerMinute != null ? Number(pricing.idleFeePricePerMinute) : 0;
   const taxRate = pricing.taxRate != null ? Number(pricing.taxRate) : 0;
+  const displayed = (price: number): number =>
+    priceForDisplay(price, taxRate, priceDisplay, resolveTaxBasis(pricing.taxBasis));
+  const formatPrice = (price: number): string =>
+    formatUnitPrice(displayed(price), pricing.currency);
+  // A session fee is a flat amount, shown rounded to the cent as it is billed.
+  const formatFee = (price: number): string => formatFlatPrice(displayed(price), pricing.currency);
   const restrictionLabel = formatRestrictions(pricing.restrictions, t);
+  const timezoneLabel =
+    pricing.timezone != null && hasTimeOrDayRestriction(pricing.restrictions)
+      ? t('charger.restrictionTimezone', { timezone: pricing.timezone })
+      : null;
+  const priceChangeNote =
+    pricing.priceChangesDuringSession === true ? (
+      <p className="text-center text-xs text-muted-foreground">
+        {t('charger.priceChangesDuringSession')}
+      </p>
+    ) : null;
 
   if (pricing.isFreeVend === true) {
     return (
@@ -79,26 +132,35 @@ export function PricingDisplay({ pricing }: { pricing: PricingInfo }): React.JSX
     );
   }
 
-  if (perKwh === 0 && perMin === 0 && perSession === 0 && idleFee === 0 && taxRate === 0) {
+  // Free when every price is zero, whatever the tax rate (same rule as the server).
+  if (isTariffFree(pricing)) {
     return (
-      <p className="text-base text-muted-foreground text-center">{t('charger.pricingFree')}</p>
+      <div className="space-y-1">
+        <p className="text-base text-muted-foreground text-center">{t('charger.pricingFree')}</p>
+        {priceChangeNote}
+      </div>
     );
   }
 
   const primaryPrice =
     perKwh > 0
-      ? `${sym}${perKwh.toFixed(2)}/${t('charger.unitKwh')}`
+      ? `${formatPrice(perKwh)}/${t('charger.unitKwh')}`
       : perMin > 0
-        ? `${sym}${perMin.toFixed(2)}/${t('charger.unitMin')}`
-        : `${sym}${perSession.toFixed(2)}`;
+        ? `${formatPrice(perMin)}/${t('charger.unitMin')}`
+        : formatFee(perSession);
 
   const breakdownLines: string[] = [];
-  if (perKwh > 0) breakdownLines.push(`${sym}${perKwh.toFixed(2)} ${t('charger.perKwh')}`);
-  if (perMin > 0) breakdownLines.push(`${sym}${perMin.toFixed(2)} ${t('charger.perMin')}`);
-  if (perSession > 0)
-    breakdownLines.push(`${sym}${perSession.toFixed(2)} ${t('charger.sessionFee')}`);
-  if (idleFee > 0) breakdownLines.push(`${sym}${idleFee.toFixed(2)} ${t('charger.idleFee')}`);
-  if (taxRate > 0) breakdownLines.push(`${(taxRate * 100).toFixed(0)}% ${t('charger.tax')}`);
+  if (perKwh > 0) breakdownLines.push(`${formatPrice(perKwh)} ${t('charger.perKwh')}`);
+  if (perMin > 0) breakdownLines.push(`${formatPrice(perMin)} ${t('charger.perMin')}`);
+  if (perSession > 0) breakdownLines.push(`${formatFee(perSession)} ${t('charger.sessionFee')}`);
+  if (idleFee > 0) breakdownLines.push(`${formatPrice(idleFee)} ${t('charger.idleFee')}`);
+
+  const taxNote =
+    taxRate > 0
+      ? t(priceDisplay === 'gross' ? 'charger.taxIncluded' : 'charger.taxExcluded', {
+          rate: formatTaxPercent(taxRate),
+        })
+      : null;
 
   return (
     <div className="space-y-2">
@@ -109,19 +171,24 @@ export function PricingDisplay({ pricing }: { pricing: PricingInfo }): React.JSX
           setExpanded((prev) => !prev);
         }}
       >
-        <span className="text-base font-semibold text-primary">{primaryPrice}</span>
+        <span className="text-base font-semibold text-link">{primaryPrice}</span>
         {expanded ? (
           <Minus className="h-4 w-4 text-muted-foreground" />
         ) : (
           <Plus className="h-4 w-4 text-muted-foreground" />
         )}
       </button>
+      {taxNote != null && <p className="text-center text-xs text-muted-foreground">{taxNote}</p>}
       {restrictionLabel != null && (
         <p className="flex items-center justify-center gap-1 text-xs text-muted-foreground">
           <Clock className="h-3 w-3" />
           {restrictionLabel}
         </p>
       )}
+      {timezoneLabel != null && (
+        <p className="text-center text-xs text-muted-foreground">{timezoneLabel}</p>
+      )}
+      {priceChangeNote}
       {expanded && (
         <div className="space-y-0.5 text-center">
           {breakdownLines.map((line) => (
@@ -133,12 +200,4 @@ export function PricingDisplay({ pricing }: { pricing: PricingInfo }): React.JSX
       )}
     </div>
   );
-}
-
-export function isPricingFree(pricing: PricingInfo): boolean {
-  const perKwh = pricing.pricePerKwh != null ? Number(pricing.pricePerKwh) : 0;
-  const perMin = pricing.pricePerMinute != null ? Number(pricing.pricePerMinute) : 0;
-  const perSession = pricing.pricePerSession != null ? Number(pricing.pricePerSession) : 0;
-  const idleFee = pricing.idleFeePricePerMinute != null ? Number(pricing.idleFeePricePerMinute) : 0;
-  return perKwh === 0 && perMin === 0 && perSession === 0 && idleFee === 0;
 }

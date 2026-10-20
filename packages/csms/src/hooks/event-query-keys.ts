@@ -21,6 +21,8 @@ export const IMMEDIATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'supportCase.created',
   'supportCase.updated',
   'supportCase.newMessage',
+  // AI insights (and their actions) are low-volume and a person is waiting on them.
+  'ai.insight.updated',
 ]);
 
 // Maps an SSE event to the TanStack Query keys to invalidate. Pure so it can be
@@ -48,8 +50,20 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
       }
       break;
 
+    // ISO 15118 charging needs and the EV schedules checked against them.
+    case 'station.evChargingNeeds':
+      if (stationId != null) {
+        keys.push(['stations', stationId, 'ev-charging-needs']);
+        keys.push(['stations', stationId, 'ev-charging-schedules']);
+      }
+      break;
+
     case 'session.started':
     case 'session.ended':
+      // The charging needs of an EVSE end with its transaction.
+      if (eventType === 'session.ended' && stationId != null) {
+        keys.push(['stations', stationId, 'ev-charging-needs']);
+      }
       keys.push(['dashboard', 'stats']);
       keys.push(['dashboard', 'session-history']);
       keys.push(['dashboard', 'energy-history']);
@@ -93,7 +107,6 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
         keys.push(['stations', stationId, 'energy-history']);
         keys.push(['stations', stationId, 'revenue-history']);
         keys.push(['stations', stationId, 'metrics']);
-        keys.push(['station-meter-values']);
       }
       if (siteId != null) {
         keys.push(['sites', siteId, 'meter-values']);
@@ -110,6 +123,8 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
       keys.push(['dashboard', 'financial-stats']);
       keys.push(['dashboard', 'payment-breakdown']);
       keys.push(['transactions']);
+      // A reservation fee refund confirmed by webhook (no session).
+      keys.push(['reservation-fee-payments']);
       break;
 
     case 'load.updated':
@@ -121,6 +136,18 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
     case 'ocpp.message':
       if (stationId != null) {
         keys.push(['stations', stationId, 'ocpp-logs']);
+      }
+      break;
+
+    case 'station.chargingProfiles':
+      if (stationId != null) {
+        keys.push(['stations', stationId, 'charging-profiles']);
+      }
+      break;
+
+    case 'displayMessage.updated':
+      if (stationId != null) {
+        keys.push(['display-messages', stationId]);
       }
       break;
 
@@ -141,9 +168,27 @@ export function getQueryKeysForEvent(event: CsmsEvent): string[][] {
     case 'supportCase.created':
     case 'supportCase.updated':
     case 'supportCase.newMessage':
-      // Prefix also covers the detail page (['support-cases', id]).
+      // Prefix also covers the detail page (['support-cases', id]) and the nav
+      // count (['support-cases', 'unassigned-count']).
       keys.push(['support-cases']);
-      keys.push(['support-cases-unread-count']);
+      break;
+
+    // AI roadmap v0.1.44: the insight cards, lists and actions (an action's
+    // change publishes the insight's event), the nav count and the usage
+    // views. The SSE stream already filters by site.
+    case 'ai.insight.updated':
+      keys.push(['ai', 'insights']);
+      break;
+
+    case 'ai.usage.threshold':
+      keys.push(['ai', 'usage']);
+      // The company budget part of the AI alert banner.
+      keys.push(['ai', 'alerts']);
+      break;
+
+    // A provider quota alert started or cleared (AI alert banner).
+    case 'ai.alerts.changed':
+      keys.push(['ai', 'alerts']);
       break;
 
     case 'certificate.signed':

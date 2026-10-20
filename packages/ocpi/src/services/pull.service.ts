@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, inArray, sql } from 'drizzle-orm';
+import { eq, and, inArray, isNull, sql } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import {
   db,
@@ -12,12 +12,20 @@ import {
   ocpiCdrs,
   ocpiSyncLog,
 } from '@evtivity/database';
-import { createLogger, withLock } from '@evtivity/lib';
+import { createInFlightTracker, createLogger, tryParseJson, withLock } from '@evtivity/lib';
 import type { PubSubClient, Subscription } from '@evtivity/lib';
+import { drainListener, trackListenerWork } from '../lib/listener-drain.js';
 import { OcpiClient } from '../lib/ocpi-client.js';
 import { getOutboundToken } from '../lib/outbound-token.js';
 import { config } from '../lib/config.js';
+import { resolvePartnerVersion } from '../lib/ocpi-version.js';
+import { priceExclTax } from '../lib/ocpi-price.js';
+import { fitsOcpiString, isOcpiGeoLocation } from '../lib/ocpi-fields.js';
 import type { OcpiLocation, OcpiTariff, OcpiCdr } from '../types/ocpi.js';
+import type { OcpiModule } from '../modules.js';
+
+// The modules the listener dispatches to: index.ts passes OCPI_MODULES.
+export type OcpiPullModules = readonly Pick<OcpiModule, 'identifier' | 'pull'>[];
 
 const logger = createLogger('ocpi-pull');
 const CHANNEL = 'ocpi_sync';
@@ -31,7 +39,7 @@ interface SyncNotification {
   module: string;
 }
 
-interface SyncResult {
+export interface SyncResult {
   module: string;
   objectsCount: number;
   status: 'completed' | 'failed';
@@ -46,6 +54,21 @@ function getPartyId(): string {
   return config.OCPI_PARTY_ID;
 }
 
+/**
+ * One row per key, the last occurrence winning: a page that repeats an object
+ * would otherwise fail its batched upsert ("ON CONFLICT DO UPDATE command
+ * cannot affect row a second time") and lose the whole page.
+ */
+export function dedupeByKey<T>(rows: readonly T[], key: (row: T) => string): T[] {
+  const byKey = new Map<string, T>();
+  for (const row of rows) {
+    const k = key(row);
+    byKey.delete(k);
+    byKey.set(k, row);
+  }
+  return [...byKey.values()];
+}
+
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -54,11 +77,21 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-async function getPartnerInfo(
-  partnerId: string,
-): Promise<{ countryCode: string; partyId: string } | null> {
+async function getPartnerInfo(partnerId: string): Promise<{
+  countryCode: string;
+  partyId: string;
+  version: string | null;
+  allowPrivateNetwork: boolean;
+  allowRawToken: boolean;
+} | null> {
   const [partner] = await db
-    .select({ countryCode: ocpiPartners.countryCode, partyId: ocpiPartners.partyId })
+    .select({
+      countryCode: ocpiPartners.countryCode,
+      partyId: ocpiPartners.partyId,
+      version: ocpiPartners.version,
+      allowPrivateNetwork: ocpiPartners.allowPrivateNetwork,
+      allowRawToken: ocpiPartners.allowRawToken,
+    })
     .from(ocpiPartners)
     .where(eq(ocpiPartners.id, partnerId))
     .limit(1);
@@ -88,13 +121,23 @@ async function getPartnerToken(partnerId: string): Promise<string | null> {
   return getOutboundToken(partnerId);
 }
 
-function createOcpiClient(token: string, toCountryCode: string, toPartyId: string): OcpiClient {
+function createOcpiClient(
+  token: string,
+  partner: {
+    countryCode: string;
+    partyId: string;
+    allowPrivateNetwork: boolean;
+    allowRawToken: boolean;
+  },
+): OcpiClient {
   return new OcpiClient({
     token,
     fromCountryCode: getCountryCode(),
     fromPartyId: getPartyId(),
-    toCountryCode,
-    toPartyId,
+    toCountryCode: partner.countryCode,
+    toPartyId: partner.partyId,
+    allowPrivateNetwork: partner.allowPrivateNetwork,
+    rawToken: partner.allowRawToken,
   });
 }
 
@@ -212,7 +255,7 @@ async function pullLocationsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
 
     // Stream page-by-page and flush each page as batched upserts so memory is
     // bounded by one page, not the whole catalog.
@@ -232,14 +275,15 @@ async function pullLocationsInner(partnerId: string): Promise<SyncResult> {
         const coords = candidate['coordinates'] as
           | { latitude?: unknown; longitude?: unknown }
           | undefined;
+        // Fields checked against the column sizes and the OCPI GeoLocation
+        // format (8.4.16), so one bad row is skipped instead of failing the
+        // page's insert or the portal geo search.
         if (
-          typeof candidate['id'] !== 'string' ||
-          typeof candidate['country_code'] !== 'string' ||
-          typeof candidate['party_id'] !== 'string' ||
-          coords == null ||
-          typeof coords !== 'object' ||
-          coords.latitude == null ||
-          coords.longitude == null
+          !fitsOcpiString(candidate['id'], 36) ||
+          !fitsOcpiString(candidate['country_code'], 2) ||
+          !fitsOcpiString(candidate['party_id'], 3) ||
+          (candidate['name'] != null && !fitsOcpiString(candidate['name'], 255)) ||
+          !isOcpiGeoLocation(coords)
         ) {
           logger.warn(
             { partnerId, locationId: candidate['id'] },
@@ -261,7 +305,8 @@ async function pullLocationsInner(partnerId: string): Promise<SyncResult> {
           locationData: location,
         });
       }
-      for (const batch of chunk(valid, UPSERT_CHUNK)) {
+      const unique = dedupeByKey(valid, (r) => `${r.countryCode}|${r.partyId}|${r.locationId}`);
+      for (const batch of chunk(unique, UPSERT_CHUNK)) {
         await upsertLocationBatch(batch);
         count += batch.length;
       }
@@ -333,7 +378,7 @@ async function pullTariffsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
 
     let count = 0;
     let skipped = 0;
@@ -346,10 +391,10 @@ async function pullTariffsInner(partnerId: string): Promise<SyncResult> {
         }
         const candidate = item as Record<string, unknown>;
         if (
-          typeof candidate['id'] !== 'string' ||
-          typeof candidate['country_code'] !== 'string' ||
-          typeof candidate['party_id'] !== 'string' ||
-          typeof candidate['currency'] !== 'string'
+          !fitsOcpiString(candidate['id'], 36) ||
+          !fitsOcpiString(candidate['country_code'], 2) ||
+          !fitsOcpiString(candidate['party_id'], 3) ||
+          !fitsOcpiString(candidate['currency'], 3)
         ) {
           logger.warn(
             { partnerId, tariffId: candidate['id'] },
@@ -368,7 +413,8 @@ async function pullTariffsInner(partnerId: string): Promise<SyncResult> {
           tariffData: tariff,
         });
       }
-      for (const batch of chunk(valid, UPSERT_CHUNK)) {
+      const unique = dedupeByKey(valid, (r) => `${r.countryCode}|${r.partyId}|${r.tariffId}`);
+      for (const batch of chunk(unique, UPSERT_CHUNK)) {
         await upsertTariffBatch(batch);
         count += batch.length;
       }
@@ -422,7 +468,10 @@ async function pullCdrsInner(partnerId: string): Promise<SyncResult> {
       throw new Error('Partner not found');
     }
 
-    const client = createOcpiClient(token, partner.countryCode, partner.partyId);
+    const client = createOcpiClient(token, partner);
+    // total_cost is a Price of the partner's version: excl_vat in 2.2.1,
+    // before_taxes in 2.3.0. ocpi_cdrs.total_cost holds that amount.
+    const version = resolvePartnerVersion(partner.version);
 
     let count = 0;
     let skipped = 0;
@@ -435,10 +484,13 @@ async function pullCdrsInner(partnerId: string): Promise<SyncResult> {
           continue;
         }
         const candidate = item as Record<string, unknown>;
+        const exclTax = priceExclTax(candidate['total_cost'], version);
         if (
-          typeof candidate['id'] !== 'string' ||
+          !fitsOcpiString(candidate['id'], 36) ||
           typeof candidate['total_energy'] !== 'number' ||
-          typeof candidate['currency'] !== 'string'
+          !Number.isFinite(candidate['total_energy']) ||
+          !fitsOcpiString(candidate['currency'], 3) ||
+          exclTax == null
         ) {
           logger.warn(
             { partnerId, cdrId: candidate['id'] },
@@ -448,8 +500,7 @@ async function pullCdrsInner(partnerId: string): Promise<SyncResult> {
           continue;
         }
         const cdr = candidate as unknown as OcpiCdr;
-        const totalCost =
-          typeof cdr.total_cost === 'object' ? String(cdr.total_cost.excl_vat) : '0';
+        const totalCost = String(exclTax);
         pageIds.push(cdr.id);
         valid.push({
           partnerId,
@@ -465,18 +516,39 @@ async function pullCdrsInner(partnerId: string): Promise<SyncResult> {
 
       // CDRs are immutable: skip ids already stored. Scope the existence check
       // to this page's ids so memory stays bounded on a large history pull.
+      // The page's own repeats are dropped (first occurrence kept), and the
+      // insert skips a row a concurrent receiver POST stored meanwhile
+      // (partial unique index uq_ocpi_cdrs_received).
       const existing = new Set<string>();
       if (pageIds.length > 0) {
         const rows = await db
           .select({ ocpiCdrId: ocpiCdrs.ocpiCdrId })
           .from(ocpiCdrs)
-          .where(and(eq(ocpiCdrs.partnerId, partnerId), inArray(ocpiCdrs.ocpiCdrId, pageIds)));
+          .where(
+            and(
+              eq(ocpiCdrs.partnerId, partnerId),
+              inArray(ocpiCdrs.ocpiCdrId, pageIds),
+              isNull(ocpiCdrs.chargingSessionId),
+            ),
+          );
         for (const r of rows) existing.add(r.ocpiCdrId);
       }
-      const fresh = valid.filter((c) => !existing.has(c.ocpiCdrId));
+      const seen = new Set<string>();
+      const fresh = valid.filter((c) => {
+        if (existing.has(c.ocpiCdrId) || seen.has(c.ocpiCdrId)) return false;
+        seen.add(c.ocpiCdrId);
+        return true;
+      });
       for (const batch of chunk(fresh, UPSERT_CHUNK)) {
-        await db.insert(ocpiCdrs).values(batch);
-        count += batch.length;
+        const inserted = await db
+          .insert(ocpiCdrs)
+          .values(batch)
+          .onConflictDoNothing({
+            target: [ocpiCdrs.partnerId, ocpiCdrs.ocpiCdrId],
+            where: isNull(ocpiCdrs.chargingSessionId),
+          })
+          .returning({ id: ocpiCdrs.id });
+        count += inserted.length;
       }
     });
 
@@ -497,46 +569,47 @@ export async function pullCdrs(partnerId: string, lockRedis?: Redis): Promise<Sy
   return runLocked(lockRedis, partnerId, 'cdrs', () => pullCdrsInner(partnerId));
 }
 
-async function handleSyncNotification(raw: string, lockRedis: Redis | undefined): Promise<void> {
-  let notification: SyncNotification;
-  try {
-    notification = JSON.parse(raw) as SyncNotification;
-  } catch {
+async function handleSyncNotification(
+  raw: string,
+  modules: OcpiPullModules,
+  lockRedis: Redis | undefined,
+): Promise<void> {
+  const parsed = tryParseJson(raw);
+  if (parsed === undefined) {
     logger.error({ raw }, 'Invalid sync notification payload');
     return;
   }
+  const notification = parsed as SyncNotification;
 
   const { partnerId, module } = notification;
   logger.info({ partnerId, module }, 'Processing sync request');
 
-  switch (module) {
-    case 'locations':
-      await pullLocations(partnerId, lockRedis);
-      break;
-    case 'tariffs':
-      await pullTariffs(partnerId, lockRedis);
-      break;
-    case 'cdrs':
-      await pullCdrs(partnerId, lockRedis);
-      break;
-    default:
-      logger.warn({ module }, 'Unknown sync module');
+  const pull = modules.find((m) => m.identifier === module)?.pull;
+  if (pull == null) {
+    logger.warn({ module }, 'Unknown sync module');
+    return;
   }
+  await pull(partnerId, lockRedis);
 }
 
 export class OcpiPullListener {
   private readonly pubsub: PubSubClient;
+  private readonly modules: OcpiPullModules;
   private readonly lockRedis: Redis | undefined;
   private subscription: Subscription | null = null;
+  private readonly inFlight = createInFlightTracker();
 
-  constructor(pubsub: PubSubClient, lockRedis?: Redis) {
+  constructor(pubsub: PubSubClient, modules: OcpiPullModules, lockRedis?: Redis) {
     this.pubsub = pubsub;
+    this.modules = modules;
     this.lockRedis = lockRedis;
   }
 
   async start(): Promise<void> {
     this.subscription = await this.pubsub.subscribe(CHANNEL, (payload: string) => {
-      void handleSyncNotification(payload, this.lockRedis);
+      trackListenerWork(this.inFlight, logger, () =>
+        handleSyncNotification(payload, this.modules, this.lockRedis),
+      );
     });
     logger.info({ channel: CHANNEL }, 'Listening for OCPI sync notifications');
   }
@@ -546,6 +619,7 @@ export class OcpiPullListener {
       await this.subscription.unsubscribe();
       this.subscription = null;
     }
+    await drainListener(this.inFlight, logger);
     logger.info('OCPI pull listener stopped');
   }
 }

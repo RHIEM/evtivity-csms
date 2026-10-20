@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { lazy, Suspense, useEffect } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router';
+import { BrowserRouter, Outlet, Routes, Route, useSearchParams } from 'react-router';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from '@/lib/query';
 import { useAuth } from '@/lib/auth';
 import { ServerDown } from '@/components/ServerDown';
 import { useGtag } from '@/hooks/use-gtag';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { ToastProvider } from '@/components/ui/toast';
 import { Layout } from '@/components/Layout';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { VerifiedRoute } from '@/components/VerifiedRoute';
@@ -16,6 +17,9 @@ import { Login } from '@/pages/Login';
 import { Register } from '@/pages/Register';
 import { ForgotPassword } from '@/pages/ForgotPassword';
 import { ResetPassword } from '@/pages/ResetPassword';
+import { Activate } from '@/pages/Activate';
+import { PaymentReturn } from '@/pages/PaymentReturn';
+import { PayoutOnboarding, PayoutOnboardingReturn } from '@/pages/PayoutOnboarding';
 
 const VerifyEmail = lazy(() =>
   import('@/pages/VerifyEmail').then((m) => ({ default: m.VerifyEmail })),
@@ -30,6 +34,10 @@ const MonthlyStatement = lazy(() =>
   import('@/pages/MonthlyStatement').then((m) => ({ default: m.MonthlyStatement })),
 );
 const Account = lazy(() => import('@/pages/Account').then((m) => ({ default: m.Account })));
+const Invoices = lazy(() => import('@/pages/Invoices').then((m) => ({ default: m.Invoices })));
+const InvoiceDetail = lazy(() =>
+  import('@/pages/InvoiceDetail').then((m) => ({ default: m.InvoiceDetail })),
+);
 const PersonalInfo = lazy(() =>
   import('@/pages/PersonalInfo').then((m) => ({ default: m.PersonalInfo })),
 );
@@ -44,6 +52,7 @@ const PaymentMethods = lazy(() =>
   import('@/pages/PaymentMethods').then((m) => ({ default: m.PaymentMethods })),
 );
 const Profile = lazy(() => import('@/pages/Profile').then((m) => ({ default: m.Profile })));
+const QrLanding = lazy(() => import('@/pages/QrLanding').then((m) => ({ default: m.QrLanding })));
 const ChargerLanding = lazy(() =>
   import('@/pages/ChargerLanding').then((m) => ({ default: m.ChargerLanding })),
 );
@@ -109,6 +118,19 @@ function GtagLoader(): null {
   return null;
 }
 
+// The emailed link (?token=) verifies without a session, so it works on any device and
+// after the session expired. Without a token the page asks a signed-in driver to check
+// their inbox, inside the app layout.
+function VerifyEmailGate(): React.JSX.Element {
+  const [searchParams] = useSearchParams();
+  if (searchParams.has('token')) return <Outlet />;
+  return (
+    <ProtectedRoute>
+      <Layout />
+    </ProtectedRoute>
+  );
+}
+
 export function App(): React.JSX.Element {
   const hydrate = useAuth((s) => s.hydrate);
   const apiDown = useAuth((s) => s.apiDown);
@@ -124,72 +146,81 @@ export function App(): React.JSX.Element {
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
-        <GtagLoader />
-        <BrowserRouter>
-          <Suspense fallback={SuspenseFallback}>
-            <Routes>
-              {/* Public routes */}
-              <Route path="/login" element={<Login />} />
-              <Route path="/register" element={<Register />} />
-              <Route path="/forgot-password" element={<ForgotPassword />} />
-              <Route path="/reset-password" element={<ResetPassword />} />
-              <Route path="/privacy-policy" element={<PrivacyPolicy />} />
-              <Route path="/terms-of-service" element={<TermsOfService />} />
-              <Route path="/charge/:stationId/:evseId" element={<ChargerLanding />} />
-              <Route path="/charge/:stationId" element={<ChargerStationLanding />} />
-              <Route path="/charge/:stationId/:evseId/checkout" element={<GuestCheckout />} />
-              <Route path="/guest-session/:sessionToken" element={<GuestSession />} />
-              <Route path="/location/:siteId" element={<LocationDetail />} />
-
-              {/* Authenticated routes */}
-              <Route
-                element={
-                  <ProtectedRoute>
-                    <Layout />
-                  </ProtectedRoute>
-                }
-              >
-                {/* Accessible without verified email */}
-                <Route path="verify-email" element={<VerifyEmail />} />
-
-                {/* Requires verified email */}
-                <Route element={<VerifiedRoute />}>
-                  <Route index element={<Home />} />
-                  <Route path="activity" element={<Activity />} />
-                  <Route path="activity/statement" element={<MonthlyStatement />} />
-                  <Route path="account" element={<Account />} />
-                  <Route path="account/personal" element={<PersonalInfo />} />
-                  <Route path="account/security" element={<Security />} />
-                  <Route path="account/notifications" element={<NotificationPrefs />} />
-                  <Route path="account/home-cards" element={<HomeScreen />} />
-                  <Route path="sessions" element={<Sessions />} />
-                  <Route path="sessions/:id" element={<SessionDetail />} />
-                  <Route path="reservations" element={<Reservations />} />
-                  <Route path="reservations/new" element={<ReservationSearch />} />
-                  <Route
-                    path="reservations/new/:stationId"
-                    element={<ChargerDetail mode="reserve" />}
-                  />
-                  <Route path="reservations/:id" element={<ReservationDetail />} />
-                  <Route path="support" element={<SupportCases />} />
-                  <Route path="support/new" element={<NewSupportCase />} />
-                  <Route path="support/:id" element={<SupportCaseDetail />} />
-                  <Route path="payment-methods" element={<PaymentMethods />} />
-                  <Route path="rfid-cards" element={<RfidCards />} />
-                  <Route path="vehicles" element={<Vehicles />} />
-                  <Route path="favorites" element={<Favorites />} />
-                  <Route path="station-watches" element={<Watching />} />
-                  <Route path="profile" element={<Profile />} />
-                  <Route path="start" element={<ChargerSearch />} />
-                  <Route path="start/:stationId" element={<ChargerDetail />} />
-                  <Route path="scan" element={<ScanQr />} />
-                  <Route path="*" element={<NotFound />} />
+        <ToastProvider>
+          <GtagLoader />
+          <BrowserRouter>
+            <Suspense fallback={SuspenseFallback}>
+              <Routes>
+                {/* Public routes */}
+                <Route path="/verify-email" element={<VerifyEmailGate />}>
+                  <Route index element={<VerifyEmail />} />
                 </Route>
-              </Route>
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </Suspense>
-        </BrowserRouter>
+                <Route path="/login" element={<Login />} />
+                <Route path="/register" element={<Register />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
+                <Route path="/reset-password" element={<ResetPassword />} />
+                <Route path="/activate" element={<Activate />} />
+                <Route path="/payments/return" element={<PaymentReturn />} />
+                <Route path="/payout-onboarding" element={<PayoutOnboarding />} />
+                <Route path="/payout-onboarding/return" element={<PayoutOnboardingReturn />} />
+                <Route path="/privacy-policy" element={<PrivacyPolicy />} />
+                <Route path="/terms-of-service" element={<TermsOfService />} />
+                <Route path="/qr/*" element={<QrLanding />} />
+                <Route path="/charge/:stationId/:evseId" element={<ChargerLanding />} />
+                <Route path="/charge/:stationId" element={<ChargerStationLanding />} />
+                <Route path="/charge/:stationId/:evseId/checkout" element={<GuestCheckout />} />
+                <Route path="/guest-session/:sessionToken" element={<GuestSession />} />
+                <Route path="/location/:siteId" element={<LocationDetail />} />
+
+                {/* Authenticated routes */}
+                <Route
+                  element={
+                    <ProtectedRoute>
+                      <Layout />
+                    </ProtectedRoute>
+                  }
+                >
+                  {/* Requires verified email */}
+                  <Route element={<VerifiedRoute />}>
+                    <Route index element={<Home />} />
+                    <Route path="activity" element={<Activity />} />
+                    <Route path="activity/statement" element={<MonthlyStatement />} />
+                    <Route path="account" element={<Account />} />
+                    <Route path="account/personal" element={<PersonalInfo />} />
+                    <Route path="account/security" element={<Security />} />
+                    <Route path="account/notifications" element={<NotificationPrefs />} />
+                    <Route path="account/home-cards" element={<HomeScreen />} />
+                    <Route path="account/invoices" element={<Invoices />} />
+                    <Route path="account/invoices/:id" element={<InvoiceDetail />} />
+                    <Route path="sessions" element={<Sessions />} />
+                    <Route path="sessions/:id" element={<SessionDetail />} />
+                    <Route path="reservations" element={<Reservations />} />
+                    <Route path="reservations/new" element={<ReservationSearch />} />
+                    <Route
+                      path="reservations/new/:stationId"
+                      element={<ChargerDetail mode="reserve" />}
+                    />
+                    <Route path="reservations/:id" element={<ReservationDetail />} />
+                    <Route path="support" element={<SupportCases />} />
+                    <Route path="support/new" element={<NewSupportCase />} />
+                    <Route path="support/:id" element={<SupportCaseDetail />} />
+                    <Route path="payment-methods" element={<PaymentMethods />} />
+                    <Route path="rfid-cards" element={<RfidCards />} />
+                    <Route path="vehicles" element={<Vehicles />} />
+                    <Route path="favorites" element={<Favorites />} />
+                    <Route path="station-watches" element={<Watching />} />
+                    <Route path="profile" element={<Profile />} />
+                    <Route path="start" element={<ChargerSearch />} />
+                    <Route path="start/:stationId" element={<ChargerDetail />} />
+                    <Route path="scan" element={<ScanQr />} />
+                    <Route path="*" element={<NotFound />} />
+                  </Route>
+                </Route>
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </Suspense>
+          </BrowserRouter>
+        </ToastProvider>
       </QueryClientProvider>
     </ErrorBoundary>
   );

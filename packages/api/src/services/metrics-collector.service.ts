@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { sql } from 'drizzle-orm';
-import { db, getCompanyCurrency } from '@evtivity/database';
+import {
+  client,
+  db,
+  getCompanyCurrency,
+  getOcppFleetHealth,
+  operatorStationIdSql,
+  operatorStationSql,
+} from '@evtivity/database';
 import { createLogger } from '@evtivity/lib';
 import {
   driversTotal,
@@ -29,8 +36,12 @@ import {
   ocppPingLatencyAvgMs,
   ocppPingLatencyMaxMs,
   ocppPingSuccessRate,
+  ocppInstances,
+  ocppInstanceConnectedStations,
   ocppHeartbeatsTotal,
 } from '../plugins/metrics.js';
+import { queryRevenueTotal } from '@evtivity/services/session-revenue';
+import { paymentRecordsOfOperatorStations } from '../lib/payment-site-scope.js';
 
 const logger = createLogger('metrics-collector');
 
@@ -39,6 +50,9 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
 export async function collectBusinessMetrics(): Promise<void> {
   try {
     const companyCurrency = await getCompanyCurrency();
+    // Conformance (OCTT) stations and their rows are left out of every
+    // station, connector, session, reservation, payment and heartbeat metric.
+    const sessionAtOperatorStation = sql.raw(operatorStationIdSql('charging_sessions.station_id'));
     const [
       driverRows,
       activeDriverRows,
@@ -59,7 +73,7 @@ export async function collectBusinessMetrics(): Promise<void> {
       firmwareRows,
       txEventRows,
       paymentRows,
-      ocppHealthRows,
+      ocppHealth,
       heartbeatRows,
     ] = await Promise.all([
       // Total drivers
@@ -71,20 +85,25 @@ export async function collectBusinessMetrics(): Promise<void> {
         FROM charging_sessions
         WHERE started_at >= NOW() - INTERVAL '30 days'
           AND driver_id IS NOT NULL
+          AND ${sessionAtOperatorStation}
       `),
 
       // Stations by online status
       db.execute(sql`
         SELECT is_online::text AS is_online, count(*)::int AS count
         FROM charging_stations
+        WHERE ${sql.raw(operatorStationSql('charging_stations'))}
         GROUP BY is_online
       `),
 
       // Connectors by status
       db.execute(sql`
-        SELECT status, count(*)::int AS count
-        FROM connectors
-        GROUP BY status
+        SELECT c.status, count(*)::int AS count
+        FROM connectors c
+        INNER JOIN evses e ON e.id = c.evse_id
+        INNER JOIN charging_stations st ON st.id = e.station_id
+        WHERE ${sql.raw(operatorStationSql('st'))}
+        GROUP BY c.status
       `),
 
       // Active sessions
@@ -92,12 +111,14 @@ export async function collectBusinessMetrics(): Promise<void> {
         SELECT count(*)::int AS count
         FROM charging_sessions
         WHERE status = 'active'
+          AND ${sessionAtOperatorStation}
       `),
 
       // Sessions by status
       db.execute(sql`
         SELECT status, count(*)::int AS count
         FROM charging_sessions
+        WHERE ${sessionAtOperatorStation}
         GROUP BY status
       `),
 
@@ -108,6 +129,7 @@ export async function collectBusinessMetrics(): Promise<void> {
           (count(*)::float / 30)::float AS avg_count
         FROM charging_sessions
         WHERE started_at >= NOW() - INTERVAL '30 days'
+          AND ${sessionAtOperatorStation}
         GROUP BY EXTRACT(HOUR FROM started_at)
       `),
 
@@ -116,20 +138,18 @@ export async function collectBusinessMetrics(): Promise<void> {
         SELECT COALESCE(SUM(energy_delivered_wh), 0)::bigint AS total
         FROM charging_sessions
         WHERE status = 'completed'
+          AND ${sessionAtOperatorStation}
       `),
 
-      // Revenue of completed sessions billed in the company currency
-      db.execute(sql`
-        SELECT COALESCE(SUM(final_cost_cents), 0)::bigint AS total
-        FROM charging_sessions
-        WHERE status = 'completed'
-          AND UPPER(currency) = ${companyCurrency}
-      `),
+      // Revenue (session-revenue.ts): ended sessions and reservation fees
+      // billed in the company currency, minus refunds, tax included.
+      queryRevenueTotal({ companyCurrency }),
 
       // Reservations by status
       db.execute(sql`
         SELECT status, count(*)::int AS count
         FROM reservations
+        WHERE ${sql.raw(operatorStationIdSql('reservations.station_id'))}
         GROUP BY status
       `),
 
@@ -162,6 +182,7 @@ export async function collectBusinessMetrics(): Promise<void> {
         WHERE status = 'completed'
           AND started_at >= NOW() - INTERVAL '30 days'
           AND ended_at IS NOT NULL
+          AND ${sessionAtOperatorStation}
       `),
 
       // Idle sessions
@@ -170,6 +191,7 @@ export async function collectBusinessMetrics(): Promise<void> {
         FROM charging_sessions
         WHERE status = 'active'
           AND idle_started_at IS NOT NULL
+          AND ${sessionAtOperatorStation}
       `),
 
       // Firmware updates pending
@@ -179,14 +201,16 @@ export async function collectBusinessMetrics(): Promise<void> {
         INNER JOIN firmware_campaigns fc ON fc.id = fcs.campaign_id
         WHERE fc.status = 'active'
           AND fcs.status IN ('pending', 'downloading')
+          AND ${sql.raw(operatorStationIdSql('fcs.station_id'))}
       `),
 
       // Transaction events by trigger reason (last 24h)
       db.execute(sql`
         SELECT trigger_reason, count(*)::int AS count
-        FROM transaction_events
-        WHERE created_at >= NOW() - INTERVAL '24 hours'
-          AND trigger_reason IS NOT NULL
+        FROM transaction_events te
+        WHERE te.created_at >= NOW() - INTERVAL '24 hours'
+          AND te.trigger_reason IS NOT NULL
+          AND ${sql.raw(operatorStationIdSql('(SELECT tcs.station_id FROM charging_sessions tcs WHERE tcs.id = te.session_id)'))}
         GROUP BY trigger_reason
       `),
 
@@ -194,16 +218,12 @@ export async function collectBusinessMetrics(): Promise<void> {
       db.execute(sql`
         SELECT status, count(*)::int AS count
         FROM payment_records
+        WHERE ${paymentRecordsOfOperatorStations()}
         GROUP BY status
       `),
 
-      // OCPP server health (ping monitor snapshot)
-      db.execute(sql`
-        SELECT connected_stations, avg_ping_latency_ms, max_ping_latency_ms,
-               ping_success_rate, total_pings_sent, total_pongs_received
-        FROM ocpp_server_health
-        WHERE id = 'singleton'
-      `),
+      // OCPP server health: the fresh rows of every OCPP process, aggregated
+      getOcppFleetHealth(client),
 
       // Total heartbeats received (last 24h)
       // ocpp.Heartbeat events are no longer archived in domain_events
@@ -214,6 +234,7 @@ export async function collectBusinessMetrics(): Promise<void> {
         WHERE action = 'Heartbeat'
           AND direction = 'inbound'
           AND created_at >= NOW() - INTERVAL '24 hours'
+          AND ${sql.raw(operatorStationIdSql('ocpp_message_logs.station_id'))}
       `),
     ]);
 
@@ -246,7 +267,7 @@ export async function collectBusinessMetrics(): Promise<void> {
     energyDeliveredWhTotal.set(asBigInt(energyRows, 'total'));
     // Reset drops the series of a previous company currency.
     revenueCentsTotal.reset();
-    revenueCentsTotal.set({ currency: companyCurrency }, asInt(revenueRows, 'total'));
+    revenueCentsTotal.set({ currency: companyCurrency }, revenueRows.grossCents);
 
     reservationsByStatus.reset();
     for (const row of asRows(reservationRows)) {
@@ -281,12 +302,18 @@ export async function collectBusinessMetrics(): Promise<void> {
     }
 
     // OCPP server health
-    const healthRow = asRows(ocppHealthRows)[0];
-    if (healthRow != null) {
-      ocppConnectedStations.set(asNum(healthRow, 'connected_stations'));
-      ocppPingLatencyAvgMs.set(asFloat(healthRow, 'avg_ping_latency_ms'));
-      ocppPingLatencyMaxMs.set(asFloat(healthRow, 'max_ping_latency_ms'));
-      ocppPingSuccessRate.set(asFloat(healthRow, 'ping_success_rate'));
+    ocppConnectedStations.set(ocppHealth.connectedStations);
+    ocppPingLatencyAvgMs.set(ocppHealth.avgPingLatencyMs);
+    ocppPingLatencyMaxMs.set(ocppHealth.maxPingLatencyMs);
+    ocppPingSuccessRate.set(ocppHealth.pingSuccessRate);
+    ocppInstances.set(ocppHealth.instanceCount);
+    // Reset first so a stopped process's series disappears.
+    ocppInstanceConnectedStations.reset();
+    for (const instance of ocppHealth.instances) {
+      ocppInstanceConnectedStations.set(
+        { ocpp_instance: instance.instanceId },
+        instance.connectedStations,
+      );
     }
 
     ocppHeartbeatsTotal.set(asInt(heartbeatRows, 'count'));

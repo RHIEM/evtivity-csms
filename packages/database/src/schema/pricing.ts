@@ -14,7 +14,9 @@ import {
   jsonb,
   index,
   unique,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { chargingStations, sites } from './assets.js';
 import { drivers, fleets } from './drivers.js';
@@ -181,7 +183,23 @@ export const sessionTariffSegments = pgTable(
     durationMinutes: numeric('duration_minutes'),
     idleMinutes: numeric('idle_minutes').notNull().default('0'),
     costCents: integer('cost_cents'),
+    // The tariff prices copied when the segment opened (issue #33): a
+    // segment is priced from these, never from the editable tariff row.
+    // price_snapshot is false on rows written before the snapshot existed.
+    priceSnapshot: boolean('price_snapshot').notNull().default(false),
+    pricePerKwh: numeric('price_per_kwh'),
+    pricePerMinute: numeric('price_per_minute'),
+    pricePerSession: numeric('price_per_session'),
+    idleFeePricePerMinute: numeric('idle_fee_price_per_minute'),
+    reservationFeePerMinute: numeric('reservation_fee_per_minute'),
+    taxRate: numeric('tax_rate'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index('idx_session_tariff_segments_session').on(table.sessionId)],
+  (table) => [
+    index('idx_session_tariff_segments_session').on(table.sessionId),
+    // At most one open segment per session (migration 0330, finding B1).
+    uniqueIndex('uq_session_tariff_segments_open')
+      .on(table.sessionId)
+      .where(sql`ended_at IS NULL`),
+  ],
 );

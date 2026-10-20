@@ -11,7 +11,7 @@ import {
   chargingStations,
   vendors,
 } from '@evtivity/database';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import {
   mapConnectorTypeToCss,
   randomCssConnectorType,
@@ -65,15 +65,17 @@ export async function enableCssPair(opts: PairOptions, tx?: Executor): Promise<v
 
   // Parent station metadata feeds the device-identity keys in the config
   // defaults (ChargingStation.VendorName, ChargePointModel, etc.).
+  // opts.stationId is the OCPP identity (charging_stations.station_id).
   const [parent] = await exec
     .select({
+      id: chargingStations.id,
       model: chargingStations.model,
       serialNumber: chargingStations.serialNumber,
       firmwareVersion: chargingStations.firmwareVersion,
       vendorId: chargingStations.vendorId,
     })
     .from(chargingStations)
-    .where(eq(chargingStations.id, opts.stationId));
+    .where(eq(chargingStations.stationId, opts.stationId));
 
   let vendorName = 'EVtivity';
   if (parent?.vendorId != null) {
@@ -105,16 +107,19 @@ export async function enableCssPair(opts: PairOptions, tx?: Executor): Promise<v
     // station already has evses/connectors, mirror them. Otherwise create
     // a single default EVSE with a randomly-picked plug type so the
     // freshly-provisioned fleet has variety.
-    const existingEvses = await innerTx
-      .select({
-        evseId: evses.evseId,
-        connectorId: connectors.connectorId,
-        connectorType: connectors.connectorType,
-        maxPowerKw: connectors.maxPowerKw,
-      })
-      .from(evses)
-      .innerJoin(connectors, eq(connectors.evseId, evses.id))
-      .where(eq(evses.stationId, opts.stationId));
+    const existingEvses =
+      parent == null
+        ? []
+        : await innerTx
+            .select({
+              evseId: evses.evseId,
+              connectorId: connectors.connectorId,
+              connectorType: connectors.connectorType,
+              maxPowerKw: connectors.maxPowerKw,
+            })
+            .from(evses)
+            .innerJoin(connectors, eq(connectors.evseId, evses.id))
+            .where(eq(evses.stationId, parent.id));
 
     let pairedEvses: PairCssEvse[];
     if (existingEvses.length > 0) {
@@ -192,4 +197,105 @@ export async function disableCssPair(stationId: string, tx?: Executor): Promise<
     .update(cssStations)
     .set({ enabled: false, updatedAt: new Date() })
     .where(eq(cssStations.stationId, stationId));
+}
+
+/**
+ * Keeps a paired simulator's credentials in step with a security change made
+ * while it is offline, so it reconnects with the password and transport the
+ * CSMS now expects. Online changes reach the simulator over OCPP instead.
+ */
+export async function syncCssStationSecurity(
+  stationId: string,
+  opts: { securityProfile: number; password?: string | undefined },
+  exec: Executor = db,
+): Promise<void> {
+  const requiresTls = opts.securityProfile >= 2;
+  await exec
+    .update(cssStations)
+    .set({
+      targetUrl: requiresTls
+        ? (process.env['OCPP_TLS_SERVER_URL'] ?? 'wss://ocpp:8443')
+        : (process.env['OCPP_SERVER_URL'] ?? 'ws://ocpp:8080'),
+      ...(opts.password != null ? { password: opts.password } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(cssStations.stationId, stationId));
+}
+
+/** A connector the operator added or edited on a station, as the CSMS stores it. */
+export interface MirroredConnector {
+  evseId: number;
+  connectorId: number;
+  connectorType?: string | undefined;
+  maxPowerKw?: number | undefined;
+}
+
+/**
+ * Mirrors connectors the operator added or edited into the paired simulator's
+ * css_evses, so its next boot reports the same plugs. `stationId` is the OCPP
+ * identity (css_stations.station_id), not the internal station id. Upsert:
+ * the pairing seeds a default EVSE 1 / connector 1 the operator may replace.
+ * Fields the operator did not send keep their simulator value. No-op for a
+ * station without a paired simulator.
+ */
+export async function mirrorCssConnectors(
+  exec: Executor,
+  stationId: string,
+  rows: readonly MirroredConnector[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  const [css] = await exec
+    .select({ id: cssStations.id })
+    .from(cssStations)
+    .where(eq(cssStations.stationId, stationId));
+  if (css == null) return;
+  for (const row of rows) {
+    const connectorType =
+      row.connectorType != null ? mapConnectorTypeToCss(row.connectorType) : undefined;
+    const maxPowerW = row.maxPowerKw != null ? Math.round(row.maxPowerKw * 1000) : undefined;
+    const set = {
+      ...(connectorType != null ? { connectorType } : {}),
+      ...(maxPowerW != null ? { maxPowerW } : {}),
+    };
+    const insert = exec.insert(cssEvses).values({
+      cssStationId: css.id,
+      evseId: row.evseId,
+      connectorId: row.connectorId,
+      ...set,
+    });
+    await (Object.keys(set).length > 0
+      ? insert.onConflictDoUpdate({
+          target: [cssEvses.cssStationId, cssEvses.evseId, cssEvses.connectorId],
+          set,
+        })
+      : insert.onConflictDoNothing());
+  }
+}
+
+/**
+ * Removes deleted connectors (or a whole EVSE when `connectorId` is omitted)
+ * from the paired simulator, so it stops reporting them and the CSMS does not
+ * create them again from its StatusNotification. `stationId` is the OCPP
+ * identity. No-op for a station without a paired simulator.
+ */
+export async function removeCssConnectors(
+  exec: Executor,
+  stationId: string,
+  evseId: number,
+  connectorId?: number,
+): Promise<void> {
+  const [css] = await exec
+    .select({ id: cssStations.id })
+    .from(cssStations)
+    .where(eq(cssStations.stationId, stationId));
+  if (css == null) return;
+  await exec
+    .delete(cssEvses)
+    .where(
+      and(
+        eq(cssEvses.cssStationId, css.id),
+        eq(cssEvses.evseId, evseId),
+        ...(connectorId != null ? [eq(cssEvses.connectorId, connectorId)] : []),
+      ),
+    );
 }

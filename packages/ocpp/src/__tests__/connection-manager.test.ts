@@ -53,6 +53,19 @@ describe('ConnectionManager', () => {
     expect(cm.count()).toBe(1);
   });
 
+  it('keeps the new connection when the replaced socket closes', () => {
+    const ws1 = mockWs();
+    const ws2 = mockWs();
+    cm.add('CS-001', ws1, createSessionState('CS-001'));
+    cm.add('CS-001', ws2, createSessionState('CS-001'));
+
+    expect(cm.remove('CS-001', ws1)).toBe(false);
+    expect(cm.get('CS-001')?.ws).toBe(ws2);
+
+    expect(cm.remove('CS-001', ws2)).toBe(true);
+    expect(cm.has('CS-001')).toBe(false);
+  });
+
   it('returns undefined for unknown station', () => {
     expect(cm.get('UNKNOWN')).toBeUndefined();
     expect(cm.has('UNKNOWN')).toBe(false);
@@ -86,7 +99,7 @@ describe('ConnectionManager', () => {
     });
   });
 
-  it('calls registry.unregister on remove when registry is set', async () => {
+  it('calls registry.unregister with its own instance on remove', async () => {
     const registry = {
       register: vi.fn().mockResolvedValue(undefined),
       unregister: vi.fn().mockResolvedValue(undefined),
@@ -101,7 +114,7 @@ describe('ConnectionManager', () => {
     cmWithRegistry.remove('CS-001');
 
     await vi.waitFor(() => {
-      expect(registry.unregister).toHaveBeenCalledWith('CS-001');
+      expect(registry.unregister).toHaveBeenCalledWith('CS-001', 'instance-1');
     });
   });
 
@@ -140,7 +153,7 @@ describe('ConnectionManager', () => {
     cmWithRegistry.remove('CS-001');
 
     await vi.waitFor(() => {
-      expect(registry.unregister).toHaveBeenCalledWith('CS-001');
+      expect(registry.unregister).toHaveBeenCalledWith('CS-001', 'instance-1');
     });
 
     // The connection is removed from the in-memory map regardless of the
@@ -160,6 +173,66 @@ describe('ConnectionManager', () => {
 
     await vi.waitFor(() => {
       expect(registry.register).toHaveBeenCalledWith('CS-001', 'instance-2');
+    });
+  });
+
+  describe('refreshRegistry', () => {
+    function registryWithRefresh(refresh = vi.fn().mockResolvedValue(undefined)) {
+      return {
+        register: vi.fn().mockResolvedValue(undefined),
+        unregister: vi.fn().mockResolvedValue(undefined),
+        getInstanceId: vi.fn().mockResolvedValue(null),
+        refreshOwned: refresh,
+      };
+    }
+
+    it('refreshes every held station under this instance', async () => {
+      const registry = registryWithRefresh();
+      cm.setRegistry(registry, 'instance-3');
+      cm.add('CS-001', mockWs(), createSessionState('CS-001'));
+      cm.add('CS-002', mockWs(), createSessionState('CS-002'));
+
+      cm.refreshRegistry();
+
+      await vi.waitFor(() => {
+        expect(registry.refreshOwned).toHaveBeenCalledWith(['CS-001', 'CS-002'], 'instance-3');
+      });
+    });
+
+    it('sends nothing without stations, a registry or an instance', () => {
+      const registry = registryWithRefresh();
+      cm.refreshRegistry();
+      cm.setRegistry(registry, 'instance-3');
+      cm.refreshRegistry();
+      expect(registry.refreshOwned).not.toHaveBeenCalled();
+    });
+
+    it('does not throw when the refresh rejects', async () => {
+      const refresh = vi.fn().mockRejectedValue(new Error('redis down'));
+      const registry = registryWithRefresh(refresh);
+      cm.setRegistry(registry, 'instance-3');
+      cm.add('CS-001', mockWs(), createSessionState('CS-001'));
+
+      expect(() => {
+        cm.refreshRegistry();
+      }).not.toThrow();
+      await vi.waitFor(() => {
+        expect(refresh).toHaveBeenCalledTimes(1);
+      });
+      expect(cm.has('CS-001')).toBe(true);
+    });
+
+    it('skips a registry without refreshOwned', () => {
+      const registry = {
+        register: vi.fn().mockResolvedValue(undefined),
+        unregister: vi.fn().mockResolvedValue(undefined),
+        getInstanceId: vi.fn().mockResolvedValue(null),
+      };
+      cm.setRegistry(registry, 'instance-3');
+      cm.add('CS-001', mockWs(), createSessionState('CS-001'));
+      expect(() => {
+        cm.refreshRegistry();
+      }).not.toThrow();
     });
   });
 });

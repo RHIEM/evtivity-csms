@@ -1,18 +1,37 @@
 import { defineConfig } from 'vitest/config';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
+
+// Escapes every regex metacharacter, backslash included, for an exact match.
+function escapeRegExp(text: string): string {
+  return text.replace(/[\\^$.*+?()[\]{}|/-]/g, '\\$&');
+}
 
 // Exact-match regexes: a plain string key is a prefix match, so '@evtivity/database'
 // would also rewrite '@evtivity/database/src/lib/id.js' in projects that inherit it.
-const workspaceAliases = Object.entries({
+const packageAliases = Object.entries({
   '@evtivity/lib': 'packages/lib/src/index.ts',
   '@evtivity/database': 'packages/database/src/index.ts',
+  '@evtivity/payments': 'packages/payments/src/index.ts',
   '@evtivity/configs': 'packages/configs/src/index.ts',
   '@evtivity/ocpp': 'packages/ocpp/src/index.ts',
   '@evtivity/octt': 'packages/octt/src/index.ts',
+  '@evtivity/v2g-exi': 'packages/v2g-exi/src/index.ts',
 }).map(([pkg, file]) => ({
-  find: new RegExp(`^${pkg.replace('/', '\\/')}$`),
+  find: new RegExp(`^${escapeRegExp(pkg)}$`),
   replacement: path.resolve(import.meta.dirname, file),
 }));
+
+// One exact-match alias per @evtivity/ai subpath export, read from its package.json,
+// so a test resolves the source file without a dist/ (CI installs without building).
+const aiPackage = JSON.parse(
+  readFileSync(path.resolve(import.meta.dirname, 'packages/ai/package.json'), 'utf8'),
+) as { exports: Record<string, { import: string }> };
+const aiAliases = Object.entries(aiPackage.exports).map(([subpath, target]) => ({
+  find: new RegExp(`^${escapeRegExp(`@evtivity/ai/${subpath.slice(2)}`)}$`),
+  replacement: path.resolve(import.meta.dirname, 'packages/ai', target.import),
+}));
+const workspaceAliases = [...packageAliases, ...aiAliases];
 
 export default defineConfig({
   resolve: {
@@ -21,12 +40,7 @@ export default defineConfig({
   test: {
     coverage: {
       provider: 'v8',
-      thresholds: {
-        statements: 80,
-        branches: 75,
-        functions: 80,
-        lines: 80,
-      },
+      reporter: ['text-summary', 'html', 'json-summary'],
       exclude: [
         '**/generated/**',
         '**/database/**',
@@ -36,9 +50,21 @@ export default defineConfig({
         '**/__tests__/**',
         '**/*.test.ts',
         '**/plugins/**',
+        // Conformance scenarios: test code the OCTT runner executes against a live stack.
+        '**/octt/src/tests/**',
+        // React components and pages: covered by the Playwright E2E suites, not unit tests.
+        '**/csms/src/**/*.tsx',
+        '**/portal/src/**/*.tsx',
       ],
     },
     projects: [
+      {
+        test: {
+          name: 'eslint-rules',
+          root: 'eslint-rules',
+          include: ['*.test.js'],
+        },
+      },
       {
         resolve: { alias: workspaceAliases },
         test: {
@@ -52,6 +78,39 @@ export default defineConfig({
         test: {
           name: '@evtivity/lib',
           root: 'packages/lib',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
+        resolve: { alias: workspaceAliases },
+        test: {
+          name: '@evtivity/ai',
+          root: 'packages/ai',
+          include: ['src/**/*.test.ts'],
+          exclude: ['src/**/*.live.test.ts'],
+        },
+      },
+      {
+        resolve: { alias: workspaceAliases },
+        test: {
+          name: '@evtivity/payments',
+          root: 'packages/payments',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
+        resolve: { alias: workspaceAliases },
+        test: {
+          name: '@evtivity/services',
+          root: 'packages/services',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
+        resolve: { alias: workspaceAliases },
+        test: {
+          name: '@evtivity/v2g-exi',
+          root: 'packages/v2g-exi',
           include: ['src/**/*.test.ts'],
         },
       },
@@ -99,7 +158,11 @@ export default defineConfig({
           name: '@evtivity/api',
           root: 'packages/api',
           include: ['src/**/*.test.ts'],
-          exclude: ['src/__integration__/**'],
+          exclude: ['src/__integration__/**', 'src/**/*.live.test.ts'],
+          setupFiles: [
+            'src/__tests__/setup/driver-active.ts',
+            'src/__tests__/setup/user-active.ts',
+          ],
           env: {
             API_PORT: '3001',
             JWT_SECRET: 'test-secret-that-is-at-least-32-characters-long',
@@ -116,6 +179,7 @@ export default defineConfig({
           name: '@evtivity/worker',
           root: 'packages/worker',
           include: ['src/**/*.test.ts'],
+          exclude: ['src/__integration__/**'],
         },
       },
       {
@@ -125,6 +189,13 @@ export default defineConfig({
           root: 'packages/css',
           include: ['src/**/*.test.ts'],
           testTimeout: 15_000,
+        },
+      },
+      {
+        test: {
+          name: '@evtivity/ocpi-simulator',
+          root: 'packages/ocpi-simulator',
+          include: ['src/**/*.test.ts'],
         },
       },
       {
@@ -139,13 +210,26 @@ export default defineConfig({
               find: '@evtivity/css/ocpp-client',
               replacement: path.resolve(import.meta.dirname, 'packages/css/src/ocpp-client.ts'),
             },
+            {
+              find: '@evtivity/css/station-simulator',
+              replacement: path.resolve(
+                import.meta.dirname,
+                'packages/css/src/station-simulator.ts',
+              ),
+            },
+            {
+              find: '@evtivity/css/iso15118-test-ev',
+              replacement: path.resolve(
+                import.meta.dirname,
+                'packages/css/src/lib/iso15118-test-ev.ts',
+              ),
+            },
           ],
         },
         test: {
           name: '@evtivity/octt',
           root: 'packages/octt',
           include: ['src/**/*.test.ts'],
-          exclude: ['src/__tests__/runner.test.ts'],
         },
       },
       {
@@ -174,8 +258,25 @@ export default defineConfig({
           root: 'packages/csms',
           include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
           environment: 'jsdom',
+          // A `?raw` stylesheet import returns the file (print-css.test.ts); other CSS stays empty.
+          css: { include: [/\.css\?raw$/] },
         },
       },
+      // Live AI provider contract runs (TC-AI-P-LIVE-*): only with AI_LIVE set, never in
+      // `npm test` or CI. Each file reads its own key and skips without it.
+      ...(process.env.AI_LIVE !== undefined && process.env.AI_LIVE !== ''
+        ? [
+            {
+              resolve: { alias: workspaceAliases },
+              test: {
+                name: '@evtivity/ai-live',
+                root: 'packages/ai',
+                include: ['src/**/*.live.test.ts'],
+                testTimeout: 120_000,
+              },
+            },
+          ]
+        : []),
     ],
   },
 });

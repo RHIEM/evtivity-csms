@@ -1,4 +1,10 @@
-FROM node:24-slim AS build
+# The build output is static files, so build once on the native platform instead of
+# again under emulation for each target architecture.
+FROM --platform=$BUILDPLATFORM node:24-slim AS build
+# A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
 
 WORKDIR /app
 
@@ -27,7 +33,7 @@ COPY --chmod=755 packages/csms/docker-runtime-config.sh /docker-entrypoint.d/40-
 VOLUME ["/tmp"]
 
 LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
-LABEL org.opencontainers.image.license="LicenseRef-EVtivity-EULA"
+LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 
 EXPOSE 8080

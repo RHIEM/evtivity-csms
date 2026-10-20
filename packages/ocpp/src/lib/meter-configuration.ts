@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { z } from 'zod';
+import { tryParseJson } from '@evtivity/lib';
 
 // OCPP 1.6 has no message for the public key of a calibration-law meter.
 // German stations (e.g. KEBA KC-P30) announce it after boot with
@@ -37,12 +38,6 @@ export function isMeterConfiguration(vendorId: unknown, messageId: unknown): boo
 // Returns null when data is not valid JSON or does not match the expected shape.
 export function parseMeterConfiguration(data: unknown): MeterConfiguration | null {
   if (typeof data !== 'string') return null;
-  let json: unknown;
-  try {
-    json = JSON.parse(data);
-  } catch {
-    return null;
-  }
-  const result = meterConfigurationSchema.safeParse(json);
+  const result = meterConfigurationSchema.safeParse(tryParseJson(data));
   return result.success ? result.data : null;
 }

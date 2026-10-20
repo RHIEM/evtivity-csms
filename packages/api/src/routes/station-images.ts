@@ -5,7 +5,13 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and, asc, desc } from 'drizzle-orm';
-import { db, writeAudit, stationImageAuditLog } from '@evtivity/database';
+import {
+  db,
+  writeAudit,
+  stationImageAuditLog,
+  pgErrorCode,
+  PG_FOREIGN_KEY_VIOLATION,
+} from '@evtivity/database';
 import { stationImages } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -25,6 +31,15 @@ import {
   deleteObject,
   buildStationImageS3Key,
 } from '../services/s3.service.js';
+
+/** True for a key the upload-url route builds for this station: one object
+ *  name directly under stations/{stationId}/ (buildStationImageS3Key). */
+function isStationImageKey(stationId: string, key: string): boolean {
+  const prefix = `stations/${stationId}/`;
+  if (!key.startsWith(prefix)) return false;
+  const name = key.slice(prefix.length);
+  return name.length > 0 && !name.includes('/');
+}
 
 const stationIdParams = z.object({
   id: z.string().min(1).describe('Station ID'),
@@ -133,14 +148,18 @@ export function stationImageRoutes(app: FastifyInstance): void {
         operationId: 'listStationImages',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationIdParams),
-        response: { 200: arrayResponse(imageItem) },
+        response: {
+          200: arrayResponse(imageItem),
+          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { id } = request.params as z.infer<typeof stationIdParams>;
       const { userId } = request.user as { userId: string };
       if (!(await checkStationSiteAccess(id, userId))) {
-        return [];
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
       }
       return db
         .select()
@@ -213,7 +232,10 @@ export function stationImageRoutes(app: FastifyInstance): void {
         body: zodSchema(confirmUploadBody),
         response: {
           201: itemResponse(imageItem),
-          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          400: errorWith('Validation error or S3 not configured', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.STORAGE_NOT_CONFIGURED,
+          ]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
         },
       },
@@ -225,6 +247,25 @@ export function stationImageRoutes(app: FastifyInstance): void {
 
       if (!(await checkStationSiteAccess(id, userId))) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
+      }
+
+      // The object must be one the upload-url route issued for this station:
+      // the configured bucket and a key directly under stations/{id}/. A body
+      // naming another bucket, or another station's object, would let this
+      // station's download and delete routes reach it.
+      const s3 = await getS3Config();
+      if (s3 == null) {
+        await reply
+          .status(400)
+          .send({ error: 'S3 not configured', code: 'STORAGE_NOT_CONFIGURED' });
+        return;
+      }
+      if (!isStationImageKey(id, body.s3Key) || body.s3Bucket !== s3.bucket) {
+        await reply.status(400).send({
+          error: 'The image key or bucket does not belong to this station',
+          code: 'VALIDATION_ERROR',
+        });
         return;
       }
 
@@ -256,7 +297,7 @@ export function stationImageRoutes(app: FastifyInstance): void {
             fileSize: body.fileSize,
             contentType: body.contentType,
             s3Key: body.s3Key,
-            s3Bucket: body.s3Bucket,
+            s3Bucket: s3.bucket,
             caption: body.caption ?? null,
             tags: body.tags ?? [],
             isDriverVisible: body.isDriverVisible ?? false,
@@ -270,11 +311,7 @@ export function stationImageRoutes(app: FastifyInstance): void {
         // station can be deleted between that check and this INSERT. Map
         // the FK violation back to the same 404 the pre-check would have
         // produced.
-        if (
-          typeof err === 'object' &&
-          err !== null &&
-          (err as { code?: string }).code === '23503'
-        ) {
+        if (pgErrorCode(err) === PG_FOREIGN_KEY_VIOLATION) {
           await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
           return;
         }

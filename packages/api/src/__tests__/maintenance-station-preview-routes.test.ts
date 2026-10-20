@@ -40,7 +40,8 @@ function makeChain(): Record<string, unknown> {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: { select: vi.fn(() => makeChain()) },
   client: vi.fn(),
   maintenanceEvents: { id: 'id', siteId: 'siteId', status: 'status', plannedStartAt: 'p' },
@@ -87,11 +88,11 @@ vi.mock('../lib/site-access.js', () => ({
   getUserSiteIds: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('../lib/station-derived-status.js', () => ({
+vi.mock('@evtivity/services/station-derived-status', () => ({
   buildDerivedStatusSubquery: vi.fn(() => 'DERIVED_STATUS_SQL'),
 }));
 
-vi.mock('../services/maintenance.service.js', () => ({
+vi.mock('@evtivity/services/maintenance.service', () => ({
   createEvent: vi.fn(),
   cancelEvent: vi.fn(),
   updateEvent: vi.fn(),
@@ -182,5 +183,8 @@ describe('Maintenance station-preview route', () => {
     expect(body[0]?.['status']).toBe('charging');
     expect(body[0]?.['hasActiveSession']).toBe(false);
     expect(body[0]?.['upcomingReservationCount']).toBe(0);
+    // Maintenance never reaches a conformance test station.
+    const { isOperatorStation } = await import('@evtivity/database');
+    expect(vi.mocked(isOperatorStation)).toHaveBeenCalled();
   });
 });

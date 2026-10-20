@@ -8,11 +8,13 @@ import { Send } from 'lucide-react';
 import { useTab } from '@/hooks/use-tab';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { SaveButton } from '@/components/save-button';
+import { CopyableId } from '@/components/copyable-id';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
@@ -76,12 +78,13 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
   const [twilioAuthToken, setTwilioAuthToken] = useState('');
   const [twilioFromNumber, setTwilioFromNumber] = useState('');
 
+  const [webhookAllowedHosts, setWebhookAllowedHosts] = useState('');
+
   const [testEmailRecipient, setTestEmailRecipient] = useState('');
   const [testSmsRecipient, setTestSmsRecipient] = useState('');
 
   const [emailWrapperTemplate, setEmailWrapperTemplate] = useState(DEFAULT_EMAIL_WRAPPER);
   const [notificationSubTab, setNotificationSubTab] = useTab('smtp', 'sub');
-  const [copiedVar, setCopiedVar] = useState<string | null>(null);
 
   useEffect(() => {
     if (settings == null) return;
@@ -99,6 +102,10 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
     setTwilioAccountSid(s('twilio.accountSid'));
     setTwilioAuthToken(s('twilio.authTokenEnc'));
     setTwilioFromNumber(s('twilio.fromNumber'));
+    const hosts = settings['notifications.webhookAllowedPrivateHosts'];
+    setWebhookAllowedHosts(
+      Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string').join('\n') : '',
+    );
     const wrapper = s('email.wrapperTemplate');
     setEmailWrapperTemplate(wrapper !== '' ? wrapper : DEFAULT_EMAIL_WRAPPER);
   }, [settings]);
@@ -130,6 +137,14 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
         api.put('/v1/settings/twilio.authTokenEnc', { value: vals.authToken }),
         api.put('/v1/settings/twilio.fromNumber', { value: vals.fromNumber }),
       ]),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
+  const webhookMutation = useMutation({
+    mutationFn: (hosts: string[]) =>
+      api.put('/v1/settings/notifications.webhookAllowedPrivateHosts', { value: hosts }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['settings'] });
     },
@@ -178,6 +193,7 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
       <TabsList>
         <TabsTrigger value="smtp">{t('settings.smtp')}</TabsTrigger>
         <TabsTrigger value="twilio">{t('settings.twilio')}</TabsTrigger>
+        <TabsTrigger value="webhooks">{t('settings.webhooks')}</TabsTrigger>
         <TabsTrigger value="emailLayout">{t('settings.emailLayout')}</TabsTrigger>
       </TabsList>
       <TabsContent value="smtp" className="mt-4">
@@ -190,7 +206,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="smtp-host">{t('settings.smtpHost')}</Label>
+                <Label htmlFor="smtp-host" className="leading-6">
+                  {t('settings.smtpHost')}
+                </Label>
                 <Input
                   id="smtp-host"
                   value={smtpHost}
@@ -202,7 +220,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="smtp-port">{t('settings.smtpPort')}</Label>
+                <Label htmlFor="smtp-port" className="leading-6">
+                  {t('settings.smtpPort')}
+                </Label>
                 <Input
                   id="smtp-port"
                   type="number"
@@ -214,7 +234,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="smtp-username">{t('settings.smtpUsername')}</Label>
+                <Label htmlFor="smtp-username" className="leading-6">
+                  {t('settings.smtpUsername')}
+                </Label>
                 <Input
                   id="smtp-username"
                   value={smtpUsername}
@@ -225,7 +247,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="smtp-password">{t('settings.smtpPassword')}</Label>
+                <Label htmlFor="smtp-password" className="leading-6">
+                  {t('settings.smtpPassword')}
+                </Label>
                 <PasswordInput
                   id="smtp-password"
                   value={smtpPassword}
@@ -236,7 +260,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="smtp-from">{t('settings.smtpFrom')}</Label>
+                <Label htmlFor="smtp-from" className="leading-6">
+                  {t('settings.smtpFrom')}
+                </Label>
                 <Input
                   id="smtp-from"
                   value={smtpFrom}
@@ -314,7 +340,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="twilio-sid">{t('settings.twilioAccountSid')}</Label>
+                <Label htmlFor="twilio-sid" className="leading-6">
+                  {t('settings.twilioAccountSid')}
+                </Label>
                 <Input
                   id="twilio-sid"
                   value={twilioAccountSid}
@@ -325,7 +353,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="twilio-token">{t('settings.twilioAuthToken')}</Label>
+                <Label htmlFor="twilio-token" className="leading-6">
+                  {t('settings.twilioAuthToken')}
+                </Label>
                 <PasswordInput
                   id="twilio-token"
                   value={twilioAuthToken}
@@ -336,7 +366,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="twilio-from">{t('settings.twilioFromNumber')}</Label>
+                <Label htmlFor="twilio-from" className="leading-6">
+                  {t('settings.twilioFromNumber')}
+                </Label>
                 <Input
                   id="twilio-from"
                   value={twilioFromNumber}
@@ -402,6 +434,55 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
           </CardContent>
         </Card>
       </TabsContent>
+      <TabsContent value="webhooks" className="mt-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>{t('settings.webhooks')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">{t('settings.webhooksDescription')}</p>
+            <div className="space-y-2">
+              <Label htmlFor="webhook-allowed-hosts" className="leading-6">
+                {t('settings.webhookAllowedPrivateHosts')}
+              </Label>
+              <Textarea
+                id="webhook-allowed-hosts"
+                rows={3}
+                value={webhookAllowedHosts}
+                onChange={(e) => {
+                  setWebhookAllowedHosts(e.target.value);
+                }}
+                placeholder="automation.internal.example"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.webhookAllowedPrivateHostsHint')}
+              </p>
+            </div>
+            <div className="flex justify-end gap-2">
+              <SaveButton
+                isPending={webhookMutation.isPending}
+                type="button"
+                onClick={() => {
+                  webhookMutation.mutate(
+                    webhookAllowedHosts
+                      .split(/[\s,]+/)
+                      .map((h) => h.trim())
+                      .filter((h) => h !== ''),
+                  );
+                }}
+              />
+            </div>
+            {webhookMutation.isSuccess && (
+              <p className="text-sm text-green-600">{t('settings.webhooksSaved')}</p>
+            )}
+            {webhookMutation.isError && (
+              <p className="text-sm text-destructive">
+                {t('settings.webhooksSaveFailed')} {getErrorMessage(webhookMutation.error, t)}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      </TabsContent>
       <TabsContent value="emailLayout" className="mt-4">
         <Card>
           <CardHeader>
@@ -426,33 +507,20 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                   'companyCountry',
                   'companyCurrency',
                 ].map((v) => (
-                  <span key={v} className="relative">
-                    <button
-                      type="button"
-                      className="cursor-pointer rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/70 active:bg-primary/10"
-                      onClick={() => {
-                        void navigator.clipboard.writeText(`{{${v}}}`);
-                        setCopiedVar(v);
-                        setTimeout(() => {
-                          setCopiedVar((cur) => (cur === v ? null : cur));
-                        }, 1500);
-                      }}
-                    >
-                      {`{{${v}}}`}
-                    </button>
-                    {copiedVar === v && (
-                      <span className="absolute -top-7 left-1/2 -translate-x-1/2 rounded bg-foreground px-1.5 py-0.5 text-xs text-background">
-                        Copied
-                      </span>
-                    )}
-                  </span>
+                  <CopyableId
+                    key={v}
+                    id={`{{${v}}}`}
+                    className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
+                  />
                 ))}
               </div>
             </div>
 
             <div className="grid gap-4 lg:grid-cols-2">
               <div className="space-y-3">
-                <Label htmlFor="email-wrapper-template">HTML Template</Label>
+                <Label htmlFor="email-wrapper-template" className="leading-6">
+                  HTML Template
+                </Label>
                 <textarea
                   id="email-wrapper-template"
                   className="h-[500px] w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"
@@ -492,7 +560,7 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
               </div>
 
               <div className="space-y-3">
-                <Label>{t('settings.emailLayoutPreview')}</Label>
+                <Label className="leading-6">{t('settings.emailLayoutPreview')}</Label>
                 {previewError != null && (
                   <p className="text-sm text-destructive">
                     {t('settings.emailLayoutInvalid')} {previewError}
@@ -500,7 +568,7 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 )}
                 <div className="overflow-hidden rounded-md border">
                   <iframe
-                    title="Email layout preview"
+                    title={t('settings.emailLayoutPreviewFrame')}
                     srcDoc={preview.data?.html ?? ''}
                     className="h-[500px] w-full"
                     sandbox=""

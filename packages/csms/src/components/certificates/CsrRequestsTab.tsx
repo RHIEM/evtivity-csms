@@ -97,7 +97,7 @@ export function CsrRequestsTab(): React.JSX.Element {
                 onChange={(e) => {
                   setCsrStatusFilter(e.target.value);
                 }}
-                className="hidden h-9 w-32 md:block"
+                className="hidden w-32 md:block"
               >
                 <option value="">{t('common.all')}</option>
                 <option value="pending">{t('pnc.pending')}</option>
@@ -113,7 +113,7 @@ export function CsrRequestsTab(): React.JSX.Element {
                   onChange={(e) => {
                     setCsrStatusFilter(e.target.value);
                   }}
-                  className="h-9 w-32"
+                  className="w-32"
                 >
                   <option value="">{t('common.all')}</option>
                   <option value="pending">{t('pnc.pending')}</option>
@@ -204,7 +204,9 @@ export function CsrRequestsTab(): React.JSX.Element {
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">{t('pnc.signCsrDescription')}</p>
             <div className="space-y-2">
-              <Label htmlFor="signed-chain">{t('pnc.signedCertificateChain')}</Label>
+              <Label htmlFor="signed-chain" className="leading-6">
+                {t('pnc.signedCertificateChain')}
+              </Label>
               <textarea
                 id="signed-chain"
                 className="h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"

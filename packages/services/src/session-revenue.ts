@@ -1,0 +1,406 @@
+// Copyright (c) 2024-2026 EVtivity. All rights reserved.
+// SPDX-License-Identifier: BUSL-1.1
+
+import { sql, type SQL } from 'drizzle-orm';
+import { db, paymentRecords, operatorStationIdSql } from '@evtivity/database';
+import { revenueFromGrossGroups } from '@evtivity/lib';
+import type { TaxTotals } from '@evtivity/lib';
+import { inCompanyCurrency } from './company-currency.js';
+
+/**
+ * Aggregate of payment records as revenue counts a payment: per record the
+ * amount captured minus the amount refunded, never below 0, summed over the
+ * records in the company currency only. Used by the payment breakdowns
+ * (dashboard and revenue report). Postgres returns the sum as bigint.
+ */
+export function paymentsKeptCentsSql(companyCurrency: string): SQL {
+  return sql`coalesce(sum(greatest(coalesce(${paymentRecords.capturedAmountCents}, 0) - ${paymentRecords.refundedAmountCents}, 0)) filter (where ${inCompanyCurrency(paymentRecords.currency, companyCurrency)}), 0)`;
+}
+
+/**
+ * The one revenue definition. The dashboard, site and station metrics, the
+ * revenue and driver activity reports, the dashboard snapshot worker, and the
+ * Prometheus revenue gauge all read revenue through queryRevenue, so they
+ * agree on what counts.
+ *
+ * Revenue is what was billed in the company currency, minus refunds:
+ *
+ * - An ended session: its final cost (final_cost_cents) minus the amount
+ *   refunded on its payment record, never below 0. Active sessions (no final
+ *   cost yet) are not revenue: their running cost is an estimate. Dated by
+ *   the session start, attributed to the session's station.
+ * - A reservation fee (cancellation or no-show payment record, captured or
+ *   refunded): the amount captured minus the amount refunded. Dated by the
+ *   charge, attributed to the reservation's station.
+ *
+ * - An account session (charge on account, billing_mode 'account', no
+ *   payment record): revenue only once its fleet invoice is paid, dated by
+ *   the invoice's paid_at (the collection date), so the daily snapshot of
+ *   that day counts it. Until then (unbilled, invoiced and unpaid, or
+ *   released by a credit note) a session with a cost is "billed on account":
+ *   counted in billedOnAccountCents, not in revenue. A zero-cost account
+ *   session counts like any free session.
+ *
+ * Every amount includes tax. A session without a refund counts the net
+ * amount and tax stored with its final cost (net_cents, tax_cents, written by
+ * the one cost assembly in @evtivity/database session-pricing; exact per
+ * tariff segment). A partly refunded session and a fee are split at their
+ * rate (revenueFromGrossGroups in @evtivity/lib/price-display): the session
+ * at its tariff snapshot rate (tariff_tax_rate), a fee at the rate it was
+ * taxed at (payment_records.tax_rate).
+ *
+ * Profit needs the electricity cost of each session. A session that delivered
+ * energy but has no electricity cost (its site has no rate periods, none
+ * matched its end time, or its station has no site) is "cost missing":
+ * counted in revenue as usual, and in costMissing* so profit can leave it out
+ * (profitCents). A session without energy costs nothing, so it is never cost
+ * missing. Fees have no electricity cost.
+ *
+ * Sessions and reservation fees of conformance test stations are never
+ * revenue: every caller aggregates, so the items leave them out.
+ */
+function sessionItemsSql(companyCurrency: string, extraWhere: SQL): SQL {
+  return sql`
+    SELECT CASE WHEN cs.billing_mode = 'account' AND pr.id IS NULL AND inv.status = 'paid'
+                THEN coalesce(inv.paid_at, cs.started_at) ELSE cs.started_at END AS occurred_at,
+           cs.station_id,
+           cs.site_id,
+           cs.driver_id,
+           coalesce(cs.tariff_tax_rate, 0)::text AS tax_rate,
+           greatest(cs.final_cost_cents - coalesce(pr.refunded_amount_cents, 0), 0) AS gross_cents,
+           CASE WHEN coalesce(pr.refunded_amount_cents, 0) = 0 AND cs.net_cents IS NOT NULL
+                THEN cs.net_cents END AS net_cents,
+           CASE WHEN coalesce(pr.refunded_amount_cents, 0) = 0 AND cs.net_cents IS NOT NULL
+                THEN cs.tax_cents END AS tax_cents,
+           CASE WHEN cs.billing_mode = 'account' AND pr.id IS NULL AND cs.final_cost_cents > 0
+                     AND inv.status IS DISTINCT FROM 'paid'
+                THEN 'account' ELSE 'session' END AS source,
+           (cs.electricity_cost_cents IS NULL
+             AND coalesce(cs.energy_delivered_wh, 0) > 0) AS cost_missing,
+           cs.electricity_cost_cents
+    FROM charging_sessions cs
+    LEFT JOIN payment_records pr ON pr.session_id = cs.id
+    LEFT JOIN invoices inv ON inv.id = cs.invoice_id
+    WHERE cs.final_cost_cents IS NOT NULL
+      AND upper(cs.currency) = ${companyCurrency}
+      AND ${sql.raw(operatorStationIdSql('cs.station_id'))}
+      ${extraWhere}
+  `;
+}
+
+/**
+ * The revenue items. With `occurredSince`, only the items that can have
+ * happened since then are read, through indexed conditions: sessions started
+ * since then, account sessions started earlier whose invoice was paid since
+ * then, and fees charged since then. The caller still filters on occurred_at.
+ */
+function revenueItemsSql(companyCurrency: string, occurredSince?: Date): SQL {
+  const since = occurredSince?.toISOString();
+  const sessions =
+    since == null
+      ? sessionItemsSql(companyCurrency, sql``)
+      : sql`${sessionItemsSql(companyCurrency, sql`AND cs.started_at >= ${since}::timestamptz`)}
+    UNION ALL
+    ${sessionItemsSql(
+      companyCurrency,
+      sql`AND cs.started_at < ${since}::timestamptz
+      AND cs.billing_mode = 'account'
+      AND inv.status = 'paid'
+      AND inv.paid_at >= ${since}::timestamptz`,
+    )}`;
+  return sql`
+    ${sessions}
+    UNION ALL
+    SELECT pr.created_at AS occurred_at,
+           r.station_id,
+           st.site_id,
+           pr.driver_id,
+           coalesce(pr.tax_rate, 0)::text AS tax_rate,
+           greatest(coalesce(pr.captured_amount_cents, 0) - pr.refunded_amount_cents, 0) AS gross_cents,
+           NULL::integer AS net_cents,
+           NULL::integer AS tax_cents,
+           'fee'::text AS source,
+           false AS cost_missing,
+           NULL::integer AS electricity_cost_cents
+    FROM payment_records pr
+    LEFT JOIN reservations r ON r.id = pr.reservation_id
+    LEFT JOIN charging_stations st ON st.id = r.station_id
+    WHERE pr.charge_type <> 'session'
+      AND pr.status IN ('captured', 'partially_refunded', 'refunded')
+      AND upper(pr.currency) = ${companyCurrency}
+      AND ${sql.raw(operatorStationIdSql('r.station_id'))}
+      ${since == null ? sql`` : sql`AND pr.created_at >= ${since}::timestamptz`}
+  `;
+}
+
+/**
+ * Columns of a revenue item, for the `key` and `where` of queryRevenue:
+ * when it happened (session start or fee charge), its station, site, and
+ * driver. A session's site is the one it happened at (charging_sessions.site_id,
+ * kept when the station moves); a reservation fee's is its station's site.
+ */
+export const revenueItem = {
+  occurredAt: sql.raw('ri.occurred_at'),
+  stationId: sql.raw('ri.station_id'),
+  siteId: sql.raw('ri.site_id'),
+  driverId: sql.raw('ri.driver_id'),
+} as const;
+
+/** Condition: revenue items at one of the sites (an operator's site access). */
+export function revenueAtSites(siteIds: readonly string[]): SQL {
+  if (siteIds.length === 0) return sql`false`;
+  return sql`${revenueItem.siteId} IN (${sql.join(
+    siteIds.map((id) => sql`${id}`),
+    sql`, `,
+  )})`;
+}
+
+/** Revenue of a group of items, in cents of the company currency. */
+export interface RevenueTotals extends TaxTotals {
+  /** Ended sessions billed in the company currency. */
+  sessionCount: number;
+  /** Revenue of those sessions, tax included (grossCents without fees). */
+  sessionGrossCents: number;
+  /** Billed sessions plus reservation fee charges. */
+  itemCount: number;
+  /**
+   * Account sessions not paid yet (unbilled, or on an unpaid fleet invoice),
+   * tax included: billed on account, not revenue.
+   */
+  billedOnAccountCents: number;
+  /** The number of those account sessions. */
+  billedOnAccountCount: number;
+  /**
+   * Electricity cost of those account sessions. Profit leaves it out until
+   * the invoice is paid, as it leaves out their revenue (profitCents).
+   */
+  billedOnAccountElectricityCostCents: number;
+  /**
+   * Billed sessions (in sessionCount) that delivered energy but have no
+   * electricity cost. Profit leaves them out (profitCents).
+   */
+  costMissingCount: number;
+  /** Revenue of those sessions, tax included. */
+  costMissingGrossCents: number;
+  /** Revenue of those sessions, tax excluded. */
+  costMissingNetCents: number;
+}
+
+export const EMPTY_REVENUE: RevenueTotals = {
+  netCents: 0,
+  taxCents: 0,
+  grossCents: 0,
+  sessionCount: 0,
+  sessionGrossCents: 0,
+  itemCount: 0,
+  billedOnAccountCents: 0,
+  billedOnAccountCount: 0,
+  billedOnAccountElectricityCostCents: 0,
+  costMissingCount: 0,
+  costMissingGrossCents: 0,
+  costMissingNetCents: 0,
+};
+
+/** Revenue items of one key, tax rate, amount, and source, as the database returns them. */
+export interface RevenueRow {
+  key: string | null;
+  taxRate: string;
+  grossCents: number | string;
+  /** The stored net amount and tax of the amount, when known (null splits at the rate). */
+  netCents?: number | string | null;
+  taxCents?: number | string | null;
+  source: string;
+  /** A billed session with energy but no electricity cost (see revenueItemsSql). */
+  costMissing?: boolean | null;
+  /** Sum of the electricity cost of the items of the row (null when none has one). */
+  electricityCostCents?: number | string | null;
+  count: number | string;
+}
+
+/** Revenue excluding tax of rows: the stored split when known, else split at the rate. */
+function netOfRows(rows: readonly RevenueRow[]): TaxTotals {
+  const split = revenueFromGrossGroups(
+    rows
+      .filter((r) => r.netCents == null || r.taxCents == null)
+      .map((r) => ({
+        taxRate: Number(r.taxRate),
+        grossCents: Number(r.grossCents),
+        count: Number(r.count),
+      })),
+  );
+  for (const r of rows) {
+    if (r.netCents == null || r.taxCents == null) continue;
+    const count = Number(r.count);
+    split.netCents += Number(r.netCents) * count;
+    split.taxCents += Number(r.taxCents) * count;
+    split.grossCents += Number(r.grossCents) * count;
+  }
+  return split;
+}
+
+/** Revenue per key from grouped revenue rows. */
+export function aggregateRevenueRows(
+  rows: readonly RevenueRow[],
+): Map<string | null, RevenueTotals> {
+  const byKey = new Map<string | null, RevenueRow[]>();
+  for (const row of rows) {
+    const list = byKey.get(row.key);
+    if (list == null) byKey.set(row.key, [row]);
+    else list.push(row);
+  }
+  const result = new Map<string | null, RevenueTotals>();
+  for (const [key, all] of byKey) {
+    // Unpaid account sessions are billed on account, not revenue.
+    const list = all.filter((r) => r.source !== 'account');
+    let billedOnAccountCents = 0;
+    let billedOnAccountCount = 0;
+    let billedOnAccountElectricityCostCents = 0;
+    for (const r of all) {
+      if (r.source !== 'account') continue;
+      const count = Number(r.count);
+      billedOnAccountCount += count;
+      billedOnAccountCents += Number(r.grossCents) * count;
+      billedOnAccountElectricityCostCents += Number(r.electricityCostCents ?? 0);
+    }
+    const split = netOfRows(list);
+    const costMissing = list.filter((r) => r.source === 'session' && r.costMissing === true);
+    const missing = netOfRows(costMissing);
+    let costMissingCount = 0;
+    for (const r of costMissing) costMissingCount += Number(r.count);
+    let sessionCount = 0;
+    let sessionGrossCents = 0;
+    let itemCount = 0;
+    for (const r of list) {
+      const count = Number(r.count);
+      itemCount += count;
+      if (r.source === 'session') {
+        sessionCount += count;
+        sessionGrossCents += Number(r.grossCents) * count;
+      }
+    }
+    result.set(key, {
+      ...split,
+      sessionCount,
+      sessionGrossCents,
+      itemCount,
+      billedOnAccountCents,
+      billedOnAccountCount,
+      billedOnAccountElectricityCostCents,
+      costMissingCount,
+      costMissingGrossCents: missing.grossCents,
+      costMissingNetCents: missing.netCents,
+    });
+  }
+  return result;
+}
+
+/** The sum of several revenue totals. */
+export function sumRevenue(totals: Iterable<RevenueTotals>): RevenueTotals {
+  const sum = { ...EMPTY_REVENUE };
+  for (const t of totals) {
+    sum.netCents += t.netCents;
+    sum.taxCents += t.taxCents;
+    sum.grossCents += t.grossCents;
+    sum.sessionCount += t.sessionCount;
+    sum.sessionGrossCents += t.sessionGrossCents;
+    sum.itemCount += t.itemCount;
+    sum.billedOnAccountCents += t.billedOnAccountCents;
+    sum.billedOnAccountCount += t.billedOnAccountCount;
+    sum.billedOnAccountElectricityCostCents += t.billedOnAccountElectricityCostCents;
+    sum.costMissingCount += t.costMissingCount;
+    sum.costMissingGrossCents += t.costMissingGrossCents;
+    sum.costMissingNetCents += t.costMissingNetCents;
+  }
+  return sum;
+}
+
+/**
+ * Profit in cents: revenue excluding tax minus electricity cost, over the
+ * revenue items with a known electricity cost. Sessions without one
+ * (costMissing*) are left out, so their revenue is not counted as profit.
+ * Unpaid account sessions are not revenue yet, so their electricity cost is
+ * left out too until the invoice is paid. `electricityCostCents` is the cost
+ * of the same sessions the revenue covers (same sites, period by session
+ * start, company currency). May be negative.
+ */
+export function profitCents(revenue: RevenueTotals, electricityCostCents: number): number {
+  return profitOf({ ...revenue, electricityCostCents });
+}
+
+/** profitCents from its parts, for a caller that keeps them in its own rows (revenue report). */
+export function profitOf(parts: {
+  netCents: number;
+  costMissingNetCents: number;
+  electricityCostCents: number;
+  billedOnAccountElectricityCostCents: number;
+}): number {
+  return (
+    parts.netCents -
+    parts.costMissingNetCents -
+    (parts.electricityCostCents - parts.billedOnAccountElectricityCostCents)
+  );
+}
+
+/**
+ * Revenue in the company currency, grouped by `key` (an expression over
+ * `revenueItem` columns, such as a day or a site id; omitted for one total
+ * under the key null) and filtered by `where` (conditions over the same
+ * columns). The map has an entry only for keys with revenue items.
+ */
+export async function queryRevenue(input: {
+  companyCurrency: string;
+  key?: SQL | undefined;
+  where?: readonly SQL[] | undefined;
+  /** Only items that happened at or after this instant, read through indexes. */
+  occurredSince?: Date | undefined;
+}): Promise<Map<string | null, RevenueTotals>> {
+  const key = input.key ?? sql`NULL::text`;
+  const conditions = [...(input.where ?? [])];
+  if (input.occurredSince != null) {
+    conditions.push(
+      sql`${revenueItem.occurredAt} >= ${input.occurredSince.toISOString()}::timestamptz`,
+    );
+  }
+  const where = conditions.length > 0 ? sql`WHERE ${sql.join(conditions, sql` AND `)}` : sql``;
+  const rows = await db.execute<{
+    key: string | null;
+    tax_rate: string;
+    gross_cents: string | number;
+    net_cents: string | number | null;
+    tax_cents: string | number | null;
+    source: string;
+    cost_missing: boolean;
+    electricity_cost_cents: string | number | null;
+    count: string | number;
+  }>(sql`
+    SELECT (${key})::text AS key, ri.tax_rate, ri.gross_cents, ri.net_cents, ri.tax_cents,
+           ri.source, ri.cost_missing, sum(ri.electricity_cost_cents) AS electricity_cost_cents,
+           count(*) AS count
+    FROM (${revenueItemsSql(input.companyCurrency, input.occurredSince)}) AS ri
+    ${where}
+    GROUP BY 1, 2, 3, 4, 5, 6, 7
+  `);
+  return aggregateRevenueRows(
+    rows.map((r) => ({
+      key: r.key,
+      taxRate: r.tax_rate,
+      grossCents: r.gross_cents,
+      netCents: r.net_cents,
+      taxCents: r.tax_cents,
+      source: r.source,
+      costMissing: r.cost_missing,
+      electricityCostCents: r.electricity_cost_cents,
+      count: r.count,
+    })),
+  );
+}
+
+/** queryRevenue without a key: the total. */
+export async function queryRevenueTotal(input: {
+  companyCurrency: string;
+  where?: readonly SQL[] | undefined;
+  occurredSince?: Date | undefined;
+}): Promise<RevenueTotals> {
+  const byKey = await queryRevenue(input);
+  return byKey.get(null) ?? EMPTY_REVENUE;
+}

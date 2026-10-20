@@ -65,7 +65,8 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
     select: vi.fn(() => makeChain()),
@@ -87,8 +88,8 @@ vi.mock('@evtivity/database', () => ({
   transactionEventTypeEnum: {
     enumValues: ['Started', 'Updated', 'Ended'] as const,
   },
-  chargingSessions: {},
-  chargingStations: {},
+  chargingSessions: { stationId: 'cs.station_id', transactionId: 'cs.transaction_id' },
+  chargingStations: { id: 'st.id', stationId: 'st.station_id' },
   sessionStatusEnum: {
     enumValues: ['active', 'completed', 'invalid', 'faulted', 'failed'] as const,
   },
@@ -116,6 +117,7 @@ vi.mock('../lib/site-access.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { transactionRoutes } from '../routes/transactions.js';
+import * as drizzleOrmModule from 'drizzle-orm';
 
 const VALID_SESSION_ID = 'ses_000000000001';
 
@@ -285,6 +287,19 @@ describe('Transaction routes', () => {
       expect(body.total).toBe(0);
     });
 
+    it('never lists the events of a session at a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.inOperatorStation).mockClear();
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/transactions',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.inOperatorStation)).toHaveBeenCalled();
+    });
+
     it('defaults total to 0 when count row is missing', async () => {
       setupDbResults([], []);
 
@@ -335,7 +350,8 @@ describe('Transaction routes', () => {
         makeEvent({ id: 1, sessionId: VALID_SESSION_ID, seqNo: 1, triggerReason: 'Authorized' }),
         makeEvent({ id: 2, sessionId: VALID_SESSION_ID, seqNo: 2, triggerReason: 'EVConnected' }),
       ];
-      setupDbResults(events);
+      // The session lookup (site check), then the events.
+      setupDbResults([{ siteId: 'sit_000000000001' }], events);
 
       const res = await app.inject({
         method: 'GET',
@@ -347,8 +363,20 @@ describe('Transaction routes', () => {
       expect(body).toEqual(events);
     });
 
-    it('returns empty array when session has no events', async () => {
+    it('returns 404 SESSION_NOT_FOUND for an unknown session', async () => {
       setupDbResults([]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/transactions/by-session/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+    });
+
+    it('returns empty array when session has no events', async () => {
+      setupDbResults([{ siteId: 'sit_000000000001' }], []);
 
       const res = await app.inject({
         method: 'GET',
@@ -376,7 +404,7 @@ describe('Transaction routes', () => {
     it('returns 401 without token', async () => {
       const res = await app.inject({
         method: 'GET',
-        url: '/transactions/by-transaction-id/txn-001',
+        url: '/transactions/by-transaction-id/txn-001?stationId=CS-001',
       });
       expect(res.statusCode).toBe(401);
     });
@@ -388,17 +416,30 @@ describe('Transaction routes', () => {
         stationId: 'station-1',
         status: 'completed',
       });
-      setupDbResults([session]);
+      setupDbResults([{ session }]);
 
       const res = await app.inject({
         method: 'GET',
-        url: '/transactions/by-transaction-id/txn-001',
+        url: '/transactions/by-transaction-id/txn-001?stationId=CS-001',
         headers: { authorization: `Bearer ${operatorToken}` },
       });
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.transactionId).toBe('txn-001');
       expect(body.status).toBe('completed');
+      // A transactionId is unique per station only: the lookup names both.
+      const { eq } = drizzleOrmModule;
+      expect(eq).toHaveBeenCalledWith('st.station_id', 'CS-001');
+      expect(eq).toHaveBeenCalledWith('cs.transaction_id', 'txn-001');
+    });
+
+    it('returns 400 without the station', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/transactions/by-transaction-id/txn-001',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(res.statusCode).toBe(400);
     });
 
     it('returns 404 when transaction not found (empty array)', async () => {
@@ -406,7 +447,7 @@ describe('Transaction routes', () => {
 
       const res = await app.inject({
         method: 'GET',
-        url: '/transactions/by-transaction-id/nonexistent',
+        url: '/transactions/by-transaction-id/nonexistent?stationId=CS-001',
         headers: { authorization: `Bearer ${operatorToken}` },
       });
       expect(res.statusCode).toBe(404);
@@ -422,7 +463,7 @@ describe('Transaction routes', () => {
 
       const res = await app.inject({
         method: 'GET',
-        url: '/transactions/by-transaction-id/missing-txn',
+        url: '/transactions/by-transaction-id/missing-txn?stationId=CS-001',
         headers: { authorization: `Bearer ${operatorToken}` },
       });
       expect(res.statusCode).toBe(404);
@@ -435,11 +476,11 @@ describe('Transaction routes', () => {
         transactionId: 'some-special-chars_123',
         status: 'active',
       });
-      setupDbResults([session]);
+      setupDbResults([{ session }]);
 
       const res = await app.inject({
         method: 'GET',
-        url: '/transactions/by-transaction-id/some-special-chars_123',
+        url: '/transactions/by-transaction-id/some-special-chars_123?stationId=CS-001',
         headers: { authorization: `Bearer ${operatorToken}` },
       });
       expect(res.statusCode).toBe(200);

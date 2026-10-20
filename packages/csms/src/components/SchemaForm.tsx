@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronDown, ChevronRight, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
@@ -91,7 +92,7 @@ function FieldRenderer({
             onChange={(e) => {
               onChange(e.target.value);
             }}
-            className={`h-9 ${errorClass}`}
+            className={errorClass}
           >
             <option value="">{t('common.select')}</option>
             {field.enumValues?.map((v) => (
@@ -108,6 +109,7 @@ function FieldRenderer({
         <FieldWrapper field={field} error={error}>
           <Input
             type="datetime-local"
+            step="1"
             value={asString(value)}
             className={errorClass}
             onChange={(e) => {
@@ -135,14 +137,11 @@ function FieldRenderer({
     case 'number':
       return (
         <FieldWrapper field={field} error={error}>
-          <Input
-            type="number"
-            step="any"
+          <DecimalInput
             value={asString(value)}
             className={errorClass}
-            onChange={(e) => {
-              onChange(e.target.value);
-            }}
+            onChange={onChange}
+            allowNegative
           />
         </FieldWrapper>
       );
@@ -212,7 +211,7 @@ function FieldWrapper({
 }): React.JSX.Element {
   return (
     <div className="space-y-1">
-      <Label htmlFor={`schema-field-${field.name}`}>
+      <Label htmlFor={`schema-field-${field.name}`} className="leading-6">
         {field.name}
         {field.required && <span className="text-destructive ml-0.5">*</span>}
       </Label>
@@ -313,7 +312,9 @@ function ArrayFieldRenderer({
   const error = errors[path];
 
   function addItem(): void {
-    onChange([...value, {}]);
+    const { arrayItem } = field;
+    if (arrayItem == null) onChange([...value, {}]);
+    else onChange([...value, arrayItem.kind === 'boolean' ? false : '']);
   }
 
   function removeItem(index: number): void {
@@ -328,7 +329,7 @@ function ArrayFieldRenderer({
 
   return (
     <fieldset className="border border-input rounded-md p-3 space-y-3">
-      <Label htmlFor={`schema-field-${field.name}`}>
+      <Label htmlFor={`schema-field-${field.name}`} className="leading-6">
         {field.name}
         {field.required && <span className="text-destructive ml-0.5">*</span>}
       </Label>
@@ -343,8 +344,7 @@ function ArrayFieldRenderer({
             <Button
               type="button"
               variant="outline"
-              size="sm"
-              className="h-6 px-2"
+              size="xs"
               onClick={() => {
                 removeItem(index);
               }}
@@ -353,7 +353,17 @@ function ArrayFieldRenderer({
               {t('commands.removeItem')}
             </Button>
           </div>
-          {field.arrayItemFields != null && field.arrayItemFields.length > 0 ? (
+          {field.arrayItem != null ? (
+            <FieldRenderer
+              field={field.arrayItem}
+              value={item}
+              path={`${path}.${String(index)}`}
+              errors={errors}
+              onChange={(val) => {
+                updateItem(index, val);
+              }}
+            />
+          ) : field.arrayItemFields != null && field.arrayItemFields.length > 0 ? (
             field.arrayItemFields.map((subField) => (
               <FieldRenderer
                 key={subField.name}

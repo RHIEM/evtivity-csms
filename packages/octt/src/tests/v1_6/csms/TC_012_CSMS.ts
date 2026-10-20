@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../types.js';
 import { pushSendAckStep } from '../../../csms-test-helpers.js';
+import { defaultReply } from '../../../default-replies.js';
 
 export const TC_012_CSMS: TestCase = {
   id: 'TC_012_CSMS',
@@ -15,7 +16,7 @@ export const TC_012_CSMS: TestCase = {
   execute: async (ctx) => {
     const steps: StepResult[] = [];
     const connectorId = 1;
-    const idTag = 'OCTT_TAG_001';
+    const idTag = ctx.tokens.valid;
     const timestamp = new Date().toISOString();
 
     await ctx.client.sendCall('BootNotification', {
@@ -47,12 +48,12 @@ export const TC_012_CSMS: TestCase = {
 
     // Handle RemoteStopTransaction from CSMS
     let remoteStopReceived = false;
-    ctx.client.setIncomingCallHandler(async (_messageId, action, _payload) => {
+    ctx.client.setIncomingCallHandler(async (_messageId, action, payload) => {
       if (action === 'RemoteStopTransaction') {
         remoteStopReceived = true;
         return { status: 'Accepted' };
       }
-      return {};
+      return defaultReply('ocpp1.6', action, payload);
     });
 
     if (ctx.triggerCommand != null) {

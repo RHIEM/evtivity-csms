@@ -3,12 +3,13 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Subscription } from '@evtivity/lib';
-import { createLogger } from '@evtivity/lib';
+import { createLogger, tryParseJson } from '@evtivity/lib';
 import { db } from '@evtivity/database';
 import { chargingStations } from '@evtivity/database';
-import { eq } from 'drizzle-orm';
-import { getPubSub } from '../../lib/pubsub.js';
-import { writeSseClient } from '../../lib/sse-broadcast.js';
+import { and, eq } from 'drizzle-orm';
+import { publicStationListed } from '../../lib/public-station.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { endSseClients, writeSseClient } from '../../lib/sse-broadcast.js';
 
 const logger = createLogger('portal-station-events-sse');
 
@@ -18,6 +19,8 @@ const CSMS_EVENTS_CHANNEL = 'csms_events';
 interface StationSseClient {
   id: number;
   stationDbId: string;
+  /** The OCPP station id the client subscribed with (public). */
+  stationOcppId: string;
   reply: FastifyReply;
 }
 
@@ -43,19 +46,20 @@ async function ensureListener(): Promise<void> {
 
   const pubsub = getPubSub();
   subscription = await pubsub.subscribe(CSMS_EVENTS_CHANNEL, (payload: string) => {
-    let parsed: { eventType?: string; stationId?: string };
-    try {
-      parsed = JSON.parse(payload) as { eventType?: string; stationId?: string };
-    } catch {
-      return;
-    }
+    const parsed = tryParseJson(payload) as
+      | { eventType?: string; stationId?: string }
+      | null
+      | undefined;
+    if (parsed == null) return;
 
     if (parsed.eventType == null || !FORWARDED_EVENTS.has(parsed.eventType)) return;
 
-    const message = `data: ${payload}\n\n`;
+    // The stream is public: forward only the event type and the OCPP station
+    // id the client already knows, never the internal station or site ids.
     for (const client of clients) {
       if (parsed.stationId === client.stationDbId) {
-        writeToClient(client, message);
+        const event = { eventType: parsed.eventType, stationId: client.stationOcppId };
+        writeToClient(client, `data: ${JSON.stringify(event)}\n\n`);
       }
     }
   });
@@ -98,7 +102,7 @@ export function portalStationEventRoutes(app: FastifyInstance): void {
       const [station] = await db
         .select({ id: chargingStations.id })
         .from(chargingStations)
-        .where(eq(chargingStations.stationId, stationId))
+        .where(and(eq(chargingStations.stationId, stationId), publicStationListed()))
         .limit(1);
 
       if (station == null) {
@@ -114,7 +118,12 @@ export function portalStationEventRoutes(app: FastifyInstance): void {
         .header('X-Accel-Buffering', 'no');
       reply.raw.writeHead(200, reply.getHeaders() as Record<string, string | string[]>);
 
-      const client: StationSseClient = { id: nextClientId++, stationDbId: station.id, reply };
+      const client: StationSseClient = {
+        id: nextClientId++,
+        stationDbId: station.id,
+        stationOcppId: stationId,
+        reply,
+      };
       clients.add(client);
 
       await ensureListener();
@@ -128,6 +137,11 @@ export function portalStationEventRoutes(app: FastifyInstance): void {
       await reply;
     },
   );
+
+  app.addHook('preClose', (done) => {
+    endSseClients(clients, logger);
+    done();
+  });
 
   app.addHook('onClose', async () => {
     if (keepaliveTimer != null) {

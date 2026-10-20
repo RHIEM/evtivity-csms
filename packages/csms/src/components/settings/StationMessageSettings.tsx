@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { RotateCcw } from 'lucide-react';
 import { SaveButton } from '@/components/save-button';
@@ -15,7 +16,9 @@ import { Toggle } from '@/components/ui/toggle';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
+import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 
 type StationMessageState =
   | 'available'
@@ -29,10 +32,19 @@ type StationMessageState =
   | 'payment_failed'
   | 'payment_required'
   | 'guest_unauthorized'
-  | 'unauthorized';
+  | 'unauthorized'
+  | 'prepaid_exhausted'
+  | 'account_credit_limit';
+
+type StationMessageLanguage = (typeof LANGUAGES)[number]['code'];
+
+function isStationMessageLanguage(value: unknown): value is StationMessageLanguage {
+  return LANGUAGES.some((lang) => lang.code === value);
+}
 
 interface TemplateRow {
   state: StationMessageState;
+  language: StationMessageLanguage;
   body: string;
   updatedAt: string | null;
   updatedBy: string | null;
@@ -65,16 +77,37 @@ const ALL: ReadonlySet<StationMessageState> = new Set([
   'payment_required',
   'guest_unauthorized',
   'unauthorized',
+  'prepaid_exhausted',
+  'account_credit_limit',
 ]);
 
 const VARIABLES: VariableDef[] = [
   { name: 'companyName', descriptionKey: 'messages.varCompanyName', states: ALL },
+  { name: 'brandLine', descriptionKey: 'messages.varBrandLine', states: ALL },
   { name: 'stationOcppId', descriptionKey: 'messages.varStationOcppId', states: ALL },
   { name: 'supportPhone', descriptionKey: 'messages.varSupportPhone', states: ALL },
   {
     name: 'pricingDisplay',
     descriptionKey: 'messages.varPricingDisplay',
     states: new Set(['available']),
+  },
+  {
+    name: 'energyPrice',
+    descriptionKey: 'messages.varEnergyPrice',
+    states: new Set(['available']),
+  },
+  { name: 'timePrice', descriptionKey: 'messages.varTimePrice', states: new Set(['available']) },
+  { name: 'sessionFee', descriptionKey: 'messages.varSessionFee', states: new Set(['available']) },
+  { name: 'idleFee', descriptionKey: 'messages.varIdleFee', states: new Set(['available']) },
+  {
+    name: 'taxRatePercent',
+    descriptionKey: 'messages.varTaxRatePercent',
+    states: new Set(['available', 'suspended']),
+  },
+  {
+    name: 'pricesIncludeTax',
+    descriptionKey: 'messages.varPricesIncludeTax',
+    states: new Set(['available', 'suspended']),
   },
   {
     name: 'energyKwh',
@@ -128,6 +161,8 @@ const STATES: StationMessageState[] = [
   'payment_required',
   'guest_unauthorized',
   'unauthorized',
+  'prepaid_exhausted',
+  'account_credit_limit',
 ];
 
 const STATE_LABEL_KEY: Record<StationMessageState, string> = {
@@ -143,7 +178,15 @@ const STATE_LABEL_KEY: Record<StationMessageState, string> = {
   payment_required: 'messages.statePaymentRequired',
   guest_unauthorized: 'messages.stateGuestUnauthorized',
   unauthorized: 'messages.stateUnauthorized',
+  prepaid_exhausted: 'messages.statePrepaidExhausted',
+  account_credit_limit: 'messages.stateAccountCreditLimit',
 };
+
+/** Translated name of a station message state, or the raw code for an unknown one. */
+export function stationMessageStateLabel(t: TFunction, state: string): string {
+  const key = (STATE_LABEL_KEY as Record<string, string | undefined>)[state];
+  return key != null ? t(key as never) : state;
+}
 
 interface StationMessageSettingsProps {
   settings: Record<string, unknown> | undefined;
@@ -155,6 +198,8 @@ export function StationMessageSettings({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  // Template writes are company-wide: the API answers 404 to a site-restricted user.
+  const canWriteTemplates = useHasCompanyWidePermission('settings.integrations:write');
 
   // Settings keys
   const [enabled, setEnabled] = useState(false);
@@ -162,6 +207,10 @@ export function StationMessageSettings({
   const [refreshSeconds, setRefreshSeconds] = useState('30');
   const [eventMessageTtlSeconds, setEventMessageTtlSeconds] = useState('30');
   const [brandLine, setBrandLine] = useState('');
+  const [displayLanguage, setDisplayLanguage] = useState<StationMessageLanguage>('en');
+  // Language of the template being edited. Follows the display language until
+  // the operator picks another one.
+  const [editLanguage, setEditLanguage] = useState<StationMessageLanguage | null>(null);
 
   useEffect(() => {
     if (settings == null) return;
@@ -186,7 +235,11 @@ export function StationMessageSettings({
     }
     const brand = settings['stationMessage.brandLine'];
     setBrandLine(typeof brand === 'string' ? brand : '');
+    const language = settings['stationMessage.language'];
+    setDisplayLanguage(isStationMessageLanguage(language) ? language : 'en');
   }, [settings]);
+
+  const templateLanguage = editLanguage ?? displayLanguage;
 
   // Templates list
   const { data: templates } = useQuery({
@@ -204,11 +257,11 @@ export function StationMessageSettings({
     const map = new Map<StationMessageState, TemplateRow>();
     if (templates != null) {
       for (const row of templates.data) {
-        map.set(row.state, row);
+        if (row.language === templateLanguage) map.set(row.state, row);
       }
     }
     return map;
-  }, [templates]);
+  }, [templates, templateLanguage]);
 
   useEffect(() => {
     const row = templatesByState.get(selectedState);
@@ -225,6 +278,7 @@ export function StationMessageSettings({
       refreshSeconds: number;
       eventMessageTtlSeconds: number;
       brandLine: string;
+      language: StationMessageLanguage;
     }) =>
       Promise.all([
         api.put('/v1/settings/stationMessage.enabled', { value: vals.enabled }),
@@ -236,6 +290,7 @@ export function StationMessageSettings({
           value: vals.eventMessageTtlSeconds,
         }),
         api.put('/v1/settings/stationMessage.brandLine', { value: vals.brandLine }),
+        api.put('/v1/settings/stationMessage.language', { value: vals.language }),
       ]),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['settings'] });
@@ -248,10 +303,19 @@ export function StationMessageSettings({
 
   // Template save
   const saveMutation = useMutation({
-    mutationFn: (vals: { state: StationMessageState; body: string }) =>
-      api.put<TemplateRow>(`/v1/station-message-templates/${vals.state}`, { body: vals.body }),
+    mutationFn: (vals: {
+      state: StationMessageState;
+      language: StationMessageLanguage;
+      body: string;
+    }) =>
+      api.put<TemplateRow>(
+        `/v1/station-message-templates/${vals.state}?language=${encodeURIComponent(vals.language)}`,
+        { body: vals.body },
+      ),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['station-message-templates'] });
+      // Template changes are listed in the Settings History tab.
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'setting'] });
       toast({ title: t('messages.saved'), variant: 'success' });
     },
     onError: () => {
@@ -261,10 +325,14 @@ export function StationMessageSettings({
 
   // Reset to default
   const resetMutation = useMutation({
-    mutationFn: (state: StationMessageState) =>
-      api.delete<TemplateRow>(`/v1/station-message-templates/${state}`),
+    mutationFn: (vals: { state: StationMessageState; language: StationMessageLanguage }) =>
+      api.delete<TemplateRow>(
+        `/v1/station-message-templates/${vals.state}?language=${encodeURIComponent(vals.language)}`,
+      ),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['station-message-templates'] });
+      // Template changes are listed in the Settings History tab.
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'setting'] });
       toast({ title: t('messages.resetSuccess'), variant: 'success' });
     },
     onError: () => {
@@ -275,15 +343,22 @@ export function StationMessageSettings({
   // Preview (debounced)
   const [preview, setPreview] = useState('');
   useEffect(() => {
+    // The API rejects an empty body; before the templates load there is nothing to render.
+    if (bodyDraft.trim() === '') {
+      setPreview('');
+      return;
+    }
     const timer = setTimeout(() => {
       void (async () => {
         try {
           const result = await api.post<PreviewResponse>('/v1/station-message-templates/preview', {
             state: selectedState,
+            language: templateLanguage,
             body: bodyDraft,
           });
           setPreview(result.rendered);
-        } catch {
+        } catch (err) {
+          console.warn('Render station message preview failed', err);
           setPreview('');
         }
       })();
@@ -291,7 +366,7 @@ export function StationMessageSettings({
     return () => {
       clearTimeout(timer);
     };
-  }, [selectedState, bodyDraft]);
+  }, [selectedState, bodyDraft, templateLanguage]);
 
   const visibleVariables = useMemo(
     () => VARIABLES.filter((v) => v.states.has(selectedState)),
@@ -341,13 +416,16 @@ export function StationMessageSettings({
                 refreshSeconds: refreshSecondsNumber,
                 eventMessageTtlSeconds: eventMessageTtlNumber,
                 brandLine,
+                language: displayLanguage,
               });
             }}
             noValidate
           >
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label htmlFor="station-message-enabled">{t('messages.enabled')}</Label>
+                <Label htmlFor="station-message-enabled" className="leading-6">
+                  {t('messages.enabled')}
+                </Label>
                 <p className="text-xs text-muted-foreground">{t('messages.enabledDesc')}</p>
               </div>
               <Toggle
@@ -362,7 +440,7 @@ export function StationMessageSettings({
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="station-message-pricing-format">
+                <Label htmlFor="station-message-pricing-format" className="leading-6">
                   {t('messages.pricingFormat')}
                 </Label>
                 <Select
@@ -379,7 +457,7 @@ export function StationMessageSettings({
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="station-message-refresh-seconds">
+                <Label htmlFor="station-message-refresh-seconds" className="leading-6">
                   {t('messages.refreshSeconds')}
                 </Label>
                 <Input
@@ -395,7 +473,7 @@ export function StationMessageSettings({
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="station-message-event-ttl-seconds">
+                <Label htmlFor="station-message-event-ttl-seconds" className="leading-6">
                   {t('messages.eventMessageTtlSeconds')}
                 </Label>
                 <Input
@@ -414,7 +492,23 @@ export function StationMessageSettings({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="station-message-brand-line">{t('messages.brandLine')}</Label>
+              <Label htmlFor="station-message-display-language" className="leading-6">
+                {t('messages.displayLanguage')}
+              </Label>
+              <LanguageSelect
+                id="station-message-display-language"
+                value={displayLanguage}
+                onChange={(value) => {
+                  if (isStationMessageLanguage(value)) setDisplayLanguage(value);
+                }}
+              />
+              <p className="text-xs text-muted-foreground">{t('messages.displayLanguageDesc')}</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="station-message-brand-line" className="leading-6">
+                {t('messages.brandLine')}
+              </Label>
               <Input
                 id="station-message-brand-line"
                 value={brandLine}
@@ -447,7 +541,7 @@ export function StationMessageSettings({
                     }}
                     className={`block w-full px-4 py-3 text-left text-sm transition-colors ${
                       active
-                        ? 'bg-primary/10 font-medium text-primary'
+                        ? 'bg-primary/10 font-medium text-link'
                         : 'hover:bg-muted text-foreground'
                     }`}
                   >
@@ -458,7 +552,26 @@ export function StationMessageSettings({
             </div>
             <div className="space-y-4 p-6">
               <div className="space-y-2">
-                <Label htmlFor="station-message-body">{t('messages.bodyLabel')}</Label>
+                <Label htmlFor="station-message-template-language" className="leading-6">
+                  {t('messages.templateLanguage')}
+                </Label>
+                <LanguageSelect
+                  id="station-message-template-language"
+                  value={templateLanguage}
+                  onChange={(value) => {
+                    if (isStationMessageLanguage(value)) setEditLanguage(value);
+                  }}
+                  className="sm:w-60"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('messages.templateLanguageDesc')}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="station-message-body" className="leading-6">
+                  {t('messages.bodyLabel')}
+                </Label>
                 <textarea
                   id="station-message-body"
                   ref={textareaRef}
@@ -467,12 +580,12 @@ export function StationMessageSettings({
                     setBodyDraft(e.target.value);
                   }}
                   placeholder={t('messages.bodyPlaceholder')}
-                  className="flex min-h-[160px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  className="flex min-h-[160px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 />
               </div>
 
               <div className="space-y-2">
-                <Label className="text-xs text-muted-foreground">
+                <Label className="text-xs text-muted-foreground leading-6">
                   {t('messages.variablesLabel')}
                 </Label>
                 <div className="flex flex-wrap gap-2">
@@ -494,8 +607,10 @@ export function StationMessageSettings({
               </div>
 
               <div className="space-y-2">
-                <Label className="text-xs text-muted-foreground">{t('messages.preview')}</Label>
-                <pre className="min-h-[6rem] whitespace-pre-wrap break-words rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
+                <Label className="text-xs text-muted-foreground leading-6">
+                  {t('messages.preview')}
+                </Label>
+                <pre className="min-h-24 whitespace-pre-wrap wrap-break-word rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
                   {preview}
                 </pre>
                 <p className="text-xs text-muted-foreground">{t('messages.previewHint')}</p>
@@ -505,27 +620,33 @@ export function StationMessageSettings({
                 <AlertDescription>{t('messages.description')}</AlertDescription>
               </Alert>
 
-              <div className="flex justify-end flex-wrap items-center gap-3">
-                <SaveButton
-                  isPending={saveMutation.isPending}
-                  type="button"
-                  disabled={bodyDraft === originalBody}
-                  onClick={() => {
-                    saveMutation.mutate({ state: selectedState, body: bodyDraft });
-                  }}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setResetOpen(true);
-                  }}
-                  disabled={resetMutation.isPending}
-                >
-                  <RotateCcw className="h-4 w-4" />
-                  {t('messages.resetToDefault')}
-                </Button>
-              </div>
+              {canWriteTemplates && (
+                <div className="flex justify-end flex-wrap items-center gap-3">
+                  <SaveButton
+                    isPending={saveMutation.isPending}
+                    type="button"
+                    disabled={bodyDraft === originalBody}
+                    onClick={() => {
+                      saveMutation.mutate({
+                        state: selectedState,
+                        language: templateLanguage,
+                        body: bodyDraft,
+                      });
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setResetOpen(true);
+                    }}
+                    disabled={resetMutation.isPending}
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                    {t('messages.resetToDefault')}
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         </CardContent>
@@ -540,7 +661,7 @@ export function StationMessageSettings({
         variant="destructive"
         isPending={resetMutation.isPending}
         onConfirm={() => {
-          resetMutation.mutate(selectedState);
+          resetMutation.mutate({ state: selectedState, language: templateLanguage });
         }}
       />
     </div>

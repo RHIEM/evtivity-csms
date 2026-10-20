@@ -9,9 +9,12 @@ import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Label } from '@/components/ui/label';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
+import { Toggle } from '@/components/ui/toggle';
 import { LanguageSelect } from '@/components/ui/language-select';
 import { TemplateEditPanel, type TemplateEditPanelHandle } from '@/components/TemplateEditPanel';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
+import { getErrorMessage } from '@/lib/error-message';
 import { TEMPLATE_VARIABLES, COMMON_VARIABLES } from '@/lib/template-variables';
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -25,22 +28,38 @@ export interface EventSection {
   events: readonly string[];
 }
 
+/** One on/off switch per event type (all channels), saved as soon as it changes. */
+export interface EventSwitch {
+  /** Stored state per event type. No entry means on. */
+  enabledMap: Map<string, boolean>;
+  /** Event types that are always on: shown on and locked, with a tooltip. */
+  isRequired: (eventType: string) => boolean;
+  requiredTooltip: string;
+  switchTooltip: string;
+  canEdit: boolean;
+  onChange: (eventType: string, enabled: boolean) => Promise<void>;
+}
+
 interface EventSettingsLayoutProps {
   sidebarTitle: string;
   emptyMessage: string;
   sections: EventSection[];
   channels: readonly string[];
+  /** The channels one event type is sent on, when fewer than `channels`. */
+  channelsFor?: (eventType: string) => readonly string[];
   channelTooltip?: string;
   toggleEndpoint?: string;
   toggleQueryKey?: string[];
   enabledMap?: Map<string, boolean>;
   defaultEnabled?: boolean;
+  eventSwitch?: EventSwitch;
   renderSettingsExtra?: (props: {
     selectedEvent: string;
     channel: string;
     language: string;
-    markDirty: () => void;
   }) => React.ReactNode;
+  /** Whether the settings extra differs from its stored value for this event and channel. */
+  isSettingsExtraDirty?: (props: { selectedEvent: string; channel: string }) => boolean;
   onSave?: (props: {
     eventType: string;
     channel: string;
@@ -53,26 +72,51 @@ export function EventSettingsLayout({
   emptyMessage,
   sections,
   channels,
+  channelsFor,
   channelTooltip,
   toggleEndpoint,
   toggleQueryKey,
   enabledMap,
   defaultEnabled,
+  eventSwitch,
   renderSettingsExtra,
+  isSettingsExtraDirty,
   onSave,
 }: EventSettingsLayoutProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // Template and event setting writes are company-wide: the API answers 404 to a
+  // site-restricted user. Templates stay readable.
+  const canWrite = useHasCompanyWidePermission('notifications:write');
 
   const [selectedEvent, setSelectedEvent] = useState('');
-  const [channel, setChannel] = useState<string>(channels[0] ?? 'email');
+  const [channelChoice, setChannel] = useState<string>(channels[0] ?? 'email');
+  const eventChannels =
+    selectedEvent !== '' ? (channelsFor?.(selectedEvent) ?? channels) : channels;
+  // An event sent on fewer channels (driver.AccountVerification is email only) falls back to
+  // its first channel instead of showing a template that is never sent.
+  const channel = eventChannels.includes(channelChoice)
+    ? channelChoice
+    : (eventChannels[0] ?? channelChoice);
   const [language, setLanguage] = useState<string>('en');
-  const [isDirty, setIsDirty] = useState(false);
   const [pendingEvent, setPendingEvent] = useState<string | null>(null);
   // Local toggle override: tracks unsaved active/inactive state per eventType:channel
   const [localToggle, setLocalToggle] = useState<Map<string, boolean>>(new Map());
   const templatePanelRef = useRef<TemplateEditPanelHandle>(null);
   const [statusMessage, setStatusMessage] = useState({ success: '', error: '' });
+  const [templateDirty, setTemplateDirty] = useState(false);
+
+  const hasToggle = toggleEndpoint != null && toggleQueryKey != null && enabledMap != null;
+
+  // Unsaved changes are differences from the stored values, never "a change event fired":
+  // the template panel compares its fields with the loaded template, a toggle counts only
+  // while it differs from the stored state, and the settings extra compares itself.
+  const toggleDirty =
+    hasToggle &&
+    [...localToggle].some(([key, on]) => on !== (enabledMap.get(key) ?? defaultEnabled ?? false));
+  const extraDirty =
+    selectedEvent !== '' && (isSettingsExtraDirty?.({ selectedEvent, channel }) ?? false);
+  const isDirty = templateDirty || toggleDirty || extraDirty;
   const dirtyRef = useRef(false);
   dirtyRef.current = isDirty;
 
@@ -89,7 +133,29 @@ export function EventSettingsLayout({
     };
   }, []);
 
-  const hasToggle = toggleEndpoint != null && toggleQueryKey != null && enabledMap != null;
+  const [switchSaving, setSwitchSaving] = useState(false);
+
+  function isEventOn(et: string): boolean {
+    if (eventSwitch == null) return true;
+    return eventSwitch.isRequired(et) || (eventSwitch.enabledMap.get(et) ?? true);
+  }
+
+  async function changeEventSwitch(et: string, enabled: boolean): Promise<void> {
+    if (eventSwitch == null) return;
+    setSwitchSaving(true);
+    try {
+      await eventSwitch.onChange(et, enabled);
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'notification_template'] });
+      setStatusMessage({
+        success: enabled ? t('notifications.eventTurnedOn') : t('notifications.eventTurnedOff'),
+        error: '',
+      });
+    } catch (err) {
+      setStatusMessage({ success: '', error: getErrorMessage(err, t) });
+    } finally {
+      setSwitchSaving(false);
+    }
+  }
 
   const selectionComplete = selectedEvent !== '';
   const variables = [...COMMON_VARIABLES, ...(TEMPLATE_VARIABLES[selectedEvent] ?? [])];
@@ -100,7 +166,6 @@ export function EventSettingsLayout({
       return;
     }
     setSelectedEvent(et);
-    setIsDirty(false);
   }, []);
 
   return (
@@ -115,14 +180,14 @@ export function EventSettingsLayout({
               {sections.map((section) => (
                 <div key={section.title}>
                   {
-                    <p className="text-xs font-semibold text-primary/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded bg-primary/5 border border-primary/10">
+                    <p className="text-xs font-semibold text-link/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded bg-primary/5 border border-primary/10">
                       {section.title}
                     </p>
                   }
                   {section.events.map((et) => {
                     const isSelected = selectedEvent === et;
                     const anyEnabled = hasToggle
-                      ? channels.some((ch) => {
+                      ? (channelsFor?.(et) ?? channels).some((ch) => {
                           const key = `${et}:${ch}`;
                           return (
                             localToggle.get(key) ?? enabledMap.get(key) ?? defaultEnabled ?? false
@@ -143,6 +208,12 @@ export function EventSettingsLayout({
                         {hasToggle && (
                           <span
                             className={`h-2 w-2 shrink-0 rounded-full ${anyEnabled ? 'bg-success' : 'bg-muted-foreground/30'}`}
+                          />
+                        )}
+                        {eventSwitch != null && (
+                          <span
+                            data-testid={`event-switch-dot-${et}`}
+                            className={`h-2 w-2 shrink-0 rounded-full ${isEventOn(et) ? 'bg-success' : 'bg-muted-foreground/30'}`}
                           />
                         )}
                       </div>
@@ -190,35 +261,78 @@ export function EventSettingsLayout({
                     >
                       {t('notifications.preview')}
                     </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() => {
-                        templatePanelRef.current?.reset();
-                      }}
-                      disabled={templatePanelRef.current?.isPending}
-                    >
-                      {t('notifications.resetToDefault')}
-                    </Button>
-                    <Button
-                      onClick={() => {
-                        templatePanelRef.current?.save();
-                      }}
-                      disabled={!isDirty || templatePanelRef.current?.isPending}
-                    >
-                      {t('notifications.save')}
-                    </Button>
+                    {canWrite && (
+                      <Button
+                        variant="outline"
+                        onClick={() => {
+                          templatePanelRef.current?.reset();
+                        }}
+                        disabled={templatePanelRef.current?.isPending}
+                      >
+                        {t('notifications.resetToDefault')}
+                      </Button>
+                    )}
+                    {canWrite && (
+                      <Button
+                        onClick={() => {
+                          templatePanelRef.current?.save();
+                        }}
+                        disabled={!isDirty || templatePanelRef.current?.isPending}
+                      >
+                        {t('notifications.save')}
+                      </Button>
+                    )}
                   </div>
                 </div>
                 <Card>
                   <CardContent className="p-6 space-y-4">
                     <div className="grid gap-4 sm:grid-cols-3">
+                      {eventSwitch != null &&
+                        (() => {
+                          const required = eventSwitch.isRequired(selectedEvent);
+                          const on = isEventOn(selectedEvent);
+                          return (
+                            <div className="space-y-2">
+                              <Label
+                                htmlFor="event-switch"
+                                className="inline-flex items-center gap-1 leading-6"
+                              >
+                                {on ? t('common.active') : t('common.inactive')}
+                                <InfoTooltip
+                                  content={
+                                    required
+                                      ? eventSwitch.requiredTooltip
+                                      : eventSwitch.switchTooltip
+                                  }
+                                />
+                              </Label>
+                              <div className="flex h-10 items-center">
+                                <Toggle
+                                  id="event-switch"
+                                  // The visible label is the state (Active or Inactive); the
+                                  // name says what the switch controls.
+                                  aria-label={t('notifications.eventToggleLabel', {
+                                    event: selectedEvent,
+                                  })}
+                                  checked={on}
+                                  disabled={
+                                    required || !eventSwitch.canEdit || !canWrite || switchSaving
+                                  }
+                                  onCheckedChange={(next) => {
+                                    void changeEventSwitch(selectedEvent, next);
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })()}
                       <div className="space-y-2">
-                        <Label className="inline-flex items-center gap-1">
+                        <Label className="inline-flex items-center gap-1 leading-6">
                           {t('notifications.channel')}
                           {channelTooltip != null && <InfoTooltip content={channelTooltip} />}
                         </Label>
                         <div className="flex rounded-md border border-input overflow-hidden">
-                          {channels.map((ch) => (
+                          {eventChannels.map((ch) => (
                             <button
                               key={ch}
                               type="button"
@@ -238,35 +352,30 @@ export function EventSettingsLayout({
                       </div>
                       {hasToggle && (
                         <div className="space-y-2">
-                          <Label>{isActive ? t('common.active') : t('common.inactive')}</Label>
+                          <Label className="leading-6">
+                            {isActive ? t('common.active') : t('common.inactive')}
+                          </Label>
                           <div className="flex h-10 items-center">
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-checked={isActive}
-                              onClick={() => {
+                            <Toggle
+                              aria-label={t('notifications.channelToggleLabel', {
+                                event: selectedEvent,
+                                channel: CHANNEL_LABELS[channel] ?? channel,
+                              })}
+                              checked={isActive}
+                              disabled={!canWrite}
+                              onCheckedChange={() => {
                                 setLocalToggle((prev) => {
                                   const next = new Map(prev);
                                   next.set(toggleKey, !isActive);
                                   return next;
                                 });
-                                setIsDirty(true);
                               }}
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
-                                isActive ? 'bg-primary' : 'bg-muted'
-                              }`}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-background shadow-lg ring-0 transition-transform ${
-                                  isActive ? 'translate-x-4' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
+                            />
                           </div>
                         </div>
                       )}
                       <div className="space-y-2">
-                        <Label>{t('notifications.language')}</Label>
+                        <Label className="leading-6">{t('notifications.language')}</Label>
                         <LanguageSelect value={language} onChange={setLanguage} />
                       </div>
                     </div>
@@ -276,9 +385,6 @@ export function EventSettingsLayout({
                         selectedEvent,
                         channel,
                         language,
-                        markDirty: () => {
-                          setIsDirty(true);
-                        },
                       })}
                     </div>
                   </CardContent>
@@ -292,9 +398,7 @@ export function EventSettingsLayout({
                   channel={channel as 'email' | 'sms' | 'webhook'}
                   language={language}
                   variables={variables}
-                  markDirty={() => {
-                    setIsDirty(true);
-                  }}
+                  onDirtyChange={setTemplateDirty}
                   onStatusChange={setStatusMessage}
                   onSave={
                     onSave != null
@@ -308,6 +412,9 @@ export function EventSettingsLayout({
                               `${toggleEndpoint}?eventType=${encodeURIComponent(selectedEvent)}&channel=${encodeURIComponent(channel)}`,
                             );
                             await queryClient.refetchQueries({ queryKey: toggleQueryKey });
+                            void queryClient.invalidateQueries({
+                              queryKey: ['audit', 'notification_template'],
+                            });
                             setStatusMessage({
                               success: t('notifications.templateDeactivated'),
                               error: '',
@@ -324,7 +431,6 @@ export function EventSettingsLayout({
                             next.delete(toggleKey);
                             return next;
                           });
-                          setIsDirty(false);
                         }
                       : undefined
                   }
@@ -346,7 +452,6 @@ export function EventSettingsLayout({
         onConfirm={() => {
           if (pendingEvent != null) {
             setSelectedEvent(pendingEvent);
-            setIsDirty(false);
             setLocalToggle(new Map());
             setPendingEvent(null);
           }

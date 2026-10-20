@@ -22,6 +22,7 @@ function makeCtx(
       authenticated: true,
       pendingMessages: new Map(),
       bootStatus,
+      readyAnnounced: false,
     },
     protocolVersion: 'ocpp2.1',
     messageId: 'msg-boot',
@@ -33,7 +34,7 @@ function makeCtx(
       error: vi.fn(),
       debug: vi.fn(),
     } as unknown as HandlerContext['logger'],
-    eventBus: { publish: vi.fn(), subscribe: vi.fn() },
+    eventBus: { publish: vi.fn(), subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };

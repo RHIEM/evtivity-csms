@@ -5,11 +5,14 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and } from 'drizzle-orm';
 import { db, panels, circuits, unmanagedLoads } from '@evtivity/database';
-import { zodSchema } from '../lib/zod-schema.js';
+import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, arrayResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
+import { siteInScope } from '../lib/site-scope.js';
+import { changedFields } from '../lib/audit-diff.js';
+import { writeSiteLoadManagementAudit } from '../lib/load-management-audit.js';
 
 // --- Schemas ---
 
@@ -35,8 +38,11 @@ const createLoadBody = z
     name: z.string().min(1).max(255),
     estimatedDrawKw: z.number().min(0).max(10000).describe('Estimated power draw in kW'),
   })
-  .refine((d) => (d.panelId != null) !== (d.circuitId != null), {
-    message: 'Exactly one of panelId or circuitId must be provided',
+  .refine((d) => d.panelId == null || d.circuitId == null, {
+    message: 'Provide either panelId or circuitId, not both',
+  })
+  .refine((d) => d.panelId != null || d.circuitId != null, {
+    message: 'One of panelId or circuitId is required',
   });
 
 const updateLoadBody = z.object({
@@ -91,6 +97,20 @@ async function verifyCircuitInSite(circuitId: string, siteId: string): Promise<b
   return circuit != null;
 }
 
+/**
+ * True when the load hangs off a panel of the site, directly or through one of
+ * the panel's circuits. A load of another site answers 404 under this URL
+ * site, so a site-restricted user cannot reach it through one of their sites.
+ */
+async function loadBelongsToSite(
+  load: { panelId: string | null; circuitId: string | null },
+  siteId: string,
+): Promise<boolean> {
+  if (load.panelId != null && (await verifyPanelInSite(load.panelId, siteId))) return true;
+  if (load.circuitId != null && (await verifyCircuitInSite(load.circuitId, siteId))) return true;
+  return false;
+}
+
 // --- Routes ---
 
 export function unmanagedLoadRoutes(app: FastifyInstance): void {
@@ -120,29 +140,11 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { siteId } = request.params as z.infer<typeof siteIdParam>;
-      const body = request.body as z.infer<typeof createLoadBody>;
-
-      // Exactly one of panelId or circuitId must be provided
-      const hasPanelId = body.panelId != null;
-      const hasCircuitId = body.circuitId != null;
-      if (hasPanelId && hasCircuitId) {
-        await reply.status(400).send({
-          error: 'Provide either panelId or circuitId, not both',
-          code: 'VALIDATION_ERROR',
-        });
-        return;
-      }
-      if (!hasPanelId && !hasCircuitId) {
-        await reply.status(400).send({
-          error: 'One of panelId or circuitId is required',
-          code: 'VALIDATION_ERROR',
-        });
-        return;
-      }
+      const body = parseZodRequest(createLoadBody, request.body);
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
@@ -185,6 +187,12 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
         return;
       }
 
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: null,
+        after: { unmanagedLoad: created },
+        notes: `unmanaged load created: ${created.name}`,
+      });
+
       return reply.status(201).send(formatLoad(created));
     },
   );
@@ -202,16 +210,18 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
         params: zodSchema(siteIdParam),
         response: {
           200: arrayResponse(loadItem),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
         },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { siteId } = request.params as z.infer<typeof siteIdParam>;
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
-        return [];
+      if (!siteInScope(siteIds, siteId)) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
       }
 
       // Get all unmanaged loads where panelId or circuitId belongs to panels in this site
@@ -294,7 +304,7 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Load not found', code: 'LOAD_NOT_FOUND' });
         return;
       }
@@ -305,7 +315,7 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
         .from(unmanagedLoads)
         .where(eq(unmanagedLoads.id, loadId));
 
-      if (existing == null) {
+      if (existing == null || !(await loadBelongsToSite(existing, siteId))) {
         await reply.status(404).send({ error: 'Load not found', code: 'LOAD_NOT_FOUND' });
         return;
       }
@@ -350,6 +360,13 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
         return;
       }
 
+      const change = changedFields(existing, updated);
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: { unmanagedLoadId: loadId, ...change.before },
+        after: { unmanagedLoadId: loadId, ...change.after },
+        notes: `unmanaged load updated: ${updated.name}`,
+      });
+
       return formatLoad(updated);
     },
   );
@@ -376,23 +393,35 @@ export function unmanagedLoadRoutes(app: FastifyInstance): void {
 
       const { userId } = request.user as { userId: string };
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null && !siteIds.includes(siteId)) {
+      if (!siteInScope(siteIds, siteId)) {
         await reply.status(404).send({ error: 'Load not found', code: 'LOAD_NOT_FOUND' });
         return;
       }
 
       const loadId = Number(id);
       const [existing] = await db
-        .select({ id: unmanagedLoads.id })
+        .select({
+          id: unmanagedLoads.id,
+          panelId: unmanagedLoads.panelId,
+          circuitId: unmanagedLoads.circuitId,
+          name: unmanagedLoads.name,
+          estimatedDrawKw: unmanagedLoads.estimatedDrawKw,
+        })
         .from(unmanagedLoads)
         .where(eq(unmanagedLoads.id, loadId));
 
-      if (existing == null) {
+      if (existing == null || !(await loadBelongsToSite(existing, siteId))) {
         await reply.status(404).send({ error: 'Load not found', code: 'LOAD_NOT_FOUND' });
         return;
       }
 
       await db.delete(unmanagedLoads).where(eq(unmanagedLoads.id, loadId));
+
+      await writeSiteLoadManagementAudit(request, siteId, {
+        before: { unmanagedLoad: existing },
+        after: null,
+        notes: `unmanaged load deleted: ${existing.name}`,
+      });
 
       return { success: true as const };
     },

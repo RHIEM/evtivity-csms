@@ -49,7 +49,14 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+const { mockAvailableEvseCountSql, mockSqlRaw } = vi.hoisted(() => ({
+  mockAvailableEvseCountSql: vi.fn((alias: string) => `AVAILABLE_EVSE_COUNT(${alias})`),
+  mockSqlRaw: vi.fn((text: string) => ({ raw: text })),
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  availableEvseCountSql: mockAvailableEvseCountSql,
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -65,10 +72,13 @@ vi.mock('@evtivity/database', () => ({
 }));
 
 vi.mock('drizzle-orm', () => {
-  const sqlTag = (...args: unknown[]) => ({ __brand: 'SQL', args });
+  const sqlTag = Object.assign((...args: unknown[]) => ({ __brand: 'SQL', args }), {
+    raw: mockSqlRaw,
+  });
   return {
     eq: vi.fn(),
     and: vi.fn(),
+    isNull: vi.fn(),
     asc: vi.fn(),
     desc: vi.fn(),
     inArray: vi.fn(),
@@ -115,6 +125,19 @@ describe('Portal station-watch routes', () => {
       expect(response.statusCode).toBe(401);
     });
 
+    it('never lists a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.isOperatorStation).mockClear();
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/station-watches',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.isOperatorStation)).toHaveBeenCalled();
+    });
+
     it('returns watches with station data', async () => {
       const now = new Date();
       const later = new Date(now.getTime() + 86_400_000);
@@ -129,11 +152,12 @@ describe('Portal station-watch routes', () => {
             siteCity: 'Springfield',
             siteState: 'IL',
             isOnline: false,
+            availableCount: 0,
             createdAt: now,
             expiresAt: later,
           },
         ],
-        [{ stationId: STATION_UUID, total: 2, available: 0 }],
+        [{ stationId: STATION_UUID, total: 2 }],
       );
       const response = await app.inject({
         method: 'GET',
@@ -145,6 +169,18 @@ describe('Portal station-watch routes', () => {
       expect(body).toHaveLength(1);
       expect(body[0].stationId).toBe(STATION_OCPP_ID);
       expect(body[0].availableCount).toBe(0);
+    });
+
+    it('counts available EVSEs with the shared driver availability rule', async () => {
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/station-watches',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mockAvailableEvseCountSql).toHaveBeenCalledWith('charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('AVAILABLE_EVSE_COUNT(charging_stations)');
     });
   });
 
@@ -195,6 +231,21 @@ describe('Portal station-watch routes', () => {
       });
       expect(response.statusCode).toBe(409);
       expect(response.json().code).toBe('STATION_ALREADY_AVAILABLE');
+    });
+
+    // A disabled station whose connectors still report Available is not
+    // available, so a driver can watch it.
+    it('decides "already available" with the shared driver availability rule', async () => {
+      setupDbResults([{ id: STATION_UUID }], [{ total: 0 }], [{ id: 5 }]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/station-watches',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { stationId: STATION_OCPP_ID },
+      });
+      expect(response.statusCode).toBe(201);
+      expect(mockAvailableEvseCountSql).toHaveBeenCalledWith('charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('AVAILABLE_EVSE_COUNT(charging_stations)');
     });
 
     it('returns the existing watch on idempotent re-tap', async () => {

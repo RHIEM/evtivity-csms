@@ -27,6 +27,7 @@ function makeCtx(
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action,
@@ -36,6 +37,8 @@ function makeCtx(
     eventBus: {
       publish: publishMock,
       subscribe: vi.fn(),
+      drain: vi.fn(),
+      track: vi.fn(),
     },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],

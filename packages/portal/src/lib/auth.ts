@@ -3,8 +3,10 @@
 
 import { create } from 'zustand';
 import { api, ApiError } from './api';
+import { queryClient } from './query';
 import { loadLanguage } from '../i18n/index';
 import { applyTheme, type Theme } from './theme';
+import type { PriceDisplay } from '@evtivity/lib/price-display';
 
 interface Driver {
   id: string;
@@ -16,6 +18,8 @@ interface Driver {
   timezone: string;
   themePreference: Theme;
   distanceUnit: 'miles' | 'km';
+  // Null follows the company setting (see usePriceDisplay).
+  priceDisplay: PriceDisplay | null;
   isActive: boolean;
   emailVerified: boolean;
 }
@@ -110,19 +114,10 @@ export const useAuth = create<AuthState>((set, get) => ({
     api.post('/v1/portal/access-logs', { action: 'login' }).catch(() => {});
   },
 
+  // The API answers the same for a new and a known email and signs nobody in:
+  // the driver opens the emailed link, then signs in.
   register: async (body) => {
-    const data = await api.post<LoginResponse>('/v1/portal/auth/register', body);
-    localStorage.setItem('portal_language', data.driver.language);
-    localStorage.setItem('portal_timezone', data.driver.timezone);
-    localStorage.setItem('portal_theme', data.driver.themePreference);
-    localStorage.setItem('portal_distance_unit', data.driver.distanceUnit);
-    applyTheme(data.driver.themePreference);
-    await loadLanguage(data.driver.language);
-    set({
-      driver: data.driver,
-      theme: data.driver.themePreference,
-      isAuthenticated: true,
-    });
+    await api.post('/v1/portal/auth/register', body);
   },
 
   completeMfaLogin: async (driver: Driver) => {
@@ -149,8 +144,9 @@ export const useAuth = create<AuthState>((set, get) => ({
     api.post('/v1/portal/access-logs', { action: 'logout' }).catch(() => {});
     try {
       await api.post('/v1/portal/auth/logout', {});
-    } catch {
+    } catch (err) {
       // Clear state even if the server call fails
+      console.warn('Logout request failed, clearing the local session anyway', err);
     }
     // Prevent auto-login from firing after logout
     sessionStorage.setItem('noAutoLogin', 'true');
@@ -161,6 +157,9 @@ export const useAuth = create<AuthState>((set, get) => ({
     localStorage.removeItem('portal_theme');
     localStorage.removeItem('portal_distance_unit');
     set({ driver: null, isAuthenticated: false });
+    // Drop every cached driver query (billing, sessions, payment methods), so
+    // the next driver to sign in on this browser never sees this driver's data.
+    queryClient.clear();
   },
 
   hydrate: () => {

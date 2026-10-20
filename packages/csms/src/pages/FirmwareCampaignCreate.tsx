@@ -9,10 +9,24 @@ import { BackButton } from '@/components/back-button';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { TargetFilterFields, type TargetFilterValue } from '@/components/TargetFilterFields';
+import {
+  FirmwareSignatureFields,
+  firmwareSignaturePayload,
+  getFirmwareSignatureErrors,
+  type FirmwareSignatureValue,
+} from '@/components/FirmwareSignatureFields';
+import {
+  EMPTY_FIRMWARE_DELIVERY,
+  FirmwareDeliveryFields,
+  firmwareDeliveryPayload,
+  getFirmwareDeliveryErrors,
+  type FirmwareDeliveryValue,
+} from '@/components/FirmwareDeliveryFields';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent } from '@/components/ui/card';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
+import { useHasAllSiteAccess } from '@/lib/auth';
 
 interface Campaign {
   id: string;
@@ -23,6 +37,18 @@ interface Campaign {
   createdAt: string;
 }
 
+interface CreateCampaignBody {
+  name: string;
+  firmwareUrl: string;
+  version?: string;
+  signingCertificate?: string;
+  signature?: string;
+  retries?: number | null;
+  retryInterval?: number | null;
+  installDateTime?: string | null;
+  targetFilter?: TargetFilterValue;
+}
+
 export function FirmwareCampaignCreate(): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -31,16 +57,17 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
   const [name, setName] = useState('');
   const [firmwareUrl, setFirmwareUrl] = useState('');
   const [version, setVersion] = useState('');
+  const [signing, setSigning] = useState<FirmwareSignatureValue>({
+    signingCertificate: '',
+    signature: '',
+  });
+  const [delivery, setDelivery] = useState<FirmwareDeliveryValue>(EMPTY_FIRMWARE_DELIVERY);
   const [filter, setFilter] = useState<TargetFilterValue>({});
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  const hasAllSiteAccess = useHasAllSiteAccess();
 
   const createMutation = useMutation({
-    mutationFn: (body: {
-      name: string;
-      firmwareUrl: string;
-      version?: string;
-      targetFilter?: TargetFilterValue;
-    }) => api.post<Campaign>('/v1/firmware-campaigns', body),
+    mutationFn: (body: CreateCampaignBody) => api.post<Campaign>('/v1/firmware-campaigns', body),
     onSuccess: (created) => {
       void queryClient.invalidateQueries({ queryKey: ['firmware-campaigns'] });
       void navigate(`/firmware-campaigns/${created.id}`);
@@ -52,28 +79,36 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
     if (!name.trim()) errors.name = t('validation.required');
     if (!firmwareUrl.trim()) {
       errors.firmwareUrl = t('validation.required');
-    } else {
-      try {
-        new URL(firmwareUrl);
-      } catch {
-        errors.firmwareUrl = t('validation.invalidUrl');
-      }
+    } else if (!URL.canParse(firmwareUrl)) {
+      errors.firmwareUrl = t('validation.invalidUrl');
+    }
+    // A campaign without a site or station targets every site: only all-site
+    // users create one (the API answers others 404).
+    if (!hasAllSiteAccess && filter.siteId == null && filter.stationId == null) {
+      errors.targetFilter = t('validation.selectRequired');
     }
     return errors;
   }
 
-  const errors = { ...getValidationErrors(), ...getApiErrorFieldDetails(createMutation.error) };
+  const signingErrors = getFirmwareSignatureErrors(signing, t);
+  const deliveryErrors = getFirmwareDeliveryErrors(delivery, t);
+  const errors: Record<string, string> = {
+    ...getValidationErrors(),
+    ...signingErrors,
+    ...deliveryErrors,
+    ...getApiErrorFieldDetails(createMutation.error),
+  };
 
   function handleSubmit(e: React.SyntheticEvent): void {
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(errors).length > 0) return;
-    const body: {
-      name: string;
-      firmwareUrl: string;
-      version?: string;
-      targetFilter?: TargetFilterValue;
-    } = { name, firmwareUrl };
+    const body: CreateCampaignBody = {
+      name,
+      firmwareUrl,
+      ...firmwareSignaturePayload(signing),
+      ...firmwareDeliveryPayload(delivery, false),
+    };
     if (version.trim() !== '') body.version = version;
     if (Object.keys(filter).length > 0) body.targetFilter = filter;
     createMutation.mutate(body);
@@ -90,7 +125,9 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="campaign-name">{t('common.name')}</Label>
+              <Label htmlFor="campaign-name" className="leading-6">
+                {t('common.name')}
+              </Label>
               <Input
                 id="campaign-name"
                 value={name}
@@ -105,7 +142,9 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-10 gap-4">
               <div className="space-y-2 md:col-span-7">
-                <Label htmlFor="campaign-firmware-url">{t('firmwareCampaigns.firmwareUrl')}</Label>
+                <Label htmlFor="campaign-firmware-url" className="leading-6">
+                  {t('firmwareCampaigns.firmwareUrl')}
+                </Label>
                 <Input
                   id="campaign-firmware-url"
                   placeholder="https://example.com/firmware-v2.bin"
@@ -120,7 +159,9 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2 md:col-span-3">
-                <Label htmlFor="campaign-version">{t('firmwareCampaigns.version')}</Label>
+                <Label htmlFor="campaign-version" className="leading-6">
+                  {t('firmwareCampaigns.version')}
+                </Label>
                 <Input
                   id="campaign-version"
                   value={version}
@@ -131,13 +172,31 @@ export function FirmwareCampaignCreate(): React.JSX.Element {
               </div>
             </div>
 
+            <FirmwareDeliveryFields
+              value={delivery}
+              onChange={setDelivery}
+              idPrefix="campaign"
+              errors={hasSubmitted ? deliveryErrors : {}}
+            />
+
+            <FirmwareSignatureFields
+              value={signing}
+              onChange={setSigning}
+              idPrefix="campaign"
+              errors={hasSubmitted ? signingErrors : {}}
+            />
+
             <TargetFilterFields
               endpoint="/v1/firmware-campaigns/filter-options"
               queryKeyPrefix={['firmware-campaign-filter-options']}
               value={filter}
               onChange={setFilter}
               idPrefix="fw-create-filter"
+              helpText={t('firmwareCampaigns.targetFilterHelp')}
             />
+            {hasSubmitted && errors.targetFilter && (
+              <p className="text-sm text-destructive">{errors.targetFilter}</p>
+            )}
 
             <div className="flex justify-end gap-2">
               <CancelButton

@@ -13,6 +13,7 @@ import { ToastProvider } from '@/components/ui/toast';
 import { Layout } from '@/components/Layout';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { AdminRoute } from '@/components/AdminRoute';
+import { AllSiteRoute } from '@/components/AllSiteRoute';
 import { Login } from '@/pages/Login';
 import { ForgotPassword } from '@/pages/ForgotPassword';
 import { ResetPassword } from '@/pages/ResetPassword';
@@ -40,6 +41,9 @@ const DriverCreate = lazy(() =>
 );
 const DriverDetail = lazy(() =>
   import('@/pages/DriverDetail').then((m) => ({ default: m.DriverDetail })),
+);
+const PaymentReturn = lazy(() =>
+  import('@/pages/PaymentReturn').then((m) => ({ default: m.PaymentReturn })),
 );
 const Pricing = lazy(() => import('@/pages/Pricing').then((m) => ({ default: m.Pricing })));
 const PricingGroupCreate = lazy(() =>
@@ -119,6 +123,12 @@ const TokenDetail = lazy(() =>
 );
 const AuthorizeLog = lazy(() =>
   import('@/pages/AuthorizeLog').then((m) => ({ default: m.AuthorizeLog })),
+);
+const AiInsights = lazy(() =>
+  import('@/pages/AiInsights').then((m) => ({ default: m.AiInsights })),
+);
+const AiInsightDetail = lazy(() =>
+  import('@/pages/AiInsightDetail').then((m) => ({ default: m.AiInsightDetail })),
 );
 const Settings = lazy(() => import('@/pages/Settings').then((m) => ({ default: m.Settings })));
 const NotificationRules = lazy(() =>
@@ -291,7 +301,14 @@ export function App(): React.JSX.Element {
                 >
                   <Route index element={<Dashboard />} />
                   <Route path="sites" element={<Sites />} />
-                  <Route path="sites/new" element={<SiteCreate />} />
+                  <Route
+                    path="sites/new"
+                    element={
+                      <AllSiteRoute>
+                        <SiteCreate />
+                      </AllSiteRoute>
+                    }
+                  />
                   <Route path="sites/:id" element={<SiteDetail />} />
                   <Route path="sites/:id/pricing/add" element={<SiteAssignPricing />} />
                   <Route
@@ -311,6 +328,7 @@ export function App(): React.JSX.Element {
                   <Route path="drivers" element={<Drivers />} />
                   <Route path="drivers/new" element={<DriverCreate />} />
                   <Route path="drivers/:id" element={<DriverDetail />} />
+                  <Route path="payments/return" element={<PaymentReturn />} />
                   <Route path="drivers/:id/pricing/add" element={<DriverAssignPricing />} />
                   <Route path="drivers/:id/tokens/new" element={<DriverTokenCreate />} />
                   <Route path="drivers/:id/vehicles/new" element={<VehicleCreate />} />
@@ -367,19 +385,88 @@ export function App(): React.JSX.Element {
                   <Route path="support-cases" element={<SupportCases />} />
                   <Route path="support-cases/new" element={<SupportCaseCreate />} />
                   <Route path="support-cases/:id" element={<SupportCaseDetail />} />
+                  <Route
+                    path="ai/insights"
+                    element={
+                      <AdminRoute requiredPermission="aiInsights:read">
+                        <AiInsights />
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="ai/insights/:id"
+                    element={
+                      <AdminRoute requiredPermission="aiInsights:read">
+                        <AiInsightDetail />
+                      </AdminRoute>
+                    }
+                  />
                   <Route path="roaming" element={<RoamingLayout />}>
-                    <Route index element={<RoamingPartners />} />
-                    <Route path="partners" element={<RoamingPartners />} />
+                    <Route
+                      index
+                      element={
+                        <AllSiteRoute fallbackTo="/roaming/locations">
+                          <RoamingPartners />
+                        </AllSiteRoute>
+                      }
+                    />
+                    <Route
+                      path="partners"
+                      element={
+                        <AllSiteRoute fallbackTo="/roaming/locations">
+                          <RoamingPartners />
+                        </AllSiteRoute>
+                      }
+                    />
                     <Route path="locations" element={<RoamingLocations />} />
                     <Route path="sessions" element={<RoamingSessions />} />
                     <Route path="cdrs" element={<RoamingCdrs />} />
-                    <Route path="tariffs" element={<RoamingTariffs />} />
+                    <Route
+                      path="tariffs"
+                      element={
+                        <AllSiteRoute fallbackTo="/roaming/locations">
+                          <RoamingTariffs />
+                        </AllSiteRoute>
+                      }
+                    />
                     <Route path="history" element={<RoamingHistory />} />
                   </Route>
-                  <Route path="roaming/partners/new" element={<RoamingPartnerCreate />} />
-                  <Route path="roaming/partners/:id" element={<RoamingPartnerDetail />} />
-                  <Route path="roaming/tariffs/new" element={<RoamingTariffMappingCreate />} />
-                  <Route path="roaming/tariffs/:id" element={<RoamingTariffMappingDetail />} />
+                  <Route
+                    path="roaming/partners/new"
+                    element={
+                      <AdminRoute requiredPermission="roaming:write">
+                        <AllSiteRoute>
+                          <RoamingPartnerCreate />
+                        </AllSiteRoute>
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="roaming/partners/:id"
+                    element={
+                      <AllSiteRoute>
+                        <RoamingPartnerDetail />
+                      </AllSiteRoute>
+                    }
+                  />
+                  <Route
+                    path="roaming/tariffs/new"
+                    element={
+                      <AdminRoute requiredPermission="roaming:write">
+                        <AllSiteRoute>
+                          <RoamingTariffMappingCreate />
+                        </AllSiteRoute>
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="roaming/tariffs/:id"
+                    element={
+                      <AllSiteRoute>
+                        <RoamingTariffMappingDetail />
+                      </AllSiteRoute>
+                    }
+                  />
                   <Route path="firmware-campaigns/new" element={<FirmwareCampaignCreate />} />
                   <Route path="firmware-campaigns/:id" element={<FirmwareCampaignDetail />} />
                   <Route
@@ -402,7 +489,14 @@ export function App(): React.JSX.Element {
                   <Route path="conformance/:runId" element={<ConformanceDetail />} />
                   <Route path="certificates" element={<Certificates />} />
                   <Route path="notifications" element={<NotificationRules />} />
-                  <Route path="logs" element={<AccessLogs />} />
+                  <Route
+                    path="logs"
+                    element={
+                      <AllSiteRoute>
+                        <AccessLogs />
+                      </AllSiteRoute>
+                    }
+                  />
                   <Route path="audit" element={<Audit />} />
                   <Route
                     path="settings"

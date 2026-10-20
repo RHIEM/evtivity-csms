@@ -30,7 +30,7 @@ interface Attachment {
 
 interface Message {
   id: number;
-  senderType: 'driver' | 'operator' | 'system';
+  senderType: 'driver' | 'operator' | 'system' | 'assistant';
   senderId: string | null;
   body: string;
   isInternal: boolean;
@@ -105,7 +105,8 @@ export function CaseInfoSidebar({
           `/v1/support-cases/${caseDetail.id}/messages/${String(att.messageId)}/attachments/${String(att.id)}/download-url`,
         );
         return res.downloadUrl;
-      } catch {
+      } catch (err) {
+        console.warn('Load support case attachment download URL failed', err);
         return null;
       }
     },
@@ -158,6 +159,12 @@ export function CaseInfoSidebar({
                 setEditStatus(e.target.value);
               }}
             >
+              {/* ai_assist is set by the driver AI only: shown, never chosen. */}
+              {caseDetail.status === 'ai_assist' && (
+                <option value="ai_assist" disabled>
+                  {t('supportCases.statuses.ai_assist')}
+                </option>
+              )}
               {STATUS_OPTIONS.map((s) => (
                 <option key={s} value={s}>
                   {t(`supportCases.statuses.${s}`)}

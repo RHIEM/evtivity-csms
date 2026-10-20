@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 
 // Mock external dependencies
 const mockSendMail = vi.fn().mockResolvedValue({});
@@ -17,6 +17,12 @@ vi.mock('node:fs/promises', () => ({
 
 const mockFetch = vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve('') });
 vi.stubGlobal('fetch', mockFetch);
+
+// The connect-time DNS guard of safeFetch has its own tests (safe-fetch.test.ts).
+vi.mock('../safe-fetch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../safe-fetch.js')>()),
+  safeFetch: (...args: unknown[]) => (globalThis.fetch as (...a: unknown[]) => unknown)(...args),
+}));
 
 // SQL mock
 const sqlCalls: Array<{ values: unknown[] }> = [];
@@ -39,6 +45,12 @@ function setupSqlResults(...results: unknown[][]) {
   sqlCalls.length = 0;
 }
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let notificationDispatchModule: typeof import('../notification-dispatch.js');
+beforeAll(async () => {
+  notificationDispatchModule = await import('../notification-dispatch.js');
+}, 30_000);
+
 describe('notification-dispatch', () => {
   let sql: ReturnType<typeof createSqlMock>;
 
@@ -57,14 +69,14 @@ describe('notification-dispatch', () => {
 
   describe('wrapEmailHtml', () => {
     it('wraps body HTML with default template', async () => {
-      const { wrapEmailHtml } = await import('../notification-dispatch.js');
+      const { wrapEmailHtml } = notificationDispatchModule;
       const result = wrapEmailHtml('<p>Hello</p>', 'TestCo');
       expect(result).toContain('<p>Hello</p>');
       expect(result).toContain('TestCo');
     });
 
     it('uses custom wrapper template when provided', async () => {
-      const { wrapEmailHtml } = await import('../notification-dispatch.js');
+      const { wrapEmailHtml } = notificationDispatchModule;
       const result = wrapEmailHtml(
         '<p>Hello</p>',
         'TestCo',
@@ -74,7 +86,7 @@ describe('notification-dispatch', () => {
     });
 
     it('falls back to default template when custom is empty', async () => {
-      const { wrapEmailHtml } = await import('../notification-dispatch.js');
+      const { wrapEmailHtml } = notificationDispatchModule;
       const result = wrapEmailHtml('<p>Hello</p>', 'TestCo', '');
       expect(result).toContain('TestCo');
       expect(result).toContain('<p>Hello</p>');
@@ -83,44 +95,99 @@ describe('notification-dispatch', () => {
 
   describe('compileTemplate', () => {
     it('compiles Handlebars template with variables', async () => {
-      const { compileTemplate } = await import('../notification-dispatch.js');
+      const { compileTemplate } = notificationDispatchModule;
       const result = compileTemplate('Hello {{name}}!', { name: 'World' });
       expect(result).toBe('Hello World!');
     });
 
     it('caches compiled templates', async () => {
-      const { compileTemplate } = await import('../notification-dispatch.js');
+      const { compileTemplate } = notificationDispatchModule;
       const result1 = compileTemplate('Hello {{name}}!', { name: 'A' });
       const result2 = compileTemplate('Hello {{name}}!', { name: 'B' });
       expect(result1).toBe('Hello A!');
       expect(result2).toBe('Hello B!');
     });
+
+    it('renders one source escaped and unescaped (the escape mode is in the cache key)', () => {
+      const { compileTemplate } = notificationDispatchModule;
+      const source = 'Hi {{name}}, {{url}}';
+      const vars = { name: "O'Brien", url: 'https://p.test/r?token=abc' };
+      expect(compileTemplate(source, vars)).toBe(
+        'Hi O&#x27;Brien, https://p.test/r?token&#x3D;abc',
+      );
+      expect(compileTemplate(source, vars, { noEscape: true })).toBe(
+        "Hi O'Brien, https://p.test/r?token=abc",
+      );
+      // The escaped renderer is still cached separately.
+      expect(compileTemplate(source, vars)).toContain('&#x27;');
+    });
+
+    it('keeps the template restrictions in plain-text mode', () => {
+      const { compileTemplate } = notificationDispatchModule;
+      expect(() => compileTemplate('{{> partial}}', {}, { noEscape: true })).toThrow();
+      expect(() => compileTemplate('{{lookup this "x"}}', {}, { noEscape: true })).toThrow();
+    });
   });
 
   describe('formatDateVariables', () => {
     it('formats ISO date variables into the given timezone', async () => {
-      const { formatDateVariables } = await import('../notification-dispatch.js');
+      const { formatDateVariables } = notificationDispatchModule;
       const iso = '2026-07-05T00:00:00.000Z';
       const result = formatDateVariables({ startedAt: iso }, 'America/New_York');
       expect(result['startedAt']).not.toBe(iso);
       expect(result['startedAt']).toContain('2026');
     });
 
-    it('formats issuedAt and dueAt the same way as startedAt', async () => {
-      const { formatDateVariables } = await import('../notification-dispatch.js');
+    it('formats issuedAt, dueAt and refundedAt the same way as startedAt', async () => {
+      const { formatDateVariables } = notificationDispatchModule;
       const iso = '2026-07-05T00:00:00.000Z';
       const result = formatDateVariables(
-        { startedAt: iso, issuedAt: iso, dueAt: iso },
+        { startedAt: iso, issuedAt: iso, dueAt: iso, refundedAt: iso },
         'America/New_York',
       );
       expect(result['issuedAt']).toBe(result['startedAt']);
       expect(result['dueAt']).toBe(result['startedAt']);
+      expect(result['refundedAt']).toBe(result['startedAt']);
       expect(result['issuedAt']).not.toContain('T');
       expect(result['issuedAt']).not.toContain('Z');
     });
 
-    it('leaves non-date variables untouched', async () => {
+    it('formats in the given language without seconds', async () => {
       const { formatDateVariables } = await import('../notification-dispatch.js');
+      const iso = '2026-03-05T08:04:09.000Z';
+      expect(formatDateVariables({ startedAt: iso }, 'Europe/Berlin', 'de')['startedAt']).toBe(
+        '05.03.2026, 09:04',
+      );
+      expect(formatDateVariables({ startedAt: iso }, 'Europe/Berlin')['startedAt']).toMatch(
+        /^Mar 5, 2026, 9:04\sAM$/,
+      );
+    });
+
+    it('formats in UTC instead of throwing for an invalid timezone', () => {
+      const { formatDateVariables } = notificationDispatchModule;
+      const iso = '2026-03-05T08:04:09.000Z';
+      const result = formatDateVariables({ startedAt: iso }, 'Not/A_Zone');
+      expect(result['startedAt']).toMatch(/^Mar 5, 2026, 8:04\sAM$/);
+    });
+
+    it('formats idleStartedAt like the other date variables', () => {
+      const { formatDateVariables } = notificationDispatchModule;
+      const iso = '2026-03-05T08:04:09.000Z';
+      const result = formatDateVariables({ idleStartedAt: iso }, 'UTC');
+      expect(result['idleStartedAt']).toMatch(/^Mar 5, 2026, 8:04\sAM$/);
+    });
+
+    it('formats a Date value (a raw timestamptz row) like an ISO string', () => {
+      const { formatDateVariables } = notificationDispatchModule;
+      const result = formatDateVariables(
+        { idleStartedAt: new Date('2026-03-05T08:04:09.000Z') },
+        'UTC',
+      );
+      expect(result['idleStartedAt']).toMatch(/^Mar 5, 2026, 8:04\sAM$/);
+    });
+
+    it('leaves non-date variables untouched', async () => {
+      const { formatDateVariables } = notificationDispatchModule;
       const result = formatDateVariables(
         { invoiceNumber: 'INV-001', issuedAt: '' },
         'America/New_York',
@@ -132,19 +199,19 @@ describe('notification-dispatch', () => {
 
   describe('resolveRecipients', () => {
     it('returns literal address as single recipient', async () => {
-      const { resolveRecipients } = await import('../notification-dispatch.js');
+      const { resolveRecipients } = notificationDispatchModule;
       const recipients = resolveRecipients(sql as never, 'user@test.com');
       expect(recipients).toEqual([{ address: 'user@test.com', language: 'en' }]);
     });
 
     it('returns empty array for empty string', async () => {
-      const { resolveRecipients } = await import('../notification-dispatch.js');
+      const { resolveRecipients } = notificationDispatchModule;
       const recipients = resolveRecipients(sql as never, '');
       expect(recipients).toEqual([]);
     });
 
     it('returns empty array for whitespace-only string', async () => {
-      const { resolveRecipients } = await import('../notification-dispatch.js');
+      const { resolveRecipients } = notificationDispatchModule;
       const recipients = resolveRecipients(sql as never, '   ');
       expect(recipients).toEqual([]);
     });
@@ -152,14 +219,14 @@ describe('notification-dispatch', () => {
 
   describe('loadDbTemplate', () => {
     it('returns template when found', async () => {
-      const { loadDbTemplate } = await import('../notification-dispatch.js');
+      const { loadDbTemplate } = notificationDispatchModule;
       setupSqlResults([{ subject: 'Test Subject', body_html: '<p>Test</p>' }]);
       const result = await loadDbTemplate(sql as never, 'test.event', 'email', 'en');
       expect(result).toEqual({ subject: 'Test Subject', bodyHtml: '<p>Test</p>' });
     });
 
     it('returns null when not found', async () => {
-      const { loadDbTemplate } = await import('../notification-dispatch.js');
+      const { loadDbTemplate } = notificationDispatchModule;
       setupSqlResults([]);
       const result = await loadDbTemplate(sql as never, 'test.event', 'email', 'en');
       expect(result).toBeNull();
@@ -168,7 +235,7 @@ describe('notification-dispatch', () => {
 
   describe('renderTemplate', () => {
     it('uses templateHtmlOverride when provided', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       const result = await renderTemplate(
         'email',
         'test.event',
@@ -182,7 +249,7 @@ describe('notification-dispatch', () => {
     });
 
     it('falls back to JSON dump when no templates available', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       const result = await renderTemplate('email', 'test.event', 'en', {
         companyName: 'TestCo',
       });
@@ -191,7 +258,7 @@ describe('notification-dispatch', () => {
     });
 
     it('uses DB template when available', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       setupSqlResults([{ subject: 'DB Subject', body_html: '<p>DB Body {{companyName}}</p>' }]);
       const result = await renderTemplate(
         'email',
@@ -206,7 +273,7 @@ describe('notification-dispatch', () => {
     });
 
     it('falls back to English DB template when language not found', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+      const { renderTemplate } = notificationDispatchModule;
       setupSqlResults(
         [], // Spanish not found
         [{ subject: 'EN Subject', body_html: '<p>English</p>' }], // English fallback
@@ -221,19 +288,62 @@ describe('notification-dispatch', () => {
       expect(result.subject).toBe('EN Subject');
     });
 
-    it('uses friendly subject for known event types', async () => {
-      const { renderTemplate } = await import('../notification-dispatch.js');
+    it('uses the generic subject when no subject template exists', async () => {
+      const { renderTemplate } = notificationDispatchModule;
       const result = await renderTemplate('email', 'session.Started', 'en', {
         companyName: 'TestCo',
       });
-      expect(result.subject).toContain('TestCo');
-      expect(result.subject).toContain('started');
+      expect(result.subject).toBe('TestCo - session.Started Notification');
+    });
+
+    it('renders SMS bodies and subjects as plain text, without HTML escaping', async () => {
+      const { renderTemplate } = notificationDispatchModule;
+      setupSqlResults([{ subject: 'Hi {{name}}', body_html: 'Reset for {{name}}: {{resetUrl}}' }]);
+      const result = await renderTemplate(
+        'sms',
+        'test.plainTextSms',
+        'en',
+        { name: "O'Brien", resetUrl: 'https://portal.test/reset-password?token=abc&lang=en' },
+        sql as never,
+      );
+      expect(result.body).toBe(
+        "Reset for O'Brien: https://portal.test/reset-password?token=abc&lang=en",
+      );
+      expect(result.subject).toBe("Hi O'Brien");
+      expect(result.html).toBeUndefined();
+    });
+
+    it('keeps email bodies HTML-escaped while the subject stays plain text', async () => {
+      const { renderTemplate } = notificationDispatchModule;
+      setupSqlResults([{ subject: 'Hi {{name}}', body_html: '<p>Hi {{name}} {{tag}}</p>' }]);
+      const result = await renderTemplate(
+        'email',
+        'test.htmlEmail',
+        'en',
+        { name: "O'Brien", tag: '<b>x</b>' },
+        sql as never,
+      );
+      expect(result.body).toBe('<p>Hi O&#x27;Brien &lt;b&gt;x&lt;/b&gt;</p>');
+      expect(result.subject).toBe("Hi O'Brien");
+    });
+
+    it('renders an SMS rule override as plain text', async () => {
+      const { renderTemplate } = notificationDispatchModule;
+      const result = await renderTemplate(
+        'sms',
+        'test.override',
+        'en',
+        { name: 'A & B' },
+        undefined,
+        'Hello {{name}}',
+      );
+      expect(result.body).toBe('Hello A & B');
     });
   });
 
   describe('sendEmail', () => {
     it('sends email via nodemailer and returns true', async () => {
-      const { sendEmail } = await import('../notification-dispatch.js');
+      const { sendEmail } = notificationDispatchModule;
       const result = await sendEmail(
         {
           host: 'smtp.test.com',
@@ -252,15 +362,50 @@ describe('notification-dispatch', () => {
         expect.objectContaining({
           to: 'to@test.com',
           subject: 'Subject',
-          text: 'Body',
+          text: 'HTML',
           html: '<p>HTML</p>',
         }),
       );
     });
 
+    it('derives the text part from the HTML, not the HTML template', async () => {
+      const { sendEmail } = notificationDispatchModule;
+      const html =
+        '<img src="https://x.test/logo.png" alt="Logo"><h2 style="color:#111">Set up your account</h2>' +
+        "<p>Hi Nightly,</p><a href='https://portal.test/activate?token&#x3D;abc'>Set Your Password</a>";
+      await sendEmail(
+        { host: 'smtp.test.com', port: 587, username: '', password: '', from: 'f@test.com' },
+        'to@test.com',
+        'Subject',
+        html,
+        html,
+      );
+      const text = (mockSendMail.mock.calls.at(-1)?.[0] as { text: string }).text;
+      expect(text).not.toContain('<');
+      expect(text).not.toContain('style=');
+      expect(text).not.toContain('logo.png');
+      expect(text).toContain('SET UP YOUR ACCOUNT');
+      expect(text).toContain('Hi Nightly,');
+      expect(text).toContain('Set Your Password [https://portal.test/activate?token=abc]');
+    });
+
+    it('sends the body as the text part without HTML', async () => {
+      const { sendEmail } = notificationDispatchModule;
+      await sendEmail(
+        { host: 'smtp.test.com', port: 587, username: '', password: '', from: 'f@test.com' },
+        'to@test.com',
+        'Subject',
+        'Plain body',
+      );
+      expect(mockSendMail.mock.calls.at(-1)?.[0]).toMatchObject({
+        text: 'Plain body',
+        html: undefined,
+      });
+    });
+
     it('returns false on send failure', async () => {
       mockSendMail.mockRejectedValueOnce(new Error('SMTP error'));
-      const { sendEmail } = await import('../notification-dispatch.js');
+      const { sendEmail } = notificationDispatchModule;
       const result = await sendEmail(
         {
           host: 'smtp.test.com',
@@ -279,7 +424,7 @@ describe('notification-dispatch', () => {
 
   describe('sendSms', () => {
     it('sends SMS via Twilio API and returns true', async () => {
-      const { sendSms } = await import('../notification-dispatch.js');
+      const { sendSms } = notificationDispatchModule;
       const result = await sendSms(
         { accountSid: 'AC123', authToken: 'token', fromNumber: '+1234567890' },
         '+0987654321',
@@ -298,7 +443,7 @@ describe('notification-dispatch', () => {
         status: 400,
         text: () => Promise.resolve('Bad request'),
       });
-      const { sendSms } = await import('../notification-dispatch.js');
+      const { sendSms } = notificationDispatchModule;
       const result = await sendSms(
         { accountSid: 'AC123', authToken: 'token', fromNumber: '+1234567890' },
         '+0987654321',
@@ -309,7 +454,7 @@ describe('notification-dispatch', () => {
 
     it('returns false on fetch exception', async () => {
       mockFetch.mockRejectedValueOnce(new Error('Network error'));
-      const { sendSms } = await import('../notification-dispatch.js');
+      const { sendSms } = notificationDispatchModule;
       const result = await sendSms(
         { accountSid: 'AC123', authToken: 'token', fromNumber: '+1234567890' },
         '+0987654321',
@@ -321,7 +466,7 @@ describe('notification-dispatch', () => {
 
   describe('sendWebhook', () => {
     it('sends webhook and returns ok', async () => {
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       const result = await sendWebhook('https://webhook.test.com/hook', 'Subject', 'Body', {
         key: 'value',
       });
@@ -341,7 +486,7 @@ describe('notification-dispatch', () => {
         status: 500,
         text: () => Promise.resolve('Server error'),
       });
-      const { sendWebhook } = await import('../notification-dispatch.js');
+      const { sendWebhook } = notificationDispatchModule;
       const result = await sendWebhook('https://webhook.test.com/hook', 'Subject', 'Body', {});
       expect(result).toBe('http_error');
     });
@@ -349,7 +494,7 @@ describe('notification-dispatch', () => {
 
   describe('logNotification', () => {
     it('logs notification without throwing', async () => {
-      const { logNotification } = await import('../notification-dispatch.js');
+      const { logNotification } = notificationDispatchModule;
       expect(() => logNotification('email', 'test@test.com', 'Subject', 'Body')).not.toThrow();
     });
   });
@@ -358,7 +503,7 @@ describe('notification-dispatch', () => {
     it('returns smtp config when host is configured, and null when not', async () => {
       // getNotificationSettings has a 5-minute cache, so we test both in order
       // First call: with SMTP settings
-      const { getNotificationSettings } = await import('../notification-dispatch.js');
+      const { getNotificationSettings } = notificationDispatchModule;
       setupSqlResults([
         { key: 'smtp.host', value: 'smtp.test.com' },
         { key: 'smtp.port', value: '587' },
@@ -383,7 +528,7 @@ describe('notification-dispatch', () => {
 
   describe('dispatchDriverNotification', () => {
     it('sends email and SMS when enabled', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       setupSqlResults(
         [{ is_enabled: true }], // driver_event_settings
         [
@@ -406,27 +551,33 @@ describe('notification-dispatch', () => {
         [], // INSERT notifications (sms)
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-1', {
-        stationId: 'CS-001',
-      });
+      await dispatchDriverNotification(
+        sql as never,
+        'session.Started',
+        'driver-1',
+        {
+          stationId: 'CS-001',
+        },
+        [],
+      );
 
       // Should have made SQL calls
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
     });
 
     it('skips when event type is disabled', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       setupSqlResults(
         [{ is_enabled: false }], // disabled
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-1', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-1', {}, []);
 
       expect(sqlCalls.length).toBe(1);
     });
 
     it('skips when driver not found', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       // Dispatcher fans driver, prefs, company, settings in Promise.all
       // after the event-settings check. Cached helpers (company,
       // settings) may skip the DB on warm runs, so the call count is
@@ -442,19 +593,37 @@ describe('notification-dispatch', () => {
         [], // smtp/twilio settings SELECT (parallel, may be cached)
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-1', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-1', {}, []);
 
       expect(sqlCalls.length).toBeLessThanOrEqual(5);
     });
 
     it('handles dispatch errors gracefully', async () => {
-      const { dispatchDriverNotification } = await import('../notification-dispatch.js');
+      const { dispatchDriverNotification } = notificationDispatchModule;
       setupSqlResults([]); // Will cause an access error
 
       // Should not throw
       await expect(
-        dispatchDriverNotification(sql as never, 'test.event', 'driver-1', {}),
-      ).resolves.toBeUndefined();
+        dispatchDriverNotification(sql as never, 'test.event', 'driver-1', {}, []),
+      ).resolves.toEqual({ delivered: [] });
     });
+  });
+});
+
+// Finding J2: a dispatch without the template directories finds no file
+// template and sends the notification unrendered (subject "<event>
+// Notification", body a dump of the variables). The parameter is required, so
+// a call that omits it fails the typecheck.
+describe('template directories are required', () => {
+  it('rejects a dispatch without template directories at compile time', () => {
+    const { dispatchDriverNotification, dispatchSystemNotification } = notificationDispatchModule;
+    const sql = createSqlMock() as never;
+    const omitted = [
+      // @ts-expect-error templatesDir is required
+      () => dispatchDriverNotification(sql, 'token.Added', 'driver-1', {}),
+      // @ts-expect-error templatesDir is required
+      () => dispatchSystemNotification(sql, 'user.Invited', { email: 'a@b.c' }, {}),
+    ];
+    expect(omitted).toHaveLength(2);
   });
 });

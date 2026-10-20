@@ -30,7 +30,7 @@ export function BackButton({ to, forceTo }: BackButtonProps): React.JSX.Element 
   return (
     <Button
       variant="outline"
-      size="icon"
+      size="icon-header"
       aria-label={t('nav.back')}
       onClick={() => {
         // Priority: explicit override -> browser history -> page default -> root.

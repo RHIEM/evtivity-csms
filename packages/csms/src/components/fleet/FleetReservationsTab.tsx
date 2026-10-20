@@ -45,6 +45,10 @@ import {
   validateReservationDateRange,
 } from '@/lib/reservation-datetime';
 import { LoadingLogo } from '@/components/loading-logo';
+import { useHasPermission } from '@/lib/auth';
+
+/** The API accepts at most this many slots per bulk reservation. */
+export const MAX_BULK_RESERVATION_SLOTS = 100;
 
 interface FleetReservation {
   id: string;
@@ -82,11 +86,14 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
   const timezone = useUserTimezone();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canWrite = useHasPermission('reservations:write');
   const [page, setPage] = useState(1);
   const limit = 10;
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [cancelId, setCancelId] = useState<string | null>(null);
+  // Per-slot outcome of a create with rejected slots, shown until dismissed.
+  const [createResult, setCreateResult] = useState<CreateResult | null>(null);
 
   // Form state. Defaults pre-fill startsAt = now + 5min (rounded to next 5-min)
   // and expiresAt = startsAt + 1h, mirroring the single-reservation create
@@ -130,7 +137,12 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
     }),
   };
 
-  const { data: response, isLoading } = useQuery({
+  const {
+    data: response,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['fleets', fleetId, 'reservations', page],
     queryFn: () =>
       api.get<{ data: FleetReservation[]; total: number }>(
@@ -152,6 +164,7 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
         description: `${t('fleets.slotsConfirmed', { confirmed: data.confirmed })}${data.failed > 0 ? `, ${t('fleets.slotsFailed', { failed: data.failed })}` : ''}`,
         variant: data.failed > 0 ? 'warning' : 'success',
       });
+      if (data.failed > 0) setCreateResult(data);
     },
     onError: (error) => {
       const message =
@@ -209,7 +222,9 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
   }
 
   function addSlot(): void {
-    setSlots((prev) => [...prev, emptyBulkReservationSlot()]);
+    setSlots((prev) =>
+      prev.length >= MAX_BULK_RESERVATION_SLOTS ? prev : [...prev, emptyBulkReservationSlot()],
+    );
   }
 
   function handleSubmit(): void {
@@ -248,22 +263,44 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
     createMutation.mutate(body);
   }
 
-  const canCancel = (status: string): boolean => status === 'active' || status === 'partial';
+  // A booking with a live slot can be cancelled; completed, expired and cancelled are final.
+  const canCancel = (status: string): boolean =>
+    status === 'scheduled' || status === 'active' || status === 'partial';
+  const statusLabel = (status: string): string => {
+    switch (status) {
+      case 'scheduled':
+        return t('fleets.bookingStatus.scheduled');
+      case 'active':
+        return t('fleets.bookingStatus.active');
+      case 'partial':
+        return t('fleets.bookingStatus.partial');
+      case 'completed':
+        return t('fleets.bookingStatus.completed');
+      case 'expired':
+        return t('fleets.bookingStatus.expired');
+      case 'cancelled':
+        return t('fleets.bookingStatus.cancelled');
+      default:
+        return status;
+    }
+  };
 
   return (
     <>
       <Card>
         <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle>{t('fleets.bulkReservations')}</CardTitle>
-          <Button
-            onClick={() => {
-              resetForm();
-              setDialogOpen(true);
-            }}
-          >
-            <Plus className="h-4 w-4" />
-            {t('fleets.newBulkReservation')}
-          </Button>
+          {canWrite && (
+            <Button
+              onClick={() => {
+                resetForm();
+                setDialogOpen(true);
+              }}
+            >
+              <Plus className="h-4 w-4" />
+              {t('fleets.newBulkReservation')}
+            </Button>
+          )}
         </CardHeader>
         <CardContent>
           <div className="overflow-x-auto">
@@ -282,8 +319,26 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
               <TableBody>
                 {isLoading && (
                   <TableRow>
-                    <TableCell colSpan={6} className="text-center text-muted-foreground">
+                    <TableCell colSpan={7} className="text-center text-muted-foreground">
                       <LoadingLogo size="inline" />
+                    </TableCell>
+                  </TableRow>
+                )}
+                {isError && (
+                  <TableRow>
+                    <TableCell colSpan={7} className="text-center text-destructive">
+                      <div className="flex flex-col items-center gap-2">
+                        <span>{t('common.loadError')}</span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            void refetch();
+                          }}
+                        >
+                          {t('common.retry')}
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 )}
@@ -293,20 +348,22 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
                       {fr.name != null && fr.name !== '' ? fr.name : fr.id.slice(0, 8)}
                     </TableCell>
                     <TableCell>
-                      <Badge variant={fleetReservationStatusVariant(fr.status)}>{fr.status}</Badge>
+                      <Badge variant={fleetReservationStatusVariant(fr.status)}>
+                        {statusLabel(fr.status)}
+                      </Badge>
                     </TableCell>
                     <TableCell>{fr.reservationCount}</TableCell>
                     <TableCell>
                       {fr.startsAt != null ? (
                         formatDateTime(fr.startsAt, timezone)
                       ) : (
-                        <span className="text-muted-foreground">n/a</span>
+                        <span className="text-muted-foreground">{t('common.na')}</span>
                       )}
                     </TableCell>
                     <TableCell>{formatDateTime(fr.expiresAt, timezone)}</TableCell>
                     <TableCell>{formatDateTime(fr.createdAt, timezone)}</TableCell>
                     <TableCell className="text-right">
-                      {canCancel(fr.status) && (
+                      {canWrite && canCancel(fr.status) && (
                         <Button
                           variant="ghost"
                           size="icon"
@@ -323,7 +380,7 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
                 ))}
                 {response?.data.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={6} className="text-center text-muted-foreground">
+                    <TableCell colSpan={7} className="text-center text-muted-foreground">
                       {t('reservations.noReservations')}
                     </TableCell>
                   </TableRow>
@@ -446,10 +503,22 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
                   );
                 })}
               </div>
-              <Button type="button" variant="outline" size="sm" onClick={addSlot} className="w-fit">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={addSlot}
+                className="w-fit"
+                disabled={slots.length >= MAX_BULK_RESERVATION_SLOTS}
+              >
                 <Plus className="h-4 w-4" />
                 {t('fleets.addStation')}
               </Button>
+              {slots.length >= MAX_BULK_RESERVATION_SLOTS && (
+                <p className="text-sm text-muted-foreground">
+                  {t('fleets.maxSlotsReached', { max: MAX_BULK_RESERVATION_SLOTS })}
+                </p>
+              )}
             </div>
 
             <DialogFooter>
@@ -467,6 +536,51 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Per-slot result of a create with rejected slots */}
+      <Dialog
+        open={createResult != null}
+        onOpenChange={(open) => {
+          if (!open) setCreateResult(null);
+        }}
+      >
+        <DialogContent className="max-w-[95vw] md:max-w-lg max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{t('fleets.bulkResultTitle')}</DialogTitle>
+            <DialogDescription>
+              {createResult != null
+                ? `${t('fleets.slotsConfirmed', { confirmed: createResult.confirmed })}, ${t('fleets.slotsFailed', { failed: createResult.failed })}`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-sm font-medium">{t('fleets.bulkResultRejected')}</p>
+          <ul className="grid gap-2 text-sm" data-testid="bulk-reservation-rejected">
+            {createResult?.results
+              .filter((r) => r.status === 'rejected')
+              .map((r, i) => (
+                <li key={`${r.stationOcppId}-${String(i)}`} className="rounded-md border p-2">
+                  <div className="font-medium wrap-anywhere">
+                    {r.stationOcppId}
+                    {r.evseId != null ? ` (${t('reservations.evse')} ${String(r.evseId)})` : ''}
+                  </div>
+                  {r.error != null && (
+                    <div className="text-muted-foreground wrap-anywhere">{r.error}</div>
+                  )}
+                </li>
+              ))}
+          </ul>
+          <DialogFooter>
+            <Button
+              type="button"
+              onClick={() => {
+                setCreateResult(null);
+              }}
+            >
+              {t('common.close')}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

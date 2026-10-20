@@ -43,9 +43,30 @@ export const TC_017_2_CS: CsTestCase = {
   description:
     'This scenario describes how the Charge Point should react to UnlockConnector with fixed cable.',
   purpose: 'To test if the Charge Point reports NotSupported for fixed cable.',
-  // Prerequisite: Station has fixed cable. CSS simulates removable cables.
-  execute: async (_ctx) => {
-    return { status: 'skipped', durationMs: 0, steps: [] };
+  // Prerequisite: Charging Station has a fixed cable.
+  stationConfig: { fixedCable: true },
+  execute: async (ctx) => {
+    const steps: StepResult[] = [];
+    ctx.server.setMessageHandler(async (action) => {
+      if (action === 'BootNotification')
+        return { status: 'Accepted', currentTime: new Date().toISOString(), interval: 300 };
+      if (action === 'Authorize') return { idTagInfo: { status: 'Accepted' } };
+      if (action === 'StartTransaction')
+        return { transactionId: 1, idTagInfo: { status: 'Accepted' } };
+      if (action === 'StopTransaction') return { idTagInfo: { status: 'Accepted' } };
+      if (action === 'Heartbeat') return { currentTime: new Date().toISOString() };
+      return {};
+    });
+    const resp = await ctx.server.sendCommand('UnlockConnector', { connectorId: 1 });
+    steps.push({
+      step: 2,
+      description: 'UnlockConnector.conf status is NotSupported',
+      status: resp['status'] === 'NotSupported' ? 'passed' : 'failed',
+      expected: 'status = NotSupported',
+      actual: `status = ${String(resp['status'])}`,
+    });
+    const allPassed = steps.every((s) => s.status === 'passed');
+    return { status: allPassed ? 'passed' : 'failed', durationMs: 0, steps };
   },
 };
 
@@ -76,32 +97,13 @@ export const TC_018_1_CS: CsTestCase = {
     await ctx.station.startCharging(1, 'OCTT_TAG_001');
     // Drain charging setup messages (StatusNotification, Authorize, StartTransaction/TransactionEvent)
     for (let _d = 0; _d < 10; _d++) {
-      try {
-        await ctx.server.waitForMessage('StatusNotification', 500);
-      } catch {
-        break;
-      }
+      if ((await ctx.server.waitForMessageOrNull('StatusNotification', 500)) == null) break;
     }
-    try {
-      await ctx.server.waitForMessage('StartTransaction', 500);
-    } catch {
-      /* drain */
-    }
-    try {
-      await ctx.server.waitForMessage('TransactionEvent', 500);
-    } catch {
-      /* drain */
-    }
-    try {
-      await ctx.server.waitForMessage('Authorize', 500);
-    } catch {
-      /* drain */
-    }
-    try {
-      await ctx.server.waitForMessage('StartTransaction', 5000);
-    } catch {
-      /* consumed */
-    }
+    await ctx.server.waitForMessageOrNull('StartTransaction', 500);
+    await ctx.server.waitForMessageOrNull('TransactionEvent', 500);
+    await ctx.server.waitForMessageOrNull('Authorize', 500);
+    // consumed
+    await ctx.server.waitForMessageOrNull('StartTransaction', 5000);
 
     const resp = await ctx.server.sendCommand('UnlockConnector', { connectorId: 1 });
     steps.push({
@@ -153,8 +155,35 @@ export const TC_018_2_CS: CsTestCase = {
   description:
     'This scenario describes how the Charge Point should react to UnlockConnector with fixed cable during session.',
   purpose: 'To test if the Charge Point reports NotSupported for fixed cable during session.',
-  // Prerequisite: Station has fixed cable. CSS simulates removable cables.
-  execute: async (_ctx) => {
-    return { status: 'skipped', durationMs: 0, steps: [] };
+  // Prerequisite: Charging Station has a fixed cable.
+  stationConfig: { fixedCable: true },
+  execute: async (ctx) => {
+    const steps: StepResult[] = [];
+    ctx.server.setMessageHandler(async (action) => {
+      if (action === 'BootNotification')
+        return { status: 'Accepted', currentTime: new Date().toISOString(), interval: 300 };
+      if (action === 'Authorize') return { idTagInfo: { status: 'Accepted' } };
+      if (action === 'StartTransaction')
+        return { transactionId: 1, idTagInfo: { status: 'Accepted' } };
+      if (action === 'StopTransaction') return { idTagInfo: { status: 'Accepted' } };
+      if (action === 'Heartbeat') return { currentTime: new Date().toISOString() };
+      return {};
+    });
+
+    // Reusable State Charging: the EV driver plugs in and starts charging.
+    await ctx.station.plugIn(1);
+    await ctx.station.startCharging(1, 'OCTT_TAG_001');
+    await ctx.server.waitForMessage('StartTransaction', 10_000);
+
+    const resp = await ctx.server.sendCommand('UnlockConnector', { connectorId: 1 });
+    steps.push({
+      step: 2,
+      description: 'UnlockConnector.conf status is NotSupported',
+      status: resp['status'] === 'NotSupported' ? 'passed' : 'failed',
+      expected: 'status = NotSupported',
+      actual: `status = ${String(resp['status'])}`,
+    });
+    const allPassed = steps.every((s) => s.status === 'passed');
+    return { status: allPassed ? 'passed' : 'failed', durationMs: 0, steps };
   },
 };

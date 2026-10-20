@@ -14,21 +14,27 @@ const LANGUAGES = [
 ] as const;
 
 interface LanguageSelectProps {
+  id?: string | undefined;
   value: string;
   onChange: (value: string) => void;
   className?: string | undefined;
+  disabled?: boolean | undefined;
 }
 
 export function LanguageSelect({
+  id,
   value,
   onChange,
   className,
+  disabled,
 }: LanguageSelectProps): React.JSX.Element {
   const { t } = useTranslation();
   return (
     <Select
-      aria-label={t('nav.language')}
+      id={id}
+      aria-label={id == null ? t('nav.language') : undefined}
       value={value}
+      disabled={disabled}
       onChange={(e) => {
         onChange(e.target.value);
       }}

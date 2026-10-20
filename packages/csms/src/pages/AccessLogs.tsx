@@ -23,6 +23,7 @@ import { FilterPopover } from '@/components/FilterBar';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
 import { httpMethodVariant, httpStatusVariant, workerStatusVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
+import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 
 interface AccessLog {
   id: number;
@@ -87,6 +88,7 @@ function DetailRow({ log, colSpan }: { log: AccessLog; colSpan: number }): React
 }
 
 function BrowserLogTab(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [expandedId, setExpandedId] = useState<number | null>(null);
 
@@ -110,7 +112,7 @@ function BrowserLogTab(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('logs.searchPlaceholder')}
-            className="h-10 w-full sm:max-w-half-vw"
+            className="w-full sm:max-w-half-vw"
           />
         </CardContent>
       </Card>
@@ -144,7 +146,7 @@ function BrowserLogTab(): React.JSX.Element {
                     }}
                   >
                     <TableCell className="whitespace-nowrap" data-testid="row-click-target">
-                      {new Date(log.createdAt).toLocaleString()}
+                      {formatDateTime(log.createdAt, timezone)}
                     </TableCell>
                     <TableCell>{userName(log)}</TableCell>
                     <TableCell>{log.action}</TableCell>
@@ -171,6 +173,7 @@ function BrowserLogTab(): React.JSX.Element {
 }
 
 function PortalLogTab(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [expandedId, setExpandedId] = useState<number | null>(null);
 
@@ -194,7 +197,7 @@ function PortalLogTab(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('logs.searchPlaceholder')}
-            className="h-10 w-full sm:max-w-half-vw"
+            className="w-full sm:max-w-half-vw"
           />
         </CardContent>
       </Card>
@@ -228,7 +231,7 @@ function PortalLogTab(): React.JSX.Element {
                     }}
                   >
                     <TableCell className="whitespace-nowrap" data-testid="row-click-target">
-                      {new Date(log.createdAt).toLocaleString()}
+                      {formatDateTime(log.createdAt, timezone)}
                     </TableCell>
                     <TableCell>{userName(log)}</TableCell>
                     <TableCell>{log.action}</TableCell>
@@ -255,6 +258,7 @@ function PortalLogTab(): React.JSX.Element {
 }
 
 function ApiLogTab(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [filterMethod, setFilterMethod] = useState('');
@@ -292,17 +296,16 @@ function ApiLogTab(): React.JSX.Element {
       value={search}
       onDebouncedChange={setSearch}
       placeholder={t('logs.searchPlaceholder')}
-      className="h-10 w-full"
+      className="w-full"
     />
   );
 
   const filters = (
     <>
       <div className="space-y-2">
-        <Label>{t('logs.method')}</Label>
+        <Label className="leading-6">{t('logs.method')}</Label>
         <Select
           aria-label={t('logs.method')}
-          className="h-10"
           value={filterMethod}
           onChange={(e) => {
             setFilterMethod(e.target.value);
@@ -318,10 +321,9 @@ function ApiLogTab(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('logs.status')}</Label>
+        <Label className="leading-6">{t('logs.status')}</Label>
         <Select
           aria-label={t('logs.status')}
-          className="h-10"
           value={filterStatus}
           onChange={(e) => {
             setFilterStatus(e.target.value);
@@ -357,7 +359,7 @@ function ApiLogTab(): React.JSX.Element {
           <div className="hidden items-end gap-4 md:flex">
             <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <Label>{t('logs.search')}</Label>
+                <Label className="leading-6">{t('logs.search')}</Label>
                 {searchInput}
               </div>
               {filters}
@@ -398,7 +400,7 @@ function ApiLogTab(): React.JSX.Element {
                     }}
                   >
                     <TableCell className="whitespace-nowrap" data-testid="row-click-target">
-                      {new Date(log.createdAt).toLocaleString()}
+                      {formatDateTime(log.createdAt, timezone)}
                     </TableCell>
                     <TableCell>{log.apiKeyName ?? 'n/a'}</TableCell>
                     <TableCell>{userName(log)}</TableCell>
@@ -451,6 +453,7 @@ interface WorkerJobLog {
 }
 
 function WorkerLogTab(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [filterQueue, setFilterQueue] = useState('');
@@ -478,17 +481,16 @@ function WorkerLogTab(): React.JSX.Element {
       value={search}
       onDebouncedChange={setSearch}
       placeholder={t('logs.searchPlaceholder')}
-      className="h-10 w-full"
+      className="w-full"
     />
   );
 
   const filters = (
     <>
       <div className="space-y-2">
-        <Label>{t('logs.queue')}</Label>
+        <Label className="leading-6">{t('logs.queue')}</Label>
         <Select
           aria-label={t('logs.queue')}
-          className="h-10"
           value={filterQueue}
           onChange={(e) => {
             setFilterQueue(e.target.value);
@@ -502,10 +504,9 @@ function WorkerLogTab(): React.JSX.Element {
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('logs.status')}</Label>
+        <Label className="leading-6">{t('logs.status')}</Label>
         <Select
           aria-label={t('logs.status')}
-          className="h-10"
           value={filterStatus}
           onChange={(e) => {
             setFilterStatus(e.target.value);
@@ -543,7 +544,7 @@ function WorkerLogTab(): React.JSX.Element {
           <div className="hidden items-end gap-4 md:flex">
             <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <Label>{t('logs.search')}</Label>
+                <Label className="leading-6">{t('logs.search')}</Label>
                 {searchInput}
               </div>
               {filters}
@@ -582,7 +583,7 @@ function WorkerLogTab(): React.JSX.Element {
                     }}
                   >
                     <TableCell className="whitespace-nowrap" data-testid="row-click-target">
-                      {new Date(log.startedAt).toLocaleString()}
+                      {formatDateTime(log.startedAt, timezone)}
                     </TableCell>
                     <TableCell>{log.jobName}</TableCell>
                     <TableCell>{log.queue}</TableCell>

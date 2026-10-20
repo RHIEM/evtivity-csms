@@ -21,6 +21,10 @@ import { Pagination } from '@/components/ui/pagination';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
 import { useUserTimezone, formatDateTime } from '@/lib/timezone';
 import { LoadingLogo } from '@/components/loading-logo';
+import { useCanExplain } from '@/components/ai/ExplainButton';
+import { AuthorizeInsightCell } from '@/components/ai/insights/AuthorizeInsightCell';
+import { useAuthorizationInsights } from '@/components/ai/insights/insight-api';
+import { formatVehicleId } from '@evtivity/lib/vehicle-id';
 
 interface AuthorizeAttempt {
   id: number;
@@ -34,6 +38,8 @@ interface AuthorizeAttempt {
   outcome: string;
   ocppVersion: string | null;
   reason: string | null;
+  vehicleIdValue?: string | null;
+  vehicleIdType?: string | null;
   createdAt: string;
 }
 
@@ -103,12 +109,19 @@ export function AuthorizeLogView({
     filters,
   );
 
-  // Columns: timestamp, idToken, type, outcome, reason (always 5) + station + matchedToken + session (conditional).
+  // Refused attempts get an insight icon or an Explain icon (AI roadmap v0.1.44).
+  const canExplain = useCanExplain();
+  const refusedIds = (data ?? []).filter((r) => r.outcome !== 'accepted').map((r) => r.id);
+  const insightsByAttempt = useAuthorizationInsights(refusedIds);
+  const showAiColumn = canExplain || insightsByAttempt.size > 0;
+
+  // Columns: timestamp, idToken, type, vehicle id, outcome, reason (always 6) + station + matchedToken + session + AI (conditional).
   const visibleColumns =
-    5 +
+    6 +
     (hideStationColumn ? 0 : 1) +
     (hideMatchedTokenColumn ? 0 : 1) +
-    (hideSessionColumn ? 0 : 1);
+    (hideSessionColumn ? 0 : 1) +
+    (showAiColumn ? 1 : 0);
 
   return (
     <div className="space-y-6">
@@ -118,21 +131,24 @@ export function AuthorizeLogView({
         >
           {!hideIdTokenFilter && (
             <div className="space-y-2">
-              <Label htmlFor="authorize-log-token">{t('tokens.idToken')}</Label>
+              <Label htmlFor="authorize-log-token" className="leading-6">
+                {t('tokens.idToken')}
+              </Label>
               <SearchInput
                 id="authorize-log-token"
                 value={idToken}
                 onDebouncedChange={setIdToken}
                 placeholder={t('tokens.filterIdToken')}
-                className="h-9 max-w-none"
+                className="max-w-none"
               />
             </div>
           )}
           <div className="space-y-2">
-            <Label htmlFor="authorize-log-outcome">{t('tokens.outcome')}</Label>
+            <Label htmlFor="authorize-log-outcome" className="leading-6">
+              {t('tokens.outcome')}
+            </Label>
             <Select
               id="authorize-log-outcome"
-              className="h-9"
               value={outcome}
               onChange={(e) => {
                 setOutcome(e.target.value);
@@ -157,10 +173,16 @@ export function AuthorizeLogView({
                 {!hideStationColumn && <TableHead>{t('tokens.stationColumn')}</TableHead>}
                 <TableHead>{t('tokens.idToken')}</TableHead>
                 <TableHead>{t('tokens.type')}</TableHead>
+                <TableHead>{t('vehicles.vehicleIdColumn')}</TableHead>
                 <TableHead>{t('tokens.outcome')}</TableHead>
                 <TableHead>{t('tokens.reason')}</TableHead>
                 {!hideMatchedTokenColumn && <TableHead>{t('tokens.matchedToken')}</TableHead>}
                 {!hideSessionColumn && <TableHead>{t('tokens.sessionColumn')}</TableHead>}
+                {showAiColumn && (
+                  <TableHead className="w-10">
+                    <span className="sr-only">{t('aiInsights.title')}</span>
+                  </TableHead>
+                )}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -193,7 +215,7 @@ export function AuthorizeLogView({
                         {row.stationDbId != null ? (
                           <Link
                             to={`/stations/${row.stationDbId}`}
-                            className="text-primary hover:underline"
+                            className="text-link hover:underline"
                           >
                             {row.stationOcppId ?? row.stationDbId}
                           </Link>
@@ -204,6 +226,24 @@ export function AuthorizeLogView({
                     )}
                     <TableCell>{row.idToken}</TableCell>
                     <TableCell>{row.tokenType ?? 'n/a'}</TableCell>
+                    <TableCell className="whitespace-nowrap">
+                      {row.vehicleIdValue != null ? (
+                        <span>
+                          <span className="font-mono">{formatVehicleId(row.vehicleIdValue)}</span>
+                          {row.vehicleIdType != null && (
+                            <span className="ml-1 text-xs text-muted-foreground">
+                              (
+                              {t(`vehicles.idTypes.${row.vehicleIdType}`, {
+                                defaultValue: row.vehicleIdType,
+                              })}
+                              )
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
+                    </TableCell>
                     <TableCell>
                       <Badge variant={outcomeVariant(row.outcome)}>{row.outcome}</Badge>
                     </TableCell>
@@ -215,7 +255,7 @@ export function AuthorizeLogView({
                         {row.matchedTokenId != null ? (
                           <Link
                             to={`/tokens/${row.matchedTokenId}`}
-                            className="text-primary hover:underline"
+                            className="text-link hover:underline"
                           >
                             {row.matchedTokenId}
                           </Link>
@@ -229,12 +269,23 @@ export function AuthorizeLogView({
                         {row.sessionId != null ? (
                           <Link
                             to={`/sessions/${row.sessionId}`}
-                            className="text-primary hover:underline"
+                            className="text-link hover:underline"
                           >
                             {row.sessionId}
                           </Link>
                         ) : (
                           'n/a'
+                        )}
+                      </TableCell>
+                    )}
+                    {showAiColumn && (
+                      <TableCell className="w-10 p-1">
+                        {row.outcome !== 'accepted' && (
+                          <AuthorizeInsightCell
+                            attemptId={row.id}
+                            stationOcppId={row.stationOcppId}
+                            insight={insightsByAttempt.get(row.id)}
+                          />
                         )}
                       </TableCell>
                     )}

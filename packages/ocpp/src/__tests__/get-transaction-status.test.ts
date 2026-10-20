@@ -4,6 +4,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../server/middleware/pipeline.js';
+import * as databaseModule from '@evtivity/database';
+import * as getTransactionStatusHandlerModule from '../handlers/v2_1/get-transaction-status.handler.js';
 
 vi.mock('@evtivity/database', () => {
   const selectFn = vi.fn();
@@ -19,6 +21,7 @@ vi.mock('@evtivity/database', () => {
     },
     chargingSessions: {
       status: 'status',
+      stationId: 'station_id',
       transactionId: 'transaction_id',
     },
     __mocks: { selectFn, fromFn, whereFn },
@@ -27,14 +30,18 @@ vi.mock('@evtivity/database', () => {
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((a: unknown, b: unknown) => ({ type: 'eq', a, b })),
+  and: vi.fn((...conditions: unknown[]) => ({ type: 'and', conditions })),
 }));
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(payload: Record<string, unknown>): HandlerContext {
+function makeCtx(
+  payload: Record<string, unknown>,
+  stationDbId: string | null = 'sta_000000000001',
+): HandlerContext {
   return {
     stationId: 'CS-001',
-    stationDbId: null,
+    stationDbId,
     session: {
       stationId: 'CS-001',
       stationDbId: null,
@@ -44,6 +51,7 @@ function makeCtx(payload: Record<string, unknown>): HandlerContext {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'GetTransactionStatus',
@@ -53,6 +61,8 @@ function makeCtx(payload: Record<string, unknown>): HandlerContext {
     eventBus: {
       publish: vi.fn().mockResolvedValue(undefined),
       subscribe: vi.fn(),
+      drain: vi.fn(),
+      track: vi.fn(),
     },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
@@ -61,27 +71,33 @@ function makeCtx(payload: Record<string, unknown>): HandlerContext {
 
 describe('GetTransactionStatus handler', () => {
   it('returns ongoingIndicator true for active session', async () => {
-    const mod = (await import('@evtivity/database')) as Record<string, unknown>;
+    const mod = databaseModule as Record<string, unknown>;
     const mocks = mod['__mocks'] as { whereFn: ReturnType<typeof vi.fn> };
     mocks.whereFn.mockResolvedValue([{ status: 'active' }]);
 
-    const { handleGetTransactionStatus } =
-      await import('../handlers/v2_1/get-transaction-status.handler.js');
+    const { handleGetTransactionStatus } = getTransactionStatusHandlerModule;
 
     const ctx = makeCtx({ transactionId: 'tx-123' });
     const response = await handleGetTransactionStatus(ctx);
 
     expect(response.ongoingIndicator).toBe(true);
     expect(response.messagesInQueue).toBe(false);
+    // A transactionId is unique per station only: the lookup is scoped by it.
+    expect(mocks.whereFn).toHaveBeenLastCalledWith({
+      type: 'and',
+      conditions: [
+        { type: 'eq', a: 'station_id', b: 'sta_000000000001' },
+        { type: 'eq', a: 'transaction_id', b: 'tx-123' },
+      ],
+    });
   });
 
   it('returns ongoingIndicator false for completed session', async () => {
-    const mod = (await import('@evtivity/database')) as Record<string, unknown>;
+    const mod = databaseModule as Record<string, unknown>;
     const mocks = mod['__mocks'] as { whereFn: ReturnType<typeof vi.fn> };
     mocks.whereFn.mockResolvedValue([{ status: 'completed' }]);
 
-    const { handleGetTransactionStatus } =
-      await import('../handlers/v2_1/get-transaction-status.handler.js');
+    const { handleGetTransactionStatus } = getTransactionStatusHandlerModule;
 
     const ctx = makeCtx({ transactionId: 'tx-456' });
     const response = await handleGetTransactionStatus(ctx);
@@ -91,12 +107,11 @@ describe('GetTransactionStatus handler', () => {
   });
 
   it('returns ongoingIndicator false when session not found', async () => {
-    const mod = (await import('@evtivity/database')) as Record<string, unknown>;
+    const mod = databaseModule as Record<string, unknown>;
     const mocks = mod['__mocks'] as { whereFn: ReturnType<typeof vi.fn> };
     mocks.whereFn.mockResolvedValue([]);
 
-    const { handleGetTransactionStatus } =
-      await import('../handlers/v2_1/get-transaction-status.handler.js');
+    const { handleGetTransactionStatus } = getTransactionStatusHandlerModule;
 
     const ctx = makeCtx({ transactionId: 'tx-unknown' });
     const response = await handleGetTransactionStatus(ctx);
@@ -106,13 +121,25 @@ describe('GetTransactionStatus handler', () => {
   });
 
   it('returns defaults when no transactionId provided', async () => {
-    const { handleGetTransactionStatus } =
-      await import('../handlers/v2_1/get-transaction-status.handler.js');
+    const { handleGetTransactionStatus } = getTransactionStatusHandlerModule;
 
     const ctx = makeCtx({});
     const response = await handleGetTransactionStatus(ctx);
 
     expect(response.ongoingIndicator).toBe(false);
     expect(response.messagesInQueue).toBe(false);
+  });
+
+  it('returns defaults for an unregistered station without a lookup', async () => {
+    const mod = databaseModule as Record<string, unknown>;
+    const mocks = mod['__mocks'] as { whereFn: ReturnType<typeof vi.fn> };
+    mocks.whereFn.mockClear();
+
+    const { handleGetTransactionStatus } = getTransactionStatusHandlerModule;
+
+    const response = await handleGetTransactionStatus(makeCtx({ transactionId: 'tx-1' }, null));
+
+    expect(response.ongoingIndicator).toBe(false);
+    expect(mocks.whereFn).not.toHaveBeenCalled();
   });
 });

@@ -9,6 +9,7 @@ import { BackButton } from '@/components/back-button';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { GoogleMapPicker } from '@/components/GoogleMapPicker';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
@@ -17,6 +18,7 @@ import { Select } from '@/components/ui/select';
 import { Card, CardContent } from '@/components/ui/card';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { stationPasswordRules, validateStationPassword } from '@evtivity/lib/station-password';
 
 interface Station {
   id: string;
@@ -44,6 +46,7 @@ export function StationCreate(): React.JSX.Element {
   const [latitude, setLatitude] = useState('');
   const [longitude, setLongitude] = useState('');
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  const passwordRules = stationPasswordRules(ocppProtocol);
 
   const { data: sites } = useQuery({
     queryKey: ['sites'],
@@ -81,12 +84,15 @@ export function StationCreate(): React.JSX.Element {
     if (!stationId.trim()) errors.stationId = t('validation.required');
     if (siteId === '') errors.siteId = t('validation.selectRequired');
     if (securityProfile !== '0') {
+      const passwordError = validateStationPassword(password, ocppProtocol);
       if (!password.trim()) {
         errors.password = t('validation.required');
-      } else if (password.length < 8) {
-        errors.password = t('validation.minLength', { min: 8 });
-      } else if (password.length > 128) {
-        errors.password = t('validation.maxLength', { max: 128 });
+      } else if (passwordError === 'tooShort') {
+        errors.password = t('validation.minLength', { min: passwordRules.min });
+      } else if (passwordError === 'tooLong') {
+        errors.password = t('validation.maxLength', { max: passwordRules.max });
+      } else if (passwordError === 'invalidCharacters') {
+        errors.password = t('stations.passwordInvalidCharacters');
       }
     }
     return errors;
@@ -122,7 +128,9 @@ export function StationCreate(): React.JSX.Element {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="stationId">{t('stations.stationId')}</Label>
+              <Label htmlFor="stationId" className="leading-6">
+                {t('stations.stationId')}
+              </Label>
               <Input
                 id="stationId"
                 value={stationId}
@@ -143,7 +151,9 @@ export function StationCreate(): React.JSX.Element {
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="model">{t('stations.model')}</Label>
+              <Label htmlFor="model" className="leading-6">
+                {t('stations.model')}
+              </Label>
               <Input
                 id="model"
                 value={model}
@@ -153,14 +163,16 @@ export function StationCreate(): React.JSX.Element {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="siteId">{t('stations.site')}</Label>
+              <Label htmlFor="siteId" className="leading-6">
+                {t('stations.site')}
+              </Label>
               <Select
                 id="siteId"
                 value={siteId}
                 onChange={(e) => {
                   setSiteId(e.target.value);
                 }}
-                className={`h-9 ${hasSubmitted && errors.siteId ? 'border-destructive' : ''}`}
+                className={hasSubmitted && errors.siteId ? 'border-destructive' : undefined}
               >
                 <option value="">{t('common.selectSite')}</option>
                 {siteList?.map((s) => (
@@ -174,28 +186,30 @@ export function StationCreate(): React.JSX.Element {
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="ocppProtocol">{t('stations.ocppProtocol')}</Label>
+              <Label htmlFor="ocppProtocol" className="leading-6">
+                {t('stations.ocppProtocol')}
+              </Label>
               <Select
                 id="ocppProtocol"
                 value={ocppProtocol}
                 onChange={(e) => {
                   setOcppProtocol(e.target.value as 'ocpp1.6' | 'ocpp2.1');
                 }}
-                className="h-9"
               >
                 <option value="ocpp1.6">OCPP 1.6</option>
                 <option value="ocpp2.1">OCPP 2.1</option>
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="securityProfile">{t('stations.securityProfile')}</Label>
+              <Label htmlFor="securityProfile" className="leading-6">
+                {t('stations.securityProfile')}
+              </Label>
               <Select
                 id="securityProfile"
                 value={securityProfile}
                 onChange={(e) => {
                   setSecurityProfile(e.target.value);
                 }}
-                className="h-9"
               >
                 <option value="0">{t('stations.sp0')}</option>
                 <option value="1">{t('stations.sp1')}</option>
@@ -215,14 +229,16 @@ export function StationCreate(): React.JSX.Element {
             </div>
             {securityProfile !== '0' && (
               <div className="space-y-2">
-                <Label htmlFor="password">{t('stations.password')}</Label>
+                <Label htmlFor="password" className="leading-6">
+                  {t('stations.password')}
+                </Label>
                 <PasswordInput
                   id="password"
                   value={password}
                   onChange={(e) => {
                     setPassword(e.target.value);
                   }}
-                  placeholder={t('stations.passwordPlaceholder')}
+                  placeholder={t('stations.passwordPlaceholder', passwordRules)}
                   className={hasSubmitted && errors.password ? 'border-destructive' : ''}
                 />
                 {hasSubmitted && errors.password && (
@@ -233,24 +249,22 @@ export function StationCreate(): React.JSX.Element {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="grid gap-2">
                 <Label htmlFor="latitude">{t('stations.latitude')}</Label>
-                <Input
+                <DecimalInput
                   id="latitude"
                   value={latitude}
-                  onChange={(e) => {
-                    setLatitude(e.target.value);
-                  }}
+                  onChange={setLatitude}
                   placeholder="43.338131"
+                  allowNegative
                 />
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="longitude">{t('stations.longitude')}</Label>
-                <Input
+                <DecimalInput
                   id="longitude"
                   value={longitude}
-                  onChange={(e) => {
-                    setLongitude(e.target.value);
-                  }}
+                  onChange={setLongitude}
                   placeholder="-73.695849"
+                  allowNegative
                 />
               </div>
             </div>

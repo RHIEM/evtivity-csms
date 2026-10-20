@@ -4,8 +4,10 @@
 import { useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
+import { useTranslation } from 'react-i18next';
 
 import { LanguageSelect } from '@/components/ui/language-select';
+import { tryParseJson } from '@evtivity/lib/safe-json';
 import { api } from '@/lib/api';
 import { APP_VERSION } from '@/lib/version';
 
@@ -54,6 +56,38 @@ function setFavicon(href: string): void {
   link.href = href;
 }
 
+/** The last company name and logo this browser loaded, for screens shown while the API is down. */
+const BRANDING_CACHE_KEY = 'portal_branding';
+
+export interface CachedBranding {
+  name: string | null;
+  logo: string | null;
+}
+
+export function readCachedBranding(): CachedBranding | null {
+  let text: string | null;
+  try {
+    text = localStorage.getItem(BRANDING_CACHE_KEY);
+  } catch {
+    // fail-open: storage is unavailable in private mode, so the default logo shows
+    return null;
+  }
+  const parsed = tryParseJson(text ?? '') as Partial<CachedBranding> | undefined;
+  if (parsed == null || typeof parsed !== 'object') return null;
+  return {
+    name: typeof parsed.name === 'string' ? parsed.name : null,
+    logo: typeof parsed.logo === 'string' ? parsed.logo : null,
+  };
+}
+
+function rememberBranding(value: CachedBranding): void {
+  try {
+    localStorage.setItem(BRANDING_CACHE_KEY, JSON.stringify(value));
+  } catch (err: unknown) {
+    console.warn('Keeping the company branding for offline screens failed', err);
+  }
+}
+
 export function useAuthBranding(): {
   companyName: string | null;
   companyLogo: string | null;
@@ -63,8 +97,17 @@ export function useAuthBranding(): {
     queryKey: ['branding'],
     queryFn: () => api.get<Branding>('/v1/portal/branding'),
   });
-  const companyName = branding?.name != null && branding.name !== '' ? branding.name : null;
-  const companyLogo = branding?.logo != null && branding.logo !== '' ? branding.logo : null;
+  const liveName = branding?.name != null && branding.name !== '' ? branding.name : null;
+  const liveLogo = branding?.logo != null && branding.logo !== '' ? branding.logo : null;
+  // Until branding loads (or while the API is down), show the last one this browser saw.
+  const cached = branding == null ? readCachedBranding() : null;
+  const companyName = branding == null ? (cached?.name ?? null) : liveName;
+  const companyLogo = branding == null ? (cached?.logo ?? null) : liveLogo;
+
+  useEffect(() => {
+    if (branding == null) return;
+    rememberBranding({ name: liveName, logo: liveLogo });
+  }, [branding, liveName, liveLogo]);
 
   useEffect(() => {
     const color =
@@ -130,6 +173,7 @@ export function AuthFooter({
   branding?: Branding | undefined;
   recaptchaEnabled?: boolean | undefined;
 }): React.JSX.Element {
+  const { t } = useTranslation();
   const year = new Date().getFullYear();
   const name = companyName ?? 'EVtivity';
 
@@ -156,27 +200,25 @@ export function AuthFooter({
       <div className="space-y-1">
         <p>
           <Link to="/privacy-policy" className="hover:underline">
-            Privacy Policy
+            {t('authFooter.privacyPolicy')}
           </Link>
           {' | '}
           <Link to="/terms-of-service" className="hover:underline">
-            Terms of Service
+            {t('authFooter.termsOfService')}
           </Link>
         </p>
-        <p>
-          All rights reserved, {String(year)} {name}
-        </p>
+        <p>{t('authFooter.allRightsReserved', { year: String(year), name })}</p>
         <p>v{APP_VERSION}</p>
         {recaptchaEnabled === true && (
           <p className="pt-1">
-            Protected by reCAPTCHA.{' '}
+            {t('authFooter.recaptchaProtected')}{' '}
             <a
               href="https://policies.google.com/privacy"
               target="_blank"
               rel="noopener noreferrer"
               className="hover:underline"
             >
-              Privacy
+              {t('authFooter.recaptchaPrivacy')}
             </a>
             {' - '}
             <a
@@ -185,7 +227,7 @@ export function AuthFooter({
               rel="noopener noreferrer"
               className="hover:underline"
             >
-              Terms
+              {t('authFooter.recaptchaTerms')}
             </a>
           </p>
         )}

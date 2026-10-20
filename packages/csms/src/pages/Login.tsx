@@ -13,11 +13,25 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { useAuth, MustResetPasswordError } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
+import { isRateLimited } from '@/lib/error-message';
 import { executeRecaptcha } from '@/lib/recaptcha';
 import { MfaChallenge } from '@/components/MfaChallenge';
+import { readSsoMfaFragment } from '@/lib/sso-mfa';
 import { API_BASE_URL } from '@/lib/config';
+import { rememberReturnTo, takeReturnTo } from '@/lib/return-to';
 
 const DEV_AUTO_LOGIN = import.meta.env.VITE_CSMS_AUTO_LOGIN;
+
+// The error is kept as a translation key and translated at render, so it follows the active
+// language instead of the one loaded when it was set.
+type LoginErrorKey =
+  | 'auth.invalidCredentials'
+  | 'auth.recaptchaFailed'
+  | 'auth.ssoNoEmail'
+  | 'auth.ssoAccountDisabled'
+  | 'auth.ssoUserNotFound'
+  | 'auth.ssoConfigError'
+  | 'errors.RATE_LIMITED';
 
 interface SecurityPublic {
   recaptchaEnabled: boolean;
@@ -31,10 +45,11 @@ export function Login(): React.JSX.Element {
   const navigate = useNavigate();
   const login = useAuth((s) => s.login);
   const mfaPending = useAuth((s) => s.mfaPending);
+  const setMfaPending = useAuth((s) => s.setMfaPending);
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoginErrorKey | null>(null);
   const [loading, setLoading] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const autoLoginAttempted = useRef(false);
@@ -42,28 +57,43 @@ export function Login(): React.JSX.Element {
   const [searchParams] = useSearchParams();
   const { companyName, companyLogo, portalUrl, themeColor } = useAuthBranding();
 
+  // An SSO login of a user with MFA lands here with the MFA pending state in
+  // the URL fragment: show the MFA challenge and drop the token from the URL.
+  useEffect(() => {
+    const pending = readSsoMfaFragment(window.location.hash);
+    if (pending == null) return;
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    setMfaPending(pending);
+  }, [setMfaPending]);
+
   // Handle SSO error query params
   useEffect(() => {
     const ssoError = searchParams.get('error');
     if (ssoError == null) return;
-    const errorMap: Record<string, string> = {
-      sso_no_email: t('auth.ssoNoEmail'),
-      sso_account_disabled: t('auth.ssoAccountDisabled'),
-      sso_user_not_found: t('auth.ssoUserNotFound'),
-      sso_config_error: t('auth.ssoConfigError'),
+    const errorMap: Record<string, LoginErrorKey> = {
+      sso_no_email: 'auth.ssoNoEmail',
+      sso_account_disabled: 'auth.ssoAccountDisabled',
+      sso_user_not_found: 'auth.ssoUserNotFound',
+      sso_config_error: 'auth.ssoConfigError',
     };
-    const message = errorMap[ssoError];
-    if (message != null) setError(message);
-  }, [searchParams, t]);
+    const key = errorMap[ssoError];
+    if (key != null) setError(key);
+  }, [searchParams]);
 
   const { data: securityPublic } = useQuery({
     queryKey: ['security-public'],
     queryFn: () => api.get<SecurityPublic>('/v1/security/public'),
   });
 
+  // A protected deep link sent the user here with ?returnTo=; keep it across
+  // MFA and the SSO round trip (lib/return-to.ts).
+  useEffect(() => {
+    rememberReturnTo(searchParams);
+  }, [searchParams]);
+
   useEffect(() => {
     if (isAuthenticated) {
-      void navigate('/');
+      void navigate(takeReturnTo() ?? '/', { replace: true });
     }
   }, [isAuthenticated, navigate]);
 
@@ -116,15 +146,17 @@ export function Login(): React.JSX.Element {
         void navigate('/set-password', { state: { email } });
         return;
       }
-      if (err instanceof ApiError) {
+      if (isRateLimited(err)) {
+        setError('errors.RATE_LIMITED');
+      } else if (err instanceof ApiError) {
         const body = err.body as { code?: string } | null;
         if (body?.code === 'RECAPTCHA_REQUIRED' || body?.code === 'RECAPTCHA_FAILED') {
-          setError(t('auth.recaptchaFailed'));
+          setError('auth.recaptchaFailed');
         } else {
-          setError(t('auth.invalidCredentials'));
+          setError('auth.invalidCredentials');
         }
       } else {
-        setError(t('auth.invalidCredentials'));
+        setError('auth.invalidCredentials');
       }
     } finally {
       setLoading(false);
@@ -152,7 +184,7 @@ export function Login(): React.JSX.Element {
       <Card className="w-full max-w-sm">
         <CardHeader className="text-center">
           <h2 className="text-2xl font-semibold">{t('auth.signIn')}</h2>
-          {error != null && <p className="mt-2 text-sm text-destructive">{error}</p>}
+          {error != null && <p className="mt-2 text-sm text-destructive">{t(error)}</p>}
         </CardHeader>
         <CardContent>
           <form
@@ -163,7 +195,9 @@ export function Login(): React.JSX.Element {
             className="space-y-4"
           >
             <div className="space-y-2">
-              <Label htmlFor="email">{t('auth.emailLabel')}</Label>
+              <Label htmlFor="email" className="leading-6">
+                {t('auth.emailLabel')}
+              </Label>
               <Input
                 id="email"
                 type="email"
@@ -179,7 +213,9 @@ export function Login(): React.JSX.Element {
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="password">{t('auth.passwordLabel')}</Label>
+              <Label htmlFor="password" className="leading-6">
+                {t('auth.passwordLabel')}
+              </Label>
               <PasswordInput
                 id="password"
                 value={password}
@@ -196,10 +232,7 @@ export function Login(): React.JSX.Element {
               {loading ? t('auth.signingIn') : t('auth.signIn')}
             </Button>
             <div className="text-center">
-              <Link
-                to="/forgot-password"
-                className="text-sm font-medium text-primary hover:underline"
-              >
+              <Link to="/forgot-password" className="text-sm font-medium text-link hover:underline">
                 {t('auth.forgotPassword')}
               </Link>
             </div>

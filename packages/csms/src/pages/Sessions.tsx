@@ -1,10 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router';
+import { AlertTriangle } from 'lucide-react';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Card, CardContent } from '@/components/ui/card';
+import { RecalculateElectricityCostAction } from '@/components/ElectricityCostNotices';
 import { Select } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
 import { Pagination } from '@/components/ui/pagination';
@@ -31,40 +35,107 @@ interface Station {
 export function Sessions(): React.JSX.Element {
   const { t } = useTranslation();
   const timezone = useUserTimezone();
-  const [filterSiteId, setFilterSiteId] = useState('');
-  const [filterStationId, setFilterStationId] = useState('');
-  const [filterStatus, setFilterStatus] = useState('');
+  // The filters and the search live in the URL (?siteId=, ?stationId=,
+  // ?status=, ?costMissing=true, ?search=), so Back, a reload and a shared
+  // link keep them. ?siteId=<id>&costMissing=true lists a site's sessions
+  // without an electricity cost.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filterSiteId = searchParams.get('siteId') ?? '';
+  const filterStationId = searchParams.get('stationId') ?? '';
+  const filterStatus = searchParams.get('status') ?? '';
+  const filterCostMissing = searchParams.get('costMissing') === 'true';
+  const setFilters = useCallback(
+    (changes: Record<string, string>) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          for (const [key, value] of Object.entries(changes)) {
+            if (value === '') next.delete(key);
+            else next.set(key, value);
+          }
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
 
   const { data: sites } = useQuery({
     queryKey: ['sites'],
     queryFn: () => api.get<{ data: Site[]; total: number }>('/v1/sites?limit=100'),
   });
+  // The filter lists hold the first 100 sites and stations. A selected one
+  // past them (a link to a later site) is loaded by id, so the filter shows it.
+  const siteListed = filterSiteId === '' || sites?.data.some((s) => s.id === filterSiteId);
+  const { data: selectedSite } = useQuery({
+    queryKey: ['sites', filterSiteId],
+    queryFn: () => api.get<Site>(`/v1/sites/${filterSiteId}`),
+    enabled: sites != null && siteListed !== true,
+  });
+  const siteOptions = useMemo(() => {
+    const list = sites?.data ?? [];
+    return selectedSite != null && !list.some((s) => s.id === selectedSite.id)
+      ? [...list, selectedSite]
+      : list;
+  }, [sites, selectedSite]);
 
   const stationQueryUrl = filterSiteId
     ? `/v1/stations?limit=100&siteId=${filterSiteId}`
     : '/v1/stations?limit=100';
   const { data: stations } = useQuery({
-    queryKey: ['stations', filterSiteId],
+    queryKey: ['stations', 'filter-options', filterSiteId],
     queryFn: () => api.get<{ data: Station[]; total: number }>(stationQueryUrl),
   });
+  const stationListed =
+    filterStationId === '' || stations?.data.some((s) => s.id === filterStationId);
+  const { data: selectedStation } = useQuery({
+    queryKey: ['stations', filterStationId],
+    queryFn: () => api.get<Station>(`/v1/stations/${filterStationId}`),
+    enabled: stations != null && stationListed !== true,
+  });
+  const stationOptions = useMemo(() => {
+    const list = stations?.data ?? [];
+    return selectedStation != null && !list.some((s) => s.id === selectedStation.id)
+      ? [...list, selectedStation]
+      : list;
+  }, [stations, selectedStation]);
 
   const extraParams = useMemo(() => {
     const params: Record<string, string> = {};
     if (filterSiteId !== '') params.siteId = filterSiteId;
     if (filterStationId !== '') params.stationId = filterStationId;
     if (filterStatus !== '') params.status = filterStatus;
+    if (filterCostMissing) params.costMissing = 'true';
     return Object.keys(params).length > 0 ? params : undefined;
-  }, [filterSiteId, filterStationId, filterStatus]);
+  }, [filterSiteId, filterStationId, filterStatus, filterCostMissing]);
+  const filterSiteName = siteOptions.find((s) => s.id === filterSiteId)?.name;
 
+  // A link can open the list already searched (`?search=`).
   const {
     data: sessions,
     isLoading,
+    isError,
+    refetch,
     page,
     totalPages,
     setPage,
     search,
-    setSearch,
-  } = usePaginatedQuery<Session>('sessions', '/v1/sessions', extraParams);
+    setSearch: setListSearch,
+  } = usePaginatedQuery<Session>(
+    'sessions',
+    '/v1/sessions',
+    extraParams,
+    searchParams.get('search') ?? '',
+  );
+
+  const setSearch = useCallback(
+    (value: string) => {
+      setListSearch(value);
+      setFilters({ search: value });
+    },
+    [setListSearch, setFilters],
+  );
 
   const { visibility, setVisibility } = useColumnVisibility('sessions', SESSIONS_COLUMNS);
 
@@ -81,24 +152,22 @@ export function Sessions(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('sessions.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('sites.title')}</Label>
+              <Label className="leading-6">{t('sites.title')}</Label>
               <Select
                 aria-label={t('sites.title')}
-                className="h-10"
                 value={filterSiteId}
                 onChange={(e) => {
-                  setFilterSiteId(e.target.value);
-                  setFilterStationId('');
+                  setFilters({ siteId: e.target.value, stationId: '' });
                 }}
               >
                 <option value="">{t('sessions.allSites')}</option>
-                {sites?.data.map((s) => (
+                {siteOptions.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
                   </option>
@@ -106,17 +175,16 @@ export function Sessions(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('stations.title')}</Label>
+              <Label className="leading-6">{t('stations.title')}</Label>
               <Select
                 aria-label={t('stations.title')}
-                className="h-10"
                 value={filterStationId}
                 onChange={(e) => {
-                  setFilterStationId(e.target.value);
+                  setFilters({ stationId: e.target.value });
                 }}
               >
                 <option value="">{t('sessions.allStations')}</option>
-                {stations?.data.map((s) => (
+                {stationOptions.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.stationId}
                   </option>
@@ -124,13 +192,12 @@ export function Sessions(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('common.status')}</Label>
+              <Label className="leading-6">{t('common.status')}</Label>
               <Select
                 aria-label={t('common.status')}
-                className="h-10"
                 value={filterStatus}
                 onChange={(e) => {
-                  setFilterStatus(e.target.value);
+                  setFilters({ status: e.target.value });
                 }}
               >
                 <option value="">{t('sessions.allStatuses')}</option>
@@ -139,6 +206,20 @@ export function Sessions(): React.JSX.Element {
                 <option value="completed">{t('status.completed')}</option>
                 <option value="failed">{t('status.failed')}</option>
                 <option value="faulted">{t('status.faulted')}</option>
+                <option value="manual_billing">{t('sessions.manualBilling')}</option>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label className="leading-6">{t('sessions.electricityCost')}</Label>
+              <Select
+                aria-label={t('sessions.electricityCost')}
+                value={filterCostMissing ? 'missing' : ''}
+                onChange={(e) => {
+                  setFilters({ costMissing: e.target.value === 'missing' ? 'true' : '' });
+                }}
+              >
+                <option value="">{t('sessions.electricityCostAll')}</option>
+                <option value="missing">{t('sessions.electricityCostMissing')}</option>
               </Select>
             </div>
           </>
@@ -146,7 +227,8 @@ export function Sessions(): React.JSX.Element {
         const activeFilterCount =
           (filterSiteId !== '' ? 1 : 0) +
           (filterStationId !== '' ? 1 : 0) +
-          (filterStatus !== '' ? 1 : 0);
+          (filterStatus !== '' ? 1 : 0) +
+          (filterCostMissing ? 1 : 0);
         const columnsToggle = (
           <ColumnVisibilityToggle
             tableKey="sessions"
@@ -163,9 +245,7 @@ export function Sessions(): React.JSX.Element {
                 <FilterPopover
                   activeCount={activeFilterCount}
                   onClearAll={() => {
-                    setFilterSiteId('');
-                    setFilterStationId('');
-                    setFilterStatus('');
+                    setFilters({ siteId: '', stationId: '', status: '', costMissing: '' });
                   }}
                 >
                   {filters}
@@ -173,9 +253,9 @@ export function Sessions(): React.JSX.Element {
                 {columnsToggle}
               </div>
               <div className="hidden items-end gap-4 md:flex">
-                <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+                <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
                   <div className="space-y-2">
-                    <Label>{t('sessions.search')}</Label>
+                    <Label className="leading-6">{t('sessions.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}
@@ -187,6 +267,22 @@ export function Sessions(): React.JSX.Element {
         );
       })()}
 
+      {filterCostMissing && (
+        <Alert variant="warning" data-testid="sessions-cost-missing-notice">
+          <AlertTriangle />
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+            <span>
+              {filterSiteName != null
+                ? t('sessions.costMissingNotice')
+                : t('sessions.costMissingSelectSite')}
+            </span>
+            {filterSiteName != null && (
+              <RecalculateElectricityCostAction siteId={filterSiteId} siteName={filterSiteName} />
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
+
       <Card>
         <CardContent className="p-0">
           <SessionsTable
@@ -196,6 +292,8 @@ export function Sessions(): React.JSX.Element {
             onPageChange={setPage}
             timezone={timezone}
             isLoading={isLoading}
+            isError={isError}
+            onRetry={refetch}
             visibility={visibility}
           />
         </CardContent>

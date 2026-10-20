@@ -13,8 +13,31 @@ vi.mock('argon2', async (importActual) => {
   };
 });
 
+const { mockWriteAudit, mockGetRegistrationPolicy } = vi.hoisted(() => ({
+  mockWriteAudit: vi.fn(),
+  mockGetRegistrationPolicy: vi.fn(),
+}));
+vi.mock('@evtivity/database', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@evtivity/database')>()),
+  writeAudit: mockWriteAudit,
+  getRegistrationPolicy: mockGetRegistrationPolicy,
+}));
+
 import { hash, verify } from 'argon2';
-import { authenticateConnection, extractStationId } from '../server/middleware/authenticate.js';
+import { STATION_PASSWORD_HASH_OPTIONS } from '@evtivity/lib';
+import {
+  authenticateConnection,
+  extractStationId,
+  rejectionFor,
+  RETRY_AFTER_BASE_SECONDS,
+  RETRY_AFTER_JITTER_SECONDS,
+  serviceUnavailable,
+} from '../server/middleware/authenticate.js';
+import {
+  StationAuthBackoff,
+  StationAuthCache,
+  StationPasswordVerifier,
+} from '../server/middleware/station-password-verifier.js';
 
 const verifyMock = verify as unknown as ReturnType<typeof vi.fn>;
 
@@ -159,6 +182,30 @@ describe('extractStationId', () => {
   it('returns null for nested path', () => {
     expect(extractStationId('/ocpp/STATION-001')).toBeNull();
   });
+
+  it('accepts every OCPP identifierString character', () => {
+    expect(extractStationId('/CS*01=a+b|c@site.x:1_2-3')).toBe('CS*01=a+b|c@site.x:1_2-3');
+  });
+
+  it('percent-decodes the path segment', () => {
+    expect(extractStationId('/CS%7C01%40site')).toBe('CS|01@site');
+    expect(extractStationId('/CS%2D01')).toBe('CS-01');
+  });
+
+  it('rejects characters outside the identifierString set, also when encoded', () => {
+    expect(extractStationId('/CS 01')).toBeNull();
+    expect(extractStationId('/CS%2001')).toBeNull();
+    expect(extractStationId('/CS%2F01')).toBeNull();
+    expect(extractStationId('/CS#01')).toBeNull();
+  });
+
+  it('rejects a malformed percent-encoding, a query string and an empty or long id', () => {
+    expect(extractStationId('/CS%E0%A4%A')).toBeNull();
+    expect(extractStationId('/CS-01?x=1')).toBeNull();
+    expect(extractStationId('/')).toBeNull();
+    expect(extractStationId('/' + 'A'.repeat(129))).toBeNull();
+    expect(extractStationId('/' + 'A'.repeat(128))).toBe('A'.repeat(128));
+  });
 });
 
 describe('authenticateConnection', () => {
@@ -189,6 +236,7 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Unknown station');
+    expect(result.failure).toBe('unknown_station');
   });
 
   it('rejects blocked station', async () => {
@@ -216,10 +264,48 @@ describe('authenticateConnection', () => {
         onboarding_status: 'pending',
       },
     ]);
+    mockGetRegistrationPolicy.mockResolvedValueOnce('approval-required');
     const req = createMockRequest('/PENDING-STATION');
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(true);
     expect(result.stationDbId).toBe('db-id-pending');
+    expect(result.onboardingStatus).toBe('pending');
+    expect(result.awaitingApproval).toBe(true);
+  });
+
+  it('does not mark a pending station awaiting approval under open registration', async () => {
+    const sql = createMockSql([
+      {
+        id: 'db-id-pending-open',
+        security_profile: 0,
+        basic_auth_password_hash: null,
+        onboarding_status: 'pending',
+      },
+    ]);
+    mockGetRegistrationPolicy.mockResolvedValueOnce('open');
+    const result = await authenticateConnection(createMockRequest('/PENDING-OPEN'), logger, sql);
+    expect(result.authenticated).toBe(true);
+    expect(result.awaitingApproval).toBe(false);
+  });
+
+  it('never reads the registration policy for an accepted station', async () => {
+    mockGetRegistrationPolicy.mockClear();
+    const sql = createMockSql([
+      {
+        id: 'db-id-accepted',
+        security_profile: 0,
+        basic_auth_password_hash: null,
+        onboarding_status: 'accepted',
+      },
+    ]);
+    const result = await authenticateConnection(
+      createMockRequest('/ACCEPTED-STATION'),
+      logger,
+      sql,
+    );
+    expect(result.awaitingApproval).toBe(false);
+    expect(result.onboardingStatus).toBe('accepted');
+    expect(mockGetRegistrationPolicy).not.toHaveBeenCalled();
   });
 
   it('accepts SP0 station without credentials', async () => {
@@ -251,6 +337,7 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Basic auth credentials required');
+    expect(result.failure).toBe('credentials');
   });
 
   it('rejects SP1 station with wrong password', async () => {
@@ -319,6 +406,38 @@ describe('authenticateConnection', () => {
     const result = await authenticateConnection(req, logger, sql);
     expect(result.authenticated).toBe(false);
     expect(result.error).toBe('Security Profile 2 requires TLS');
+    expect(result.failure).toBe('tls_required');
+  });
+
+  it('accepts SP2 station when a trusted load balancer ended TLS', async () => {
+    const passwordHash = await hash('testpass');
+    const sql = createMockSql([
+      {
+        id: 'db-id-5b',
+        security_profile: 2,
+        basic_auth_password_hash: passwordHash,
+        onboarding_status: 'accepted',
+      },
+    ]);
+    const authHeader = 'Basic ' + Buffer.from('SP2-STATION:testpass').toString('base64');
+    const req = createMockRequest('/SP2-STATION', authHeader, false);
+    const result = await authenticateConnection(req, logger, sql, null, true);
+    expect(result.authenticated).toBe(true);
+  });
+
+  it('still requires TLS on the socket for SP3 behind a load balancer', async () => {
+    const sql = createMockSql([
+      {
+        id: 'db-id-5c',
+        security_profile: 3,
+        basic_auth_password_hash: null,
+        onboarding_status: 'accepted',
+      },
+    ]);
+    const req = createMockRequest('/SP3-STATION', undefined, false);
+    const result = await authenticateConnection(req, logger, sql, null, true);
+    expect(result.authenticated).toBe(false);
+    expect(result.failure).toBe('tls_required');
   });
 
   it('rejects SP1 station with no password configured', async () => {
@@ -640,5 +759,668 @@ describe('authenticateConnection', () => {
       expect.objectContaining({ event: 'auth_failed', stationDbId: 'db-id-log-fail' }),
       'Failed to write connection_logs row',
     );
+  });
+});
+
+describe('rejectionFor', () => {
+  it('challenges credential failures with 401 and WWW-Authenticate', () => {
+    const rejection = rejectionFor({
+      authenticated: false,
+      stationId: 'CS-1',
+      stationDbId: 'sta_1',
+      failure: 'credentials',
+    });
+    expect(rejection.status).toBe(401);
+    expect(rejection.headers?.['WWW-Authenticate']).toMatch(/^Basic realm="OCPP"/);
+  });
+
+  it('rejects TLS and client certificate failures with 401 and no challenge', () => {
+    for (const failure of ['tls_required', 'client_certificate'] as const) {
+      const rejection = rejectionFor({
+        authenticated: false,
+        stationId: 'CS-1',
+        stationDbId: 'sta_1',
+        failure,
+      });
+      expect(rejection.status).toBe(401);
+      expect(rejection.headers).toBeUndefined();
+    }
+  });
+
+  it('maps unknown, blocked and unavailable to 404, 403 and 503', () => {
+    const base = { authenticated: false, stationId: 'CS-1', stationDbId: null };
+    expect(rejectionFor({ ...base, failure: 'unknown_station' }).status).toBe(404);
+    expect(rejectionFor({ ...base, failure: 'blocked' }).status).toBe(403);
+    expect(rejectionFor({ ...base, failure: 'unavailable' }).status).toBe(503);
+    expect(rejectionFor(base).status).toBe(503);
+  });
+
+  it('answers a locked-out station with 429 and Retry-After', () => {
+    const rejection = rejectionFor({
+      authenticated: false,
+      stationId: 'CS-1',
+      stationDbId: 'sta_1',
+      failure: 'locked_out',
+      retryAfterSeconds: 42,
+    });
+    expect(rejection.status).toBe(429);
+    expect(rejection.headers?.['Retry-After']).toBe('42');
+  });
+
+  it('tells a station when to retry after a 503', () => {
+    const base = { authenticated: false, stationId: 'CS-1', stationDbId: null };
+    const retryAfter = Number(
+      rejectionFor({ ...base, failure: 'unavailable' }).headers?.['Retry-After'],
+    );
+    expect(retryAfter).toBeGreaterThanOrEqual(RETRY_AFTER_BASE_SECONDS);
+    expect(retryAfter).toBeLessThanOrEqual(RETRY_AFTER_BASE_SECONDS + RETRY_AFTER_JITTER_SECONDS);
+  });
+
+  it('spreads Retry-After over the jitter range in whole seconds', () => {
+    expect(serviceUnavailable(() => 0)).toEqual({
+      status: 503,
+      message: 'Service Unavailable',
+      headers: { 'Retry-After': String(RETRY_AFTER_BASE_SECONDS) },
+    });
+    expect(serviceUnavailable(() => 0.999).headers?.['Retry-After']).toBe(
+      String(RETRY_AFTER_BASE_SECONDS + RETRY_AFTER_JITTER_SECONDS),
+    );
+  });
+});
+
+describe('authenticateConnection with a pending security profile upgrade', () => {
+  const PASSWORD = 'pending-upgrade-pw';
+  let passwordHash = '';
+  const basic = (user: string): string =>
+    'Basic ' + Buffer.from(`${user}:${PASSWORD}`).toString('base64');
+
+  // Records each query's SQL text and values, answering the station lookup
+  // and, with `promoted`, the promotion's compare-and-set.
+  function recordingSql(station: Record<string, unknown>, promoted = true) {
+    const queries: { text: string; values: unknown[] }[] = [];
+    const fn = vi.fn();
+    const proxy = new Proxy(fn, {
+      apply(_t, _this, args: unknown[]) {
+        const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
+        const text = strings.join('?');
+        queries.push({ text, values });
+        if (text.includes('pending_security_profile = NULL')) {
+          return Promise.resolve(promoted ? [{ id: station['id'] }] : []) as unknown;
+        }
+        return Promise.resolve(text.includes('FROM charging_stations') ? [station] : []) as unknown;
+      },
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'json') return (v: unknown) => v;
+        return target[prop as keyof typeof target];
+      },
+    });
+    return { sql: proxy as unknown as Parameters<typeof authenticateConnection>[2], queries };
+  }
+
+  beforeEach(async () => {
+    if (passwordHash === '') {
+      passwordHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    }
+  });
+
+  it('accepts the pending profile and promotes it (A05.FR.06)', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 0,
+      pending_security_profile: 1,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP', basic('CS-UP')),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    const update = queries.find((q) => q.text.includes('UPDATE charging_stations'));
+    expect(update?.text).toContain('pending_security_profile = NULL');
+    expect(update?.values).toEqual([1, 1, 'sta_up', 1]);
+    // The password hash is cleared only for an upgrade to Mutual TLS (profile 3).
+    expect(update?.text).toContain('basic_auth_password_hash = CASE WHEN');
+    expect(queries.some((q) => q.values.includes('security_profile_upgraded'))).toBe(true);
+    expect(mockWriteAudit).toHaveBeenCalledWith(
+      { table: expect.anything() as unknown, idColumn: 'station_id' },
+      {
+        entityId: 'sta_up',
+        entityIdSnapshot: 'sta_up',
+        action: 'updated',
+        actor: 'ocpp',
+        actorLabel: 'security_profile_upgraded',
+        before: { securityProfile: 0, pendingSecurityProfile: 1 },
+        after: { securityProfile: 1, pendingSecurityProfile: null },
+        notes: 'The station connected with the pending security profile',
+      },
+      undefined,
+      expect.anything(),
+    );
+  });
+
+  it('writes no station audit row when another connection promoted it first', async () => {
+    mockWriteAudit.mockClear();
+    const { sql } = recordingSql(
+      {
+        id: 'sta_up',
+        security_profile: 0,
+        pending_security_profile: 1,
+        basic_auth_password_hash: passwordHash,
+        onboarding_status: 'accepted',
+      },
+      false,
+    );
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP', basic('CS-UP')),
+      createMockLogger(),
+      sql,
+    );
+    expect(result.authenticated).toBe(true);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('still accepts the current profile while the upgrade is pending, without logging failures', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 0,
+      pending_security_profile: 1,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    expect(queries.some((q) => q.text.includes('UPDATE charging_stations'))).toBe(false);
+    expect(queries.some((q) => q.values.includes('auth_failed'))).toBe(false);
+  });
+
+  it('does not promote to TLS profile 2 on a plain connection; profile 1 still applies', async () => {
+    const { sql, queries } = recordingSql({
+      id: 'sta_up',
+      security_profile: 1,
+      pending_security_profile: 2,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP', basic('CS-UP')),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    expect(queries.some((q) => q.text.includes('UPDATE charging_stations'))).toBe(false);
+  });
+
+  it('rejects the lower profile once the upgrade is promoted (A05.FR.07)', async () => {
+    const { sql } = recordingSql({
+      id: 'sta_up',
+      security_profile: 1,
+      pending_security_profile: null,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    });
+    const result = await authenticateConnection(
+      createMockRequest('/CS-UP'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(false);
+    expect(result.failure).toBe('credentials');
+  });
+});
+
+describe('authenticateConnection stores the negotiated OCPP protocol', () => {
+  // Records each query; the station lookup answers `station`, an UPDATE can fail.
+  function protocolSql(station: Record<string, unknown>, failUpdate = false) {
+    const queries: { text: string; values: unknown[] }[] = [];
+    const proxy = new Proxy(vi.fn(), {
+      apply(_t, _this, args: unknown[]) {
+        const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
+        const text = strings.join('?');
+        queries.push({ text, values });
+        if (failUpdate && text.includes('UPDATE charging_stations')) {
+          return Promise.reject(new Error('write CONNECT_TIMEOUT')) as unknown;
+        }
+        return Promise.resolve(text.includes('FROM charging_stations') ? [station] : []) as unknown;
+      },
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'json') return (v: unknown) => v;
+        return target[prop as keyof typeof target];
+      },
+    });
+    return { sql: proxy as unknown as Parameters<typeof authenticateConnection>[2], queries };
+  }
+
+  function protocolUpdates(queries: { text: string; values: unknown[] }[]) {
+    return queries.filter((q) => q.text.includes('SET ocpp_protocol'));
+  }
+
+  const sp0Station = (ocppProtocol: string | null) => ({
+    id: 'sta_proto',
+    security_profile: 0,
+    pending_security_profile: null,
+    basic_auth_password_hash: null,
+    onboarding_status: 'accepted',
+    ocpp_protocol: ocppProtocol,
+  });
+
+  function requestOffering(protocols: string): IncomingMessage {
+    const req = createMockRequest('/CS-PROTO');
+    req.headers['sec-websocket-protocol'] = protocols;
+    return req;
+  }
+
+  it('writes the protocol of a new station before the upgrade completes', async () => {
+    const { sql, queries } = protocolSql(sp0Station(null));
+    const result = await authenticateConnection(
+      requestOffering('ocpp2.1'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    const updates = protocolUpdates(queries);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.values).toEqual(['ocpp2.1', 'sta_proto', 'ocpp2.1']);
+  });
+
+  it('stores the protocol the upgrade selects: 2.1 over 1.6', async () => {
+    const { sql, queries } = protocolSql(sp0Station('ocpp1.6'));
+    await authenticateConnection(requestOffering('ocpp1.6, ocpp2.1'), createMockLogger(), sql);
+
+    expect(protocolUpdates(queries)[0]?.values[0]).toBe('ocpp2.1');
+  });
+
+  it('replaces the previous protocol of a station that reconnects with another one', async () => {
+    const { sql, queries } = protocolSql(sp0Station('ocpp2.1'));
+    await authenticateConnection(requestOffering('ocpp1.6'), createMockLogger(), sql);
+
+    expect(protocolUpdates(queries)[0]?.values[0]).toBe('ocpp1.6');
+  });
+
+  it('writes nothing when the stored protocol already matches', async () => {
+    const { sql, queries } = protocolSql(sp0Station('ocpp2.1'));
+    const result = await authenticateConnection(
+      requestOffering('ocpp2.1'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(true);
+    expect(protocolUpdates(queries)).toHaveLength(0);
+  });
+
+  it('writes nothing when no supported subprotocol is offered', async () => {
+    const { sql, queries } = protocolSql(sp0Station(null));
+    await authenticateConnection(requestOffering('ocpp2.0.1'), createMockLogger(), sql);
+
+    expect(protocolUpdates(queries)).toHaveLength(0);
+  });
+
+  it('writes nothing for a rejected connection', async () => {
+    const { sql, queries } = protocolSql({ ...sp0Station(null), security_profile: 1 });
+    const result = await authenticateConnection(
+      requestOffering('ocpp2.1'),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(result.authenticated).toBe(false);
+    expect(protocolUpdates(queries)).toHaveLength(0);
+  });
+
+  it('still accepts the station and warns when the write fails', async () => {
+    const { sql } = protocolSql(sp0Station(null), true);
+    const logger = createMockLogger();
+    const result = await authenticateConnection(requestOffering('ocpp2.1'), logger, sql);
+
+    expect(result.authenticated).toBe(true);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ stationDbId: 'sta_proto', protocol: 'ocpp2.1' }),
+      'Failed to store the negotiated OCPP protocol at connection',
+    );
+  });
+});
+
+describe('authenticateConnection password cache and rehash', () => {
+  const PASSWORD = 'cache-and-rehash-pw1';
+  const auth = (password: string): string =>
+    'Basic ' + Buffer.from(`CS-CACHE:${password}`).toString('base64');
+
+  function stationSql(
+    station: Record<string, unknown>,
+    updateRows: unknown[] = [{ id: station['id'] }],
+  ) {
+    const queries: { text: string; values: unknown[] }[] = [];
+    const fn = vi.fn();
+    const proxy = new Proxy(fn, {
+      apply(_t, _this, args: unknown[]) {
+        const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
+        const text = strings.join('?');
+        queries.push({ text, values });
+        if (text.includes('FROM charging_stations')) return Promise.resolve([station]);
+        if (text.includes('UPDATE charging_stations')) return Promise.resolve(updateRows);
+        return Promise.resolve([]) as unknown;
+      },
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'json') return (v: unknown) => v;
+        return target[prop as keyof typeof target];
+      },
+    });
+    return { sql: proxy as unknown as Parameters<typeof authenticateConnection>[2], queries };
+  }
+
+  function sp1(passwordHash: string): Record<string, unknown> {
+    return {
+      id: 'sta_cache',
+      security_profile: 1,
+      pending_security_profile: null,
+      basic_auth_password_hash: passwordHash,
+      onboarding_status: 'accepted',
+    };
+  }
+
+  const rehashes = (queries: { text: string; values: unknown[] }[]) =>
+    queries.filter((q) => q.text.includes('SET basic_auth_password_hash'));
+
+  beforeEach(() => {
+    verifyMock.mockClear();
+  });
+
+  it('skips argon2 for a reconnect with the same password and stored hash', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    const { sql } = stationSql(sp1(storedHash));
+    const req = () => createMockRequest('/CS-CACHE', auth(PASSWORD));
+
+    const first = await authenticateConnection(
+      req(),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+    const second = await authenticateConnection(
+      req(),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(first.authenticated).toBe(true);
+    expect(second.authenticated).toBe(true);
+    expect(verifyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a wrong password after a cached success, through argon2', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    const { sql, queries } = stationSql(sp1(storedHash));
+
+    await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth(PASSWORD)),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+    const wrong = await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth('wrong-password-0001')),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(wrong).toMatchObject({ authenticated: false, failure: 'credentials' });
+    expect(verifyMock).toHaveBeenCalledTimes(2);
+    expect(queries.some((q) => q.values.includes('auth_failed'))).toBe(true);
+  });
+
+  it('rejects the old password once the stored hash changed, even with a cached entry', async () => {
+    const oldHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const newHash = await hash('new-password-000001', { ...STATION_PASSWORD_HASH_OPTIONS });
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    const req = () => createMockRequest('/CS-CACHE', auth(PASSWORD));
+
+    const before = await authenticateConnection(
+      req(),
+      createMockLogger(),
+      stationSql(sp1(oldHash)).sql,
+      null,
+      false,
+      verifier,
+    );
+    // No invalidation message: the changed row alone must refuse the old password.
+    const after = await authenticateConnection(
+      req(),
+      createMockLogger(),
+      stationSql(sp1(newHash)).sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(before.authenticated).toBe(true);
+    expect(after).toMatchObject({ authenticated: false, failure: 'credentials' });
+  });
+
+  it('keeps the TLS requirement of a station moved to profile 2 despite a cached password', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    const req = () => createMockRequest('/CS-CACHE', auth(PASSWORD));
+
+    await authenticateConnection(
+      req(),
+      createMockLogger(),
+      stationSql(sp1(storedHash)).sql,
+      null,
+      false,
+      verifier,
+    );
+    const sp2 = await authenticateConnection(
+      req(),
+      createMockLogger(),
+      stationSql({ ...sp1(storedHash), security_profile: 2 }).sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(sp2).toMatchObject({ authenticated: false, failure: 'tls_required' });
+  });
+
+  it('rehashes a hash stored with the argon2 defaults, guarded by the old hash', async () => {
+    const legacyHash = await hash(PASSWORD);
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    const { sql, queries } = stationSql(sp1(legacyHash));
+
+    const result = await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth(PASSWORD)),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(result.authenticated).toBe(true);
+    // The station is accepted before the rehash: it runs in the background.
+    expect(rehashes(queries)).toHaveLength(0);
+    expect(verifier.stats().rehashPending).toBe(1);
+    await verifier.whenRehashIdle();
+    const [update] = rehashes(queries);
+    expect(update?.text).toContain('AND basic_auth_password_hash = ');
+    const [newHash, stationDbId, guard] = update?.values as [string, string, string];
+    expect(stationDbId).toBe('sta_cache');
+    expect(guard).toBe(legacyHash);
+    expect(newHash).toContain('$argon2id$v=19$m=19456,t=2,p=1$');
+    expect(await verify(newHash, PASSWORD)).toBe(true);
+    // The new hash is cached, so the next connection with it skips argon2.
+    expect(verifier.stats().cacheEntries).toBe(1);
+  });
+
+  it('does not rehash a hash that already uses the station parameters', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const { sql, queries } = stationSql(sp1(storedHash));
+
+    await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth(PASSWORD)),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(rehashes(queries)).toHaveLength(0);
+  });
+
+  it('does not rehash after a wrong password', async () => {
+    const legacyHash = await hash(PASSWORD);
+    const { sql, queries } = stationSql(sp1(legacyHash));
+
+    await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth('wrong-password-0001')),
+      createMockLogger(),
+      sql,
+    );
+
+    expect(rehashes(queries)).toHaveLength(0);
+  });
+
+  it('still accepts the station and warns when the rehash write fails', async () => {
+    const legacyHash = await hash(PASSWORD);
+    const queries: string[] = [];
+    const fn = vi.fn();
+    const sql = new Proxy(fn, {
+      apply(_t, _this, args: unknown[]) {
+        const text = (args[0] as TemplateStringsArray).join('?');
+        queries.push(text);
+        if (text.includes('FROM charging_stations')) return Promise.resolve([sp1(legacyHash)]);
+        if (text.includes('SET basic_auth_password_hash')) {
+          return Promise.reject(new Error('db down'));
+        }
+        return Promise.resolve([]) as unknown;
+      },
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'json') return (v: unknown) => v;
+        return target[prop as keyof typeof target];
+      },
+    }) as unknown as Parameters<typeof authenticateConnection>[2];
+    const logger = createMockLogger();
+    const verifier = new StationPasswordVerifier();
+
+    const result = await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth(PASSWORD)),
+      logger,
+      sql,
+      null,
+      false,
+      verifier,
+    );
+
+    expect(result.authenticated).toBe(true);
+    await verifier.whenRehashIdle();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ stationDbId: 'sta_cache' }),
+      'Failed to rehash the station password',
+    );
+  });
+
+  it('does not cache the rehash when an operator changed the password meanwhile', async () => {
+    const legacyHash = await hash(PASSWORD);
+    const verifier = new StationPasswordVerifier({ cache: new StationAuthCache() });
+    // The guarded UPDATE matches no row: the stored hash is no longer the one verified.
+    const { sql } = stationSql(sp1(legacyHash), []);
+
+    await authenticateConnection(
+      createMockRequest('/CS-CACHE', auth(PASSWORD)),
+      createMockLogger(),
+      sql,
+      null,
+      false,
+      verifier,
+    );
+    await verifier.whenRehashIdle();
+
+    // The guarded UPDATE matched nothing; only the legacy hash entry from the verify
+    // exists, and the unsaved new hash is never cached.
+    const fresh = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    verifyMock.mockClear();
+    await verifier.verify('sta_cache', fresh, PASSWORD, '10.0.0.1');
+    expect(verifyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('locks a station out after repeated wrong passwords without argon2, still logging auth_failed', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    const verifier = new StationPasswordVerifier({
+      cache: new StationAuthCache(),
+      backoff: new StationAuthBackoff({ limit: 2 }),
+    });
+    const { sql, queries } = stationSql(sp1(storedHash));
+    const attempt = (password: string) =>
+      authenticateConnection(
+        createMockRequest('/CS-CACHE', auth(password)),
+        createMockLogger(),
+        sql,
+        null,
+        false,
+        verifier,
+      );
+
+    await attempt('wrong-password-0001');
+    await attempt('wrong-password-0002');
+    verifyMock.mockClear();
+    queries.length = 0;
+
+    const locked = await attempt('wrong-password-0003');
+    expect(locked).toMatchObject({ authenticated: false, failure: 'locked_out' });
+    expect(locked.retryAfterSeconds).toBeGreaterThan(0);
+    expect(verifyMock).not.toHaveBeenCalled();
+    expect(queries.some((q) => q.values.includes('auth_failed'))).toBe(true);
+    // The right password is refused too while no success is cached.
+    expect(await attempt(PASSWORD)).toMatchObject({ failure: 'locked_out' });
+  });
+
+  it('keys the lockout on the client IP, so wrong passwords from another address never lock the station out', async () => {
+    const storedHash = await hash(PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
+    // No cache: the real station must pass through argon2, not a cached success.
+    const verifier = new StationPasswordVerifier({
+      cache: null,
+      backoff: new StationAuthBackoff({ limit: 2 }),
+    });
+    const { sql } = stationSql(sp1(storedHash));
+    const attempt = (password: string, clientIp: string) =>
+      authenticateConnection(
+        createMockRequest('/CS-CACHE', auth(password)),
+        createMockLogger(),
+        sql,
+        clientIp,
+        false,
+        verifier,
+      );
+
+    await attempt('wrong-password-0001', '203.0.113.9');
+    await attempt('wrong-password-0002', '203.0.113.9');
+    expect(await attempt(PASSWORD, '203.0.113.9')).toMatchObject({ failure: 'locked_out' });
+
+    // The station on its own address still connects.
+    expect(await attempt(PASSWORD, '198.51.100.20')).toMatchObject({ authenticated: true });
   });
 });

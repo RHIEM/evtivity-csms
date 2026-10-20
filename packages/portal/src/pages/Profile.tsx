@@ -14,6 +14,7 @@ import { Select } from '@/components/ui/select';
 import { LANGUAGES } from '@/components/ui/language-select';
 import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
 import { TIMEZONE_OPTIONS } from '@/lib/timezone';
 import { AccountNotificationPrefs } from '@/components/account/AccountNotificationPrefs';
 
@@ -68,8 +69,8 @@ export function Profile(): React.JSX.Element {
       await api.patch('/v1/portal/driver/profile', { firstName, lastName, phone });
       hydrate();
       setProfileMsg(t('profile.profileUpdated'));
-    } catch {
-      setProfileMsg(t('profile.profileUpdateFailed'));
+    } catch (err) {
+      setProfileMsg(getErrorMessage(err, t, 'profile.profileUpdateFailed'));
     } finally {
       setProfileLoading(false);
     }
@@ -85,8 +86,8 @@ export function Profile(): React.JSX.Element {
       await setTimezone(selectedTimezone);
       await setTheme(selectedTheme);
       setPrefsSettingsMsg(t('profile.preferencesSaved'));
-    } catch {
-      setPrefsSettingsMsg(t('profile.preferencesFailed'));
+    } catch (err) {
+      setPrefsSettingsMsg(getErrorMessage(err, t, 'profile.preferencesFailed'));
     } finally {
       setPrefsSettingsLoading(false);
     }
@@ -102,8 +103,8 @@ export function Profile(): React.JSX.Element {
       setPasswordMsg(t('profile.passwordChanged'));
       setCurrentPassword('');
       setNewPassword('');
-    } catch {
-      setPasswordMsg(t('profile.passwordChangeFailed'));
+    } catch (err) {
+      setPasswordMsg(getErrorMessage(err, t, 'profile.passwordChangeFailed'));
     } finally {
       setPasswordLoading(false);
     }
@@ -135,8 +136,8 @@ export function Profile(): React.JSX.Element {
         { method: selectedMfaMethod },
       );
       setMfaSetupData(data);
-    } catch {
-      setMfaMsg(t('profile.mfaSetupFailed'));
+    } catch (err) {
+      setMfaMsg(getErrorMessage(err, t, 'profile.mfaSetupFailed'));
     } finally {
       setMfaLoading(false);
     }
@@ -157,8 +158,8 @@ export function Profile(): React.JSX.Element {
       setMfaMethod(selectedMfaMethod);
       setMfaSetupData(null);
       setMfaCode('');
-    } catch {
-      setMfaMsg(t('profile.mfaVerifyFailed'));
+    } catch (err) {
+      setMfaMsg(getErrorMessage(err, t, 'profile.mfaVerifyFailed'));
     } finally {
       setMfaLoading(false);
     }
@@ -174,8 +175,8 @@ export function Profile(): React.JSX.Element {
       setMfaEnabled(false);
       setMfaMethod(null);
       setDisablePassword('');
-    } catch {
-      setMfaMsg(t('profile.mfaDisableFailed'));
+    } catch (err) {
+      setMfaMsg(getErrorMessage(err, t, 'profile.mfaDisableFailed'));
     } finally {
       setMfaLoading(false);
     }
@@ -198,14 +199,14 @@ export function Profile(): React.JSX.Element {
           <form onSubmit={(e) => void handleProfileUpdate(e)} className="space-y-4">
             {profileMsg !== '' && <p className="text-sm text-muted-foreground">{profileMsg}</p>}
             <div className="space-y-2">
-              <label htmlFor="profileEmail" className="text-sm font-medium">
+              <label htmlFor="profileEmail" className="block text-sm font-medium leading-6">
                 {t('profile.email')}
               </label>
               <Input id="profileEmail" value={driver?.email ?? ''} disabled />
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-2">
-                <label htmlFor="profileFirst" className="text-sm font-medium">
+                <label htmlFor="profileFirst" className="block text-sm font-medium leading-6">
                   {t('profile.firstName')}
                 </label>
                 <Input
@@ -217,7 +218,7 @@ export function Profile(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-2">
-                <label htmlFor="profileLast" className="text-sm font-medium">
+                <label htmlFor="profileLast" className="block text-sm font-medium leading-6">
                   {t('profile.lastName')}
                 </label>
                 <Input
@@ -230,7 +231,7 @@ export function Profile(): React.JSX.Element {
               </div>
             </div>
             <div className="space-y-2">
-              <label htmlFor="profilePhone" className="text-sm font-medium">
+              <label htmlFor="profilePhone" className="block text-sm font-medium leading-6">
                 {t('profile.phone')}
               </label>
               <Input
@@ -258,7 +259,7 @@ export function Profile(): React.JSX.Element {
               <p className="text-sm text-muted-foreground">{prefsSettingsMsg}</p>
             )}
             <Select
-              aria-label="Language"
+              aria-label={t('profile.language')}
               value={selectedLanguage}
               onChange={(e) => {
                 setSelectedLanguage(e.target.value);
@@ -271,7 +272,7 @@ export function Profile(): React.JSX.Element {
               ))}
             </Select>
             <div className="space-y-2">
-              <label htmlFor="profileTimezone" className="text-sm font-medium">
+              <label htmlFor="profileTimezone" className="block text-sm font-medium leading-6">
                 {t('profile.timezone')}
               </label>
               <Select
@@ -289,7 +290,7 @@ export function Profile(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <label htmlFor="profileTheme" className="text-sm font-medium">
+              <label htmlFor="profileTheme" className="block text-sm font-medium leading-6">
                 {t('profile.theme')}
               </label>
               <Select
@@ -327,7 +328,7 @@ export function Profile(): React.JSX.Element {
           <form onSubmit={(e) => void handlePasswordChange(e)} className="space-y-4">
             {passwordMsg !== '' && <p className="text-sm text-muted-foreground">{passwordMsg}</p>}
             <div className="space-y-2">
-              <label htmlFor="currentPw" className="text-sm font-medium">
+              <label htmlFor="currentPw" className="block text-sm font-medium leading-6">
                 {t('profile.currentPassword')}
               </label>
               <PasswordInput
@@ -340,7 +341,7 @@ export function Profile(): React.JSX.Element {
               />
             </div>
             <div className="space-y-2">
-              <label htmlFor="newPw" className="text-sm font-medium">
+              <label htmlFor="newPw" className="block text-sm font-medium leading-6">
                 {t('profile.newPassword')}
               </label>
               <PasswordInput
@@ -411,7 +412,7 @@ export function Profile(): React.JSX.Element {
               <form onSubmit={(e) => void handleMfaSetup(e)} className="space-y-4">
                 <p className="text-sm text-muted-foreground">{t('profile.mfaDisabled')}</p>
                 <div className="space-y-2">
-                  <label htmlFor="mfaMethod" className="text-sm font-medium">
+                  <label htmlFor="mfaMethod" className="block text-sm font-medium leading-6">
                     {t('profile.mfaSelectMethod')}
                   </label>
                   <Select
@@ -448,7 +449,11 @@ export function Profile(): React.JSX.Element {
                 {selectedMfaMethod === 'totp' && mfaSetupData.qrDataUri != null && (
                   <div className="space-y-3">
                     <p className="text-sm font-medium">{t('profile.mfaScanQr')}</p>
-                    <img src={mfaSetupData.qrDataUri} alt="QR Code" className="mx-auto" />
+                    <img
+                      src={mfaSetupData.qrDataUri}
+                      alt={t('profile.mfaQrCode')}
+                      className="mx-auto"
+                    />
                     {mfaSetupData.secret != null && (
                       <div className="space-y-1">
                         <p className="text-sm text-muted-foreground">
@@ -462,7 +467,7 @@ export function Profile(): React.JSX.Element {
                   </div>
                 )}
                 <div className="space-y-2">
-                  <label htmlFor="mfaCode" className="text-sm font-medium">
+                  <label htmlFor="mfaCode" className="block text-sm font-medium leading-6">
                     {t('profile.mfaEnterCode')}
                   </label>
                   <Input

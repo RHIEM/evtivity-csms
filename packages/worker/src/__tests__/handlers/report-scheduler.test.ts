@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import type { Logger } from 'pino';
 
 // Drizzle chain mock: each method returns the chain; awaiting it pops the next
@@ -11,6 +11,7 @@ import type { Logger } from 'pino';
 //   then per schedule:
 //   2. UPDATE reportSchedules (nextRunAt/lastRunAt)  -> no awaited result needed
 //   3. SELECT report (inside waitForReport)
+//   4. SELECT users (recipient languages), when there are recipients and SMTP
 let dbResults: unknown[][] = [];
 let dbCallIndex = 0;
 function setupDbResults(...results: unknown[][]) {
@@ -73,20 +74,45 @@ vi.mock('@evtivity/database', () => ({
     fileData: 'reports.fileData',
     fileName: 'reports.fileName',
   },
+  users: { email: 'users.email', language: 'users.language' },
 }));
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(),
   and: vi.fn(),
+  inArray: vi.fn((col: unknown, values: unknown) => ({ col, values })),
   lte: vi.fn(),
   sql: vi.fn(() => 'now()'),
 }));
 
 const mockQueueReport = vi.fn().mockResolvedValue('report-id-123');
 const mockComputeNextRunAt = vi.fn().mockResolvedValue(new Date('2026-01-02T06:00:00Z'));
-vi.mock('@evtivity/api/src/services/report.service.js', () => ({
+const mockOperatorReportLanguage = vi.fn().mockResolvedValue('en');
+const mockRenderReport = vi.fn();
+const mockSweepStaleReports = vi.fn().mockResolvedValue({ pending: [], timedOut: 0 });
+vi.mock('@evtivity/services/report.service', () => ({
   queueReport: (...args: unknown[]) => mockQueueReport(...args),
+  sweepStaleReports: () => mockSweepStaleReports(),
   computeNextRunAtInTz: (...args: unknown[]) => mockComputeNextRunAt(...args),
+  operatorReportLanguage: (...args: unknown[]) => mockOperatorReportLanguage(...args),
+  renderReport: (...args: unknown[]) => mockRenderReport(...args),
+}));
+
+const mockScheduleRunScope = vi.fn().mockResolvedValue(['site_1']);
+const mockScheduleSkipReason = vi.fn().mockResolvedValue(null);
+vi.mock('@evtivity/services/report-scope', () => ({
+  scheduleRunScope: (...args: unknown[]) => mockScheduleRunScope(...args),
+  scheduleSkipReason: (...args: unknown[]) => mockScheduleSkipReason(...args),
+}));
+
+const mockWriteReportGeneratedAudit = vi.fn().mockResolvedValue(undefined);
+vi.mock('@evtivity/services/report-audit', () => ({
+  writeReportGeneratedAudit: (...args: unknown[]) => mockWriteReportGeneratedAudit(...args),
+}));
+
+const mockEnqueueReport = vi.fn().mockResolvedValue(undefined);
+vi.mock('../../report-worker.js', () => ({
+  enqueueReport: (...args: unknown[]) => mockEnqueueReport(...args),
 }));
 
 const mockGetNotificationSettings = vi.fn();
@@ -119,6 +145,7 @@ function makeSchedule(overrides: Record<string, unknown> = {}): Record<string, u
     format: 'csv',
     filters: { siteId: 'site_1' },
     createdById: 'usr_1',
+    siteScope: ['site_1', 'site_2'],
     frequency: 'daily',
     dayOfWeek: null,
     dayOfMonth: null,
@@ -129,6 +156,14 @@ function makeSchedule(overrides: Record<string, unknown> = {}): Record<string, u
 
 const SMTP = { host: 'smtp.test', port: 587 };
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let reportSchedulerModule: typeof import('../../handlers/report-scheduler.js');
+let drizzleOrmModule: typeof import('drizzle-orm');
+beforeAll(async () => {
+  reportSchedulerModule = await import('../../handlers/report-scheduler.js');
+  drizzleOrmModule = await import('drizzle-orm');
+}, 30_000);
+
 describe('reportSchedulerHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -137,21 +172,189 @@ describe('reportSchedulerHandler', () => {
     clientCalls.length = 0;
     clientCallIndex = 0;
     mockQueueReport.mockResolvedValue('report-id-123');
+    mockSweepStaleReports.mockResolvedValue({ pending: [], timedOut: 0 });
+    mockEnqueueReport.mockResolvedValue(undefined);
     mockComputeNextRunAt.mockResolvedValue(new Date('2026-01-02T06:00:00Z'));
+    mockOperatorReportLanguage.mockResolvedValue('en');
+    mockScheduleRunScope.mockResolvedValue(['site_1']);
+    mockScheduleSkipReason.mockResolvedValue(null);
     mockClient.json.mockImplementation((v: unknown) => v);
+  });
+
+  it('attaches the report in each recipient language, reusing the stored file', async () => {
+    const schedule = makeSchedule({
+      format: 'pdf',
+      recipientEmails: ['de1@example.com', 'ko@example.com', 'x@ext.com', 'de2@example.com'],
+    });
+    setupDbResults(
+      [schedule],
+      [],
+      [{ status: 'completed', fileData: Buffer.from('stored-de'), fileName: 'stored.pdf' }],
+      [
+        { email: 'de1@example.com', language: 'de' },
+        { email: 'ko@example.com', language: 'ko' },
+        { email: 'de2@example.com', language: 'de' },
+      ],
+    );
+    setupClientResults([{ value: 'Acme' }], [], [], [], []);
+    mockGetNotificationSettings.mockResolvedValue({ smtp: SMTP, emailWrapperTemplate: null });
+    mockRenderTemplate.mockResolvedValue({ subject: 's', body: 'b' });
+    mockSendEmail.mockResolvedValue(true);
+    // The schedule creator reads German, so the stored report is the German file.
+    mockOperatorReportLanguage.mockResolvedValue('de');
+    mockRenderReport.mockImplementation(
+      (_type: string, _filters: unknown, _format: string, language: string) =>
+        Promise.resolve({ data: Buffer.from(`file-${language}`), fileName: `${language}.pdf` }),
+    );
+
+    const { reportSchedulerHandler } = reportSchedulerModule;
+    await reportSchedulerHandler(makeLog());
+
+    expect(mockOperatorReportLanguage).toHaveBeenCalledWith('usr_1');
+    // One file per missing language, with the schedule's type, filters and format.
+    // Each in-memory file covers the same sites as the stored report.
+    expect(mockRenderReport.mock.calls).toEqual([
+      ['sessions', { siteId: 'site_1' }, 'pdf', 'ko', ['site_1']],
+      ['sessions', { siteId: 'site_1' }, 'pdf', 'en', ['site_1']],
+    ]);
+    const attached = mockSendEmail.mock.calls.map((c) => {
+      const files = c[5] as Array<{ filename: string; contentType: string }>;
+      return [c[1], files.map((f) => f.filename), files[0]?.contentType];
+    });
+    expect(attached).toEqual([
+      ['de1@example.com', ['stored.pdf'], 'application/pdf'],
+      ['ko@example.com', ['ko.pdf'], 'application/pdf'],
+      ['x@ext.com', ['en.pdf'], 'application/pdf'],
+      ['de2@example.com', ['stored.pdf'], 'application/pdf'],
+    ]);
+  });
+
+  it('sends without an attachment when a language fails to render', async () => {
+    const schedule = makeSchedule({ recipientEmails: ['ko@example.com', 'ops@evtivity.com'] });
+    setupDbResults(
+      [schedule],
+      [],
+      [{ status: 'completed', fileData: Buffer.from('stored'), fileName: 'stored.csv' }],
+      [{ email: 'ko@example.com', language: 'ko' }],
+    );
+    setupClientResults([{ value: 'Acme' }], [], []);
+    mockGetNotificationSettings.mockResolvedValue({ smtp: SMTP, emailWrapperTemplate: null });
+    mockRenderTemplate.mockResolvedValue({ subject: 's', body: 'b' });
+    mockSendEmail.mockResolvedValue(true);
+    mockRenderReport.mockRejectedValue(new Error('generator failed'));
+    const log = makeLog();
+
+    const { reportSchedulerHandler } = reportSchedulerModule;
+    await reportSchedulerHandler(log);
+
+    expect(mockSendEmail.mock.calls.map((c) => [c[1], c[5]])).toEqual([
+      ['ko@example.com', undefined],
+      ['ops@evtivity.com', [expect.objectContaining({ filename: 'stored.csv' })]],
+    ]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scheduleId: 'sch_1', language: 'ko' }),
+      'Scheduled report attachment failed in this language, sending without it',
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('renders the email once per recipient language and falls back to en', async () => {
+    const schedule = makeSchedule({
+      recipientEmails: ['Ko.Op@Example.com', 'de.op@example.com', 'ko2@example.com', 'x@ext.com'],
+    });
+    setupDbResults(
+      [schedule],
+      [],
+      [{ status: 'completed', fileData: Buffer.from('a'), fileName: 'r.csv' }],
+      [
+        { email: 'ko.op@example.com', language: 'ko' },
+        { email: 'DE.OP@example.com', language: 'de' },
+        { email: 'ko2@example.com', language: 'ko' },
+      ],
+    );
+    setupClientResults([{ value: 'Acme' }], [], [], [], []);
+    mockGetNotificationSettings.mockResolvedValue({ smtp: SMTP, emailWrapperTemplate: null });
+    mockRenderTemplate.mockImplementation((_c: string, _e: string, language: string) =>
+      Promise.resolve({ subject: `subject-${language}`, body: `body-${language}` }),
+    );
+    mockSendEmail.mockResolvedValue(true);
+
+    const { inArray } = drizzleOrmModule;
+    const { reportSchedulerHandler } = reportSchedulerModule;
+    await reportSchedulerHandler(makeLog());
+
+    // The lookup is case-insensitive: lowercased, deduplicated addresses.
+    expect(vi.mocked(inArray).mock.calls.at(-1)?.[1]).toEqual([
+      'ko.op@example.com',
+      'de.op@example.com',
+      'ko2@example.com',
+      'x@ext.com',
+    ]);
+    // One render per language, in the language of each recipient.
+    expect(mockRenderTemplate.mock.calls.map((c) => c[2])).toEqual(['ko', 'de', 'en']);
+    expect(mockSendEmail.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      ['Ko.Op@Example.com', 'subject-ko'],
+      ['de.op@example.com', 'subject-de'],
+      ['ko2@example.com', 'subject-ko'],
+      ['x@ext.com', 'subject-en'],
+    ]);
+    const inserts = clientCalls.filter((c) => String(c[0]).includes('INSERT INTO notifications'));
+    expect(inserts.map((c) => c[2])).toEqual([
+      'subject-ko',
+      'subject-de',
+      'subject-ko',
+      'subject-en',
+    ]);
   });
 
   it('does nothing when no schedules are due', async () => {
     setupDbResults([]);
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     const log = makeLog();
     await expect(reportSchedulerHandler(log)).resolves.toBeUndefined();
     expect(mockQueueReport).not.toHaveBeenCalled();
     expect(log.info).not.toHaveBeenCalled();
   });
 
+  it('queues stale pending reports again and logs the sweep', async () => {
+    setupDbResults([]);
+    mockSweepStaleReports.mockResolvedValue({ pending: ['rpt_a', 'rpt_b'], timedOut: 1 });
+    const log = makeLog();
+
+    await reportSchedulerModule.reportSchedulerHandler(log);
+
+    expect(mockEnqueueReport).toHaveBeenCalledWith('rpt_a');
+    expect(mockEnqueueReport).toHaveBeenCalledWith('rpt_b');
+    expect(log.info).toHaveBeenCalledWith({ requeued: 2, timedOut: 1 }, 'Stale reports swept');
+  });
+
+  it('stays quiet when the sweep finds nothing', async () => {
+    setupDbResults([]);
+    const log = makeLog();
+
+    await reportSchedulerModule.reportSchedulerHandler(log);
+
+    expect(mockSweepStaleReports).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueReport).not.toHaveBeenCalled();
+    expect(log.info).not.toHaveBeenCalled();
+  });
+
+  it('logs a sweep failure and still runs the due schedules', async () => {
+    setupDbResults([makeSchedule({ recipientEmails: [] })]);
+    mockSweepStaleReports.mockRejectedValue(new Error('db down'));
+    const log = makeLog();
+
+    await reportSchedulerModule.reportSchedulerHandler(log);
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error) }),
+      'Report sweep failed',
+    );
+    expect(mockQueueReport).toHaveBeenCalledTimes(1);
+  });
+
   it('can be imported and the function is exported', async () => {
-    const mod = await import('../../handlers/report-scheduler.js');
+    const mod = reportSchedulerModule;
     expect(typeof mod.reportSchedulerHandler).toBe('function');
   });
 
@@ -180,18 +383,28 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<wrap><p>report</p></wrap>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     const log = makeLog();
     await reportSchedulerHandler(log);
 
-    // queueReport receives the schedule's identity and filters verbatim.
-    expect(mockQueueReport).toHaveBeenCalledWith({
-      name: 'Daily Sessions',
-      reportType: 'sessions',
-      format: 'csv',
-      filters: { siteId: 'site_1' },
-      userId: 'usr_1',
-    });
+    // queueReport receives the schedule's identity and filters verbatim, the
+    // schedule scope narrowed to the creator's current sites, and queues the
+    // generation on the worker's report queue.
+    expect(mockScheduleRunScope).toHaveBeenCalledWith(['site_1', 'site_2'], 'usr_1');
+    expect(mockQueueReport).toHaveBeenCalledWith(
+      {
+        name: 'Daily Sessions',
+        reportType: 'sessions',
+        format: 'csv',
+        filters: { siteId: 'site_1' },
+        userId: 'usr_1',
+        siteScope: ['site_1'],
+      },
+      expect.any(Function),
+    );
+    const dispatch = mockQueueReport.mock.calls[0]?.[1] as (id: string) => Promise<void>;
+    await dispatch('report-id-123');
+    expect(mockEnqueueReport).toHaveBeenCalledWith('report-id-123');
     // Schedule advancement computed from the schedule cadence.
     expect(mockComputeNextRunAt).toHaveBeenCalledWith('daily', null, null);
     expect(log.info).toHaveBeenCalledWith(
@@ -239,7 +452,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<wrapped>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockWrapEmailHtml).toHaveBeenCalledWith(
@@ -262,7 +475,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockSendEmail).toHaveBeenCalledWith(SMTP, 'ops@evtivity.com', 's', 'b', '<w>', [
@@ -284,7 +497,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockSendEmail).toHaveBeenCalledWith(SMTP, 'ops@evtivity.com', 's', 'b', '<w>', [
@@ -304,7 +517,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(false);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     const insertCall = clientCalls.find((c) => String(c[0]).includes('INSERT INTO notifications'));
@@ -312,29 +525,79 @@ describe('reportSchedulerHandler', () => {
     expect(insertCall).toContain('failed');
   });
 
+  it('records the generated report with actor system', async () => {
+    setupDbResults([makeSchedule({ recipientEmails: [] })]);
+    const log = makeLog();
+
+    const { reportSchedulerHandler } = reportSchedulerModule;
+    await reportSchedulerHandler(log);
+
+    expect(mockWriteReportGeneratedAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteReportGeneratedAudit).toHaveBeenCalledWith(
+      {
+        reportId: 'report-id-123',
+        name: 'Daily Sessions',
+        reportType: 'sessions',
+        format: 'csv',
+        filters: { siteId: 'site_1' },
+        siteScope: ['site_1'],
+        scheduleId: 'sch_1',
+      },
+      { actor: 'system', actorLabel: 'report-scheduler' },
+      log,
+    );
+  });
+
+  it('writes no generated row when the run is skipped', async () => {
+    mockScheduleSkipReason.mockResolvedValue('creator_inactive');
+    setupDbResults([makeSchedule()], []);
+
+    const { reportSchedulerHandler } = reportSchedulerModule;
+    await reportSchedulerHandler(makeLog());
+
+    expect(mockWriteReportGeneratedAudit).not.toHaveBeenCalled();
+  });
+
   it('treats null filters as an empty object', async () => {
     setupDbResults([makeSchedule({ filters: null, recipientEmails: [] })]);
     mockGetNotificationSettings.mockResolvedValue({ smtp: SMTP });
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
-    expect(mockQueueReport).toHaveBeenCalledWith(expect.objectContaining({ filters: {} }));
+    expect(mockQueueReport).toHaveBeenCalledWith(
+      expect.objectContaining({ filters: {} }),
+      expect.any(Function),
+    );
   });
 
-  it('falls back to empty userId when createdById is null', async () => {
-    setupDbResults([makeSchedule({ createdById: null, recipientEmails: null })]);
+  it.each(['no_creator', 'creator_missing', 'creator_inactive', 'creator_lacks_reports_read'])(
+    'skips the run with a warning and moves to the next run (%s)',
+    async (reason) => {
+      mockScheduleSkipReason.mockResolvedValue(reason);
+      setupDbResults([makeSchedule()], []);
+      const log = makeLog();
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
-    await reportSchedulerHandler(makeLog());
+      const { reportSchedulerHandler } = reportSchedulerModule;
+      await reportSchedulerHandler(log);
 
-    expect(mockQueueReport).toHaveBeenCalledWith(expect.objectContaining({ userId: '' }));
-  });
+      expect(mockScheduleSkipReason).toHaveBeenCalledWith('usr_1');
+      expect(mockQueueReport).not.toHaveBeenCalled();
+      expect(mockScheduleRunScope).not.toHaveBeenCalled();
+      expect(mockSendEmail).not.toHaveBeenCalled();
+      expect(mockComputeNextRunAt).toHaveBeenCalledWith('daily', null, null);
+      expect(log.warn).toHaveBeenCalledWith(
+        { scheduleId: 'sch_1', createdById: 'usr_1', reason },
+        'Scheduled report skipped, its creator cannot read reports',
+      );
+      expect(log.error).not.toHaveBeenCalled();
+    },
+  );
 
   it('returns before emailing when the schedule has no recipients', async () => {
     setupDbResults([makeSchedule({ recipientEmails: [] })]);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockGetNotificationSettings).not.toHaveBeenCalled();
@@ -344,7 +607,7 @@ describe('reportSchedulerHandler', () => {
   it('returns before emailing when recipientEmails is null', async () => {
     setupDbResults([makeSchedule({ recipientEmails: null })]);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockGetNotificationSettings).not.toHaveBeenCalled();
@@ -358,7 +621,7 @@ describe('reportSchedulerHandler', () => {
     );
     mockGetNotificationSettings.mockResolvedValue({ smtp: null });
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockSendEmail).not.toHaveBeenCalled();
@@ -377,7 +640,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     const log = makeLog();
     await reportSchedulerHandler(log);
 
@@ -407,7 +670,7 @@ describe('reportSchedulerHandler', () => {
     mockRenderTemplate.mockResolvedValue({ subject: 's', body: 'plain only', html: null });
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockWrapEmailHtml).not.toHaveBeenCalled();
@@ -428,7 +691,7 @@ describe('reportSchedulerHandler', () => {
     setupDbResults([makeSchedule()]);
     mockQueueReport.mockRejectedValue(new Error('queue exploded'));
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     const log = makeLog();
     await expect(reportSchedulerHandler(log)).resolves.toBeUndefined();
 
@@ -447,7 +710,7 @@ describe('reportSchedulerHandler', () => {
     );
     mockQueueReport.mockRejectedValueOnce(new Error('boom')).mockResolvedValueOnce('report-ok');
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     const log = makeLog();
     await reportSchedulerHandler(log);
 
@@ -469,7 +732,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockSendEmail).toHaveBeenCalledWith(
@@ -497,7 +760,7 @@ describe('reportSchedulerHandler', () => {
       mockWrapEmailHtml.mockReturnValue('<w>');
       mockSendEmail.mockResolvedValue(true);
 
-      const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+      const { reportSchedulerHandler } = reportSchedulerModule;
       const promise = reportSchedulerHandler(makeLog());
       // Advance past the 5s poll interval so the second poll runs.
       await vi.advanceTimersByTimeAsync(5000);
@@ -520,15 +783,16 @@ describe('reportSchedulerHandler', () => {
       // missing report -> early null. To keep the loop running we hand every
       // poll a non-terminal 'processing' row by re-arming the mock.
       const pendingRow = { status: 'processing', fileData: null, fileName: null };
-      const pollResults = Array.from({ length: 61 }, () => [pendingRow]);
-      setupDbResults([makeSchedule()], [], ...pollResults);
+      const pollResults = Array.from({ length: 60 }, () => [pendingRow]);
+      // Then the recipient language lookup (no user account: en).
+      setupDbResults([makeSchedule()], [], ...pollResults, []);
       setupClientResults([{ value: 'Acme' }], []);
       mockGetNotificationSettings.mockResolvedValue({ smtp: SMTP, emailWrapperTemplate: null });
       mockRenderTemplate.mockResolvedValue({ subject: 's', body: 'b', html: '<p>h</p>' });
       mockWrapEmailHtml.mockReturnValue('<w>');
       mockSendEmail.mockResolvedValue(true);
 
-      const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+      const { reportSchedulerHandler } = reportSchedulerModule;
       const log = makeLog();
       const promise = reportSchedulerHandler(log);
       // 60 polls * 5s interval drains the loop to the timeout branch.
@@ -564,7 +828,7 @@ describe('reportSchedulerHandler', () => {
     mockWrapEmailHtml.mockReturnValue('<w>');
     mockSendEmail.mockResolvedValue(true);
 
-    const { reportSchedulerHandler } = await import('../../handlers/report-scheduler.js');
+    const { reportSchedulerHandler } = reportSchedulerModule;
     await reportSchedulerHandler(makeLog());
 
     expect(mockSendEmail).toHaveBeenCalledWith(

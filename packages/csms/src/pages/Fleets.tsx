@@ -45,7 +45,7 @@ export function Fleets(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('fleets.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('fleets.subtitle')}</p>
@@ -64,7 +64,7 @@ export function Fleets(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('fleets.searchPlaceholder')}
-            className="h-10 w-full sm:max-w-half-vw"
+            className="w-full sm:max-w-half-vw"
           />
         </CardContent>
       </Card>
@@ -100,7 +100,7 @@ export function Fleets(): React.JSX.Element {
                   }}
                 >
                   <TableCell className="text-muted-foreground">{fleet.id}</TableCell>
-                  <TableCell className="font-medium text-primary" data-testid="row-click-target">
+                  <TableCell className="font-medium text-link" data-testid="row-click-target">
                     {fleet.name}
                   </TableCell>
                   <TableCell>{fleet.description ?? '-'}</TableCell>

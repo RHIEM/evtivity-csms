@@ -49,8 +49,44 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+const {
+  mockRecordSessionEndRequest,
+  mockAvailableEvseCountSql,
+  mockSqlRaw,
+  mockWriteCsmsSessionAudit,
+  mockFailUnstartedRemoteSession,
+} = vi.hoisted(() => ({
+  mockWriteCsmsSessionAudit: vi.fn(),
+  mockFailUnstartedRemoteSession: vi.fn(),
+  mockRecordSessionEndRequest: vi.fn().mockResolvedValue(true),
+  mockAvailableEvseCountSql: vi.fn((alias: string) => `AVAILABLE_EVSE_COUNT(${alias})`),
+  mockSqlRaw: vi.fn((text: string) => ({ raw: text })),
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  writeAudit: vi.fn(() => Promise.resolve()),
+  sessionSiteIdSql: vi.fn(() => 'site-of-station'),
+  userAuditLog: { _table: 'user_audit_log' },
+  driverAuditLog: { _table: 'driver_audit_log' },
+  stationAuditLog: { _table: 'station_audit_log' },
+  sessionAuditLog: { _table: 'session_audit_log' },
+  apiKeyAuditLog: { _table: 'api_key_audit_log' },
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
+  SESSION_END_REQUEST_CHANNEL: 'session_end_requests',
+  recordSessionEndRequest: mockRecordSessionEndRequest,
+  writeCsmsSessionAudit: mockWriteCsmsSessionAudit,
+  failUnstartedRemoteSession: mockFailUnstartedRemoteSession,
+  REMOTE_START_TIMEOUT_REASON: 'RemoteStartTimeout',
+  REMOTE_START_REJECTED_REASON: 'RemoteStartRejected',
+  availableEvseCountSql: mockAvailableEvseCountSql,
+  isStationLevelUnavailable: (
+    await vi.importActual<typeof import('../../../database/src/lib/station-status.js')>(
+      '../../../database/src/lib/station-status.js',
+    )
+  ).isStationLevelUnavailable,
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getCompanyTaxBasis: vi.fn(() => Promise.resolve('net')),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -79,6 +115,18 @@ vi.mock('@evtivity/database', () => ({
   stationImages: {},
   settings: {},
   driverTokens: {},
+  snapshotReservationFeeTerms: vi.fn().mockResolvedValue({
+    feeTaxBasis: 'gross',
+    feeTaxRate: '0.19',
+    feePerMinute: '0.10',
+    feeCancellationCents: 300,
+  }),
+  resolveReservationFeeTerms: vi.fn().mockResolvedValue({
+    basis: 'gross',
+    taxRate: '0.19',
+    feePerMinute: '0.10',
+    cancellationFeeCents: 300,
+  }),
   getReservationSettings: vi.fn().mockResolvedValue({
     enabled: true,
     bufferMinutes: 0,
@@ -88,6 +136,18 @@ vi.mock('@evtivity/database', () => ({
   }),
   writeReservationAudit: vi.fn().mockResolvedValue(undefined),
   reservationDiffChanged: vi.fn().mockReturnValue(false),
+  resolveStationTariff: vi.fn().mockResolvedValue(null),
+  resolveStationPricing: vi.fn().mockResolvedValue(null),
+  isSplitBillingEnabled: vi.fn().mockResolvedValue(false),
+  hasPaidTariff: (tariffs: Array<{ pricePerKwh: string | null }>) =>
+    tariffs.some((t) => Number(t.pricePerKwh ?? 0) > 0),
+  isStationChargingFree: vi.fn().mockResolvedValue(true),
+  resolveAccountBilling: vi.fn().mockResolvedValue(null),
+  checkFleetCreditLimit: vi.fn().mockResolvedValue(null),
+  sessionBillingColumns: (billing: { fleetId: string } | null) =>
+    billing == null
+      ? { billingMode: 'card', billingFleetId: null }
+      : { billingMode: 'account', billingFleetId: billing.fleetId },
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -95,7 +155,7 @@ vi.mock('drizzle-orm', () => ({
   and: vi.fn(),
   or: vi.fn(),
   ilike: vi.fn(),
-  sql: vi.fn(),
+  sql: Object.assign(vi.fn(), { raw: mockSqlRaw }),
   desc: vi.fn(),
   count: vi.fn(),
   asc: vi.fn(),
@@ -114,26 +174,50 @@ vi.mock('postgres', () => ({
   }),
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn().mockResolvedValue(null),
-  createPreAuthorization: vi.fn().mockResolvedValue({ id: 'pi_test_123' }),
+const {
+  mockActivePaymentProvider,
+  mockAuthorizeSessionHold,
+  mockCancelOpenSessionHold,
+  mockDispatchFleetCreditLimitNotices,
+  mockScheduleRemoteStartTimeout,
+} = vi.hoisted(() => ({
+  mockActivePaymentProvider: vi.fn(),
+  mockAuthorizeSessionHold: vi.fn(),
+  mockCancelOpenSessionHold: vi.fn(),
+  mockDispatchFleetCreditLimitNotices: vi.fn(),
+  mockScheduleRemoteStartTimeout: vi.fn(),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/payments', () => ({
+  authorizeSessionHold: mockAuthorizeSessionHold,
+  cancelOpenSessionHold: mockCancelOpenSessionHold,
+  dispatchFleetCreditLimitNotices: mockDispatchFleetCreditLimitNotices,
+  chargeReservationFee: vi.fn(),
+}));
+
+vi.mock('../lib/remote-start-timeout.js', () => ({
+  scheduleRemoteStartTimeout: mockScheduleRemoteStartTimeout,
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: mockActivePaymentProvider,
+  paymentContext: vi.fn((logger: unknown) => ({ registry: 'registry', logger })),
+}));
+
+const { mockPublish } = vi.hoisted(() => ({
+  mockPublish: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
-    publish: vi.fn().mockResolvedValue(undefined),
+    publish: mockPublish,
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
     close: vi.fn().mockResolvedValue(undefined),
   })),
   setPubSub: vi.fn(),
 }));
 
-vi.mock('../services/tariff.service.js', () => ({
-  resolveTariff: vi.fn().mockResolvedValue(null),
-  isTariffFree: vi.fn().mockReturnValue(true),
-}));
-
-vi.mock('../lib/ocpp-command.js', () => ({
+vi.mock('@evtivity/services/ocpp-command', () => ({
   sendOcppCommandAndWait: vi.fn().mockResolvedValue({
     response: { status: 'Accepted' },
     error: null,
@@ -152,15 +236,15 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/template-dirs.js', () => ({
+vi.mock('@evtivity/services/template-dirs', () => ({
   ALL_TEMPLATES_DIRS: [],
 }));
 
-vi.mock('../services/maintenance.service.js', () => ({
+vi.mock('@evtivity/services/maintenance.service', () => ({
   getActiveMaintenanceForStation: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('../lib/maintenance-check.js', () => ({
+vi.mock('@evtivity/services/maintenance-check', () => ({
   assertNoMaintenanceConflict: vi.fn().mockResolvedValue(undefined),
   MaintenanceConflictError: class MaintenanceConflictError extends Error {
     statusCode = 409;
@@ -171,11 +255,22 @@ vi.mock('../lib/maintenance-check.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { portalChargerRoutes } from '../routes/portal/charger.js';
-import { getStripeConfig } from '../services/stripe.service.js';
-import { resolveTariff, isTariffFree } from '../services/tariff.service.js';
+import {
+  db,
+  resolveReservationFeeTerms,
+  resolveStationTariff,
+  resolveStationPricing,
+  isSplitBillingEnabled,
+  isStationChargingFree,
+  resolveAccountBilling,
+  checkFleetCreditLimit,
+} from '@evtivity/database';
+import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
 import { isEvseInReservationBuffer } from '../lib/reservation-buffer.js';
-import { getActiveMaintenanceForStation } from '../services/maintenance.service.js';
-import { assertNoMaintenanceConflict } from '../lib/maintenance-check.js';
+import { getActiveMaintenanceForStation } from '@evtivity/services/maintenance.service';
+import { assertNoMaintenanceConflict } from '@evtivity/services/maintenance-check';
+import * as ocppCommandModule from '@evtivity/services/ocpp-command';
+import * as databaseModule from '@evtivity/database';
 
 const VALID_STATION_ID = 'sta_000000000001';
 const VALID_USER_ID = 'usr_000000000001';
@@ -184,12 +279,20 @@ const VALID_SESSION_ID = 'ses_000000000001';
 const VALID_RESERVATION_ID = 'rsv_000000000001';
 const DRIVER_ID = 'drv_000000000001';
 
+/** An active payment provider: only its presence matters to these routes. */
+const STRIPE_PROVIDER = { id: 'stripe' };
+
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
   await registerAuth(app);
   await app.register(portalChargerRoutes);
   await app.ready();
   return app;
+}
+
+/** A resolveStationPricing result of one tariff and its group. */
+function withGroup(tariff: Record<string, unknown>): never {
+  return { tariff, groupTariffs: [tariff] } as never;
 }
 
 describe('Portal charger routes - handler logic', () => {
@@ -207,9 +310,13 @@ describe('Portal charger routes - handler logic', () => {
 
   beforeEach(() => {
     setupDbResults();
-    vi.mocked(getStripeConfig).mockResolvedValue(null);
-    vi.mocked(resolveTariff).mockResolvedValue(null);
-    vi.mocked(isTariffFree).mockReturnValue(true);
+    vi.mocked(databaseModule.writeAudit).mockClear();
+    mockActivePaymentProvider.mockResolvedValue(null);
+    vi.mocked(resolveStationTariff).mockResolvedValue(null);
+    vi.mocked(isStationChargingFree).mockResolvedValue(true);
+    vi.mocked(resolveAccountBilling).mockResolvedValue(null);
+    vi.mocked(checkFleetCreditLimit).mockResolvedValue(null);
+    mockDispatchFleetCreditLimitNotices.mockResolvedValue(null);
     vi.mocked(isEvseInReservationBuffer).mockResolvedValue(false);
     vi.mocked(getActiveMaintenanceForStation).mockResolvedValue(null);
     vi.mocked(assertNoMaintenanceConflict).mockResolvedValue(undefined);
@@ -251,7 +358,7 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.json().code).toBe('EVSE_NOT_FOUND');
     });
 
-    it('returns charger info with paymentEnabled false when no stripe config', async () => {
+    it('returns charger info with paymentEnabled false when no payment provider is active', async () => {
       setupDbResults(
         [
           {
@@ -277,7 +384,7 @@ describe('Portal charger routes - handler logic', () => {
           },
         ],
       );
-      vi.mocked(getStripeConfig).mockResolvedValue(null);
+      mockActivePaymentProvider.mockResolvedValue(null);
 
       const response = await app.inject({
         method: 'GET',
@@ -291,7 +398,7 @@ describe('Portal charger routes - handler logic', () => {
       expect(body.evse.connectors).toHaveLength(1);
     });
 
-    it('returns paymentEnabled true when stripe config exists', async () => {
+    it('returns paymentEnabled true when a payment provider is active', async () => {
       setupDbResults(
         [
           {
@@ -309,15 +416,7 @@ describe('Portal charger routes - handler logic', () => {
         [{ id: 'evs_000000000001', evseId: 1, status: 'available' }],
         [],
       );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: 1,
-        connectedAccountId: null,
-        platformFeePercent: 0,
-      });
+      mockActivePaymentProvider.mockResolvedValue(STRIPE_PROVIDER);
 
       const response = await app.inject({
         method: 'GET',
@@ -325,6 +424,36 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().paymentEnabled).toBe(true);
+    });
+  });
+
+  describe('GET /v1/portal/chargers/:stationId', () => {
+    const stationRow = {
+      id: VALID_STATION_ID,
+      stationId: 'CS-001',
+      siteId: 'site-1',
+      model: 'M1',
+      isOnline: true,
+      isSimulator: false,
+      siteName: 'Site A',
+      siteAddress: '123 Main',
+      siteCity: 'City',
+      siteState: 'CA',
+      siteContactIsPublic: false,
+    };
+
+    it.each([
+      [null, false],
+      [STRIPE_PROVIDER, true],
+    ])('reports paymentEnabled from the active provider (%o -> %s)', async (provider, enabled) => {
+      setupDbResults([stationRow], []);
+      mockActivePaymentProvider.mockResolvedValue(provider);
+
+      const response = await app.inject({ method: 'GET', url: '/portal/chargers/CS-001' });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().paymentEnabled).toBe(enabled);
+      expect(mockActivePaymentProvider).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -350,7 +479,7 @@ describe('Portal charger routes - handler logic', () => {
 
     it('returns 404 when no tariff found', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveTariff).mockResolvedValue(null);
+      vi.mocked(resolveStationPricing).mockResolvedValue(null);
       const response = await app.inject({
         method: 'GET',
         url: '/portal/chargers/CS-001/pricing',
@@ -362,19 +491,23 @@ describe('Portal charger routes - handler logic', () => {
 
     it('returns resolved pricing for driver in the company currency', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveTariff).mockResolvedValue({
-        id: 'tar_001',
-        name: 'Standard',
-        pricePerKwh: '0.25',
-        pricePerMinute: '0.10',
-        pricePerSession: '2.00',
-        idleFeePricePerMinute: '0.05',
-        reservationFeePerMinute: null,
-        taxRate: '0.08',
-        restrictions: null,
-        priority: 0,
-        isDefault: true,
-      });
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Standard',
+          pricePerKwh: '0.25',
+          pricePerMinute: '0.10',
+          pricePerSession: '2.00',
+          idleFeePricePerMinute: '0.05',
+          reservationFeePerMinute: null,
+          taxRate: '0.08',
+          restrictions: null,
+          priority: 0,
+          isDefault: true,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
       const response = await app.inject({
         method: 'GET',
         url: '/portal/chargers/CS-001/pricing',
@@ -388,22 +521,33 @@ describe('Portal charger routes - handler logic', () => {
       expect(body.pricePerSession).toBe('2.00');
       expect(body.idleFeePricePerMinute).toBe('0.05');
       expect(body.taxRate).toBe('0.08');
+      expect(body.taxBasis).toBe('net');
+      expect(body.billing).toEqual({ mode: 'card', fleetName: null, invoicedTo: null });
     });
 
-    it('calls resolveTariff with station UUID and driver ID', async () => {
+    it('tells an account driver the session is billed to the fleet', async () => {
       setupDbResults([{ id: VALID_STATION_ID }]);
-      vi.mocked(resolveTariff).mockResolvedValue({
-        id: 'tar_001',
-        name: 'Driver Rate',
-        pricePerKwh: '0.30',
-        pricePerMinute: null,
-        pricePerSession: null,
-        idleFeePricePerMinute: null,
-        reservationFeePerMinute: null,
-        taxRate: null,
-        restrictions: null,
-        priority: 0,
-        isDefault: false,
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Standard',
+          pricePerKwh: '0.25',
+          pricePerMinute: null,
+          pricePerSession: null,
+          idleFeePricePerMinute: null,
+          reservationFeePerMinute: null,
+          taxRate: null,
+          restrictions: null,
+          priority: 0,
+          isDefault: true,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
       });
       const response = await app.inject({
         method: 'GET',
@@ -411,7 +555,80 @@ describe('Portal charger routes - handler logic', () => {
         headers: { authorization: `Bearer ${driverToken}` },
       });
       expect(response.statusCode).toBe(200);
-      expect(resolveTariff).toHaveBeenCalledWith(VALID_STATION_ID, DRIVER_ID);
+      expect(response.json().billing).toEqual({
+        mode: 'account',
+        fleetName: 'Acme',
+        invoicedTo: 'fleet',
+      });
+      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
+    });
+
+    it('resolves the tariff for the station UUID and driver ID', async () => {
+      setupDbResults([{ id: VALID_STATION_ID }]);
+      vi.mocked(resolveStationPricing).mockResolvedValue(
+        withGroup({
+          id: 'tar_001',
+          name: 'Driver Rate',
+          pricePerKwh: '0.30',
+          pricePerMinute: null,
+          pricePerSession: null,
+          idleFeePricePerMinute: null,
+          reservationFeePerMinute: null,
+          taxRate: null,
+          restrictions: null,
+          priority: 0,
+          isDefault: false,
+          pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' },
+          timezone: 'UTC',
+        }),
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/pricing',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(resolveStationPricing).toHaveBeenCalledWith(
+        { stationUuid: VALID_STATION_ID, driverUuid: DRIVER_ID },
+        expect.anything(),
+      );
+    });
+    it('tells the driver the price can change and a paid tariff is ahead (B3, UI)', async () => {
+      setupDbResults([{ id: VALID_STATION_ID }]);
+      vi.mocked(isSplitBillingEnabled).mockResolvedValueOnce(true);
+      const free = {
+        id: 'tar_free',
+        name: 'Free',
+        pricePerKwh: '0',
+        pricePerMinute: null,
+        pricePerSession: null,
+        idleFeePricePerMinute: null,
+        reservationFeePerMinute: null,
+        taxRate: null,
+        restrictions: null,
+        priority: 0,
+        isDefault: true,
+        pricingGroup: { id: 'pgr_1', name: 'Group', source: 'station' as const },
+        timezone: 'Europe/Berlin',
+      };
+      vi.mocked(resolveStationPricing).mockResolvedValue({
+        tariff: free,
+        groupTariffs: [
+          free,
+          { ...free, id: 'tar_peak', pricePerKwh: '0.40', priority: 50, isDefault: false },
+        ],
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/CS-001/pricing',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        timezone: 'Europe/Berlin',
+        priceChangesDuringSession: true,
+        paidTariffAhead: true,
+      });
     });
   });
 
@@ -465,6 +682,49 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(400);
     });
+
+    // An operator-disabled station whose connectors still report Available was
+    // counted as "3/3 available". The count must come from the shared rule.
+    it('counts available EVSEs with the shared driver availability rule', async () => {
+      setupDbResults([], []);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/search?q=CS',
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mockAvailableEvseCountSql).toHaveBeenCalledWith('charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('AVAILABLE_EVSE_COUNT(charging_stations)');
+    });
+  });
+
+  describe('GET /v1/portal/chargers/nearby', () => {
+    it('counts available EVSEs with the shared driver availability rule', async () => {
+      setupDbResults(
+        [
+          {
+            stationId: 'CS-001',
+            stationUuid: 'uuid-001',
+            model: 'M1',
+            isOnline: true,
+            siteName: 'Site A',
+            siteAddress: null,
+            siteCity: null,
+            distanceKm: 1.23,
+            evseCount: 3,
+            availableCount: 0,
+          },
+        ],
+        [],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/nearby?lat=30.2&lng=-97.7',
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()[0].availableCount).toBe(0);
+      expect(mockAvailableEvseCountSql).toHaveBeenCalledWith('charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('AVAILABLE_EVSE_COUNT(charging_stations)');
+    });
   });
 
   describe('POST /v1/portal/chargers/:stationId/evse/:evseId/start', () => {
@@ -497,6 +757,31 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(404);
       expect(response.json().code).toBe('STATION_NOT_FOUND');
     });
+
+    it.each(['pending', 'blocked'])(
+      'refuses a %s station before the maintenance check (second layer)',
+      async (onboardingStatus) => {
+        vi.mocked(getActiveMaintenanceForStation).mockClear();
+        setupDbResults([
+          {
+            id: VALID_STATION_ID,
+            stationId: 'CS-001',
+            siteId: null,
+            isOnline: true,
+            onboardingStatus,
+            ocppProtocol: 'ocpp2.1',
+          },
+        ]);
+        const response = await app.inject({
+          method: 'POST',
+          url: '/portal/chargers/CS-001/evse/1/start',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload: {},
+        });
+        expect(response.statusCode).toBe(403);
+        expect(getActiveMaintenanceForStation).not.toHaveBeenCalled();
+      },
+    );
 
     it('returns 400 when station is offline', async () => {
       setupDbResults([
@@ -543,6 +828,32 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.json().code).toBe('EVSE_NOT_FOUND');
     });
 
+    it.each([
+      { disabledReason: 'operator', firmwareState: null, reportedStatus: null },
+      { disabledReason: null, firmwareState: 'failed', reportedStatus: null },
+      { disabledReason: null, firmwareState: null, reportedStatus: 'faulted' },
+    ])('returns 409 STATION_UNAVAILABLE for a station-level state %o', async (state) => {
+      setupDbResults([
+        {
+          id: VALID_STATION_ID,
+          stationId: 'CS-001',
+          siteId: null,
+          isOnline: true,
+          onboardingStatus: 'accepted',
+          ocppProtocol: 'ocpp2.1',
+          ...state,
+        },
+      ]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('STATION_UNAVAILABLE');
+    });
+
     it('returns 400 when connector is not available', async () => {
       setupDbResults(
         [
@@ -569,7 +880,7 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('returns 400 when payment is required but no paymentMethodId provided', async () => {
-      vi.mocked(isTariffFree).mockReturnValue(false);
+      vi.mocked(isStationChargingFree).mockResolvedValue(false);
       setupDbResults(
         [
           {
@@ -584,15 +895,7 @@ describe('Portal charger routes - handler logic', () => {
         [{ id: 'evs_000000000001' }],
         [{ status: 'available' }],
       );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: 1,
-        connectedAccountId: null,
-        platformFeePercent: 0,
-      });
+      mockActivePaymentProvider.mockResolvedValue(STRIPE_PROVIDER);
 
       const response = await app.inject({
         method: 'POST',
@@ -602,9 +905,14 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(400);
       expect(response.json().code).toBe('PAYMENT_METHOD_REQUIRED');
+      // No reservation held by this driver: the reservation fee does not count.
+      expect(vi.mocked(isStationChargingFree)).toHaveBeenCalledWith(
+        { stationUuid: VALID_STATION_ID, driverUuid: DRIVER_ID, reserved: false, freeVend: false },
+        expect.anything(),
+      );
     });
 
-    it('starts charging session without payment when stripe not configured', async () => {
+    it('starts charging session without payment when no payment provider is active', async () => {
       setupDbResults(
         [
           {
@@ -623,7 +931,7 @@ describe('Portal charger routes - handler logic', () => {
         [], // driver active-session check
         [{ id: VALID_SESSION_ID }],
       );
-      vi.mocked(getStripeConfig).mockResolvedValue(null);
+      mockActivePaymentProvider.mockResolvedValue(null);
 
       const response = await app.inject({
         method: 'POST',
@@ -633,6 +941,730 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(isStationChargingFree).not.toHaveBeenCalled();
+      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+      // The driver's start is on the station history, without the idToken.
+      expect(vi.mocked(databaseModule.writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'station_id' }),
+        expect.objectContaining({
+          entityId: VALID_STATION_ID,
+          action: 'command_dispatched',
+          actor: 'driver',
+          after: {
+            action: 'RequestStartTransaction',
+            sessionId: VALID_SESSION_ID,
+            evseId: 1,
+            outcome: 'Accepted',
+          },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    describe('OCPP 1.6 transaction id', () => {
+      const station16 = {
+        id: VALID_STATION_ID,
+        stationId: 'CS-016',
+        siteId: null,
+        isOnline: true,
+        onboardingStatus: 'accepted',
+        ocppProtocol: 'ocpp1.6',
+      };
+
+      function setupStart16(): void {
+        setupDbResults(
+          [station16],
+          [{ id: 'evs_000000000001' }],
+          [{ status: 'available' }],
+          [], // active reservation gate
+          [], // EVSE active-session check
+          [], // driver active-session check
+          [{ id: VALID_SESSION_ID }],
+        );
+      }
+
+      function insertedValues(): unknown[] {
+        return vi
+          .mocked(db.insert)
+          .mock.results.flatMap(
+            (res) =>
+              (res.value as { values: ReturnType<typeof vi.fn> }).values.mock.calls as unknown[][],
+          )
+          .map(([values]) => values);
+      }
+
+      async function start16() {
+        return app.inject({
+          method: 'POST',
+          url: '/portal/chargers/CS-016/evse/1/start',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload: {},
+        });
+      }
+
+      it('stamps the session with the next value of the 1.6 sequence', async () => {
+        vi.mocked(db.insert).mockClear();
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(200);
+        expect(insertedValues()).toContainEqual(expect.objectContaining({ transactionId: '42' }));
+      });
+
+      it('answers 500 SESSION_CREATE_FAILED and creates nothing when the sequence read fails', async () => {
+        vi.mocked(db.insert).mockClear();
+        vi.mocked(db.execute).mockRejectedValueOnce(new Error('db down'));
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(500);
+        expect(response.json().code).toBe('SESSION_CREATE_FAILED');
+        expect(db.insert).not.toHaveBeenCalled();
+        expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+      });
+
+      it('answers 500 SESSION_CREATE_FAILED when the sequence returns no row', async () => {
+        vi.mocked(db.insert).mockClear();
+        vi.mocked(db.execute).mockResolvedValueOnce([] as never);
+        setupStart16();
+
+        const response = await start16();
+
+        expect(response.statusCode).toBe(500);
+        expect(response.json().code).toBe('SESSION_CREATE_FAILED');
+        expect(db.insert).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('POST /v1/portal/chargers/:stationId/evse/:evseId/start - pre-authorization', () => {
+    const stationRow = {
+      id: VALID_STATION_ID,
+      stationId: 'CS-001',
+      siteId: 'sit_000000000001',
+      isOnline: true,
+      onboardingStatus: 'accepted',
+      ocppProtocol: 'ocpp2.1',
+    };
+
+    /** Station, EVSE, connector, the three empty gate checks, then the given rows. */
+    function setupStartRows(...rest: unknown[][]): void {
+      setupDbResults(
+        [stationRow],
+        [{ id: 'evs_000000000001' }],
+        [{ status: 'available' }],
+        [], // active reservation gate
+        [], // EVSE active-session check
+        [], // driver active-session check
+        ...rest,
+      );
+    }
+
+    async function startWithCard() {
+      return app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { paymentMethodId: 7 },
+      });
+    }
+
+    function sessionUpdateSets(): unknown[] {
+      return vi
+        .mocked(db.update)
+        .mock.results.flatMap(
+          (res) => (res.value as { set: ReturnType<typeof vi.fn> }).set.mock.calls as unknown[][],
+        )
+        .map(([values]) => values);
+    }
+
+    beforeEach(() => {
+      mockActivePaymentProvider.mockResolvedValue(STRIPE_PROVIDER);
+      vi.mocked(isStationChargingFree).mockResolvedValue(false);
+      mockFailUnstartedRemoteSession.mockResolvedValue({
+        outcome: 'failed',
+        session: { id: VALID_SESSION_ID },
+      });
+      mockWriteCsmsSessionAudit.mockClear();
+    });
+
+    function sessionInsertValues(): Array<Record<string, unknown>> {
+      return vi
+        .mocked(db.insert)
+        .mock.results.flatMap(
+          (res) =>
+            (res.value as { values: ReturnType<typeof vi.fn> }).values.mock.calls as unknown[][],
+        )
+        .map(([values]) => values as Record<string, unknown>);
+    }
+
+    it('starts an account driver without a payment method or a hold, stamped account', async () => {
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      vi.mocked(db.insert).mockClear();
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
+      expect(isStationChargingFree).not.toHaveBeenCalled();
+      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+      expect(sessionInsertValues()[0]).toMatchObject({
+        billingMode: 'account',
+        billingFleetId: 'flt_1',
+      });
+    });
+
+    function creditCheck(
+      level: 'ok' | 'warning' | 'reached',
+      totalCents: number,
+      remainingCents = Math.max(10_000 - totalCents, 0),
+    ) {
+      return {
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        limitCents: 10_000,
+        warningPercent: 80,
+        exposure: {
+          unbilledCents: totalCents,
+          invoicedCents: 0,
+          runningCents: 0,
+          totalCents,
+          currency: 'USD',
+        },
+        level,
+        remainingCents,
+        ceilingCents: null,
+      };
+    }
+
+    it('refuses an account start at the fleet credit limit with 402 and creates no session', async () => {
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      const check = creditCheck('reached', 10_000);
+      vi.mocked(checkFleetCreditLimit).mockResolvedValue(check);
+      vi.mocked(db.insert).mockClear();
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(402);
+      expect(response.json().code).toBe('FLEET_CREDIT_LIMIT_REACHED');
+      expect(checkFleetCreditLimit).toHaveBeenCalledWith(expect.anything(), 'flt_1');
+      expect(mockDispatchFleetCreditLimitNotices).toHaveBeenCalledWith(
+        check,
+        expect.objectContaining({ templatesDirs: expect.any(Array) as unknown[] }),
+        expect.anything(),
+      );
+      expect(sessionInsertValues()).toHaveLength(0);
+      expect(sendOcppCommandAndWait).not.toHaveBeenCalled();
+    });
+
+    it('refuses an account start when running sessions reserve the rest of the limit (plan S8)', async () => {
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      vi.mocked(checkFleetCreditLimit).mockResolvedValue(creditCheck('ok', 2000, 0));
+      vi.mocked(db.insert).mockClear();
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(402);
+      expect(response.json().code).toBe('FLEET_CREDIT_LIMIT_REACHED');
+      expect(sessionInsertValues()).toHaveLength(0);
+    });
+
+    it('starts an account driver at the warning percent and notifies the fleet', async () => {
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      vi.mocked(checkFleetCreditLimit).mockResolvedValue(creditCheck('warning', 8500));
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockDispatchFleetCreditLimitNotices).toHaveBeenCalledTimes(1);
+    });
+
+    it('checks no credit limit for a card driver', async () => {
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+      await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+      expect(checkFleetCreditLimit).not.toHaveBeenCalled();
+    });
+
+    it('starts an account driver when no payment provider is active', async () => {
+      mockActivePaymentProvider.mockResolvedValue(null);
+      vi.mocked(resolveAccountBilling).mockResolvedValue({
+        fleetId: 'flt_1',
+        fleetName: 'Acme',
+        recipient: 'fleet',
+      });
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/chargers/CS-001/evse/1/start',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+    });
+
+    it('stamps a card driver card and places the hold', async () => {
+      vi.mocked(db.insert).mockClear();
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(200);
+      expect(mockAuthorizeSessionHold).toHaveBeenCalledTimes(1);
+      expect(sessionInsertValues()[0]).toMatchObject({ billingMode: 'card', billingFleetId: null });
+    });
+
+    it('returns 404 when the payment method is not the driver', async () => {
+      setupStartRows([]); // payment method lookup
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('PAYMENT_METHOD_NOT_FOUND');
+      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+    });
+
+    it('places the hold for the new session before starting the station', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(mockAuthorizeSessionHold).toHaveBeenCalledWith(
+        {
+          sessionId: VALID_SESSION_ID,
+          driverId: DRIVER_ID,
+          methodRowId: 7,
+          siteId: 'sit_000000000001',
+          trigger: 'portal_start',
+        },
+        { registry: 'registry', logger: expect.anything() },
+      );
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith(
+        'CS-001',
+        'RequestStartTransaction',
+        expect.objectContaining({ evseId: 1 }),
+      );
+      // The accepted start is closed by the worker if no transaction follows.
+      expect(mockScheduleRemoteStartTimeout).toHaveBeenCalledWith(
+        { kind: 'session', sessionId: VALID_SESSION_ID },
+        expect.objectContaining({ id: stationRow.id }),
+        expect.anything(),
+      );
+      expect(mockCancelOpenSessionHold).not.toHaveBeenCalled();
+    });
+
+    it('cancels the hold and schedules nothing when the station rejects the start', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockCancelOpenSessionHold.mockResolvedValueOnce({ status: 'cancelled', paymentRecordId: 3 });
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        response: { status: 'Rejected' },
+        error: null,
+      } as never);
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(502);
+      expect(response.json().code).toBe('START_REJECTED');
+      // Closed by the guarded helper (active only, ended, zero cost), never
+      // by an unguarded status write.
+      expect(mockFailUnstartedRemoteSession).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'RemoteStartRejected',
+      );
+      expect(sessionUpdateSets()).not.toContainEqual(
+        expect.objectContaining({ status: 'faulted' }),
+      );
+      expect(mockCancelOpenSessionHold).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'Station rejected the start: Rejected',
+        { registry: 'registry', logger: expect.anything() },
+      );
+      expect(mockWriteCsmsSessionAudit).toHaveBeenCalledTimes(1);
+      expect(mockScheduleRemoteStartTimeout).not.toHaveBeenCalled();
+    });
+
+    it('closes an unanswered start through the guarded helper and releases its hold', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockCancelOpenSessionHold.mockResolvedValueOnce({ status: 'cancelled', paymentRecordId: 3 });
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'c',
+        error: 'No response within 35s',
+        timedOut: true,
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(504);
+      expect(response.json().code).toBe('STATION_TIMEOUT');
+      expect(mockFailUnstartedRemoteSession).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'RemoteStartTimeout',
+      );
+      expect(sessionUpdateSets()).not.toContainEqual(
+        expect.objectContaining({ status: 'faulted' }),
+      );
+      expect(mockCancelOpenSessionHold).toHaveBeenCalledWith(
+        VALID_SESSION_ID,
+        'Station did not answer the start',
+        { registry: 'registry', logger: expect.anything() },
+      );
+      expect(mockWriteCsmsSessionAudit).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers the start when the station reported its transaction before the timeout', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockFailUnstartedRemoteSession.mockResolvedValueOnce({ outcome: 'skipped' });
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'c',
+        error: 'No response within 35s',
+        timedOut: true,
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      // The session charges: its hold stays, nothing is audited as faulted.
+      expect(mockCancelOpenSessionHold).not.toHaveBeenCalled();
+      expect(mockWriteCsmsSessionAudit).not.toHaveBeenCalled();
+    });
+
+    it('writes no audit and sends no notice when another path closed the start first', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockFailUnstartedRemoteSession.mockResolvedValueOnce({
+        outcome: 'closed',
+        session: { id: VALID_SESSION_ID },
+      });
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'c',
+        response: { status: 'Rejected' },
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(502);
+      expect(mockWriteCsmsSessionAudit).not.toHaveBeenCalled();
+      // A retry still releases the hold (same idempotency key at the provider).
+      expect(mockCancelOpenSessionHold).toHaveBeenCalledTimes(1);
+    });
+
+    it('still answers the rejection when the hold cancel fails (fail-open)', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'authorized',
+        paymentRecordId: 3,
+        paymentId: 'pi_test_123',
+      });
+      mockCancelOpenSessionHold.mockRejectedValueOnce(new Error('provider down'));
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        response: { status: 'Rejected' },
+        error: null,
+      } as never);
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(502);
+      expect(response.json().code).toBe('START_REJECTED');
+    });
+
+    it('returns 402 and fails the session without starting the station when the card is declined', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'declined',
+        reason: 'Your card was declined.',
+        paymentRecordId: 3,
+        failure: 'declined',
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(402);
+      expect(response.json()).toEqual({
+        error: 'Payment authorization declined: Your card was declined.',
+        code: 'PAYMENT_PREAUTH_FAILED',
+      });
+      expect(sessionUpdateSets()).toContainEqual(
+        expect.objectContaining({ status: 'failed', stoppedReason: 'PreAuthDeclined' }),
+      );
+      expect(sendOcppCommandAndWait).not.toHaveBeenCalled();
+    });
+
+    describe('a cable-first transaction waiting for its authorization (F01)', () => {
+      const WAITING_ID = 'ses_waiting00001';
+
+      /** The EVSE has the station's waiting session, which this start takes over. */
+      function setupTakeoverRows(...rest: unknown[][]): void {
+        setupDbResults(
+          [stationRow],
+          [{ id: 'evs_000000000001' }],
+          [{ status: 'ev_connected' }],
+          [], // active reservation gate
+          [{ id: WAITING_ID }], // EVSE active-session check
+          [{ id: WAITING_ID }], // the session waits for its authorization
+          [], // driver active-session check
+          ...rest,
+        );
+      }
+
+      function stopCommands(): unknown[] {
+        return mockPublish.mock.calls
+          .filter(([channel]) => channel === 'ocpp_commands')
+          .map(([, message]) => JSON.parse(message as string) as Record<string, unknown>)
+          .filter((command) => command['action'] === 'RequestStopTransaction');
+      }
+
+      it('takes over the waiting session: driver, remote start id, hold on it', async () => {
+        setupTakeoverRows([{ id: 7 }], [{ id: WAITING_ID, transactionId: 'tx-station' }]);
+        mockAuthorizeSessionHold.mockResolvedValueOnce({
+          outcome: 'authorized',
+          paymentRecordId: 3,
+          paymentId: 'pi_test_123',
+        });
+
+        const response = await startWithCard();
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().chargingSessionId).toBe(WAITING_ID);
+        expect(sessionInsertValues()).toHaveLength(0);
+        const takeover = sessionUpdateSets()[0] as Record<string, unknown>;
+        expect(takeover).toMatchObject({ driverId: DRIVER_ID, billingMode: 'card' });
+        expect(typeof takeover['remoteStartId']).toBe('number');
+        expect(mockAuthorizeSessionHold).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: WAITING_ID, methodRowId: 7 }),
+          expect.anything(),
+        );
+        expect(sendOcppCommandAndWait).toHaveBeenCalledWith(
+          'CS-001',
+          'RequestStartTransaction',
+          expect.objectContaining({ remoteStartId: takeover['remoteStartId'] }),
+        );
+        expect(stopCommands()).toHaveLength(0);
+      });
+
+      it('answers EVSE_IN_USE when the session stopped waiting before the takeover', async () => {
+        setupTakeoverRows([{ id: 7 }], []);
+
+        const response = await startWithCard();
+
+        expect(response.statusCode).toBe(409);
+        expect(response.json().code).toBe('EVSE_IN_USE');
+        expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
+        expect(sendOcppCommandAndWait).not.toHaveBeenCalled();
+      });
+
+      it('answers EVSE_IN_USE for an active session that does not wait', async () => {
+        setupDbResults(
+          [stationRow],
+          [{ id: 'evs_000000000001' }],
+          [{ status: 'ev_connected' }],
+          [],
+          [{ id: WAITING_ID }],
+          [], // not waiting: a driver, token or idToken already
+        );
+
+        const response = await startWithCard();
+
+        expect(response.statusCode).toBe(409);
+        expect(response.json().code).toBe('EVSE_IN_USE');
+      });
+
+      it('fails the taken-over session and stops its transaction when the card is declined', async () => {
+        setupTakeoverRows([{ id: 7 }], [{ id: WAITING_ID, transactionId: 'tx-station' }]);
+        mockAuthorizeSessionHold.mockResolvedValueOnce({
+          outcome: 'declined',
+          reason: 'Your card was declined.',
+          paymentRecordId: 3,
+          failure: 'declined',
+        });
+
+        const response = await startWithCard();
+
+        expect(response.statusCode).toBe(402);
+        expect(sessionUpdateSets()).toContainEqual(
+          expect.objectContaining({ status: 'failed', stoppedReason: 'PreAuthDeclined' }),
+        );
+        expect(stopCommands()).toEqual([
+          expect.objectContaining({
+            stationId: 'CS-001',
+            payload: { transactionId: 'tx-station' },
+          }),
+        ]);
+        expect(sendOcppCommandAndWait).not.toHaveBeenCalled();
+      });
+
+      it('stops the taken-over transaction, not as a ghost, when the station rejects', async () => {
+        setupTakeoverRows(
+          [{ id: 7 }],
+          [{ id: WAITING_ID, transactionId: 'tx-station' }],
+          [{ id: WAITING_ID }], // the guarded fault
+        );
+        mockAuthorizeSessionHold.mockResolvedValueOnce({
+          outcome: 'authorized',
+          paymentRecordId: 3,
+          paymentId: 'pi_test_123',
+        });
+        mockCancelOpenSessionHold.mockResolvedValueOnce({
+          status: 'cancelled',
+          paymentRecordId: 3,
+        });
+        vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+          response: {
+            status: 'Rejected',
+            statusInfo: { reasonCode: 'TxInProgress', additionalInfo: 'tx-station' },
+          },
+          error: null,
+        } as never);
+
+        const response = await startWithCard();
+
+        expect(response.statusCode).toBe(502);
+        // No ghost recovery: one RequestStartTransaction, no RequestStop wait.
+        expect(sendOcppCommandAndWait).toHaveBeenCalledTimes(1);
+        expect(sessionUpdateSets()).toContainEqual(
+          expect.objectContaining({
+            status: 'faulted',
+            stoppedReason: 'RemoteStartRejected',
+            finalCostCents: 0,
+            currentCostCents: 0,
+            endedAt: expect.any(Date),
+          }),
+        );
+        // A taken-over transaction has events: the unstarted helper does not apply.
+        expect(mockFailUnstartedRemoteSession).not.toHaveBeenCalled();
+        expect(mockCancelOpenSessionHold).toHaveBeenCalledWith(
+          WAITING_ID,
+          expect.any(String),
+          expect.anything(),
+        );
+        expect(stopCommands()).toHaveLength(1);
+      });
+    });
+
+    it('returns 500 and fails the session when the hold could not be recorded', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'record_failed',
+        reason: 'insert failed',
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({
+        error: 'Failed to record payment authorization',
+        code: 'INTERNAL_ERROR',
+      });
+      expect(sessionUpdateSets()).toContainEqual(
+        expect.objectContaining({ status: 'failed', stoppedReason: 'PreAuthRecordFailed' }),
+      );
+      expect(sendOcppCommandAndWait).not.toHaveBeenCalled();
+    });
+
+    it('starts the session without a hold when the card provider is not configured', async () => {
+      setupStartRows([{ id: 7 }], [{ id: VALID_SESSION_ID }]);
+      mockAuthorizeSessionHold.mockResolvedValueOnce({
+        outcome: 'not_configured',
+        providerId: 'adyen',
+      });
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(sendOcppCommandAndWait).toHaveBeenCalled();
+    });
+
+    it('skips the hold when charging is free for the driver', async () => {
+      vi.mocked(isStationChargingFree).mockResolvedValue(true);
+      setupStartRows([{ id: VALID_SESSION_ID }]);
+
+      const response = await startWithCard();
+
+      expect(response.statusCode).toBe(200);
+      expect(mockAuthorizeSessionHold).not.toHaveBeenCalled();
     });
   });
 
@@ -693,7 +1725,14 @@ describe('Portal charger routes - handler logic', () => {
     });
 
     it('stops an active session', async () => {
-      setupDbResults([{ id: VALID_SESSION_ID, transactionId: 'tx-123', stationOcppId: 'CS-001' }]);
+      setupDbResults([
+        {
+          id: VALID_SESSION_ID,
+          transactionId: 'tx-123',
+          stationDbId: VALID_STATION_ID,
+          stationOcppId: 'CS-001',
+        },
+      ]);
       const response = await app.inject({
         method: 'POST',
         url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
@@ -702,6 +1741,189 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().status).toBe('stopping');
       expect(response.json().chargingSessionId).toBe(VALID_SESSION_ID);
+      expect(vi.mocked(databaseModule.writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'station_id' }),
+        expect.objectContaining({
+          entityId: VALID_STATION_ID,
+          action: 'command_dispatched',
+          actor: 'driver',
+          after: expect.objectContaining({
+            action: 'RequestStopTransaction',
+            sessionId: VALID_SESSION_ID,
+          }),
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      ['ocpp2.1', 'CS-001', 'tx-123'],
+      ['ocpp1.6', 'CS-016', '4'],
+    ])(
+      'answers 409 SESSION_STOP_REJECTED when an %s station rejects the stop',
+      async (ocppProtocol, stationOcppId, transactionId) => {
+        vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+          commandId: 'm',
+          response: { status: 'Rejected' },
+        });
+        setupDbResults([
+          {
+            id: VALID_SESSION_ID,
+            transactionId,
+            stationDbId: VALID_STATION_ID,
+            stationOcppId,
+            ocppProtocol,
+          },
+        ]);
+
+        const response = await app.inject({
+          method: 'POST',
+          url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+          headers: { authorization: `Bearer ${driverToken}` },
+        });
+
+        expect(response.statusCode).toBe(409);
+        expect(response.json().code).toBe('SESSION_STOP_REJECTED');
+      },
+    );
+
+    it('answers 409 STATION_OFFLINE when the stop is queued for an offline station', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        error: 'Station offline, command queued',
+        queued: true,
+      });
+      setupDbResults([
+        {
+          id: VALID_SESSION_ID,
+          transactionId: 'tx-123',
+          stationDbId: VALID_STATION_ID,
+          stationOcppId: 'CS-001',
+        },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('STATION_OFFLINE');
+    });
+
+    it('answers 504 STATION_TIMEOUT when the station does not answer the stop', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        error: 'No response within 35s',
+        timedOut: true,
+      });
+      setupDbResults([
+        {
+          id: VALID_SESSION_ID,
+          transactionId: 'tx-123',
+          stationDbId: VALID_STATION_ID,
+          stationOcppId: 'CS-001',
+        },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(504);
+      expect(response.json().code).toBe('STATION_TIMEOUT');
+    });
+
+    it('lets the OCPP server translate the stop for an OCPP 1.6 station', async () => {
+      const { sendOcppCommandAndWait } = ocppCommandModule;
+      const sendMock = vi.mocked(sendOcppCommandAndWait);
+      sendMock.mockClear();
+      setupDbResults([
+        {
+          id: VALID_SESSION_ID,
+          transactionId: '4',
+          stationOcppId: 'CS-016',
+          ocppProtocol: 'ocpp1.6',
+        },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      // Without a version the command is translated to RemoteStopTransaction
+      // with an integer transactionId; with it, a 1.6 station got the 2.1
+      // RequestStopTransaction and answered CALLERROR.
+      expect(sendMock).toHaveBeenCalledWith('CS-016', 'RequestStopTransaction', {
+        transactionId: '4',
+      });
+      expect(sendMock.mock.calls[0]).toHaveLength(3);
+    });
+
+    it('ends a ghost session (TxNotFound) through the OCPP server, completed and billed', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        response: { status: 'Rejected', statusInfo: { reasonCode: 'TxNotFound' } },
+      });
+      mockRecordSessionEndRequest.mockClear();
+      mockPublish.mockClear();
+      const { db } = databaseModule;
+      vi.mocked(db.execute).mockClear();
+      setupDbResults([
+        { id: VALID_SESSION_ID, transactionId: 'tx-ghost', stationOcppId: 'CS-001' },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        status: 'ghostRecovered',
+        chargingSessionId: VALID_SESSION_ID,
+      });
+      // Recorded durably first (P4), then the OCPP server ends it the normal way.
+      expect(mockRecordSessionEndRequest).toHaveBeenCalledWith(
+        {},
+        VALID_SESSION_ID,
+        'GhostRecovered',
+      );
+      expect(mockPublish).toHaveBeenCalledWith(
+        'session_end_requests',
+        JSON.stringify({ sessionId: VALID_SESSION_ID, reason: 'GhostRecovered' }),
+      );
+      // The route never faults the session itself.
+      expect(db.execute).not.toHaveBeenCalled();
+    });
+
+    it('publishes no end request when the ghost session ended meanwhile (P5)', async () => {
+      vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
+        commandId: 'm',
+        response: { status: 'Rejected', statusInfo: { reasonCode: 'TxNotFound' } },
+      });
+      mockRecordSessionEndRequest.mockResolvedValueOnce(false);
+      mockPublish.mockClear();
+      setupDbResults([
+        { id: VALID_SESSION_ID, transactionId: 'tx-ghost', stationOcppId: 'CS-001' },
+      ]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/portal/chargers/sessions/${VALID_SESSION_ID}/stop`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockPublish).not.toHaveBeenCalledWith('session_end_requests', expect.anything());
     });
   });
 
@@ -733,6 +1955,145 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().data).toHaveLength(1);
+    });
+
+    it('TC-T3-25 returns the gross cancellation fee and its tax rate of an open reservation', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'active',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-12-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: null,
+          feeCancellationCents: 300,
+        },
+        {
+          id: 'r2',
+          reservationId: 2,
+          stationOcppId: 'CS-001',
+          status: 'cancelled',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-11-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: null,
+          feeCancellationCents: 300,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockResolvedValueOnce({
+        basis: 'net',
+        taxRate: '0.19',
+        feePerMinute: null,
+        cancellationFeeCents: 300,
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const data = response.json().data as Array<Record<string, unknown>>;
+      // 300 net at 19 %: the driver sees the 357 charged, not 300.
+      expect(data[0]?.cancellationFee).toEqual({ grossCents: 357, taxRate: 0.19 });
+      expect(data[1]?.cancellationFee).toBeNull();
+      expect(data[0]).not.toHaveProperty('feeCancellationCents');
+      expect(resolveReservationFeeTerms).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stationId: VALID_STATION_ID,
+          driverId: DRIVER_ID,
+          feeTaxBasis: 'net',
+          feeCancellationCents: 300,
+        }),
+      );
+    });
+
+    it('returns no cancellation fee when the fee terms cannot be read', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'scheduled',
+          startsAt: null,
+          expiresAt: '2025-01-01',
+          createdAt: '2024-12-01',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: null,
+          feeTaxRate: null,
+          feePerMinute: null,
+          feeCancellationCents: null,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockRejectedValueOnce(new Error('db down'));
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data[0].cancellationFee).toBeNull();
+      expect(response.json().data[0].noShowFee).toBeNull();
+    });
+
+    it('returns the no-show fee of an open reservation, tax included, from one terms lookup', async () => {
+      setupDbResults([
+        {
+          id: 'r1',
+          reservationId: 1,
+          stationOcppId: 'CS-001',
+          status: 'active',
+          startsAt: '2026-10-09T10:00:00Z',
+          expiresAt: '2026-10-09T10:30:00Z',
+          createdAt: '2026-10-09T09:00:00Z',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: '0.10',
+          feeCancellationCents: 0,
+        },
+        {
+          id: 'r2',
+          reservationId: 2,
+          stationOcppId: 'CS-001',
+          status: 'expired',
+          startsAt: null,
+          expiresAt: '2026-10-09T10:30:00Z',
+          createdAt: '2026-10-09T10:00:00Z',
+          stationDbId: VALID_STATION_ID,
+          feeTaxBasis: 'net',
+          feeTaxRate: '0.19',
+          feePerMinute: '0.10',
+          feeCancellationCents: 0,
+        },
+      ]);
+      vi.mocked(resolveReservationFeeTerms).mockClear();
+      vi.mocked(resolveReservationFeeTerms).mockResolvedValueOnce({
+        basis: 'net',
+        taxRate: '0.19',
+        feePerMinute: '0.10',
+        cancellationFeeCents: 0,
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/reservations',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const data = response.json().data as Array<Record<string, unknown>>;
+      // 30 held minutes at 0.10 net, 19 %: 300 net, 357 charged (TC-T3-20).
+      expect(data[0]?.noShowFee).toEqual({ grossCents: 357, taxRate: 0.19 });
+      expect(data[0]?.cancellationFee).toBeNull();
+      // A closed reservation shows no fee and needs no lookup.
+      expect(data[1]?.noShowFee).toBeNull();
+      expect(resolveReservationFeeTerms).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -774,19 +2135,18 @@ describe('Portal charger routes - handler logic', () => {
       expect(response.json().code).toBe('STATION_OFFLINE');
     });
 
-    it('returns 400 PAYMENT_METHOD_REQUIRED when driver has no default card', async () => {
-      // Station -> PM lookup (empty) -> 400
-      setupDbResults(
-        [
-          {
-            id: VALID_STATION_ID,
-            isOnline: true,
-            onboardingStatus: 'accepted',
-            reservationsEnabled: true,
-          },
-        ],
-        [],
-      );
+    it('returns 409 STATION_UNAVAILABLE when the station is disabled', async () => {
+      setupDbResults([
+        {
+          id: VALID_STATION_ID,
+          isOnline: true,
+          onboardingStatus: 'accepted',
+          reservationsEnabled: true,
+          disabledReason: 'security',
+          firmwareState: null,
+          reportedStatus: null,
+        },
+      ]);
       const response = await app.inject({
         method: 'POST',
         url: '/portal/reservations',
@@ -796,54 +2156,8 @@ describe('Portal charger routes - handler logic', () => {
           expiresAt: new Date(Date.now() + 3600000).toISOString(),
         },
       });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('PAYMENT_METHOD_REQUIRED');
-    });
-
-    it('creates a reservation', async () => {
-      const reservationData = {
-        id: VALID_RESERVATION_ID,
-        reservationId: 1,
-        stationId: VALID_STATION_ID,
-        driverId: null,
-        status: 'active',
-        expiresAt: '2024-01-01T00:00:00.000Z',
-        createdAt: '2024-01-01T00:00:00.000Z',
-      };
-      // DB call 1: station lookup
-      // DB call 2: default payment method check (always required for portal)
-      // DB call 3: conflict check (no conflicts)
-      // DB call 4: driverTokens lookup for preferredTokenId (empty)
-      // DB call 5: insert returning reservation
-      // The new active-session pre-check is gated on activeSessionCheckHours
-      // > 0 in settings; the global mock leaves it undefined so the check is
-      // skipped and consumes no DB slot.
-      // getNextReservationId uses db.execute (sequence) and does not consume a slot.
-      setupDbResults(
-        [
-          {
-            id: VALID_STATION_ID,
-            isOnline: true,
-            onboardingStatus: 'accepted',
-            reservationsEnabled: true,
-          },
-        ],
-        [{ id: 1, isDefault: true }],
-        [],
-        [],
-        [reservationData],
-      );
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/reservations',
-        headers: { authorization: `Bearer ${driverToken}` },
-        payload: {
-          stationId: 'CS-001',
-          expiresAt: new Date(Date.now() + 3600000).toISOString(),
-        },
-      });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().id).toBe(VALID_RESERVATION_ID);
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe('STATION_UNAVAILABLE');
     });
   });
 
@@ -898,6 +2212,10 @@ describe('Portal charger routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().status).toBe('cancelled');
+      // G7: the portal cancel waits for the station's answer.
+      expect(sendOcppCommandAndWait).toHaveBeenCalledWith('CS-001', 'CancelReservation', {
+        reservationId: 1,
+      });
     });
   });
 

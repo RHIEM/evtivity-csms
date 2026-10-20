@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station
 async function boot(ctx: {
@@ -69,7 +70,7 @@ export const TC_D_01_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -80,7 +81,7 @@ export const TC_D_01_CSMS: TestCase = {
         updateType: 'Full',
         localAuthorizationList: [
           {
-            idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+            idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
             idTokenInfo: { status: 'Accepted' },
           },
         ],
@@ -190,7 +191,7 @@ export const TC_D_02_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -201,7 +202,7 @@ export const TC_D_02_CSMS: TestCase = {
         updateType: 'Differential',
         localAuthorizationList: [
           {
-            idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+            idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
             idTokenInfo: { status: 'Accepted' },
           },
         ],
@@ -291,7 +292,7 @@ export const TC_D_03_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -300,7 +301,7 @@ export const TC_D_03_CSMS: TestCase = {
         stationId: ctx.stationId,
         versionNumber: 3,
         updateType: 'Differential',
-        localAuthorizationList: [{ idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' } }],
+        localAuthorizationList: [{ idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' } }],
       });
     } else {
       await new Promise((resolve) => setTimeout(resolve, 10000));
@@ -379,7 +380,7 @@ export const TC_D_04_CSMS: TestCase = {
           updateType = String(payload['updateType'] ?? '');
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

@@ -1,18 +1,12 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import type { StepResult, TestCase, TestContext } from '../../../../types.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station and send initial StatusNotification
-async function bootAndStatus(ctx: {
-  client: {
-    sendCall: (
-      action: string,
-      payload: Record<string, unknown>,
-    ) => Promise<Record<string, unknown>>;
-  };
-}) {
+async function bootAndStatus(ctx: TestContext) {
   await ctx.client.sendCall('BootNotification', {
     chargingStation: { model: 'OCTT-Virtual', vendorName: 'OCTT' },
     reason: 'PowerUp',
@@ -26,15 +20,8 @@ async function bootAndStatus(ctx: {
 }
 
 // Helper: start a charging transaction and return the txId
-async function startChargingTransaction(ctx: {
-  client: {
-    sendCall: (
-      action: string,
-      payload: Record<string, unknown>,
-    ) => Promise<Record<string, unknown>>;
-  };
-}) {
-  const txId = `OCTT-TX-${String(Date.now())}`;
+async function startChargingTransaction(ctx: TestContext) {
+  const txId = newTransactionId('OCTT-TX');
   await ctx.client.sendCall('TransactionEvent', {
     eventType: 'Started',
     timestamp: new Date().toISOString(),
@@ -42,7 +29,7 @@ async function startChargingTransaction(ctx: {
     seqNo: 0,
     transactionInfo: { transactionId: txId, chargingState: 'Charging' },
     evse: { id: 1, connectorId: 1 },
-    idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+    idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
   });
   return txId;
 }
@@ -273,7 +260,7 @@ export const TC_E_21_CSMS: TestCase = {
           requestStopTxId = String(payload['transactionId'] ?? '');
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -459,7 +446,7 @@ export const TC_E_16_CSMS: TestCase = {
 
     await bootAndStatus(ctx);
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
 
     // Step 1: TransactionEvent Started with invalid idToken
     const startRes = await ctx.client.sendCall('TransactionEvent', {

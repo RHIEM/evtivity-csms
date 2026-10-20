@@ -89,7 +89,9 @@ export function ForgotPassword(): React.JSX.Element {
             className="space-y-4"
           >
             <div className="space-y-2">
-              <Label htmlFor="email">{t('auth.emailLabel')}</Label>
+              <Label htmlFor="email" className="leading-6">
+                {t('auth.emailLabel')}
+              </Label>
               <Input
                 id="email"
                 type="email"
@@ -110,7 +112,7 @@ export function ForgotPassword(): React.JSX.Element {
             </Button>
             <Link
               to="/login"
-              className="block text-center text-sm font-medium text-primary hover:underline"
+              className="block text-center text-sm font-medium text-link hover:underline"
             >
               {t('auth.backToLogin')}
             </Link>

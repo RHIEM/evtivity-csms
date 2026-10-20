@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../types.js';
 import { pushSendAckStep } from '../../../csms-test-helpers.js';
+import { defaultReply } from '../../../default-replies.js';
 
 export const TC_051_CSMS: TestCase = {
   id: 'TC_051_CSMS',
@@ -34,7 +35,7 @@ export const TC_051_CSMS: TestCase = {
         cancelReceived = true;
         return { status: 'Accepted' };
       }
-      return {};
+      return defaultReply('ocpp1.6', action, payload);
     });
 
     if (ctx.triggerCommand != null) {
@@ -42,7 +43,7 @@ export const TC_051_CSMS: TestCase = {
         stationId: ctx.stationId,
         connectorId: 1,
         expiryDate: new Date(Date.now() + 300000).toISOString(),
-        idTag: 'OCTT-TOKEN-001',
+        idTag: ctx.tokens.valid,
         reservationId: 1,
       });
     } else {

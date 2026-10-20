@@ -27,6 +27,8 @@ function makeChain() {
     'returning',
     'set',
     'onConflictDoUpdate',
+    'onConflictDoNothing',
+    'for',
     'delete',
   ];
   for (const m of methods) {
@@ -46,7 +48,10 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  // The real SQLSTATE readers, so the mocked errors map as in production.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
+  currentAuditViaAi: () => undefined,
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -84,6 +89,8 @@ vi.mock('@evtivity/database', () => ({
     lastName: 'lastName',
     email: 'email',
   },
+  pncContracts: { driverTokenId: 'driverTokenId', status: 'status' },
+  driverTokenTombstones: { idToken: 'idToken', tokenType: 'tokenType' },
   tokenAuditLog: {
     id: 'id',
     tokenId: 'tokenId',
@@ -116,6 +123,7 @@ vi.mock('drizzle-orm', () => ({
   sql: vi.fn(),
   desc: vi.fn(),
   inArray: vi.fn(),
+  ne: vi.fn(),
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => {
@@ -132,13 +140,18 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
     close: vi.fn().mockResolvedValue(undefined),
   })),
   setPubSub: vi.fn(),
+}));
+
+const publishOcpiTokenPushMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../lib/ocpi-token-push.js', () => ({
+  publishOcpiTokenPush: (...args: unknown[]) => publishOcpiTokenPushMock(...args) as unknown,
 }));
 
 import {
@@ -151,8 +164,15 @@ import {
   exportTokensCsv,
   importTokensCsv,
   DuplicateTokenError,
+  TokenDriverNotFoundError,
+  TokenDriverInactiveError,
+  TokenReactivationBlockedError,
+  PncContractTokenError,
+  tokenActorOf,
 } from '../services/token.service.js';
 import { dispatchDriverNotification } from '@evtivity/lib';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import * as databaseModule from '@evtivity/database';
 
 beforeEach(() => {
   dbResults = [];
@@ -262,7 +282,8 @@ describe('createToken', () => {
       tokenType: 'ISO14443',
       driverId: 'drv_1',
     };
-    setupDbResults([], [token]);
+    // existing check (none), the driver (active), insert returning
+    setupDbResults([], [{ isActive: true }], [token]);
 
     const result = await createToken(
       { idToken: 'DRIVER_TOKEN', tokenType: 'ISO14443', driverId: 'drv_1' },
@@ -279,6 +300,8 @@ describe('createToken', () => {
         tokenType: 'ISO14443',
         addedBy: 'operator',
       }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -301,8 +324,11 @@ describe('createToken', () => {
       tokenType: 'ISO14443',
       driverId: 'drv_1',
       isActive: false,
+      deactivatedBy: 'driver',
     };
-    setupDbResults([existing], [currentRow], [reactivated], []);
+    // existing row, current (locked), the driver (active), update returning,
+    // stations holding the token
+    setupDbResults([existing], [currentRow], [{ isActive: true }], [reactivated], []);
 
     const result = await createToken(
       { idToken: 'RFID-1', tokenType: 'ISO14443', driverId: 'drv_1' },
@@ -315,6 +341,8 @@ describe('createToken', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'you' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -333,7 +361,7 @@ describe('createToken', () => {
     // dup pre-check returns empty, but the insert throws a unique-violation as
     // a concurrent insert won the TOCTOU race.
     setupDbResults([]);
-    const { db } = await import('@evtivity/database');
+    const { db } = databaseModule;
     const uniqueErr = Object.assign(new Error('duplicate key'), { code: '23505' });
     vi.mocked(db.insert).mockImplementationOnce(
       () =>
@@ -351,7 +379,7 @@ describe('createToken', () => {
 
   it('rethrows non-unique-violation insert errors', async () => {
     setupDbResults([]);
-    const { db } = await import('@evtivity/database');
+    const { db } = databaseModule;
     const otherErr = new Error('connection lost');
     vi.mocked(db.insert).mockImplementationOnce(
       () =>
@@ -385,6 +413,27 @@ describe('updateToken', () => {
     const result = await updateToken('t1', { idToken: 'UPDATED', tokenType: 'ISO15693' });
 
     expect(result).toEqual(token);
+  });
+
+  it('pushes no tombstone from ISO14443 to ISO15693 (same OCPI Token, uid and RFID)', async () => {
+    const token = { id: 't1', idToken: 'CARD', tokenType: 'ISO15693' };
+    setupDbResults([{ idToken: 'CARD', tokenType: 'ISO14443' }], [], [token]);
+
+    await updateToken('t1', { tokenType: 'ISO15693' });
+
+    expect(publishOcpiTokenPushMock).toHaveBeenCalledWith({ tokenIds: ['t1'], tombstones: [] });
+  });
+
+  it('tombstones the old value when the OCPI type changes', async () => {
+    const token = { id: 't1', idToken: 'CARD', tokenType: 'eMAID' };
+    setupDbResults([{ idToken: 'CARD', tokenType: 'ISO14443' }], [], [token]);
+
+    await updateToken('t1', { tokenType: 'eMAID' });
+
+    expect(publishOcpiTokenPushMock).toHaveBeenCalledWith({
+      tokenIds: ['t1'],
+      tombstones: [{ idToken: 'CARD', tokenType: 'ISO14443' }],
+    });
   });
 
   it('returns null when not found', async () => {
@@ -447,6 +496,95 @@ describe('updateToken', () => {
       'token.Deactivated',
       'drv_1',
       expect.objectContaining({ reason: 'Lost card' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
+    );
+  });
+
+  it('refuses a driver reactivating a token the operator deactivated', async () => {
+    const current = {
+      idToken: 'RFID-1',
+      tokenType: 'ISO14443',
+      driverId: 'drv_1',
+      isActive: false,
+      deactivatedBy: 'operator',
+    };
+    setupDbResults([current]);
+
+    await expect(
+      updateToken('t1', { isActive: true }, { type: 'driver', driverId: 'drv_1' }),
+    ).rejects.toBeInstanceOf(TokenReactivationBlockedError);
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+  });
+
+  it('lets a driver reactivate a token the driver deactivated', async () => {
+    const current = {
+      idToken: 'RFID-1',
+      tokenType: 'ISO14443',
+      driverId: 'drv_1',
+      isActive: false,
+      deactivatedBy: 'driver',
+    };
+    const updated = { ...current, id: 't1', isActive: true, deactivatedBy: null };
+    setupDbResults([current], [{ isActive: true }], [updated], []);
+
+    const result = await updateToken(
+      't1',
+      { isActive: true },
+      { type: 'driver', driverId: 'drv_1' },
+    );
+
+    expect(result).toEqual(updated);
+  });
+
+  it('maps a foreign key violation on driver_id to TokenDriverNotFoundError', async () => {
+    const { db } = databaseModule;
+    vi.mocked(db.transaction).mockRejectedValueOnce(
+      Object.assign(new Error('fk'), { code: '23503' }),
+    );
+
+    await expect(
+      updateToken('t1', { driverId: 'drv_missing' }, { type: 'operator', userId: 'usr_1' }),
+    ).rejects.toBeInstanceOf(TokenDriverNotFoundError);
+  });
+
+  it('refuses reactivating a token of a deactivated driver', async () => {
+    const current = {
+      idToken: 'RFID-1',
+      tokenType: 'ISO14443',
+      driverId: 'drv_1',
+      isActive: false,
+      deactivatedBy: 'operator',
+    };
+    setupDbResults([current], [{ isActive: false }]);
+
+    await expect(
+      updateToken('t1', { isActive: true }, { type: 'operator', userId: 'usr_1' }),
+    ).rejects.toBeInstanceOf(TokenDriverInactiveError);
+  });
+
+  it('records an API key as the actor, not the user it acts for', async () => {
+    const { writeAudit } = databaseModule;
+    const current = {
+      idToken: 'RFID-1',
+      tokenType: 'ISO14443',
+      driverId: null,
+      isActive: true,
+      deactivatedBy: null,
+    };
+    setupDbResults([current], [{ ...current, id: 't1', isActive: false }], []);
+
+    await updateToken(
+      't1',
+      { isActive: false },
+      { type: 'api_key', apiKeyId: 'key_1', userId: 'usr_1' },
+    );
+
+    expect(writeAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ actor: 'api_key', actorApiKeyId: 'key_1', actorUserId: 'usr_1' }),
+      expect.anything(),
+      expect.anything(),
     );
   });
 
@@ -468,7 +606,7 @@ describe('updateToken', () => {
     // 1. select current
     // 2. update returning
     // 3. bumpStationsHoldingToken: select entries (empty)
-    setupDbResults([current], [updated], []);
+    setupDbResults([current], [{ isActive: true }], [updated], []);
 
     const result = await updateToken(
       't1',
@@ -482,6 +620,8 @@ describe('updateToken', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'operator' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -527,15 +667,32 @@ describe('updateToken', () => {
 describe('deleteToken', () => {
   it('returns deleted token when found', async () => {
     const token = { id: 't1', idToken: 'DELETED' };
-    setupDbResults([token]);
+    // 1. stations holding the token (none), 2. delete returning
+    setupDbResults([], [token]);
 
     const result = await deleteToken('t1');
 
     expect(result).toEqual(token);
   });
 
+  it('marks the local auth list of every station holding the token changed', async () => {
+    const token = { id: 't1', idToken: 'DELETED', tokenType: 'ISO14443', driverId: null };
+    // 1. stations holding the token, 2. delete returning, 3. version bump,
+    // 4. station sites for the SSE event
+    setupDbResults(
+      [{ stationId: 'sta_1' }, { stationId: 'sta_1' }],
+      [token],
+      [],
+      [{ id: 'sta_1', siteId: 'site_1' }],
+    );
+
+    await deleteToken('t1', { type: 'operator', userId: 'usr_1' });
+
+    expect(databaseModule.db.update).toHaveBeenCalled();
+  });
+
   it('returns null when not found', async () => {
-    setupDbResults([]);
+    setupDbResults([], []);
 
     const result = await deleteToken('nonexistent');
 
@@ -558,6 +715,18 @@ describe('bulkSetActive', () => {
     expect(result).toEqual({ updated: 0 });
   });
 
+  it('changes only tokens not already in the target state', async () => {
+    const { ne } = await import('drizzle-orm');
+    setupDbResults([]);
+
+    await bulkSetActive(['t1'], false, { type: 'operator', userId: 'usr_1' });
+
+    // The update is guarded by is_active <> target, so an already inactive
+    // token keeps its revokedAt and gets no audit row or notification.
+    expect(vi.mocked(ne)).toHaveBeenCalledWith('isActive', false);
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+  });
+
   it('deactivates tokens, writes one audit batch, bumps stations, and notifies drivers', async () => {
     const updatedRows = [
       { id: 't1', idToken: 'A', tokenType: 'ISO14443', driverId: 'drv_1' },
@@ -577,12 +746,16 @@ describe('bulkSetActive', () => {
       'token.Deactivated',
       'drv_1',
       expect.objectContaining({ reason: '' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
     expect(dispatchDriverNotification).toHaveBeenCalledWith(
       expect.anything(),
       'token.Deactivated',
       'drv_2',
       expect.objectContaining({ reason: '' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 
@@ -591,7 +764,9 @@ describe('bulkSetActive', () => {
     // 1. update returning
     // 2. insert audit
     // 3. select entries -> empty (no station bump)
-    setupDbResults(updatedRows, [], []);
+    // no revoked contract token, no token of a deactivated driver, update
+    // returning, audit, stations
+    setupDbResults([], [], updatedRows, [], []);
 
     const result = await bulkSetActive(['t1'], true, { type: 'operator', userId: 'usr_1' });
 
@@ -601,6 +776,8 @@ describe('bulkSetActive', () => {
       'token.Reactivated',
       'drv_1',
       expect.objectContaining({ reactivatedBy: 'operator' }),
+      ALL_TEMPLATES_DIRS,
+      expect.anything(),
     );
   });
 });
@@ -645,7 +822,7 @@ describe('exportTokensCsv', () => {
       },
     ]);
 
-    const csv = await exportTokensCsv('TOK3');
+    const csv = await exportTokensCsv({ search: 'TOK3', tokenType: 'ISO14443', status: 'active' });
 
     const lines = csv.split('\n');
     expect(lines[1]).toBe('TOK3,ISO14443,c@d.com,true,2027-01-01T00:00:00.000Z');
@@ -659,7 +836,7 @@ describe('importTokensCsv', () => {
     //  2. tx.select existing (idToken, tokenType) (empty)
     //  3. tx.insert(driverTokens).values(...).returning() (returns the 2 inserted rows)
     //  4. tx.insert(tokenAuditLog).values(...) (audit, no result needed)
-    const driverRow = { id: 'driver-1', email: 'a@b.com' };
+    const driverRow = { id: 'driver-1', email: 'a@b.com', isActive: true };
     const insertedRows = [
       { id: 't1', idToken: 'T1', tokenType: 'ISO14443', driverId: 'driver-1' },
       { id: 't2', idToken: 'T2', tokenType: 'ISO15693', driverId: null },
@@ -747,10 +924,23 @@ describe('importTokensCsv', () => {
   it('returns empty result when every row fails parsing (no transaction)', async () => {
     setupDbResults();
 
-    const result = await importTokensCsv([{ idToken: '', tokenType: '' }]);
+    const result = await importTokensCsv([{ idToken: 'X1', tokenType: '' }]);
 
     expect(result.imported).toBe(0);
     expect(result.errors).toHaveLength(1);
+  });
+
+  it('skips a blank line and reports an unknown token type or a bad email per row', async () => {
+    setupDbResults();
+
+    const result = await importTokensCsv([
+      { idToken: '', tokenType: '' },
+      { idToken: 'A1', tokenType: 'Bogus' },
+      { idToken: 'A2', tokenType: 'ISO14443', driverEmail: 'not-an-email' },
+    ]);
+
+    expect(result.imported).toBe(0);
+    expect(result.errors).toEqual(['Row 2: unknown tokenType Bogus', 'Row 3: invalid driverEmail']);
   });
 
   it('treats a blank expiresAt string as no expiry', async () => {
@@ -783,5 +973,70 @@ describe('importTokensCsv', () => {
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('Row 2');
     expect(result.errors[0]).toContain('duplicate');
+  });
+});
+
+describe('tokenActorOf', () => {
+  it('maps a request actor to the token actor', () => {
+    const base = { actorUserId: null, actorDriverId: null, actorApiKeyId: null, actorLabel: null };
+    expect(tokenActorOf({ ...base, actor: 'operator', actorUserId: 'usr_1' })).toEqual({
+      type: 'operator',
+      userId: 'usr_1',
+    });
+    expect(
+      tokenActorOf({ ...base, actor: 'api_key', actorUserId: 'usr_1', actorApiKeyId: 'key_1' }),
+    ).toEqual({ type: 'api_key', apiKeyId: 'key_1', userId: 'usr_1' });
+    expect(tokenActorOf({ ...base, actor: 'driver', actorDriverId: 'drv_1' })).toEqual({
+      type: 'driver',
+      driverId: 'drv_1',
+    });
+    expect(tokenActorOf({ ...base, actor: 'system' })).toEqual({ type: 'system' });
+  });
+});
+
+describe('bulkSetActive with a deactivated driver', () => {
+  it('refuses activation when a token belongs to a deactivated driver', async () => {
+    setupDbResults([], [{ driverId: 'drv_off' }]);
+    await expect(bulkSetActive(['t1'], true)).rejects.toBeInstanceOf(TokenDriverInactiveError);
+  });
+});
+
+describe('Plug and Charge contract tokens', () => {
+  const emaid = {
+    id: 't9',
+    idToken: 'USEVTC12345678',
+    tokenType: 'eMAID',
+    driverId: 'drv_1',
+    isActive: false,
+    deactivatedBy: 'operator',
+  };
+
+  it('refuses to reactivate the eMAID of a revoked contract', async () => {
+    setupDbResults([emaid], [{ tokenId: 't9', status: 'revoked' }]);
+    await expect(updateToken('t9', { isActive: true })).rejects.toMatchObject({
+      name: 'PncContractTokenError',
+      reason: 'contract_revoked',
+    });
+  });
+
+  it.each([
+    ['value', { idToken: 'USEVTC00000000' }],
+    ['type', { tokenType: 'ISO14443' }],
+    ['driver', { driverId: 'drv_2' }],
+  ])('refuses to change the %s of a contract eMAID', async (_label, data) => {
+    setupDbResults([{ ...emaid, isActive: true }], [{ tokenId: 't9', status: 'active' }]);
+    await expect(updateToken('t9', data)).rejects.toBeInstanceOf(PncContractTokenError);
+  });
+
+  it('refuses to delete the eMAID of an active contract', async () => {
+    // stations holding it, delete matches nothing, the contract lookup finds
+    // the active contract
+    setupDbResults([], [], [{ tokenId: 't9', status: 'active' }]);
+    await expect(deleteToken('t9')).rejects.toMatchObject({ reason: 'contract_active' });
+  });
+
+  it('refuses a bulk activation that holds the eMAID of a revoked contract', async () => {
+    setupDbResults([{ tokenId: 't9', status: 'revoked' }]);
+    await expect(bulkSetActive(['t1', 't9'], true)).rejects.toBeInstanceOf(PncContractTokenError);
   });
 });

@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/table';
 import { TableSkeleton } from '@/components/TableSkeleton';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import type { PricingGroup } from '@/lib/types';
 
@@ -29,6 +30,8 @@ export function Pricing(): React.JSX.Element {
   const navigate = useNavigate();
   const timezone = useUserTimezone();
   const [search, setSearch] = useState('');
+  // Pricing writes are company-wide: the API answers 404 to a site-restricted user.
+  const canWrite = useHasCompanyWidePermission('pricing:write');
 
   const { data: groups, isLoading } = useQuery({
     queryKey: ['pricing-groups'],
@@ -47,12 +50,12 @@ export function Pricing(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl font-bold md:text-3xl">{t('pricing.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('pricing.subtitle')}</p>
         </div>
-        <div className="flex flex-col gap-2 [&>*]:w-full sm:flex-row sm:items-center sm:[&>*]:w-auto">
+        <div className="flex flex-col gap-2 *:w-full sm:flex-row sm:items-center sm:*:w-auto">
           <Button
             variant="outline"
             onClick={() => {
@@ -62,12 +65,14 @@ export function Pricing(): React.JSX.Element {
             <Calendar className="h-4 w-4" />
             {t('pricing.manageHolidays')}
           </Button>
-          <CreateButton
-            label={t('pricing.createPricingGroup')}
-            onClick={() => {
-              void navigate('/pricing/new');
-            }}
-          />
+          {canWrite && (
+            <CreateButton
+              label={t('pricing.createPricingGroup')}
+              onClick={() => {
+                void navigate('/pricing/new');
+              }}
+            />
+          )}
         </div>
       </div>
 
@@ -77,7 +82,7 @@ export function Pricing(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('common.search')}
-            className="h-10 w-full sm:max-w-half-vw"
+            className="w-full sm:max-w-half-vw"
           />
         </CardContent>
       </Card>
@@ -115,10 +120,7 @@ export function Pricing(): React.JSX.Element {
                       }}
                     >
                       <TableCell className="text-muted-foreground">{group.id}</TableCell>
-                      <TableCell
-                        className="font-medium text-primary"
-                        data-testid="row-click-target"
-                      >
+                      <TableCell className="font-medium text-link" data-testid="row-click-target">
                         {group.name}
                       </TableCell>
                       <TableCell className="text-muted-foreground">

@@ -23,6 +23,7 @@ import { useToast } from '@/components/ui/toast';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
 import { SessionCharts } from '@/components/SessionCharts';
 import { api } from '@/lib/api';
+import { costContainsTax } from '@evtivity/lib/price-display';
 import { formatCents, formatEnergy, formatDate } from '@/lib/utils';
 
 interface GuestSessionStatus {
@@ -33,11 +34,16 @@ interface GuestSessionStatus {
   energyDeliveredWh?: string | null;
   currentCostCents?: number | null;
   finalCostCents?: number | null;
+  taxCents?: number | null;
   currency?: string;
   failureReason?: string | null;
+  /** True when the charging session ended faulted (unbilled). */
+  faulted?: boolean;
   startedAt?: string | null;
   endedAt?: string | null;
   idleStartedAt?: string | null;
+  /** Transaction limit the station reported reaching (cost: the hold amount). */
+  limitReached?: 'cost' | 'energy' | 'time' | null;
 }
 
 function statusLabel(status: string, t: (key: string) => string): string {
@@ -163,7 +169,8 @@ export function GuestSession(): React.JSX.Element {
     setStopping(true);
     try {
       await api.post(`/v1/portal/guest/stop/${sessionToken}`, {});
-    } catch {
+    } catch (err) {
+      console.warn('Guest session stop request failed', err);
       // Stop request failed (network etc.). Drop the spinner so the user can
       // try again. If the OCPP RequestStopTransaction was actually dispatched
       // the polling effect below will still flip the status when it completes.
@@ -275,6 +282,11 @@ export function GuestSession(): React.JSX.Element {
           <p className="text-sm text-muted-foreground">
             {t('guest.stationPort', { stationId: session.stationOcppId, evseId: session.evseId })}
           </p>
+          {session.limitReached != null && (
+            <p role="status" className="text-sm text-muted-foreground">
+              {t(`sessionDetail.limitReached.${session.limitReached}`)}
+            </p>
+          )}
         </div>
 
         {/* Stats grid */}
@@ -294,7 +306,13 @@ export function GuestSession(): React.JSX.Element {
             <CardContent className="p-3 text-center">
               <DollarSign className="mx-auto h-5 w-5 text-muted-foreground mb-1" />
               <p className="text-xs text-muted-foreground h-8 flex items-center justify-center">
-                {isDone ? t('guestSession.totalCost') : t('guestSession.estimatedCost')}
+                {costContainsTax(costCents, session.taxCents)
+                  ? t(
+                      isDone
+                        ? 'guestSession.totalCostInclTax'
+                        : 'guestSession.estimatedCostInclTax',
+                    )
+                  : t(isDone ? 'guestSession.totalCost' : 'guestSession.estimatedCost')}
               </p>
               <p className="text-base font-bold">
                 {session.currency != null ? formatCents(costCents, session.currency) : 'n/a'}
@@ -337,6 +355,20 @@ export function GuestSession(): React.JSX.Element {
                   <span className="font-medium">{formatDate(session.endedAt)}</span>
                 </div>
               )}
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Faulted charging session: ended unbilled */}
+        {isFailed && session.faulted === true && (
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="h-4 w-4 text-destructive mt-0.5 shrink-0" />
+                <p role="status" className="text-sm text-destructive">
+                  {t('guestSession.faultedNotice')}
+                </p>
+              </div>
             </CardContent>
           </Card>
         )}

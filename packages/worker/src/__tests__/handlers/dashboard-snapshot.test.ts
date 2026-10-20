@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 
 // `db.select({...}).from(sites)` resolves to the site list.
@@ -10,7 +10,7 @@ import type { Logger } from 'pino';
 // site's four read blocks run via Promise.all and up to five sites run
 // concurrently, so a call-order queue interleaves unpredictably. Instead we
 // route results by inspecting the sql template: the joined `strings` identify
-// the query kind (ping / yesterday / dayBoundaries / stations / uptime /
+// the query kind (yesterday / dayBoundaries / stations / uptime /
 // sessions / revenue / upsert) and the bound `values` carry the siteId. Per-
 // site overrides are keyed by siteId so concurrency is irrelevant.
 
@@ -25,6 +25,8 @@ const mockSelect = vi.fn(() => ({
 
 interface SiteData {
   yesterday?: string;
+  /** Earlier dates without a snapshot, which the run backfills. */
+  missing?: string[];
   stations?: { total: string; online: string };
   uptime?:
     | { uptime_percent: string; total_ports: string; stations_below_threshold: string }
@@ -38,16 +40,19 @@ interface SiteData {
     day_electricity_cost_cents: string;
     active_sessions: string;
   };
-  revenue?: {
-    total_revenue_cents: string;
-    day_revenue_cents: string;
-    total_transactions: string;
-    day_transactions: string;
-  };
+  /** Revenue rows (session-revenue.ts) keyed 'true' for the snapshot day. */
+  revenue?: Array<{
+    key: string;
+    taxRate: string;
+    grossCents: number;
+    source: string;
+    count: number;
+  }>;
 }
 
 const DEFAULT_SITE_DATA: Required<Omit<SiteData, 'uptime'>> & Pick<SiteData, 'uptime'> = {
   yesterday: '2026-06-03',
+  missing: [],
   stations: { total: '10', online: '8' },
   uptime: { uptime_percent: '99.5', total_ports: '20', stations_below_threshold: '1' },
   sessions: {
@@ -59,21 +64,26 @@ const DEFAULT_SITE_DATA: Required<Omit<SiteData, 'uptime'>> & Pick<SiteData, 'up
     day_electricity_cost_cents: '150',
     active_sessions: '3',
   },
-  revenue: {
-    total_revenue_cents: '250000',
-    day_revenue_cents: '30000',
-    total_transactions: '90',
-    day_transactions: '11',
-  },
+  // Day: 10 sessions of 25.00 and one 50.00 fee (30000, 11 items). Earlier:
+  // 78 sessions of 28.00 and one 16.00 fee (220000, 79 items).
+  revenue: [
+    { key: 'true', taxRate: '0', grossCents: 2500, source: 'session', count: 10 },
+    { key: 'true', taxRate: '0', grossCents: 5000, source: 'fee', count: 1 },
+    { key: 'false', taxRate: '0', grossCents: 2800, source: 'session', count: 78 },
+    { key: 'false', taxRate: '0', grossCents: 1600, source: 'fee', count: 1 },
+  ],
 };
 
-let pingRow: Record<string, string> | undefined;
+// Fleet ping health (getOcppFleetHealth aggregates the per-process rows; its
+// aggregation is covered in the database package tests).
+let fleetPing: { avgPingLatencyMs: number; pingSuccessRate: number };
+const mockGetOcppFleetHealth = vi.fn(() => Promise.resolve(fleetPing));
 let siteDataById: Record<string, SiteData> = {};
 // Per-site forced rejections, optionally limited to a query kind.
 let siteRejects: Record<string, { kind?: string }> = {};
 
 function resetExecute(): void {
-  pingRow = { avg_ping_latency_ms: '0', ping_success_rate: '100' };
+  fleetPing = { avgPingLatencyMs: 0, pingSuccessRate: 100 };
   siteDataById = {};
   siteRejects = {};
   upsertCalls.length = 0;
@@ -83,12 +93,10 @@ const upsertCalls: Array<{ siteId: string; values: unknown[] }> = [];
 
 function classify(strings: readonly string[]): string {
   const joined = strings.join('?');
-  if (joined.includes('ocpp_server_health')) return 'ping';
   if (joined.includes('INSERT INTO dashboard_snapshots')) return 'upsert';
-  if (joined.includes('AS yesterday')) return 'yesterday';
+  if (joined.includes('AS missing')) return 'days';
   if (joined.includes('AS day_start')) return 'dayBoundaries';
   if (joined.includes('AS total_sessions')) return 'sessions';
-  if (joined.includes('AS total_revenue_cents')) return 'revenue';
   if (joined.includes('all_ports')) return 'uptime';
   if (joined.includes('FROM charging_stations')) return 'stations';
   return 'unknown';
@@ -101,10 +109,6 @@ function dataFor(siteId: string): SiteData {
 const mockExecute = vi.fn((arg: unknown) => {
   const { strings, values } = arg as { strings: readonly string[]; values: unknown[] };
   const kind = classify(strings);
-
-  if (kind === 'ping') {
-    return Promise.resolve(pingRow ? [pingRow] : []);
-  }
 
   // siteId is the first bound value for every per-site query except
   // yesterday/dayBoundaries (which bind the timezone). For those two the
@@ -123,8 +127,13 @@ const mockExecute = vi.fn((arg: unknown) => {
   const d = siteId ? dataFor(siteId) : {};
 
   switch (kind) {
-    case 'yesterday':
-      return Promise.resolve([{ yesterday: d.yesterday ?? DEFAULT_SITE_DATA.yesterday }]);
+    case 'days': {
+      // Yesterday first, then the earlier days of the backfill window.
+      const yesterday = d.yesterday ?? DEFAULT_SITE_DATA.yesterday;
+      const missing = new Set(d.missing ?? []);
+      const days = [yesterday, '2026-06-02', '2026-06-01', '2026-05-31'];
+      return Promise.resolve(days.map((day, i) => ({ day, missing: i > 0 && missing.has(day) })));
+    }
     case 'dayBoundaries':
       return Promise.resolve([
         { day_start: '2026-06-03T07:00:00.000Z', day_end: '2026-06-04T07:00:00.000Z' },
@@ -135,8 +144,6 @@ const mockExecute = vi.fn((arg: unknown) => {
       return Promise.resolve('uptime' in d ? [d.uptime] : [DEFAULT_SITE_DATA.uptime]);
     case 'sessions':
       return Promise.resolve([d.sessions ?? DEFAULT_SITE_DATA.sessions]);
-    case 'revenue':
-      return Promise.resolve([d.revenue ?? DEFAULT_SITE_DATA.revenue]);
     case 'upsert':
       upsertCalls.push({ siteId, values });
       return Promise.resolve([]);
@@ -146,12 +153,36 @@ const mockExecute = vi.fn((arg: unknown) => {
 });
 
 vi.mock('@evtivity/database', () => ({
+  client: {},
+  getOcppFleetHealth: () => mockGetOcppFleetHealth(),
   db: {
     select: mockSelect,
     execute: mockExecute,
   },
   sites: { id: 'sites.id', timezone: 'sites.timezone' },
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  operatorStationSql: (alias: string) => `OPERATOR_STATION(${alias})`,
+  operatorStationIdSql: (column: string) => `OPERATOR_STATION_ID(${column})`,
+}));
+
+// Revenue comes from the shared definition (session-revenue.ts); its SQL is
+// covered by the API integration tests.
+const mockQueryRevenue = vi.fn(
+  async (input: { companyCurrency: string; where?: Array<{ values: unknown[] }> }) => {
+    const found = input.where?.[0]?.values.find((v): v is string => typeof v === 'string');
+    const siteId = found ?? '';
+    if (siteRejects[siteId]?.kind === 'revenue') throw new Error(`forced failure: ${siteId}`);
+    const { aggregateRevenueRows } = await vi.importActual<
+      typeof import('@evtivity/services/session-revenue')
+    >('@evtivity/services/session-revenue');
+    return aggregateRevenueRows(dataFor(siteId).revenue ?? DEFAULT_SITE_DATA.revenue);
+  },
+);
+
+vi.mock('@evtivity/services/session-revenue', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  queryRevenue: (input: { companyCurrency: string; where?: Array<{ values: unknown[] }> }) =>
+    mockQueryRevenue(input),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -172,6 +203,14 @@ function upsertFor(siteId: string): unknown[] {
   return found.values;
 }
 
+// The module is imported after the mocks above are initialized. The first import loads the
+// whole module graph, which under coverage on a busy machine took longer than one test's
+// 5 s timeout, so it happens once here with its own timeout instead of inside the first test.
+let mod: typeof import('../../handlers/dashboard-snapshot.js');
+beforeAll(async () => {
+  mod = await import('../../handlers/dashboard-snapshot.js');
+}, 30_000);
+
 describe('dashboardSnapshotHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -181,7 +220,7 @@ describe('dashboardSnapshotHandler', () => {
 
   it('sums electricity cost and revenue only in the company currency', async () => {
     setSites([{ id: 'sit_1', timezone: 'UTC' }]);
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(makeLog());
 
     const callsOf = (kind: string) =>
@@ -197,38 +236,105 @@ describe('dashboardSnapshotHandler', () => {
       });
 
     const [sessions] = callsOf('sessions');
-    const [revenue] = callsOf('revenue');
     expect(sessions && filterIn(sessions, 'UPPER(cs2.currency)')).toBe(true);
-    expect(revenue && filterIn(revenue, 'UPPER(pr.currency)')).toBe(true);
+    // Revenue: the shared definition in the company currency, for this site.
+    expect(mockQueryRevenue).toHaveBeenCalledWith(
+      expect.objectContaining({ companyCurrency: 'EUR' }),
+    );
+    const where = mockQueryRevenue.mock.calls[0]?.[0].where ?? [];
+    expect(where[0]?.values).toContain('sit_1');
+  });
+
+  it('counts accepted stations and the totals through the end of the snapshot day', async () => {
+    setSites([{ id: 'sit_1', timezone: 'UTC' }]);
+    const { dashboardSnapshotHandler } = mod;
+    await dashboardSnapshotHandler(makeLog());
+
+    const callsOf = (kind: string) =>
+      mockExecute.mock.calls
+        .map(([arg]) => arg as { strings: readonly string[]; values: unknown[] })
+        .filter((q) => classify(q.strings) === kind);
+    const [stations] = callsOf('stations');
+    expect(stations?.strings.join('?')).toContain("onboarding_status = 'accepted'");
+    // Sessions started before the end of the day (not the run time).
+    const [sessions] = callsOf('sessions');
+    expect(sessions?.strings.join('?')).toContain('cs2.started_at < ?::timestamptz');
+    expect(sessions?.values).toContain('2026-06-04T07:00:00.000Z');
+    // Revenue up to the end of the day.
+    const where = mockQueryRevenue.mock.calls[0]?.[0].where ?? [];
+    expect(where[1]?.values).toContain('2026-06-04T07:00:00.000Z');
+  });
+
+  it('leaves conformance test stations and their sessions out of every count', async () => {
+    setSites([{ id: 'sit_1', timezone: 'UTC' }]);
+    const { dashboardSnapshotHandler } = mod;
+    await dashboardSnapshotHandler(makeLog());
+
+    const valuesOf = (kind: string) =>
+      mockExecute.mock.calls
+        .map(([arg]) => arg as { strings: readonly string[]; values: unknown[] })
+        .filter((q) => classify(q.strings) === kind)
+        .flatMap((q) => q.values);
+    expect(valuesOf('stations')).toContainEqual({ raw: 'OPERATOR_STATION(cs)' });
+    expect(valuesOf('uptime')).toContainEqual({ raw: 'OPERATOR_STATION(cs)' });
+    expect(valuesOf('sessions')).toContainEqual({ raw: 'OPERATOR_STATION_ID(cs2.station_id)' });
+  });
+
+  it('backfills the earlier days without a snapshot and never replaces them', async () => {
+    setSites([{ id: 'sit_1', timezone: 'UTC' }]);
+    siteDataById = { sit_1: { missing: ['2026-06-01', '2026-05-31'] } };
+    const log = makeLog();
+    const { dashboardSnapshotHandler } = mod;
+    await dashboardSnapshotHandler(log);
+
+    // Yesterday plus the two missing days; 2026-06-02 already has its row.
+    expect(upsertCalls.map((u) => u.values[1])).toEqual(['2026-06-03', '2026-06-01', '2026-05-31']);
+    const conflictOf = (date: string) => {
+      const call = mockExecute.mock.calls
+        .map(([arg]) => arg as { strings: readonly string[]; values: unknown[] })
+        .find((q) => classify(q.strings) === 'upsert' && q.values[1] === date);
+      const clause = call?.values.at(-1) as { strings: readonly string[] } | undefined;
+      return clause?.strings.join('');
+    };
+    expect(conflictOf('2026-06-03')).toContain('DO UPDATE SET');
+    expect(conflictOf('2026-06-01')).toContain('DO NOTHING');
+    expect(log.info).toHaveBeenCalledWith(
+      { siteId: 'sit_1', snapshotDate: '2026-06-01', mode: 'fill' },
+      'Site snapshot saved',
+    );
   });
 
   it('returns early and logs when there are no sites', async () => {
     setSites([]);
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
     expect(log.info).toHaveBeenCalledWith('No sites found, skipping dashboard snapshot');
-    // No execute() ran: ping read is skipped when there are no sites.
+    // No query ran: the ping read is skipped when there are no sites.
     expect(mockExecute).not.toHaveBeenCalled();
+    expect(mockGetOcppFleetHealth).not.toHaveBeenCalled();
   });
 
-  it('reads the ping singleton, snapshots a single site, and upserts the computed row', async () => {
+  it('reads the fleet ping health, snapshots a single site, and upserts the computed row', async () => {
     setSites([{ id: 'sit_1', timezone: 'America/Los_Angeles' }]);
-    pingRow = { avg_ping_latency_ms: '12.345', ping_success_rate: '99.1' };
+    fleetPing = { avgPingLatencyMs: 12.35, pingSuccessRate: 99.1 };
     siteDataById = { sit_1: {} }; // all defaults
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
-    // ping + 7 per-site queries (yesterday, dayBoundaries, 4-way Promise.all,
-    // upsert) = 8 execute calls.
-    expect(mockExecute).toHaveBeenCalledTimes(8);
+    // 6 per-site queries (yesterday, dayBoundaries, 3 reads, upsert); the
+    // fleet ping health is read once; revenue goes through queryRevenue.
+    expect(mockExecute).toHaveBeenCalledTimes(6);
+    expect(mockGetOcppFleetHealth).toHaveBeenCalledTimes(1);
+    expect(mockQueryRevenue).toHaveBeenCalledTimes(1);
 
     // INSERT VALUES(...) bound params in source column order.
-    expect(upsertFor('sit_1')).toEqual([
+    // The last value is the ON CONFLICT clause.
+    expect(upsertFor('sit_1').slice(0, -1)).toEqual([
       'sit_1',
       '2026-06-03',
       10, // totalStations
@@ -241,39 +347,41 @@ describe('dashboardSnapshotHandler', () => {
       100, // totalSessions
       12, // daySessions
       8, // connected = onlineStations
-      250000, // totalRevCents
+      250000, // totalRevCents (sessions and fees)
       30000, // dayRevenueCents
-      2500, // avgRevPerSession = round(250000/100)
+      2766, // avgRevPerSession = round(243400 session revenue / 88 billed sessions)
+      88, // billedSessions (reservation fees left out)
+      243400, // sessionRevenueCents
       1200, // totalElectricityCostCents
       150, // dayElectricityCostCents
-      90, // totalTransactions
+      90, // totalTransactions (billed sessions and fee charges)
       11, // dayTransactions
       20, // totalPorts
       1, // stationsBelowThreshold
-      12.35, // avgPingLatencyMs rounded to 2dp
+      12.35, // avgPingLatencyMs
       99.1, // pingSuccessRate
       'EUR', // currency
     ]);
 
     expect(log.info).toHaveBeenCalledWith(
-      { siteId: 'sit_1', snapshotDate: '2026-06-03' },
+      { siteId: 'sit_1', snapshotDate: '2026-06-03', mode: 'replace' },
       'Site snapshot saved',
     );
     expect(log.info).toHaveBeenCalledWith({ siteCount: 1 }, 'Dashboard snapshot complete');
   });
 
-  it('defaults ping metrics to 0 latency and 100 success when the singleton row is missing', async () => {
+  it('records the empty fleet values (0 latency, 100 success) when no OCPP process reports', async () => {
     setSites([{ id: 'sit_1', timezone: 'UTC' }]);
-    pingRow = undefined; // no ping singleton row
+    fleetPing = { avgPingLatencyMs: 0, pingSuccessRate: 100 }; // no fresh process row
     siteDataById = { sit_1: {} };
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
     const values = upsertFor('sit_1');
-    expect(values[21]).toBe(0); // avgPingLatencyMs default
-    expect(values[22]).toBe(100); // pingSuccessRate default
+    expect(values[23]).toBe(0); // avgPingLatencyMs default
+    expect(values[24]).toBe(100); // pingSuccessRate default
   });
 
   it('handles zero stations: onlinePercent and avgRevPerSession both 0, uptime/ports default', async () => {
@@ -291,17 +399,12 @@ describe('dashboardSnapshotHandler', () => {
           day_electricity_cost_cents: '0',
           active_sessions: '0',
         },
-        revenue: {
-          total_revenue_cents: '0',
-          day_revenue_cents: '0',
-          total_transactions: '0',
-          day_transactions: '0',
-        },
+        revenue: [],
       },
     };
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
     const values = upsertFor('sit_empty');
@@ -310,8 +413,9 @@ describe('dashboardSnapshotHandler', () => {
     expect(values[4]).toBe(0); // onlinePercent -> 0 (no divide-by-zero)
     expect(values[5]).toBe(100); // uptimePercent default when row missing
     expect(values[14]).toBe(0); // avgRevPerSession -> 0 (no sessions)
-    expect(values[19]).toBe(0); // totalPorts default
-    expect(values[20]).toBe(0); // stationsBelowThreshold default
+    expect(values[15]).toBe(0); // billedSessions
+    expect(values[21]).toBe(0); // totalPorts default
+    expect(values[22]).toBe(0); // stationsBelowThreshold default
   });
 
   it('snapshots every site across batch boundaries (CONCURRENCY=5)', async () => {
@@ -323,11 +427,12 @@ describe('dashboardSnapshotHandler', () => {
     siteDataById = Object.fromEntries(sites.map((s) => [s.id, {}]));
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
-    // 1 ping + 6 sites * 7 queries = 43 execute calls
-    expect(mockExecute).toHaveBeenCalledTimes(1 + 6 * 7);
+    // 6 sites * 6 queries = 36 execute calls, plus one revenue query per site
+    expect(mockExecute).toHaveBeenCalledTimes(6 * 6);
+    expect(mockQueryRevenue).toHaveBeenCalledTimes(6);
     // One upsert per site.
     expect(upsertCalls).toHaveLength(6);
     const savedCalls = (log.info as ReturnType<typeof vi.fn>).mock.calls.filter(
@@ -346,7 +451,7 @@ describe('dashboardSnapshotHandler', () => {
     siteRejects = { sit_bad: { kind: 'stations' } }; // sit_bad fails on its station query
     const log = makeLog();
 
-    const { dashboardSnapshotHandler } = await import('../../handlers/dashboard-snapshot.js');
+    const { dashboardSnapshotHandler } = mod;
     await dashboardSnapshotHandler(log);
 
     expect(log.error).toHaveBeenCalledWith(
@@ -356,7 +461,7 @@ describe('dashboardSnapshotHandler', () => {
     // The good site still produced its upsert + saved log; the run completes.
     expect(upsertCalls.map((u) => u.siteId)).toEqual(['sit_ok']);
     expect(log.info).toHaveBeenCalledWith(
-      { siteId: 'sit_ok', snapshotDate: '2026-06-03' },
+      { siteId: 'sit_ok', snapshotDate: '2026-06-03', mode: 'replace' },
       'Site snapshot saved',
     );
     expect(log.info).toHaveBeenCalledWith({ siteCount: 2 }, 'Dashboard snapshot complete');

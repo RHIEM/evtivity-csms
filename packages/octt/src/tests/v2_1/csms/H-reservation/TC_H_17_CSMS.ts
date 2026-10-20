@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../../types.js';
 import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_H_17_CSMS: Cancel reservation of an EVSE - Success
@@ -58,7 +59,7 @@ export const TC_H_17_CSMS: TestCase = {
           cancelReservationId = Number(payload['reservationId'] ?? 0);
           return { status: 'Accepted' };
         }
-        return { status: 'NotSupported' };
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -68,7 +69,7 @@ export const TC_H_17_CSMS: TestCase = {
         stationId: ctx.stationId,
         id: 1,
         expiryDateTime: new Date(Date.now() + 300000).toISOString(),
-        idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+        idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
         evseId: 1,
       });
     } else {

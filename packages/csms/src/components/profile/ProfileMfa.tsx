@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
+import { Select } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
 import { api } from '@/lib/api';
 import { LoadingLogo } from '@/components/loading-logo';
@@ -111,7 +112,9 @@ export function ProfileMfa(): React.JSX.Element {
             {mfaError !== '' && <p className="text-sm text-destructive">{mfaError}</p>}
             <p className="text-sm text-muted-foreground">{t('profile.mfaDisableConfirm')}</p>
             <div className="space-y-2">
-              <Label htmlFor="mfa-disable-password">{t('profile.currentPassword')}</Label>
+              <Label htmlFor="mfa-disable-password" className="leading-6">
+                {t('profile.currentPassword')}
+              </Label>
               <PasswordInput
                 id="mfa-disable-password"
                 value={disablePassword}
@@ -141,10 +144,11 @@ export function ProfileMfa(): React.JSX.Element {
             </div>
             {mfaError !== '' && <p className="text-sm text-destructive">{mfaError}</p>}
             <div className="space-y-2">
-              <Label htmlFor="mfa-method-select">{t('profile.mfaSelectMethod')}</Label>
-              <select
+              <Label htmlFor="mfa-method-select" className="leading-6">
+                {t('profile.mfaSelectMethod')}
+              </Label>
+              <Select
                 id="mfa-method-select"
-                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 value={mfaMethod}
                 onChange={(e) => {
                   setMfaMethod(e.target.value);
@@ -156,7 +160,7 @@ export function ProfileMfa(): React.JSX.Element {
                     {t((MFA_METHOD_LABELS[m] ?? m) as never)}
                   </option>
                 ))}
-              </select>
+              </Select>
             </div>
             <Button
               disabled={mfaMethod === '' || mfaSetupMutation.isPending}
@@ -176,7 +180,7 @@ export function ProfileMfa(): React.JSX.Element {
                 <p className="text-sm text-muted-foreground">{t('profile.mfaScanQr')}</p>
                 <img
                   src={mfaSetupData.qrDataUri}
-                  alt="QR Code"
+                  alt={t('profile.mfaQrCode')}
                   className="rounded border p-2"
                   width={200}
                   height={200}
@@ -192,7 +196,9 @@ export function ProfileMfa(): React.JSX.Element {
               </div>
             )}
             <div className="space-y-2">
-              <Label htmlFor="mfa-verify-code">{t('profile.mfaEnterCode')}</Label>
+              <Label htmlFor="mfa-verify-code" className="leading-6">
+                {t('profile.mfaEnterCode')}
+              </Label>
               <Input
                 id="mfa-verify-code"
                 value={mfaCode}

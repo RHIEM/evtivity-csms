@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { OcppServer } from '../server/ocpp-server.js';
+import { EVENT_DRAIN_TIMEOUT_MS, OcppServer } from '../server/ocpp-server.js';
 import type { HandlerContext } from '../server/middleware/pipeline.js';
 
 let testPort = 19080;
@@ -223,6 +223,50 @@ describe('OcppServer integration', () => {
     ws.close();
   });
 
+  describe('station.Ready', () => {
+    function collectReady(srv: OcppServer): string[] {
+      const ready: string[] = [];
+      srv.getEventBus().subscribe('station.Ready', (event) => {
+        ready.push(event.aggregateId);
+        return Promise.resolve();
+      });
+      return ready;
+    }
+
+    it('is not published when the WebSocket opens, only after BootNotification Accepted', async () => {
+      const port = getNextPort();
+      const srv = await startServer(port);
+      const ready = collectReady(srv);
+
+      const ws = await connectStation(port, 'TEST-READY-BOOT');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(ready).toEqual([]);
+
+      await bootStation(ws);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(ready).toEqual(['TEST-READY-BOOT']);
+      ws.close();
+    });
+
+    it('is published once, on the first message of a station that reconnects without a boot', async () => {
+      const port = getNextPort();
+      const srv = await startServer(port);
+      const ready = collectReady(srv);
+
+      const ws = await connectStation(port, 'TEST-READY-RECONNECT');
+      const first = waitForMessage(ws);
+      sendCall(ws, 'hb-1', 'Heartbeat', {});
+      await first;
+      const second = waitForMessage(ws);
+      sendCall(ws, 'hb-2', 'Heartbeat', {});
+      await second;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(ready).toEqual(['TEST-READY-RECONNECT']);
+      ws.close();
+    });
+  });
+
   it('tracks connections in ConnectionManager', async () => {
     const port = getNextPort();
     const srv = await startServer(port);
@@ -265,13 +309,14 @@ describe('OcppServer integration', () => {
     ws.close();
   });
 
-  it('silently ignores arrays with fewer than 3 elements', async () => {
+  it('answers RpcFrameworkError to a CALL with fewer than 3 elements', async () => {
     const port = getNextPort();
     await startServer(port);
     const ws = await connectStation(port, 'TEST-SHORT');
 
+    const answer = waitForMessage(ws);
     ws.send(JSON.stringify([2, 'msg-x']));
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((await answer).slice(0, 3)).toEqual([4, 'msg-x', 'RpcFrameworkError']);
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });
@@ -444,52 +489,233 @@ describe('OcppServer integration', () => {
     ws.close();
   });
 
-  it('publishes an inbound CALLRESULT message log for unmatched responses', async () => {
+  it('does not log a CALLRESULT or CALLERROR for an unknown message id, and counts it', async () => {
     const port = getNextPort();
     const srv = await startServer(port);
-    const eventBus = srv.getEventBus();
-
-    const logged = new Promise<Record<string, unknown>>((resolve) => {
-      eventBus.subscribe('ocpp.MessageLog', (event) => {
-        const p = event.payload;
-        if (p['messageType'] === 3 && p['direction'] === 'inbound') {
-          resolve(p);
-        }
-        return Promise.resolve();
-      });
+    const inbound: unknown[] = [];
+    srv.getEventBus().subscribe('ocpp.MessageLog', (event) => {
+      if (event.payload['direction'] === 'inbound') inbound.push(event.payload);
+      return Promise.resolve();
     });
 
     const ws = await connectStation(port, 'TEST-RESLOG');
     ws.send(JSON.stringify([3, 'orphan-msg', { status: 'Accepted' }]));
+    ws.send(JSON.stringify([4, 'orphan-err', 'InternalError', 'boom', { extra: true }]));
 
-    const payload = await logged;
-    expect(payload['messageId']).toBe('orphan-msg');
-    expect(payload['action']).toBeNull();
+    const deadline = Date.now() + 2000;
+    while ((srv.getInboundFrameStats()['unknown_response'] ?? 0) < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(srv.getInboundFrameStats()['unknown_response']).toBe(2);
+    expect(inbound).toEqual([]);
     ws.close();
   });
 
-  it('publishes an inbound CALLERROR message log for unmatched error responses', async () => {
+  it('logs the CALLRESULT answering a pending CSMS call and resolves the call', async () => {
     const port = getNextPort();
     const srv = await startServer(port);
-    const eventBus = srv.getEventBus();
-
     const logged = new Promise<Record<string, unknown>>((resolve) => {
-      eventBus.subscribe('ocpp.MessageLog', (event) => {
+      srv.getEventBus().subscribe('ocpp.MessageLog', (event) => {
         const p = event.payload;
-        if (p['messageType'] === 4 && p['direction'] === 'inbound') {
-          resolve(p);
-        }
+        if (p['messageType'] === 3 && p['direction'] === 'inbound') resolve(p);
         return Promise.resolve();
       });
     });
 
-    const ws = await connectStation(port, 'TEST-ERRLOG');
-    ws.send(JSON.stringify([4, 'orphan-err', 'InternalError', 'boom', { extra: true }]));
+    const ws = await connectStation(port, 'TEST-RESPLOG');
+    ws.on('message', (data: Buffer) => {
+      const msg = JSON.parse(data.toString('utf-8')) as unknown[];
+      if (msg[0] === 2) ws.send(JSON.stringify([3, msg[1], { status: 'Accepted' }]));
+    });
+    await vi.waitFor(() => {
+      expect(srv.getConnectionManager().get('TEST-RESPLOG')).toBeDefined();
+    });
+    const conn = srv.getConnectionManager().get('TEST-RESPLOG');
+    const reply = await srv
+      .getCorrelator()
+      .sendCall(conn!.ws, conn!.session, 'Reset', { type: 'Immediate' });
 
+    expect(reply).toEqual({ status: 'Accepted' });
     const payload = await logged;
-    expect(payload['errorCode']).toBe('InternalError');
-    expect(payload['errorDescription']).toBe('boom');
+    expect(payload['payload']).toEqual({ status: 'Accepted' });
     ws.close();
+  });
+
+  describe('inbound frame checks', () => {
+    // JSON text of `depth` nested arrays around an empty object, built as a
+    // string so the test itself never recurses that deep.
+    function nested(depth: number): string {
+      return '['.repeat(depth) + '{}' + ']'.repeat(depth);
+    }
+
+    // The first `count` messages the station receives, in order.
+    function collectMessages(ws: WebSocket, count: number): Promise<unknown[][]> {
+      return new Promise((resolve) => {
+        const received: unknown[][] = [];
+        const onMessage = (data: Buffer): void => {
+          received.push(JSON.parse(data.toString('utf-8')) as unknown[]);
+          if (received.length === count) {
+            ws.off('message', onMessage);
+            resolve(received);
+          }
+        };
+        ws.on('message', onMessage);
+      });
+    }
+
+    // Sends a frame, then a Heartbeat, and returns the first answer: the
+    // Heartbeat's own answer shows the frame was dropped without one.
+    async function firstAnswerAfter(ws: WebSocket, frame: string): Promise<unknown[]> {
+      const answers = collectMessages(ws, 1);
+      ws.send(frame);
+      sendCall(ws, 'hb-after', 'Heartbeat', {});
+      const [first] = await answers;
+      return first ?? [];
+    }
+
+    it('refuses a deeply nested CALL with FormatViolation and stays up', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-DEEP');
+      await bootStation(ws);
+
+      const answers = collectMessages(ws, 2);
+      ws.send(`[2,"deep-1","DataTransfer",{"vendorId":"x","data":${nested(5000)}}]`);
+      sendCall(ws, 'hb-after', 'Heartbeat', {});
+      const [first, second] = await answers;
+      expect(first?.slice(0, 3)).toEqual([4, 'deep-1', 'FormatViolation']);
+      expect(second?.slice(0, 2)).toEqual([3, 'hb-after']);
+      ws.close();
+    });
+
+    it('answers FormationViolation to a deeply nested CALL on OCPP 1.6', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation16(port, 'TEST-DEEP16');
+
+      const answer = waitForMessage(ws);
+      ws.send(`[2,"deep-16","DataTransfer",{"vendorId":"x","data":${nested(100)}}]`);
+      expect((await answer).slice(0, 3)).toEqual([4, 'deep-16', 'FormationViolation']);
+      ws.close();
+    });
+
+    it('drops a deeply nested response to an unknown id without crashing', async () => {
+      const port = getNextPort();
+      const srv = await startServer(port);
+      const ws = await connectStation(port, 'TEST-DEEPRES');
+      await bootStation(ws);
+
+      const answer = await firstAnswerAfter(ws, `[3,"x",${nested(5000)}]`);
+      expect(answer.slice(0, 2)).toEqual([3, 'hb-after']);
+      expect(srv.getInboundFrameStats()['too_deep']).toBe(1);
+      ws.close();
+    });
+
+    it('answers a CALL whose message id is longer than 36 characters with id "-1"', async () => {
+      const port = getNextPort();
+      const srv = await startServer(port);
+      const ws = await connectStation(port, 'TEST-LONGID');
+      await bootStation(ws);
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([2, 'x'.repeat(37), 'Heartbeat', {}]));
+      expect((await answer).slice(0, 3)).toEqual([4, '-1', 'RpcFrameworkError']);
+      expect(srv.getInboundFrameStats()['invalid_message_id']).toBe(1);
+      ws.close();
+    });
+
+    it('refuses an action longer than 100 characters with RpcFrameworkError', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-LONGACT');
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([2, 'act-1', 'A'.repeat(101), {}]));
+      expect((await answer).slice(0, 3)).toEqual([4, 'act-1', 'RpcFrameworkError']);
+      ws.close();
+    });
+
+    it('answers ProtocolError on OCPP 1.6 for an action that is not a string', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation16(port, 'TEST-ACT16');
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([2, 'act-16', 42, {}]));
+      expect((await answer).slice(0, 3)).toEqual([4, 'act-16', 'ProtocolError']);
+      ws.close();
+    });
+
+    it('refuses a CALL without a payload element with RpcFrameworkError', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-NOPAYLOAD');
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([2, 'short-1', 'Heartbeat']));
+      expect((await answer).slice(0, 3)).toEqual([4, 'short-1', 'RpcFrameworkError']);
+      ws.close();
+    });
+
+    it('answers MessageTypeNotSupported to an unknown message type', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-TYPE7');
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([7, 'type-7', {}]));
+      expect((await answer).slice(0, 3)).toEqual([4, 'type-7', 'MessageTypeNotSupported']);
+      ws.close();
+    });
+
+    it('answers GenericError to an unknown message type on OCPP 1.6', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation16(port, 'TEST-TYPE7-16');
+
+      const answer = waitForMessage(ws);
+      ws.send(JSON.stringify([7, 'type-7', {}]));
+      expect((await answer).slice(0, 3)).toEqual([4, 'type-7', 'GenericError']);
+      ws.close();
+    });
+
+    it('never answers an OCPP 2.1 SEND or CALLRESULTERROR', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-SEND');
+      await bootStation(ws);
+
+      ws.send(JSON.stringify([6, 'send-1', 'NotifyPeriodicEventStream', {}]));
+      const answer = await firstAnswerAfter(
+        ws,
+        JSON.stringify([5, 'cre-1', 'InternalError', 'x', {}]),
+      );
+      expect(answer.slice(0, 2)).toEqual([3, 'hb-after']);
+      ws.close();
+    });
+
+    it('answers OccurenceConstraintViolation (1.6 spelling) to a 1.6 payload missing a field', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation16(port, 'TEST-OCC16');
+
+      const answer = waitForMessage(ws);
+      sendCall(ws, 'boot-16', 'BootNotification', {});
+      expect((await answer).slice(0, 3)).toEqual([4, 'boot-16', 'OccurenceConstraintViolation']);
+      ws.close();
+    });
+
+    it('answers NotImplemented to an action named after an Object.prototype member', async () => {
+      const port = getNextPort();
+      await startServer(port);
+      const ws = await connectStation(port, 'TEST-PROTO');
+      await bootStation(ws);
+
+      const answer = waitForMessage(ws);
+      sendCall(ws, 'proto-1', 'constructor', {});
+      expect((await answer).slice(0, 3)).toEqual([4, 'proto-1', 'NotImplemented']);
+      ws.close();
+    });
   });
 
   it('publishes an outbound CALLRESULT message log on a successful handler', async () => {
@@ -551,7 +777,7 @@ describe('OcppServer integration', () => {
     // The pool belongs to the caller (the process-wide client), so stop() must not end it.
     const port = getNextPort();
     const end = vi.fn();
-    const sharedSql = { end } as unknown as import('postgres').Sql;
+    const sharedSql = { end, options: { max: 20 } } as unknown as import('postgres').Sql;
     const srv = new OcppServer({ sql: sharedSql });
     await srv.start({ port, host: '127.0.0.1' });
     await expect(srv.stop()).resolves.toBeUndefined();
@@ -593,6 +819,8 @@ describe('OcppServer integration', () => {
           '1',
           '-subj',
           '/CN=127.0.0.1',
+          '-addext',
+          'subjectAltName=IP:127.0.0.1',
         ]);
       } catch {
         return;
@@ -614,7 +842,7 @@ describe('OcppServer integration', () => {
 
       const secureOpened = await new Promise<boolean>((resolve) => {
         const ws = new WebSocket(`wss://127.0.0.1:${String(tlsPort)}/TEST-TLS`, ['ocpp2.1'], {
-          rejectUnauthorized: false,
+          ca: readFileSync(certPath),
           headers: {
             authorization: 'Basic ' + Buffer.from('TEST-TLS:password').toString('base64'),
           },
@@ -633,5 +861,166 @@ describe('OcppServer integration', () => {
     } finally {
       rmSync(certDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('OcppServer stop drains event handlers', () => {
+  it('returns only after the station.Disconnected handlers of the sockets it closed finish', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    const order: string[] = [];
+    srv.getEventBus().subscribe('station.Disconnected', async (event) => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      order.push(`disconnected:${event.aggregateId}`);
+    });
+    const ws = await connectStation(port, 'DRAIN-001');
+    ws.on('error', () => undefined);
+
+    await srv.stop();
+    order.push('stopped');
+    server = null;
+
+    expect(order).toEqual(['disconnected:DRAIN-001', 'stopped']);
+  });
+
+  it('marks sockets it closes while stopping with the server_shutdown reason', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    const payloads: Record<string, unknown>[] = [];
+    srv.getEventBus().subscribe('station.Disconnected', (event) => {
+      payloads.push(event.payload);
+      return Promise.resolve();
+    });
+    const own = await connectStation(port, 'REASON-001');
+    own.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const ws = await connectStation(port, 'REASON-002');
+    ws.on('error', () => undefined);
+
+    await srv.stop();
+    server = null;
+
+    expect(payloads).toEqual([
+      { stationId: 'REASON-001', remoteAddress: '127.0.0.1' },
+      { stationId: 'REASON-002', remoteAddress: '127.0.0.1', reason: 'server_shutdown' },
+    ]);
+  });
+
+  it('drains after the sockets close, with the drain timeout', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    const ws = await connectStation(port, 'DRAIN-002');
+    ws.on('error', () => undefined);
+    let openAtDrain = -1;
+    const drain = vi.spyOn(srv.getEventBus(), 'drain').mockImplementation(() => {
+      openAtDrain = srv.getConnectionManager().count();
+      return Promise.resolve(true);
+    });
+
+    await srv.stop();
+    server = null;
+
+    expect(drain).toHaveBeenCalledWith(EVENT_DRAIN_TIMEOUT_MS);
+    expect(openAtDrain).toBe(0);
+  });
+
+  it('closes a connected TLS station and returns (the wss:// close waits for its clients)', async () => {
+    const certDir = mkdtempSync(join(tmpdir(), 'ocpp-tls-stop-'));
+    try {
+      const keyPath = join(certDir, 'key.pem');
+      const certPath = join(certDir, 'cert.pem');
+      execFileSync(
+        'openssl',
+        [
+          'req',
+          '-x509',
+          '-newkey',
+          'rsa:2048',
+          '-nodes',
+          '-keyout',
+          keyPath,
+          '-out',
+          certPath,
+          '-days',
+          '1',
+          '-subj',
+          '/CN=127.0.0.1',
+          '-addext',
+          'subjectAltName=IP:127.0.0.1',
+        ],
+        { stdio: 'ignore' },
+      );
+      const tlsPort = getNextPort();
+      const srv = new OcppServer();
+      server = srv;
+      await srv.start({
+        port: getNextPort(),
+        host: '127.0.0.1',
+        tls: {
+          cert: readFileSync(certPath, 'utf-8'),
+          key: readFileSync(keyPath, 'utf-8'),
+          port: tlsPort,
+        },
+      });
+      const order: string[] = [];
+      srv.getEventBus().subscribe('station.Disconnected', (event) => {
+        order.push(`disconnected:${event.aggregateId}`);
+        return Promise.resolve();
+      });
+      const ws = await new Promise<WebSocket>((resolve, reject) => {
+        const sock = new WebSocket(`wss://127.0.0.1:${String(tlsPort)}/TLS-STOP-001`, ['ocpp2.1'], {
+          ca: readFileSync(certPath),
+          headers: {
+            authorization: 'Basic ' + Buffer.from('TLS-STOP-001:password').toString('base64'),
+          },
+        });
+        sock.on('open', () => {
+          resolve(sock);
+        });
+        sock.on('error', reject);
+      });
+      const closeCode = new Promise<number>((resolve) => {
+        ws.on('close', (code) => {
+          resolve(code);
+        });
+      });
+
+      await srv.stop();
+      order.push('stopped');
+      server = null;
+
+      expect(await closeCode).toBe(1001);
+      expect(order).toEqual(['disconnected:TLS-STOP-001', 'stopped']);
+      const refused = await new Promise<boolean>((resolve) => {
+        const late = new WebSocket(`wss://127.0.0.1:${String(tlsPort)}/TLS-STOP-002`, ['ocpp2.1'], {
+          ca: readFileSync(certPath),
+        });
+        late.on('open', () => {
+          late.close();
+          resolve(false);
+        });
+        late.on('error', () => {
+          resolve(true);
+        });
+      });
+      expect(refused).toBe(true);
+    } finally {
+      rmSync(certDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('logs a warning and still returns when handlers outlive the timeout', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    vi.spyOn(srv.getEventBus(), 'drain').mockResolvedValue(false);
+    const warn = vi.spyOn(srv.getLogger(), 'warn');
+
+    await expect(srv.stop()).resolves.toBeUndefined();
+    server = null;
+
+    expect(warn).toHaveBeenCalledWith(
+      { timeoutMs: EVENT_DRAIN_TIMEOUT_MS },
+      'Event handlers still running at shutdown; closing anyway',
+    );
   });
 });

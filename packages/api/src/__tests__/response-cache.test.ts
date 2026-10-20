@@ -1,18 +1,66 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
+
+// The user's access, keyed by userId: sites (null is every site) and
+// permissions. Requests read it through the mocked helpers below.
+const access = vi.hoisted(() => ({
+  sites: new Map<string, string[] | null>(),
+  permissions: new Map<string, string[]>(),
+}));
+
+vi.mock('../lib/site-access.js', () => ({
+  getUserSiteIds: vi.fn((userId: string) => Promise.resolve(access.sites.get(userId) ?? null)),
+  requireAllSiteAccess: vi.fn(
+    async (
+      request: { user: { userId: string } },
+      reply: { status: (code: number) => { send: (body: unknown) => Promise<unknown> } },
+      notFound: unknown,
+    ) => {
+      if (access.sites.get(request.user.userId) == null) return true;
+      await reply.status(404).send(notFound);
+      return false;
+    },
+  ),
+}));
+
+// A signed-in driver on a public portal route: the x-test-driver header.
+vi.mock('../lib/optional-driver.js', () => ({
+  optionalDriverId: vi.fn((request: { headers: Record<string, unknown> }) => {
+    const driver = request.headers['x-test-driver'];
+    return Promise.resolve(typeof driver === 'string' ? driver : null);
+  }),
+}));
+
+vi.mock('../middleware/rbac.js', () => ({
+  authorize: vi.fn(() => async () => undefined),
+  getEffectivePermissions: vi.fn(
+    (request: { user: { userId: string; apiKeyPermissions?: string[] } }) => {
+      const own = access.permissions.get(request.user.userId) ?? [];
+      const scope = request.user.apiKeyPermissions;
+      return Promise.resolve(scope == null ? own : own.filter((p) => scope.includes(p)));
+    },
+  ),
+}));
+
 import {
   matchCacheRule,
   extractWriteResource,
   tagsForWrite,
   buildCacheKey,
   registerResponseCache,
+  cacheRoutes,
   setResponseCacheRedis,
+  noteDashboardEvent,
+  resetDashboardBumpThrottle,
+  DASHBOARD_BUMP_INTERVAL_MS,
+  DASHBOARD_EVENT_TYPES,
   type ResponseCacheRedis,
 } from '../plugins/response-cache.js';
+import { buildScopeHash } from '../lib/access-scope.js';
 
 class FakeRedis implements ResponseCacheRedis {
   store = new Map<string, string>();
@@ -107,8 +155,12 @@ describe('extractWriteResource', () => {
 
 describe('tagsForWrite', () => {
   it('adds cross-resource tags', () => {
-    expect(tagsForWrite('stations')).toEqual(['stations', 'dashboard']);
+    expect(tagsForWrite('stations')).toEqual(['stations', 'dashboard', 'portal']);
     expect(tagsForWrite('pricing-holidays')).toEqual(['pricing-holidays', 'pricing']);
+  });
+
+  it('busts the dashboard and session lists on a site write (electricity cost recalculation)', () => {
+    expect(tagsForWrite('sites')).toEqual(['sites', 'dashboard', 'sessions']);
   });
 
   it('returns only the resource tag when unmapped', () => {
@@ -117,12 +169,24 @@ describe('tagsForWrite', () => {
 });
 
 describe('buildCacheKey', () => {
-  it('varies by version, user, and url', () => {
-    const a = buildCacheKey('0', 'usr_1', '/v1/stations?page=1');
-    expect(a).not.toBe(buildCacheKey('1', 'usr_1', '/v1/stations?page=1'));
-    expect(a).not.toBe(buildCacheKey('0', 'usr_2', '/v1/stations?page=1'));
-    expect(a).not.toBe(buildCacheKey('0', 'usr_1', '/v1/stations?page=2'));
-    expect(a).toBe(buildCacheKey('0', 'usr_1', '/v1/stations?page=1'));
+  it('varies by version, user, scope, and url', () => {
+    const a = buildCacheKey('0', 'usr_1', 's1', '/v1/stations?page=1');
+    expect(a).not.toBe(buildCacheKey('1', 'usr_1', 's1', '/v1/stations?page=1'));
+    expect(a).not.toBe(buildCacheKey('0', 'usr_2', 's1', '/v1/stations?page=1'));
+    expect(a).not.toBe(buildCacheKey('0', 'usr_1', 's2', '/v1/stations?page=1'));
+    expect(a).not.toBe(buildCacheKey('0', 'usr_1', 's1', '/v1/stations?page=2'));
+    expect(a).toBe(buildCacheKey('0', 'usr_1', 's1', '/v1/stations?page=1'));
+  });
+});
+
+describe('buildScopeHash', () => {
+  it('ignores order and varies by sites and permissions', () => {
+    const a = buildScopeHash(['site_b', 'site_a'], ['stations:read', 'sites:read']);
+    expect(a).toBe(buildScopeHash(['site_a', 'site_b'], ['sites:read', 'stations:read']));
+    expect(a).not.toBe(buildScopeHash(['site_a'], ['sites:read', 'stations:read']));
+    expect(a).not.toBe(buildScopeHash(null, ['sites:read', 'stations:read']));
+    expect(a).not.toBe(buildScopeHash(['site_a', 'site_b'], ['sites:read']));
+    expect(buildScopeHash(null, [])).not.toBe(buildScopeHash([], []));
   });
 });
 
@@ -138,10 +202,16 @@ describe('response cache hooks', () => {
 
     app = Fastify();
     registerResponseCache(app);
+    access.sites.clear();
+    access.permissions.clear();
     app.addHook('onRequest', async (request) => {
       const header = request.headers['x-test-user'];
       if (typeof header === 'string') {
-        (request as { user?: unknown }).user = { userId: header };
+        const scope = request.headers['x-test-api-key-scope'];
+        (request as { user?: unknown }).user = {
+          userId: header,
+          ...(typeof scope === 'string' ? { apiKeyPermissions: scope.split(',') } : {}),
+        };
       }
     });
     app.get('/v1/stations', async () => {
@@ -153,6 +223,12 @@ describe('response cache hooks', () => {
       return reply.type('text/csv').send('a,b\n1,2\n');
     });
     app.post('/v1/stations', async () => ({ id: 'sta_new' }));
+    app.get('/v1/portal/chargers/:id', async (request) => {
+      handlerCalls++;
+      const driver = request.headers['x-test-driver'];
+      return { reservedByMe: typeof driver === 'string' };
+    });
+    await app.register(cacheRoutes, { prefix: '/v1' });
     await app.ready();
   });
 
@@ -195,12 +271,84 @@ describe('response cache hooks', () => {
     expect(handlerCalls).toBe(2);
   });
 
+  it('misses after the user loses a site, so a revoked site is never served', async () => {
+    access.sites.set('usr_r', ['site_a', 'site_b']);
+    const headers = { 'x-test-user': 'usr_r' };
+    await app.inject({ method: 'GET', url: '/v1/stations', headers });
+    const hit = await app.inject({ method: 'GET', url: '/v1/stations', headers });
+    expect(hit.headers['x-cache']).toBe('HIT');
+
+    access.sites.set('usr_r', ['site_a']);
+    const after = await app.inject({ method: 'GET', url: '/v1/stations', headers });
+    expect(after.headers['x-cache']).toBe('MISS');
+    expect(handlerCalls).toBe(2);
+  });
+
+  it('misses after a permission change', async () => {
+    access.permissions.set('usr_p', ['stations:read', 'sessions:read']);
+    const headers = { 'x-test-user': 'usr_p' };
+    await app.inject({ method: 'GET', url: '/v1/stations', headers });
+    access.permissions.set('usr_p', ['stations:read']);
+    const after = await app.inject({ method: 'GET', url: '/v1/stations', headers });
+    expect(after.headers['x-cache']).toBe('MISS');
+  });
+
+  it('separates an API key scope from the same user without it', async () => {
+    access.permissions.set('usr_k', ['stations:read', 'sessions:read']);
+    await app.inject({ method: 'GET', url: '/v1/stations', headers: { 'x-test-user': 'usr_k' } });
+    const scoped = await app.inject({
+      method: 'GET',
+      url: '/v1/stations',
+      headers: { 'x-test-user': 'usr_k', 'x-test-api-key-scope': 'stations:read' },
+    });
+    expect(scoped.headers['x-cache']).toBe('MISS');
+    expect(handlerCalls).toBe(2);
+  });
+
   it('passes through uncached when redis is down', async () => {
     redis.failing = true;
     const res = await app.inject({ method: 'GET', url: '/v1/stations' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['x-cache']).toBeUndefined();
     expect(res.json()).toEqual({ data: [{ id: 'sta_1' }], total: 1 });
+  });
+
+  it('caches anonymous portal charger pages but never a signed-in driver one', async () => {
+    await app.inject({ method: 'GET', url: '/v1/portal/chargers/CS-1' });
+    const driverView = await app.inject({
+      method: 'GET',
+      url: '/v1/portal/chargers/CS-1',
+      headers: { 'x-test-driver': 'drv_1' },
+    });
+    expect(driverView.headers['x-cache']).toBeUndefined();
+    expect(driverView.json()).toEqual({ reservedByMe: true });
+
+    const anon = await app.inject({ method: 'GET', url: '/v1/portal/chargers/CS-1' });
+    expect(anon.headers['x-cache']).toBe('HIT');
+    expect(anon.json()).toEqual({ reservedByMe: false });
+    expect(handlerCalls).toBe(2);
+  });
+
+  it('refuses a cache flush to a site-restricted user and allows an all-site user', async () => {
+    await app.inject({ method: 'GET', url: '/v1/stations' });
+    access.sites.set('usr_site_a', ['site_a']);
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/v1/cache/flush',
+      headers: { 'x-test-user': 'usr_site_a' },
+    });
+    expect(refused.statusCode).toBe(404);
+    expect(refused.json()).toEqual({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
+    expect(redis.store.get('rc:ver:stations')).toBeUndefined();
+
+    redis.store.set('rc:ver:stations', '3');
+    const flushed = await app.inject({
+      method: 'POST',
+      url: '/v1/cache/flush',
+      headers: { 'x-test-user': 'usr_all' },
+    });
+    expect(flushed.statusCode).toBe(200);
+    expect(redis.store.has('rc:ver:stations')).toBe(false);
   });
 
   it('never stores non-JSON responses matched by a prefix rule', async () => {
@@ -211,5 +359,71 @@ describe('response cache hooks', () => {
     const second = await app.inject({ method: 'GET', url: '/v1/sites/export' });
     expect(second.headers['x-cache']).toBeUndefined();
     expect(handlerCalls).toBe(2);
+  });
+});
+
+describe('noteDashboardEvent', () => {
+  let redis: FakeRedis;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    redis = new FakeRedis();
+    setResponseCacheRedis(redis);
+    resetDashboardBumpThrottle();
+  });
+
+  afterEach(() => {
+    resetDashboardBumpThrottle();
+    setResponseCacheRedis(null);
+    vi.useRealTimers();
+  });
+
+  const version = (): string | undefined => redis.store.get('rc:ver:dashboard');
+
+  it('bumps the dashboard tag at once for a dashboard event, so the refetch reads fresh data', async () => {
+    noteDashboardEvent('session.ended', Date.now());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(version()).toBe('1');
+  });
+
+  it('ignores events that change no dashboard figure', async () => {
+    noteDashboardEvent('supportCase.newMessage', Date.now());
+    noteDashboardEvent(undefined, Date.now());
+    await vi.advanceTimersByTimeAsync(DASHBOARD_BUMP_INTERVAL_MS * 2);
+    expect(version()).toBeUndefined();
+  });
+
+  it('bumps once more at the end of the interval for a burst, never more often', async () => {
+    noteDashboardEvent('meter.values', Date.now());
+    await vi.advanceTimersByTimeAsync(100);
+    noteDashboardEvent('meter.values', Date.now());
+    noteDashboardEvent('station.status', Date.now());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(version()).toBe('1');
+    await vi.advanceTimersByTimeAsync(DASHBOARD_BUMP_INTERVAL_MS);
+    expect(version()).toBe('2');
+    // The trailing bump covered the burst: nothing else is pending.
+    await vi.advanceTimersByTimeAsync(DASHBOARD_BUMP_INTERVAL_MS * 2);
+    expect(version()).toBe('2');
+  });
+
+  it('covers every event type the CSMS refetches the dashboard on', () => {
+    expect([...DASHBOARD_EVENT_TYPES].sort()).toEqual([
+      'meter.values',
+      'ocpp.health',
+      'payment.settled',
+      'session.ended',
+      'session.started',
+      'station.status',
+    ]);
+  });
+
+  it('keeps going when the cache is down', async () => {
+    redis.failing = true;
+    expect(() => {
+      noteDashboardEvent('session.started', Date.now());
+    }).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(version()).toBeUndefined();
   });
 });

@@ -3,10 +3,11 @@
 
 import * as React from 'react';
 import { ChevronDown } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
-import { Input } from './input';
+import { Input, type InputProps } from './input';
 
-interface ComboboxProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'onChange'> {
+interface ComboboxProps extends Omit<InputProps, 'onChange'> {
   value: string;
   onChange: (value: string) => void;
   options: string[];
@@ -20,6 +21,7 @@ interface ComboboxProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>
  */
 export const Combobox = React.forwardRef<HTMLInputElement, ComboboxProps>(
   ({ value, onChange, options, className, disabled, onFocus, onBlur, ...props }, ref) => {
+    const { t } = useTranslation();
     const [open, setOpen] = React.useState(false);
     const [highlight, setHighlight] = React.useState(-1);
     const containerRef = React.useRef<HTMLDivElement>(null);
@@ -117,7 +119,7 @@ export const Combobox = React.forwardRef<HTMLInputElement, ComboboxProps>(
         <button
           type="button"
           tabIndex={-1}
-          aria-label="Toggle suggestions"
+          aria-label={t('common.toggleSuggestions')}
           onClick={() => {
             if (disabled === true) return;
             setOpen((prev) => !prev);

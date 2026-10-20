@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, desc, count, and, or, ilike, like } from 'drizzle-orm';
 import { readFile } from 'node:fs/promises';
@@ -12,17 +12,31 @@ import {
   notifications,
   notificationTemplates,
   driverEventSettings,
-  systemEventSettings,
   ocppEventSettings,
   settings,
+  notificationTemplateAuditLog,
+  writeAudit,
 } from '@evtivity/database';
 import {
   assertTemplateAllowed,
   compileAllowedTemplate,
   decryptString,
+  formatLocalizedVariables,
+  loadSubjectTemplate,
+  notificationMoney,
+  notificationTaxRate,
+  notificationUnitPrice,
   wrapEmailHtml,
 } from '@evtivity/lib';
-import { getPubSub } from '../lib/pubsub.js';
+import { isMissingFileError } from '../lib/fs-errors.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import {
+  DRIVER_EVENT_TYPES,
+  isDriverEventType,
+  isRequiredDriverEventType,
+  OCPP_NOTIFICATION_EVENT_TYPES,
+  REQUIRED_DRIVER_EVENT_TYPES,
+} from '@evtivity/lib/notification-events';
 
 const OCPP_CACHE_INVALIDATE_CHANNEL = 'cache_invalidate';
 async function invalidateOcppEventSettingsCache(log: FastifyBaseLogger): Promise<void> {
@@ -62,8 +76,70 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { config as apiConfig } from '../lib/config.js';
 import { authorize } from '../middleware/rbac.js';
+import { getAuditActor } from '../lib/audit-actor.js';
+
+type AuditFields = Record<string, unknown>;
+
+/**
+ * notification_template audit row (id the event type). With a before and an
+ * after state it records only the fields that differ, and writes nothing when
+ * none does. Fail-open: writeAudit logs and continues.
+ */
+async function auditNotificationTemplate(
+  request: FastifyRequest,
+  change: {
+    eventType: string;
+    action: 'updated' | 'deleted' | 'event_settings_changed';
+    /** Identifies the row within the event type (channel, language); always recorded. */
+    key: AuditFields;
+    before: AuditFields | null;
+    after: AuditFields | null;
+    notes?: string;
+  },
+): Promise<void> {
+  let before = change.before;
+  let after = change.after;
+  if (before != null && after != null) {
+    const changed = Object.keys(after).filter(
+      (field) => JSON.stringify(before?.[field] ?? null) !== JSON.stringify(after?.[field] ?? null),
+    );
+    if (changed.length === 0) return;
+    before = Object.fromEntries(changed.map((field) => [field, change.before?.[field] ?? null]));
+    after = Object.fromEntries(changed.map((field) => [field, change.after?.[field] ?? null]));
+  }
+  await writeAudit(
+    { table: notificationTemplateAuditLog, idColumn: 'notification_template_id' },
+    {
+      entityId: change.eventType,
+      entityIdSnapshot: change.eventType,
+      action: change.action,
+      ...getAuditActor(request),
+      before: before == null ? null : { ...change.key, ...before },
+      after: after == null ? null : { ...change.key, ...after },
+      notes: change.notes ?? null,
+    },
+    db,
+    request.log,
+  );
+}
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_MESSAGE_NOT_FOUND = {
+  error: 'Message not found',
+  code: 'MESSAGE_NOT_FOUND',
+} as const;
+const ALL_SITES_SETTING_NOT_FOUND = {
+  error: 'Setting not found',
+  code: 'SETTING_NOT_FOUND',
+} as const;
+const ALL_SITES_TEMPLATE_NOT_FOUND = {
+  error: 'Template not found',
+  code: 'TEMPLATE_NOT_FOUND',
+} as const;
 
 const ocppEventSettingItem = z
   .object({
@@ -72,7 +148,7 @@ const ocppEventSettingItem = z
       .string()
       .max(255)
       .describe('OCPP event type (e.g. station.Connected, ocpp.BootNotification)'),
-    recipient: z.string().max(500).describe('Recipient address (email, webhook URL, or $admin)'),
+    recipient: z.string().max(500).describe('Recipient address (email or webhook URL)'),
     channel: z
       .enum(['email', 'webhook', 'sms', 'log'])
       .describe('Delivery channel (email, webhook, sms, log)'),
@@ -87,19 +163,12 @@ const ocppEventSettingItem = z
   })
   .passthrough();
 
-// Shared item shape for driver + system event toggle settings. Both tables
-// expose the same columns; the endpoint summaries differentiate which catalog
-// of event types each surface manages.
+// Item shape of the driver event settings (driver_event_settings).
 const eventToggleSettingItem = z
   .object({
     id: z.number().int().describe('Setting ID'),
-    eventType: z
-      .string()
-      .max(255)
-      .describe(
-        'Event type identifier (driver event for driver settings, system event for system settings)',
-      ),
-    isEnabled: z.boolean().describe('Whether notifications are enabled for this event type'),
+    eventType: z.string().max(255).describe('Driver event type identifier'),
+    isEnabled: z.boolean().describe('Whether the driver event type is sent'),
     createdAt: z.coerce.date().describe('Timestamp when the setting was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the setting was last updated'),
   })
@@ -217,69 +286,32 @@ const ocppEventTemplateResponse = z
   })
   .passthrough();
 
-const OCPP_EVENT_TYPES = [
-  'station.Connected',
-  'station.Disconnected',
-  'ocpp.Authorize',
-  'ocpp.BatterySwap',
-  'ocpp.BootNotification',
-  'ocpp.ClearedChargingLimit',
-  'ocpp.DataTransfer',
-  'ocpp.FirmwareStatusNotification',
-  'ocpp.Get15118EVCertificate',
-  'ocpp.GetCertificateChainStatus',
-  'ocpp.GetCertificateStatus',
-  'ocpp.Heartbeat',
-  'ocpp.LogStatusNotification',
-  'ocpp.MeterValues',
-  'ocpp.MessageLog',
-  'ocpp.NotifyAllowedEnergyTransfer',
-  'ocpp.NotifyChargingLimit',
-  'ocpp.NotifyCustomerInformation',
-  'ocpp.NotifyDERAlarm',
-  'ocpp.NotifyDERStartStop',
-  'ocpp.NotifyDisplayMessages',
-  'ocpp.NotifyEVChargingNeeds',
-  'ocpp.NotifyEVChargingSchedule',
-  'ocpp.NotifyEvent',
-  'ocpp.NotifyMonitoringReport',
-  'ocpp.NotifyPeriodicEventStream',
-  'ocpp.NotifyPriorityCharging',
-  'ocpp.NotifyQRCodeScanned',
-  'ocpp.NotifyReport',
-  'ocpp.NotifySettlement',
-  'ocpp.NotifyWebPaymentStarted',
-  'ocpp.PublishFirmwareStatusNotification',
-  'ocpp.PullDynamicScheduleUpdate',
-  'ocpp.ReportChargingProfiles',
-  'ocpp.ReportDERControl',
-  'ocpp.ReservationStatusUpdate',
-  'ocpp.SecurityEventNotification',
-  'ocpp.SignCertificate',
-  'ocpp.StatusNotification',
-  'ocpp.TransactionEvent',
-  'ocpp.VatNumberValidation',
+// Notifications sent to operators and site hosts. Matches the CSMS System Events tab.
+export const SYSTEM_EVENT_TYPES = [
+  'operator.UserCreated',
+  'operator.ForgotPassword',
+  'operator.PasswordChanged',
+  'supportCase.NewCaseFromDriver',
+  'supportCase.DriverReply',
+  'session.EndRequestFailed',
+  'site.PayoutOnboarding',
+  'fleet.CreditLimitWarning',
+  'fleet.CreditLimitReached',
+  'fleet.InvoiceRunFailed',
+  'invoice.FleetInvoice',
+  'invoice.FleetCreditNote',
+  'invoice.FleetOverdue',
+  'ai.ProposalDigest',
+  'ai.ProviderQuotaExceeded',
+  'ai.BudgetWarning',
+  'ai.BudgetExhausted',
 ];
 
-const DRIVER_EVENT_TYPES = [
-  'session.Started',
-  'session.Updated',
-  'session.Completed',
-  'session.Faulted',
-  'session.PaymentReceived',
-  'session.IdlingStarted',
+const ALL_EVENT_TYPES = [
+  ...OCPP_NOTIFICATION_EVENT_TYPES,
+  ...DRIVER_EVENT_TYPES,
+  ...SYSTEM_EVENT_TYPES,
 ];
-
-const SYSTEM_EVENT_TYPES = [
-  'driver.Welcome',
-  'driver.ForgotPassword',
-  'driver.PasswordChanged',
-  'driver.AccountVerification',
-  'payment.Complete',
-  'session.Receipt',
-];
-
-const ALL_EVENT_TYPES = [...OCPP_EVENT_TYPES, ...DRIVER_EVENT_TYPES, ...SYSTEM_EVENT_TYPES];
 
 const TEMPLATE_LANGUAGES = new Set(['en', 'de', 'es', 'ko', 'zh', 'zh-TW']);
 const TEMPLATE_CHANNELS = new Set(['email', 'sms', 'webhook', 'log']);
@@ -302,21 +334,34 @@ function safeTemplatePath(
   const lang = TEMPLATE_LANGUAGES.has(language) ? language : 'en';
   const baseResolved = resolve(baseDir);
   const filePath = resolve(baseResolved, lang, eventType.replace(/\./g, '/'), `${channel}.hbs`);
-  if (filePath !== baseResolved && !filePath.startsWith(baseResolved + sep)) return null;
+  // The file always lies below the base (it ends in `<channel>.hbs`).
+  if (!filePath.startsWith(baseResolved + sep)) return null;
   return filePath;
 }
 
-const eventToggleSettingBody = z.object({
+const REQUIRED_DRIVER_EVENT_LIST = REQUIRED_DRIVER_EVENT_TYPES.join(', ');
+
+const driverEventSettingBody = z.object({
   eventType: z
     .string()
     .max(255)
-    .describe('Event type identifier (driver or system event, depending on endpoint)'),
-  isEnabled: z.boolean().describe('Whether notifications are enabled for this event type'),
+    .describe(
+      'Driver event type identifier. Only driver notification types have a switch: any other type returns 400 VALIDATION_ERROR.',
+    ),
+  isEnabled: z
+    .boolean()
+    .describe(
+      `Whether the driver event type is sent. The required types (${REQUIRED_DRIVER_EVENT_LIST}) cannot be turned off.`,
+    ),
 });
 
 const ocppEventSettingsBody = z.object({
   eventType: z.string().max(255).describe('OCPP event type identifier'),
-  recipient: z.string().max(500).optional().describe('Recipient address or $admin'),
+  recipient: z
+    .string()
+    .max(500)
+    .optional()
+    .describe('Recipient address: an email address (email channel) or an http(s) URL (webhook)'),
   channel: z.enum(['email', 'webhook']).optional().describe('Notification delivery channel'),
   templateHtml: z.string().nullable().optional(),
   language: z.string().max(10).nullable().optional().describe('ISO language code'),
@@ -348,12 +393,8 @@ function isValidPhone(value: string): boolean {
   return PHONE_RE.test(value);
 }
 function isValidWebhookUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
+  const url = URL.parse(value);
+  return url != null && (url.protocol === 'http:' || url.protocol === 'https:');
 }
 
 const notificationChannelValues = ['email', 'sms', 'webhook', 'push', 'log'] as const;
@@ -415,6 +456,7 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
   'ocpp.TransactionEvent': ['stationId', 'occurredAt', 'transactionId', 'evseId'],
   'ocpp.MeterValues': ['stationId', 'occurredAt', 'evseId'],
   'ocpp.FirmwareStatusNotification': ['stationId', 'occurredAt', 'status'],
+  'ocpp.PublishFirmwareStatusNotification': ['stationId', 'occurredAt', 'status'],
   'ocpp.SecurityEventNotification': ['stationId', 'occurredAt', 'type'],
   'session.Started': [
     'firstName',
@@ -444,10 +486,30 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'transactionId',
     'energyDeliveredWh',
     'finalCostCents',
+    'costIncludesTax',
+    'taxFormatted',
+    'taxCents',
+    'netFormatted',
+    'taxRatePercent',
+    'taxLinesFormatted',
+    'energyCostFormatted',
+    'timeCostFormatted',
+    'sessionFeeFormatted',
+    'idleCostFormatted',
+    'reservationFeeFormatted',
+    'partiallyPaid',
+    'chargedFormatted',
+    'chargedCents',
+    'unpaidFormatted',
+    'unpaidCents',
     'currency',
     'durationMinutes',
     'startedAt',
     'endedAt',
+    'notCharged',
+    'billingMode',
+    'billedTo',
+    'billedToMember',
   ],
   'session.Faulted': ['firstName', 'lastName', 'email', 'stationId', 'reason'],
   'session.PaymentReceived': [
@@ -456,17 +518,79 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'email',
     'stationId',
     'transactionId',
+    'amountFormatted',
     'amountCents',
     'currency',
   ],
   'driver.Welcome': ['firstName', 'lastName', 'email'],
   'driver.ForgotPassword': ['firstName', 'lastName', 'email'],
+  'driver.PortalInvite': ['firstName', 'lastName', 'email', 'activateUrl', 'expiresInDays'],
+  'driver.RegistrationAttempt': ['firstName', 'lastName', 'email', 'signInUrl', 'resetUrl'],
+  'invoice.Sent': [
+    'firstName',
+    'lastName',
+    'invoiceNumber',
+    'status',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'invoice.CreditNote': [
+    'firstName',
+    'lastName',
+    'creditNoteNumber',
+    'invoiceNumber',
+    'creditReason',
+    'issuedAt',
+    'total',
+    'totalCents',
+    'currency',
+    'wasPaid',
+  ],
+  'prepaid.LowCredit': [
+    'firstName',
+    'lastName',
+    'email',
+    'idToken',
+    'balanceFormatted',
+    'balanceCents',
+    'thresholdFormatted',
+    'currency',
+  ],
+  'prepaid.CreditExhausted': [
+    'firstName',
+    'lastName',
+    'email',
+    'idToken',
+    'siteName',
+    'stationId',
+    'transactionId',
+    'creditFormatted',
+    'currency',
+  ],
+  'site.PayoutOnboarding': ['siteName', 'contactName', 'email', 'onboardingUrl', 'expiresInDays'],
+  'session.EndRequestFailed': [
+    'firstName',
+    'lastName',
+    'email',
+    'sessionId',
+    'stationId',
+    'siteName',
+    'transactionId',
+    'endRequestReason',
+    'attempts',
+    'startedAt',
+    'endedAt',
+  ],
   'driver.PasswordChanged': ['firstName', 'lastName'],
   'driver.AccountVerification': ['firstName', 'lastName', 'email'],
   'payment.Complete': [
     'firstName',
     'lastName',
     'email',
+    'amountFormatted',
     'amountCents',
     'currency',
     'transactionId',
@@ -478,65 +602,212 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'transactionId',
     'energyDeliveredWh',
     'finalCostCents',
+    'costIncludesTax',
+    'taxFormatted',
+    'taxCents',
+    'netFormatted',
+    'taxRatePercent',
+    'taxLinesFormatted',
+    'energyCostFormatted',
+    'timeCostFormatted',
+    'sessionFeeFormatted',
+    'idleCostFormatted',
+    'reservationFeeFormatted',
+    'partiallyPaid',
+    'chargedFormatted',
+    'chargedCents',
+    'unpaidFormatted',
+    'unpaidCents',
     'currency',
     'durationMinutes',
     'startedAt',
     'endedAt',
     'stationName',
+    'notCharged',
+    'billingMode',
+    'billedTo',
+    'billedToMember',
+  ],
+  'fleet.AccountBillingChanged': [
+    'firstName',
+    'lastName',
+    'email',
+    'fleetName',
+    'billedTo',
+    'accountBilling',
+    'invoicedTo',
+    'invoicedToMember',
+  ],
+  'payment.AccountCreditLimit': [
+    'firstName',
+    'lastName',
+    'email',
+    'fleetName',
+    'siteName',
+    'stationId',
+    'transactionId',
+  ],
+  'fleet.CreditLimitWarning': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'exposureFormatted',
+    'limitFormatted',
+    'exposureCents',
+    'limitCents',
+    'warningPercent',
+    'currency',
+  ],
+  'fleet.CreditLimitReached': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'exposureFormatted',
+    'limitFormatted',
+    'exposureCents',
+    'limitCents',
+    'warningPercent',
+    'currency',
+  ],
+  'invoice.FleetInvoice': [
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'invoice.FleetCreditNote': [
+    'fleetName',
+    'creditNoteNumber',
+    'invoiceNumber',
+    'periodLabel',
+    'creditReason',
+    'issuedAt',
+    'total',
+    'totalCents',
+    'currency',
+    'wasPaid',
+  ],
+  'invoice.MemberInvoice': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'invoice.MemberCreditNote': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'creditNoteNumber',
+    'invoiceNumber',
+    'periodLabel',
+    'creditReason',
+    'issuedAt',
+    'total',
+    'totalCents',
+    'currency',
+    'wasPaid',
+  ],
+  'invoice.MemberOverdue': [
+    'firstName',
+    'lastName',
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'invoice.FleetOverdue': [
+    'fleetName',
+    'invoiceNumber',
+    'periodLabel',
+    'sessionCount',
+    'issuedAt',
+    'dueAt',
+    'total',
+    'totalCents',
+    'currency',
+  ],
+  'fleet.InvoiceRunFailed': [
+    'firstName',
+    'lastName',
+    'period',
+    'fleetCount',
+    'fleetNames',
+    'memberCount',
+    'issuedNotEmailed',
+    'issuedNotEmailedCount',
+    'notInvoiced',
+    'notInvoicedCount',
+  ],
+  // Daily digest of pending AI insight actions: counts only, never model text.
+  'ai.ProposalDigest': [
+    'firstName',
+    'lastName',
+    'digestDate',
+    'pendingCount',
+    'stuckSessionsCount',
+    'networkSummaryCount',
+    'siteCount',
+    'siteNames',
+    'insightsUrl',
+  ],
+  // An AI provider account out of credit or quota: AI features are paused.
+  'ai.ProviderQuotaExceeded': ['firstName', 'lastName', 'provider', 'providerName', 'since'],
+  // A company or site monthly AI token budget at its warning level, or used up.
+  'ai.BudgetWarning': [
+    'firstName',
+    'lastName',
+    'scope',
+    'siteName',
+    'period',
+    'percent',
+    'usedTokens',
+    'limitTokens',
+  ],
+  'ai.BudgetExhausted': [
+    'firstName',
+    'lastName',
+    'scope',
+    'siteName',
+    'period',
+    'percent',
+    'usedTokens',
+    'limitTokens',
   ],
 };
 
-const FRIENDLY_SUBJECTS: Record<string, string> = {
-  // Driver session events
-  'session.Started': '{{companyName}} - Your charging session has started',
-  'session.Updated': '{{companyName}} - Charging session update',
-  'session.Completed': '{{companyName}} - Your charging session is complete',
-  'session.Faulted': '{{companyName}} - Charging session failed to start',
-  'session.PaymentReceived': '{{companyName}} - Payment received',
-  'session.IdlingStarted': '{{companyName}} - Your vehicle has stopped charging',
-  'session.Receipt': '{{companyName}} - Charging session receipt',
-  // Driver account events
-  'driver.Welcome': '{{companyName}} - Welcome',
-  'driver.ForgotPassword': '{{companyName}} - Reset your password',
-  'driver.PasswordChanged': '{{companyName}} - Password changed',
-  'driver.AccountVerification': '{{companyName}} - Verify your account',
-  // Payment events
-  'payment.Complete': '{{companyName}} - Payment confirmation',
-  'payment.Refunded': '{{companyName}} - Refund processed',
-  'payment.PreAuthFailed': '{{companyName}} - Payment authorization failed',
-  'payment.CaptureFailed': '{{companyName}} - Payment capture failed',
-  'payment.MissingPaymentMethod': '{{companyName}} - Payment method required',
-  // Reservation events
-  'reservation.Created': '{{companyName}} - Reservation confirmed',
-  'reservation.Cancelled': '{{companyName}} - Reservation cancelled',
-  'reservation.Expiring': '{{companyName}} - Your reservation is expiring soon',
-  'reservation.Expired': '{{companyName}} - Your reservation has expired',
-  'reservation.StationFaulted': '{{companyName}} - Reserved station is unavailable',
-  // Token (RFID card) events
-  'token.Added': '{{companyName}} - New RFID card added to your account',
-  'token.Removed': '{{companyName}} - RFID card removed from your account',
-  'token.Deactivated': '{{companyName}} - RFID card deactivated',
-  'token.Reactivated': '{{companyName}} - RFID card reactivated',
-  // Support case events (driver-facing)
-  'supportCase.Created': '{{companyName}} - Your support case has been opened',
-  'supportCase.OperatorReply': '{{companyName}} - New reply on your support case',
-  'supportCase.Resolved': '{{companyName}} - Your support case has been resolved',
-  // MFA
-  'mfa.VerificationCode': '{{companyName}} - Verification code',
-  // Operator events
-  'operator.UserCreated': '{{companyName}} - New operator account created',
-  'operator.ForgotPassword': '{{companyName}} - Reset your operator password',
-  'operator.PasswordChanged': '{{companyName}} - Operator password changed',
-  // Operator support events
-  'supportCase.NewCaseFromDriver': '{{companyName}} - New support case from driver',
-  'supportCase.DriverReply': '{{companyName}} - Driver replied to support case',
-};
-
-function getDefaultSubject(eventType: string, channel: string): string | null {
+// The default email subject is the event's `subject.hbs` in the template
+// folders (same lookup as the dispatcher), else the generic subject.
+async function getDefaultSubject(
+  eventType: string,
+  channel: string,
+  language: string,
+  templatesDirs: string[],
+): Promise<string | null> {
   if (channel !== 'email') return null;
-  const friendly = FRIENDLY_SUBJECTS[eventType];
-  if (friendly != null) return friendly;
-  return `{{companyName}} - ${eventType} Notification`;
+  // Same checks as the body path: no path segments from the query reach the file system.
+  const valid = templatesDirs.every(
+    (dir) => safeTemplatePath(dir, language, eventType, channel) != null,
+  );
+  const lang = TEMPLATE_LANGUAGES.has(language) ? language : 'en';
+  const source = valid ? await loadSubjectTemplate(eventType, lang, templatesDirs) : null;
+  return source ?? `{{{companyName}}} - ${eventType} Notification`;
 }
 
 function generateDefaultTemplate(eventType: string, channel: string): string {
@@ -617,8 +888,13 @@ export function notificationRoutes(app: FastifyInstance): void {
         try {
           const content = await readFile(filePath, 'utf-8');
           return { template: content };
-        } catch {
-          // try the English fallback / next candidate
+        } catch (err) {
+          if (!isMissingFileError(err)) {
+            request.log.warn(
+              { err, filePath },
+              'Reading the default template failed, trying the next one',
+            );
+          }
         }
       }
       await reply
@@ -661,17 +937,20 @@ export function notificationRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(ocppEventSettingItem),
           400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof ocppEventSettingsBody>;
       const channel = body.channel ?? 'email';
       // Validate the recipient against the channel format so misconfigured
       // settings fail at save time with a clear error, not silently at
       // dispatch time with an SMTP/webhook rejection deep in the worker log.
-      // `$admin` is the magic recipient that resolves to the operator email.
-      if (body.recipient != null && body.recipient !== '' && body.recipient !== '$admin') {
+      if (body.recipient != null && body.recipient !== '') {
         if (channel === 'email' && !isValidEmail(body.recipient)) {
           await reply.status(400).send({
             error: 'recipient must be a valid email address for email channel',
@@ -701,6 +980,19 @@ export function notificationRoutes(app: FastifyInstance): void {
       if (body.templateHtml !== undefined) updates['templateHtml'] = body.templateHtml;
       if (body.language !== undefined) updates['language'] = body.language;
 
+      const [existing] = await db
+        .select({
+          recipient: ocppEventSettings.recipient,
+          templateHtml: ocppEventSettings.templateHtml,
+          language: ocppEventSettings.language,
+        })
+        .from(ocppEventSettings)
+        .where(
+          and(
+            eq(ocppEventSettings.eventType, body.eventType),
+            eq(ocppEventSettings.channel, channel),
+          ),
+        );
       const [saved] = await db
         .insert(ocppEventSettings)
         .values({
@@ -715,6 +1007,19 @@ export function notificationRoutes(app: FastifyInstance): void {
           set: updates,
         })
         .returning();
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
+          eventType: body.eventType,
+          action: 'event_settings_changed',
+          key: { setting: 'ocpp', channel },
+          before: existing ?? null,
+          after: {
+            recipient: saved.recipient,
+            templateHtml: saved.templateHtml,
+            language: saved.language,
+          },
+        });
+      }
       await invalidateOcppEventSettingsCache(request.log);
       return saved;
     },
@@ -742,6 +1047,7 @@ export function notificationRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const { eventType, channel } = request.query as { eventType: string; channel: string };
       const deleted = await db
         .delete(ocppEventSettings)
@@ -752,10 +1058,23 @@ export function notificationRoutes(app: FastifyInstance): void {
           ),
         )
         .returning();
-      if (deleted.length === 0) {
+      const [removed] = deleted;
+      if (removed == null) {
         await reply.status(404).send({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
         return;
       }
+      await auditNotificationTemplate(request, {
+        eventType,
+        action: 'event_settings_changed',
+        key: { setting: 'ocpp', channel: removed.channel },
+        before: {
+          recipient: removed.recipient,
+          templateHtml: removed.templateHtml,
+          language: removed.language,
+        },
+        after: null,
+        notes: 'Setting removed',
+      });
       await invalidateOcppEventSettingsCache(request.log);
       return { success: true };
     },
@@ -773,10 +1092,16 @@ export function notificationRoutes(app: FastifyInstance): void {
         operationId: 'listNotifications',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(notificationListQuery),
-        response: { 200: paginatedResponse(notificationHistoryItem) },
+        response: {
+          200: paginatedResponse(notificationHistoryItem),
+          404: errorWith('Message not found, or the user is restricted to some sites', [
+            ERROR_CODES.MESSAGE_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_MESSAGE_NOT_FOUND))) return;
       const params = request.query as z.infer<typeof notificationListQuery>;
       const offset = (params.page - 1) * params.limit;
 
@@ -841,10 +1166,14 @@ export function notificationRoutes(app: FastifyInstance): void {
             ERROR_CODES.EMAIL_SEND_FAILED,
             ERROR_CODES.SMS_SEND_FAILED,
           ]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const { channel, recipient } = request.body as z.infer<typeof testBody>;
 
       // Fail fast on bad recipients so operators don't see a vague SMTP/Twilio
@@ -885,9 +1214,13 @@ export function notificationRoutes(app: FastifyInstance): void {
         if (rawPassword != null && rawPassword !== '' && encryptionKey != null) {
           try {
             password = decryptString(rawPassword, encryptionKey);
-          } catch {
+          } catch (err) {
             // Leave password empty so SMTP returns a clear auth failure instead
             // of silently leaking ciphertext as the credential.
+            request.log.error(
+              { err, key: 'smtp.passwordEnc' },
+              'Decrypting the SMTP password failed, testing without it',
+            );
           }
         }
 
@@ -933,9 +1266,13 @@ export function notificationRoutes(app: FastifyInstance): void {
       if (rawToken != null && rawToken !== '' && encryptionKey != null) {
         try {
           authToken = decryptString(rawToken, encryptionKey);
-        } catch {
+        } catch (err) {
           // Leave authToken empty so Twilio returns a clear auth failure
           // instead of silently leaking ciphertext as the credential.
+          request.log.error(
+            { err, key: 'twilio.authTokenEnc' },
+            'Decrypting the Twilio auth token failed, testing without it',
+          );
         }
       }
 
@@ -1000,15 +1337,46 @@ export function notificationRoutes(app: FastifyInstance): void {
       onRequest: [authorize('notifications:write')],
       schema: {
         tags: ['Notifications'],
-        summary: 'Create or update a driver event setting',
+        summary: 'Turn a driver event type on or off',
+        description: `Operators turn each driver notification type on or off. Drivers' own notification preferences apply on top when it is on. Only driver notification types have a switch: any other event type returns 400 VALIDATION_ERROR. The required types (${REQUIRED_DRIVER_EVENT_LIST}) are always on: turning one off returns 400 NOTIFICATION_EVENT_REQUIRED.`,
         operationId: 'updateDriverEventSettings',
         security: [{ bearerAuth: [] }],
-        body: zodSchema(eventToggleSettingBody),
-        response: { 200: itemResponse(eventToggleSettingItem) },
+        body: zodSchema(driverEventSettingBody),
+        response: {
+          200: itemResponse(eventToggleSettingItem),
+          400: errorWith('Not a driver event type, or the event type is always on', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.NOTIFICATION_EVENT_REQUIRED,
+          ]),
+          404: errorWith('Setting not found, or the user is restricted to some sites', [
+            ERROR_CODES.SETTING_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
-      const body = request.body as z.infer<typeof eventToggleSettingBody>;
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
+      const body = request.body as z.infer<typeof driverEventSettingBody>;
+      // Only driver notification types have a switch. A row for a system or
+      // OCPP event type would let an operator silence it through dispatch.
+      if (!isDriverEventType(body.eventType)) {
+        await reply.status(400).send({
+          error: 'eventType must be a driver notification event type',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      if (!body.isEnabled && isRequiredDriverEventType(body.eventType)) {
+        await reply.status(400).send({
+          error: 'This notification is required for account access and cannot be turned off',
+          code: 'NOTIFICATION_EVENT_REQUIRED',
+        });
+        return;
+      }
+      const [existing] = await db
+        .select({ isEnabled: driverEventSettings.isEnabled })
+        .from(driverEventSettings)
+        .where(eq(driverEventSettings.eventType, body.eventType));
       const [saved] = await db
         .insert(driverEventSettings)
         .values({
@@ -1023,59 +1391,15 @@ export function notificationRoutes(app: FastifyInstance): void {
           },
         })
         .returning();
-      return saved;
-    },
-  );
-
-  // --- System Event Settings ---
-
-  app.get(
-    '/system-event-settings',
-    {
-      onRequest: [authorize('notifications:read')],
-      schema: {
-        tags: ['Notifications'],
-        summary: 'List system event settings',
-        operationId: 'getSystemEventSettings',
-        security: [{ bearerAuth: [] }],
-        response: { 200: arrayResponse(eventToggleSettingItem) },
-      },
-    },
-    async () => {
-      const rows = await db.select().from(systemEventSettings);
-      return rows;
-    },
-  );
-
-  app.put(
-    '/system-event-settings',
-    {
-      onRequest: [authorize('notifications:write')],
-      schema: {
-        tags: ['Notifications'],
-        summary: 'Create or update a system event setting',
-        operationId: 'updateSystemEventSettings',
-        security: [{ bearerAuth: [] }],
-        body: zodSchema(eventToggleSettingBody),
-        response: { 200: itemResponse(eventToggleSettingItem) },
-      },
-    },
-    async (request) => {
-      const body = request.body as z.infer<typeof eventToggleSettingBody>;
-      const [saved] = await db
-        .insert(systemEventSettings)
-        .values({
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
           eventType: body.eventType,
-          isEnabled: body.isEnabled,
-        })
-        .onConflictDoUpdate({
-          target: [systemEventSettings.eventType],
-          set: {
-            isEnabled: body.isEnabled,
-            updatedAt: new Date(),
-          },
-        })
-        .returning();
+          action: 'event_settings_changed',
+          key: { setting: 'driver' },
+          before: { isEnabled: existing?.isEnabled ?? null },
+          after: { isEnabled: saved.isEnabled },
+        });
+      }
       return saved;
     },
   );
@@ -1129,7 +1453,10 @@ export function notificationRoutes(app: FastifyInstance): void {
       const apiTemplatesDir =
         process.env['API_TEMPLATES_DIR'] ?? resolve(currentDir, '..', 'templates');
 
-      const defaultSubject = getDefaultSubject(eventType, channel);
+      const defaultSubject = await getDefaultSubject(eventType, channel, language, [
+        ocppTemplatesDir,
+        apiTemplatesDir,
+      ]);
 
       const candidates = [
         safeTemplatePath(ocppTemplatesDir, language, eventType, channel),
@@ -1150,8 +1477,13 @@ export function notificationRoutes(app: FastifyInstance): void {
             bodyHtml: content,
             isCustomized: false,
           };
-        } catch {
-          // try next candidate
+        } catch (err) {
+          if (!isMissingFileError(err)) {
+            request.log.warn(
+              { err, filePath },
+              'Reading the default template failed, trying the next one',
+            );
+          }
         }
       }
       const defaultBody = generateDefaultTemplate(eventType, channel);
@@ -1179,10 +1511,14 @@ export function notificationRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(notificationTemplateDbItem),
           400: errorWith('Template is invalid', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Template not found, or the user is restricted to some sites', [
+            ERROR_CODES.TEMPLATE_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof templateUpsertBody>;
       const details: Record<string, string> = {};
       const subjectError = templateError(body.subject);
@@ -1195,6 +1531,18 @@ export function notificationRoutes(app: FastifyInstance): void {
           .send({ error: 'Template is invalid', code: 'VALIDATION_ERROR', details });
         return;
       }
+      const templateMatch = and(
+        eq(notificationTemplates.eventType, body.eventType),
+        eq(notificationTemplates.channel, body.channel),
+        eq(notificationTemplates.language, body.language),
+      );
+      const [existing] = await db
+        .select({
+          subject: notificationTemplates.subject,
+          bodyHtml: notificationTemplates.bodyHtml,
+        })
+        .from(notificationTemplates)
+        .where(templateMatch);
       const [saved] = await db
         .insert(notificationTemplates)
         .values({
@@ -1217,6 +1565,16 @@ export function notificationRoutes(app: FastifyInstance): void {
           },
         })
         .returning();
+      if (saved != null) {
+        await auditNotificationTemplate(request, {
+          eventType: body.eventType,
+          action: 'updated',
+          key: { channel: body.channel, language: body.language },
+          // No stored row: the default file template applied before.
+          before: existing ?? { subject: null, bodyHtml: null },
+          after: { subject: saved.subject, bodyHtml: saved.bodyHtml },
+        });
+      }
       return saved;
     },
   );
@@ -1231,12 +1589,18 @@ export function notificationRoutes(app: FastifyInstance): void {
         operationId: 'deleteNotificationTemplate',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(templateCrudQuery),
-        response: { 200: successResponse },
+        response: {
+          200: successResponse,
+          404: errorWith('Template not found, or the user is restricted to some sites', [
+            ERROR_CODES.TEMPLATE_NOT_FOUND,
+          ]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_TEMPLATE_NOT_FOUND))) return;
       const { eventType, channel, language } = request.query as z.infer<typeof templateCrudQuery>;
-      await db
+      const removed = await db
         .delete(notificationTemplates)
         .where(
           and(
@@ -1244,8 +1608,22 @@ export function notificationRoutes(app: FastifyInstance): void {
             eq(notificationTemplates.channel, channel),
             eq(notificationTemplates.language, language),
           ),
-        );
+        )
+        .returning({
+          subject: notificationTemplates.subject,
+          bodyHtml: notificationTemplates.bodyHtml,
+        });
 
+      const [deleted] = removed;
+      if (deleted != null) {
+        await auditNotificationTemplate(request, {
+          eventType,
+          action: 'deleted',
+          key: { channel, language },
+          before: deleted,
+          after: null,
+        });
+      }
       return { success: true };
     },
   );
@@ -1354,6 +1732,9 @@ export function notificationRoutes(app: FastifyInstance): void {
         companyZip: companyMap.get('company.zip') ?? '',
         companyCountry: companyMap.get('company.country') ?? '',
         siteName: 'Downtown Charging Hub',
+        sessionId: 'ses_8f3k2m9x4q',
+        endRequestReason: 'GhostRecovered',
+        attempts: 5,
         stationId: 'STATION-001',
         transactionId: 'TXN-12345',
         occurredAt: new Date().toISOString(),
@@ -1365,6 +1746,81 @@ export function notificationRoutes(app: FastifyInstance): void {
         startedAt: new Date(Date.now() - 3600000).toISOString(),
         endedAt: new Date().toISOString(),
         amountCents: 1250,
+        reservationId: 1042,
+        feeType: 'cancellation',
+        isNoShowFee: false,
+        refundedAt: new Date().toISOString(),
+        idToken: 'PREPAID-0042',
+        invoiceNumber: 'INV-202606-0042',
+        creditNoteNumber: 'CN-202606-0001',
+        creditReason: 'Wrong tariff applied',
+        wasPaid: true,
+        issuedAt: new Date().toISOString(),
+        dueAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+        periodLabel: 'September 2026',
+        sessionCount: 42,
+        period: '2026-09',
+        fleetCount: 2,
+        memberCount: 0,
+        fleetNames: 'Acme Logistics, Nordic Vans',
+        issuedNotEmailedCount: 1,
+        issuedNotEmailed: 'Acme Logistics (INV-202610-0012): SMTP connection timed out',
+        notInvoicedCount: 1,
+        notInvoiced: 'Nordic Vans: Connection terminated unexpectedly',
+        digestDate: '2026-10-10',
+        pendingCount: 3,
+        stuckSessionsCount: 2,
+        networkSummaryCount: 1,
+        siteCount: 2,
+        siteNames: 'Downtown Charging Hub, Airport Parking',
+        insightsUrl: 'https://csms.example.com/ai/insights?status=pending',
+        balanceCents: 350,
+        // Money and rates as the dispatcher formats them, in the template language.
+        ...formatLocalizedVariables(
+          {
+            costFormatted: notificationMoney(1250, companyCurrency),
+            amountFormatted: notificationMoney(1250, companyCurrency),
+            total: notificationMoney(1250, companyCurrency),
+            cancellationFeeFormatted: notificationMoney(595, companyCurrency),
+            balanceFormatted: notificationMoney(350, companyCurrency),
+            thresholdFormatted: notificationMoney(500, companyCurrency),
+            creditFormatted: notificationMoney(2500, companyCurrency),
+            exposureFormatted: notificationMoney(812_500, companyCurrency),
+            limitFormatted: notificationMoney(1_000_000, companyCurrency),
+            idleFeeFormatted: notificationUnitPrice(0.25, companyCurrency),
+            taxFormatted: notificationMoney(200, companyCurrency),
+            netFormatted: notificationMoney(1050, companyCurrency),
+            energyCostFormatted: notificationMoney(1000, companyCurrency),
+            sessionFeeFormatted: notificationMoney(250, companyCurrency),
+            chargedFormatted: notificationMoney(1000, companyCurrency),
+            unpaidFormatted: notificationMoney(250, companyCurrency),
+            taxRatePercent: notificationTaxRate(0.19),
+          },
+          body.language,
+        ),
+        totalCents: 1250,
+        cancellationFeeCents: 595,
+        costIncludesTax: true,
+        taxCents: 200,
+        taxLinesFormatted: '',
+        timeCostFormatted: '',
+        idleCostFormatted: '',
+        reservationFeeFormatted: '',
+        partiallyPaid: false,
+        chargedCents: 1250,
+        unpaidCents: 0,
+        notCharged: false,
+        billingMode: 'account',
+        billedTo: 'Acme Logistics',
+        billedToMember: false,
+        fleetName: 'Acme Logistics',
+        accountBilling: true,
+        invoicedTo: 'fleet',
+        invoicedToMember: false,
+        exposureCents: 812_500,
+        limitCents: 1_000_000,
+        warningPercent: 80,
+        idleFeeIncludesTax: true,
         evseId: 1,
         connectorId: 1,
         stationName: 'Main Street Charger',

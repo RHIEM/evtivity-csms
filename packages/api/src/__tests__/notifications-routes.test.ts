@@ -2,10 +2,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
+import { readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import {
+  DRIVER_EVENT_TYPES,
+  OCPP_NOTIFICATION_EVENT_TYPES,
+} from '@evtivity/lib/notification-events';
 
 // DB mock helpers
+const mockWriteAudit = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+
 let dbResults: unknown[][] = [];
 let dbCallIndex = 0;
 function setupDbResults(...results: unknown[][]) {
@@ -88,6 +100,8 @@ vi.mock('@evtivity/database', () => ({
   driverEventSettings: {},
   ocppEventSettings: {},
   settings: {},
+  notificationTemplateAuditLog: { _name: 'notificationTemplateAuditLog' },
+  writeAudit: mockWriteAudit,
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -118,12 +132,22 @@ vi.mock('nodemailer', () => ({
   },
 }));
 
+const { mockLoadSubjectTemplate } = vi.hoisted(() => ({
+  mockLoadSubjectTemplate: vi.fn(),
+}));
+
 vi.mock('@evtivity/lib', async () => {
   const actual = await vi.importActual<typeof import('@evtivity/lib')>('@evtivity/lib');
   return {
     // The template rules are the behavior under test, so they stay real.
     assertTemplateAllowed: actual.assertTemplateAllowed,
     compileAllowedTemplate: actual.compileAllowedTemplate,
+    // Sample money values are formatted like the dispatcher formats them.
+    formatLocalizedVariables: actual.formatLocalizedVariables,
+    notificationMoney: actual.notificationMoney,
+    notificationUnitPrice: actual.notificationUnitPrice,
+    notificationTaxRate: actual.notificationTaxRate,
+    loadSubjectTemplate: mockLoadSubjectTemplate,
     decryptString: vi.fn().mockReturnValue('decrypted'),
     wrapEmailHtml: vi.fn(
       (html: string, _company: string, _wrapper: string | null, _vars: unknown) =>
@@ -133,7 +157,7 @@ vi.mock('@evtivity/lib', async () => {
 });
 
 import { registerAuth } from '../plugins/auth.js';
-import { notificationRoutes } from '../routes/notifications.js';
+import { notificationRoutes, SYSTEM_EVENT_TYPES } from '../routes/notifications.js';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -161,7 +185,14 @@ describe('Notification routes', () => {
 
   beforeEach(() => {
     setupDbResults();
+    mockWriteAudit.mockClear();
   });
+
+  function auditArgs(index = 0): Record<string, unknown> | undefined {
+    return (mockWriteAudit.mock.calls as unknown as unknown[][])[index]?.[1] as
+      | Record<string, unknown>
+      | undefined;
+  }
 
   // --- Auth requirements ---
 
@@ -210,6 +241,10 @@ describe('Notification routes', () => {
     expect(body).toContain('ocpp.TransactionEvent');
     expect(body).toContain('session.Started');
     expect(body).toContain('driver.Welcome');
+    expect(body).toContain('session.EndRequestFailed');
+    for (const event of OCPP_NOTIFICATION_EVENT_TYPES) {
+      expect(body, event).toContain(event);
+    }
   });
 
   it('GET /v1/ocpp-event-settings returns all settings', async () => {
@@ -237,18 +272,21 @@ describe('Notification routes', () => {
   });
 
   it('PUT /v1/ocpp-event-settings upserts a setting', async () => {
-    setupDbResults([
-      {
-        id: '1',
-        eventType: 'station.Connected',
-        recipient: 'admin@test.com',
-        channel: 'email',
-        templateHtml: null,
-        language: null,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
-    ]);
+    setupDbResults(
+      [{ recipient: 'old@test.com', templateHtml: null, language: null }],
+      [
+        {
+          id: '1',
+          eventType: 'station.Connected',
+          recipient: 'admin@test.com',
+          channel: 'email',
+          templateHtml: null,
+          language: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    );
     const response = await app.inject({
       method: 'PUT',
       url: '/ocpp-event-settings',
@@ -258,6 +296,46 @@ describe('Notification routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.eventType).toBe('station.Connected');
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect((mockWriteAudit.mock.calls as unknown as unknown[][])[0]?.[0]).toEqual({
+      table: { _name: 'notificationTemplateAuditLog' },
+      idColumn: 'notification_template_id',
+    });
+    expect(auditArgs()).toMatchObject({
+      entityId: 'station.Connected',
+      entityIdSnapshot: 'station.Connected',
+      action: 'event_settings_changed',
+      actor: 'operator',
+      actorUserId: VALID_USER_ID,
+      before: { setting: 'ocpp', channel: 'email', recipient: 'old@test.com' },
+      after: { setting: 'ocpp', channel: 'email', recipient: 'admin@test.com' },
+    });
+    expect(auditArgs()?.['after']).not.toHaveProperty('templateHtml');
+  });
+
+  it('PUT /v1/ocpp-event-settings writes no audit row when nothing changed', async () => {
+    const row = { recipient: 'admin@test.com', templateHtml: null, language: null };
+    setupDbResults(
+      [row],
+      [
+        {
+          id: '1',
+          eventType: 'station.Connected',
+          channel: 'email',
+          ...row,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/ocpp-event-settings',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { eventType: 'station.Connected', recipient: 'admin@test.com' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 
   it('PUT /v1/ocpp-event-settings validates schema', async () => {
@@ -271,7 +349,9 @@ describe('Notification routes', () => {
   });
 
   it('DELETE /v1/ocpp-event-settings deletes a setting', async () => {
-    setupDbResults([{ id: '1' }]);
+    setupDbResults([
+      { id: '1', channel: 'email', recipient: 'a@test.com', templateHtml: null, language: 'de' },
+    ]);
     const response = await app.inject({
       method: 'DELETE',
       url: '/ocpp-event-settings?eventType=station.Connected&channel=email',
@@ -280,6 +360,12 @@ describe('Notification routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
+    expect(auditArgs()).toMatchObject({
+      entityId: 'station.Connected',
+      action: 'event_settings_changed',
+      before: { setting: 'ocpp', channel: 'email', recipient: 'a@test.com', language: 'de' },
+      after: null,
+    });
   });
 
   it('DELETE /v1/ocpp-event-settings returns 404 when not found', async () => {
@@ -290,6 +376,7 @@ describe('Notification routes', () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(response.statusCode).toBe(404);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 
   it('GET /v1/notifications returns paginated notification history', async () => {
@@ -387,15 +474,18 @@ describe('Notification routes', () => {
   });
 
   it('PUT /v1/driver-event-settings upserts a driver event setting', async () => {
-    setupDbResults([
-      {
-        id: '1',
-        eventType: 'session.Started',
-        isEnabled: true,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
-    ]);
+    setupDbResults(
+      [{ isEnabled: true }],
+      [
+        {
+          id: '1',
+          eventType: 'session.Started',
+          isEnabled: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    );
     const response = await app.inject({
       method: 'PUT',
       url: '/driver-event-settings',
@@ -406,6 +496,72 @@ describe('Notification routes', () => {
     const body = JSON.parse(response.body);
     expect(body.eventType).toBe('session.Started');
     expect(body.isEnabled).toBe(true);
+    // Unchanged: no audit row.
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/driver-event-settings turns a driver event type off', async () => {
+    setupDbResults(
+      [{ isEnabled: true }],
+      [
+        {
+          id: '2',
+          eventType: 'session.Receipt',
+          isEnabled: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/driver-event-settings',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { eventType: 'session.Receipt', isEnabled: false },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).isEnabled).toBe(false);
+    expect(auditArgs()).toMatchObject({
+      entityId: 'session.Receipt',
+      action: 'event_settings_changed',
+      before: { setting: 'driver', isEnabled: true },
+      after: { setting: 'driver', isEnabled: false },
+    });
+  });
+
+  it.each([
+    'driver.ForgotPassword',
+    'driver.AccountVerification',
+    'driver.PortalInvite',
+    'mfa.VerificationCode',
+    'driver.PasswordChanged',
+    'driver.MfaDisabled',
+  ])('PUT /v1/driver-event-settings refuses to turn off %s', async (eventType) => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/driver-event-settings',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { eventType, isEnabled: false },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('NOTIFICATION_EVENT_REQUIRED');
+  });
+
+  it.each([
+    'session.EndRequestFailed',
+    'operator.ForgotPassword',
+    'station.Connected',
+    'x.Unknown',
+  ])('PUT /v1/driver-event-settings refuses the non-driver event type %s', async (eventType) => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/driver-event-settings',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { eventType, isEnabled: false },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 
   it('PUT /v1/driver-event-settings validates schema', async () => {
@@ -453,19 +609,66 @@ describe('Notification routes', () => {
     expect(body.eventType).toBe('station.Connected');
   });
 
+  it('GET /v1/notification-templates returns the subject file in the requested language', async () => {
+    setupDbResults([]);
+    mockLoadSubjectTemplate.mockResolvedValueOnce('{{{companyName}}} - 결제 확인');
+    const response = await app.inject({
+      method: 'GET',
+      url: '/notification-templates?eventType=payment.Complete&channel=email&language=ko',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).subject).toBe('{{{companyName}}} - 결제 확인');
+    const [eventType, language, dirs] = mockLoadSubjectTemplate.mock.calls.at(-1) as [
+      string,
+      string,
+      string[],
+    ];
+    expect(eventType).toBe('payment.Complete');
+    expect(language).toBe('ko');
+    expect(dirs).toHaveLength(2);
+  });
+
+  it('GET /v1/notification-templates never looks up a subject for an unsafe event type', async () => {
+    setupDbResults([]);
+    mockLoadSubjectTemplate.mockClear();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/notification-templates?eventType=..%2F..%2Fetc&channel=email&language=en',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockLoadSubjectTemplate).not.toHaveBeenCalled();
+    expect(JSON.parse(response.body).subject).toBe('{{{companyName}}} - ../../etc Notification');
+  });
+
+  it('GET /v1/notification-templates returns no subject for sms', async () => {
+    setupDbResults([]);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/notification-templates?eventType=payment.Complete&channel=sms&language=ko',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).subject).toBeNull();
+  });
+
   it('PUT /v1/notification-templates upserts a template', async () => {
-    setupDbResults([
-      {
-        id: 1,
-        eventType: 'station.Connected',
-        channel: 'email',
-        language: 'en',
-        subject: 'New Subject',
-        bodyHtml: '<p>New Body</p>',
-        createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
-      },
-    ]);
+    setupDbResults(
+      [{ subject: 'New Subject', bodyHtml: '<p>Old Body</p>' }],
+      [
+        {
+          id: 1,
+          eventType: 'station.Connected',
+          channel: 'email',
+          language: 'en',
+          subject: 'New Subject',
+          bodyHtml: '<p>New Body</p>',
+          createdAt: '2024-01-01T00:00:00.000Z',
+          updatedAt: '2024-01-01T00:00:00.000Z',
+        },
+      ],
+    );
     const response = await app.inject({
       method: 'PUT',
       url: '/notification-templates',
@@ -481,10 +684,17 @@ describe('Notification routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.subject).toBe('New Subject');
+    expect(auditArgs()).toMatchObject({
+      entityId: 'station.Connected',
+      action: 'updated',
+      before: { channel: 'email', language: 'en', bodyHtml: '<p>Old Body</p>' },
+      after: { channel: 'email', language: 'en', bodyHtml: '<p>New Body</p>' },
+    });
+    expect(auditArgs()?.['after']).not.toHaveProperty('subject');
   });
 
   it('DELETE /v1/notification-templates deletes a template', async () => {
-    setupDbResults([]);
+    setupDbResults([{ subject: 'S', bodyHtml: '<p>B</p>' }]);
     const response = await app.inject({
       method: 'DELETE',
       url: '/notification-templates?eventType=station.Connected&channel=email&language=en',
@@ -493,6 +703,23 @@ describe('Notification routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
+    expect(auditArgs()).toMatchObject({
+      entityId: 'station.Connected',
+      action: 'deleted',
+      before: { channel: 'email', language: 'en', subject: 'S', bodyHtml: '<p>B</p>' },
+      after: null,
+    });
+  });
+
+  it('DELETE /v1/notification-templates writes no audit row when no template was stored', async () => {
+    setupDbResults([]);
+    const response = await app.inject({
+      method: 'DELETE',
+      url: '/notification-templates?eventType=station.Connected&channel=email&language=en',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 
   it('POST /v1/notification-templates/preview returns rendered template', async () => {
@@ -524,6 +751,30 @@ describe('Notification routes', () => {
     expect(body).toHaveProperty('bodyHtml');
     // Subject should be rendered with Handlebars
     expect(body.subject).toContain('TestCo');
+  });
+
+  it('POST /v1/notification-templates/preview formats sample money in the template language', async () => {
+    setupDbResults(
+      [{ value: 'TestCo' }],
+      [{ value: null }],
+      [{ value: 'EUR' }],
+      [{ key: 'company.name', value: 'TestCo' }],
+    );
+    const response = await app.inject({
+      method: 'POST',
+      url: '/notification-templates/preview',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        eventType: 'payment.Complete',
+        channel: 'sms',
+        language: 'de',
+        bodyHtml:
+          'Bezahlt: {{amountFormatted}} ({{amountCents}} {{currency}}), {{taxRatePercent}} %',
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body) as { bodyHtml: string };
+    expect(body.bodyHtml).toMatch(/^Bezahlt: 12,50\s€ \(1250 [A-Z]{3}\), 19 %$/);
   });
 
   it('POST /v1/notification-templates/preview renders if/else blocks used by shipped templates', async () => {
@@ -577,7 +828,7 @@ describe('Notification routes', () => {
       payload: {
         eventType: 'station.Connected',
         channel: 'email',
-        recipient: '$admin',
+        recipient: 'admin@test.com',
         templateHtml: '{{#each items}}x{{/each}}',
       },
     });
@@ -684,5 +935,65 @@ describe('Notification routes', () => {
     expect(response.statusCode).toBe(404);
     const body = JSON.parse(response.body);
     expect(body.code).toBe('TEMPLATE_NOT_FOUND');
+  });
+});
+
+describe('notification event type lists', () => {
+  // report.Scheduled is the scheduled report email the worker renders; it is not a notification event.
+  const NOT_NOTIFICATION_EVENTS = new Set(['report.Scheduled']);
+
+  // Driver and system templates ship in the api and ocpp packages. OCPP and station events
+  // are listed in OCPP_EVENT_TYPES.
+  const TEMPLATE_ROOTS = ['../templates', '../../../ocpp/src/templates'];
+  const OCPP_FAMILIES = new Set(['ocpp', 'station']);
+
+  function templateEventTypes(language: string): string[] {
+    return TEMPLATE_ROOTS.flatMap((root) => {
+      const dir = fileURLToPath(new URL(`${root}/${language}`, import.meta.url));
+      return readdirSync(dir, { withFileTypes: true })
+        .filter((family) => family.isDirectory() && !OCPP_FAMILIES.has(family.name))
+        .flatMap((family) =>
+          readdirSync(`${dir}/${family.name}`, { withFileTypes: true })
+            .filter((event) => event.isDirectory())
+            .map((event) => `${family.name}.${event.name}`),
+        );
+    });
+  }
+
+  it('lists every event with shipped templates in exactly one list', () => {
+    for (const language of ['en', 'de', 'es', 'ko', 'zh', 'zh-TW']) {
+      for (const event of templateEventTypes(language)) {
+        if (NOT_NOTIFICATION_EVENTS.has(event)) continue;
+        const count =
+          DRIVER_EVENT_TYPES.filter((e) => e === event).length +
+          SYSTEM_EVENT_TYPES.filter((e) => e === event).length;
+        expect(count, `${language}: ${event}`).toBe(1);
+      }
+    }
+  });
+
+  function ocppTemplateEventTypes(language: string): string[] {
+    const dir = fileURLToPath(new URL(`../../../ocpp/src/templates/${language}`, import.meta.url));
+    return [...OCPP_FAMILIES].flatMap((family) =>
+      readdirSync(`${dir}/${family}`, { withFileTypes: true })
+        .filter((event) => event.isDirectory())
+        .map((event) => `${family}.${event.name}`),
+    );
+  }
+
+  it('lists every OCPP and station event with shipped templates in the OCPP list, and only those', () => {
+    const listed: readonly string[] = OCPP_NOTIFICATION_EVENT_TYPES;
+    for (const language of ['en', 'de', 'es', 'ko', 'zh', 'zh-TW']) {
+      expect([...ocppTemplateEventTypes(language)].sort(), language).toEqual([...listed].sort());
+    }
+  });
+
+  it('keeps operator and site host events out of the driver list', () => {
+    for (const event of DRIVER_EVENT_TYPES) {
+      expect(event).not.toMatch(/^(operator|site)\./);
+    }
+    for (const event of SYSTEM_EVENT_TYPES) {
+      expect(event).not.toMatch(/^(driver|payment|token|watch|maintenance|mfa)\./);
+    }
   });
 });

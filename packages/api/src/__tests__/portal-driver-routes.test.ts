@@ -50,6 +50,12 @@ function makeChain() {
 }
 
 vi.mock('@evtivity/database', () => ({
+  writeAudit: vi.fn(() => Promise.resolve()),
+  userAuditLog: { _table: 'user_audit_log' },
+  driverAuditLog: { _table: 'driver_audit_log' },
+  stationAuditLog: { _table: 'station_audit_log' },
+  sessionAuditLog: { _table: 'session_audit_log' },
+  apiKeyAuditLog: { _table: 'api_key_audit_log' },
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -101,17 +107,17 @@ vi.mock('@evtivity/lib', () => ({
   generateTotpUri: vi.fn().mockReturnValue('otpauth://totp/test'),
   verifyTotpCode: vi.fn().mockReturnValue(true),
   createMfaChallenge: vi.fn().mockResolvedValue({ challengeId: 1, code: '123456' }),
-  verifyMfaChallenge: vi.fn().mockResolvedValue(true),
+  verifyMfaChallenge: vi.fn().mockResolvedValue('verified'),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
   })),
 }));
 
-vi.mock('../lib/template-dirs.js', () => ({
+vi.mock('@evtivity/services/template-dirs', () => ({
   ALL_TEMPLATES_DIRS: ['/mock/templates'],
   API_TEMPLATES_DIR: '/mock/templates',
   OCPP_TEMPLATES_DIR: '/mock/templates',
@@ -122,8 +128,27 @@ vi.mock('../services/refresh-token.service.js', () => ({
   createRefreshToken: vi.fn().mockResolvedValue({ rawToken: 'mock', expiresAt: new Date() }),
 }));
 
+const { updateDriverBillingAddressMock } = vi.hoisted(() => ({
+  updateDriverBillingAddressMock: vi.fn(),
+}));
+
+vi.mock('../services/driver-billing.service.js', () => ({
+  DRIVER_BILLING_ADDRESS_MAX_LENGTHS: {
+    billingName: 255,
+    billingStreet: 255,
+    billingCity: 100,
+    billingState: 100,
+    billingZip: 20,
+    billingCountry: 100,
+  },
+  updateDriverBillingAddress: updateDriverBillingAddressMock,
+}));
+
 import { registerAuth } from '../plugins/auth.js';
 import { portalDriverRoutes } from '../routes/portal/driver.js';
+import * as argon2Module from 'argon2';
+import * as databaseModule from '@evtivity/database';
+import { writeAudit } from '@evtivity/database';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -152,6 +177,7 @@ describe('Portal driver routes - handler logic', () => {
 
   beforeEach(() => {
     setupDbResults();
+    vi.mocked(databaseModule.writeAudit).mockClear();
   });
 
   describe('PATCH /v1/portal/driver/profile', () => {
@@ -198,10 +224,12 @@ describe('Portal driver routes - handler logic', () => {
         timezone: 'America/New_York',
         themePreference: 'light',
         distanceUnit: 'miles',
+        priceDisplay: null,
         isActive: true,
         createdAt: '2024-01-01',
       };
-      setupDbResults([updatedDriver]);
+      // The row before the update, then the updated row.
+      setupDbResults([{ ...updatedDriver, firstName: 'John', phone: null }], [updatedDriver]);
       const response = await app.inject({
         method: 'PATCH',
         url: '/portal/driver/profile',
@@ -212,24 +240,54 @@ describe('Portal driver routes - handler logic', () => {
       const body = response.json();
       expect(body.firstName).toBe('Jane');
       expect(body.phone).toBe('555-9999');
+      // Audited with the changed fields only, the driver as actor.
+      expect(vi.mocked(databaseModule.writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'driver_id' }),
+        expect.objectContaining({
+          entityId: DRIVER_ID,
+          action: 'updated',
+          actor: 'driver',
+          actorDriverId: DRIVER_ID,
+          before: { firstName: 'John', phone: null },
+          after: { firstName: 'Jane', phone: '555-9999' },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it('accepts language update', async () => {
-      setupDbResults([
-        {
-          id: DRIVER_ID,
-          firstName: 'John',
-          lastName: 'Doe',
-          email: 'john@example.com',
-          phone: null,
-          language: 'es',
-          timezone: 'America/New_York',
-          themePreference: 'light',
-          distanceUnit: 'miles',
-          isActive: true,
-          createdAt: '2024-01-01',
-        },
-      ]);
+      // The stored row already holds every value sent.
+      setupDbResults(
+        [
+          {
+            firstName: 'John',
+            lastName: 'Doe',
+            phone: null,
+            language: 'es',
+            timezone: 'America/New_York',
+            themePreference: 'light',
+            distanceUnit: 'miles',
+            priceDisplay: null,
+          },
+        ],
+        [
+          {
+            id: DRIVER_ID,
+            firstName: 'John',
+            lastName: 'Doe',
+            email: 'john@example.com',
+            phone: null,
+            language: 'es',
+            timezone: 'America/New_York',
+            themePreference: 'light',
+            distanceUnit: 'miles',
+            priceDisplay: null,
+            isActive: true,
+            createdAt: '2024-01-01',
+          },
+        ],
+      );
       const response = await app.inject({
         method: 'PATCH',
         url: '/portal/driver/profile',
@@ -238,6 +296,107 @@ describe('Portal driver routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().language).toBe('es');
+      // Nothing changed: no audit row.
+      expect(vi.mocked(databaseModule.writeAudit)).not.toHaveBeenCalled();
+    });
+    it('stores the price display and clears it with null', async () => {
+      const driverRow = {
+        id: DRIVER_ID,
+        firstName: 'John',
+        lastName: 'Doe',
+        email: 'john@example.com',
+        phone: null,
+        language: 'de',
+        timezone: 'Europe/Berlin',
+        themePreference: 'light',
+        distanceUnit: 'km',
+        isActive: true,
+        createdAt: '2024-01-01',
+      };
+      setupDbResults(
+        [{ ...driverRow, priceDisplay: null }],
+        [{ ...driverRow, priceDisplay: 'gross' }],
+      );
+      const gross = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/profile',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { priceDisplay: 'gross' },
+      });
+      expect(gross.statusCode).toBe(200);
+      expect(gross.json().priceDisplay).toBe('gross');
+
+      setupDbResults(
+        [{ ...driverRow, priceDisplay: 'gross' }],
+        [{ ...driverRow, priceDisplay: null }],
+      );
+      const inherit = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/profile',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { priceDisplay: null },
+      });
+      expect(inherit.statusCode).toBe(200);
+      expect(inherit.json().priceDisplay).toBeNull();
+    });
+
+    it('rejects an unknown price display', async () => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/profile',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { priceDisplay: 'brutto' },
+      });
+      expect(response.statusCode).toBe(400);
+    });
+  });
+
+  describe('PATCH /v1/portal/driver/billing-address', () => {
+    it('returns 401 without token', async () => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/billing-address',
+        payload: { billingCity: 'Berlin' },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(updateDriverBillingAddressMock).not.toHaveBeenCalled();
+    });
+
+    it('updates the address of the signed-in driver as the driver', async () => {
+      const address = {
+        billingName: 'Erika Muster',
+        billingStreet: null,
+        billingCity: 'Berlin',
+        billingState: null,
+        billingZip: null,
+        billingCountry: null,
+      };
+      updateDriverBillingAddressMock.mockResolvedValueOnce(address);
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/billing-address',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { billingName: 'Erika Muster', billingCity: 'Berlin' },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual(address);
+      expect(updateDriverBillingAddressMock).toHaveBeenCalledWith(
+        DRIVER_ID,
+        { billingName: 'Erika Muster', billingCity: 'Berlin' },
+        expect.objectContaining({
+          actor: expect.objectContaining({ actor: 'driver', actorDriverId: DRIVER_ID }),
+        }),
+      );
+    });
+
+    it('rejects a field longer than its column', async () => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/portal/driver/billing-address',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { billingCountry: 'x'.repeat(101) },
+      });
+      expect(response.statusCode).toBe(400);
     });
   });
 
@@ -276,7 +435,7 @@ describe('Portal driver routes - handler logic', () => {
     });
 
     it('returns 400 when current password is incorrect', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(false);
 
       setupDbResults([{ passwordHash: '$argon2id$hashed' }]);
@@ -291,7 +450,7 @@ describe('Portal driver routes - handler logic', () => {
     });
 
     it('changes password successfully', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(true);
 
       setupDbResults([{ passwordHash: '$argon2id$hashed' }], []);
@@ -303,6 +462,13 @@ describe('Portal driver routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().success).toBe(true);
+      expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'driver_id' }),
+        expect.objectContaining({ entityId: DRIVER_ID, action: 'password_reset', actor: 'driver' }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(JSON.stringify(vi.mocked(writeAudit).mock.calls)).not.toContain('NewPassword1');
     });
 
     it('returns 400 when new password is too short', async () => {
@@ -390,6 +556,43 @@ describe('Portal driver routes - handler logic', () => {
       const body = response.json();
       expect(body.emailEnabled).toBe(false);
       expect(body.smsEnabled).toBe(true);
+    });
+
+    it('audits the changed channels against the defaults when no row is stored', async () => {
+      setupDbResults([], []);
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/portal/driver/notification-preferences',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { emailEnabled: false, smsEnabled: true },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+        expect.objectContaining({ idColumn: 'driver_id' }),
+        expect.objectContaining({
+          entityId: DRIVER_ID,
+          action: 'updated',
+          actor: 'driver',
+          before: { notificationPreferences: { emailEnabled: true } },
+          after: { notificationPreferences: { emailEnabled: false } },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('writes no audit row when the preferences do not change', async () => {
+      setupDbResults([{ emailEnabled: true, smsEnabled: true, pushEnabled: false }], []);
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/portal/driver/notification-preferences',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: { emailEnabled: true, smsEnabled: true },
+      });
+      expect(response.statusCode).toBe(200);
+      // The stored push choice is kept, not reset.
+      expect(response.json().pushEnabled).toBe(false);
+      expect(vi.mocked(writeAudit)).not.toHaveBeenCalled();
     });
 
     it('returns 400 when smsEnabled is missing', async () => {

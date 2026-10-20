@@ -14,6 +14,7 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  foreignKey,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { chargingStations } from './assets.js';
@@ -42,6 +43,9 @@ export const firmwareUpdateStatusEnum = pgEnum('firmware_update_status', [
   'InstallVerificationFailed',
   'InvalidSignature',
   'SignatureVerified',
+  // CSMS-side: the station never started the update (refused, command error,
+  // queued command expired). status_info.reasonCode says which.
+  'Rejected',
 ]);
 
 export const logUploadStatusEnum = pgEnum('log_upload_status', [
@@ -172,11 +176,16 @@ export const stationConfigurations = pgTable(
   },
   (table) => [
     index('idx_station_configurations_station_id').on(table.stationId),
-    uniqueIndex('uq_station_configurations_composite').using(
+    // One row per OCPP 2.1 component/variable identity: component instance and
+    // variable instance are part of it (DeviceDataCtrlr.ItemsPerMessage[GetReport]
+    // and [GetVariables] are different variables).
+    uniqueIndex('uq_station_configurations_identity').using(
       'btree',
       table.stationId,
       table.component,
+      sql`COALESCE(instance, '')`,
       table.variable,
+      sql`COALESCE(variable_instance, '')`,
       sql`COALESCE(evse_id, -1)`,
       sql`COALESCE(connector_id, -1)`,
       table.attributeType,
@@ -267,6 +276,8 @@ export const evChargingNeeds = pgTable(
     requestedEnergyTransfer: varchar('requested_energy_transfer', { length: 50 }),
     controlMode: varchar('control_mode', { length: 50 }),
     maxScheduleTuples: integer('max_schedule_tuples'),
+    /** The TxProfile the CSMS sent for these needs (SetChargingProfile payload), or null. */
+    csmsChargingProfile: jsonb('csms_charging_profile'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -286,6 +297,8 @@ export const evChargingSchedules = pgTable(
     evseId: integer('evse_id').notNull(),
     timeBase: timestamp('time_base', { withTimezone: true }),
     chargingSchedule: jsonb('charging_schedule').notNull(),
+    /** The CSMS check of the schedule against its own (K15.FR.11/12); null when not checked. */
+    withinLimits: boolean('within_limits'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('idx_ev_charging_schedules_station_id').on(table.stationId)],
@@ -326,6 +339,8 @@ export const variableMonitoringRules = pgTable(
 
 // --- Offline Command Queue ---
 
+// Keyed by the OCPP station id (charging_stations.station_id): deleting a station
+// deletes its queued commands, and a station id change carries them along.
 export const offlineCommandQueue = pgTable(
   'offline_command_queue',
   {
@@ -342,6 +357,13 @@ export const offlineCommandQueue = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    foreignKey({
+      name: 'offline_command_queue_station_id_fk',
+      columns: [table.stationId],
+      foreignColumns: [chargingStations.stationId],
+    })
+      .onDelete('cascade')
+      .onUpdate('cascade'),
     index('idx_offline_cmd_queue_station_id').on(table.stationId),
     index('idx_offline_cmd_queue_status').on(table.status),
     index('idx_offline_cmd_queue_expires_at').on(table.expiresAt),
@@ -379,20 +401,6 @@ export const periodicEventStreams = pgTable(
   (table) => [index('idx_periodic_event_streams_station').on(table.stationId)],
 );
 
-export const qrScanEvents = pgTable(
-  'qr_scan_events',
-  {
-    id: serial('id').primaryKey(),
-    stationId: text('station_id')
-      .notNull()
-      .references(() => chargingStations.id, { onDelete: 'cascade' }),
-    evseId: integer('evse_id'),
-    timeout: integer('timeout'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (table) => [index('idx_qr_scan_events_station').on(table.stationId)],
-);
-
 // -- OCPP 2.1 additional stub persistence tables --
 
 export const vatNumberValidations = pgTable(
@@ -407,20 +415,6 @@ export const vatNumberValidations = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index('idx_vat_number_validations_station').on(table.stationId)],
-);
-
-export const webPaymentEvents = pgTable(
-  'web_payment_events',
-  {
-    id: serial('id').primaryKey(),
-    stationId: text('station_id')
-      .notNull()
-      .references(() => chargingStations.id, { onDelete: 'cascade' }),
-    evseId: integer('evse_id'),
-    timeout: integer('timeout'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (table) => [index('idx_web_payment_events_station').on(table.stationId)],
 );
 
 export const allowedEnergyTransferEvents = pgTable(
@@ -494,7 +488,7 @@ export const eventAlertRules = pgTable(
     minSeverity: integer('min_severity').notNull().default(0),
     isEnabled: boolean('is_enabled').notNull().default(true),
     notifyChannel: varchar('notify_channel', { length: 50 }).notNull().default('email'),
-    notifyRecipient: varchar('notify_recipient', { length: 500 }).notNull().default('$admin'),
+    notifyRecipient: varchar('notify_recipient', { length: 500 }).notNull().default(''),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

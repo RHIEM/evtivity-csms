@@ -13,6 +13,7 @@ import { Label } from '@/components/ui/label';
 import { Combobox } from '@/components/ui/combobox';
 import { Card, CardContent } from '@/components/ui/card';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
+import { normalizeEvccid } from '@evtivity/lib/vehicle-id';
 import { getErrorMessage } from '@/lib/error-message';
 
 interface VehicleLookup {
@@ -46,6 +47,7 @@ export function VehicleCreate(): React.JSX.Element {
   const [year, setYear] = useState('');
   const [vin, setVin] = useState('');
   const [licensePlate, setLicensePlate] = useState('');
+  const [evccid, setEvccid] = useState('');
   const [hasSubmitted, setHasSubmitted] = useState(false);
 
   const { data: lookup } = useQuery({
@@ -68,6 +70,7 @@ export function VehicleCreate(): React.JSX.Element {
       year?: string;
       vin?: string;
       licensePlate?: string;
+      evccid?: string;
     }) => api.post<Vehicle>(`/v1/drivers/${id ?? ''}/vehicles`, body),
     onSuccess: (created) => {
       void queryClient.invalidateQueries({ queryKey: ['drivers', id ?? '', 'vehicles'] });
@@ -85,6 +88,9 @@ export function VehicleCreate(): React.JSX.Element {
     if (vin.trim() !== '' && !/^[A-HJ-NPR-Z0-9]{17}$/i.test(vin.trim())) {
       errors.vin = t('vehicles.vinFormat');
     }
+    if (evccid.trim() !== '' && normalizeEvccid(evccid) == null) {
+      errors.evccid = t('vehicles.evccidFormat');
+    }
     return errors;
   }
 
@@ -100,10 +106,12 @@ export function VehicleCreate(): React.JSX.Element {
       year?: string;
       vin?: string;
       licensePlate?: string;
+      evccid?: string;
     } = { make, model };
     if (year.trim() !== '') body.year = year;
     if (vin.trim() !== '') body.vin = vin;
     if (licensePlate.trim() !== '') body.licensePlate = licensePlate;
+    if (evccid.trim() !== '') body.evccid = evccid.trim();
     createMutation.mutate(body);
   }
 
@@ -119,7 +127,9 @@ export function VehicleCreate(): React.JSX.Element {
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="vehicle-make">{t('vehicles.make')}</Label>
+                <Label htmlFor="vehicle-make" className="leading-6">
+                  {t('vehicles.make')}
+                </Label>
                 <Combobox
                   id="vehicle-make"
                   value={make}
@@ -132,7 +142,9 @@ export function VehicleCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="vehicle-model">{t('vehicles.model')}</Label>
+                <Label htmlFor="vehicle-model" className="leading-6">
+                  {t('vehicles.model')}
+                </Label>
                 <Combobox
                   id="vehicle-model"
                   value={model}
@@ -145,7 +157,9 @@ export function VehicleCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="vehicle-year">{t('vehicles.year')}</Label>
+                <Label htmlFor="vehicle-year" className="leading-6">
+                  {t('vehicles.year')}
+                </Label>
                 <Combobox
                   id="vehicle-year"
                   value={year}
@@ -162,7 +176,9 @@ export function VehicleCreate(): React.JSX.Element {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="vehicle-vin">{t('vehicles.vin')}</Label>
+                <Label htmlFor="vehicle-vin" className="leading-6">
+                  {t('vehicles.vin')}
+                </Label>
                 <Input
                   id="vehicle-vin"
                   value={vin}
@@ -177,7 +193,9 @@ export function VehicleCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="vehicle-plate">{t('vehicles.licensePlate')}</Label>
+                <Label htmlFor="vehicle-plate" className="leading-6">
+                  {t('vehicles.licensePlate')}
+                </Label>
                 <Input
                   id="vehicle-plate"
                   value={licensePlate}
@@ -185,6 +203,24 @@ export function VehicleCreate(): React.JSX.Element {
                     setLicensePlate(e.target.value);
                   }}
                 />
+              </div>
+              <div className="space-y-2 md:col-span-2">
+                <Label htmlFor="vehicle-evccid" className="leading-6">
+                  {t('vehicles.evccid')}
+                </Label>
+                <Input
+                  id="vehicle-evccid"
+                  value={evccid}
+                  onChange={(e) => {
+                    setEvccid(e.target.value);
+                  }}
+                  maxLength={255}
+                  className={hasSubmitted && errors.evccid ? 'border-destructive' : ''}
+                />
+                <p className="text-xs text-muted-foreground">{t('vehicles.evccidHelp')}</p>
+                {hasSubmitted && errors.evccid && (
+                  <p className="text-sm text-destructive">{errors.evccid}</p>
+                )}
               </div>
             </div>
             {createMutation.isError && Object.keys(errors).length === 0 && (

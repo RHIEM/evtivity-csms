@@ -4,14 +4,18 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../config.js';
 import { settings } from '../schema/settings.js';
+import { createLogger } from '@evtivity/lib';
+
+const logger = createLogger('pnc-setting');
 
 let cachedValue: boolean | undefined;
 let cachedAt = 0;
-const TTL_MS = 60_000;
+/** How long each process caches the pnc.* settings it reads (pnc.enabled, the OCSP host allowlist). */
+export const PNC_SETTINGS_CACHE_TTL_MS = 60_000;
 
 export async function isPncEnabled(): Promise<boolean> {
   const now = Date.now();
-  if (cachedValue !== undefined && now - cachedAt < TTL_MS) {
+  if (cachedValue !== undefined && now - cachedAt < PNC_SETTINGS_CACHE_TTL_MS) {
     return cachedValue;
   }
 
@@ -24,15 +28,56 @@ export async function isPncEnabled(): Promise<boolean> {
     cachedValue = row != null && row.value === true;
     cachedAt = now;
     return cachedValue;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'pnc.enabled' },
+      'isPncEnabled failed, using the cached value or default',
+    );
     return cachedValue ?? false;
   }
 }
 
-/** Invalidate the cached pnc.enabled flag. Call after PUT /v1/pnc/settings
- * so OCPP authorize handlers and other readers do not keep returning the
- * stale value for up to 60 seconds after an operator flip. */
+let cachedAllowedHosts: string[] | undefined;
+let allowedHostsCachedAt = 0;
+
+/**
+ * Hosts the CSMS may contact for OCSP although they are private or internal
+ * addresses (`pnc.ocsp.allowedPrivateHosts`, lowercased). Empty when unset.
+ */
+export async function getOcspAllowedPrivateHosts(): Promise<string[]> {
+  const now = Date.now();
+  if (cachedAllowedHosts !== undefined && now - allowedHostsCachedAt < PNC_SETTINGS_CACHE_TTL_MS) {
+    return cachedAllowedHosts;
+  }
+
+  try {
+    const [row] = await db
+      .select({ value: settings.value })
+      .from(settings)
+      .where(eq(settings.key, 'pnc.ocsp.allowedPrivateHosts'));
+
+    const value = row?.value;
+    cachedAllowedHosts = Array.isArray(value)
+      ? value.filter((h): h is string => typeof h === 'string').map((h) => h.toLowerCase())
+      : [];
+    allowedHostsCachedAt = now;
+    return cachedAllowedHosts;
+  } catch (err) {
+    logger.warn(
+      { err, key: 'pnc.ocsp.allowedPrivateHosts' },
+      'getOcspAllowedPrivateHosts failed, using the cached value or default',
+    );
+    return cachedAllowedHosts ?? [];
+  }
+}
+
+/** Invalidate the cached PnC settings (pnc.enabled and the OCSP host
+ * allowlist). Call after PUT /v1/pnc/settings so OCPP handlers and other
+ * readers do not keep returning the stale value for up to 60 seconds after an
+ * operator change. */
 export function clearPncSettingsCache(): void {
   cachedValue = undefined;
   cachedAt = 0;
+  cachedAllowedHosts = undefined;
+  allowedHostsCachedAt = 0;
 }

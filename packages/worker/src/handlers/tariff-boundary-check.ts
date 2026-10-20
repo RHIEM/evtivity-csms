@@ -1,20 +1,25 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { eq, and, isNull, isNotNull, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import {
   db,
+  client,
   chargingSessions,
   chargingStations,
-  sessionTariffSegments,
+  getHeartbeatIntervalSeconds,
   isSplitBillingEnabled,
   isStationMessageEnabled,
+  priceSessionAt,
+  resolveStationTariff,
+  sendSessionTariffChange,
+  storeRunningCost,
+  switchTariffSegment,
 } from '@evtivity/database';
 import type { Logger } from 'pino';
-import crypto from 'node:crypto';
-import { getPubSub } from '@evtivity/api/src/lib/pubsub.js';
-import { resolveTariff } from '@evtivity/api/src/services/tariff.service.js';
-import { pushAllMessagesToAllStations } from '@evtivity/api/src/services/station-message.service.js';
+import { isStationLiveForSegmentSwitch, isTariffFree, publishOcppCommand } from '@evtivity/lib';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { pushAllMessagesToAllStations } from '@evtivity/services/station-message.service';
 
 export async function tariffBoundaryCheckHandler(log: Logger): Promise<void> {
   const [splitBilling, pushDisplay] = await Promise.all([
@@ -34,102 +39,125 @@ export async function tariffBoundaryCheckHandler(log: Logger): Promise<void> {
         stationUuid: chargingSessions.stationId,
         driverId: chargingSessions.driverId,
         tariffId: chargingSessions.tariffId,
+        // The group the session started in (B7); a session a release before
+        // 0340 started has none, so its tariff's group is read.
+        pricingGroupId: sql<string | null>`COALESCE(${chargingSessions.pricingGroupId},
+          (SELECT t.pricing_group_id FROM tariffs t WHERE t.id = ${chargingSessions.tariffId}))`,
+        tariffPricePerKwh: chargingSessions.tariffPricePerKwh,
+        tariffPricePerMinute: chargingSessions.tariffPricePerMinute,
+        tariffPricePerSession: chargingSessions.tariffPricePerSession,
+        tariffIdleFeePricePerMinute: chargingSessions.tariffIdleFeePricePerMinute,
+        tariffReservationFeePerMinute: chargingSessions.tariffReservationFeePerMinute,
+        tariffTaxRate: chargingSessions.tariffTaxRate,
         energyDeliveredWh: chargingSessions.energyDeliveredWh,
-        idleMinutes: chargingSessions.idleMinutes,
-        currentCostCents: chargingSessions.currentCostCents,
         stationOcppId: chargingStations.stationId,
         ocppProtocol: chargingStations.ocppProtocol,
+        stationOnline: chargingStations.isOnline,
+        stationLastActivityAt: chargingStations.lastHeartbeat,
       })
       .from(chargingSessions)
       .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
       .where(eq(chargingSessions.status, 'active'));
 
     const pubsub = getPubSub();
+    const heartbeatSeconds = await getHeartbeatIntervalSeconds();
 
     // Per-session body has internal sequencing (resolve tariff -> close
-    // segment -> open segment -> snapshot -> publish), but every session is
+    // segment -> open segment -> publish), but every session is
     // independent of every other. The previous serial loop spent (~5 DB
     // queries) * N sessions of wall time per minute; at N=500 this saturates
     // the worker's DB pool. Batch the sessions and run each batch with
     // Promise.allSettled so one session's failure doesn't stop the cron tick.
     const processSession = async (session: (typeof activeSessions)[number]): Promise<void> => {
-      const currentTariff = await resolveTariff(session.stationUuid, session.driverId);
-      if (currentTariff == null || currentTariff.id === session.tariffId) return;
-
-      const energyWh = session.energyDeliveredWh != null ? Number(session.energyDeliveredWh) : 0;
-      const sessionIdleMins = Number(session.idleMinutes);
-
-      // session.idleMinutes is the WHOLE-session idle accumulator, not a
-      // per-segment delta. Subtract whatever was already attributed to
-      // closed segments so each segment carries only the idle that occurred
-      // inside its own window. Without this, sessions that cross multiple
-      // tariff boundaries inflate the per-segment idle column on every
-      // additional close (segment 1 holds idle@T1, segment 2 holds idle@T2
-      // which already includes segment 1's portion, etc.). The final
-      // invoice is unaffected (event-projections.ts overrides per-segment
-      // idle to zero except the last segment when it recomputes total
-      // cost) but per-segment cost reports and dispute audits would read
-      // inflated values from this column.
-      const [closedIdleAgg] = await db
-        .select({
-          total: sql<string>`COALESCE(SUM(${sessionTariffSegments.idleMinutes}), 0)`,
+      // An offline or silent station may be queueing readings and its end:
+      // they switch and end the segments at their own timestamps when they
+      // arrive (finding B6), so the job does not switch at wall clock.
+      if (
+        !isStationLiveForSegmentSwitch({
+          isOnline: session.stationOnline,
+          lastActivityAt: session.stationLastActivityAt,
+          now,
+          heartbeatSeconds,
         })
-        .from(sessionTariffSegments)
-        .where(
-          and(
-            eq(sessionTariffSegments.sessionId, session.sessionId),
-            isNotNull(sessionTariffSegments.endedAt),
-          ),
-        );
-      const closedIdleMins = Number(closedIdleAgg?.total ?? 0);
-      const segmentIdleMins = Math.max(0, sessionIdleMins - closedIdleMins);
+      ) {
+        return;
+      }
+      // A session without a tariff at its start has no pricing group and
+      // stays unpriced (an assignment applies to the next session).
+      if (session.pricingGroupId == null) return;
+      const energyWh = session.energyDeliveredWh != null ? Number(session.energyDeliveredWh) : 0;
+      // The session's energy so far selects an energy-threshold tariff once
+      // the threshold is crossed. Only within the pricing group the session
+      // started in (B7).
+      const currentTariff = await resolveStationTariff(
+        {
+          stationUuid: session.stationUuid,
+          driverUuid: session.driverId,
+          at: now,
+          sessionEnergyKwh: energyWh / 1000,
+          pricingGroupId: session.pricingGroupId,
+        },
+        client,
+      );
+      if (currentTariff == null) return;
 
-      // Wrap close-open-snapshot in a transaction so a transient failure
-      // (e.g. close succeeds, open fails) doesn't leave the session with no
-      // open segment while the tariff snapshot still points at the old
-      // tariff. The next cron tick still self-heals via the same path, but
-      // the transaction keeps each tick's segments and snapshot consistent.
-      await db.transaction(async (tx) => {
-        await tx
-          .update(sessionTariffSegments)
-          .set({
-            endedAt: now,
-            energyWhEnd: String(energyWh),
-            durationMinutes: sql`EXTRACT(EPOCH FROM (NOW() - started_at)) / 60`,
-            idleMinutes: String(segmentIdleMins),
-          })
-          .where(
-            and(
-              eq(sessionTariffSegments.sessionId, session.sessionId),
-              isNull(sessionTariffSegments.endedAt),
-            ),
-          );
-
-        await tx.insert(sessionTariffSegments).values({
-          sessionId: session.sessionId,
-          tariffId: currentTariff.id,
-          startedAt: now,
-          energyWhStart: String(energyWh),
-        });
-
-        await tx
-          .update(chargingSessions)
-          .set({
-            tariffId: currentTariff.id,
-            tariffPricePerKwh: currentTariff.pricePerKwh,
-            tariffPricePerMinute: currentTariff.pricePerMinute,
-            tariffPricePerSession: currentTariff.pricePerSession,
-            tariffIdleFeePricePerMinute: currentTariff.idleFeePricePerMinute,
-            tariffTaxRate: currentTariff.taxRate,
-            updatedAt: sql`now()`,
-          })
-          .where(eq(chargingSessions.id, session.sessionId));
+      // Under the session row lock: close the open segment (compare-and-set
+      // on its id, with the session idle not yet attributed to closed
+      // segments) and open one priced from the new tariff. Nothing changes
+      // when the open segment already has this tariff, which is also what a
+      // MeterValues projection that switched first leaves (finding B1). The
+      // session's own tariff snapshot stays the one it started with.
+      const switched = await switchTariffSegment(client, {
+        sessionId: session.sessionId,
+        tariff: currentTariff,
+        at: now,
+        energyWh,
       });
+      if (switched == null) return;
+
+      // A station that calculates the cost locally gets the tariff that
+      // applies from now, unless its tariff already describes it (I11).
+      await sendSessionTariffChange(client, pubsub, {
+        sessionId: session.sessionId,
+        at: now,
+        energyWh,
+      });
+
+      // A session that started free and moved to a paid tariff needs the
+      // payment gate (B3), which runs in the OCPP projection: the mark is
+      // written here (P4) and the next meter reading runs the gate.
+      const startTariff =
+        session.tariffId != null
+          ? {
+              id: session.tariffId,
+              pricePerKwh: session.tariffPricePerKwh,
+              pricePerMinute: session.tariffPricePerMinute,
+              pricePerSession: session.tariffPricePerSession,
+              idleFeePricePerMinute: session.tariffIdleFeePricePerMinute,
+              reservationFeePerMinute: session.tariffReservationFeePerMinute,
+              taxRate: session.tariffTaxRate,
+            }
+          : null;
+      if (isTariffFree(startTariff) && !isTariffFree(currentTariff)) {
+        await db
+          .update(chargingSessions)
+          .set({ paymentGateDueAt: now })
+          .where(eq(chargingSessions.id, session.sessionId));
+      }
+
+      // The running cost at the boundary, from the one cost assembly, stored
+      // with its split and sent to the station below. storeRunningCost writes
+      // active sessions only: false means the session ended meanwhile, and its
+      // final cost (already sent with the Ended response) is not overwritten
+      // on the station by a stale CostUpdated.
+      const breakdown = await priceSessionAt(client, session.sessionId, now, energyWh);
+      const stored =
+        breakdown != null && (await storeRunningCost(client, session.sessionId, breakdown));
 
       log.info(
         {
           sessionId: session.sessionId,
-          oldTariffId: session.tariffId,
+          oldTariffId: switched.fromTariffId,
           newTariffId: currentTariff.id,
         },
         'Tariff boundary: split session at new tariff',
@@ -141,21 +169,24 @@ export async function tariffBoundaryCheckHandler(log: Logger): Promise<void> {
       // payload used session.sessionId (our internal nanoid PK) so stations
       // couldn't correlate the update with any of their active
       // transactions and silently dropped it.
-      if (session.ocppProtocol != null && session.ocppProtocol.startsWith('ocpp2')) {
-        const commandId = crypto.randomUUID();
-        await pubsub.publish(
-          'ocpp_commands',
-          JSON.stringify({
-            commandId,
-            stationId: session.stationOcppId,
-            action: 'CostUpdated',
-            payload: {
-              totalCost: (session.currentCostCents ?? 0) / 100,
-              transactionId: session.transactionId,
-            },
-            version: session.ocppProtocol,
-          }),
-        );
+      // Only a live station gets here (the liveness gate above), so the
+      // command is never queued for an offline station and replayed later
+      // with a stale cost.
+      if (
+        breakdown != null &&
+        stored &&
+        session.ocppProtocol != null &&
+        session.ocppProtocol.startsWith('ocpp2')
+      ) {
+        await publishOcppCommand(pubsub, {
+          stationId: session.stationOcppId,
+          action: 'CostUpdated',
+          payload: {
+            totalCost: breakdown.grossCents / 100,
+            transactionId: session.transactionId,
+          },
+          version: session.ocppProtocol,
+        });
       }
     };
 

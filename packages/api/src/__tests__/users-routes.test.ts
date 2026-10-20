@@ -103,6 +103,7 @@ vi.mock('drizzle-orm', () => ({
   and: vi.fn(),
   or: vi.fn(),
   isNull: vi.fn(),
+  ne: vi.fn(),
   ilike: vi.fn(),
   sql: vi.fn(),
   desc: vi.fn(),
@@ -147,13 +148,19 @@ vi.mock('@evtivity/lib', () => ({
   generateTotpSecret: vi.fn().mockReturnValue('JBSWY3DPEHPK3PXP'),
   generateTotpUri: vi.fn().mockReturnValue('otpauth://totp/test'),
   verifyTotpCode: vi.fn().mockReturnValue(true),
+  matchTotpStep: vi.fn().mockReturnValue(1),
   createMfaChallenge: vi.fn().mockResolvedValue({ challengeId: 1, code: '123456' }),
-  verifyMfaChallenge: vi.fn().mockResolvedValue(true),
-  ADMIN_DEFAULT_PERMISSIONS: ['stations:read', 'stations:write'],
-  OPERATOR_DEFAULT_PERMISSIONS: ['stations:read'],
-  VIEWER_DEFAULT_PERMISSIONS: ['stations:read'],
+  verifyMfaChallenge: vi.fn().mockResolvedValue('verified'),
+  AI_EFFORTS: ['low', 'medium', 'high'],
+  AI_PROVIDER_IDS: ['anthropic', 'openai', 'gemini', 'deepseek'],
+  isAiEffort: (v: unknown): boolean => v === 'low' || v === 'medium' || v === 'high',
+  permissionCatalog: {
+    defaultsFor: (role: string | undefined): string[] =>
+      role === 'admin' ? ['stations:read', 'stations:write'] : ['stations:read'],
+    isKnown: (p: string): boolean => ['stations:read', 'stations:write'].includes(p),
+    groups: () => [],
+  },
   hasPermission: vi.fn().mockReturnValue(true),
-  PERMISSIONS: ['stations:read', 'stations:write'],
   isSubsetOf: vi.fn().mockReturnValue(true),
 }));
 
@@ -180,6 +187,57 @@ vi.mock('../middleware/rbac.js', () => ({
         await reply.status(401).send({ error: 'Unauthorized' });
       }
     },
+  selfService:
+    (opts?: { allowApiKey?: boolean }) =>
+    async (
+      request: { jwtVerify: () => Promise<void>; user?: { isApiKey?: boolean } },
+      reply: { status: (n: number) => { send: (body: unknown) => Promise<void> } },
+    ) => {
+      try {
+        await request.jwtVerify();
+      } catch {
+        await reply.status(401).send({ error: 'Unauthorized' });
+        return;
+      }
+      if (request.user?.isApiKey === true && opts?.allowApiKey !== true) {
+        await reply.status(403).send({ error: 'Session required', code: 'SESSION_REQUIRED' });
+      }
+    },
+  invalidatePermissionCache: vi.fn(),
+  getEffectivePermissions: vi.fn().mockResolvedValue(['stations:read', 'stations:write']),
+}));
+
+vi.mock('../lib/operator-session.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/operator-session.js')>();
+  return {
+    ...actual,
+    passwordAuthBlocked: vi.fn().mockResolvedValue(false),
+    ssoManagedUser: vi.fn().mockResolvedValue(false),
+    bumpSessionVersion: vi.fn().mockResolvedValue(1),
+    endUserSessions: vi.fn().mockResolvedValue(1),
+    announceSessionChange: vi.fn(),
+  };
+});
+
+vi.mock('../lib/sign-in-backoff.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/sign-in-backoff.js')>();
+  return {
+    ...actual,
+    recordSignInFailure: vi.fn().mockResolvedValue(null),
+    clearSignInFailures: vi.fn().mockResolvedValue(undefined),
+    mfaResendRetryAfter: vi.fn().mockResolvedValue(null),
+    acceptTotpStep: vi.fn().mockResolvedValue(true),
+  };
+});
+
+vi.mock('../services/user-status.service.js', () => ({
+  USER_EMAIL_LINK_TYPES: ['password_reset'],
+  applyUserDeactivation: vi.fn().mockResolvedValue(undefined),
+  revokeUserEmailLinks: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../lib/password-changed-notice.js', () => ({
+  sendPasswordChangedNotice: vi.fn(),
 }));
 
 vi.mock('../lib/site-access.js', () => ({
@@ -189,6 +247,8 @@ vi.mock('../lib/site-access.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { userRoutes } from '../routes/users.js';
+import * as argon2Module from 'argon2';
+import { writeAudit } from '@evtivity/database';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -217,6 +277,7 @@ describe('User routes', () => {
 
   beforeEach(() => {
     setupDbResults();
+    vi.mocked(writeAudit).mockClear();
   });
 
   // --- Auth requirements ---
@@ -323,6 +384,58 @@ describe('User routes', () => {
     expect(body).toHaveProperty('user');
     expect(body.user.email).toBe('admin@example.com');
     expect(body).toHaveProperty('role');
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.objectContaining({ idColumn: 'user_id' }),
+      expect.objectContaining({
+        entityId: VALID_USER_ID,
+        action: 'login_succeeded',
+        actor: 'operator',
+        actorUserId: VALID_USER_ID,
+        after: expect.objectContaining({ method: 'password', ip: '127.0.0.1' }),
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('POST /v1/auth/login records a failed login on the account for a wrong password', async () => {
+    vi.mocked(argon2Module.default.verify).mockResolvedValueOnce(false);
+    setupDbResults([
+      {
+        id: VALID_USER_ID,
+        email: 'admin@example.com',
+        passwordHash: '$argon2id$hashed',
+        firstName: 'Admin',
+        lastName: 'User',
+        roleId: VALID_ROLE_ID,
+        isActive: true,
+        mustResetPassword: false,
+        language: 'en',
+        timezone: 'America/New_York',
+        mfaEnabled: false,
+        mfaMethod: null,
+        totpSecretEnc: null,
+      },
+    ]);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { email: 'admin@example.com', password: 'WrongPassword1' },
+    });
+    expect(response.statusCode).toBe(401);
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.objectContaining({ idColumn: 'user_id' }),
+      expect.objectContaining({
+        entityId: VALID_USER_ID,
+        action: 'login_failed',
+        actor: 'system',
+        actorLabel: 'login',
+        notes: 'bad_password',
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(JSON.stringify(vi.mocked(writeAudit).mock.calls)).not.toContain('WrongPassword1');
   });
 
   it('POST /v1/auth/login returns 401 when user not found', async () => {
@@ -335,6 +448,8 @@ describe('User routes', () => {
     expect(response.statusCode).toBe(401);
     const body = JSON.parse(response.body);
     expect(body.code).toBe('INVALID_CREDENTIALS');
+    // No account to key on: access_logs holds the attempt.
+    expect(vi.mocked(writeAudit)).not.toHaveBeenCalled();
   });
 
   it('GET /v1/users/me returns current user profile', async () => {
@@ -619,6 +734,17 @@ describe('User routes', () => {
     expect(response.statusCode).toBe(200);
   });
 
+  it('PATCH /v1/users/:id refuses an unknown timezone with 400 VALIDATION_ERROR', async () => {
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/users/${VALID_USER_ID}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { timezone: 'Not/A_Zone' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+  });
+
   it('PATCH /v1/users/:id returns 404 when user not found', async () => {
     const otherId = 'usr_000000000099';
     setupDbResults([]);
@@ -634,7 +760,8 @@ describe('User routes', () => {
   });
 
   it('POST /v1/users/:id/reset-password resets password', async () => {
-    setupDbResults([{ id: VALID_USER_ID }]);
+    // The target's permissions (within the actor's), then the update.
+    setupDbResults([{ permission: 'stations:read' }], [{ id: VALID_USER_ID }]);
     const response = await app.inject({
       method: 'POST',
       url: `/users/${VALID_USER_ID}/reset-password`,
@@ -745,12 +872,11 @@ describe('User routes', () => {
   // --- Reset password ---
 
   it('POST /v1/auth/reset-password resets password with valid token', async () => {
-    // 1: token lookup, 2: update user password, 3: revoke token, 4: fetch user for notification
+    // 1: guarded consume of the link, 2: user status, 3: password write
     setupDbResults(
-      [{ id: VALID_USER_ID, userId: VALID_USER_ID, expiresAt: new Date(Date.now() + 3600000) }],
-      [],
-      [],
-      [{ email: 'user@example.com', firstName: 'Test', lastName: 'User', language: 'en' }],
+      [{ userId: VALID_USER_ID }],
+      [{ isActive: true, authSource: 'password' }],
+      [{ id: VALID_USER_ID }],
     );
     const response = await app.inject({
       method: 'POST',
@@ -760,6 +886,17 @@ describe('User routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
+    expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+      expect.objectContaining({ idColumn: 'user_id' }),
+      expect.objectContaining({
+        entityId: VALID_USER_ID,
+        action: 'password_reset',
+        actor: 'operator',
+        after: expect.objectContaining({ method: 'reset_token' }),
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it('POST /v1/auth/reset-password returns 400 for invalid token', async () => {
@@ -775,9 +912,8 @@ describe('User routes', () => {
   });
 
   it('POST /v1/auth/reset-password returns 400 for expired token', async () => {
-    setupDbResults([
-      { id: VALID_USER_ID, userId: VALID_USER_ID, expiresAt: new Date(Date.now() - 1000) },
-    ]);
+    // The consume matches only an unexpired link (expires_at > now() in SQL).
+    setupDbResults([]);
     const response = await app.inject({
       method: 'POST',
       url: '/auth/reset-password',
@@ -815,7 +951,7 @@ describe('User routes', () => {
     expect(body.code).toBe('INVALID_CREDENTIALS');
   });
 
-  it('POST /v1/auth/force-change-password returns 400 when mustResetPassword is false', async () => {
+  it('POST /v1/auth/force-change-password answers 401 when no reset is required', async () => {
     setupDbResults([
       {
         id: VALID_USER_ID,
@@ -843,12 +979,13 @@ describe('User routes', () => {
         newPassword: 'NewPassword1',
       },
     });
-    expect(response.statusCode).toBe(400);
+    // Every refusal answers the same, so the route tells nothing about the account.
+    expect(response.statusCode).toBe(401);
     const body = JSON.parse(response.body);
-    expect(body.code).toBe('RESET_NOT_REQUIRED');
+    expect(body.code).toBe('INVALID_CREDENTIALS');
   });
 
-  it('POST /v1/auth/force-change-password returns 403 when account disabled', async () => {
+  it('POST /v1/auth/force-change-password answers 401 for a disabled account', async () => {
     setupDbResults([
       {
         id: VALID_USER_ID,
@@ -876,13 +1013,13 @@ describe('User routes', () => {
         newPassword: 'NewPassword1',
       },
     });
-    expect(response.statusCode).toBe(403);
+    expect(response.statusCode).toBe(401);
     const body = JSON.parse(response.body);
-    expect(body.code).toBe('ACCOUNT_DISABLED');
+    expect(body.code).toBe('INVALID_CREDENTIALS');
   });
 
   it('POST /v1/auth/force-change-password returns 401 when current password wrong', async () => {
-    const argon2 = await import('argon2');
+    const argon2 = argon2Module;
     vi.mocked(argon2.default.verify).mockResolvedValueOnce(false);
     setupDbResults([
       {
@@ -957,5 +1094,26 @@ describe('User routes', () => {
     expect(body.user.email).toBe('admin@example.com');
     expect(body).toHaveProperty('role');
     expect(body.role.name).toBe('admin');
+  });
+});
+
+describe('PUT /v1/users/:id/permissions response schema', () => {
+  it('documents SELF_EDIT_FORBIDDEN on 403, which the route sends for the own user', async () => {
+    const app = Fastify();
+    let forbidden: unknown;
+    app.addHook('onRoute', (route) => {
+      const methods = Array.isArray(route.method) ? route.method : [route.method];
+      if (route.url === '/users/:id/permissions' && methods.includes('PUT')) {
+        forbidden = (route.schema?.response as Record<number, unknown> | undefined)?.[403];
+      }
+    });
+    await app.register(cookie, { secret: 'test-cookie-secret-12345' });
+    await registerAuth(app);
+    userRoutes(app);
+    await app.ready();
+    const serialized = JSON.stringify(forbidden);
+    expect(serialized).toContain('"SELF_EDIT_FORBIDDEN"');
+    expect(serialized).toContain('"FORBIDDEN"');
+    await app.close();
   });
 });

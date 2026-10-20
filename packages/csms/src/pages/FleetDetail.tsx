@@ -17,14 +17,22 @@ import { FleetVehiclesTab } from '@/components/fleet/FleetVehiclesTab';
 import { FleetDriversTab } from '@/components/fleet/FleetDriversTab';
 import { FleetPricingTab } from '@/components/fleet/FleetPricingTab';
 import { FleetReservationsTab } from '@/components/fleet/FleetReservationsTab';
+import { FleetBillingTab } from '@/components/fleet/FleetBillingTab';
+import { FleetBillingProfileCard } from '@/components/fleet/FleetBillingProfileCard';
+import type { FleetBillingProfile } from '@/components/fleet/FleetBillingProfileCard';
+import { FleetCreditLimitCard } from '@/components/fleet/FleetCreditLimitCard';
+import { FleetInvoicesCard } from '@/components/fleet/FleetInvoicesCard';
 import { api } from '@/lib/api';
-import { useHasPermission } from '@/lib/auth';
+import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
 
-interface Fleet {
+interface Fleet extends Partial<FleetBillingProfile> {
   id: string;
   name: string;
   description: string | null;
+  accountBillingEnabled?: boolean;
+  accountInvoiceRecipient?: 'fleet' | 'member';
+  hasPricingGroup?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -33,6 +41,10 @@ export function FleetDetail(): React.JSX.Element {
   const { id } = useParams<{ id: string }>();
   const { t } = useTranslation();
   const canReadAudit = useHasPermission('audit:read');
+  // The bulk reservation list needs reservations:read (the API answers 403 without it).
+  const canReadReservations = useHasPermission('reservations:read');
+  // Fleet billing and invoices are company-wide: the API answers 404 to a site-restricted user.
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const [activeTab, setActiveTab] = useTab('details');
 
   const { data: fleet, isLoading } = useQuery({
@@ -50,13 +62,17 @@ export function FleetDetail(): React.JSX.Element {
   }
 
   const fleetId = id ?? '';
+  // A site-restricted user changes the members only of a fleet with no
+  // pricing group and no account billing (the API answers 404 otherwise).
+  const canManageMembers =
+    hasAllSiteAccess || (fleet.accountBillingEnabled !== true && fleet.hasPricingGroup !== true);
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/fleets" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{fleet.name}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{fleet.name}</h1>
           <CopyableId id={fleet.id} />
         </div>
         <EntityNavButtons resource="fleets" basePath="/fleets" currentId={id} />
@@ -70,7 +86,10 @@ export function FleetDetail(): React.JSX.Element {
           <TabsTrigger value="vehicles">{t('fleets.vehicles')}</TabsTrigger>
           <TabsTrigger value="drivers">{t('fleets.drivers')}</TabsTrigger>
           <TabsTrigger value="pricing">{t('fleets.pricing')}</TabsTrigger>
-          <TabsTrigger value="reservations">{t('fleets.bulkReservations')}</TabsTrigger>
+          {hasAllSiteAccess && <TabsTrigger value="billing">{t('fleets.billingTab')}</TabsTrigger>}
+          {canReadReservations && (
+            <TabsTrigger value="reservations">{t('fleets.bulkReservations')}</TabsTrigger>
+          )}
           {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
 
@@ -87,20 +106,35 @@ export function FleetDetail(): React.JSX.Element {
         </TabsContent>
 
         <TabsContent value="vehicles">
-          <FleetVehiclesTab fleetId={fleetId} />
+          <FleetVehiclesTab fleetId={fleetId} canManageMembers={canManageMembers} />
         </TabsContent>
 
         <TabsContent value="drivers" className="space-y-6">
-          <FleetDriversTab fleetId={fleetId} />
+          <FleetDriversTab
+            fleetId={fleetId}
+            accountBillingEnabled={fleet.accountBillingEnabled === true}
+            canManageMembers={canManageMembers}
+          />
         </TabsContent>
 
         <TabsContent value="pricing" className="space-y-6">
           <FleetPricingTab fleetId={fleetId} />
         </TabsContent>
 
-        <TabsContent value="reservations" className="space-y-6">
-          <FleetReservationsTab fleetId={fleetId} />
-        </TabsContent>
+        {hasAllSiteAccess && (
+          <TabsContent value="billing" className="space-y-6">
+            <FleetBillingTab fleet={fleet} />
+            <FleetBillingProfileCard fleet={fleet} />
+            <FleetCreditLimitCard fleetId={fleetId} />
+            <FleetInvoicesCard fleetId={fleetId} recipient={fleet.accountInvoiceRecipient} />
+          </TabsContent>
+        )}
+
+        {canReadReservations && (
+          <TabsContent value="reservations" className="space-y-6">
+            <FleetReservationsTab fleetId={fleetId} />
+          </TabsContent>
+        )}
 
         <TabsContent value="history">
           <EntityHistoryTab entityType="fleet" entityId={fleetId} />

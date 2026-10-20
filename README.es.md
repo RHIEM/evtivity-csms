@@ -7,8 +7,9 @@
 <p align="center">
   <a href="https://github.com/EVtivity/evtivity-csms/releases/latest"><img src="https://img.shields.io/github/v/release/EVtivity/evtivity-csms?label=Release&color=4ade80" alt="Release" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml"><img src="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FEVtivity%2Fevtivity-csms%2Fbadges%2Fcoverage.json" alt="Coverage" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-BUSL--1.1-blue.svg" alt="License: BUSL-1.1" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/TypeScript-6.x-3178C6.svg" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-339933.svg" alt="Node.js" />
   <img src="https://img.shields.io/badge/OCPP-1.6%20%7C%202.1-4ade80.svg" alt="OCPP" />
   <img src="https://img.shields.io/badge/OCPI-2.2.1%20%7C%202.3.0-4ade80.svg" alt="OCPI" />
@@ -23,9 +24,9 @@
   <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
-Un sistema de gestión de estaciones de carga (CSMS) compatible con OCPP 1.6 y 2.1 para gestionar infraestructura de carga de vehículos eléctricos. Gestiona la comunicación WebSocket en tiempo real con las estaciones, roaming OCPI 2.2.1/2.3.0, Plug and Charge ISO 15118, una API REST para operadores y dos frontends en React para operadores y conductores.
+EVtivity es una plataforma de carga de vehículos eléctricos impulsada por IA. Su núcleo es un sistema de gestión de estaciones de carga (CSMS) compatible con OCPP 1.6 y 2.1 para infraestructura de carga de vehículos eléctricos. Gestiona la comunicación WebSocket en tiempo real con las estaciones de carga, el roaming OCPI 2.2.1/2.3.0, ISO 15118 Plug and Charge, una API REST para operadores y dos frontends React para operadores y conductores.
 
-EVtivity integra IA en toda la experiencia del operador. Un asistente chatbot responde preguntas en lenguaje natural sobre estaciones, sesiones, ingresos y operaciones llamando a los endpoints de la API como herramientas. Un asistente de IA para soporte redacta respuestas a casos de soporte recopilando el contexto completo del caso. Ambos soportan múltiples proveedores de LLM (Anthropic, OpenAI, Gemini) con parámetros configurables a nivel de sistema y por usuario, responden en el idioma preferido del operador y aplican salvaguardas que evitan la fuga de datos sensibles.
+La IA está integrada en el panel del operador. El asistente de IA responde preguntas sobre estaciones, sesiones, ingresos y operaciones, lee archivos adjuntos como la foto de la pantalla de un cargador, un PDF o un registro, y propone cambios que solo se ejecutan cuando el operador los confirma. La asistencia de soporte redacta respuestas a casos de soporte en el idioma del conductor. Ambos funcionan con Anthropic, OpenAI, Gemini o DeepSeek, y los secretos y datos personales se enmascaran antes de llegar al modelo.
 
 ## Arquitectura
 
@@ -68,6 +69,19 @@ graph TB
 ```
 
 ## Resumen de funciones
+
+### Operaciones impulsadas por IA
+
+| Función                         | Descripción                                                                                                                                                                                                                        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Asistente de IA                 | Preguntas sobre estaciones, sesiones, ingresos y operaciones en lenguaje natural. Las respuestas se transmiten en streaming y las conversaciones se guardan con búsqueda, cambio de nombre y eliminación                           |
+| Análisis de imágenes y archivos | Adjunta imágenes (como la foto de la pantalla de un cargador) y archivos PDF, CSV, de texto, de registro y JSON                                                                                                                    |
+| Cambios confirmados             | El asistente lee datos mediante herramientas de la API. Un cambio propuesto muestra una tarjeta de confirmación y solo se ejecuta cuando el operador lo confirma                                                                   |
+| Asistencia de soporte           | Redacta respuestas a casos de soporte en el idioma del conductor y notas internas en el del operador, con las fuentes consultadas                                                                                                  |
+| Elección de proveedor           | Anthropic, OpenAI, Google Gemini o DeepSeek, por superficie o por usuario, con un nivel de esfuerzo                                                                                                                                |
+| Enmascaramiento y protecciones  | Los secretos y datos personales se enmascaran en los resultados de las herramientas antes de llegar al modelo. La configuración, los secretos, los usuarios, los pagos y la seguridad de las estaciones quedan fuera de su alcance |
+| Seis idiomas                    | Responde en el idioma del operador: inglés, alemán, español, coreano, chino simplificado y chino tradicional                                                                                                                       |
+| Límites y auditoría             | Límites de frecuencia por usuario y por sitio, un presupuesto diario de tokens por usuario y entradas de auditoría para los cambios hechos con el asistente                                                                        |
 
 ### Cumplimiento OCPP
 
@@ -146,20 +160,6 @@ graph TB
 | Casos de soporte      | Tickets de soporte con enlace a sesiones, acciones de reembolso y adjuntos en S3         |
 | Notificaciones        | Email y SMS para eventos de sesión, estado de pago, reservas y casos de soporte          |
 
-### Operaciones impulsadas por IA
-
-| Función                                  | Descripción                                                                                                                           |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Asistente chatbot                        | Asistente en lenguaje natural para operadores con acceso a todos los endpoints API mediante un catálogo de herramientas autogenerado  |
-| Selección de herramientas en dos niveles | Enrutamiento por categoría mantiene el conteo de herramientas por petición bajo el límite del proveedor (128)                         |
-| IA para casos de soporte                 | Redacción de respuestas al cliente y notas internas a partir del contexto completo del caso (mensajes, sesiones, estación, conductor) |
-| Soporte multi-proveedor                  | Anthropic Claude, OpenAI GPT y Google Gemini con configuración a nivel de sistema y por usuario                                       |
-| Parámetros del LLM                       | Temperatura, top-p, top-k, system prompt y tono configurables a nivel de sistema y por usuario                                        |
-| Respuestas según el idioma               | La IA responde en el idioma preferido del operador en los 6 locales soportados                                                        |
-| Salvaguardas de seguridad                | Bloquea fuga de contraseñas y claves API, exige confirmación antes de modificaciones de datos                                         |
-| Herramientas autogeneradas               | El codegen del spec OpenAPI produce definiciones tipadas para los 500+ endpoints del operador                                         |
-| Chat editable                            | Editar y reenviar mensajes del usuario, copiar respuestas del asistente, renderizado Markdown con tablas con scroll                   |
-
 ### Sostenibilidad
 
 | Función                       | Descripción                                                                                  |
@@ -217,11 +217,21 @@ graph TB
 | UI multi-idioma          | 6 idiomas: inglés, alemán, español, coreano, chino simplificado y tradicional                                   |
 | Filtros responsivos      | Los controles de filtro colapsan en un dropdown en tablet y móvil en todas las listas                           |
 | Página de servidor caído | Página de error amigable con reintento cuando la API no responde, en CSMS y Portal                              |
-| Gestión de releases      | Bump automático de versión en todos los paquetes y el Helm chart mediante el script de release                  |
+| Gestión de releases      | Canales stable, alpha y beta. Cada release stable sube el Helm chart y la app de AWS CDK a su versión           |
 
-## Servicios
+## Despliegue
 
-Cuando se despliega con el Helm chart, cada servicio se expone en su propio subdominio vía Gateway API:
+| Opción                   | Uso                                                  | Código                                                                        | Guía                                                                          |
+| ------------------------ | ---------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Docker Compose           | Desarrollo local e instalaciones en un solo host     | `docker-compose.yml` en este repositorio                                      | [Docker Compose](https://www.evtivity.com/es/docs/deployment/docker-compose/) |
+| Helm chart de Kubernetes | Producción en Kubernetes (Istio o Envoy Gateway)     | [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm) | [Helm chart](https://www.evtivity.com/es/docs/deployment/helm-chart/)         |
+| AWS CDK                  | Producción en AWS (ECS Fargate, Aurora, ElastiCache) | [EVtivity/evtivity-csms-cdk](https://github.com/EVtivity/evtivity-csms-cdk)   | [AWS](https://www.evtivity.com/es/docs/deployment/aws/)                       |
+
+El Helm chart y la app de AWS CDK siguen solo las releases stable. Cada release stable los sube a su versión.
+
+### Endpoints de servicio
+
+Con el Helm chart, cada servicio se expone en su propio subdominio vía Gateway API:
 
 | Servicio             | URL                                | Puerto público | Puerto interno |
 | -------------------- | ---------------------------------- | -------------- | -------------- |
@@ -237,9 +247,33 @@ Cuando se despliega con el Helm chart, cada servicio se expone en su propio subd
 
 Todos los hostnames comparten una sola IP de load balancer. Los registros DNS de cada hostname deben apuntar a esa IP. OCPP TLS (puerto 8443) se aprovisiona como un servicio `LoadBalancer` separado para conexiones directas con Security Profile 3 (mTLS).
 
-## Helm Chart
+## Skills
 
-El Helm chart de Kubernetes se mantiene en un repositorio separado: [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm)
+[EVtivity Agent Skills](https://github.com/EVtivity/evtivity-skills) enseñan a tu agente de programación con IA a trabajar con EVtivity. Siguen el estándar abierto [Agent Skills](https://agentskills.io), así que los mismos skills funcionan en Claude Code, Codex, GitHub Copilot, Gemini CLI, Cursor y otros agentes.
+
+| Skill                      | Te ayuda a                                                                                        |
+| -------------------------- | ------------------------------------------------------------------------------------------------- |
+| `evtivity-getting-started` | Instalar y ejecutar EVtivity en local con Docker e iniciar sesión                                 |
+| `evtivity-deployment`      | Desplegar y actualizar con Docker Compose, Helm o AWS CDK                                         |
+| `evtivity-configuration`   | Configurar variables de entorno, secretos, autenticación, base de datos y seguridad de estaciones |
+| `evtivity-csms`            | Usar el panel: sitios, estaciones, sesiones, conductores, precios, informes                       |
+| `evtivity-portal`          | Usar el portal del conductor: buscar una estación, cargar, pagar, gestionar tarjetas              |
+| `evtivity-mobile-app`      | Compilar, personalizar y publicar la app móvil del conductor                                      |
+| `evtivity-guides`          | Seguir guías paso a paso como el alta de estaciones y las sesiones bloqueadas                     |
+| `evtivity-integrations`    | Configurar Stripe, Adyen, el proveedor de pagos de prueba y los pagos a sitios                    |
+| `evtivity-api`             | Usar la API REST: claves de API, códigos de error, rutas de comandos OCPP                         |
+| `evtivity-simulator`       | Ejecutar estaciones OCPP 1.6 y 2.1 simuladas y sesiones de carga                                  |
+| `evtivity-conformance`     | Enviar comandos OCPP, leer logs de mensajes y ejecutar pruebas de conformidad OCTT                |
+| `evtivity-troubleshoot`    | Encontrar y corregir un servicio con fallos, la conexión de una estación o el inicio de sesión    |
+| `evtivity-report-issue`    | Reunir la versión y logs sin datos sensibles y redactar un issue de GitHub                        |
+
+Instálalos para cualquier agente:
+
+```bash
+npx skills add EVtivity/evtivity-skills
+```
+
+Las versiones de los skills usan las mismas etiquetas que EVtivity. Instala la etiqueta que coincide con tu despliegue. Los pull requests y las discusiones sobre nuevos skills son bienvenidos.
 
 ## Licencia
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { Link } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -21,17 +21,30 @@ interface NavButtonProps {
   icon: React.JSX.Element;
 }
 
+/** The search param of a detail page's tab (`useTab` default). */
+const DETAIL_TAB_PARAM = 'tab';
+
+/**
+ * A neighbor's detail path. The open tab goes along, so Prev and Next keep it
+ * (a tab the neighbor lacks shows the first tab, see `Tabs`).
+ */
+function neighborPath(basePath: string, id: string, tab: string | null): string {
+  const path = `${basePath}/${id}`;
+  if (tab == null || tab === '') return path;
+  return `${path}?${new URLSearchParams({ [DETAIL_TAB_PARAM]: tab }).toString()}`;
+}
+
 function NavButton({ to, label, icon }: NavButtonProps): React.JSX.Element {
   return (
     <div className="flex flex-col items-center gap-1">
       {to != null ? (
         <Link to={to}>
-          <Button variant="outline" size="icon" aria-label={label}>
+          <Button variant="outline" size="icon-header" aria-label={label}>
             {icon}
           </Button>
         </Link>
       ) : (
-        <Button variant="outline" size="icon" aria-label={label} disabled>
+        <Button variant="outline" size="icon-header" aria-label={label} disabled>
           {icon}
         </Button>
       )}
@@ -47,16 +60,18 @@ export function EntityNavButtons({
 }: EntityNavButtonsProps): React.JSX.Element {
   const { t } = useTranslation();
   const { prevId, nextId } = useEntityNeighbors(resource, currentId);
+  const [searchParams] = useSearchParams();
+  const tab = searchParams.get(DETAIL_TAB_PARAM);
 
   return (
-    <div className="ml-auto flex items-start gap-2">
+    <div className="ml-auto flex shrink-0 items-start gap-2">
       <NavButton
-        to={prevId != null ? `${basePath}/${prevId}` : null}
+        to={prevId != null ? neighborPath(basePath, prevId, tab) : null}
         label={t('common.prev')}
         icon={<ChevronLeft className="h-4 w-4" />}
       />
       <NavButton
-        to={nextId != null ? `${basePath}/${nextId}` : null}
+        to={nextId != null ? neighborPath(basePath, nextId, tab) : null}
         label={t('common.next')}
         icon={<ChevronRight className="h-4 w-4" />}
       />

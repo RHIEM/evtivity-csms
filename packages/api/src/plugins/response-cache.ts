@@ -4,10 +4,13 @@
 import { createHash } from 'node:crypto';
 import { Redis } from 'ioredis';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { createLogger } from '@evtivity/lib';
+import { createLogger, redisTlsOptions } from '@evtivity/lib';
 import { config } from '../lib/config.js';
 import { authorize } from '../middleware/rbac.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
+import { requestAccessScope } from '../lib/access-scope.js';
 import { successResponse, errorWith } from '../lib/response-schemas.js';
+import { optionalDriverId } from '../lib/optional-driver.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 
 const logger = createLogger('response-cache');
@@ -61,8 +64,11 @@ export const CACHE_RULES: CacheRule[] = [
 
 // Writes to a resource bust its own tag plus these extras.
 export const CROSS_INVALIDATION: Record<string, string[]> = {
-  sites: ['dashboard'],
-  stations: ['dashboard'],
+  // Session lists show the site name and the electricity cost a site's
+  // recalculation fills (POST /v1/sites/:id/electricity-cost/recalculate).
+  sites: ['dashboard', 'sessions'],
+  // Portal charger pages show station availability (stationUnavailable).
+  stations: ['dashboard', 'portal'],
   sessions: ['dashboard'],
   'pricing-groups': ['pricing'],
   'pricing-holidays': ['pricing'],
@@ -100,9 +106,26 @@ function requestUserId(request: FastifyRequest): string {
   return user?.userId ?? user?.driverId ?? 'anon';
 }
 
-export function buildCacheKey(tagVersions: string, userId: string, url: string): string {
+/**
+ * The access fingerprint of an operator request (`requestAccessScope`): a
+ * site, permission or role change never serves a response cached under the
+ * old access. A deactivated user is refused by authentication before the
+ * cache is read. '-' for drivers and anonymous requests.
+ */
+async function requestScopeHash(request: FastifyRequest): Promise<string> {
+  const user = request.user as { userId?: string } | undefined;
+  if (user?.userId == null) return '-';
+  return requestAccessScope(request, user.userId);
+}
+
+export function buildCacheKey(
+  tagVersions: string,
+  userId: string,
+  scopeHash: string,
+  url: string,
+): string {
   const urlHash = createHash('sha256').update(url).digest('hex').slice(0, 16);
-  return `rc:${tagVersions}:${userId}:${urlHash}`;
+  return `rc:${tagVersions}:${userId}:${scopeHash}:${urlHash}`;
 }
 
 interface CacheCtx {
@@ -113,6 +136,14 @@ interface CacheCtx {
 declare module 'fastify' {
   interface FastifyRequest {
     responseCacheCtx: CacheCtx | null;
+  }
+  interface FastifyContextConfig {
+    /**
+     * Cache tags a successful write of this route busts besides its own
+     * resource's (tagsForWrite): a station route that ends a session also
+     * changes the session lists.
+     */
+    invalidatesCacheTags?: readonly string[];
   }
 }
 
@@ -144,6 +175,7 @@ function getCacheRedis(): ResponseCacheRedis {
       maxRetriesPerRequest: 1,
       enableOfflineQueue: false,
       lazyConnect: true,
+      ...redisTlsOptions(config.REDIS_URL),
     });
     // Fail-fast cache connection: commands throw while disconnected and every
     // call site degrades to an uncached pass-through.
@@ -163,14 +195,81 @@ export function setResponseCacheRedis(redis: ResponseCacheRedis | null): void {
   cacheRedis = redis;
 }
 
+/**
+ * CSMS events that change dashboard figures. The CSMS refetches the
+ * dashboard on them, so the dashboard cache tag is bumped first and the
+ * refetch reads fresh data instead of a response cached before the event.
+ */
+export const DASHBOARD_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'station.status',
+  'session.started',
+  'session.ended',
+  'meter.values',
+  'payment.settled',
+  'ocpp.health',
+]);
+
+/**
+ * Shortest time between two bumps of the dashboard tag by one API process.
+ * Below the CSMS refetch delay for events (5 s), so the refetch an event
+ * triggers always comes after the bump that covers it.
+ */
+export const DASHBOARD_BUMP_INTERVAL_MS = 2_000;
+
+let lastDashboardBumpAt = 0;
+let trailingDashboardBump: ReturnType<typeof setTimeout> | null = null;
+
+function bumpDashboardTag(now: number): void {
+  lastDashboardBumpAt = now;
+  try {
+    void getCacheRedis()
+      .incr('rc:ver:dashboard')
+      .catch((err: unknown) => {
+        logger.debug({ err }, 'Dashboard cache bump failed, entries expire by TTL');
+      });
+  } catch (err) {
+    logger.debug({ err }, 'Dashboard cache bump skipped, no cache connection');
+  }
+}
+
+/**
+ * Bump the dashboard cache tag for a CSMS event, at most once per
+ * DASHBOARD_BUMP_INTERVAL_MS: an event inside the interval schedules one
+ * bump at its end, so the last event of a burst is always covered.
+ */
+export function noteDashboardEvent(eventType: unknown, now: number = Date.now()): void {
+  if (typeof eventType !== 'string' || !DASHBOARD_EVENT_TYPES.has(eventType)) return;
+  const wait = lastDashboardBumpAt + DASHBOARD_BUMP_INTERVAL_MS - now;
+  if (wait <= 0) {
+    bumpDashboardTag(now);
+    return;
+  }
+  if (trailingDashboardBump != null) return;
+  trailingDashboardBump = setTimeout(() => {
+    trailingDashboardBump = null;
+    bumpDashboardTag(Date.now());
+  }, wait);
+  trailingDashboardBump.unref();
+}
+
+/** Resets the bump throttle (tests). */
+export function resetDashboardBumpThrottle(): void {
+  if (trailingDashboardBump != null) clearTimeout(trailingDashboardBump);
+  trailingDashboardBump = null;
+  lastDashboardBumpAt = 0;
+}
+
 async function versionedKey(
   redis: ResponseCacheRedis,
   rule: CacheRule,
   request: FastifyRequest,
 ): Promise<string> {
-  const versions = await redis.mget(...rule.tags.map((t) => `rc:ver:${t}`));
+  const [versions, scopeHash] = await Promise.all([
+    redis.mget(...rule.tags.map((t) => `rc:ver:${t}`)),
+    requestScopeHash(request),
+  ]);
   const tagVersions = versions.map((v) => v ?? '0').join(':');
-  return buildCacheKey(tagVersions, requestUserId(request), request.url);
+  return buildCacheKey(tagVersions, requestUserId(request), scopeHash, request.url);
 }
 
 export function registerResponseCache(app: FastifyInstance): void {
@@ -193,8 +292,8 @@ export function registerResponseCache(app: FastifyInstance): void {
   if (process.env['NODE_ENV'] !== 'test') {
     try {
       getCacheRedis();
-    } catch {
-      // Redis down at boot: every request degrades to uncached pass-through.
+    } catch (err) {
+      logger.warn({ err }, 'Response cache Redis connect failed at boot, serving uncached');
     }
   }
 
@@ -205,6 +304,9 @@ export function registerResponseCache(app: FastifyInstance): void {
     const pathname = request.url.split('?')[0] ?? request.url;
     const rule = matchCacheRule(pathname);
     if (rule == null) return;
+    // Public portal charger pages answer per caller for a signed-in driver
+    // (reservedByMe), so only anonymous requests share the cached body.
+    if (rule.tags.includes('portal') && (await optionalDriverId(request)) != null) return;
 
     try {
       const redis = getCacheRedis();
@@ -217,8 +319,8 @@ export function registerResponseCache(app: FastifyInstance): void {
           .send(cached);
       }
       request.responseCacheCtx = { key, ttlSeconds: rule.ttlSeconds };
-    } catch {
-      // Redis down: pass through uncached.
+    } catch (err) {
+      logger.debug({ err, url: request.url }, 'Response cache read failed, serving uncached');
     }
     return;
   });
@@ -233,8 +335,8 @@ export function registerResponseCache(app: FastifyInstance): void {
     reply.header('X-Cache', 'MISS');
     try {
       await getCacheRedis().setex(ctx.key, ctx.ttlSeconds, payload);
-    } catch {
-      // Redis down: response still goes out, just not cached.
+    } catch (err) {
+      logger.debug({ err, url: request.url }, 'Response cache write failed, response not cached');
     }
     return payload;
   });
@@ -245,12 +347,19 @@ export function registerResponseCache(app: FastifyInstance): void {
     const pathname = request.url.split('?')[0] ?? request.url;
     const resource = extractWriteResource(pathname);
     if (resource == null) return;
+    const tags = new Set([
+      ...tagsForWrite(resource),
+      ...(request.routeOptions.config.invalidatesCacheTags ?? []),
+    ]);
 
     try {
       const redis = getCacheRedis();
-      await Promise.all(tagsForWrite(resource).map((tag) => redis.incr(`rc:ver:${tag}`)));
-    } catch {
-      // Redis down: nothing was being served from cache either.
+      await Promise.all([...tags].map((tag) => redis.incr(`rc:ver:${tag}`)));
+    } catch (err) {
+      logger.debug(
+        { err, resource },
+        'Response cache invalidation failed, nothing was served from the cache either',
+      );
     }
   });
 }
@@ -259,7 +368,7 @@ export function cacheRoutes(app: FastifyInstance): void {
   app.post(
     '/cache/flush',
     {
-      onRequest: [authorize('settings:write')],
+      onRequest: [authorize('settings.system:write')],
       schema: {
         tags: ['Settings'],
         summary: 'Flush the HTTP response cache',
@@ -267,11 +376,20 @@ export function cacheRoutes(app: FastifyInstance): void {
         security: [{ bearerAuth: [] }],
         response: {
           200: successResponse,
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
           500: errorWith('Cache backend unreachable', [ERROR_CODES.INTERNAL_ERROR]),
         },
       },
     },
     async (request, reply) => {
+      // The cache is shared by every site: flushing it is company-wide.
+      if (
+        !(await requireAllSiteAccess(request, reply, {
+          error: 'Setting not found',
+          code: 'SETTING_NOT_FOUND',
+        }))
+      )
+        return;
       try {
         const redis = getCacheRedis();
         let cursor = '0';
@@ -283,7 +401,8 @@ export function cacheRoutes(app: FastifyInstance): void {
         } while (cursor !== '0');
         request.log.info({ deleted }, 'response cache flushed');
         return { success: true };
-      } catch {
+      } catch (err) {
+        request.log.warn({ err }, 'Response cache flush failed, cache backend unreachable');
         await reply
           .status(500)
           .send({ error: 'Cache backend unreachable', code: 'INTERNAL_ERROR' });

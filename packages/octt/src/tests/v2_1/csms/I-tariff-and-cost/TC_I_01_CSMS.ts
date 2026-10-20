@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 // Helper: boot station and send initial StatusNotification
 async function bootAndStatus(ctx: {
@@ -52,7 +54,7 @@ export const TC_I_01_CSMS: TestCase = {
 
     // Step 1-2: Authorize
     const authRes = await ctx.client.sendCall('Authorize', {
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
     const authStatus = (authRes['idTokenInfo'] as Record<string, unknown>)?.['status'] as string;
     steps.push({
@@ -64,7 +66,7 @@ export const TC_I_01_CSMS: TestCase = {
     });
 
     // Step 3-4: TransactionEvent Updated (Authorized)
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Updated',
       timestamp: new Date().toISOString(),
@@ -72,7 +74,7 @@ export const TC_I_01_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     // EVConnected + EnergyTransferStarted
@@ -134,7 +136,7 @@ export const TC_I_01_CSMS: TestCase = {
           costValue = payload['totalCost'];
           return {};
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

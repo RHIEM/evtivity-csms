@@ -36,9 +36,13 @@ import { FilterPopover } from '@/components/FilterBar';
 import { Label } from '@/components/ui/label';
 import { Pagination } from '@/components/ui/pagination';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
+import { useToast } from '@/components/ui/toast';
 import { TableSkeleton } from '@/components/TableSkeleton';
 import { formatDate, useUserTimezone } from '@/lib/timezone';
+import { formatNumber } from '@/lib/formatting';
+import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 
 interface Site {
   id: string;
@@ -51,6 +55,7 @@ interface Site {
   stationCount: number;
   loadManagementEnabled: boolean;
   underMaintenance: boolean;
+  aiInsightsSuppressed?: boolean;
   maxPowerKw: string | null;
   totalDrawKw: string;
   createdAt: string;
@@ -71,6 +76,9 @@ interface ImportResult {
 export function Sites(): React.JSX.Element {
   const timezone = useUserTimezone();
   const { t } = useTranslation();
+  const hasAllSiteAccess = useHasAllSiteAccess();
+  const canWrite = useHasPermission('sites:write');
+  const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -80,6 +88,7 @@ export function Sites(): React.JSX.Element {
   const [updateExisting, setUpdateExisting] = useState(false);
   const [locationFilter, setLocationFilter] = useState('');
   const [loadManagementFilter, setLoadManagementFilter] = useState('');
+  const [aiInsightsFilter, setAiInsightsFilter] = useState('');
 
   const { data: filterOptions } = useQuery({
     queryKey: ['sites-filter-options'],
@@ -101,6 +110,7 @@ export function Sites(): React.JSX.Element {
     city: locationCity ?? '',
     state: locationState ?? '',
     loadManagement: loadManagementFilter,
+    aiInsights: aiInsightsFilter,
   });
 
   const importMutation = useMutation({
@@ -113,16 +123,29 @@ export function Sites(): React.JSX.Element {
   });
 
   function handleExport(): void {
-    const params = search ? `?search=${encodeURIComponent(search)}` : '';
-    const url = `${API_BASE_URL}/v1/sites/export${params}`;
+    // The export applies the same filters as the list on screen.
+    const params = new URLSearchParams();
+    if (search) params.set('search', search);
+    if (locationCity) params.set('city', locationCity);
+    if (locationState) params.set('state', locationState);
+    if (loadManagementFilter) params.set('loadManagement', loadManagementFilter);
+    if (aiInsightsFilter) params.set('aiInsights', aiInsightsFilter);
+    const query = params.toString();
+    const url = `${API_BASE_URL}/v1/sites/export${query ? `?${query}` : ''}`;
     void fetch(url, { credentials: 'include' })
-      .then((res) => res.blob())
+      .then(async (res) => {
+        if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => null));
+        return res.blob();
+      })
       .then((blob) => {
         const link = document.createElement('a');
         link.href = URL.createObjectURL(blob);
         link.download = 'sites.csv';
         link.click();
         URL.revokeObjectURL(link.href);
+      })
+      .catch((err: unknown) => {
+        toast({ title: getErrorMessage(err, t), variant: 'destructive' });
       });
   }
 
@@ -196,20 +219,24 @@ export function Sites(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('sites.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('sites.subtitle')}</p>
         </div>
-        <div className="flex flex-col gap-2 [&>*]:w-full sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 sm:[&>*]:w-auto">
-          <TemplateButton label={t('sites.downloadTemplate')} onClick={handleDownloadTemplate} />
-          <ImportButton
-            label={importMutation.isPending ? t('sites.importing') : t('sites.importCsv')}
-            onClick={() => {
-              fileInputRef.current?.click();
-            }}
-            disabled={importMutation.isPending}
-          />
+        <div className="flex flex-col gap-2 *:w-full sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 sm:*:w-auto">
+          {canWrite && (
+            <TemplateButton label={t('sites.downloadTemplate')} onClick={handleDownloadTemplate} />
+          )}
+          {canWrite && (
+            <ImportButton
+              label={importMutation.isPending ? t('sites.importing') : t('sites.importCsv')}
+              onClick={() => {
+                fileInputRef.current?.click();
+              }}
+              disabled={importMutation.isPending}
+            />
+          )}
           <ExportButton label={t('sites.exportCsv')} onClick={handleExport} />
           <input
             ref={fileInputRef}
@@ -218,12 +245,14 @@ export function Sites(): React.JSX.Element {
             className="hidden"
             onChange={handleImportFile}
           />
-          <CreateButton
-            label={t('sites.addSite')}
-            onClick={() => {
-              void navigate('/sites/new');
-            }}
-          />
+          {hasAllSiteAccess && canWrite && (
+            <CreateButton
+              label={t('sites.addSite')}
+              onClick={() => {
+                void navigate('/sites/new');
+              }}
+            />
+          )}
         </div>
       </div>
 
@@ -281,16 +310,15 @@ export function Sites(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('sites.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('sites.location')}</Label>
+              <Label className="leading-6">{t('sites.location')}</Label>
               <Select
                 aria-label={t('sites.location')}
-                className="h-10"
                 value={locationFilter}
                 onChange={(e) => {
                   setLocationFilter(e.target.value);
@@ -306,10 +334,9 @@ export function Sites(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('sites.loadManagementFilter')}</Label>
+              <Label className="leading-6">{t('sites.loadManagementFilter')}</Label>
               <Select
                 aria-label={t('sites.loadManagementFilter')}
-                className="h-10"
                 value={loadManagementFilter}
                 onChange={(e) => {
                   setLoadManagementFilter(e.target.value);
@@ -321,10 +348,27 @@ export function Sites(): React.JSX.Element {
                 <option value="false">{t('common.no')}</option>
               </Select>
             </div>
+            <div className="space-y-2">
+              <Label className="leading-6">{t('sites.aiInsights.label')}</Label>
+              <Select
+                aria-label={t('sites.aiInsights.label')}
+                value={aiInsightsFilter}
+                onChange={(e) => {
+                  setAiInsightsFilter(e.target.value);
+                  setPage(1);
+                }}
+              >
+                <option value="">{t('sites.aiInsights.allScopes')}</option>
+                <option value="in_scope">{t('sites.aiInsights.inScope')}</option>
+                <option value="suppressed">{t('sites.aiInsights.suppressed')}</option>
+              </Select>
+            </div>
           </>
         );
         const activeFilterCount =
-          (locationFilter !== '' ? 1 : 0) + (loadManagementFilter !== '' ? 1 : 0);
+          (locationFilter !== '' ? 1 : 0) +
+          (loadManagementFilter !== '' ? 1 : 0) +
+          (aiInsightsFilter !== '' ? 1 : 0);
         return (
           <Card>
             <CardContent className="p-4">
@@ -335,6 +379,7 @@ export function Sites(): React.JSX.Element {
                   onClearAll={() => {
                     setLocationFilter('');
                     setLoadManagementFilter('');
+                    setAiInsightsFilter('');
                     setPage(1);
                   }}
                 >
@@ -344,7 +389,7 @@ export function Sites(): React.JSX.Element {
               <div className="hidden items-end gap-4 md:flex">
                 <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
                   <div className="space-y-2">
-                    <Label>{t('sites.search')}</Label>
+                    <Label className="leading-6">{t('sites.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}
@@ -387,11 +432,16 @@ export function Sites(): React.JSX.Element {
                   }}
                 >
                   <TableCell className="text-muted-foreground">{site.id}</TableCell>
-                  <TableCell className="font-medium text-primary" data-testid="row-click-target">
+                  <TableCell className="font-medium text-link" data-testid="row-click-target">
                     <span className="inline-flex items-center gap-2">
                       {site.name}
                       {site.underMaintenance && (
                         <Badge variant="warning">{t('sites.underMaintenanceBadge')}</Badge>
+                      )}
+                      {site.aiInsightsSuppressed === true && (
+                        <Badge variant="secondary" data-testid="site-ai-suppressed-badge">
+                          {t('sites.aiInsights.listBadge')}
+                        </Badge>
                       )}
                     </span>
                   </TableCell>
@@ -399,7 +449,9 @@ export function Sites(): React.JSX.Element {
                   <TableCell>{site.stationCount}</TableCell>
                   <TableCell>
                     <span className="inline-flex items-center gap-1.5">
-                      <span className="font-medium">{Number(site.totalDrawKw).toFixed(1)} kW</span>
+                      <span className="font-medium">
+                        {formatNumber(Number(site.totalDrawKw), 1)} kW
+                      </span>
                       {site.maxPowerKw != null && Number(site.maxPowerKw) > 0 && (
                         <span className="text-muted-foreground">
                           / {Number(site.maxPowerKw)} kW
@@ -453,6 +505,9 @@ export function Sites(): React.JSX.Element {
               <span>{t('sites.updateExisting')}</span>
             </label>
             <p className="text-xs text-muted-foreground">{t('sites.updateExistingDescription')}</p>
+            {importMutation.isError && (
+              <p className="text-sm text-destructive">{getErrorMessage(importMutation.error, t)}</p>
+            )}
           </div>
           <DialogFooter>
             <CancelButton

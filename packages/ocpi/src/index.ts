@@ -2,23 +2,36 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { FastifyServerOptions } from 'fastify';
-import { RedisPubSubClient, createBullMQConnection, initSentry } from '@evtivity/lib';
-import { getSentryConfig } from '@evtivity/database';
+import {
+  RedisPubSubClient,
+  createBullMQConnection,
+  createLogger,
+  initSentry,
+  logFormatOptions,
+} from '@evtivity/lib';
+import { getSentryConfig, guardPgConnectionRejections } from '@evtivity/database';
 import { buildOcpiApp } from './app.js';
 import { OcpiPushListener } from './services/push.service.js';
 import { OcpiPullListener } from './services/pull.service.js';
+import { OCPI_MODULES } from './modules.js';
 import { OcpiRegisterListener } from './services/register-listener.service.js';
 import { initCommandCallbackService } from './services/command-callback.service.js';
+import { startOcpiCdrJobs } from './services/cdr-jobs.js';
 import { setPubSub } from './lib/pubsub.js';
 import { config } from './lib/config.js';
 
 async function start(): Promise<void> {
+  // A backend terminated while postgres.js fetches its array types must not end
+  // the process (pg-connection-rejections.ts).
+  guardPgConnectionRejections(createLogger('ocpi'));
   const sentryConfig = await getSentryConfig();
   initSentry('evtivity-ocpi', sentryConfig);
 
   const opts: FastifyServerOptions = {
+    trustProxy: config.TRUST_PROXY,
     logger: {
       level: config.LOG_LEVEL,
+      ...logFormatOptions,
       serializers: {
         req(request) {
           return {
@@ -47,12 +60,19 @@ async function start(): Promise<void> {
   // run SET NX / EVAL). Serializes overlapping pulls across OCPI replicas.
   const lockRedis = createBullMQConnection(config.REDIS_URL);
 
-  // Start push listener for data change notifications
-  const pushListener = new OcpiPushListener(pubsub);
+  // CDR issue and push, the location, session, tariff and token pushes, and
+  // the one-time legacy EVSE removal (BullMQ, so a job runs once across
+  // replicas, retries, and survives a restart).
+  const cdrJobs = await startOcpiCdrJobs(config.REDIS_URL);
+
+  // Start push listener for data change notifications: it adds the push jobs
+  // (deduplicated across replicas). A pushed completed session schedules its
+  // CDR.
+  const pushListener = new OcpiPushListener(pubsub, cdrJobs.pushSink);
   await pushListener.start();
 
   // Start pull listener for sync requests
-  const pullListener = new OcpiPullListener(pubsub, lockRedis);
+  const pullListener = new OcpiPullListener(pubsub, OCPI_MODULES, lockRedis);
   await pullListener.start();
 
   // Start outbound-registration listener so the operator-triggered
@@ -64,18 +84,27 @@ async function start(): Promise<void> {
   const commandCallbackService = initCommandCallbackService(pubsub);
   await commandCallbackService.start();
 
-  // Graceful shutdown
+  // Graceful shutdown: stop HTTP intake and finish in-flight requests, then
+  // stop the listeners (each waits for the messages it is still handling),
+  // and only then close pub/sub and the lock Redis connection they use.
   const shutdown = async (): Promise<void> => {
-    await commandCallbackService.stop();
-    await registerListener.stop();
-    await pullListener.stop();
-    await pushListener.stop();
+    await app.close();
+    await Promise.all([
+      commandCallbackService.stop(),
+      registerListener.stop(),
+      pullListener.stop(),
+      pushListener.stop(),
+    ]);
+    await cdrJobs.stop();
     await pubsub.close();
     await lockRedis.quit();
-    await app.close();
   };
 
+  let shuttingDown = false;
   const handleSignal = (): void => {
+    // SIGINT and SIGTERM can both arrive; run the sequence once.
+    if (shuttingDown) return;
+    shuttingDown = true;
     shutdown()
       .then(() => process.exit(0))
       .catch(() => process.exit(1));

@@ -11,8 +11,12 @@ import { Button } from '@/components/ui/button';
 import { SystemInfoDialog } from '@/components/SystemInfoDialog';
 import { api } from '@/lib/api';
 import { useQrIcon } from '@/hooks/use-qr-icon';
-import { useAuth, hasPermissionCheck } from '@/lib/auth';
+import type { Permission } from '@evtivity/lib/permissions';
+import { useAuth, hasPermissionCheck, useHasAllSiteAccess } from '@/lib/auth';
 import { CompanySettings } from '@/components/settings/CompanySettings';
+import { InvoiceSellerSettings } from '@/components/settings/InvoiceSellerSettings';
+import { InvoicePaymentSettings } from '@/components/settings/InvoicePaymentSettings';
+import { PdfBrandingSettings } from '@/components/settings/PdfBrandingSettings';
 import { MarketingSettings } from '@/components/settings/MarketingSettings';
 import { ContentSettings } from '@/components/settings/ContentSettings';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -25,13 +29,17 @@ import { SecuritySsoSettings } from '@/components/settings/SecuritySsoSettings';
 import { ApiKeysSettings } from '@/components/settings/ApiKeysSettings';
 import { AiSettings } from '@/components/settings/AiSettings';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
+import { stationMessageStateLabel } from '@/components/settings/StationMessageSettings';
+import { auditEntityLabel } from '@/lib/audit-labels';
 import { FirmwareCampaigns } from '@/pages/FirmwareCampaigns';
 import { ConfigTemplates } from '@/pages/ConfigTemplates';
 import { SmartChargingTemplates } from '@/pages/SmartChargingTemplates';
 import { Conformance } from '@/pages/Conformance';
 
 /** Maps tab value -> required permission */
-const TAB_PERMISSIONS: Record<string, string> = {
+// Several tabs share settings.system. Typed as Permission so a tab cannot name a permission
+// the catalog does not hold.
+const TAB_PERMISSIONS: Record<string, Permission> = {
   company: 'settings.system:read',
   marketing: 'settings.system:read',
   content: 'settings.system:read',
@@ -49,6 +57,25 @@ const TAB_PERMISSIONS: Record<string, string> = {
   history: 'audit:read',
 };
 
+/**
+ * Tabs of company-wide configuration: their routes answer 404 to a user
+ * without access to every site (features/site-access-control.md). A
+ * site-restricted user keeps payment (site configs, prepaid and invoice
+ * settings), API keys, firmware, station configurations, smart charging and
+ * conformance.
+ */
+const ALL_SITE_TABS = new Set([
+  'company',
+  'marketing',
+  'content',
+  'notification',
+  'sustainability',
+  'integrations',
+  'security',
+  'ai',
+  'history',
+]);
+
 function formatSettingValue(value: unknown): string {
   if (value === null || value === undefined) return '∅';
   if (typeof value === 'string') {
@@ -60,7 +87,8 @@ function formatSettingValue(value: unknown): string {
   try {
     const serialized = JSON.stringify(value);
     return serialized.length > 60 ? `${serialized.slice(0, 60)}…` : serialized;
-  } catch {
+  } catch (err) {
+    console.warn('Serialize a setting value for display failed', err);
     return '[unserializable]';
   }
 }
@@ -68,6 +96,7 @@ function formatSettingValue(value: unknown): string {
 export function Settings(): React.JSX.Element {
   const { t } = useTranslation();
   const permissions = useAuth((s) => s.permissions);
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const [showSystemInfo, setShowSystemInfo] = useState(false);
 
   const { data: settings } = useQuery({
@@ -75,9 +104,12 @@ export function Settings(): React.JSX.Element {
     queryFn: () => api.get<Record<string, unknown>>('/v1/settings'),
   });
 
+  const canReadSecurity =
+    hasAllSiteAccess && hasPermissionCheck(permissions, 'settings.security:read');
   const { data: securitySettings } = useQuery({
     queryKey: ['security-settings'],
     queryFn: () => api.get<Record<string, unknown>>('/v1/security/settings'),
+    enabled: canReadSecurity,
   });
 
   const { svgDataUri } = useQrIcon();
@@ -87,8 +119,9 @@ export function Settings(): React.JSX.Element {
   const visibleTabs = useMemo(() => {
     return Object.entries(TAB_PERMISSIONS)
       .filter(([, perm]) => hasPermissionCheck(permissions, perm))
+      .filter(([tab]) => hasAllSiteAccess || !ALL_SITE_TABS.has(tab))
       .map(([tab]) => tab);
-  }, [permissions]);
+  }, [permissions, hasAllSiteAccess]);
 
   const [securitySubTab, setSecuritySubTab] = useTab('recaptcha', 'sub');
 
@@ -99,23 +132,27 @@ export function Settings(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('settings.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('settings.subtitle')}</p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            setShowSystemInfo(true);
-          }}
-        >
-          <Info className="mr-2 h-4 w-4" />
-          {t('systemInfo.button')}
-        </Button>
+        {hasAllSiteAccess && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setShowSystemInfo(true);
+            }}
+          >
+            <Info className="mr-2 h-4 w-4" />
+            {t('systemInfo.button')}
+          </Button>
+        )}
       </div>
-      <SystemInfoDialog open={showSystemInfo} onOpenChange={setShowSystemInfo} />
+      {hasAllSiteAccess && (
+        <SystemInfoDialog open={showSystemInfo} onOpenChange={setShowSystemInfo} />
+      )}
 
       <Tabs value={activeTab} onValueChange={setActiveTab}>
         <TabsList>
@@ -163,8 +200,11 @@ export function Settings(): React.JSX.Element {
         </TabsList>
 
         {tabVisible('company') && (
-          <TabsContent value="company">
+          <TabsContent value="company" className="space-y-6">
             <CompanySettings settings={settings} svgDataUri={svgDataUri} hasIcon={hasIcon} />
+            <InvoiceSellerSettings settings={settings} />
+            <InvoicePaymentSettings settings={settings} />
+            <PdfBrandingSettings settings={settings} />
           </TabsContent>
         )}
 
@@ -266,11 +306,16 @@ export function Settings(): React.JSX.Element {
             <EntityHistoryTab
               entityType="setting"
               entityId={null}
+              relatedEntityTypes={['station_message_template']}
               extraColumns={[
                 {
                   header: t('audit.settingKey'),
                   className: 'text-sm font-medium',
                   render: (row) => {
+                    if (row.entityType === 'station_message_template') {
+                      const language = (row.after as { language?: string } | null)?.language;
+                      return `${auditEntityLabel(t, row.entityType)}: ${stationMessageStateLabel(t, row.entityIdSnapshot)}${language != null ? ` (${language})` : ''}`;
+                    }
                     const after = row.after as { key?: string } | null;
                     const before = row.before as { key?: string } | null;
                     return after?.key ?? before?.key ?? row.entityIdSnapshot;
@@ -280,15 +325,17 @@ export function Settings(): React.JSX.Element {
                   header: t('audit.change'),
                   className: 'text-xs',
                   render: (row) => {
-                    const before = row.before as { value?: unknown } | null;
-                    const after = row.after as { value?: unknown } | null;
+                    // A setting row holds `value`, a station message template row `body`.
+                    const field = row.entityType === 'station_message_template' ? 'body' : 'value';
+                    const before = row.before as Record<string, unknown> | null;
+                    const after = row.after as Record<string, unknown> | null;
                     return (
                       <span className="font-mono">
                         <span className="text-muted-foreground">
-                          {formatSettingValue(before?.value)}
+                          {formatSettingValue(before?.[field])}
                         </span>
                         <span className="mx-2 text-muted-foreground">{'→'}</span>
-                        <span>{formatSettingValue(after?.value)}</span>
+                        <span>{formatSettingValue(after?.[field])}</span>
                       </span>
                     );
                   },

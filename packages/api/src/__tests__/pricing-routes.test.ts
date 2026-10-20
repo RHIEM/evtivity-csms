@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
 // DB mock helpers
 let dbResults: unknown[][] = [];
+// Values of every insert run inside db.transaction.
+const lastTxInsertValues: unknown[] = [];
 let dbCallIndex = 0;
 function setupDbResults(...results: unknown[][]) {
   dbResults = results;
@@ -75,7 +81,15 @@ vi.mock('@evtivity/database', () => ({
     transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
       const tx = {
         select: vi.fn(() => makeChain()),
-        insert: vi.fn(() => makeChain()),
+        insert: vi.fn(() => {
+          const chain = makeChain();
+          const values = chain['values'] as (v: unknown) => unknown;
+          chain['values'] = (v: unknown) => {
+            lastTxInsertValues.push(v);
+            return values(v);
+          };
+          return chain;
+        }),
         update: vi.fn(() => makeChain()),
         delete: vi.fn(() => makeChain()),
       };
@@ -100,6 +114,9 @@ vi.mock('@evtivity/database', () => ({
   holidayAuditLog: {},
   pricingAssignmentAuditLog: {},
   writeAudit: vi.fn().mockResolvedValue(undefined),
+  resolveGroupTariffs: vi.fn(() => Promise.resolve({ tariffs: [], current: null })),
+  getSystemTimezone: vi.fn(() => Promise.resolve('Europe/Berlin')),
+  isRoamingEnabled: vi.fn(() => Promise.resolve(false)),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -116,7 +133,7 @@ vi.mock('drizzle-orm', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { pricingRoutes } from '../routes/pricing.js';
-import { db } from '@evtivity/database';
+import { resolveGroupTariffs } from '@evtivity/database';
 
 const VALID_GROUP_ID = 'pgr_000000000001';
 const VALID_TARIFF_ID = 'trf_000000000001';
@@ -245,6 +262,46 @@ describe('Pricing routes', () => {
 
   // ---------- POST /v1/pricing-groups ----------
 
+  describe('GET /v1/pricing-groups/:id/schedule', () => {
+    const group = { id: VALID_GROUP_ID, name: 'Default' };
+
+    it('resolves the current tariff in the timezone given', async () => {
+      setupDbResults([group]);
+      const res = await app.inject({
+        method: 'GET',
+        url: `/pricing-groups/${VALID_GROUP_ID}/schedule?timezone=Asia/Tokyo`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(vi.mocked(resolveGroupTariffs).mock.calls.at(-1)?.[1]).toMatchObject({
+        timezone: 'Asia/Tokyo',
+      });
+    });
+
+    it('defaults to the system timezone setting', async () => {
+      setupDbResults([group]);
+      const res = await app.inject({
+        method: 'GET',
+        url: `/pricing-groups/${VALID_GROUP_ID}/schedule`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(vi.mocked(resolveGroupTariffs).mock.calls.at(-1)?.[1]).toMatchObject({
+        timezone: 'Europe/Berlin',
+      });
+    });
+
+    it('returns 400 for an invalid timezone', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/pricing-groups/${VALID_GROUP_ID}/schedule?timezone=Not/AZone`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().code).toBe('VALIDATION_ERROR');
+    });
+  });
+
   describe('POST /v1/pricing-groups', () => {
     it('returns 401 without token', async () => {
       const res = await app.inject({
@@ -286,7 +343,8 @@ describe('Pricing routes', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
       };
-      setupDbResults([created]);
+      // Q1: no default group yet, Q2: insert
+      setupDbResults([], [created]);
       const res = await app.inject({
         method: 'POST',
         url: '/pricing-groups',
@@ -525,7 +583,7 @@ describe('Pricing routes', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
       };
-      // Q1: existing tariffs, Q2: unset defaults, Q3: insert
+      // Q1: the group tariffs, Q2: unset defaults, Q3: insert (in the transaction)
       setupDbResults([], [], [created]);
       const res = await app.inject({
         method: 'POST',
@@ -535,12 +593,9 @@ describe('Pricing routes', () => {
       });
       expect(res.statusCode).toBe(201);
       expect(res.json()).not.toHaveProperty('currency');
-      const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
-        values: ReturnType<typeof vi.fn>;
-      };
-      expect(insertChain.values).toHaveBeenCalledWith(
-        expect.not.objectContaining({ currency: expect.anything() }),
-      );
+      const insertValues = lastTxInsertValues.at(-1);
+      expect(insertValues).toBeDefined();
+      expect(insertValues).not.toHaveProperty('currency');
     });
 
     it('creates a tariff with only required fields', async () => {
@@ -581,6 +636,64 @@ describe('Pricing routes', () => {
         payload: {},
       });
       expect(res.statusCode).toBe(400);
+    });
+
+    it.each([
+      ['pricePerKwh', '0,49'],
+      ['pricePerKwh', 'abc'],
+      ['pricePerKwh', '-1'],
+      ['pricePerKwh', ''],
+      ['pricePerMinute', '1,5'],
+      ['pricePerSession', '1.000,00'],
+      ['idleFeePricePerMinute', '0.1.2'],
+      ['reservationFeePerMinute', '.'],
+      ['taxRate', '0,19'],
+      ['taxRate', '1.5'],
+      ['taxRate', '19'],
+    ])('returns 400 when %s is %j', async (field, value) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/pricing-groups/${VALID_GROUP_ID}/tariffs`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { name: 'Test', [field]: value },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it.each([
+      ['pricePerKwh', '0.49'],
+      ['pricePerKwh', '0'],
+      ['pricePerKwh', '.5'],
+      ['taxRate', '0.19'],
+      ['taxRate', '1'],
+      ['taxRate', '1.0'],
+    ])('accepts %s of %j', async (field, value) => {
+      const created = {
+        id: VALID_TARIFF_ID,
+        pricingGroupId: VALID_GROUP_ID,
+        name: 'Test',
+        pricePerKwh: null,
+        pricePerMinute: null,
+        pricePerSession: null,
+        isActive: true,
+        idleFeePricePerMinute: null,
+        taxRate: null,
+        restrictions: null,
+        reservationFeePerMinute: null,
+        priority: 0,
+        isDefault: true,
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        [field]: value,
+      };
+      setupDbResults([], [], [created]);
+      const res = await app.inject({
+        method: 'POST',
+        url: `/pricing-groups/${VALID_GROUP_ID}/tariffs`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { name: 'Test', [field]: value },
+      });
+      expect(res.statusCode).toBe(201);
     });
 
     it('returns 400 when id param is invalid', async () => {
@@ -821,6 +934,55 @@ describe('Pricing routes', () => {
       });
       expect(res.statusCode).toBe(404);
       expect(res.json().code).toBe('TARIFF_NOT_FOUND');
+    });
+
+    it('returns 400 when a price uses a comma as decimal separator', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/pricing-groups/${VALID_GROUP_ID}/tariffs/${VALID_TARIFF_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { pricePerKwh: '0,49' },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('returns 400 when taxRate is above 1', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/pricing-groups/${VALID_GROUP_ID}/tariffs/${VALID_TARIFF_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { taxRate: '8.25' },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('accepts null to clear a price', async () => {
+      const existing = {
+        id: VALID_TARIFF_ID,
+        pricingGroupId: VALID_GROUP_ID,
+        name: 'Old Rate',
+        pricePerKwh: '0.25',
+        pricePerMinute: null,
+        pricePerSession: null,
+        isActive: true,
+        idleFeePricePerMinute: null,
+        taxRate: null,
+        restrictions: null,
+        reservationFeePerMinute: null,
+        priority: 0,
+        isDefault: true,
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+      };
+      setupDbResults([existing], [], [{ ...existing, pricePerKwh: null }]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/pricing-groups/${VALID_GROUP_ID}/tariffs/${VALID_TARIFF_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { pricePerKwh: null },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().pricePerKwh).toBeNull();
     });
 
     it('returns 400 when tariffId is invalid', async () => {

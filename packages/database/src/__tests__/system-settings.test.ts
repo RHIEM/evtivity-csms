@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockSelect = vi.fn();
 vi.mock('../config.js', () => ({
@@ -12,6 +12,7 @@ vi.mock('../config.js', () => ({
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((_col, val) => ({ type: 'eq', val })),
+  inArray: vi.fn((_col, values) => ({ type: 'inArray', values })),
 }));
 
 vi.mock('../schema/settings.js', () => ({
@@ -32,10 +33,18 @@ function makeFailingChain() {
   return chain;
 }
 
+// Under load (a full run) the first import of the module graph can outlast
+// the 5 s test timeout. Load it once here with a longer hook timeout; each
+// test still imports a fresh copy after vi.resetModules, from the warm cache.
+beforeAll(async () => {
+  await import('../lib/system-settings.js');
+}, 30_000);
+
 describe('getCompanyCurrency', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    mockSelect.mockReset();
   });
 
   it('returns the configured currency, upper-cased', async () => {
@@ -99,5 +108,177 @@ describe('getCompanyCurrency', () => {
     mockSelect.mockReturnValue(makeFailingChain());
     const { getCompanyCurrency } = await import('../lib/system-settings.js');
     expect(await getCompanyCurrency()).toBe('USD');
+  });
+});
+
+describe('getCompanyPriceDisplay', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockSelect.mockReset();
+  });
+
+  it('returns the configured price display', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyPriceDisplay } = await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('gross');
+  });
+
+  it('falls back to net when the setting is missing or invalid', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'brutto' }]));
+    const { getCompanyPriceDisplay, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('net');
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyPriceDisplay, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyPriceDisplay();
+    await getCompanyPriceDisplay();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'net' }]));
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+
+  it('returns net when the first query fails', async () => {
+    mockSelect.mockReturnValue(makeFailingChain());
+    const { getCompanyPriceDisplay } = await import('../lib/system-settings.js');
+    expect(await getCompanyPriceDisplay()).toBe('net');
+  });
+});
+
+describe('getCompanyTaxBasis', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockSelect.mockReset();
+  });
+
+  it('returns the configured tax basis', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyTaxBasis } = await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('gross');
+  });
+
+  it('falls back to net when the setting is missing or invalid', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'brutto' }]));
+    const { getCompanyTaxBasis, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('net');
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'gross' }]));
+    const { getCompanyTaxBasis, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyTaxBasis();
+    await getCompanyTaxBasis();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'net' }]));
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+
+  it('keeps the last value, or net, when the query fails', async () => {
+    mockSelect.mockReturnValue(makeFailingChain());
+    const { getCompanyTaxBasis } = await import('../lib/system-settings.js');
+    expect(await getCompanyTaxBasis()).toBe('net');
+  });
+});
+
+describe('getCompanyCountry', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockSelect.mockReset();
+  });
+
+  it('returns the configured country, upper-cased', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: ' de ' }]));
+    const { getCompanyCountry } = await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBe('DE');
+  });
+
+  it('returns null when the setting is missing or not a two-letter code', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'Germany' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBeNull();
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([]));
+    expect(await getCompanyCountry()).toBeNull();
+  });
+
+  it('caches the value until the cache is cleared', async () => {
+    mockSelect.mockReturnValue(makeChain([{ value: 'US' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    await getCompanyCountry();
+    await getCompanyCountry();
+    expect(mockSelect).toHaveBeenCalledTimes(1);
+    clearSystemSettingsCache();
+    mockSelect.mockReturnValue(makeChain([{ value: 'FR' }]));
+    expect(await getCompanyCountry()).toBe('FR');
+  });
+
+  it('keeps the last value, or null, when the query fails', async () => {
+    vi.useFakeTimers();
+    mockSelect.mockReturnValue(makeChain([{ value: 'NL' }]));
+    const { getCompanyCountry, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    expect(await getCompanyCountry()).toBe('NL');
+    vi.advanceTimersByTime(60_001);
+    mockSelect.mockReturnValue(makeFailingChain());
+    expect(await getCompanyCountry()).toBe('NL');
+    clearSystemSettingsCache();
+    expect(await getCompanyCountry()).toBeNull();
+    vi.useRealTimers();
+  });
+});
+
+describe('getInvoicePaymentSettings', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockSelect.mockReset();
+  });
+
+  it('reads the bank details and the QR switch, dropping invalid values', async () => {
+    mockSelect.mockReturnValue(
+      makeChain([
+        { key: 'company.bankAccountHolder', value: 'Acme GmbH' },
+        { key: 'company.iban', value: 'DE89370400440532013000' },
+        { key: 'company.bic', value: 'not a bic' },
+        { key: 'company.bankName', value: '' },
+        { key: 'invoice.epcQrEnabled', value: false },
+      ]),
+    );
+    const { getInvoicePaymentSettings } = await import('../lib/system-settings.js');
+    expect(await getInvoicePaymentSettings()).toEqual({
+      accountHolder: 'Acme GmbH',
+      iban: 'DE89370400440532013000',
+      bic: null,
+      bankName: null,
+      epcQrEnabled: false,
+    });
+  });
+
+  it('has no bank details and the QR code on when nothing is set or the query fails', async () => {
+    mockSelect.mockReturnValueOnce(makeChain([])).mockReturnValueOnce(makeFailingChain());
+    const { getInvoicePaymentSettings, clearSystemSettingsCache } =
+      await import('../lib/system-settings.js');
+    const none = { accountHolder: null, iban: null, bic: null, bankName: null, epcQrEnabled: true };
+    expect(await getInvoicePaymentSettings()).toEqual(none);
+    clearSystemSettingsCache();
+    expect(await getInvoicePaymentSettings()).toEqual(none);
   });
 });

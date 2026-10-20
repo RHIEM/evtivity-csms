@@ -12,7 +12,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { permissionCatalog } from '@evtivity/lib/permissions';
 import { PermissionEditor } from '@/components/PermissionEditor';
+import { useHasAllSiteAccess } from '@/lib/auth';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 
@@ -36,6 +38,7 @@ interface Site {
 
 export function UserCreate(): React.JSX.Element {
   const { t } = useTranslation();
+  const canGrantAllSites = useHasAllSiteAccess();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -60,36 +63,13 @@ export function UserCreate(): React.JSX.Element {
   });
   const sitesList = sitesData?.data ?? [];
 
-  // Fetch role defaults for permission pre-population
-  const { data: roleDefaults } = useQuery({
-    queryKey: ['role-defaults'],
-    queryFn: async () => {
-      const groups = await api.get<{ label: string; permissions: string[] }[]>('/v1/permissions');
-      const allPerms = groups.flatMap((g) => g.permissions);
-      // Admin gets all, operator gets operational subset
-      // We replicate the backend logic here
-      const adminPerms = [...allPerms];
-      const operatorPerms = allPerms.filter(
-        (p) => !p.startsWith('settings.') && p !== 'users:write',
-      );
-      const viewerPerms = allPerms.filter((p) => p.endsWith(':read') && !p.startsWith('settings.'));
-      return { admin: adminPerms, operator: operatorPerms, viewer: viewerPerms };
-    },
-  });
-
-  // When role changes, reset permissions to that role's defaults
+  // When role changes, reset permissions to the defaults the server gives that role
   useEffect(() => {
-    if (roleId === '' || roles == null || roleDefaults == null) return;
+    if (roleId === '' || roles == null) return;
     const selectedRole = roles.find((r) => r.id === roleId);
     if (selectedRole == null) return;
-    const defaults =
-      selectedRole.name === 'admin'
-        ? roleDefaults.admin
-        : selectedRole.name === 'viewer'
-          ? roleDefaults.viewer
-          : roleDefaults.operator;
-    setSelectedPermissions(defaults);
-  }, [roleId, roles, roleDefaults]);
+    setSelectedPermissions(permissionCatalog.defaultsFor(selectedRole.name));
+  }, [roleId, roles]);
 
   const createMutation = useMutation({
     mutationFn: async (body: {
@@ -155,7 +135,9 @@ export function UserCreate(): React.JSX.Element {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="grid gap-6">
             <div className="space-y-2">
-              <Label htmlFor="user-email">{t('common.email')}</Label>
+              <Label htmlFor="user-email" className="leading-6">
+                {t('common.email')}
+              </Label>
               <Input
                 id="user-email"
                 type="email"
@@ -171,7 +153,9 @@ export function UserCreate(): React.JSX.Element {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="user-first">{t('users.firstName')}</Label>
+                <Label htmlFor="user-first" className="leading-6">
+                  {t('users.firstName')}
+                </Label>
                 <Input
                   id="user-first"
                   value={firstName}
@@ -185,7 +169,9 @@ export function UserCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="user-last">{t('users.lastName')}</Label>
+                <Label htmlFor="user-last" className="leading-6">
+                  {t('users.lastName')}
+                </Label>
                 <Input
                   id="user-last"
                   value={lastName}
@@ -200,7 +186,9 @@ export function UserCreate(): React.JSX.Element {
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="user-phone">{t('users.phone')}</Label>
+              <Label htmlFor="user-phone" className="leading-6">
+                {t('users.phone')}
+              </Label>
               <Input
                 id="user-phone"
                 type="tel"
@@ -212,7 +200,9 @@ export function UserCreate(): React.JSX.Element {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="user-role">{t('users.role')}</Label>
+              <Label htmlFor="user-role" className="leading-6">
+                {t('users.role')}
+              </Label>
               <Select
                 id="user-role"
                 value={roleId}
@@ -246,21 +236,26 @@ export function UserCreate(): React.JSX.Element {
               </Card>
             )}
             <div className="space-y-2">
-              <Label>{t('users.siteAccess')}</Label>
-              <div className="flex items-center gap-2">
-                <input
-                  id="create-all-sites"
-                  type="checkbox"
-                  checked={hasAllSiteAccess}
-                  onChange={(e) => {
-                    setHasAllSiteAccess(e.target.checked);
-                    if (e.target.checked) setSelectedSiteIds([]);
-                  }}
-                  className="h-4 w-4 rounded border-input"
-                />
-                <Label htmlFor="create-all-sites">{t('users.allSites')}</Label>
-              </div>
-              <p className="text-xs text-muted-foreground">{t('users.allSitesDescription')}</p>
+              <Label className="leading-6">{t('users.siteAccess')}</Label>
+              {/* Only an operator with access to every site may grant it. */}
+              {canGrantAllSites && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="create-all-sites"
+                      type="checkbox"
+                      checked={hasAllSiteAccess}
+                      onChange={(e) => {
+                        setHasAllSiteAccess(e.target.checked);
+                        if (e.target.checked) setSelectedSiteIds([]);
+                      }}
+                      className="h-4 w-4 rounded border-input"
+                    />
+                    <Label htmlFor="create-all-sites">{t('users.allSites')}</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{t('users.allSitesDescription')}</p>
+                </>
+              )}
               {!hasAllSiteAccess && (
                 <div
                   className={`max-h-48 overflow-y-auto rounded-md border p-3 space-y-2 ${

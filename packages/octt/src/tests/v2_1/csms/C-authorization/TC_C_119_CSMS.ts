@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { TestCase, StepResult } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 
 export const TC_C_119_CSMS: TestCase = {
   id: 'TC_C_119_CSMS',
@@ -37,7 +37,7 @@ export const TC_C_119_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const pspRef = `PSP-${String(Date.now())}`;
 
     // Step 2: Send TransactionEvent Started with DirectPayment
@@ -49,6 +49,7 @@ export const TC_C_119_CSMS: TestCase = {
       transactionInfo: {
         transactionId: txId,
         chargingState: 'Charging',
+        transactionLimit: { maxCost: 50.0 },
       },
       evse: { id: 1, connectorId: 1 },
       idToken: {
@@ -88,7 +89,8 @@ export const TC_C_119_CSMS: TestCase = {
       },
     });
 
-    // Step 4: Send NotifySettlement with status Failed
+    // Step 5: Send NotifySettlement with status Failed (receiptUrl omitted). The doc has
+    // no tool validations, so only the response is checked.
     try {
       const settlementRes = await ctx.client.sendCall('NotifySettlement', {
         transactionId: txId,
@@ -98,8 +100,6 @@ export const TC_C_119_CSMS: TestCase = {
         settlementAmount: 18.15,
       });
 
-      const receiptUrl = settlementRes['receiptUrl'] as string | undefined;
-
       pushSendAckStep(
         steps,
         2,
@@ -108,21 +108,13 @@ export const TC_C_119_CSMS: TestCase = {
         'NotifySettlementResponse received',
         `Response keys: ${Object.keys(settlementRes).join(', ')}`,
       );
-
-      steps.push({
-        step: 3,
-        description: 'Verify receiptUrl is present in NotifySettlementResponse',
-        status: receiptUrl != null && receiptUrl.length > 0 ? 'passed' : 'failed',
-        expected: 'receiptUrl must be present',
-        actual: `receiptUrl = ${String(receiptUrl)}`,
-      });
-    } catch {
+    } catch (err) {
       steps.push({
         step: 2,
         description: 'Send NotifySettlement with status Failed',
         status: 'failed',
         expected: 'NotifySettlementResponse received',
-        actual: 'NotifySettlement call failed or not supported',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 

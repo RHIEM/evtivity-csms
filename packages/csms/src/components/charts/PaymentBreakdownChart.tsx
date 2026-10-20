@@ -7,19 +7,24 @@ import type { ApexOptions } from 'apexcharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { useTranslation } from 'react-i18next';
+import { ChartBody, type QueryState } from './ChartBody';
+import { formatNumber } from '@/lib/formatting';
 import { useAuth } from '@/lib/auth';
 import { PAYMENT_STATUS_COLORS } from '@/lib/chart-theme';
 
 interface PaymentBreakdownChartProps {
   data: { status: string; count: number; totalCents: number }[];
   info?: string;
+  /** The state of the query behind the chart; omitted, the chart shows as given. */
+  state?: QueryState;
 }
 
 export function PaymentBreakdownChart({
   data,
   info,
+  state,
 }: PaymentBreakdownChartProps): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
   const labels = useMemo(
     () => data.map((d) => t(`payments.statuses.${d.status}`, d.status)),
@@ -42,6 +47,7 @@ export function PaymentBreakdownChart({
       labels,
       colors,
       legend: { position: 'bottom' },
+      dataLabels: { formatter: (val: number) => `${formatNumber(val, 1)}%` },
       responsive: [
         {
           breakpoint: 768,
@@ -51,7 +57,7 @@ export function PaymentBreakdownChart({
         },
       ],
     }),
-    [isDark, labels, colors],
+    [isDark, labels, colors, i18n.language],
   );
 
   return (
@@ -63,7 +69,9 @@ export function PaymentBreakdownChart({
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <ReactApexChart options={options} series={values} type="donut" height={300} />
+        <ChartBody state={state} isEmpty={values.length === 0} emptyText={t('charts.noData')}>
+          <ReactApexChart options={options} series={values} type="donut" height={300} />
+        </ChartBody>
       </CardContent>
     </Card>
   );

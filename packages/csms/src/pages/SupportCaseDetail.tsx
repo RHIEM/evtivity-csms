@@ -12,6 +12,7 @@ import { AddIconButton } from '@/components/add-icon-button';
 import { CopyableId } from '@/components/copyable-id';
 import { RefundButton } from '@/components/refund-button';
 import { RemoveIconButton } from '@/components/remove-icon-button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -27,10 +28,14 @@ import {
 } from '@/components/ui/table';
 import { MessageThread } from '@/components/support/MessageThread';
 import { CaseInfoSidebar } from '@/components/support/CaseInfoSidebar';
+import { SupportCaseAiBadge, SupportCaseAiCard } from '@/components/support/SupportCaseAiCard';
+import type { SupportCaseAiFields } from '@/components/support/SupportCaseAiCard';
+import { SupportCaseInsights } from '@/components/ai/insights/SupportCaseInsights';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
+import { parseMajorInputToCents } from '@evtivity/lib/currency';
 import { api } from '@/lib/api';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
-import { formatCents } from '@/lib/formatting';
+import { formatCents, formatNumber } from '@/lib/formatting';
 import { LoadingLogo } from '@/components/loading-logo';
 
 interface Attachment {
@@ -44,7 +49,7 @@ interface Attachment {
 
 interface Message {
   id: number;
-  senderType: 'driver' | 'operator' | 'system';
+  senderType: 'driver' | 'operator' | 'system' | 'assistant';
   senderId: string | null;
   body: string;
   isInternal: boolean;
@@ -60,7 +65,7 @@ interface SessionRef {
   status: string | null;
 }
 
-interface CaseDetail {
+interface CaseDetail extends SupportCaseAiFields {
   id: string;
   caseNumber: string;
   subject: string;
@@ -131,7 +136,6 @@ export function SupportCaseDetail(): React.JSX.Element {
     api
       .post(`/v1/support-cases/${id}/read`, {})
       .then(() => {
-        void queryClient.invalidateQueries({ queryKey: ['support-cases-unread-count'] });
         void queryClient.invalidateQueries({ queryKey: ['support-cases'] });
       })
       .catch((err: unknown) => {
@@ -146,8 +150,8 @@ export function SupportCaseDetail(): React.JSX.Element {
   });
 
   const { data: s3Status } = useQuery({
-    queryKey: ['s3-status'],
-    queryFn: () => api.get<{ configured: boolean }>('/v1/settings/s3/status'),
+    queryKey: ['s3-status', 'support'],
+    queryFn: () => api.get<{ configured: boolean }>('/v1/support-cases/attachment-storage'),
   });
 
   // Fetch payment for each linked session
@@ -223,7 +227,9 @@ export function SupportCaseDetail(): React.JSX.Element {
   }
 
   if (caseDetail == null) {
-    return <p className="text-sm text-destructive">Case not found</p>;
+    // A 404 (missing case, or a case outside the operator's sites) leaves
+    // caseDetail undefined.
+    return <p className="text-sm text-destructive">{t('supportCases.notFound')}</p>;
   }
 
   function canRefundSession(sessionId: string): boolean {
@@ -235,8 +241,8 @@ export function SupportCaseDetail(): React.JSX.Element {
 
   function handleRefundConfirm(): boolean {
     if (refundSession == null) return false;
-    const cents = Math.round(parseFloat(refundAmount) * 100);
-    if (isNaN(cents) || cents <= 0) {
+    const cents = parseMajorInputToCents(refundAmount);
+    if (cents == null || cents <= 0) {
       setRefundError(t('supportCases.refundAmountRequired'));
       return false;
     }
@@ -258,13 +264,17 @@ export function SupportCaseDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/support-cases" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{caseDetail.caseNumber}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{caseDetail.caseNumber}</h1>
           <CopyableId id={caseDetail.id} />
         </div>
         <Badge>{t(`supportCases.statuses.${caseDetail.status}`, caseDetail.status)}</Badge>
+        <SupportCaseAiBadge
+          aiState={caseDetail.aiState ?? null}
+          resolutionSource={caseDetail.resolutionSource ?? null}
+        />
         <EntityNavButtons resource="support-cases" basePath="/support-cases" currentId={id} />
       </div>
 
@@ -283,7 +293,7 @@ export function SupportCaseDetail(): React.JSX.Element {
                 <Row label={t('supportCases.driver')}>
                   <Link
                     to={`/drivers/${caseDetail.driverId ?? ''}`}
-                    className="text-primary hover:underline"
+                    className="text-link hover:underline"
                   >
                     {caseDetail.driverName}
                   </Link>
@@ -310,7 +320,6 @@ export function SupportCaseDetail(): React.JSX.Element {
                   </span>
                   <AddIconButton
                     title={t('supportCases.addSession')}
-                    size="sm"
                     onClick={() => {
                       setShowSessionSearch(true);
                     }}
@@ -360,7 +369,7 @@ export function SupportCaseDetail(): React.JSX.Element {
                                     s.driverName,
                                     s.status,
                                     s.finalCostCents != null
-                                      ? `${(s.finalCostCents / 100).toFixed(2)} ${s.currency.toUpperCase()}`
+                                      ? formatCents(s.finalCostCents, s.currency)
                                       : null,
                                   ]
                                     .filter(Boolean)
@@ -395,13 +404,13 @@ export function SupportCaseDetail(): React.JSX.Element {
                           const refunded = payment?.refundedAmountCents ?? 0;
                           const remaining = captured - refunded;
                           const currency = payment?.currency.toUpperCase();
-                          const fmt = (cents: number) => (cents / 100).toFixed(2);
+                          const fmt = (cents: number) => formatNumber(cents / 100, 2);
                           return (
                             <TableRow key={session.id}>
                               <TableCell>
                                 <Link
                                   to={`/sessions/${session.id}`}
-                                  className="text-primary hover:underline text-sm"
+                                  className="text-link hover:underline text-sm"
                                 >
                                   {session.id}
                                 </Link>
@@ -464,7 +473,6 @@ export function SupportCaseDetail(): React.JSX.Element {
                                   )}
                                   <RemoveIconButton
                                     title={t('common.remove')}
-                                    size="sm"
                                     onClick={() => {
                                       setRemoveSessionId(session.id);
                                     }}
@@ -505,7 +513,11 @@ export function SupportCaseDetail(): React.JSX.Element {
         </div>
 
         {/* Sidebar controls */}
-        <CaseInfoSidebar caseDetail={caseDetail} operatorUsers={operatorUsers?.data} />
+        <div className="space-y-4">
+          <CaseInfoSidebar caseDetail={caseDetail} operatorUsers={operatorUsers?.data} />
+          <SupportCaseAiCard fields={caseDetail} timezone={timezone} />
+          <SupportCaseInsights caseId={caseDetail.id} />
+        </div>
       </div>
 
       <ConfirmDialog
@@ -524,15 +536,15 @@ export function SupportCaseDetail(): React.JSX.Element {
         onConfirm={handleRefundConfirm}
       >
         <div className="space-y-2">
-          <Label htmlFor="support-case-refund-amount">{t('supportCases.refundAmountLabel')}</Label>
-          <Input
+          <Label htmlFor="support-case-refund-amount" className="leading-6">
+            {t('supportCases.refundAmountLabel')}
+          </Label>
+          <DecimalInput
             id="support-case-refund-amount"
-            type="number"
-            step="0.01"
-            min="0.01"
+            decimalScale={2}
             value={refundAmount}
-            onChange={(e) => {
-              setRefundAmount(e.target.value);
+            onChange={(value) => {
+              setRefundAmount(value);
               setRefundError('');
             }}
             className={refundError !== '' ? 'border-destructive' : ''}

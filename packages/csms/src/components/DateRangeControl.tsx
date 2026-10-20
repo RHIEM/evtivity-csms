@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useTranslation } from 'react-i18next';
+import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { presetRange } from '@/lib/date-range';
 
@@ -46,14 +47,14 @@ export function DateRangeControl({
   return (
     <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
       <Select
-        aria-label="Date range"
+        aria-label={t('common.dateRange')}
         value={isCustom ? '' : String(days)}
         onChange={(e) => {
           if (e.target.value) {
             onPresetChange(Number(e.target.value));
           }
         }}
-        className="h-8 w-auto px-2 pr-8 text-xs"
+        className="w-auto"
       >
         {isCustom && <option value="">{t('dashboard.custom')}</option>}
         {PRESETS.map((p) => (
@@ -63,9 +64,9 @@ export function DateRangeControl({
         ))}
       </Select>
       <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
-        <input
+        <Input
           type="date"
-          aria-label="Start date"
+          aria-label={t('common.startDate')}
           value={displayFrom}
           min={minDate}
           // max stops the user from picking a start that comes after the
@@ -79,12 +80,12 @@ export function DateRangeControl({
               onCustomChange(e.target.value, displayTo);
             }
           }}
-          className="h-8 w-[130px] rounded-md border bg-background px-1.5 text-xs"
+          className="w-auto"
         />
         <span className="text-xs text-muted-foreground">{t('dashboard.to')}</span>
-        <input
+        <Input
           type="date"
-          aria-label="End date"
+          aria-label={t('common.endDate')}
           value={displayTo}
           min={displayFrom}
           max={maxDate}
@@ -93,7 +94,7 @@ export function DateRangeControl({
               onCustomChange(displayFrom, e.target.value);
             }
           }}
-          className="h-8 w-[130px] rounded-md border bg-background px-1.5 text-xs"
+          className="w-auto"
         />
       </div>
     </div>

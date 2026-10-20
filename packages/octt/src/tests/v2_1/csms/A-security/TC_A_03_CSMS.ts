@@ -5,6 +5,7 @@ import { OcppClient } from '@evtivity/css/ocpp-client';
 import { db, chargingStations } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
 import { hash } from 'argon2';
+import { STATION_PASSWORD_HASH_OPTIONS } from '@evtivity/lib';
 import type { TestCase, StepResult } from '../../../../types.js';
 
 const KNOWN_PASSWORD = 'test-password-tc-a03';
@@ -24,7 +25,7 @@ export const TC_A_03_CSMS: TestCase = {
 
     // The executor provisions the station as SP0 (no auth). Update it to SP1
     // with a known password so the CSMS enforces Basic Auth.
-    const passwordHash = await hash(KNOWN_PASSWORD);
+    const passwordHash = await hash(KNOWN_PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
     await db
       .update(chargingStations)
       .set({ securityProfile: 1, basicAuthPasswordHash: passwordHash })
@@ -39,12 +40,14 @@ export const TC_A_03_CSMS: TestCase = {
     });
 
     let noAuthRejected = false;
+    let noAuthRejectedError: string | null = null;
     try {
       await noAuthClient.connect();
       await new Promise((resolve) => setTimeout(resolve, 1000));
       noAuthRejected = !noAuthClient.isConnected;
-    } catch {
+    } catch (err) {
       noAuthRejected = true;
+      noAuthRejectedError = err instanceof Error ? err.message : String(err);
     } finally {
       noAuthClient.disconnect();
     }
@@ -54,7 +57,9 @@ export const TC_A_03_CSMS: TestCase = {
       description: 'CSMS rejects connection without Authorization header (securityProfile 0)',
       status: noAuthRejected ? 'passed' : 'failed',
       expected: 'Connection rejected (no auth)',
-      actual: noAuthRejected ? 'Connection rejected' : 'Connection unexpectedly accepted',
+      actual: noAuthRejected
+        ? `Connection rejected${noAuthRejectedError != null ? `: ${noAuthRejectedError}` : ''}`
+        : 'Connection unexpectedly accepted',
     });
 
     // Step 2: Attempt connection with wrong password. CSMS should reject.
@@ -68,12 +73,14 @@ export const TC_A_03_CSMS: TestCase = {
     });
 
     let badPasswordRejected = false;
+    let badPasswordRejectedError: string | null = null;
     try {
       await badPasswordClient.connect();
       await new Promise((resolve) => setTimeout(resolve, 1000));
       badPasswordRejected = !badPasswordClient.isConnected;
-    } catch {
+    } catch (err) {
       badPasswordRejected = true;
+      badPasswordRejectedError = err instanceof Error ? err.message : String(err);
     } finally {
       badPasswordClient.disconnect();
     }
@@ -83,7 +90,9 @@ export const TC_A_03_CSMS: TestCase = {
       description: 'CSMS rejects connection with invalid password',
       status: badPasswordRejected ? 'passed' : 'failed',
       expected: 'Connection rejected (wrong password)',
-      actual: badPasswordRejected ? 'Connection rejected' : 'Connection unexpectedly accepted',
+      actual: badPasswordRejected
+        ? `Connection rejected${badPasswordRejectedError != null ? `: ${badPasswordRejectedError}` : ''}`
+        : 'Connection unexpectedly accepted',
     });
 
     // Step 3: Verify valid connection works with correct credentials.
@@ -98,12 +107,13 @@ export const TC_A_03_CSMS: TestCase = {
     });
 
     let validConnected = false;
+    let validConnectError: string | null = null;
     try {
       await validClient.connect();
       await new Promise((resolve) => setTimeout(resolve, 500));
       validConnected = validClient.isConnected;
-    } catch {
-      validConnected = false;
+    } catch (err) {
+      validConnectError = err instanceof Error ? err.message : String(err);
     } finally {
       validClient.disconnect();
     }
@@ -113,7 +123,9 @@ export const TC_A_03_CSMS: TestCase = {
       description: 'CSMS accepts connection with valid credentials',
       status: validConnected ? 'passed' : 'failed',
       expected: 'Connected with valid credentials',
-      actual: validConnected ? 'Connected with valid credentials' : 'Not connected',
+      actual: validConnected
+        ? 'Connected with valid credentials'
+        : (validConnectError ?? 'Not connected'),
     });
 
     return {

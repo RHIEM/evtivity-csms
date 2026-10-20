@@ -13,9 +13,12 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { EnergyChart } from '@/components/charts/EnergyChart';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
 import { formatEnergy, formatDurationMinutes } from '@/lib/formatting';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
+import { useHasAllSiteAccess } from '@/lib/auth';
 
 interface Fleet {
   id: string;
@@ -47,12 +50,15 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  // Deleting a fleet removes its links at every site: all-site users only.
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const timezone = useUserTimezone();
 
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   const { data: metrics } = useQuery({
     queryKey: ['fleets', fleetId, 'metrics'],
@@ -86,6 +92,7 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
   const deleteMutation = useMutation({
     mutationFn: () => api.delete<Fleet>(`/v1/fleets/${fleetId}`),
     onSuccess: () => {
+      setDeleteOpen(false);
       void queryClient.invalidateQueries({ queryKey: ['fleets'] });
       void navigate('/fleets');
     },
@@ -124,22 +131,27 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
           <CardTitle>{t('common.details')}</CardTitle>
           <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
             {!editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
-            <div title={driverCount > 0 ? t('fleets.removeDriversFirst') : undefined}>
-              <RemoveButton
-                label={t('common.delete')}
-                onClick={() => {
-                  deleteMutation.mutate();
-                }}
-                disabled={deleteMutation.isPending || driverCount > 0}
-              />
-            </div>
+            {hasAllSiteAccess && (
+              <div title={driverCount > 0 ? t('fleets.removeDriversFirst') : undefined}>
+                <RemoveButton
+                  label={t('common.delete')}
+                  onClick={() => {
+                    deleteMutation.reset();
+                    setDeleteOpen(true);
+                  }}
+                  disabled={deleteMutation.isPending || driverCount > 0}
+                />
+              </div>
+            )}
           </div>
         </CardHeader>
         <CardContent>
           {editing ? (
             <form onSubmit={handleSave} noValidate className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-name">{t('common.name')}</Label>
+                <Label htmlFor="edit-name" className="leading-6">
+                  {t('common.name')}
+                </Label>
                 <Input
                   id="edit-name"
                   value={name}
@@ -153,7 +165,9 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-desc">{t('common.description')}</Label>
+                <Label htmlFor="edit-desc" className="leading-6">
+                  {t('common.description')}
+                </Label>
                 <textarea
                   id="edit-desc"
                   value={description}
@@ -241,6 +255,23 @@ export function FleetDetailsTab({ fleetId, fleet }: FleetDetailsTabProps): React
       )}
 
       {energyData != null && energyData.length > 0 && <EnergyChart data={energyData} />}
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={t('fleets.deleteFleetTitle')}
+        description={t('fleets.deleteFleetDescription', { name: fleet.name })}
+        confirmLabel={t('common.delete')}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          deleteMutation.mutate();
+          return false;
+        }}
+      >
+        {/* 409 FLEET_HAS_OPEN_BILLING or FLEET_HAS_RESERVATIONS: the fleet stays. */}
+        {deleteMutation.isError && (
+          <p className="text-sm text-destructive">{getErrorMessage(deleteMutation.error, t)}</p>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

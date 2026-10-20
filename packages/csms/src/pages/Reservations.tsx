@@ -108,7 +108,7 @@ export function Reservations(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('reservations.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('reservations.subtitle')}</p>
@@ -127,16 +127,15 @@ export function Reservations(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('reservations.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('sites.title')}</Label>
+              <Label className="leading-6">{t('sites.title')}</Label>
               <Select
                 aria-label={t('sites.title')}
-                className="h-10"
                 value={siteFilter}
                 onChange={(e) => {
                   setSiteFilter(e.target.value);
@@ -152,10 +151,9 @@ export function Reservations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('stations.title')}</Label>
+              <Label className="leading-6">{t('stations.title')}</Label>
               <Select
                 aria-label={t('stations.title')}
-                className="h-10"
                 value={stationFilter}
                 onChange={(e) => {
                   setStationFilter(e.target.value);
@@ -171,10 +169,9 @@ export function Reservations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('common.status')}</Label>
+              <Label className="leading-6">{t('common.status')}</Label>
               <Select
                 aria-label={t('common.status')}
-                className="h-10"
                 value={statusFilter}
                 onChange={(e) => {
                   setStatusFilter(e.target.value);
@@ -216,7 +213,7 @@ export function Reservations(): React.JSX.Element {
               <div className="hidden items-end gap-4 md:flex">
                 <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
                   <div className="space-y-2">
-                    <Label>{t('reservations.search')}</Label>
+                    <Label className="leading-6">{t('reservations.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}
@@ -263,7 +260,7 @@ export function Reservations(): React.JSX.Element {
                   <TableCell className="whitespace-nowrap">
                     <Link
                       to={`/stations/${r.stationId}`}
-                      className="text-primary hover:underline"
+                      className="text-link hover:underline"
                       onClick={(e) => {
                         e.stopPropagation();
                       }}
@@ -275,7 +272,7 @@ export function Reservations(): React.JSX.Element {
                     {r.driverFirstName != null ? (
                       <Link
                         to={`/drivers/${r.driverId ?? ''}`}
-                        className="text-primary hover:underline"
+                        className="text-link hover:underline"
                         onClick={(e) => {
                           e.stopPropagation();
                         }}
@@ -295,7 +292,7 @@ export function Reservations(): React.JSX.Element {
                     {r.sessionId != null ? (
                       <Link
                         to={`/sessions/${r.sessionId}`}
-                        className="text-primary hover:underline"
+                        className="text-link hover:underline"
                         onClick={(e) => {
                           e.stopPropagation();
                         }}

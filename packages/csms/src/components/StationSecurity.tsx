@@ -1,29 +1,40 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { RotateCcw } from 'lucide-react';
 import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { useToast } from '@/components/ui/toast';
 import { SecurityProfileBadge } from '@/components/SecurityProfileBadge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Pagination } from '@/components/ui/pagination';
+import { JsonDetailBlock, JsonPreviewToggle } from '@/components/ExpandableJson';
 import { api } from '@/lib/api';
 import { formatDateTime } from '@/lib/timezone';
 import { SEVERITY_VARIANT } from '@/lib/severity';
+import { getErrorMessage } from '@/lib/error-message';
+import {
+  generateStationPassword,
+  stationPasswordRules,
+  validateStationPassword,
+} from '@evtivity/lib/station-password';
 
 interface StationSecurityProps {
   stationId: string;
   stationDbId: string;
   securityProfile: number;
+  pendingSecurityProfile: number | null;
   hasPassword: boolean;
   isOnline: boolean;
   timezone: string;
@@ -40,13 +51,22 @@ interface SecurityLog {
   createdAt: string;
 }
 
+const PROFILE_LABELS = ['stations.sp0', 'stations.sp1', 'stations.sp2', 'stations.sp3'] as const;
+
 const CONNECTION_EVENT_OPTIONS = [
   'auth_failed',
   'password_changed',
   'credentials_rotated',
+  'security_profile_change_sent',
+  'security_profile_upgraded',
+  'simulator_self_healed',
+  'simulator_conflict',
   'connected',
   'disconnected',
 ] as const;
+
+/** Severities of OCPP security events (connection rows have none). */
+const SEVERITY_OPTIONS = ['critical', 'high', 'medium', 'low', 'info'] as const;
 
 function getProfileDescLabel(
   profile: number,
@@ -74,12 +94,16 @@ export function StationSecurity({
   stationId,
   stationDbId,
   securityProfile,
+  pendingSecurityProfile,
   hasPassword,
   isOnline,
   timezone,
   ocppProtocol,
 }: StationSecurityProps): React.JSX.Element {
   const { t } = useTranslation();
+  const { toast } = useToast();
+  const is16 = ocppProtocol === 'ocpp1.6';
+  const passwordRules = stationPasswordRules(is16 ? 'ocpp1.6' : 'ocpp2.1');
   const queryClient = useQueryClient();
   const [showPasswordForm, setShowPasswordForm] = useState(false);
   const [passwordConfirmOpen, setPasswordConfirmOpen] = useState(false);
@@ -93,6 +117,8 @@ export function StationSecurity({
   const [logsLimit, setLogsLimit] = useState(50);
   const [logsSource, setLogsSource] = useState<'' | 'connection' | 'security'>('');
   const [logsEvent, setLogsEvent] = useState('');
+  const [logsSeverity, setLogsSeverity] = useState('');
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [logsFrom, setLogsFrom] = useState('');
   const [logsTo, setLogsTo] = useState('');
   const [hasSubmittedPassword, setHasSubmittedPassword] = useState(false);
@@ -107,6 +133,7 @@ export function StationSecurity({
       logsLimit,
       logsSource,
       logsEvent,
+      logsSeverity,
       logsFrom,
       logsTo,
     ],
@@ -117,6 +144,7 @@ export function StationSecurity({
       });
       if (logsSource !== '') params.set('source', logsSource);
       if (logsEvent !== '') params.set('event', logsEvent);
+      if (logsSeverity !== '') params.set('severity', logsSeverity);
       if (logsFrom !== '') params.set('from', new Date(logsFrom).toISOString());
       if (logsTo !== '') params.set('to', new Date(logsTo).toISOString());
       return api.get<{ data: SecurityLog[]; total: number }>(
@@ -125,10 +153,26 @@ export function StationSecurity({
     },
   });
 
+  function showSecurityError(err: unknown): void {
+    toast({
+      title: t('stations.securityChangeFailed'),
+      description: getErrorMessage(err, t),
+      variant: 'destructive',
+    });
+  }
+
   const updateProfileMutation = useMutation({
     mutationFn: (data: { securityProfile: number; password?: string }) =>
-      api.patch(`/v1/stations/${stationDbId}`, data),
-    onSuccess: () => {
+      api.patch<{ pendingSecurityProfile: number | null }>(`/v1/stations/${stationDbId}`, data),
+    onError: showSecurityError,
+    onSuccess: (station) => {
+      toast({
+        title:
+          station.pendingSecurityProfile != null
+            ? t('stations.profileUpgradeSent', { profile: station.pendingSecurityProfile })
+            : t('stations.profileSaved'),
+        variant: 'success',
+      });
       void queryClient.invalidateQueries({ queryKey: ['stations'] });
       setPendingProfile(null);
       setProfileConfirmOpen(false);
@@ -140,8 +184,18 @@ export function StationSecurity({
 
   const setPasswordMutation = useMutation({
     mutationFn: (pw: string) =>
-      api.post(`/v1/stations/${stationDbId}/credentials`, { password: pw }),
-    onSuccess: () => {
+      api.post<{ appliedTo: 'station' | 'stored' }>(`/v1/stations/${stationDbId}/credentials`, {
+        password: pw,
+      }),
+    onError: showSecurityError,
+    onSuccess: (result) => {
+      toast({
+        title:
+          result.appliedTo === 'station'
+            ? t('stations.passwordAccepted')
+            : t('stations.passwordStored'),
+        variant: 'success',
+      });
       void queryClient.invalidateQueries({ queryKey: ['stations'] });
       setPasswordConfirmOpen(false);
       setShowPasswordForm(false);
@@ -152,9 +206,16 @@ export function StationSecurity({
   });
 
   function generatePassword(): string {
-    const bytes = new Uint8Array(15);
-    crypto.getRandomValues(bytes);
-    return btoa(String.fromCharCode(...bytes)).slice(0, 20);
+    return generateStationPassword();
+  }
+
+  function passwordRuleError(pw: string): string | undefined {
+    if (pw.trim() === '') return t('validation.required');
+    const error = validateStationPassword(pw, is16 ? 'ocpp1.6' : 'ocpp2.1');
+    if (error === 'tooShort') return t('validation.minLength', { min: passwordRules.min });
+    if (error === 'tooLong') return t('validation.maxLength', { max: passwordRules.max });
+    if (error === 'invalidCharacters') return t('stations.passwordInvalidCharacters');
+    return undefined;
   }
 
   function handleRotateCredentials(): void {
@@ -209,13 +270,8 @@ export function StationSecurity({
 
   function getPasswordErrors(): Record<string, string> {
     const errs: Record<string, string> = {};
-    if (password.trim() === '') {
-      errs.password = t('validation.required');
-    } else if (password.length < 8) {
-      errs.password = t('validation.minLength', { min: 8 });
-    } else if (password.length > 128) {
-      errs.password = t('validation.maxLength', { max: 128 });
-    }
+    const passwordError = passwordRuleError(password);
+    if (passwordError != null) errs.password = passwordError;
     if (confirmPassword.trim() === '') {
       errs.confirmPassword = t('validation.required');
     } else if (password !== confirmPassword) {
@@ -226,11 +282,8 @@ export function StationSecurity({
 
   function getProfilePasswordErrors(): Record<string, string> {
     const errs: Record<string, string> = {};
-    if (profilePassword.trim() === '') {
-      errs.profilePassword = t('validation.required');
-    } else if (profilePassword.length < 8) {
-      errs.profilePassword = t('validation.minLength', { min: 8 });
-    }
+    const profilePasswordError = passwordRuleError(profilePassword);
+    if (profilePasswordError != null) errs.profilePassword = profilePasswordError;
     if (profilePasswordConfirm.trim() === '') {
       errs.profilePasswordConfirm = t('validation.required');
     } else if (profilePassword !== profilePasswordConfirm) {
@@ -242,7 +295,6 @@ export function StationSecurity({
   const passwordErrors = getPasswordErrors();
   const profilePasswordErrors = getProfilePasswordErrors();
 
-  const is16 = ocppProtocol === 'ocpp1.6';
   const needsPassword =
     pendingProfile != null && pendingProfile >= 1 && pendingProfile < 3 && !hasPassword;
   const showProfileConfirm = pendingProfile != null && !needsPassword;
@@ -264,90 +316,27 @@ export function StationSecurity({
             </span>
           </div>
 
-          {is16 ? (
-            <>
-              <p className="text-sm text-muted-foreground">{t('stations.security16Info')}</p>
-
-              <div className="border-t pt-4">
-                <div className="flex items-center gap-3">
-                  <span className="text-sm">{t('stations.passwordStatus')}</span>
-                  <Badge variant={hasPassword ? 'default' : 'outline'}>
-                    {hasPassword ? t('stations.passwordSet') : t('stations.passwordNotSet')}
-                  </Badge>
-                </div>
-              </div>
-
-              {!showPasswordForm && (
+          {pendingSecurityProfile != null && (
+            <Alert variant="info">
+              <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  {t('stations.profileUpgradePending', { profile: pendingSecurityProfile })}
+                </span>
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={updateProfileMutation.isPending}
                   onClick={() => {
-                    setPassword('');
-                    setConfirmPassword('');
-                    setShowPasswordForm(true);
+                    updateProfileMutation.mutate({ securityProfile });
                   }}
                 >
-                  {hasPassword ? t('stations.changePassword') : t('stations.setPassword')}
+                  {t('stations.cancelProfileUpgrade')}
                 </Button>
-              )}
+              </AlertDescription>
+            </Alert>
+          )}
 
-              {showPasswordForm && (
-                <div className="rounded-md border p-4 space-y-3">
-                  <p className="text-sm font-medium">
-                    {hasPassword ? t('stations.changePassword') : t('stations.setPassword')}
-                  </p>
-                  <div className="space-y-2">
-                    <Label htmlFor="new-password">{t('stations.newPassword')}</Label>
-                    <PasswordInput
-                      id="new-password"
-                      value={password}
-                      onChange={(e) => {
-                        setPassword(e.target.value);
-                      }}
-                      placeholder={t('stations.passwordPlaceholder')}
-                      className={
-                        hasSubmittedPassword && passwordErrors.password ? 'border-destructive' : ''
-                      }
-                    />
-                    {hasSubmittedPassword && passwordErrors.password && (
-                      <p className="text-sm text-destructive">{passwordErrors.password}</p>
-                    )}
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="confirm-password">{t('stations.confirmPassword')}</Label>
-                    <PasswordInput
-                      id="confirm-password"
-                      value={confirmPassword}
-                      onChange={(e) => {
-                        setConfirmPassword(e.target.value);
-                      }}
-                      className={
-                        hasSubmittedPassword && passwordErrors.confirmPassword
-                          ? 'border-destructive'
-                          : ''
-                      }
-                    />
-                    {hasSubmittedPassword && passwordErrors.confirmPassword && (
-                      <p className="text-sm text-destructive">{passwordErrors.confirmPassword}</p>
-                    )}
-                  </div>
-                  <div className="flex justify-end gap-2">
-                    <CancelButton onClick={resetPasswordForm} />
-                    <SaveButton
-                      isPending={setPasswordMutation.isPending}
-                      type="button"
-                      onClick={() => {
-                        setHasSubmittedPassword(true);
-                        if (Object.keys(passwordErrors).length > 0) return;
-                        setPasswordMutation.mutate(password);
-                      }}
-                      label={hasPassword ? t('stations.changePassword') : t('stations.setPassword')}
-                    />
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
+          {
             <>
               <div className="flex items-center gap-2 flex-wrap">
                 <Label htmlFor="security-profile" className="text-sm whitespace-nowrap">
@@ -359,13 +348,20 @@ export function StationSecurity({
                   onChange={(e) => {
                     handleProfileSelect(Number(e.target.value));
                   }}
-                  className="h-9"
                   disabled={updateProfileMutation.isPending}
                 >
-                  <option value="0">{t('stations.sp0')}</option>
-                  <option value="1">{t('stations.sp1')}</option>
-                  <option value="2">{t('stations.sp2')}</option>
-                  <option value="3">{t('stations.sp3')}</option>
+                  {/* A connected station cannot be moved to a lower profile over OCPP. */}
+                  {[0, 1, 2, 3]
+                    .filter((profile) => !is16 || profile < 3)
+                    .map((profile) => (
+                      <option
+                        key={profile}
+                        value={String(profile)}
+                        disabled={isOnline && profile < securityProfile}
+                      >
+                        {t(PROFILE_LABELS[profile] ?? 'stations.sp0')}
+                      </option>
+                    ))}
                 </Select>
                 {securityProfile >= 1 && securityProfile < 3 && pendingProfile == null && (
                   <>
@@ -413,14 +409,16 @@ export function StationSecurity({
                 <div className="rounded-md border p-4 space-y-3">
                   <p className="text-sm font-medium">{t('stations.passwordRequiredForProfile')}</p>
                   <div className="space-y-2">
-                    <Label htmlFor="profile-password">{t('stations.password')}</Label>
+                    <Label htmlFor="profile-password" className="leading-6">
+                      {t('stations.password')}
+                    </Label>
                     <PasswordInput
                       id="profile-password"
                       value={profilePassword}
                       onChange={(e) => {
                         setProfilePassword(e.target.value);
                       }}
-                      placeholder={t('stations.passwordPlaceholder')}
+                      placeholder={t('stations.passwordPlaceholder', passwordRules)}
                       className={
                         hasSubmittedProfilePassword && profilePasswordErrors.profilePassword
                           ? 'border-destructive'
@@ -434,7 +432,7 @@ export function StationSecurity({
                     )}
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="profile-password-confirm">
+                    <Label htmlFor="profile-password-confirm" className="leading-6">
                       {t('stations.confirmPassword')}
                     </Label>
                     <PasswordInput
@@ -481,6 +479,11 @@ export function StationSecurity({
               {showProfileConfirm && (
                 <div className="rounded-md border p-4 space-y-3">
                   <p className="text-sm font-medium">{t('stations.changeProfile')}</p>
+                  {isOnline && (
+                    <p className="text-xs text-muted-foreground">
+                      {t('stations.profileChangeOnline')}
+                    </p>
+                  )}
                   {!isOnline && (
                     <p className="text-xs text-destructive">
                       {t('stations.profileChangeOcppOffline')}
@@ -502,14 +505,16 @@ export function StationSecurity({
                 <div className="rounded-md border p-4 space-y-3">
                   <p className="text-sm font-medium">{t('stations.changePassword')}</p>
                   <div className="space-y-2">
-                    <Label htmlFor="new-password">{t('stations.newPassword')}</Label>
+                    <Label htmlFor="new-password" className="leading-6">
+                      {t('stations.newPassword')}
+                    </Label>
                     <PasswordInput
                       id="new-password"
                       value={password}
                       onChange={(e) => {
                         setPassword(e.target.value);
                       }}
-                      placeholder={t('stations.passwordPlaceholder')}
+                      placeholder={t('stations.passwordPlaceholder', passwordRules)}
                       className={
                         hasSubmittedPassword && passwordErrors.password ? 'border-destructive' : ''
                       }
@@ -519,7 +524,9 @@ export function StationSecurity({
                     )}
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="confirm-password">{t('stations.confirmPassword')}</Label>
+                    <Label htmlFor="confirm-password" className="leading-6">
+                      {t('stations.confirmPassword')}
+                    </Label>
                     <PasswordInput
                       id="confirm-password"
                       value={confirmPassword}
@@ -570,7 +577,7 @@ export function StationSecurity({
                 </div>
               </div>
             </>
-          )}
+          }
         </CardContent>
       </Card>
 
@@ -580,18 +587,20 @@ export function StationSecurity({
           <CardTitle>{t('stations.securityLog')}</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-5 mb-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6 mb-4">
             <div className="space-y-1">
-              <Label htmlFor="security-logs-source" className="text-xs">
+              <Label htmlFor="security-logs-source" className="text-xs leading-6">
                 {t('stations.securityLogSource')}
               </Label>
               <Select
                 id="security-logs-source"
-                className="h-9"
                 value={logsSource}
                 onChange={(e) => {
-                  setLogsSource(e.target.value as '' | 'connection' | 'security');
+                  const source = e.target.value as '' | 'connection' | 'security';
+                  setLogsSource(source);
                   setLogsEvent('');
+                  // Connection rows have no severity.
+                  if (source === 'connection') setLogsSeverity('');
                   setLogsPage(1);
                 }}
               >
@@ -601,13 +610,12 @@ export function StationSecurity({
               </Select>
             </div>
             <div className="space-y-1">
-              <Label htmlFor="security-logs-event" className="text-xs">
+              <Label htmlFor="security-logs-event" className="text-xs leading-6">
                 {t('stations.eventType')}
               </Label>
               {logsSource === 'connection' ? (
                 <Select
                   id="security-logs-event"
-                  className="h-9"
                   value={logsEvent}
                   onChange={(e) => {
                     setLogsEvent(e.target.value);
@@ -622,10 +630,9 @@ export function StationSecurity({
                   ))}
                 </Select>
               ) : (
-                <input
+                <Input
                   id="security-logs-event"
                   type="text"
-                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                   placeholder={t('stations.eventTypePlaceholder')}
                   value={logsEvent}
                   onChange={(e) => {
@@ -636,14 +643,34 @@ export function StationSecurity({
               )}
             </div>
             <div className="space-y-1">
-              <Label htmlFor="security-logs-from" className="text-xs">
+              <Label htmlFor="security-logs-severity" className="text-xs leading-6">
+                {t('common.severity')}
+              </Label>
+              <Select
+                id="security-logs-severity"
+                value={logsSeverity}
+                disabled={logsSource === 'connection'}
+                onChange={(e) => {
+                  setLogsSeverity(e.target.value);
+                  setLogsPage(1);
+                }}
+              >
+                <option value="">{t('common.all')}</option>
+                {SEVERITY_OPTIONS.map((severity) => (
+                  <option key={severity} value={severity}>
+                    {t(`severity.${severity}`)}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="security-logs-from" className="text-xs leading-6">
                 {t('common.from')}
               </Label>
-              <input
+              <Input
                 id="security-logs-from"
                 type="datetime-local"
                 aria-label={t('common.from')}
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 value={logsFrom}
                 onChange={(e) => {
                   setLogsFrom(e.target.value);
@@ -652,14 +679,13 @@ export function StationSecurity({
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="security-logs-to" className="text-xs">
+              <Label htmlFor="security-logs-to" className="text-xs leading-6">
                 {t('common.to')}
               </Label>
-              <input
+              <Input
                 id="security-logs-to"
                 type="datetime-local"
                 aria-label={t('common.to')}
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 value={logsTo}
                 onChange={(e) => {
                   setLogsTo(e.target.value);
@@ -668,12 +694,11 @@ export function StationSecurity({
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="security-logs-limit" className="text-xs">
+              <Label htmlFor="security-logs-limit" className="text-xs leading-6">
                 {t('common.pageSize')}
               </Label>
               <Select
                 id="security-logs-limit"
-                className="h-9"
                 value={String(logsLimit)}
                 onChange={(e) => {
                   setLogsLimit(Number(e.target.value));
@@ -702,36 +727,66 @@ export function StationSecurity({
                     </tr>
                   </thead>
                   <tbody>
-                    {logsResponse.data.map((log) => (
-                      <tr key={log.id} className="border-b">
-                        <td className="py-2 pr-4 text-muted-foreground whitespace-nowrap">
-                          {formatDateTime(log.createdAt, timezone)}
-                        </td>
-                        <td className="py-2 pr-4">
-                          <Badge variant={log.source === 'security' ? 'info' : 'secondary'}>
-                            {t(
-                              `stations.securityLogSource${log.source === 'security' ? 'Security' : 'Connection'}`,
-                            )}
-                          </Badge>
-                        </td>
-                        <td className="py-2 pr-4">
-                          <Badge variant="outline">{log.event}</Badge>
-                        </td>
-                        <td className="py-2 pr-4">
-                          {log.severity != null ? (
-                            <Badge variant={SEVERITY_VARIANT[log.severity] ?? 'outline'}>
-                              {t(`severity.${log.severity}`, { defaultValue: log.severity })}
-                            </Badge>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">-</span>
+                    {logsResponse.data.map((log) => {
+                      const metadata = log.metadata;
+                      const isExpanded = metadata != null && expandedLogId === log.id;
+                      const toggle = (): void => {
+                        setExpandedLogId(isExpanded ? null : log.id);
+                      };
+                      const detailId = `security-log-${log.id.replace(':', '-')}-details`;
+                      return (
+                        <Fragment key={log.id}>
+                          <tr
+                            className={metadata != null ? 'border-b cursor-pointer' : 'border-b'}
+                            data-testid={`security-log-row-${log.id}`}
+                            onClick={metadata != null ? toggle : undefined}
+                          >
+                            <td className="py-2 pr-4 text-muted-foreground whitespace-nowrap">
+                              {formatDateTime(log.createdAt, timezone)}
+                            </td>
+                            <td className="py-2 pr-4">
+                              <Badge variant={log.source === 'security' ? 'info' : 'secondary'}>
+                                {t(
+                                  `stations.securityLogSource${log.source === 'security' ? 'Security' : 'Connection'}`,
+                                )}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-4">
+                              <Badge variant="outline">{log.event}</Badge>
+                            </td>
+                            <td className="py-2 pr-4">
+                              {log.severity != null ? (
+                                <Badge variant={SEVERITY_VARIANT[log.severity] ?? 'outline'}>
+                                  {t(`severity.${log.severity}`, { defaultValue: log.severity })}
+                                </Badge>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">-</span>
+                              )}
+                            </td>
+                            <td className="py-2 pr-4 text-xs">{log.remoteAddress ?? '-'}</td>
+                            <td className="py-2 text-xs text-muted-foreground max-w-md">
+                              {metadata != null ? (
+                                <JsonPreviewToggle
+                                  value={metadata}
+                                  expanded={isExpanded}
+                                  onToggle={toggle}
+                                  controlsId={detailId}
+                                />
+                              ) : (
+                                '-'
+                              )}
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr className="border-b bg-muted/30">
+                              <td colSpan={6} className="p-3">
+                                <JsonDetailBlock id={detailId} value={metadata} />
+                              </td>
+                            </tr>
                           )}
-                        </td>
-                        <td className="py-2 pr-4 text-xs">{log.remoteAddress ?? '-'}</td>
-                        <td className="py-2 text-xs text-muted-foreground max-w-md truncate">
-                          {log.metadata != null ? JSON.stringify(log.metadata) : '-'}
-                        </td>
-                      </tr>
-                    ))}
+                        </Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

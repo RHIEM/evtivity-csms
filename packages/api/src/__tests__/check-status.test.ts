@@ -49,7 +49,9 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -102,12 +104,16 @@ vi.mock('postgres', () => ({
   }),
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn().mockResolvedValue(null),
-  createPreAuthorization: vi.fn().mockResolvedValue({ id: 'pi_test_123' }),
+vi.mock('@evtivity/payments', () => ({
+  authorizeSessionHold: vi.fn(),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: vi.fn().mockResolvedValue(null),
+  paymentContext: vi.fn(() => ({})),
+}));
+
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
@@ -116,19 +122,18 @@ vi.mock('../lib/pubsub.js', () => ({
   setPubSub: vi.fn(),
 }));
 
-vi.mock('../services/tariff.service.js', () => ({
-  resolveTariff: vi.fn().mockResolvedValue(null),
-  isTariffFree: vi.fn().mockReturnValue(true),
-}));
-
 const mockTriggerAndWaitForStatus = vi.fn().mockResolvedValue({ status: 'available' });
 
-vi.mock('../lib/ocpp-command.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../lib/ocpp-command.js')>()),
+vi.mock('@evtivity/services/ocpp-command', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@evtivity/services/ocpp-command')>()),
   sendOcppCommandAndWait: vi.fn().mockResolvedValue({
     response: { status: 'Accepted' },
     error: null,
   }),
+}));
+
+vi.mock('../lib/station-status-check.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/station-status-check.js')>()),
   triggerAndWaitForStatus: (...args: unknown[]) => mockTriggerAndWaitForStatus(...args),
 }));
 

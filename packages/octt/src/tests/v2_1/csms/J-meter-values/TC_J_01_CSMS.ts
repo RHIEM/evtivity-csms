@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 
 /**
  * TC_J_01_CSMS: Clock-aligned Meter Values - No transaction ongoing
@@ -62,13 +62,13 @@ export const TC_J_01_CSMS: TestCase = {
           expected: 'MeterValuesResponse received',
           actual: resp56 != null ? 'Response received' : 'No response',
         });
-      } catch {
+      } catch (err) {
         steps.push({
           step: i + 1,
           description: `MeterValues clock-aligned #${String(i + 1)}`,
           status: 'failed',
           expected: 'MeterValuesResponse received',
-          actual: 'Error or rejection',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -114,7 +114,7 @@ export const TC_J_02_CSMS: TestCase = {
     });
 
     // Start transaction
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -122,7 +122,7 @@ export const TC_J_02_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     // Step 1-2: MeterValues for evseId=0 (station-level, idle EVSE)
@@ -149,13 +149,13 @@ export const TC_J_02_CSMS: TestCase = {
         resp1,
         'MeterValuesResponse received',
       );
-    } catch {
+    } catch (err) {
       steps.push({
         step: 1,
         description: 'MeterValues clock-aligned for evseId=0',
         status: 'failed',
         expected: 'MeterValuesResponse received',
-        actual: 'Error or rejection',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
@@ -189,13 +189,13 @@ export const TC_J_02_CSMS: TestCase = {
           expected: 'TransactionEventResponse received',
           actual: res != null ? `Response keys: ${Object.keys(res).join(', ')}` : 'No response',
         });
-      } catch {
+      } catch (err) {
         steps.push({
           step: i + 2,
           description: `TransactionEvent Updated MeterValueClock #${String(i + 1)}`,
           status: 'failed',
           expected: 'TransactionEventResponse received',
-          actual: 'Error or rejection',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -238,7 +238,7 @@ export const TC_J_03_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -246,7 +246,7 @@ export const TC_J_03_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     // End transaction with clock-aligned meter values
@@ -324,7 +324,7 @@ export const TC_J_04_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -332,7 +332,7 @@ export const TC_J_04_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     const endRes = await ctx.client.sendCall('TransactionEvent', {

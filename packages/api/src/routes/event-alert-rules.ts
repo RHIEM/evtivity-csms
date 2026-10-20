@@ -4,7 +4,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, count } from 'drizzle-orm';
-import { db, eventAlertRules } from '@evtivity/database';
+import { db, eventAlertRules, eventAlertRuleAuditLog, writeAudit } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import {
   successResponse,
@@ -13,9 +13,17 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
+import { getAuditActor } from '../lib/audit-actor.js';
+
+const RULE_AUDIT = { table: eventAlertRuleAuditLog, idColumn: 'event_alert_rule_id' } as const;
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_RULE_NOT_FOUND = { error: 'Rule not found', code: 'RULE_NOT_FOUND' } as const;
 
 const ruleItem = z
   .object({
@@ -35,9 +43,18 @@ const ruleItem = z
     notifyRecipient: z
       .string()
       .max(500)
-      .describe('Recipient address for the chosen channel ($admin resolves to system admins)'),
+      .describe('Recipient address for the chosen channel (empty when none is set)'),
   })
   .passthrough();
+
+// A `$name` placeholder (the old `$admin` default) was never resolved to an
+// address, so it is refused instead of being stored as a recipient.
+const recipientSchema = z
+  .string()
+  .max(500)
+  // A pattern, not a refine: route schemas are validated as JSON Schema.
+  .regex(/^(?!\$)/, 'notifyRecipient must be an address, not a placeholder')
+  .describe('Recipient address for the chosen channel; placeholders such as $admin are refused');
 
 const createRuleBody = z.object({
   component: z.string().min(1).max(100).describe('OCPP component name'),
@@ -45,14 +62,14 @@ const createRuleBody = z.object({
   minSeverity: z.number().int().min(0).max(9).default(0).describe('Minimum severity (0=Danger)'),
   isEnabled: z.boolean().default(true),
   notifyChannel: z.enum(['email', 'webhook', 'sms', 'log']).default('email'),
-  notifyRecipient: z.string().max(500).default('$admin'),
+  notifyRecipient: recipientSchema.default(''),
 });
 
 const updateRuleBody = z.object({
   minSeverity: z.number().int().min(0).max(9).optional(),
   isEnabled: z.boolean().optional(),
   notifyChannel: z.enum(['email', 'webhook', 'sms', 'log']).optional(),
-  notifyRecipient: z.string().max(500).optional(),
+  notifyRecipient: recipientSchema.optional(),
 });
 
 const ruleIdParams = z.object({
@@ -94,11 +111,41 @@ export function eventAlertRuleRoutes(app: FastifyInstance): void {
       response: {
         201: itemResponse(ruleItem),
         400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+        404: errorWith('Rule not found, or the user is restricted to some sites', [
+          ERROR_CODES.RULE_NOT_FOUND,
+        ]),
+        409: errorWith('A rule for this component and variable exists', [
+          ERROR_CODES.DUPLICATE_ALERT_RULE,
+        ]),
       },
     },
     handler: async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_RULE_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof createRuleBody>;
-      const [rule] = await db.insert(eventAlertRules).values(body).returning();
+      // One rule per component and variable (uq_event_alert_rules_component_variable).
+      const [rule] = await db
+        .insert(eventAlertRules)
+        .values(body)
+        .onConflictDoNothing({ target: [eventAlertRules.component, eventAlertRules.variable] })
+        .returning();
+      if (rule == null) {
+        return reply.status(409).send({
+          error: 'An alert rule for this component and variable already exists',
+          code: 'DUPLICATE_ALERT_RULE',
+        });
+      }
+      await writeAudit(
+        RULE_AUDIT,
+        {
+          entityId: String(rule.id),
+          entityIdSnapshot: String(rule.id),
+          action: 'created',
+          ...getAuditActor(request),
+          after: rule,
+        },
+        db,
+        request.log,
+      );
       return reply.status(201).send(rule);
     },
   });
@@ -114,13 +161,16 @@ export function eventAlertRuleRoutes(app: FastifyInstance): void {
       body: zodSchema(updateRuleBody),
       response: {
         200: itemResponse(ruleItem),
+        400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
         404: errorWith('Rule not found', [ERROR_CODES.RULE_NOT_FOUND]),
       },
     },
     handler: async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_RULE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof ruleIdParams>;
       const body = request.body as z.infer<typeof updateRuleBody>;
 
+      const [before] = await db.select().from(eventAlertRules).where(eq(eventAlertRules.id, id));
       const [updated] = await db
         .update(eventAlertRules)
         .set({ ...body, updatedAt: new Date() })
@@ -129,6 +179,24 @@ export function eventAlertRuleRoutes(app: FastifyInstance): void {
 
       if (updated == null) {
         return reply.status(404).send({ error: 'Rule not found', code: 'RULE_NOT_FOUND' });
+      }
+      const changedKeys = (Object.keys(body) as (keyof typeof body)[]).filter(
+        (key) => before?.[key] !== updated[key],
+      );
+      if (changedKeys.length > 0) {
+        await writeAudit(
+          RULE_AUDIT,
+          {
+            entityId: String(id),
+            entityIdSnapshot: String(id),
+            action: 'updated',
+            ...getAuditActor(request),
+            before: Object.fromEntries(changedKeys.map((key) => [key, before?.[key] ?? null])),
+            after: Object.fromEntries(changedKeys.map((key) => [key, updated[key]])),
+          },
+          db,
+          request.log,
+        );
       }
       return updated;
     },
@@ -148,16 +216,29 @@ export function eventAlertRuleRoutes(app: FastifyInstance): void {
       },
     },
     handler: async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_RULE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof ruleIdParams>;
 
       const [deleted] = await db
         .delete(eventAlertRules)
         .where(eq(eventAlertRules.id, id))
-        .returning({ id: eventAlertRules.id });
+        .returning();
 
       if (deleted == null) {
         return reply.status(404).send({ error: 'Rule not found', code: 'RULE_NOT_FOUND' });
       }
+      await writeAudit(
+        RULE_AUDIT,
+        {
+          entityId: null,
+          entityIdSnapshot: String(id),
+          action: 'deleted',
+          ...getAuditActor(request),
+          before: deleted,
+        },
+        db,
+        request.log,
+      );
       return { success: true as const };
     },
   });

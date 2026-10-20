@@ -10,8 +10,26 @@ import { config as apiConfig } from './config.js';
  * centralize the rule so every settings route applies it identically.
  */
 
+/**
+ * The permission that reads stored secrets in plaintext: the generic settings
+ * GET requires it, and the payment provider settings GETs (`payments:read`)
+ * include their decrypted secrets only for callers that also hold it.
+ */
+export const SECRET_SETTINGS_READ_PERMISSION = 'settings.system:read';
+
 export function isEncryptedAtRest(key: string): boolean {
   return key.endsWith('Enc');
+}
+
+/**
+ * Settings the CSMS generates and reads itself. The generic settings routes
+ * never return or write them: pnc.local.caEnc holds the private keys of the
+ * local ISO 15118 contract CA, created by POST /v1/pnc/settings/local-ca.
+ */
+const SERVER_MANAGED_SETTING_KEYS = new Set(['pnc.local.caEnc']);
+
+export function isServerManagedSetting(key: string): boolean {
+  return SERVER_MANAGED_SETTING_KEYS.has(key);
 }
 
 // scrypt key derivation costs ~30-50ms per call. GET /v1/settings can decrypt

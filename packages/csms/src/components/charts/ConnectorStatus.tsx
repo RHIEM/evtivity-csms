@@ -7,6 +7,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { Tooltip } from '@/components/ui/tooltip';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { SaveButton } from '@/components/save-button';
@@ -27,9 +28,12 @@ import { LinkIconButton } from '@/components/link-icon-button';
 import { PlugInIconButton } from '@/components/plug-in-icon-button';
 import { RefreshIconButton } from '@/components/refresh-icon-button';
 import { RemoveIconButton } from '@/components/remove-icon-button';
+import { RetireIconButton } from '@/components/retire-icon-button';
+import { RestoreIconButton } from '@/components/restore-icon-button';
 import { StopIconButton } from '@/components/stop-icon-button';
 import { UnplugIconButton } from '@/components/unplug-icon-button';
 import { useToast } from '@/components/ui/toast';
+import { getErrorMessage } from '@/lib/error-message';
 import { PORTAL_BASE_URL } from '@/lib/config';
 import { api } from '@/lib/api';
 import { Select } from '@/components/ui/select';
@@ -99,12 +103,14 @@ interface Connector {
   status: string;
   autoCreated?: boolean;
   isIdling?: boolean;
+  retiredAt?: string | null;
 }
 
 interface Evse {
   evseId: number;
   status: string;
   autoCreated?: boolean;
+  retiredAt?: string | null;
   connectors: Connector[];
 }
 
@@ -182,11 +188,14 @@ export function ConnectorStatus({
           variables.action === 'plugIn' ? 'stations.simPlugInSent' : 'stations.simUnplugSent',
         ),
       });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId, 'connectors'] });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId, 'connectors'] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId] });
     },
-    onError: () => {
-      toast({ variant: 'destructive', title: t('stations.simActionFailed') });
+    onError: (err: unknown) => {
+      toast({
+        variant: 'destructive',
+        title: getErrorMessage(err, t, 'stations.simActionFailed'),
+      });
     },
     onSettled: () => {
       setSimActionEvseId(null);
@@ -202,8 +211,8 @@ export function ConnectorStatus({
       ),
     onSettled: () => {
       setRefreshingEvseId(null);
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId, 'connectors'] });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId, 'connectors'] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId] });
     },
   });
 
@@ -215,16 +224,20 @@ export function ConnectorStatus({
       ),
     onSuccess: () => {
       toast({ variant: 'success', title: t('stations.stopSessionDispatched') });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId, 'connectors'] });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId, 'sessions'] });
-      void queryClient.invalidateQueries({ queryKey: ['station', stationId] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId, 'connectors'] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId, 'sessions'] });
+      void queryClient.invalidateQueries({ queryKey: ['stations', stationId] });
     },
     onError: (err: unknown) => {
       const code = (err as { body?: { code?: string } }).body?.code;
       if (code === 'NO_ACTIVE_SESSION') {
         toast({ variant: 'warning', title: t('stations.noActiveSession') });
       } else {
-        toast({ variant: 'destructive', title: t('stations.stopSessionFailed') });
+        // STATION_OFFLINE (the stop is queued for the reconnect), STATION_TIMEOUT, ...
+        toast({
+          variant: 'destructive',
+          title: getErrorMessage(err, t, 'stations.stopSessionFailed'),
+        });
       }
     },
     onSettled: () => {
@@ -264,9 +277,20 @@ export function ConnectorStatus({
   const [deleteConnectorOpen, setDeleteConnectorOpen] = useState(false);
   const [deleteConnectorTarget, setDeleteConnectorTarget] = useState({ evseId: 0, connectorId: 0 });
 
+  // Retire (confirmed) and restore: out of service with history kept.
+  const [retireTarget, setRetireTarget] = useState<{
+    evseId: number;
+    connectorId?: number;
+  } | null>(null);
+
+  // A refused EVSE or connector change (duplicate number, a plug in use, an
+  // EVSE with charging history) is shown, not swallowed.
   const invalidateConnectors = {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['stations', stationId, 'connectors'] });
+    },
+    onError: (err: unknown) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
     },
   };
 
@@ -315,6 +339,25 @@ export function ConnectorStatus({
 
   const deleteEvseMutation = useMutation({
     mutationFn: (evseId: number) => api.delete(`/v1/stations/${stationId}/evses/${String(evseId)}`),
+    ...invalidateConnectors,
+  });
+
+  function retirePath(target: { evseId: number; connectorId?: number }): string {
+    const evsePath = `/v1/stations/${stationId}/evses/${String(target.evseId)}`;
+    return target.connectorId != null
+      ? `${evsePath}/connectors/${String(target.connectorId)}`
+      : evsePath;
+  }
+
+  const retireMutation = useMutation({
+    mutationFn: (target: { evseId: number; connectorId?: number }) =>
+      api.post(`${retirePath(target)}/retire`, {}),
+    ...invalidateConnectors,
+  });
+
+  const restoreMutation = useMutation({
+    mutationFn: (target: { evseId: number; connectorId?: number }) =>
+      api.post(`${retirePath(target)}/restore`, {}),
     ...invalidateConnectors,
   });
 
@@ -444,6 +487,9 @@ export function ConnectorStatus({
         <CreateButton
           label={t('stations.addEvse')}
           onClick={() => {
+            if (ocppProtocol === 'ocpp1.6') {
+              setNewEvseConnector((prev) => ({ ...prev, connectorId: newEvseId }));
+            }
             setAddEvseOpen(true);
           }}
         />
@@ -475,6 +521,11 @@ export function ConnectorStatus({
                     {evse.autoCreated === true && (
                       <Badge variant="outline" className="text-xs font-normal">
                         {t('stations.autoCreated')}
+                      </Badge>
+                    )}
+                    {evse.retiredAt != null && (
+                      <Badge variant="secondary" className="text-xs font-normal">
+                        {t('stations.retired')}
                       </Badge>
                     )}
                   </div>
@@ -549,18 +600,41 @@ export function ConnectorStatus({
                       href={`${PORTAL_BASE_URL}/charge/${stationOcppId}/${String(evse.evseId)}`}
                       title={t('stations.openGuestCharger')}
                     />
-                    <AddIconButton
-                      onClick={() => {
-                        openAddConnector(evse.evseId);
-                      }}
-                      title={t('stations.addConnector')}
-                    />
+                    {ocppProtocol !== 'ocpp1.6' && (
+                      <AddIconButton
+                        onClick={() => {
+                          openAddConnector(evse.evseId);
+                        }}
+                        title={t('stations.addConnector')}
+                      />
+                    )}
                     <EditIconButton
                       onClick={() => {
                         openEditEvse(evse);
                       }}
                       title={t('stations.editEvse')}
                     />
+                    {evse.retiredAt != null ? (
+                      <RestoreIconButton
+                        onClick={() => {
+                          restoreMutation.mutate({ evseId: evse.evseId });
+                        }}
+                        disabled={restoreMutation.isPending}
+                        title={t('stations.restoreEvse')}
+                      />
+                    ) : (
+                      <RetireIconButton
+                        disabled={hasInUseConnector(evse)}
+                        onClick={() => {
+                          setRetireTarget({ evseId: evse.evseId });
+                        }}
+                        title={
+                          hasInUseConnector(evse)
+                            ? t('stations.cannotRetireOccupied')
+                            : t('stations.retireEvse')
+                        }
+                      />
+                    )}
                     <RemoveIconButton
                       disabled={hasInUseConnector(evse)}
                       onClick={() => {
@@ -594,12 +668,23 @@ export function ConnectorStatus({
                               {t('stations.autoCreated')}
                             </Badge>
                           )}
+                          {conn.retiredAt != null && (
+                            <Badge variant="secondary" className="text-xs font-normal">
+                              {t('stations.retired')}
+                            </Badge>
+                          )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
-                          {conn.maxPowerKw != null && (
+                          {conn.maxPowerKw != null ? (
                             <span className="text-muted-foreground">
                               {t('charts.powerValue', { value: conn.maxPowerKw })}
                             </span>
+                          ) : (
+                            <Tooltip content={t('stations.maxPowerUnknownHint')}>
+                              <Badge variant="warning" className="text-xs font-normal">
+                                {t('stations.maxPowerUnknown')}
+                              </Badge>
+                            </Tooltip>
                           )}
                           {conn.maxCurrentAmps != null && (
                             <span className="text-muted-foreground">
@@ -615,8 +700,35 @@ export function ConnectorStatus({
                               ? t('status.idle')
                               : t(`status.${conn.status}`, conn.status)}
                           </Badge>
+                          {evse.retiredAt == null &&
+                            (conn.retiredAt != null ? (
+                              <RestoreIconButton
+                                onClick={() => {
+                                  restoreMutation.mutate({
+                                    evseId: evse.evseId,
+                                    connectorId: conn.connectorId,
+                                  });
+                                }}
+                                disabled={restoreMutation.isPending}
+                                title={t('stations.restoreConnector')}
+                              />
+                            ) : (
+                              <RetireIconButton
+                                disabled={IN_USE_STATUSES.includes(conn.status)}
+                                onClick={() => {
+                                  setRetireTarget({
+                                    evseId: evse.evseId,
+                                    connectorId: conn.connectorId,
+                                  });
+                                }}
+                                title={
+                                  IN_USE_STATUSES.includes(conn.status)
+                                    ? t('stations.cannotRetireOccupied')
+                                    : t('stations.retireConnector')
+                                }
+                              />
+                            ))}
                           <RemoveIconButton
-                            size="sm"
                             disabled={IN_USE_STATUSES.includes(conn.status)}
                             onClick={() => {
                               setDeleteConnectorTarget({
@@ -654,7 +766,9 @@ export function ConnectorStatus({
           </DialogHeader>
           <form onSubmit={handleAddEvse} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="new-evse-id">{t('stations.evseIdLabel')}</Label>
+              <Label htmlFor="new-evse-id" className="leading-6">
+                {t('stations.evseIdLabel')}
+              </Label>
               <Input
                 id="new-evse-id"
                 type="number"
@@ -663,38 +777,49 @@ export function ConnectorStatus({
                 value={newEvseId}
                 onChange={(e) => {
                   setNewEvseId(e.target.value);
+                  // A 1.6 EVSE holds only the connector with its own number.
+                  if (ocppProtocol === 'ocpp1.6') {
+                    const value = e.target.value;
+                    setNewEvseConnector((prev) => ({ ...prev, connectorId: value }));
+                  }
                 }}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-id">{t('stations.connectorIdLabel')}</Label>
+              <Label htmlFor="new-evse-conn-id" className="leading-6">
+                {t('stations.connectorIdLabel')}
+              </Label>
               <Input
                 id="new-evse-conn-id"
                 type="number"
                 min="1"
                 required
                 value={newEvseConnector.connectorId}
+                disabled={ocppProtocol === 'ocpp1.6'}
                 onChange={(e) => {
                   setNewEvseConnector((prev) => ({ ...prev, connectorId: e.target.value }));
                 }}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-type">{t('stations.connectorType')}</Label>
+              <Label htmlFor="new-evse-conn-type" className="leading-6">
+                {t('stations.connectorType')}
+              </Label>
               <Select
                 id="new-evse-conn-type"
                 value={newEvseConnector.connectorType}
                 onChange={(e) => {
                   setNewEvseConnector((prev) => ({ ...prev, connectorType: e.target.value }));
                 }}
-                className="h-9"
               >
                 <option value="">— Select one —</option>
                 <ConnectorTypeOptions />
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-power">{t('stations.maxPower')}</Label>
+              <Label htmlFor="new-evse-conn-power" className="leading-6">
+                {t('stations.maxPower')}
+              </Label>
               <Input
                 id="new-evse-conn-power"
                 type="number"
@@ -707,7 +832,9 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-evse-conn-current">{t('stations.maxCurrent')}</Label>
+              <Label htmlFor="new-evse-conn-current" className="leading-6">
+                {t('stations.maxCurrent')}
+              </Label>
               <Input
                 id="new-evse-conn-current"
                 type="number"
@@ -742,7 +869,9 @@ export function ConnectorStatus({
           </DialogHeader>
           <form onSubmit={handleAddConnector} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="add-conn-id">{t('stations.connectorIdLabel')}</Label>
+              <Label htmlFor="add-conn-id" className="leading-6">
+                {t('stations.connectorIdLabel')}
+              </Label>
               <Input
                 id="add-conn-id"
                 type="number"
@@ -755,21 +884,24 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-type">{t('stations.connectorType')}</Label>
+              <Label htmlFor="add-conn-type" className="leading-6">
+                {t('stations.connectorType')}
+              </Label>
               <Select
                 id="add-conn-type"
                 value={newConnector.connectorType}
                 onChange={(e) => {
                   setNewConnector((prev) => ({ ...prev, connectorType: e.target.value }));
                 }}
-                className="h-9"
               >
                 <option value="">— Select one —</option>
                 <ConnectorTypeOptions />
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-power">{t('stations.maxPower')}</Label>
+              <Label htmlFor="add-conn-power" className="leading-6">
+                {t('stations.maxPower')}
+              </Label>
               <Input
                 id="add-conn-power"
                 type="number"
@@ -782,7 +914,9 @@ export function ConnectorStatus({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="add-conn-current">{t('stations.maxCurrent')}</Label>
+              <Label htmlFor="add-conn-current" className="leading-6">
+                {t('stations.maxCurrent')}
+              </Label>
               <Input
                 id="add-conn-current"
                 type="number"
@@ -825,7 +959,9 @@ export function ConnectorStatus({
                 </p>
                 <div className="grid grid-cols-3 gap-2">
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-type-${String(i)}`}>{t('stations.connectorType')}</Label>
+                    <Label htmlFor={`edit-type-${String(i)}`} className="leading-6">
+                      {t('stations.connectorType')}
+                    </Label>
                     <Select
                       id={`edit-type-${String(i)}`}
                       value={c.connectorType}
@@ -837,14 +973,15 @@ export function ConnectorStatus({
                           ),
                         );
                       }}
-                      className="h-9"
                     >
                       <option value="">— Select one —</option>
                       <ConnectorTypeOptions />
                     </Select>
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-power-${String(i)}`}>{t('stations.maxPower')}</Label>
+                    <Label htmlFor={`edit-power-${String(i)}`} className="leading-6">
+                      {t('stations.maxPower')}
+                    </Label>
                     <Input
                       id={`edit-power-${String(i)}`}
                       type="number"
@@ -862,7 +999,9 @@ export function ConnectorStatus({
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor={`edit-current-${String(i)}`}>{t('stations.maxCurrent')}</Label>
+                    <Label htmlFor={`edit-current-${String(i)}`} className="leading-6">
+                      {t('stations.maxCurrent')}
+                    </Label>
                     <Input
                       id={`edit-current-${String(i)}`}
                       type="number"
@@ -892,6 +1031,36 @@ export function ConnectorStatus({
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Retire confirmation */}
+      <ConfirmDialog
+        open={retireTarget != null}
+        onOpenChange={(open) => {
+          if (!open) setRetireTarget(null);
+        }}
+        title={
+          retireTarget?.connectorId != null
+            ? t('stations.retireConnector')
+            : t('stations.retireEvse')
+        }
+        description={
+          retireTarget?.connectorId != null
+            ? t('stations.confirmRetireConnector', { id: retireTarget.connectorId })
+            : t('stations.confirmRetireEvse', { id: retireTarget?.evseId ?? '' })
+        }
+        confirmLabel={t('stations.retire')}
+        isPending={retireMutation.isPending}
+        onConfirm={() => {
+          if (retireTarget != null) {
+            retireMutation.mutate(retireTarget, {
+              onSettled: () => {
+                setRetireTarget(null);
+              },
+            });
+          }
+          return false;
+        }}
+      />
 
       {/* Delete EVSE Confirmation */}
       <ConfirmDialog

@@ -4,13 +4,14 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Copy, Check } from 'lucide-react';
+import { tryParseJson } from '@evtivity/lib/safe-json';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Toggle } from '@/components/ui/toggle';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Button } from '@/components/ui/button';
+import { CopyButton } from '@/components/ui/copy-button';
 import { Select } from '@/components/ui/select';
 import { api } from '@/lib/api';
 
@@ -37,22 +38,17 @@ function ToggleRow({
   return (
     <div className="flex items-center justify-between rounded-lg border p-4">
       <div className="space-y-0.5">
-        <Label>{label}</Label>
+        <Label className="leading-6">{label}</Label>
         {description != null && <p className="text-xs text-muted-foreground">{description}</p>}
       </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => {
+      <Toggle
+        aria-label={label}
+        size="lg"
+        checked={checked}
+        onCheckedChange={() => {
           onChange(!checked);
         }}
-        className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${checked ? 'bg-primary' : 'bg-muted'}`}
-      >
-        <span
-          className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${checked ? 'translate-x-5' : 'translate-x-0'}`}
-        />
-      </button>
+      />
     </div>
   );
 }
@@ -72,7 +68,6 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
   const [attrEmail, setAttrEmail] = useState('email');
   const [attrFirstName, setAttrFirstName] = useState('firstName');
   const [attrLastName, setAttrLastName] = useState('lastName');
-  const [copied, setCopied] = useState(false);
 
   // Load SSO settings
   const { data: ssoSettings } = useQuery({
@@ -108,10 +103,10 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
     };
     const rawMapping = s['sso.attributeMapping'];
     if (typeof rawMapping === 'string') {
-      try {
-        mapping = JSON.parse(rawMapping) as Record<string, string>;
-      } catch {
-        // keep default
+      // Invalid JSON keeps the default mapping.
+      const parsed = tryParseJson(rawMapping);
+      if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        mapping = parsed as Record<string, string>;
       }
     } else if (typeof rawMapping === 'object' && rawMapping !== null) {
       mapping = rawMapping as Record<string, string>;
@@ -150,15 +145,6 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
       payload['cert'] = cert;
     }
     mutation.mutate(payload);
-  }
-
-  function handleCopyCallbackUrl(): void {
-    const url = `${window.location.origin}/v1/auth/sso/callback`;
-    void navigator.clipboard.writeText(url);
-    setCopied(true);
-    setTimeout(() => {
-      setCopied(false);
-    }, 2000);
   }
 
   const callbackUrl = `${window.location.origin}/v1/auth/sso/callback`;
@@ -248,19 +234,8 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
                 <Label htmlFor="sso-callback-url">{t('settings.ssoCallbackUrl')}</Label>
                 <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
                   <Input id="sso-callback-url" value={callbackUrl} readOnly className="bg-muted" />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    onClick={handleCopyCallbackUrl}
-                    aria-label="Copy"
-                  >
-                    {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                  </Button>
+                  <CopyButton value={callbackUrl} size="icon" />
                 </div>
-                {copied && (
-                  <p className="text-xs text-muted-foreground">{t('settings.ssoCopied')}</p>
-                )}
               </div>
 
               {/* Auto-Provision */}

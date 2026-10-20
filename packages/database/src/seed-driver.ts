@@ -10,6 +10,7 @@
 
 import argon2 from 'argon2';
 import postgres from 'postgres';
+import { connectionName } from '@evtivity/lib';
 
 const DATABASE_URL = process.env['DATABASE_URL'];
 const INITIAL_DRIVER_EMAIL = process.env['INITIAL_DRIVER_EMAIL'];
@@ -26,7 +27,7 @@ function rid(prefix: string): string {
   return `${prefix}_${s}`;
 }
 
-const sql = postgres(DATABASE_URL);
+const sql = postgres(DATABASE_URL, { connection: { application_name: connectionName() } });
 
 try {
   // drivers.email has a partial unique index (WHERE email IS NOT NULL) added
@@ -39,12 +40,6 @@ try {
   `;
 
   if (existing.length > 0) {
-    // Portal login filters on registration_source = 'portal'; heal rows with
-    // any other source so this driver can always log in via the portal.
-    await sql`
-      UPDATE drivers SET registration_source = 'portal'
-      WHERE email = ${INITIAL_DRIVER_EMAIL} AND registration_source <> 'portal'
-    `;
     console.log(`Driver already exists: ${INITIAL_DRIVER_EMAIL}`);
   } else {
     const passwordHash = await argon2.hash(INITIAL_DRIVER_PASSWORD);

@@ -3,22 +3,122 @@
 
 import type { IncomingMessage } from 'node:http';
 import type postgres from 'postgres';
-import { verify } from 'argon2';
+import { getRegistrationPolicy, stationAuditLog, writeAudit } from '@evtivity/database';
 import type { Logger } from '@evtivity/lib';
+import { logConnectionEvent } from './connection-log.js';
+import { hasSimulatorMarker, reconcileSimulatorIdentity } from './simulator-identity.js';
+import { offeredSubprotocols, selectOcppSubprotocol } from '../subprotocol.js';
+import type { OcppSubprotocol } from '../subprotocol.js';
+import { StationPasswordVerifier } from './station-password-verifier.js';
+
+// Callers without their own verifier (tests, tools) check every password with
+// argon2, cache nothing and keep no failed-attempt backoff. OcppServer passes
+// its own, with a cache and the backoff.
+const uncachedVerifier = new StationPasswordVerifier({ cache: null, backoff: null });
+
+export type AuthFailure =
+  | 'unknown_station'
+  | 'blocked'
+  | 'tls_required'
+  | 'client_certificate'
+  | 'credentials'
+  | 'locked_out'
+  | 'unavailable';
 
 export interface AuthResult {
   authenticated: boolean;
   stationId: string | null;
   stationDbId: string | null;
   error?: string | undefined;
+  failure?: AuthFailure | undefined;
+  /** 'locked_out' only: seconds until the station may try a password again. */
+  retryAfterSeconds?: number | undefined;
+  /** `charging_stations.onboarding_status` at connect (authenticated results). */
+  onboardingStatus?: string | undefined;
+  /**
+   * The station is pending and the registration policy requires approval, so
+   * its BootNotification would be answered Pending. The connection then starts
+   * at boot status Pending and the boot guard refuses other CALLs.
+   */
+  awaitingApproval?: boolean | undefined;
 }
 
+export interface AuthRejection {
+  status: number;
+  message: string;
+  headers?: Record<string, string>;
+}
+
+// HTTP response for a rejected WebSocket upgrade. Stations that send Basic
+// auth only after a challenge (RFC 7617) need 401 with WWW-Authenticate; a
+// challenge is only offered where Basic auth applies and the transport is
+// acceptable (SP1, or SP2 over TLS). OCPP-J 1.6 recommends 404 for an unknown
+// charge point identity.
+export function rejectionFor(auth: AuthResult): AuthRejection {
+  switch (auth.failure) {
+    case 'credentials':
+      return {
+        status: 401,
+        message: 'Unauthorized',
+        headers: { 'WWW-Authenticate': 'Basic realm="OCPP", charset="UTF-8"' },
+      };
+    case 'tls_required':
+    case 'client_certificate':
+      return { status: 401, message: 'Unauthorized' };
+    case 'unknown_station':
+      return { status: 404, message: 'Not Found' };
+    case 'blocked':
+      return { status: 403, message: 'Forbidden' };
+    case 'locked_out':
+      return {
+        status: 429,
+        message: 'Too Many Requests',
+        headers: { 'Retry-After': String(Math.max(1, auth.retryAfterSeconds ?? 1)) },
+      };
+    case 'unavailable':
+    case undefined:
+      return serviceUnavailable();
+  }
+}
+
+// A refused upgrade during a reconnect wave or a database outage. Retry-After
+// (RFC 9110) tells a station that honors it when to come back; the jitter
+// spreads those retries instead of returning the whole wave at once.
+export const RETRY_AFTER_BASE_SECONDS = 10;
+export const RETRY_AFTER_JITTER_SECONDS = 10;
+
+export function serviceUnavailable(random: () => number = Math.random): AuthRejection {
+  const seconds =
+    RETRY_AFTER_BASE_SECONDS + Math.floor(random() * (RETRY_AFTER_JITTER_SECONDS + 1));
+  return {
+    status: 503,
+    message: 'Service Unavailable',
+    headers: { 'Retry-After': String(seconds) },
+  };
+}
+
+// OCPP identifierString characters (2.1 Part 2 and 1.6 CiString identities):
+// a-z, A-Z, 0-9 and * - _ = : + | @ .
+const STATION_ID = /^[A-Za-z0-9*\-_=:+|@.]{1,128}$/;
+
+/**
+ * The station identity from the OCPP WebSocket URL, `/<stationId>`. The one
+ * path segment is percent-decoded (a station may encode `|` or `@`), then
+ * must be 1 to 128 identifierString characters.
+ */
 export function extractStationId(url: string | undefined): string | null {
   if (url == null) return null;
-
-  // OCPP WebSocket URL format: /<stationId>
-  const match = /^\/([A-Za-z0-9_\-:.]{1,128})$/.exec(url);
-  return match?.[1] ?? null;
+  const match = /^\/([^/?#]+)$/.exec(url);
+  const segment = match?.[1];
+  if (segment == null) return null;
+  let stationId: string;
+  try {
+    stationId = decodeURIComponent(segment);
+  } catch (err) {
+    if (err instanceof URIError) return null;
+    throw err;
+  }
+  return STATION_ID.test(stationId) ? stationId : null;
 }
 
 export async function authenticateConnection(
@@ -26,6 +126,8 @@ export async function authenticateConnection(
   logger: Logger,
   sql: postgres.Sql | null,
   clientIp: string | null = req.socket.remoteAddress ?? null,
+  viaTls: boolean = 'encrypted' in req.socket && req.socket.encrypted === true,
+  verifier: StationPasswordVerifier = uncachedVerifier,
 ): Promise<AuthResult> {
   const stationId = extractStationId(req.url);
   if (stationId == null) {
@@ -34,6 +136,7 @@ export async function authenticateConnection(
       stationId: null,
       stationDbId: null,
       error: 'Missing station ID in URL',
+      failure: 'unknown_station',
     };
   }
 
@@ -44,28 +147,50 @@ export async function authenticateConnection(
       return { authenticated: true, stationId, stationDbId: null };
     }
     logger.error({ stationId }, 'No database connection; rejecting connection');
-    return { authenticated: false, stationId, stationDbId: null, error: 'Database unavailable' };
+    return {
+      authenticated: false,
+      stationId,
+      stationDbId: null,
+      error: 'Database unavailable',
+      failure: 'unavailable',
+    };
   }
 
   // Look up station in database
+  // The paired simulator row (if any) rides along so a simulator-flagged
+  // station needs no second lookup (see simulator-identity.ts).
   const rows = await sql`
-    SELECT id, security_profile, basic_auth_password_hash, availability, onboarding_status
-    FROM charging_stations
-    WHERE station_id = ${stationId}
+    SELECT cs.id, cs.security_profile, cs.pending_security_profile, cs.basic_auth_password_hash,
+           cs.availability, cs.onboarding_status, cs.is_simulator, cs.ocpp_protocol,
+           css.enabled AS css_enabled, css.marker_seen_at AS css_marker_seen_at
+    FROM charging_stations cs
+    LEFT JOIN css_stations css ON css.station_id = cs.station_id
+    WHERE cs.station_id = ${stationId}
   `;
   const station = rows[0] as
     | {
         id: string;
         security_profile: number;
+        pending_security_profile: number | null;
         basic_auth_password_hash: string | null;
         availability: string;
         onboarding_status: string;
+        is_simulator?: boolean | null;
+        ocpp_protocol?: string | null;
+        css_enabled?: boolean | null;
+        css_marker_seen_at?: Date | null;
       }
     | undefined;
 
   if (station == null) {
     logger.warn({ stationId }, 'Connection rejected: unknown station');
-    return { authenticated: false, stationId, stationDbId: null, error: 'Unknown station' };
+    return {
+      authenticated: false,
+      stationId,
+      stationDbId: null,
+      error: 'Unknown station',
+      failure: 'unknown_station',
+    };
   }
 
   if (station.onboarding_status === 'blocked') {
@@ -75,6 +200,7 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'Station is blocked',
+      failure: 'blocked',
     };
   }
 
@@ -83,7 +209,124 @@ export async function authenticateConnection(
   // Blocked stations are rejected here at the connection level.
 
   const remoteAddress = clientIp;
-  const securityProfile = station.security_profile;
+  const ctx = { req, sql, logger, stationId, station, remoteAddress, viaTls, verifier };
+
+  // An upgrade sent to the station is pending until the station connects with
+  // the new profile. Try it first; on success promote it, after which the old
+  // profile is no longer accepted (OCPP 2.1 A05.FR.07). Its failures are not
+  // logged: until the station switches, every connection fails this check.
+  const pending = station.pending_security_profile;
+  let result: AuthResult | null = null;
+  let usedProfile = station.security_profile;
+  if (pending != null && pending !== station.security_profile) {
+    const upgraded = await authenticateForProfile(pending, ctx, false);
+    if (upgraded.authenticated) {
+      await promotePendingSecurityProfile(
+        sql,
+        station.id,
+        station.security_profile,
+        pending,
+        remoteAddress,
+        logger,
+      );
+      result = upgraded;
+      usedProfile = pending;
+    }
+  }
+  result ??= await authenticateForProfile(station.security_profile, ctx, true);
+
+  // A pending station whose BootNotification would be answered Pending starts
+  // its connection at boot status Pending (the boot guard refuses other CALLs
+  // until a BootNotification is Accepted, OCPP 2.1 B02.FR.09). The policy
+  // reader is cached and falls back to approval-required on a failed read,
+  // as the BootNotification handler does.
+  if (result.authenticated) {
+    const awaitingApproval =
+      station.onboarding_status === 'pending' &&
+      (await getRegistrationPolicy()) === 'approval-required';
+    result = { ...result, onboardingStatus: station.onboarding_status, awaitingApproval };
+  }
+
+  // A simulator-flagged station: tell the simulator from a real station that
+  // uses its identity. Never changes the outcome of the authentication.
+  if (result.authenticated && station.is_simulator === true) {
+    await reconcileSimulatorIdentity(
+      sql,
+      {
+        stationDbId: station.id,
+        stationId,
+        securityProfile: usedProfile,
+        markerPresent: hasSimulatorMarker(req),
+        pairing:
+          station.css_enabled == null
+            ? null
+            : { enabled: station.css_enabled, markerSeenAt: station.css_marker_seen_at ?? null },
+        remoteAddress,
+      },
+      logger,
+    );
+  }
+
+  // Store the negotiated protocol before the upgrade completes, so it is in the
+  // database before the station can send a message and before any projection
+  // marks it online. The station.Connected projection also writes it, but it
+  // can run after a projection of the station's first messages has marked the
+  // station online (inbound message logs are not persisted to domain_events,
+  // so they reach the projection queue first), and an API call in that window
+  // read a missing or previous protocol (OCPP_VERSION_MISMATCH).
+  if (result.authenticated) {
+    const protocol = selectOcppSubprotocol(
+      offeredSubprotocols(req.headers['sec-websocket-protocol']),
+    );
+    if (protocol != null && protocol !== station.ocpp_protocol) {
+      await storeNegotiatedProtocol(sql, station.id, protocol, logger);
+    }
+  }
+  return result;
+}
+
+async function storeNegotiatedProtocol(
+  sql: postgres.Sql,
+  stationDbId: string,
+  protocol: OcppSubprotocol,
+  logger: Logger,
+): Promise<void> {
+  // Fail open: the station authenticated, and the station.Connected projection
+  // writes the protocol too, so a failed write only reopens the short window
+  // above for this connection.
+  try {
+    await sql`
+      UPDATE charging_stations
+      SET ocpp_protocol = ${protocol}, updated_at = now()
+      WHERE id = ${stationDbId} AND ocpp_protocol IS DISTINCT FROM ${protocol}
+    `;
+  } catch (err) {
+    logger.warn(
+      { err, stationDbId, protocol },
+      'Failed to store the negotiated OCPP protocol at connection',
+    );
+  }
+}
+
+interface ProfileAuthContext {
+  req: IncomingMessage;
+  sql: postgres.Sql;
+  logger: Logger;
+  stationId: string;
+  station: { id: string; basic_auth_password_hash: string | null };
+  remoteAddress: string | null;
+  // TLS on the socket, or reported by a trusted load balancer that ended it.
+  viaTls: boolean;
+  verifier: StationPasswordVerifier;
+}
+
+async function authenticateForProfile(
+  securityProfile: number,
+  ctx: ProfileAuthContext,
+  logFailures: boolean,
+): Promise<AuthResult> {
+  const { req, sql, logger, stationId, station, remoteAddress, viaTls, verifier } = ctx;
+  const logEvent = logFailures ? logConnectionEvent : async (): Promise<void> => {};
 
   // SP0: no authentication required
   if (securityProfile === 0) {
@@ -95,7 +338,7 @@ export async function authenticateConnection(
   if (securityProfile === 3) {
     const isTls = 'encrypted' in req.socket && req.socket.encrypted === true;
     if (!isTls) {
-      await logAuthEvent(
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -110,13 +353,14 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'SP3 requires TLS',
+        failure: 'tls_required',
       };
     }
 
     const tlsSocket = req.socket as import('node:tls').TLSSocket;
     const cert = tlsSocket.getPeerCertificate();
     if (Object.keys(cert).length === 0) {
-      await logAuthEvent(
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -131,12 +375,13 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Client certificate required for SP3',
+        failure: 'client_certificate',
       };
     }
 
     if (!tlsSocket.authorized) {
       const authError = tlsSocket.authorizationError;
-      await logAuthEvent(
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -152,6 +397,7 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Client certificate not trusted',
+        failure: 'client_certificate',
       };
     }
 
@@ -166,7 +412,7 @@ export async function authenticateConnection(
     // not registered" instead of the real "no serial" reason. Cover both.
     const certSerial = cert.serialNumber as string | undefined;
     if (certSerial == null || certSerial === '') {
-      await logAuthEvent(
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -181,6 +427,7 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Client certificate missing serial number',
+        failure: 'client_certificate',
       };
     }
     // Node returns the serial uppercase without separators; normalize the DB
@@ -195,7 +442,7 @@ export async function authenticateConnection(
       LIMIT 1
     `;
     if (certRows.length === 0) {
-      await logAuthEvent(
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -211,6 +458,7 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Client certificate not registered for this station',
+        failure: 'client_certificate',
       };
     }
 
@@ -221,11 +469,11 @@ export async function authenticateConnection(
     return { authenticated: true, stationId, stationDbId: station.id };
   }
 
-  // SP2: require TLS
+  // SP2: require TLS. A load balancer may end it; SP3 needs the client
+  // certificate on this socket, so only SP2 accepts that.
   if (securityProfile === 2) {
-    const isTls = 'encrypted' in req.socket && req.socket.encrypted === true;
-    if (!isTls) {
-      await logAuthEvent(
+    if (!viaTls) {
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -240,6 +488,7 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Security Profile 2 requires TLS',
+        failure: 'tls_required',
       };
     }
   }
@@ -247,7 +496,7 @@ export async function authenticateConnection(
   // SP1 and SP2: require Basic auth
   const authHeader = req.headers['authorization'];
   if (authHeader == null) {
-    await logAuthEvent(
+    await logEvent(
       sql,
       station.id,
       'auth_failed',
@@ -262,11 +511,12 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'Basic auth credentials required',
+      failure: 'credentials',
     };
   }
 
   if (!authHeader.startsWith('Basic ')) {
-    await logAuthEvent(
+    await logEvent(
       sql,
       station.id,
       'auth_failed',
@@ -281,6 +531,7 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'Invalid auth scheme',
+      failure: 'credentials',
     };
   }
 
@@ -294,7 +545,7 @@ export async function authenticateConnection(
   // station presenting valid credentials for station A could connect to
   // station B's URL and inherit B's identity for the session.
   if (username !== stationId) {
-    await logAuthEvent(
+    await logEvent(
       sql,
       station.id,
       'auth_failed',
@@ -309,11 +560,12 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'Username must equal the ChargingStationId',
+      failure: 'credentials',
     };
   }
 
   if (station.basic_auth_password_hash == null) {
-    await logAuthEvent(
+    await logEvent(
       sql,
       station.id,
       'auth_failed',
@@ -328,13 +580,38 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'No password configured for station',
+      failure: 'credentials',
     };
   }
 
+  const storedHash = station.basic_auth_password_hash;
+  let cached: boolean;
   try {
-    const valid = await verify(station.basic_auth_password_hash, password);
-    if (!valid) {
-      await logAuthEvent(
+    const check = await verifier.verify(station.id, storedHash, password, remoteAddress);
+    cached = check.cached;
+    if (check.lockedForMs != null) {
+      // Repeated wrong passwords: refused without argon2 (StationAuthBackoff).
+      await logEvent(
+        sql,
+        station.id,
+        'auth_failed',
+        remoteAddress,
+        {
+          reason: 'Too many failed password attempts',
+        },
+        logger,
+      );
+      return {
+        authenticated: false,
+        stationId,
+        stationDbId: station.id,
+        error: 'Too many failed password attempts',
+        failure: 'locked_out',
+        retryAfterSeconds: Math.ceil(check.lockedForMs / 1000),
+      };
+    }
+    if (!check.valid) {
+      await logEvent(
         sql,
         station.id,
         'auth_failed',
@@ -349,6 +626,7 @@ export async function authenticateConnection(
         stationId,
         stationDbId: station.id,
         error: 'Invalid credentials',
+        failure: 'credentials',
       };
     }
   } catch (err: unknown) {
@@ -361,29 +639,107 @@ export async function authenticateConnection(
       stationId,
       stationDbId: station.id,
       error: 'Authentication error',
+      failure: 'unavailable',
     };
   }
 
-  logger.debug({ stationId }, 'Station authenticated via Basic Auth');
+  if (!cached && verifier.needsRehash(storedHash)) {
+    const stationDbId = station.id;
+    verifier.scheduleRehash(stationDbId, () =>
+      rehashStationPassword(sql, stationDbId, storedHash, password, verifier, logger),
+    );
+  }
+
+  logger.debug({ stationId, cached }, 'Station authenticated via Basic Auth');
   return { authenticated: true, stationId, stationDbId: station.id };
 }
 
-async function logAuthEvent(
+// A hash stored with other parameters (the argon2 default before
+// STATION_PASSWORD_HASH_OPTIONS) is replaced after the station proves the
+// password, the only time the plaintext is known. It runs in the verifier's
+// background lane, after the connection was accepted and outside the
+// connection admission limit, so a post-upgrade reconnect wave pays one
+// argon2 verify per station, not a verify plus a new hash. The update only
+// applies while the row still holds the hash just verified, so a password the
+// operator set in the meantime always wins, however late the rehash runs.
+// Fail-open: the station authenticated, and the next connection retries.
+async function rehashStationPassword(
   sql: postgres.Sql,
   stationDbId: string,
-  event: string,
-  remoteAddress: string | null,
-  metadata: Record<string, unknown>,
+  storedHash: string,
+  password: string,
+  verifier: StationPasswordVerifier,
   logger: Logger,
 ): Promise<void> {
   try {
-    await sql`
-      INSERT INTO connection_logs (station_id, event, remote_address, metadata)
-      VALUES (${stationDbId}, ${event}, ${remoteAddress}, ${sql.json(metadata as Parameters<postgres.Sql['json']>[0])})
+    const newHash = await verifier.rehash(password);
+    const updated = await sql`
+      UPDATE charging_stations
+      SET basic_auth_password_hash = ${newHash}, updated_at = now()
+      WHERE id = ${stationDbId} AND basic_auth_password_hash = ${storedHash}
+      RETURNING id
     `;
+    if (updated.length > 0) verifier.remember(stationDbId, newHash, password);
   } catch (err) {
-    // Best-effort logging; do not fail the auth flow, but surface the failure
-    // so operators notice when forensic logs go missing.
-    logger.warn({ err, stationDbId, event }, 'Failed to write connection_logs row');
+    logger.warn({ err, stationDbId }, 'Failed to rehash the station password');
   }
+}
+
+async function promotePendingSecurityProfile(
+  sql: postgres.Sql,
+  stationDbId: string,
+  fromProfile: number,
+  toProfile: number,
+  remoteAddress: string | null,
+  logger: Logger,
+): Promise<void> {
+  // Fail open: the station authenticated with the new profile; a failed write
+  // only delays the promotion to its next connection.
+  let promoted: boolean;
+  try {
+    const rows = await sql`
+      UPDATE charging_stations
+      SET security_profile = ${toProfile}, pending_security_profile = NULL, updated_at = now(),
+        basic_auth_password_hash = CASE WHEN ${toProfile} = 3 THEN NULL ELSE basic_auth_password_hash END
+      WHERE id = ${stationDbId} AND pending_security_profile = ${toProfile}
+      RETURNING id
+    `;
+    promoted = rows.length > 0;
+  } catch (err) {
+    logger.warn({ err, stationDbId, toProfile }, 'Failed to promote pending security profile');
+    return;
+  }
+  // The station audit row, only from the connection whose compare-and-set
+  // promoted it (a concurrent connection on another pod finds nothing).
+  // Fail-open (writeAudit).
+  if (promoted) {
+    await writeAudit(
+      { table: stationAuditLog, idColumn: 'station_id' },
+      {
+        entityId: stationDbId,
+        entityIdSnapshot: stationDbId,
+        action: 'updated',
+        actor: 'ocpp',
+        actorLabel: 'security_profile_upgraded',
+        before: { securityProfile: fromProfile, pendingSecurityProfile: toProfile },
+        after: {
+          securityProfile: toProfile,
+          pendingSecurityProfile: null,
+          ...(toProfile === 3 ? { basicAuthPasswordCleared: true } : {}),
+        },
+        notes: 'The station connected with the pending security profile',
+      },
+      undefined,
+      logger,
+    );
+  }
+  logger.info({ stationDbId, fromProfile, toProfile }, 'Security profile upgrade completed');
+  await logConnectionEvent(
+    sql,
+    stationDbId,
+    'security_profile_upgraded',
+    remoteAddress,
+    { fromProfile, toProfile },
+    logger,
+  );
 }

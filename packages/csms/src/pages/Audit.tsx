@@ -19,128 +19,31 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { actorDisplay, type AuditEntry } from '@/components/EntityHistoryTab';
+import { actorDisplay, AuditActorBadge, type AuditEntry } from '@/components/EntityHistoryTab';
+import {
+  AUDIT_ACTIONS,
+  AUDIT_ACTORS,
+  AUDIT_ENTITY_TYPES,
+  auditActionLabel,
+  auditActorLabel,
+  auditEntityLabel,
+} from '@/lib/audit-labels';
 import { FilterPopover } from '@/components/FilterBar';
 import { LoadingLogo } from '@/components/loading-logo';
+import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 
 interface AuditPage {
   data: AuditEntry[];
   total: number;
 }
 
-const ENTITY_TYPES = [
-  'site',
-  'station',
-  'driver',
-  'fleet',
-  'user',
-  'vehicle',
-  'support_case',
-  'ocpi_partner',
-  'certificate',
-  'role',
-  'api_key',
-  'setting',
-  'smart_charging_template',
-  'config_template',
-  'firmware_campaign',
-  'station_image',
-  'local_auth_list',
-  'token',
-  'reservation',
-  'pricing_group',
-  'tariff',
-  'holiday',
-  'pricing_assignment',
-  'maintenance_event',
-] as const;
-
-const ACTORS = ['operator', 'driver', 'api_key', 'system', 'ocpp'] as const;
-
-// Union of every action verb declared across all per-entity action enums in
-// packages/database/src/schema/audit.ts. Keep sorted alphabetically. Adding
-// a new entity action enum? Add the value(s) here so the global Audit page
-// dropdown can offer it.
-const ACTIONS = [
-  'activated',
-  'assigned',
-  'attachment_added',
-  'availability_changed',
-  'ca_certificate_added',
-  'ca_certificate_deleted',
-  'cancelled',
-  'carbon_region_changed',
-  'category_changed',
-  'certificate_deleted',
-  'certificate_installed',
-  'command_dispatched',
-  'completed',
-  'configuration_pushed',
-  'created',
-  'csr_rejected',
-  'csr_signed',
-  'deactivated',
-  'deleted',
-  'disconnected',
-  'email_verified',
-  'ended',
-  'expired',
-  'fleet_assignment_changed',
-  'free_vend_toggled',
-  'imported',
-  'location_published_changed',
-  'login_failed',
-  'login_succeeded',
-  'member_added',
-  'member_removed',
-  'message_added',
-  'mfa_disabled',
-  'mfa_enabled',
-  'onboarding_status_changed',
-  'password_reset',
-  'paused',
-  'payment_config_changed',
-  'permissions_changed',
-  'pnc_settings_updated',
-  'pricing_assignment_changed',
-  'priority_changed',
-  'pulled',
-  'pushed',
-  'refund_issued',
-  'registered',
-  'reservations_cancelled',
-  'reset_triggered',
-  'resumed',
-  'revoked',
-  'role_changed',
-  'root_certificates_refreshed',
-  'session_failed',
-  'sessions_linked',
-  'sessions_stopped',
-  'sessions_unlinked',
-  'set_main',
-  'simulator_toggled',
-  'site_access_changed',
-  'started',
-  'station_added',
-  'station_removed',
-  'status_changed',
-  'sync_triggered',
-  'tariff_mapping_changed',
-  'token_received',
-  'tokens_added',
-  'tokens_removed',
-  'updated',
-  'uploaded',
-  'used',
-] as const;
-
-function formatTimestamp(iso: string): string {
+function formatTimestamp(iso: string, timezone: string): string {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  return Number.isNaN(d.getTime()) ? iso : formatDateTime(d, timezone);
 }
 
 export function Audit(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [page, setPage] = useState(1);
   const [entityType, setEntityType] = useState('');
@@ -198,10 +101,9 @@ export function Audit(): React.JSX.Element {
   const filters = (
     <>
       <div className="space-y-2">
-        <Label>{t('audit.entityType', 'Entity type')}</Label>
+        <Label className="leading-6">{t('audit.entityType', 'Entity type')}</Label>
         <Select
           aria-label={t('audit.entityType', 'Entity type')}
-          className="h-10"
           value={entityType}
           onChange={(e) => {
             setEntityType(e.target.value);
@@ -209,18 +111,17 @@ export function Audit(): React.JSX.Element {
           }}
         >
           <option value="">{t('audit.all', 'All')}</option>
-          {ENTITY_TYPES.map((tt) => (
+          {AUDIT_ENTITY_TYPES.map((tt) => (
             <option key={tt} value={tt}>
-              {tt}
+              {auditEntityLabel(t, tt)}
             </option>
           ))}
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('audit.actor', 'Actor')}</Label>
+        <Label className="leading-6">{t('audit.actor', 'Actor')}</Label>
         <Select
           aria-label={t('audit.actor', 'Actor')}
-          className="h-10"
           value={actor}
           onChange={(e) => {
             setActor(e.target.value);
@@ -228,18 +129,17 @@ export function Audit(): React.JSX.Element {
           }}
         >
           <option value="">{t('audit.all', 'All')}</option>
-          {ACTORS.map((a) => (
+          {AUDIT_ACTORS.map((a) => (
             <option key={a} value={a}>
-              {a}
+              {auditActorLabel(t, a)}
             </option>
           ))}
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('audit.action', 'Action')}</Label>
+        <Label className="leading-6">{t('audit.action', 'Action')}</Label>
         <Select
           aria-label={t('audit.action', 'Action')}
-          className="h-10"
           value={action}
           onChange={(e) => {
             setAction(e.target.value);
@@ -247,15 +147,15 @@ export function Audit(): React.JSX.Element {
           }}
         >
           <option value="">{t('audit.all', 'All')}</option>
-          {ACTIONS.map((a) => (
+          {AUDIT_ACTIONS.map((a) => (
             <option key={a} value={a}>
-              {a}
+              {auditActionLabel(t, a)}
             </option>
           ))}
         </Select>
       </div>
       <div className="space-y-2">
-        <Label>{t('audit.entityId', 'Entity id')}</Label>
+        <Label className="leading-6">{t('audit.entityId', 'Entity id')}</Label>
         <Input
           value={entityId}
           placeholder={t('audit.entityIdPlaceholder', 'sta_... / sit_... / etc')}
@@ -266,7 +166,7 @@ export function Audit(): React.JSX.Element {
         />
       </div>
       <div className="space-y-2">
-        <Label>{t('audit.from', 'From')}</Label>
+        <Label className="leading-6">{t('audit.from', 'From')}</Label>
         <Input
           type="date"
           value={from}
@@ -277,7 +177,7 @@ export function Audit(): React.JSX.Element {
         />
       </div>
       <div className="space-y-2">
-        <Label>{t('audit.to', 'To')}</Label>
+        <Label className="leading-6">{t('audit.to', 'To')}</Label>
         <Input
           type="date"
           value={to}
@@ -302,7 +202,7 @@ export function Audit(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('audit.title', 'Audit Log')}</h1>
           <p className="text-sm text-muted-foreground">
@@ -355,19 +255,23 @@ export function Audit(): React.JSX.Element {
                   {rows.map((row) => (
                     <TableRow key={`${row.entityType}-${String(row.id)}`}>
                       <TableCell className="whitespace-nowrap text-xs">
-                        {formatTimestamp(row.createdAt)}
+                        {formatTimestamp(row.createdAt, timezone)}
                       </TableCell>
                       <TableCell>
-                        <Badge variant="secondary">{row.entityType}</Badge>
+                        <Badge variant="secondary" title={row.entityType}>
+                          {auditEntityLabel(t, row.entityType)}
+                        </Badge>
                       </TableCell>
                       <TableCell className="text-muted-foreground">
                         {row.entityId ?? row.entityIdSnapshot}
                       </TableCell>
                       <TableCell>
-                        <Badge variant="outline">{row.action}</Badge>
+                        <Badge variant="outline" title={row.action}>
+                          {auditActionLabel(t, row.action)}
+                        </Badge>
                       </TableCell>
                       <TableCell>
-                        <Badge variant="info">{row.actor}</Badge>
+                        <AuditActorBadge actor={row.actor} />
                       </TableCell>
                       <TableCell className="text-sm">{actorDisplay(row)}</TableCell>
                       <TableCell className="text-xs text-muted-foreground">

@@ -30,9 +30,11 @@ export function reservationStatusVariant(status: string): BadgeVariant {
   }
 }
 
-/** Fleet reservation status -> badge variant (active/partial/cancelled/expired/completed) */
+/** Fleet reservation status -> badge variant (scheduled/active/partial/completed/expired/cancelled) */
 export function fleetReservationStatusVariant(status: string): BadgeVariant {
   switch (status) {
+    case 'scheduled':
+      return 'info';
     case 'active':
       return 'success';
     case 'partial':
@@ -142,8 +144,10 @@ export function eventTypeVariant(
 /** Support case status -> badge variant */
 export function supportCaseStatusVariant(
   status: string,
-): 'default' | 'secondary' | 'destructive' | 'outline' {
+): 'default' | 'secondary' | 'destructive' | 'outline' | 'info' {
   switch (status) {
+    case 'ai_assist':
+      return 'info';
     case 'open':
       return 'default';
     case 'in_progress':
@@ -362,6 +366,30 @@ export function cdrPushStatusVariant(
       return 'outline';
     case 'failed':
       return 'destructive';
+    default:
+      return 'outline';
+  }
+}
+
+/**
+ * AI insight status (one for the insight and its action) -> badge variant.
+ * Open and pending ask for attention; done and resolved are good news.
+ */
+export function insightStatusVariant(status: string): BadgeVariant {
+  // One color per shown status, so no two read the same.
+  switch (status) {
+    case 'open':
+      return 'info';
+    case 'pending':
+      return 'warning';
+    case 'done':
+      return 'success';
+    case 'resolved':
+      return 'default';
+    case 'rejected':
+      return 'destructive';
+    case 'dismissed':
+      return 'secondary';
     default:
       return 'outline';
   }

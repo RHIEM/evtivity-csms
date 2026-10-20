@@ -9,12 +9,14 @@ vi.mock('@evtivity/database', () => {
   const where = vi.fn().mockResolvedValue([{ isActive: true }]);
   const limit = vi.fn().mockReturnValue({ where });
   const innerJoin = vi.fn().mockReturnValue({ where, limit });
-  const from = vi.fn().mockReturnValue({ where, innerJoin, limit });
+  const leftJoin = vi.fn().mockReturnValue({ where, limit });
+  const from = vi.fn().mockReturnValue({ where, innerJoin, leftJoin, limit });
   return {
     db: {
       select: vi.fn().mockReturnValue({ from }),
       execute: vi.fn().mockResolvedValue([{ nextval: '12345' }]),
     },
+    drivers: { id: 'id', isActive: 'is_active' },
     driverTokens: { isActive: 'is_active', idToken: 'id_token', tokenType: 'token_type' },
     chargingStations: {
       id: 'id',
@@ -61,6 +63,7 @@ function makeCtx(
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp1.6',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action,
@@ -70,6 +73,8 @@ function makeCtx(
     eventBus: {
       publish: publishMock,
       subscribe: vi.fn(),
+      drain: vi.fn(),
+      track: vi.fn(),
     },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
@@ -453,6 +458,22 @@ describe('OCPP 1.6 StopTransaction handler - transactionData', () => {
       expect.objectContaining({ eventType: 'ocpp.MeterValues' }),
     );
   });
+
+  it('publishes the transactionData readings before the Ended, so they reach the active session', async () => {
+    const { ctx, publishMock } = makeCtx('StopTransaction', {
+      transactionId: 42,
+      timestamp: '2026-02-15T11:00:00Z',
+      meterStop: 5000,
+      transactionData: [{ timestamp: '2026-02-15T10:30:00Z', sampledValue: [{ value: '3000' }] }],
+    });
+
+    await handleStopTransaction(ctx);
+
+    const order = publishMock.mock.calls.map(
+      (call) => (call[0] as { eventType: string }).eventType,
+    );
+    expect(order).toEqual(['ocpp.MeterValues', 'ocpp.TransactionEvent']);
+  });
 });
 
 describe('OCPP 1.6 StatusNotification handler - passes through raw status', () => {
@@ -506,7 +527,7 @@ describe('OCPP 1.6 StatusNotification handler - passes through raw status', () =
     );
   });
 
-  it('uses current time when timestamp is absent', async () => {
+  it('leaves the timestamp out when the station sent none', async () => {
     const { ctx, publishMock } = makeCtx('StatusNotification', {
       connectorId: 1,
       errorCode: 'NoError',
@@ -515,8 +536,22 @@ describe('OCPP 1.6 StatusNotification handler - passes through raw status', () =
 
     await handleStatusNotification(ctx);
 
-    const call = publishMock.mock.calls[0]?.[0] as { payload: { timestamp: string } };
-    expect(call.payload.timestamp).toBeDefined();
+    const call = publishMock.mock.calls[0]?.[0] as { payload: Record<string, unknown> };
+    expect(call.payload).not.toHaveProperty('timestamp');
+  });
+
+  it('passes the station timestamp through', async () => {
+    const { ctx, publishMock } = makeCtx('StatusNotification', {
+      connectorId: 1,
+      errorCode: 'NoError',
+      status: 'Available',
+      timestamp: '2026-02-15T10:30:00Z',
+    });
+
+    await handleStatusNotification(ctx);
+
+    const call = publishMock.mock.calls[0]?.[0] as { payload: Record<string, unknown> };
+    expect(call.payload.timestamp).toBe('2026-02-15T10:30:00Z');
   });
 });
 

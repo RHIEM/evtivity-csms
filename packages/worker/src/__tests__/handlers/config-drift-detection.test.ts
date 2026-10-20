@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 
 // Drizzle chain mock: each builder call returns the chain; awaiting it pulls the
@@ -46,6 +46,7 @@ vi.mock('@evtivity/database', () => ({
     model: 'chargingStations.model',
   },
   configTemplates: {},
+  isOperatorStation: () => 'OPERATOR_STATION',
   stationConfigurations: {
     stationId: 'stationConfigurations.stationId',
   },
@@ -61,9 +62,19 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 const mockPublish = vi.fn().mockResolvedValue(undefined);
-vi.mock('@evtivity/api/src/lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: () => ({ publish: mockPublish }),
 }));
+
+// Identity columns of a reported value with no instance, EVSE, or connector
+// (the row a template variable targets).
+const TOP_LEVEL = {
+  instance: null,
+  evseId: null,
+  connectorId: null,
+  variableInstance: null,
+  attributeType: 'Actual',
+};
 
 const log = {
   info: vi.fn(),
@@ -71,6 +82,14 @@ const log = {
   error: vi.fn(),
   debug: vi.fn(),
 } as unknown as Logger;
+
+// The module is imported after the mocks above are initialized. The first import loads the
+// whole module graph, which under coverage on a busy machine took longer than one test's
+// 5 s timeout, so it happens once here with its own timeout instead of inside the first test.
+let mod: typeof import('../../handlers/config-drift-detection.js');
+beforeAll(async () => {
+  mod = await import('../../handlers/config-drift-detection.js');
+}, 30_000);
 
 describe('configDriftDetectionHandler', () => {
   beforeEach(() => {
@@ -83,8 +102,7 @@ describe('configDriftDetectionHandler', () => {
   it('does nothing when there are no templates', async () => {
     setupDbResults([]); // templates
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).not.toHaveBeenCalled();
@@ -94,8 +112,7 @@ describe('configDriftDetectionHandler', () => {
   it('skips templates with no variables', async () => {
     setupDbResults([{ id: 'tpl_empty', variables: [], targetFilter: null }]);
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     // No target-station query issued for an empty-variable template.
@@ -115,11 +132,28 @@ describe('configDriftDetectionHandler', () => {
       [], // targetStations empty
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).not.toHaveBeenCalled();
+  });
+
+  it('never targets conformance test stations unless the template is bound to one station', async () => {
+    const variables = [{ component: 'AuthCtrlr', variable: 'Enabled', value: 'true' }];
+    const { configDriftDetectionHandler } = mod;
+
+    setupDbResults(
+      [{ id: 'tpl_1', variables, stationId: null, targetFilter: { siteId: 'site_x' } }],
+      [],
+    );
+    mockAnd.mockClear();
+    await configDriftDetectionHandler(log);
+    expect(mockAnd.mock.calls[0]).toContain('OPERATOR_STATION');
+
+    setupDbResults([{ id: 'tpl_2', variables, stationId: 'sta_1', targetFilter: null }], []);
+    mockAnd.mockClear();
+    await configDriftDetectionHandler(log);
+    expect(mockAnd.mock.calls[0]).not.toContain('OPERATOR_STATION');
   });
 
   it('emits config.driftDetected when a station value differs from the template', async () => {
@@ -131,12 +165,19 @@ describe('configDriftDetectionHandler', () => {
           targetFilter: null,
         },
       ],
-      [{ id: 'sta_drift' }], // targetStations
-      [{ stationId: 'sta_drift', component: 'AuthCtrlr', variable: 'Enabled', value: 'false' }],
+      [{ id: 'sta_drift', siteId: 'sit_1' }], // targetStations
+      [
+        {
+          stationId: 'sta_drift',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'false',
+        },
+      ],
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).toHaveBeenCalledTimes(1);
@@ -146,7 +187,7 @@ describe('configDriftDetectionHandler', () => {
         eventType: 'config.driftDetected',
         stationId: 'sta_drift',
         sessionId: null,
-        siteId: null,
+        siteId: 'sit_1',
       }),
     );
     expect(log.info).toHaveBeenCalledWith({ driftCount: 1 }, 'Configuration drift detected');
@@ -165,8 +206,7 @@ describe('configDriftDetectionHandler', () => {
       [], // station has no configurations at all -> find() returns undefined
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).toHaveBeenCalledTimes(1);
@@ -190,9 +230,16 @@ describe('configDriftDetectionHandler', () => {
       ],
       [{ id: 'sta_ok' }],
       [
-        { stationId: 'sta_ok', component: 'AuthCtrlr', variable: 'Enabled', value: 'true' },
         {
           stationId: 'sta_ok',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'true',
+        },
+        {
+          stationId: 'sta_ok',
+          ...TOP_LEVEL,
           component: 'TxCtrlr',
           variable: 'TxStartPoint',
           value: 'EVConnected',
@@ -200,8 +247,7 @@ describe('configDriftDetectionHandler', () => {
       ],
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).not.toHaveBeenCalled();
@@ -222,9 +268,16 @@ describe('configDriftDetectionHandler', () => {
       ],
       [{ id: 'sta_two_drift' }],
       [
-        { stationId: 'sta_two_drift', component: 'AuthCtrlr', variable: 'Enabled', value: 'false' },
         {
           stationId: 'sta_two_drift',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'false',
+        },
+        {
+          stationId: 'sta_two_drift',
+          ...TOP_LEVEL,
           component: 'TxCtrlr',
           variable: 'TxStartPoint',
           value: 'Authorized',
@@ -232,8 +285,7 @@ describe('configDriftDetectionHandler', () => {
       ],
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).toHaveBeenCalledTimes(1);
@@ -251,13 +303,24 @@ describe('configDriftDetectionHandler', () => {
       ],
       [{ id: 'sta_ok' }, { id: 'sta_bad' }],
       [
-        { stationId: 'sta_ok', component: 'AuthCtrlr', variable: 'Enabled', value: 'true' },
-        { stationId: 'sta_bad', component: 'AuthCtrlr', variable: 'Enabled', value: 'false' },
+        {
+          stationId: 'sta_ok',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'true',
+        },
+        {
+          stationId: 'sta_bad',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'false',
+        },
       ],
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     expect(mockPublish).toHaveBeenCalledTimes(1);
@@ -279,8 +342,7 @@ describe('configDriftDetectionHandler', () => {
       [], // no stations -> short-circuit, we only care about the filter build
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await configDriftDetectionHandler(log);
 
     // isOnline + siteId + vendorId + model = 4 eq conditions for this template.
@@ -289,6 +351,44 @@ describe('configDriftDetectionHandler', () => {
     expect(mockEq).toHaveBeenCalledWith('chargingStations.vendorId', 'ven_1');
     expect(mockEq).toHaveBeenCalledWith('chargingStations.model', 'ModelX');
     expect(mockInArray).not.toHaveBeenCalled();
+  });
+
+  it('applies the stationId filter condition', async () => {
+    setupDbResults(
+      [
+        {
+          id: 'tpl_station_filter',
+          variables: [{ component: 'AuthCtrlr', variable: 'Enabled', value: 'true' }],
+          stationId: null,
+          targetFilter: { stationId: 'st_7' },
+        },
+      ],
+      [],
+    );
+
+    await mod.configDriftDetectionHandler(log);
+
+    expect(mockEq).toHaveBeenCalledWith('chargingStations.id', 'st_7');
+  });
+
+  it('matches a template bound to a station only against that station', async () => {
+    setupDbResults(
+      [
+        {
+          id: 'tpl_bound',
+          variables: [{ component: 'AuthCtrlr', variable: 'Enabled', value: 'true' }],
+          stationId: 'st_bound',
+          // A bound template's filter never widens its reach.
+          targetFilter: null,
+        },
+      ],
+      [],
+    );
+
+    await mod.configDriftDetectionHandler(log);
+
+    expect(mockEq).toHaveBeenCalledWith('chargingStations.id', 'st_bound');
+    expect(mockEq).not.toHaveBeenCalledWith('chargingStations.siteId', expect.anything());
   });
 
   it('continues to the next template when SSE publish fails (best-effort)', async () => {
@@ -302,14 +402,67 @@ describe('configDriftDetectionHandler', () => {
         },
       ],
       [{ id: 'sta_drift' }],
-      [{ stationId: 'sta_drift', component: 'AuthCtrlr', variable: 'Enabled', value: 'false' }],
+      [
+        {
+          stationId: 'sta_drift',
+          ...TOP_LEVEL,
+          component: 'AuthCtrlr',
+          variable: 'Enabled',
+          value: 'false',
+        },
+      ],
     );
 
-    const { configDriftDetectionHandler } =
-      await import('../../handlers/config-drift-detection.js');
+    const { configDriftDetectionHandler } = mod;
     await expect(configDriftDetectionHandler(log)).resolves.toBeUndefined();
 
     // driftCount still incremented despite the publish failure.
+    expect(log.info).toHaveBeenCalledWith({ driftCount: 1 }, 'Configuration drift detected');
+  });
+
+  it('compares only the row the template sets, not other instances or EVSEs', async () => {
+    setupDbResults(
+      [
+        {
+          id: 'tpl_1',
+          variables: [{ component: 'TxCtrlr', variable: 'EVConnectionTimeOut', value: '60' }],
+          targetFilter: null,
+        },
+      ],
+      [{ id: 'sta_other_rows' }],
+      [
+        // Same component and variable, but an EVSE-level row, a variable
+        // instance, and a MaxSet attribute: none is the value the template sets.
+        {
+          stationId: 'sta_other_rows',
+          ...TOP_LEVEL,
+          evseId: 1,
+          component: 'TxCtrlr',
+          variable: 'EVConnectionTimeOut',
+          value: '60',
+        },
+        {
+          stationId: 'sta_other_rows',
+          ...TOP_LEVEL,
+          variableInstance: 'Other',
+          component: 'TxCtrlr',
+          variable: 'EVConnectionTimeOut',
+          value: '60',
+        },
+        {
+          stationId: 'sta_other_rows',
+          ...TOP_LEVEL,
+          attributeType: 'MaxSet',
+          component: 'TxCtrlr',
+          variable: 'EVConnectionTimeOut',
+          value: '60',
+        },
+      ],
+    );
+
+    const { configDriftDetectionHandler } = mod;
+    await configDriftDetectionHandler(log);
+
     expect(log.info).toHaveBeenCalledWith({ driftCount: 1 }, 'Configuration drift detected');
   });
 });

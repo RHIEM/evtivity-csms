@@ -5,6 +5,8 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
+const mockWriteAudit = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve()));
+
 let dbResults: unknown[][] = [];
 let dbCallIndex = 0;
 function setupDbResults(...results: unknown[][]) {
@@ -67,6 +69,9 @@ vi.mock('@evtivity/database', () => ({
   },
   reports: {},
   reportSchedules: {},
+  chargingStations: {},
+  reportScheduleAuditLog: { _name: 'reportScheduleAuditLog' },
+  writeAudit: mockWriteAudit,
   reportStatusEnum: {
     enumValues: ['pending', 'generating', 'completed', 'failed'] as const,
   },
@@ -88,18 +93,48 @@ vi.mock('drizzle-orm', () => ({
   lte: vi.fn(),
 }));
 
-vi.mock('../services/report.service.js', () => ({
+vi.mock('@evtivity/services/report.service', () => ({
   queueReport: vi.fn(() => Promise.resolve('report-123')),
   computeNextRunAtInTz: vi.fn(() => Promise.resolve(new Date('2026-01-02T06:00:00Z'))),
+  REPORT_GENERATE_CHANNEL: 'report_generate',
+  reportFiltersError: vi.fn((reportType: string, filters: Record<string, unknown>) =>
+    reportType === 'nevi' && (filters['quarter'] == null || filters['year'] == null)
+      ? 'Filters must include a valid quarter (1-4) and year'
+      : null,
+  ),
+  listReportTypes: vi.fn(() => [
+    { type: 'nevi', formats: ['xlsx'], generateFromUi: false },
+    { type: 'revenue', formats: ['csv', 'pdf', 'xlsx'], generateFromUi: true },
+  ]),
+  REPORT_TYPES: [
+    'nevi',
+    'revenue',
+    'energy',
+    'sessions',
+    'utilization',
+    'stationHealth',
+    'sustainability',
+    'driverActivity',
+  ],
 }));
 
+const mockPublish = vi.hoisted(() => vi.fn());
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
+  getPubSub: () => ({ publish: mockPublish }),
+}));
+
+// Echoes the permission a route requires in a header, so a test can check it.
 vi.mock('../middleware/rbac.js', () => ({
   authorize:
-    () =>
+    (permission: string) =>
     async (
       request: { jwtVerify: () => Promise<void> },
-      reply: { status: (n: number) => { send: (body: unknown) => Promise<void> } },
+      reply: {
+        header: (name: string, value: string) => void;
+        status: (n: number) => { send: (body: unknown) => Promise<void> };
+      },
     ) => {
+      reply.header('x-required-permission', permission);
       try {
         await request.jwtVerify();
       } catch {
@@ -117,6 +152,7 @@ vi.mock('../lib/site-access.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { reportRoutes } from '../routes/reports.js';
+import { queueReport } from '@evtivity/services/report.service';
 
 const VALID_REPORT_ID = 'rpt_000000000001';
 const VALID_USER_ID = 'usr_000000000001';
@@ -145,6 +181,7 @@ describe('Report routes', () => {
 
   beforeEach(() => {
     setupDbResults();
+    mockWriteAudit.mockClear();
   });
 
   it('GET /v1/reports returns 401 without auth', async () => {
@@ -164,6 +201,7 @@ describe('Report routes', () => {
           fileName: null,
           fileSize: null,
           error: null,
+          siteScope: null,
           createdAt: '2024-01-01T00:00:00.000Z',
           completedAt: null,
         },
@@ -179,6 +217,25 @@ describe('Report routes', () => {
     const body = JSON.parse(response.body);
     expect(body.data).toHaveLength(1);
     expect(body.total).toBe(1);
+  });
+
+  it('GET /v1/reports/types returns 401 without auth', async () => {
+    const response = await app.inject({ method: 'GET', url: '/reports/types' });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('GET /v1/reports/types lists the report types with formats and generateFromUi', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/reports/types',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-required-permission']).toBe('reports:read');
+    expect(JSON.parse(response.body)).toEqual([
+      { type: 'nevi', formats: ['xlsx'], generateFromUi: false },
+      { type: 'revenue', formats: ['csv', 'pdf', 'xlsx'], generateFromUi: true },
+    ]);
   });
 
   it('GET /v1/reports/:id returns 404 when report not found', async () => {
@@ -204,6 +261,7 @@ describe('Report routes', () => {
         fileName: null,
         fileSize: null,
         error: null,
+        siteScope: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         completedAt: null,
         filters: null,
@@ -251,6 +309,57 @@ describe('Report routes', () => {
     expect(response.headers['content-disposition']).toContain('report.csv');
   });
 
+  it('GET /v1/reports/:id/download records one downloaded row per request', async () => {
+    setupDbResults([
+      {
+        fileData: Buffer.from('test data'),
+        fileName: 'report.csv',
+        format: 'csv',
+        name: 'Revenue Q1',
+        reportType: 'revenue',
+      },
+    ]);
+    const response = await app.inject({
+      method: 'GET',
+      url: `/reports/${VALID_REPORT_ID}/download`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit.mock.calls[0]?.[0]).toEqual({
+      table: { _name: 'reportScheduleAuditLog' },
+      idColumn: 'report_schedule_id',
+    });
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toEqual({
+      entityId: null,
+      entityIdSnapshot: `report:${VALID_REPORT_ID}`,
+      action: 'report_downloaded',
+      actor: 'operator',
+      actorUserId: VALID_USER_ID,
+      actorDriverId: null,
+      actorApiKeyId: null,
+      actorLabel: null,
+      after: {
+        reportId: VALID_REPORT_ID,
+        name: 'Revenue Q1',
+        reportType: 'revenue',
+        format: 'csv',
+        fileName: 'report.csv',
+      },
+      notes: VALID_REPORT_ID,
+    });
+  });
+
+  it('GET /v1/reports/:id/download writes no row when the file is missing', async () => {
+    setupDbResults([]);
+    await app.inject({
+      method: 'GET',
+      url: `/reports/${VALID_REPORT_ID}/download`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
   it('POST /v1/reports/generate returns 401 without auth', async () => {
     const response = await app.inject({
       method: 'POST',
@@ -273,6 +382,105 @@ describe('Report routes', () => {
     expect(body.status).toBe('pending');
   });
 
+  it('POST /v1/reports/generate records the generated report with its filters', async () => {
+    const filters = {
+      dateFrom: '2026-01-01',
+      dateTo: '2026-03-31',
+      siteId: 'sit_1',
+      stationId: 'sta_1',
+    };
+    setupDbResults([{ siteId: 'sit_1' }]);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/reports/generate',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'Q1 Revenue', reportType: 'revenue', format: 'xlsx', filters },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit.mock.calls[0]?.[0]).toEqual({
+      table: { _name: 'reportScheduleAuditLog' },
+      idColumn: 'report_schedule_id',
+    });
+    const row = mockWriteAudit.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(row).toMatchObject({
+      entityId: null,
+      entityIdSnapshot: 'report:report-123',
+      action: 'report_generated',
+      actor: 'operator',
+      actorUserId: VALID_USER_ID,
+      after: {
+        reportId: 'report-123',
+        name: 'Q1 Revenue',
+        reportType: 'revenue',
+        format: 'xlsx',
+        filters,
+        siteScope: null,
+        scheduleId: null,
+      },
+      notes: 'report-123',
+    });
+    expect(row['before']).toBeUndefined();
+  });
+
+  it('POST /v1/reports/generate writes no row when a filter is refused', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/reports/generate',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'NEVI', reportType: 'nevi', format: 'xlsx' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('POST /v1/reports/generate announces the report to the worker instead of generating it', async () => {
+    vi.mocked(queueReport).mockClear();
+    mockPublish.mockResolvedValue(undefined);
+    await app.inject({
+      method: 'POST',
+      url: '/reports/generate',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'Test Report', reportType: 'revenue', format: 'csv' },
+    });
+
+    const dispatch = vi.mocked(queueReport).mock.calls[0]?.[1];
+    expect(dispatch).toBeTypeOf('function');
+    await dispatch?.('rpt_9');
+    expect(mockPublish).toHaveBeenCalledWith(
+      'report_generate',
+      JSON.stringify({ reportId: 'rpt_9' }),
+    );
+  });
+
+  it('POST /v1/reports/generate refuses a NEVI report without quarter and year', async () => {
+    vi.mocked(queueReport).mockClear();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/reports/generate',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'NEVI', reportType: 'nevi', format: 'xlsx' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+    expect(queueReport).not.toHaveBeenCalled();
+  });
+
+  it('POST /v1/reports/generate queues a NEVI report with quarter and year', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/reports/generate',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        name: 'NEVI',
+        reportType: 'nevi',
+        format: 'xlsx',
+        filters: { quarter: 2, year: 2026 },
+      },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
   it('DELETE /v1/reports/:id returns 404 when not found', async () => {
     setupDbResults([]);
     const response = await app.inject({
@@ -286,7 +494,7 @@ describe('Report routes', () => {
   });
 
   it('DELETE /v1/reports/:id deletes report when found', async () => {
-    setupDbResults([{ id: VALID_REPORT_ID }]);
+    setupDbResults([{ id: VALID_REPORT_ID, name: 'Revenue', reportType: 'revenue' }]);
     const response = await app.inject({
       method: 'DELETE',
       url: `/reports/${VALID_REPORT_ID}`,
@@ -295,6 +503,30 @@ describe('Report routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit.mock.calls[0]?.[0]).toEqual({
+      table: { _name: 'reportScheduleAuditLog' },
+      idColumn: 'report_schedule_id',
+    });
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toMatchObject({
+      entityId: null,
+      entityIdSnapshot: `report:${VALID_REPORT_ID}`,
+      action: 'report_deleted',
+      actor: 'operator',
+      actorUserId: VALID_USER_ID,
+      before: { id: VALID_REPORT_ID, name: 'Revenue' },
+      notes: VALID_REPORT_ID,
+    });
+  });
+
+  it('DELETE /v1/reports/:id writes no audit row when not found', async () => {
+    setupDbResults([]);
+    await app.inject({
+      method: 'DELETE',
+      url: `/reports/${VALID_REPORT_ID}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 });
 
@@ -313,6 +545,7 @@ describe('Report schedule routes', () => {
 
   beforeEach(() => {
     setupDbResults();
+    mockWriteAudit.mockClear();
   });
 
   it('GET /v1/report-schedules returns schedule list', async () => {
@@ -328,6 +561,7 @@ describe('Report schedule routes', () => {
         filters: null,
         recipientEmails: [],
         isEnabled: true,
+        siteScope: null,
         nextRunAt: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
@@ -356,6 +590,7 @@ describe('Report schedule routes', () => {
         filters: null,
         recipientEmails: [],
         isEnabled: true,
+        siteScope: null,
         nextRunAt: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
@@ -375,6 +610,76 @@ describe('Report schedule routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.name).toBe('Weekly Revenue');
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toMatchObject({
+      entityId: 's1',
+      entityIdSnapshot: 's1',
+      action: 'created',
+      after: { id: 's1', name: 'Weekly Revenue' },
+    });
+  });
+
+  it('PATCH /v1/report-schedules/:id audits the changed fields only', async () => {
+    const existing = {
+      id: '7',
+      name: 'Weekly Revenue',
+      reportType: 'revenue',
+      format: 'csv',
+      frequency: 'weekly',
+      dayOfWeek: null,
+      dayOfMonth: null,
+      filters: null,
+      recipientEmails: [],
+      isEnabled: true,
+      siteScope: null,
+      nextRunAt: null,
+      createdAt: '2024-01-01T00:00:00.000Z',
+      updatedAt: '2024-01-01T00:00:00.000Z',
+    };
+    setupDbResults(
+      [existing],
+      [{ ...existing, name: 'Renamed', updatedAt: '2024-01-02T00:00:00.000Z' }],
+    );
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/report-schedules/7`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'Renamed', isEnabled: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toMatchObject({
+      entityId: '7',
+      action: 'updated',
+      before: { name: 'Weekly Revenue' },
+      after: { name: 'Renamed' },
+    });
+    const call = mockWriteAudit.mock.calls[0]?.[1] as {
+      before: Record<string, unknown>;
+    };
+    expect(Object.keys(call.before)).toEqual(['name']);
+  });
+
+  it('POST /v1/report-schedules refuses a NEVI schedule without quarter and year', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/report-schedules',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'NEVI', reportType: 'nevi', format: 'xlsx', frequency: 'monthly' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+  });
+
+  it('PATCH /v1/report-schedules/:id refuses switching to NEVI without quarter and year', async () => {
+    setupDbResults([{ id: 1, reportType: 'revenue', filters: null }]);
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/report-schedules/1`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { reportType: 'nevi' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
   });
 
   it('PATCH /v1/report-schedules/:id returns 404 when not found', async () => {
@@ -403,7 +708,7 @@ describe('Report schedule routes', () => {
   });
 
   it('DELETE /v1/report-schedules/:id deletes schedule when found', async () => {
-    setupDbResults([{ id: VALID_REPORT_ID }]);
+    setupDbResults([{ id: 1, name: 'Weekly Revenue' }]);
     const response = await app.inject({
       method: 'DELETE',
       url: `/report-schedules/1`,
@@ -412,6 +717,45 @@ describe('Report schedule routes', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toMatchObject({
+      entityId: null,
+      entityIdSnapshot: '1',
+      action: 'deleted',
+      before: { id: 1, name: 'Weekly Revenue' },
+    });
+  });
+
+  it('POST /v1/report-schedules/:id/run-now records the generated report under the schedule', async () => {
+    setupDbResults([
+      {
+        id: 7,
+        name: 'Weekly Energy',
+        reportType: 'energy',
+        format: 'csv',
+        filters: { dateFrom: '2026-01-01' },
+        siteScope: null,
+      },
+    ]);
+    const response = await app.inject({
+      method: 'POST',
+      url: `/report-schedules/7/run-now`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mockWriteAudit).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit.mock.calls[0]?.[1]).toMatchObject({
+      entityId: '7',
+      entityIdSnapshot: 'report:report-123',
+      action: 'report_generated',
+      actor: 'operator',
+      after: {
+        reportId: 'report-123',
+        name: 'Weekly Energy',
+        reportType: 'energy',
+        filters: { dateFrom: '2026-01-01' },
+        scheduleId: 7,
+      },
+    });
   });
 
   it('POST /v1/report-schedules/:id/run-now returns 404 when not found', async () => {

@@ -4,6 +4,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../server/middleware/pipeline.js';
+import { handleSignCertificate } from '../handlers/v2_1/sign-certificate.handler.js';
+import { getPkiProvider } from '../services/pki/index.js';
+import { isPncEnabled } from '@evtivity/database';
 
 const mockSignCsr = vi.fn();
 
@@ -24,6 +27,18 @@ vi.mock('../services/pki/index.js', () => ({
   })),
 }));
 
+const { mockIsValidCsr, mockRecordCsr, mockMarkFailed } = vi.hoisted(() => ({
+  mockIsValidCsr: vi.fn(),
+  mockRecordCsr: vi.fn(),
+  mockMarkFailed: vi.fn(),
+}));
+
+vi.mock('../services/pki/csr-requests.js', () => ({
+  isValidCsr: mockIsValidCsr,
+  recordCsrRequest: mockRecordCsr,
+  markCsrFailed: mockMarkFailed,
+}));
+
 const logger = pino({ level: 'silent' });
 
 function makeCtx(payload: Record<string, unknown>): {
@@ -33,7 +48,7 @@ function makeCtx(payload: Record<string, unknown>): {
   const publishMock = vi.fn().mockResolvedValue(undefined);
   const ctx: HandlerContext = {
     stationId: 'CS-001',
-    stationDbId: null,
+    stationDbId: 'sta_001',
     session: {
       stationId: 'CS-001',
       stationDbId: null,
@@ -43,6 +58,7 @@ function makeCtx(payload: Record<string, unknown>): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'SignCertificate',
@@ -52,6 +68,8 @@ function makeCtx(payload: Record<string, unknown>): {
     eventBus: {
       publish: publishMock,
       subscribe: vi.fn(),
+      drain: vi.fn(),
+      track: vi.fn(),
     },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
@@ -59,15 +77,16 @@ function makeCtx(payload: Record<string, unknown>): {
   return { ctx, publishMock };
 }
 
-beforeEach(async () => {
+beforeEach(() => {
   vi.resetAllMocks();
   mockSignCsr.mockResolvedValue({
     certificateChain: 'mock-chain',
     providerReference: 'mock-ref',
   });
-  const { isPncEnabled } = await import('@evtivity/database');
   vi.mocked(isPncEnabled).mockResolvedValue(true);
-  const { getPkiProvider } = await import('../services/pki/index.js');
+  mockIsValidCsr.mockResolvedValue(true);
+  mockRecordCsr.mockResolvedValue(31);
+  mockMarkFailed.mockResolvedValue(undefined);
   vi.mocked(getPkiProvider).mockResolvedValue({
     signCsr: mockSignCsr,
     getContractCertificate: vi.fn(),
@@ -78,7 +97,6 @@ beforeEach(async () => {
 
 describe('v2_1 SignCertificate handler - uncovered branches', () => {
   it('defaults certificateType to ChargingStationCertificate when not provided', async () => {
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({ csr: 'csr-data' });
     const response = await handleSignCertificate(ctx);
 
@@ -101,7 +119,6 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
       providerReference: 'ref-123',
     });
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({
       csr: 'csr-data',
       certificateType: 'ChargingStationCertificate',
@@ -127,7 +144,6 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
     (manualError as Error & { code?: string }).code = 'MANUAL_SIGNING_REQUIRED';
     mockSignCsr.mockRejectedValue(manualError);
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({
       csr: 'csr-data',
       certificateType: 'V2GCertificate',
@@ -141,10 +157,49 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
     );
   });
 
+  it('records every accepted CSR with its station and requestId (A02.FR.25)', async () => {
+    const { ctx, publishMock } = makeCtx({
+      csr: 'csr-data',
+      certificateType: 'V2GCertificate',
+      requestId: 12,
+    });
+    await handleSignCertificate(ctx);
+    expect(mockRecordCsr).toHaveBeenCalledWith({
+      stationDbId: 'sta_001',
+      csr: 'csr-data',
+      certificateType: 'V2GCertificate',
+      requestId: 12,
+    });
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'pnc.CsrSigned',
+        payload: expect.objectContaining({ csrId: 31, requestId: 12 }) as unknown,
+      }),
+    );
+  });
+
+  it('rejects a CSR that is not a valid PKCS#10 request (A02.FR.12)', async () => {
+    mockIsValidCsr.mockResolvedValue(false);
+    const { ctx, publishMock } = makeCtx({ csr: 'garbage' });
+    const response = await handleSignCertificate(ctx);
+    expect(response).toEqual({ status: 'Rejected' });
+    expect(mockRecordCsr).not.toHaveBeenCalled();
+    expect(mockSignCsr).not.toHaveBeenCalled();
+    expect(publishMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves a manual CSR pending (no failure mark)', async () => {
+    const manualError = new Error('Manual signing required');
+    (manualError as Error & { code?: string }).code = 'MANUAL_SIGNING_REQUIRED';
+    mockSignCsr.mockRejectedValue(manualError);
+    const { ctx } = makeCtx({ csr: 'csr-data', certificateType: 'V2GCertificate' });
+    await handleSignCertificate(ctx);
+    expect(mockMarkFailed).not.toHaveBeenCalled();
+  });
+
   it('logs error and returns Accepted when provider throws a generic error', async () => {
     mockSignCsr.mockRejectedValue(new Error('network timeout'));
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({
       csr: 'csr-data',
       certificateType: 'ChargingStationCertificate',
@@ -152,20 +207,16 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
     const response = await handleSignCertificate(ctx);
 
     expect(response).toEqual({ status: 'Accepted' });
-    // The initial event is published
+    // The initial event is published and the CSR ends rejected with the reason
     expect(publishMock).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'ocpp.SignCertificate' }),
     );
-    expect(publishMock).toHaveBeenCalledWith(
-      expect.objectContaining({ eventType: 'ocpp.SignCertificate' }),
-    );
+    expect(mockMarkFailed).toHaveBeenCalledWith(31, 'network timeout');
   });
 
   it('rejects V2GCertificate when PnC is disabled', async () => {
-    const { isPncEnabled } = await import('@evtivity/database');
     vi.mocked(isPncEnabled).mockResolvedValueOnce(false);
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({
       csr: 'csr-data',
       certificateType: 'V2GCertificate',
@@ -178,10 +229,8 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
   });
 
   it('accepts ChargingStationCertificate when PnC is disabled (SP3/mTLS renewal)', async () => {
-    const { isPncEnabled } = await import('@evtivity/database');
     vi.mocked(isPncEnabled).mockResolvedValueOnce(false);
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx } = makeCtx({
       csr: 'csr-data',
       certificateType: 'ChargingStationCertificate',
@@ -195,10 +244,8 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
   });
 
   it('publishes SignCertificate event with csr and certificateType from request', async () => {
-    const { isPncEnabled } = await import('@evtivity/database');
     vi.mocked(isPncEnabled).mockResolvedValue(true);
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx, publishMock } = makeCtx({
       csr: 'my-csr-pem',
       certificateType: 'V2GCertificate',
@@ -220,10 +267,8 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
   });
 
   it('handles getPkiProvider failure as a generic error', async () => {
-    const { getPkiProvider } = await import('../services/pki/index.js');
     vi.mocked(getPkiProvider).mockRejectedValueOnce(new Error('provider init failed'));
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx } = makeCtx({
       csr: 'csr-data',
       certificateType: 'ChargingStationCertificate',
@@ -235,10 +280,8 @@ describe('v2_1 SignCertificate handler - uncovered branches', () => {
   });
 
   it('rejects non-standard certificate type when PnC is disabled', async () => {
-    const { isPncEnabled } = await import('@evtivity/database');
     vi.mocked(isPncEnabled).mockResolvedValueOnce(false);
 
-    const { handleSignCertificate } = await import('../handlers/v2_1/sign-certificate.handler.js');
     const { ctx } = makeCtx({
       csr: 'csr-data',
       certificateType: 'ManufacturerRootCertificate',

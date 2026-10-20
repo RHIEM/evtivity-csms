@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, and, count, sql, inArray, or, isNull, desc } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import { eq, and, or, count, sql, inArray, desc, isNull } from 'drizzle-orm';
+import { db, isOperatorStation } from '@evtivity/database';
 import {
   cssStations,
   cssEvses,
@@ -14,12 +14,13 @@ import {
   chargingStations,
   evses,
   connectors,
+  sites,
 } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, paginatedResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { paginationQuery } from '../lib/pagination.js';
-import { getPubSub } from '../lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import {
   bootReasonEnum,
   certificateActionEnum,
@@ -47,18 +48,33 @@ import {
   triggerReasonEnum,
   uploadLogStatusEnum,
 } from '../lib/ocpp-zod-types-v21.js';
-import { meterValueType as meterValueType16 } from '../lib/ocpp-zod-types-v16.js';
+import {
+  meterValueType as meterValueType16,
+  sampledValueType as sampledValueType16,
+  stopReasonEnum as stopReasonEnum16,
+} from '../lib/ocpp-zod-types-v16.js';
 import { OCPP21_CONFIG_DEFAULTS, OCPP16_CONFIG_DEFAULTS } from '../lib/css-config-defaults.js';
 import { authorize } from '../middleware/rbac.js';
 import { getUserSiteIds } from '../lib/site-access.js';
+import { siteInScope } from '../lib/site-scope.js';
 import type { JwtPayload } from '../plugins/auth.js';
+import { generateStationPassword, tryParseJson } from '@evtivity/lib';
+import { getAuditActor } from '../lib/audit-actor.js';
+import { auditStationChange } from '../lib/station-audit.js';
+import {
+  initialStationPassword,
+  changeStationPassword,
+  changeSecurityProfile,
+} from '../services/station-security.service.js';
 
 // Multi-tenant access check for CSS endpoints. Looks up the paired
 // charging_stations.siteId for the css_stations row and verifies the
 // operator can read it per the same rules as charging_stations:
 //   - full access (siteIds == null) wins
-//   - no paired charging_stations row OR paired with siteId=null is visible
-//     to everyone (matches stations.ts behavior for unsited rows)
+//   - no paired charging_stations row, or one with siteId=null, is visible
+//     to all-site users only (matches stations.ts behavior for unsited rows).
+//     So a site-restricted user cannot create a simulator for a new station
+//     id (it would create an unsited station) or take over an unsited one.
 //   - otherwise the paired siteId must be in the operator's allow-list
 // Returns 404 (not 403) on denial to avoid leaking existence.
 async function isCssStationAccessible(stationId: string, userId: string): Promise<boolean> {
@@ -69,9 +85,29 @@ async function isCssStationAccessible(stationId: string, userId: string): Promis
     .from(chargingStations)
     .where(eq(chargingStations.stationId, stationId))
     .limit(1);
-  if (cs == null) return true;
-  if (cs.siteId == null) return true;
-  return siteIds.includes(cs.siteId);
+  return siteInScope(siteIds, cs?.siteId);
+}
+
+/**
+ * Audits a simulator change on the paired charging station. A simulator row
+ * without a charging_stations row has no station entity to audit.
+ */
+async function auditCssStation(
+  request: FastifyRequest,
+  stationId: string,
+  enabled: boolean | null,
+  notes: string,
+): Promise<void> {
+  const [cs] = await db
+    .select({ id: chargingStations.id })
+    .from(chargingStations)
+    .where(eq(chargingStations.stationId, stationId))
+    .limit(1);
+  if (cs == null) return;
+  await auditStationChange(request, cs.id, 'simulator_toggled', {
+    after: enabled == null ? { simulator: 'deleted' } : { simulatorEnabled: enabled },
+    notes,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +123,24 @@ export const HIGH_LEVEL_ACTIONS = [
   'unplug',
   'injectFault',
   'clearFault',
+  'suspendCharging',
+  'resumeCharging',
+  'evFull',
+  'powerCycle',
   'goOffline',
   'comeOnline',
+  'reservationReply',
+] as const;
+
+// Plug and Charge EV actions, registered under both v16/ and v21/ prefixes: a 1.6
+// station runs them over DataTransfer (OCA application note "Using ISO 15118
+// Plug & Charge with OCPP 1.6", ISO 15118-2 EVs only).
+export const PNC_ACTIONS = [
+  'createPncEv',
+  'installPncContract',
+  'updatePncContract',
+  'authorizePnc',
+  'startPncCharging',
 ] as const;
 
 // Station-initiated messages registered under both v16/ and v21/ prefixes
@@ -111,8 +163,13 @@ export const ACTION_VERSIONS: Record<string, 'all' | 'ocpp1.6' | 'ocpp2.1'> = {
   unplug: 'all',
   injectFault: 'all',
   clearFault: 'all',
+  suspendCharging: 'all',
+  resumeCharging: 'all',
+  evFull: 'all',
+  powerCycle: 'all',
   goOffline: 'all',
   comeOnline: 'all',
+  reservationReply: 'all',
 
   // OCPP 2.1 only
   sendTransactionEvent: 'ocpp2.1',
@@ -134,12 +191,10 @@ export const ACTION_VERSIONS: Record<string, 'all' | 'ocpp1.6' | 'ocpp2.1'> = {
   sendNotifyEVChargingSchedule: 'ocpp2.1',
   sendNotifySettlement: 'ocpp2.1',
   sendNotifyPriorityCharging: 'ocpp2.1',
-  sendNotifyQRCodeScanned: 'ocpp2.1',
   sendNotifyAllowedEnergyTransfer: 'ocpp2.1',
   sendGet15118EVCertificate: 'ocpp2.1',
   sendGetCertificateChainStatus: 'ocpp2.1',
   sendPublishFirmwareStatusNotification: 'ocpp2.1',
-  sendNotifyWebPaymentStarted: 'ocpp2.1',
   sendNotifyPeriodicEventStream: 'ocpp2.1',
   sendNotifyDERAlarm: 'ocpp2.1',
   sendNotifyDERStartStop: 'ocpp2.1',
@@ -190,6 +245,12 @@ const createStationBody = z.object({
   caCert: z.string().optional().describe('CA certificate PEM'),
   sourceType: z.enum(['api', 'chaos', 'cli']).optional().describe('Source type'),
   evses: z.array(createStationEvse).min(1).max(50).describe('EVSE configurations'),
+  siteId: z
+    .string()
+    .optional()
+    .describe(
+      'Site of the charging station created for a new station id. A site-restricted user must give one of its sites. Ignored when the charging station already exists (it keeps its site).',
+    ),
 });
 
 const updateStationBody = z.object({
@@ -215,9 +276,15 @@ const stationItem = z
     id: z.string().describe('Internal CSS station ID'),
     stationId: z.string().describe('Station identifier string used as the OCPP identity'),
     targetUrl: z.string().describe('Target OCPP WebSocket URL the simulator connects to'),
-    password: z.string().nullable().describe('Basic auth password'),
+    hasPassword: z
+      .boolean()
+      .describe('Whether the simulator has a Basic Auth password. The password is never returned.'),
     clientCert: z.string().nullable().describe('Client certificate PEM (Security Profile 3)'),
-    clientKey: z.string().nullable().describe('Client private key PEM (Security Profile 3)'),
+    hasClientKey: z
+      .boolean()
+      .describe(
+        'Whether the simulator has a client private key (Security Profile 3). The key is never returned.',
+      ),
     caCert: z.string().nullable().describe('CA certificate PEM (Security Profile 3)'),
     status: z.string().describe('Connection status (connected, disconnected, etc.)'),
     availabilityState: z
@@ -257,6 +324,31 @@ const actionResponse = z
 
 const plugInBody = z.object({
   evseId: z.number().int().describe('EVSE ID'),
+  ev: z
+    .object({
+      evccid: z
+        .string()
+        .min(1)
+        .max(255)
+        .optional()
+        .describe(
+          'EVCCID of the EV charging controller (ISO 15118-2: the MAC address). A 2.1 transaction start on the EVSE carries it in idToken.additionalInfo (type EVCCID)',
+        ),
+      vin: z.string().min(1).max(17).optional().describe('VIN of the EV'),
+      autocharge: z
+        .enum(['MacAddress', 'EVCCID', 'VIN'])
+        .optional()
+        .describe(
+          'Autocharge: after the plug-in the station authorizes the EV by this id and starts the transaction when accepted (2.1 idToken type; 1.6 idTag). The result is in data.autocharge',
+        ),
+      idTagPrefix: z
+        .string()
+        .max(10)
+        .optional()
+        .describe('OCPP 1.6 idTag prefix (default VID: for a MAC address, none for a VIN)'),
+    })
+    .optional()
+    .describe('The EV plugged in (simulated vehicle ids)'),
 });
 
 const authorizeBody = z.object({
@@ -300,7 +392,9 @@ const stopChargingBody = z.object({
       'UnlockCommand',
     ])
     .optional()
-    .describe('Stop reason (Local, Remote, etc.)'),
+    .describe(
+      'Stop reason of the station OCPP version (1.6 StopTransaction reason, 2.1 ReasonEnumType). A reason of the other version is refused with 400 VALIDATION_ERROR.',
+    ),
 });
 
 const unplugBody = z.object({
@@ -331,15 +425,93 @@ const injectFaultBody = z.object({
     .describe(
       'Error code (1.6: GroundFailure, OverCurrentFailure, HighTemperature, InternalError, etc.)',
     ),
+  mode: z
+    .enum(['end', 'suspend'])
+    .optional()
+    .describe(
+      'What happens to a running transaction: end (default) ends it with the fault stop reason (2.1: GroundFault, OvercurrentFault or Other, trigger AbnormalCondition; 1.6: Other), suspend keeps it suspended by the EVSE until clearFault and resumeCharging',
+    ),
 });
 
 const clearFaultBody = z.object({
   evseId: z.number().int().describe('EVSE ID'),
 });
 
+const suspendChargingBody = z.object({
+  evseId: z.number().int().describe('EVSE ID'),
+  by: z
+    .enum(['EV', 'EVSE'])
+    .describe(
+      'Who stops the energy transfer: EV (SuspendedEV) or EVSE (SuspendedEVSE). The transaction and the cable stay; meter values report power 0 with flat energy.',
+    ),
+});
+
+const resumeChargingBody = z.object({
+  evseId: z.number().int().describe('EVSE ID'),
+});
+
+const evFullBody = z.object({
+  evseId: z.number().int().describe('EVSE ID'),
+});
+
+const powerCycleBody = z.object({
+  powerOffMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(600_000)
+    .optional()
+    .describe('How long the station stays without power, in milliseconds (default 0)'),
+  preserveTransactions: z
+    .boolean()
+    .optional()
+    .describe(
+      'true (default): the station goes down without stopping its transactions. 2.1 resumes them with TxResumed when TxCtrlr.ResumptionTimeout is above 0 (default 0: they end with PowerLoss); 1.6 stops them with PowerLoss after the reboot. false: the transactions stop with PowerLoss first.',
+    ),
+});
+
+// --- Plug and Charge (OCPP 2.1) ---
+
+const createPncEvBody = z.object({
+  evseId: z.number().int().describe('EVSE ID the EV is plugged into'),
+  edition: z
+    .union([z.literal(2), z.literal(20)])
+    .optional()
+    .describe(
+      'ISO 15118 edition of the EV: 2 (ISO 15118-2, default) or 20 (ISO 15118-20, OCPP 2.1 stations only)',
+    ),
+});
+
+const installPncContractBody = z.object({
+  evseId: z.number().int().describe('EVSE ID of the EV created with createPncEv'),
+});
+
+const updatePncContractBody = z.object({
+  evseId: z.number().int().describe('EVSE ID of the ISO 15118-2 EV with an installed contract'),
+});
+
+const authorizePncBody = z.object({
+  evseId: z.number().int().describe('EVSE ID of the EV with an installed contract'),
+});
+
+const startPncChargingBody = z.object({
+  evseId: z
+    .number()
+    .int()
+    .describe('EVSE ID of the EV with an installed contract; the cable must be plugged in'),
+});
+
 const goOfflineBody = z.object({});
 
 const comeOnlineBody = z.object({});
+
+const reservationReplyBody = z.object({
+  reply: z
+    .enum(['Rejected', 'Occupied', 'NoReply', 'Accepted'])
+    .describe(
+      'Answer of the next ReserveNow only: Rejected or Occupied answer that status, NoReply sends no reply (the CSMS times out), Accepted clears the override',
+    ),
+});
 
 // --- Station-initiated messages (all versions) ---
 
@@ -402,6 +574,16 @@ const sendMeterValuesBody = z.object({
     .optional()
     .describe('Sampled values array (auto-generated if omitted)'),
   transactionId: z.string().optional().describe('Transaction ID (1.6 only)'),
+});
+
+// OCPP 1.6 SampledValue: string value and a flat unit, not the 2.1 shape.
+const sendMeterValuesBody16 = z.object({
+  evseId: z.number().int().describe('Connector ID'),
+  sampledValues: z
+    .array(sampledValueType16)
+    .optional()
+    .describe('OCPP 1.6 sampled values (auto-generated if omitted)'),
+  transactionId: z.string().optional().describe('Transaction ID'),
 });
 
 const sendAuthorizeBody = z.object({
@@ -599,11 +781,6 @@ const sendNotifyPriorityChargingBody = z.object({
   activated: z.boolean().describe('Whether priority charging is activated'),
 });
 
-const sendNotifyQRCodeScannedBody = z.object({
-  evseId: z.number().int().describe('EVSE ID'),
-  timeout: z.number().int().describe('Timeout in seconds'),
-});
-
 const sendNotifyAllowedEnergyTransferBody = z.object({
   transactionId: z.string().describe('Transaction ID'),
   allowedEnergyTransfer: z
@@ -650,11 +827,6 @@ const sendPublishFirmwareStatusNotificationBody = z.object({
     'Publish firmware status (Idle, DownloadScheduled, Downloading, Downloaded, Published, etc.)',
   ),
   requestId: z.number().int().optional().describe('Request ID (defaults to 0)'),
-});
-
-const sendNotifyWebPaymentStartedBody = z.object({
-  evseId: z.number().int().describe('EVSE ID'),
-  timeout: z.number().int().describe('Timeout in seconds'),
 });
 
 const sendNotifyPeriodicEventStreamBody = z
@@ -807,6 +979,7 @@ function actionRoute(
             ERROR_CODES.CONNECTOR_NOT_AVAILABLE,
             ERROR_CODES.CSS_ACTION_REJECTED,
             ERROR_CODES.OCPP_VERSION_MISMATCH,
+            ERROR_CODES.VALIDATION_ERROR,
           ]),
           404: errorWith('Resource not found', [
             ERROR_CODES.EVSE_NOT_FOUND,
@@ -848,6 +1021,20 @@ function actionRoute(
           error: `Action ${actionName} requires ${version}, station ${station.stationId} is ${station.ocppProtocol ?? 'unknown'}`,
           code: 'OCPP_VERSION_MISMATCH',
         });
+      }
+
+      // A stop reason must belong to the station's OCPP version: the simulator would
+      // otherwise send a StopTransaction or TransactionEvent that fails the schema.
+      if (actionName === 'stopCharging') {
+        const reason = (params as { reason?: string }).reason;
+        const allowed: readonly string[] =
+          station.ocppProtocol === 'ocpp1.6' ? stopReasonEnum16.options : reasonEnum.options;
+        if (reason != null && !allowed.includes(reason)) {
+          return reply.status(400).send({
+            error: `Stop reason ${reason} is not valid for ${station.ocppProtocol ?? 'unknown'}`,
+            code: 'VALIDATION_ERROR',
+          });
+        }
       }
 
       // Pre-check connector status for startCharging so the dashboard Simulate
@@ -966,12 +1153,8 @@ async function waitForCssCommandResult(
   let subscription: import('@evtivity/lib').Subscription | null = null;
   try {
     subscription = await pubsub.subscribe(CSS_RESULTS_CHANNEL, (raw: string) => {
-      let parsed: CssCommandResultMessage;
-      try {
-        parsed = JSON.parse(raw) as CssCommandResultMessage;
-      } catch {
-        return;
-      }
+      const parsed = tryParseJson(raw) as CssCommandResultMessage | null | undefined;
+      if (parsed == null) return;
       if (parsed.commandId !== commandId) return;
       clearTimeout(timeout);
       resolveResult({
@@ -996,6 +1179,16 @@ async function waitForCssCommandResult(
   }
 }
 
+// The simulator's Basic Auth password and client private key stay in
+// css_stations for the simulator process, which reads them from the database.
+// No API response carries them.
+function publicCssStation<T extends { password: string | null; clientKey: string | null }>(
+  row: T,
+): Omit<T, 'password' | 'clientKey'> & { hasPassword: boolean; hasClientKey: boolean } {
+  const { password, clientKey, ...rest } = row;
+  return { ...rest, hasPassword: password != null, hasClientKey: clientKey != null };
+}
+
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
@@ -1016,8 +1209,16 @@ export function cssRoutes(app: FastifyInstance): void {
         body: zodSchema(createStationBody),
         response: {
           201: itemResponse(stationItem),
-          404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          400: errorWith('Invalid password', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Station or site not found', [
+            ERROR_CODES.STATION_NOT_FOUND,
+            ERROR_CODES.SITE_NOT_FOUND,
+          ]),
           409: errorWith('Duplicate station id', [ERROR_CODES.DUPLICATE_STATION_ID]),
+          502: errorWith('The station did not accept the password', [
+            ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
           500: errorWith('Internal server error', [ERROR_CODES.INTERNAL_ERROR]),
         },
       },
@@ -1026,11 +1227,36 @@ export function cssRoutes(app: FastifyInstance): void {
       const body = request.body as z.infer<typeof createStationBody>;
       const { userId } = request.user as JwtPayload;
 
-      // Reject if the caller is scoped to a site set that doesn't include the
-      // paired charging_stations row's site. Unsited / not-yet-existing
-      // charging_stations are fine -- those are visible to every operator.
-      if (!(await isCssStationAccessible(body.stationId, userId))) {
-        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      // An existing charging_stations row must be in the caller's sites: a
+      // site-restricted user cannot take over an unsited or foreign real
+      // station. A new station id creates a charging station in body.siteId,
+      // which must exist and be one of the caller's sites; without a site the
+      // new station is unsited, which only an all-site user may create.
+      const callerSiteIds = await getUserSiteIds(userId);
+      if (callerSiteIds != null || body.siteId != null) {
+        const [pairedStation] = await db
+          .select({ siteId: chargingStations.siteId })
+          .from(chargingStations)
+          .where(eq(chargingStations.stationId, body.stationId))
+          .limit(1);
+        if (pairedStation != null) {
+          if (!siteInScope(callerSiteIds, pairedStation.siteId)) {
+            return reply
+              .status(404)
+              .send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          }
+        } else if (body.siteId != null) {
+          const [targetSite] = await db
+            .select({ id: sites.id })
+            .from(sites)
+            .where(eq(sites.id, body.siteId))
+            .limit(1);
+          if (targetSite == null || !siteInScope(callerSiteIds, targetSite.id)) {
+            return reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+          }
+        } else {
+          return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        }
       }
 
       // Check for duplicate stationId (read-only, safe outside the transaction).
@@ -1047,32 +1273,69 @@ export function cssRoutes(app: FastifyInstance): void {
         });
       }
 
+      const [existingCs] = await db
+        .select({
+          id: chargingStations.id,
+          isSimulator: chargingStations.isSimulator,
+          securityProfile: chargingStations.securityProfile,
+        })
+        .from(chargingStations)
+        .where(eq(chargingStations.stationId, body.stationId))
+        .limit(1);
+
+      // The simulator and the CSMS must agree on the Basic Auth password, or
+      // the simulator cannot connect. A new charging_stations row gets the
+      // given or a generated password hashed on insert. An existing row gets
+      // it through the station security service (the only writer of the
+      // hash), before any write here, so a refused change creates nothing.
+      let simulatorPassword: string | null;
+      let newStationPasswordHash: string | null = null;
+      if (existingCs == null) {
+        const initial = await initialStationPassword({
+          ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
+          securityProfile: body.securityProfile ?? 1,
+          password: body.password,
+        });
+        simulatorPassword = initial.password;
+        newStationPasswordHash = initial.passwordHash;
+      } else {
+        const usesPassword = existingCs.securityProfile === 1 || existingCs.securityProfile === 2;
+        simulatorPassword = body.password ?? (usesPassword ? generateStationPassword() : null);
+        if (simulatorPassword != null) {
+          await changeStationPassword(existingCs.id, simulatorPassword, {
+            actor: getAuditActor(request),
+            log: request.log,
+          });
+        }
+      }
+
       // Wrap all writes (chargingStations, cssStations, cssEvses, cssConfigVariables) in a
       // transaction so a partial failure cannot leave a chargingStations row with isSimulator=true
       // and an incomplete cssStations setup.
       const result = await db.transaction(async (tx) => {
         // Ensure a charging_stations row exists, marked as simulator.
-        const [existingCs] = await tx
-          .select({ id: chargingStations.id, isSimulator: chargingStations.isSimulator })
-          .from(chargingStations)
-          .where(eq(chargingStations.stationId, body.stationId))
-          .limit(1);
-
+        let chargingStationId = existingCs?.id ?? null;
         if (existingCs == null) {
-          await tx.insert(chargingStations).values({
-            stationId: body.stationId,
-            model: body.model ?? 'CSS-1000',
-            serialNumber: body.serialNumber ?? `SN-${body.stationId}`,
-            firmwareVersion: body.firmwareVersion ?? '1.0.0',
-            securityProfile: body.securityProfile ?? 1,
-            ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
-            isSimulator: true,
-            onboardingStatus: 'accepted',
-          });
+          const [created] = await tx
+            .insert(chargingStations)
+            .values({
+              stationId: body.stationId,
+              siteId: body.siteId ?? null,
+              model: body.model ?? 'CSS-1000',
+              serialNumber: body.serialNumber ?? `SN-${body.stationId}`,
+              firmwareVersion: body.firmwareVersion ?? '1.0.0',
+              securityProfile: body.securityProfile ?? 1,
+              ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
+              basicAuthPasswordHash: newStationPasswordHash,
+              isSimulator: true,
+              onboardingStatus: 'accepted',
+            })
+            .returning({ id: chargingStations.id });
+          chargingStationId = created?.id ?? null;
         } else if (!existingCs.isSimulator) {
           await tx
             .update(chargingStations)
-            .set({ isSimulator: true, updatedAt: new Date() })
+            .set({ isSimulator: true, simulatorConflictAt: null, updatedAt: new Date() })
             .where(eq(chargingStations.id, existingCs.id));
         }
 
@@ -1082,7 +1345,7 @@ export function cssRoutes(app: FastifyInstance): void {
           .values({
             stationId: body.stationId,
             targetUrl: body.targetUrl,
-            password: body.password ?? null,
+            password: simulatorPassword,
             clientCert: body.clientCert ?? null,
             clientKey: body.clientKey ?? null,
             caCert: body.caCert ?? null,
@@ -1123,10 +1386,40 @@ export function cssRoutes(app: FastifyInstance): void {
         // the just-inserted rows.
         const evses = await tx.select().from(cssEvses).where(eq(cssEvses.cssStationId, station.id));
 
-        return { station, evses };
+        return { station, evses, chargingStationId };
       });
 
-      return reply.status(201).send({ ...result.station, evses: result.evses });
+      if (result.chargingStationId != null) {
+        await auditStationChange(
+          request,
+          result.chargingStationId,
+          existingCs == null ? 'created' : 'updated',
+          {
+            before: existingCs == null ? null : { isSimulator: existingCs.isSimulator },
+            after: {
+              stationId: body.stationId,
+              isSimulator: true,
+              simulator: {
+                targetUrl: body.targetUrl,
+                sourceType: body.sourceType ?? 'api',
+                evseCount: result.evses.length,
+              },
+              ...(existingCs == null
+                ? {
+                    siteId: body.siteId ?? null,
+                    model: body.model ?? 'CSS-1000',
+                    ocppProtocol: body.ocppProtocol ?? 'ocpp1.6',
+                    securityProfile: body.securityProfile ?? 1,
+                  }
+                : {}),
+            },
+            notes:
+              existingCs == null ? 'Simulator station created' : 'Simulator paired to the station',
+          },
+        );
+      }
+
+      return reply.status(201).send({ ...publicCssStation(result.station), evses: result.evses });
     },
   );
 
@@ -1160,16 +1453,13 @@ export function cssRoutes(app: FastifyInstance): void {
 
       // Filter css_stations by the paired charging_stations.siteId. LEFT JOIN
       // because some css_stations rows have no charging_stations pair (legacy
-      // seeded fixtures); those stay visible. Same rule for siteId=null --
-      // unsited stations are visible to everyone per site-access-control.md.
-      const accessCondition =
-        siteIds == null
-          ? undefined
-          : or(
-              isNull(chargingStations.id),
-              isNull(chargingStations.siteId),
-              inArray(chargingStations.siteId, siteIds),
-            );
+      // seeded fixtures). Rows without a pair or with siteId=null are visible
+      // to all-site users only, per site-access-control.md.
+      // The simulators of conformance test stations are never listed.
+      const accessCondition = and(
+        or(isNull(chargingStations.id), isOperatorStation()),
+        siteIds == null ? undefined : inArray(chargingStations.siteId, siteIds),
+      );
 
       const [data, totalResult] = await Promise.all([
         db
@@ -1177,9 +1467,9 @@ export function cssRoutes(app: FastifyInstance): void {
             id: cssStations.id,
             stationId: cssStations.stationId,
             targetUrl: cssStations.targetUrl,
-            password: cssStations.password,
+            hasPassword: sql<boolean>`${cssStations.password} IS NOT NULL`,
             clientCert: cssStations.clientCert,
-            clientKey: cssStations.clientKey,
+            hasClientKey: sql<boolean>`${cssStations.clientKey} IS NOT NULL`,
             caCert: cssStations.caCert,
             status: cssStations.status,
             availabilityState: cssStations.availabilityState,
@@ -1252,7 +1542,7 @@ export function cssRoutes(app: FastifyInstance): void {
           ),
       ]);
 
-      return { ...station, evses, activeTransactionCount: txCount?.count ?? 0 };
+      return { ...publicCssStation(station), evses, activeTransactionCount: txCount?.count ?? 0 };
     },
   );
 
@@ -1270,7 +1560,17 @@ export function cssRoutes(app: FastifyInstance): void {
         body: zodSchema(updateStationBody),
         response: {
           200: itemResponse(stationItem),
+          400: errorWith('Invalid security change', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.PASSWORD_REQUIRED,
+            ERROR_CODES.SECURITY_PROFILE_DOWNGRADE,
+            ERROR_CODES.STATION_TLS_URL_NOT_CONFIGURED,
+          ]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          502: errorWith('The station did not accept the change', [
+            ERROR_CODES.STATION_SECURITY_CHANGE_REJECTED,
+            ERROR_CODES.OCPP_COMMAND_FAILED,
+          ]),
         },
       },
     },
@@ -1284,7 +1584,11 @@ export function cssRoutes(app: FastifyInstance): void {
       }
 
       const [existing] = await db
-        .select({ id: cssStations.id })
+        .select({
+          id: cssStations.id,
+          targetUrl: cssStations.targetUrl,
+          enabled: cssStations.enabled,
+        })
         .from(cssStations)
         .where(eq(cssStations.stationId, stationId));
 
@@ -1292,17 +1596,46 @@ export function cssRoutes(app: FastifyInstance): void {
         return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
       }
 
+      const [pairedCs] = await db
+        .select({
+          id: chargingStations.id,
+          ocppProtocol: chargingStations.ocppProtocol,
+          model: chargingStations.model,
+          serialNumber: chargingStations.serialNumber,
+          firmwareVersion: chargingStations.firmwareVersion,
+        })
+        .from(chargingStations)
+        .where(eq(chargingStations.stationId, stationId));
+
+      // Password and security profile changes go through the station security
+      // service (the only writer of the hash and profile), which also keeps an
+      // offline simulator's css_stations password in step.
+      if (pairedCs != null && (body.securityProfile != null || body.password != null)) {
+        const securityCtx = { actor: getAuditActor(request), log: request.log };
+        if (body.securityProfile != null) {
+          await changeSecurityProfile(
+            pairedCs.id,
+            body.securityProfile,
+            body.password,
+            securityCtx,
+          );
+        } else if (body.password != null) {
+          await changeStationPassword(pairedCs.id, body.password, securityCtx);
+        }
+      }
+
       // Route deduplicated fields to charging_stations where they now live.
       const csUpdates: Record<string, unknown> = {};
       if (body.ocppProtocol !== undefined) csUpdates['ocppProtocol'] = body.ocppProtocol;
-      if (body.securityProfile !== undefined) csUpdates['securityProfile'] = body.securityProfile;
       if (body.model !== undefined) csUpdates['model'] = body.model;
       if (body.serialNumber !== undefined) csUpdates['serialNumber'] = body.serialNumber;
       if (body.firmwareVersion !== undefined) csUpdates['firmwareVersion'] = body.firmwareVersion;
 
       const updates: Record<string, unknown> = { updatedAt: new Date() };
       if (body.targetUrl !== undefined) updates['targetUrl'] = body.targetUrl;
-      if (body.password !== undefined) updates['password'] = body.password;
+      // A simulator without a charging_stations row has no CSMS credentials to
+      // keep in step, so its password is stored on the simulator row only.
+      if (pairedCs == null && body.password !== undefined) updates['password'] = body.password;
       if (body.clientCert !== undefined) updates['clientCert'] = body.clientCert;
       if (body.clientKey !== undefined) updates['clientKey'] = body.clientKey;
       if (body.caCert !== undefined) updates['caCert'] = body.caCert;
@@ -1328,7 +1661,40 @@ export function cssRoutes(app: FastifyInstance): void {
         return row;
       });
 
-      return updated;
+      if (updated == null) {
+        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      }
+
+      // Changed fields only. The password and security profile are audited by
+      // the station security service; certificates and keys are recorded as
+      // changed, never by value.
+      if (pairedCs != null) {
+        const before: Record<string, unknown> = {};
+        const after: Record<string, unknown> = {};
+        const record = (key: string, prev: unknown, next: unknown): void => {
+          if (next !== undefined && prev !== next) {
+            before[key] = prev;
+            after[key] = next;
+          }
+        };
+        record('ocppProtocol', pairedCs.ocppProtocol, body.ocppProtocol);
+        record('model', pairedCs.model, body.model);
+        record('serialNumber', pairedCs.serialNumber, body.serialNumber);
+        record('firmwareVersion', pairedCs.firmwareVersion, body.firmwareVersion);
+        record('simulatorTargetUrl', existing.targetUrl, body.targetUrl);
+        record('simulatorEnabled', existing.enabled, body.enabled);
+        for (const key of ['clientCert', 'clientKey', 'caCert'] as const) {
+          if (body[key] !== undefined) after[`${key}Changed`] = true;
+        }
+        if (Object.keys(after).length > 0) {
+          await auditStationChange(request, pairedCs.id, 'updated', {
+            before,
+            after,
+            notes: 'Simulator station updated',
+          });
+        }
+      }
+      return publicCssStation(updated);
     },
   );
 
@@ -1367,6 +1733,7 @@ export function cssRoutes(app: FastifyInstance): void {
       }
 
       await db.delete(cssStations).where(eq(cssStations.id, existing.id));
+      await auditCssStation(request, stationId, null, 'Simulator removed from the station');
 
       return reply.status(204).send();
     },
@@ -1412,7 +1779,11 @@ export function cssRoutes(app: FastifyInstance): void {
         .where(eq(cssStations.id, existing.id))
         .returning();
 
-      return updated;
+      if (updated == null) {
+        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      }
+      await auditCssStation(request, stationId, true, 'Simulator enabled');
+      return publicCssStation(updated);
     },
   );
 
@@ -1456,7 +1827,11 @@ export function cssRoutes(app: FastifyInstance): void {
         .where(eq(cssStations.id, existing.id))
         .returning();
 
-      return updated;
+      if (updated == null) {
+        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      }
+      await auditCssStation(request, stationId, false, 'Simulator disabled');
+      return publicCssStation(updated);
     },
   );
 
@@ -1472,8 +1847,38 @@ export function cssRoutes(app: FastifyInstance): void {
   actionRoute(app, 'unplug', 'all', 'Unplug charging cable', unplugBody);
   actionRoute(app, 'injectFault', 'all', 'Inject a fault on an EVSE', injectFaultBody);
   actionRoute(app, 'clearFault', 'all', 'Clear a fault on an EVSE', clearFaultBody);
-  actionRoute(app, 'goOffline', 'all', 'Disconnect station from OCPP server', goOfflineBody);
-  actionRoute(app, 'comeOnline', 'all', 'Reconnect station to OCPP server', comeOnlineBody);
+  actionRoute(
+    app,
+    'suspendCharging',
+    'all',
+    'Suspend the energy transfer (EV or EVSE)',
+    suspendChargingBody,
+  );
+  actionRoute(app, 'resumeCharging', 'all', 'Resume the energy transfer', resumeChargingBody);
+  actionRoute(app, 'evFull', 'all', 'EV battery full: suspend, then end', evFullBody);
+  actionRoute(app, 'powerCycle', 'all', 'Power cycle the station', powerCycleBody);
+  actionRoute(
+    app,
+    'goOffline',
+    'all',
+    'Disconnect station from OCPP server, keeping its transactions and queueing their messages',
+    goOfflineBody,
+  );
+  // The journey runner reads "replays queued" in this summary as the comeOnlineResume capability.
+  actionRoute(
+    app,
+    'comeOnline',
+    'all',
+    'Reconnect station to OCPP server without a reboot: reports connector statuses and replays queued transaction messages',
+    comeOnlineBody,
+  );
+  actionRoute(
+    app,
+    'reservationReply',
+    'all',
+    'Force the answer of the next ReserveNow (test control)',
+    reservationReplyBody,
+  );
 
   // --- Station-initiated messages (version-specific endpoints) ---
   for (const ver of ['ocpp1.6', 'ocpp2.1'] as const) {
@@ -1492,7 +1897,13 @@ export function cssRoutes(app: FastifyInstance): void {
       'Send StatusNotification',
       sendStatusNotificationBody,
     );
-    actionRoute(app, 'sendMeterValues', ver, 'Send MeterValues', sendMeterValuesBody);
+    actionRoute(
+      app,
+      'sendMeterValues',
+      ver,
+      'Send MeterValues',
+      ver === 'ocpp1.6' ? sendMeterValuesBody16 : sendMeterValuesBody,
+    );
     actionRoute(app, 'sendAuthorize', ver, 'Send Authorize request', sendAuthorizeBody);
     actionRoute(
       app,
@@ -1526,6 +1937,44 @@ export function cssRoutes(app: FastifyInstance): void {
     'Send SecurityEventNotification',
     sendSecurityEventNotificationBody,
   );
+  // --- Plug and Charge EV actions (both versions) ---
+  for (const ver of ['ocpp1.6', 'ocpp2.1'] as const) {
+    actionRoute(
+      app,
+      'createPncEv',
+      ver,
+      'Plug and Charge: create an EV with an OEM provisioning certificate (returns pcid and oemRootCertificate)',
+      createPncEvBody,
+    );
+    actionRoute(
+      app,
+      'installPncContract',
+      ver,
+      'Plug and Charge: the EV installs a contract through Get15118EVCertificate (returns emaid)',
+      installPncContractBody,
+    );
+    actionRoute(
+      app,
+      'updatePncContract',
+      ver,
+      'Plug and Charge: the EV updates its contract through Get15118EVCertificate Update (ISO 15118-2, returns emaid)',
+      updatePncContractBody,
+    );
+    actionRoute(
+      app,
+      'authorizePnc',
+      ver,
+      'Plug and Charge: Authorize with the eMAID and certificate hash data without starting (returns status and certificateStatus)',
+      authorizePncBody,
+    );
+    actionRoute(
+      app,
+      'startPncCharging',
+      ver,
+      'Plug and Charge: Authorize with the eMAID and certificate hash data, then start',
+      startPncChargingBody,
+    );
+  }
   actionRoute(app, 'sendNotifyEvent', 'ocpp2.1', 'Send NotifyEvent', sendNotifyEventBody);
   actionRoute(app, 'sendNotifyReport', 'ocpp2.1', 'Send NotifyReport', sendNotifyReportBody);
   actionRoute(
@@ -1628,13 +2077,6 @@ export function cssRoutes(app: FastifyInstance): void {
   );
   actionRoute(
     app,
-    'sendNotifyQRCodeScanned',
-    'ocpp2.1',
-    'Send NotifyQRCodeScanned',
-    sendNotifyQRCodeScannedBody,
-  );
-  actionRoute(
-    app,
     'sendNotifyAllowedEnergyTransfer',
     'ocpp2.1',
     'Send NotifyAllowedEnergyTransfer',
@@ -1660,13 +2102,6 @@ export function cssRoutes(app: FastifyInstance): void {
     'ocpp2.1',
     'Send PublishFirmwareStatusNotification',
     sendPublishFirmwareStatusNotificationBody,
-  );
-  actionRoute(
-    app,
-    'sendNotifyWebPaymentStarted',
-    'ocpp2.1',
-    'Send NotifyWebPaymentStarted',
-    sendNotifyWebPaymentStartedBody,
   );
   actionRoute(
     app,

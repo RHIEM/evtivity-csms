@@ -1,9 +1,58 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import 'reflect-metadata';
+import { webcrypto } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as x509 from '@peculiar/x509';
+const stationOcspMock = vi.fn();
+
+vi.mock('../../../services/pki/ocsp.js', () => ({
+  getOcspResultForStation: (...args: unknown[]) => stationOcspMock(...args) as unknown,
+}));
+
 import { HubjectProvider } from '../../../services/pki/hubject-provider.js';
 import type { OcspRequestData } from '../../../services/pki/pki-provider.js';
+
+x509.cryptoProvider.set(webcrypto as unknown as Crypto);
+
+const PEM = '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----';
+
+const ALG = { name: 'ECDSA', namedCurve: 'P-256', hash: 'SHA-256' };
+
+/** A CA and a leaf it issued, as the EST server would return them. */
+async function caAndLeaf(): Promise<{ ca: x509.X509Certificate; leaf: x509.X509Certificate }> {
+  const caKeys = (await webcrypto.subtle.generateKey(ALG, true, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair;
+  const leafKeys = (await webcrypto.subtle.generateKey(ALG, true, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair;
+  const notBefore = new Date(Date.now() - 60_000);
+  const notAfter = new Date(Date.now() + 86_400_000);
+  const ca = await x509.X509CertificateGenerator.createSelfSigned({
+    serialNumber: '01',
+    name: 'CN=Test CPO Sub-CA',
+    notBefore,
+    notAfter,
+    keys: caKeys,
+    signingAlgorithm: ALG,
+    extensions: [new x509.BasicConstraintsExtension(true, undefined, true)],
+  });
+  const leaf = await x509.X509CertificateGenerator.create({
+    serialNumber: '02',
+    subject: 'CN=CS-001',
+    issuer: ca.subject,
+    notBefore,
+    notAfter,
+    publicKey: leafKeys.publicKey,
+    signingKey: caKeys.privateKey,
+    signingAlgorithm: ALG,
+  });
+  return { ca, leaf };
+}
 
 const config = {
   baseUrl: 'https://hubject.example.com',
@@ -42,23 +91,12 @@ function jsonResponse(ok: boolean, status: number, body: unknown): Response {
   } as unknown as Response;
 }
 
-function binaryResponse(ok: boolean, status: number, bytes: Buffer): Response {
-  return {
-    ok,
-    status,
-    arrayBuffer: vi
-      .fn()
-      .mockResolvedValue(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
-    text: vi.fn().mockResolvedValue(''),
-    json: vi.fn(),
-  } as unknown as Response;
-}
-
 type FetchMock = ReturnType<typeof vi.fn<(url: string, init: RequestInit) => Promise<Response>>>;
 
 let fetchMock: FetchMock;
 
 beforeEach(() => {
+  stationOcspMock.mockReset();
   fetchMock = vi.fn<(url: string, init: RequestInit) => Promise<Response>>();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -72,8 +110,8 @@ describe('HubjectProvider OAuth2 token flow', () => {
   it('fetches an access token with client_credentials and caches it across calls', async () => {
     fetchMock
       .mockResolvedValueOnce(tokenResponse('cached-token', 3600))
-      .mockResolvedValueOnce(textResponse(true, 200, 'cert-chain-pem'))
-      .mockResolvedValueOnce(textResponse(true, 200, 'cert-chain-pem-2'));
+      .mockResolvedValueOnce(textResponse(true, 200, PEM))
+      .mockResolvedValueOnce(textResponse(true, 200, PEM));
 
     const provider = new HubjectProvider(config);
     await provider.signCsr('csr-1', 'V2GCertificate');
@@ -110,9 +148,9 @@ describe('HubjectProvider OAuth2 token flow', () => {
     // inside the 60s refresh guard, forcing a refresh on the next call.
     fetchMock
       .mockResolvedValueOnce(tokenResponse('short-token', 30))
-      .mockResolvedValueOnce(textResponse(true, 200, 'chain-1'))
+      .mockResolvedValueOnce(textResponse(true, 200, PEM))
       .mockResolvedValueOnce(tokenResponse('fresh-token', 3600))
-      .mockResolvedValueOnce(textResponse(true, 200, 'chain-2'));
+      .mockResolvedValueOnce(textResponse(true, 200, PEM));
 
     const provider = new HubjectProvider(config);
     await provider.signCsr('csr-1', 'V2GCertificate');
@@ -140,29 +178,47 @@ describe('HubjectProvider OAuth2 token flow', () => {
 });
 
 describe('HubjectProvider.signCsr', () => {
-  it('posts the CSR to EST simpleenroll and returns the certificate chain', async () => {
+  it('posts the base64 DER CSR to EST simpleenroll and returns a PEM chain from the leaf', async () => {
+    const { ca, leaf } = await caAndLeaf();
+    // RFC 7030: certs-only PKCS#7, base64 with line breaks, CA first on purpose.
+    const pkcs7 = new x509.X509Certificates([ca, leaf])
+      .toString('base64')
+      .replace(/(.{64})/g, '$1\r\n');
     fetchMock
       .mockResolvedValueOnce(tokenResponse('tok', 3600))
-      .mockResolvedValueOnce(
-        textResponse(true, 200, '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----'),
-      );
+      .mockResolvedValueOnce(textResponse(true, 200, pkcs7));
 
     const provider = new HubjectProvider(config);
-    const result = await provider.signCsr('my-csr', 'ChargingStationCertificate');
+    const csrPem =
+      '-----BEGIN CERTIFICATE REQUEST-----\nTUlJ\nQkFB\n-----END CERTIFICATE REQUEST-----\n';
+    const result = await provider.signCsr(csrPem, 'ChargingStationCertificate');
 
     const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(url).toBe('https://hubject.example.com/.well-known/est/simpleenroll');
     expect(init.method).toBe('POST');
-    expect(init.body).toBe('my-csr');
+    expect(init.body).toBe('TUlJQkFB');
     expect(init.headers).toEqual({
       Authorization: 'Bearer tok',
       'Content-Type': 'application/pkcs10',
+      'Content-Transfer-Encoding': 'base64',
+      Accept: 'application/pkcs7-mime',
     });
 
+    expect(result.certificateChain).toBe(`${leaf.toString('pem')}\n${ca.toString('pem')}`);
+    expect(result.providerReference).toMatch(/^hubject-est-\d+$/);
+  });
+
+  it('keeps a PEM response as it is', async () => {
+    fetchMock
+      .mockResolvedValueOnce(tokenResponse('tok', 3600))
+      .mockResolvedValueOnce(
+        textResponse(true, 200, '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n'),
+      );
+    const provider = new HubjectProvider(config);
+    const result = await provider.signCsr('csr', 'V2GCertificate');
     expect(result.certificateChain).toBe(
       '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----',
     );
-    expect(result.providerReference).toMatch(/^hubject-est-\d+$/);
   });
 
   it('throws with status and body when EST signing fails', async () => {
@@ -184,7 +240,12 @@ describe('HubjectProvider.getContractCertificate', () => {
       .mockResolvedValueOnce(jsonResponse(true, 200, { exiResponse: 'exi-out' }));
 
     const provider = new HubjectProvider(config);
-    const result = await provider.getContractCertificate('exi-in');
+    const result = await provider.getContractCertificate({
+      stationDbId: 'sta_1',
+      iso15118SchemaVersion: 'urn:iso:15118:2:2013:MsgDef',
+      action: 'Install',
+      exiRequest: 'exi-in',
+    });
 
     const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(url).toBe('https://hubject.example.com/ccp/getSignedContractData');
@@ -204,7 +265,12 @@ describe('HubjectProvider.getContractCertificate', () => {
       .mockResolvedValueOnce(textResponse(false, 500, 'ccp down'));
 
     const provider = new HubjectProvider(config);
-    const result = await provider.getContractCertificate('exi-in');
+    const result = await provider.getContractCertificate({
+      stationDbId: 'sta_1',
+      iso15118SchemaVersion: 'urn:iso:15118:2:2013:MsgDef',
+      action: 'Install',
+      exiRequest: 'exi-in',
+    });
 
     expect(result).toEqual({ status: 'Failed', exiResponse: '' });
   });
@@ -213,60 +279,37 @@ describe('HubjectProvider.getContractCertificate', () => {
 describe('HubjectProvider.getOcspStatus', () => {
   const ocspData: OcspRequestData = {
     hashAlgorithm: 'SHA256',
-    issuerNameHash: 'name-hash',
-    issuerKeyHash: 'key-hash',
-    serialNumber: 'serial-1',
+    issuerNameHash: 'aa'.repeat(32),
+    issuerKeyHash: 'bb'.repeat(32),
+    serialNumber: '1f',
     responderURL: 'https://ocsp.public-responder.com/check',
   };
 
-  it('posts a base64 OCSP request to the responder and returns the base64 result', async () => {
-    const ocspBytes = Buffer.from('ocsp-binary-response');
-    fetchMock.mockResolvedValueOnce(binaryResponse(true, 200, ocspBytes));
+  it('returns the DER OCSP response the shared RFC 6960 helper fetched', async () => {
+    stationOcspMock.mockResolvedValueOnce({ status: 'Accepted', ocspResult: 'MIIB' });
 
-    const provider = new HubjectProvider(config);
-    const result = await provider.getOcspStatus(ocspData);
+    const result = await new HubjectProvider(config).getOcspStatus(ocspData);
 
-    // No OAuth token fetch on the OCSP path; it goes straight to the responder.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('https://ocsp.public-responder.com/check');
-    expect(init.method).toBe('POST');
-    expect(init.headers).toEqual({ 'Content-Type': 'application/ocsp-request' });
-
-    // The body is the decoded form of a base64-encoded JSON OCSP request.
-    const sentBody = init.body as Buffer;
-    const decoded = JSON.parse(sentBody.toString('utf8')) as Record<string, string>;
-    expect(decoded).toEqual({
-      hashAlgorithm: 'SHA256',
-      issuerNameHash: 'name-hash',
-      issuerKeyHash: 'key-hash',
-      serialNumber: 'serial-1',
-    });
-
-    expect(result).toEqual({
-      status: 'Accepted',
-      ocspResult: ocspBytes.toString('base64'),
-    });
-  });
-
-  it('rejects a responder URL pointing at a private/internal address (SSRF guard)', async () => {
-    const provider = new HubjectProvider(config);
-    const result = await provider.getOcspStatus({
-      ...ocspData,
-      responderURL: 'http://169.254.169.254/latest/meta-data',
-    });
-
-    expect(result).toEqual({ status: 'Failed', ocspResult: '' });
+    expect(stationOcspMock).toHaveBeenCalledWith(ocspData);
+    expect(result).toEqual({ status: 'Accepted', ocspResult: 'MIIB' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('returns Failed when the OCSP responder returns a non-2xx response', async () => {
-    fetchMock.mockResolvedValueOnce(binaryResponse(false, 503, Buffer.from('')));
+  it('returns Failed with an empty ocspResult when the helper fails', async () => {
+    stationOcspMock.mockResolvedValueOnce({
+      status: 'Failed',
+      ocspResult: '',
+      reason: 'OCSP responder returned HTTP 503',
+    });
 
-    const provider = new HubjectProvider(config);
-    const result = await provider.getOcspStatus(ocspData);
+    const result = await new HubjectProvider(config).getOcspStatus(ocspData);
 
-    expect(result).toEqual({ status: 'Failed', ocspResult: '' });
+    // The caller logs the failure with the station it serves.
+    expect(result).toEqual({
+      status: 'Failed',
+      ocspResult: '',
+      reason: 'OCSP responder returned HTTP 503',
+    });
   });
 });
 
@@ -315,7 +358,7 @@ describe('HubjectProvider.getRootCertificates', () => {
     expect(init.method).toBe('GET');
     expect(init.headers).toEqual({
       Authorization: 'Bearer tok',
-      'Content-Type': 'application/pkcs10',
+      Accept: 'application/pkcs7-mime',
     });
 
     expect(certs).toEqual([
@@ -324,15 +367,27 @@ describe('HubjectProvider.getRootCertificates', () => {
     ]);
   });
 
-  it('returns an empty array when the bundle has no certificates', async () => {
+  it('reads an RFC 7030 certs-only PKCS#7 bundle', async () => {
+    const { ca, leaf } = await caAndLeaf();
+    fetchMock
+      .mockResolvedValueOnce(tokenResponse('tok', 3600))
+      .mockResolvedValueOnce(
+        textResponse(true, 200, new x509.X509Certificates([ca, leaf]).toString('base64')),
+      );
+
+    const provider = new HubjectProvider(config);
+    const certs = await provider.getRootCertificates('V2G');
+
+    expect(certs).toEqual([ca.toString('pem'), leaf.toString('pem')]);
+  });
+
+  it('fails on a body that is neither PEM nor PKCS#7', async () => {
     fetchMock
       .mockResolvedValueOnce(tokenResponse('tok', 3600))
       .mockResolvedValueOnce(textResponse(true, 200, 'no certs here'));
 
     const provider = new HubjectProvider(config);
-    const certs = await provider.getRootCertificates('V2G');
-
-    expect(certs).toEqual([]);
+    await expect(provider.getRootCertificates('V2G')).rejects.toThrow();
   });
 
   it('throws with status and body when the cacerts fetch fails', async () => {

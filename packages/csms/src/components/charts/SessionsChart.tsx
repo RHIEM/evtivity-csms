@@ -7,6 +7,8 @@ import type { ApexOptions } from 'apexcharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { useTranslation } from 'react-i18next';
+import { ChartBody, type QueryState } from './ChartBody';
+import { formatNumber } from '@/lib/formatting';
 import { useAuth } from '@/lib/auth';
 import { CHART_COLORS, getGridColor, formatChartDateLabel } from '@/lib/chart-theme';
 
@@ -14,10 +16,17 @@ interface SessionsChartProps {
   data: { date: string; count: number }[];
   actions?: React.ReactNode;
   info?: string;
+  /** The state of the query behind the chart; omitted, the chart shows as given. */
+  state?: QueryState;
 }
 
-export function SessionsChart({ data, actions, info }: SessionsChartProps): React.JSX.Element {
-  const { t } = useTranslation();
+export function SessionsChart({
+  data,
+  actions,
+  info,
+  state,
+}: SessionsChartProps): React.JSX.Element {
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
   const options = useMemo<ApexOptions>(
     () => ({
@@ -41,7 +50,7 @@ export function SessionsChart({ data, actions, info }: SessionsChartProps): Reac
       yaxis: {
         title: { text: t('charts.sessions') },
         labels: {
-          formatter: (val: number) => String(Math.round(val)),
+          formatter: (val: number) => formatNumber(val, 0),
         },
       },
       colors: [CHART_COLORS.primary],
@@ -54,7 +63,7 @@ export function SessionsChart({ data, actions, info }: SessionsChartProps): Reac
         },
       ],
     }),
-    [isDark, data, t],
+    [isDark, data, t, i18n.language],
   );
 
   const series = useMemo(
@@ -72,7 +81,9 @@ export function SessionsChart({ data, actions, info }: SessionsChartProps): Reac
         {actions}
       </CardHeader>
       <CardContent>
-        <ReactApexChart options={options} series={series} type="bar" height={300} />
+        <ChartBody state={state} isEmpty={data.length === 0} emptyText={t('charts.noData')}>
+          <ReactApexChart options={options} series={series} type="bar" height={300} />
+        </ChartBody>
       </CardContent>
     </Card>
   );

@@ -14,13 +14,16 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  check,
 } from 'drizzle-orm/pg-core';
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { tariffs } from './pricing.js';
-import { chargingStations, evses, connectors } from './assets.js';
-import { drivers, driverTokens, vehicles } from './drivers.js';
+import { chargingStations, evses, connectors, sites } from './assets.js';
+import { drivers, driverTokens, vehicles, fleets } from './drivers.js';
 import { reservations } from './reservations.js';
+import { invoices } from './invoices.js';
 
 export const sessionStatusEnum = pgEnum('session_status', [
   'active',
@@ -29,6 +32,14 @@ export const sessionStatusEnum = pgEnum('session_status', [
   'faulted',
   'failed',
 ]);
+
+/** charging_sessions.rebill_status: the state of an operator re-bill. */
+export const SESSION_REBILL_STATUSES = ['in_progress', 'billed', 'manual'] as const;
+export type SessionRebillStatus = (typeof SESSION_REBILL_STATUSES)[number];
+
+/** charging_sessions.billing_mode: how a driver session is paid (fleet account billing). */
+export const SESSION_BILLING_MODES = ['card', 'account'] as const;
+export type SessionBillingMode = (typeof SESSION_BILLING_MODES)[number];
 
 export const transactionEventTypeEnum = pgEnum('transaction_event_type', [
   'started',
@@ -45,18 +56,31 @@ export const chargingSessions = pgTable(
     stationId: text('station_id')
       .notNull()
       .references(() => chargingStations.id, { onDelete: 'cascade' }),
+    // The site the session happened at, stamped from its station at insert by
+    // the BEFORE INSERT trigger charging_sessions_stamp_site (migration 0475),
+    // so revenue and history stay with that site when the station moves.
+    siteId: text('site_id').references(() => sites.id, { onDelete: 'set null' }),
     evseId: text('evse_id').references(() => evses.id),
     connectorId: text('connector_id').references(() => connectors.id),
     driverId: text('driver_id').references(() => drivers.id),
     tokenId: text('token_id').references(() => driverTokens.id, { onDelete: 'set null' }),
     vehicleId: text('vehicle_id').references(() => vehicles.id, { onDelete: 'set null' }),
-    transactionId: varchar('transaction_id', { length: 36 }).notNull().unique(),
+    // Unique per station only (OCPP 2.1 E01.FR.08): uq_charging_sessions_station_transaction.
+    transactionId: varchar('transaction_id', { length: 36 }).notNull(),
     status: sessionStatusEnum('status').notNull().default('active'),
     startedAt: timestamp('started_at', { withTimezone: true }),
     endedAt: timestamp('ended_at', { withTimezone: true }),
     meterStart: integer('meter_start'),
     meterStop: integer('meter_stop'),
     energyDeliveredWh: numeric('energy_delivered_wh'),
+    // Energy register rebase (migration 0331, finding B10): energy is
+    // register + offset - meter_start. A newer reading below the newest
+    // projected register (a meter reset or replacement, OCPP 2.1 J02.FR.16)
+    // adds the drop to the offset; a reading older than
+    // meter_last_register_at never changes the energy (session-energy.ts).
+    meterRegisterOffsetWh: numeric('meter_register_offset_wh').notNull().default('0'),
+    meterLastRegisterWh: numeric('meter_last_register_wh'),
+    meterLastRegisterAt: timestamp('meter_last_register_at', { withTimezone: true }),
     stoppedReason: varchar('stopped_reason', { length: 50 }),
     isRoaming: boolean('is_roaming').notNull().default(false),
     remoteStartId: integer('remote_start_id'),
@@ -70,9 +94,103 @@ export const chargingSessions = pgTable(
     tariffPricePerSession: numeric('tariff_price_per_session'),
     tariffIdleFeePricePerMinute: numeric('tariff_idle_fee_price_per_minute'),
     tariffTaxRate: numeric('tariff_tax_rate'),
+    // Reservation holding fee per minute of the tariff snapshot (issue #33).
+    tariffReservationFeePerMinute: numeric('tariff_reservation_fee_per_minute'),
+    // The pricing group the tariff snapshot was resolved in (migration 0340).
+    // Split billing switches resolve only within it, so an assignment or fleet
+    // membership change applies to the next session. A snapshot (no FK).
+    pricingGroupId: text('pricing_group_id'),
+    // Set by the worker's tariff boundary job when it moved the session from a
+    // free to a paid tariff segment; the OCPP projection runs the payment gate
+    // on the next reading and clears it (migration 0340).
+    paymentGateDueAt: timestamp('payment_gate_due_at', { withTimezone: true }),
+    // Tax basis ('net' or 'gross') the snapshot prices were entered in,
+    // written with the tariff snapshot. Null when the session has no tariff.
+    taxBasis: varchar('tax_basis', { length: 5 }),
+    // The cost split: net_cents + tax_cents = coalesce(final_cost_cents,
+    // current_cost_cents), written in the same statement as the cost by
+    // @evtivity/database session-pricing. cost_breakdown holds the
+    // SessionCostBreakdown (tax lines per rate and billed components).
+    netCents: integer('net_cents'),
+    taxCents: integer('tax_cents'),
+    costBreakdown: jsonb('cost_breakdown'),
+    // The most the session can be billed, tax included, stamped when the
+    // session starts: the authorized amount of a guest's card hold (OCPP 2.1
+    // C25: the authorization is the ceiling for the cost) or a prepaid
+    // token's credit (C17.FR.03). The cost assembly bills at most this
+    // amount. Null: no ceiling.
+    costCeilingCents: integer('cost_ceiling_cents'),
+    // The ceiling last sent to an OCPP 2.1 station as transactionLimit.maxCost.
+    costCeilingSentCents: integer('cost_ceiling_sent_cents'),
+    // OCPP 2.1 local cost calculation (I08, I11, I12): the tariffId the
+    // station last reported for the transaction (transactionInfo.tariffId),
+    // its last reported costDetails, its total including tax in cents, and,
+    // once the session ended, that total minus final_cost_cents. The CSMS
+    // bills its own cost; these record what the station showed.
+    stationTariffId: varchar('station_tariff_id', { length: 60 }),
+    stationCostDetails: jsonb('station_cost_details'),
+    stationCostCents: integer('station_cost_cents'),
+    stationCostDifferenceCents: integer('station_cost_difference_cents'),
     idleStartedAt: timestamp('idle_started_at', { withTimezone: true }),
+    // Timestamp of the meter reading that last raised energy_delivered_wh by
+    // 1 Wh or more. The flat-energy idle fallback opens a period only when the
+    // register stayed flat for a full sample interval since then (finding J3).
+    energyRoseAt: timestamp('energy_rose_at', { withTimezone: true }),
     idleMinutes: numeric('idle_minutes').notNull().default('0'),
+    // The idle_started_at the idle notification was sent for (one per idle period).
+    idleNotifiedAt: timestamp('idle_notified_at', { withTimezone: true }),
     lastUpdateNotifiedAt: timestamp('last_update_notified_at', { withTimezone: true }),
+    // Claims of the end notices: session.Completed and session.Receipt go out
+    // only from the projection run that set them (one per session, also when
+    // the station resends its Ended event).
+    completedNotifiedAt: timestamp('completed_notified_at', { withTimezone: true }),
+    receiptNotifiedAt: timestamp('receipt_notified_at', { withTimezone: true }),
+    // A durable request to end the session the normal way (completed and
+    // billed) because the station will not: 'GhostRecovered', 'Superseded' or
+    // 'OperatorEnded'.
+    // end_claimed_at is the lease of the OCPP pod processing it (retried by the
+    // OCPP sweep). See packages/ocpp/src/server/csms-session-end.ts.
+    endRequestReason: varchar('end_request_reason', { length: 32 }),
+    endClaimedAt: timestamp('end_claimed_at', { withTimezone: true }),
+    // Claims taken for the end request; the sweep gives up after a cap.
+    endAttempts: integer('end_attempts').notNull().default(0),
+    // Operator re-bill of a session the CSMS gave up ending (stopped reason
+    // EndRequestFailed): 'in_progress' while a request holds the claim
+    // (rebill_claimed_at is its lease), then 'billed' (charged, debited or
+    // nothing to charge) or 'manual' (collected outside the platform). Null:
+    // never re-billed. See packages/api/src/services/session-rebill.service.ts.
+    rebillStatus: varchar('rebill_status', { length: 16 }).$type<SessionRebillStatus>(),
+    rebillClaimedAt: timestamp('rebill_claimed_at', { withTimezone: true }),
+    // The invoice that bills this session, set in the invoice transaction only
+    // while null, so a session is never on two invoices. A voided invoice
+    // releases it.
+    invoiceId: text('invoice_id').references((): AnyPgColumn => invoices.id, {
+      onDelete: 'set null',
+    }),
+    // How the driver session is paid, decided once at its start and never
+    // rewritten (write-once stamp, P5): 'card' (the driver's card) or
+    // 'account' (billed to billing_fleet_id on the fleet invoice). Stamped by
+    // the portal start or the payment gate on TransactionEvent Started after
+    // roaming, free vend and prepaid are ruled out. Null: older sessions and
+    // sessions without a driver, roaming, free vend or prepaid.
+    billingMode: varchar('billing_mode', { length: 8 }).$type<SessionBillingMode>(),
+    billingFleetId: text('billing_fleet_id').references((): AnyPgColumn => fleets.id, {
+      onDelete: 'restrict',
+    }),
+    // The account session goes on the driver's own member invoice, not the
+    // fleet invoice: stamped with billing_mode from the fleet's
+    // account_invoice_recipient at start and never rewritten (P5), so a later
+    // recipient switch never moves a started session.
+    memberBilled: boolean('member_billed').notNull().default(false),
+    // The vehicle id the charger sent at the start (@evtivity/lib/vehicle-id):
+    // the normalized value, its type (VIN, EVCCID, MacAddress) and source
+    // (id_token, additional_info, id_tag). Written once, by the first event
+    // that carries one.
+    vehicleIdValue: varchar('vehicle_id_value', { length: 255 }),
+    vehicleIdType: varchar('vehicle_id_type', { length: 20 }),
+    vehicleIdSource: varchar('vehicle_id_source', { length: 20 }),
+    // The session was authorized by an Autocharge vehicle (no card or app).
+    autocharge: boolean('autocharge').notNull().default(false),
     metadata: jsonb('metadata'),
     freeVend: boolean('free_vend').notNull().default(false),
     co2AvoidedKg: numeric('co2_avoided_kg'),
@@ -82,10 +200,20 @@ export const chargingSessions = pgTable(
   },
   (table) => [
     index('idx_sessions_station_id').on(table.stationId),
+    index('idx_sessions_site_started_at').on(table.siteId, table.startedAt),
     index('idx_sessions_status').on(table.status),
-    index('idx_sessions_transaction_id').on(table.transactionId),
+    uniqueIndex('uq_charging_sessions_station_transaction').on(
+      table.stationId,
+      table.transactionId,
+    ),
     index('idx_sessions_started_at').on(table.startedAt),
     index('idx_sessions_driver_id').on(table.driverId),
+    // The portal session list (a driver's sessions, newest first).
+    index('idx_sessions_driver_created').on(
+      table.driverId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
     index('idx_sessions_reservation_id').on(table.reservationId),
     index('idx_sessions_status_idle').on(table.status, table.idleStartedAt),
     index('idx_sessions_created_at').on(table.createdAt),
@@ -96,6 +224,38 @@ export const chargingSessions = pgTable(
     index('idx_sessions_driver_status').on(table.driverId, table.status),
     index('idx_sessions_token_id').on(table.tokenId),
     index('idx_sessions_vehicle_id').on(table.vehicleId),
+    index('idx_charging_sessions_end_request')
+      .on(table.endRequestReason)
+      .where(sql`status = 'active' AND end_request_reason IS NOT NULL`),
+    index('idx_charging_sessions_rebill_manual')
+      .on(table.createdAt)
+      .where(sql`rebill_status = 'manual'`),
+    index('idx_sessions_invoice_id')
+      .on(table.invoiceId)
+      .where(sql`invoice_id IS NOT NULL`),
+    index('idx_sessions_billing_fleet_id')
+      .on(table.billingFleetId)
+      .where(sql`billing_fleet_id IS NOT NULL`),
+    index('idx_sessions_account_unbilled')
+      .on(table.billingFleetId)
+      .where(sql`billing_mode = 'account' AND invoice_id IS NULL`),
+    check(
+      'charging_sessions_billing_mode_check',
+      sql`billing_mode IS NULL OR billing_mode IN ('card', 'account')`,
+    ),
+    check(
+      'charging_sessions_billing_fleet_check',
+      sql`coalesce(billing_mode = 'account', false) = (billing_fleet_id IS NOT NULL)`,
+    ),
+    // Added NOT VALID in v0.1.46 (enforced on new writes), validated in v0.1.47.
+    check(
+      'charging_sessions_member_billed_check',
+      sql`NOT member_billed OR (coalesce(billing_mode = 'account', false) AND driver_id IS NOT NULL)`,
+    ),
+    check(
+      'charging_sessions_rebill_status_check',
+      sql`rebill_status IS NULL OR rebill_status IN ('in_progress', 'billed', 'manual')`,
+    ),
   ],
 );
 
@@ -119,6 +279,16 @@ export const transactionEvents = pgTable(
   (table) => [
     index('idx_transaction_events_session_id').on(table.sessionId),
     index('idx_transaction_events_timestamp').on(table.timestamp),
+    // One row per event identity, the TransactionEvent resend check's key.
+    // Built CONCURRENTLY by 0476_release_0_1_46_indexes.sql; inserts use
+    // ON CONFLICT DO NOTHING, so a resend projected on a second pod adds no row.
+    uniqueIndex('uq_transaction_events_event').on(
+      table.sessionId,
+      table.eventType,
+      table.seqNo,
+      table.timestamp,
+      table.triggerReason,
+    ),
   ],
 );
 
@@ -178,6 +348,13 @@ export const meterValues = pgTable(
     index('idx_meter_values_station_standalone_ts')
       .on(table.stationId, table.timestamp)
       .where(sql`session_id IS NULL`),
+    // Deleting an EVSE (a station delete cascades to its EVSEs) checks the
+    // evse_id foreign key, a full scan of meter_values without this index:
+    // 355 ms per EVSE at 3.7M rows, so a conformance run's end-of-run delete
+    // of several hundred test stations took minutes, hours on a large table.
+    index('idx_meter_values_evse_id')
+      .on(table.evseId)
+      .where(sql`evse_id IS NOT NULL`),
     // Dedup retransmits: OCPP allows the station to resend a MeterValues batch
     // if the CALLRESULT is lost. Without this, duplicate rows inflate energy
     // sums in dashboards, cost calculations, and OCPI CDRs. The backing
@@ -186,7 +363,24 @@ export const meterValues = pgTable(
     // drizzle schema can't express NULLS NOT DISTINCT in this version, so the
     // schema declaration is for drift detection only and the migration is the
     // source of truth.
+    // It leaves out station_id, so station-wide readings (no session, no EVSE)
+    // of two stations with the same timestamp and measurand collide. v0.1.46
+    // builds meter_values_station_dedup_idx (below) CONCURRENTLY; this index
+    // stays until v0.1.47 because v0.1.45 pods name its columns in their
+    // ON CONFLICT. Inserts use a targetless ON CONFLICT DO NOTHING, so the
+    // swap needs no code change.
     uniqueIndex('meter_values_dedup_idx').on(
+      table.sessionId,
+      table.evseId,
+      table.timestamp,
+      table.measurand,
+      table.phase,
+      table.location,
+    ),
+    // The dedup key with the station (NULLS NOT DISTINCT in the migration,
+    // 0476_release_0_1_46_indexes.sql).
+    uniqueIndex('meter_values_station_dedup_idx').on(
+      table.stationId,
       table.sessionId,
       table.evseId,
       table.timestamp,

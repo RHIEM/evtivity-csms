@@ -5,8 +5,10 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Play } from 'lucide-react';
+import { AlertTriangle, Play } from 'lucide-react';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Spinner } from '@/components/ui/spinner';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -21,6 +23,9 @@ import {
 } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
+import { formatNumber } from '@/lib/formatting';
+import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 
 interface OcttRun {
   id: number;
@@ -32,6 +37,7 @@ interface OcttRun {
   failed: number;
   skipped: number;
   errors: number;
+  notApplicable: number;
   durationMs: number | null;
   triggeredBy: string | null;
   startedAt: string | null;
@@ -50,9 +56,22 @@ function statusBadge(status: string): React.JSX.Element {
   return <Badge variant={variants[status] ?? 'default'}>{status}</Badge>;
 }
 
+/** Pass rate over the tests that apply: the PICS excludes notApplicable tests. */
 function passRate(run: OcttRun): string {
-  if (run.totalTests === 0) return 'n/a';
-  return `${((run.passed / run.totalTests) * 100).toFixed(1)}%`;
+  const applicable = run.totalTests - run.notApplicable;
+  if (applicable <= 0) return 'n/a';
+  return `${formatNumber((run.passed / applicable) * 100, 1)}%`;
+}
+
+/** A run creates temporary stations, a test driver and tokens, and changes settings. */
+function EnvironmentWarning(): React.JSX.Element {
+  const { t } = useTranslation();
+  return (
+    <Alert variant="warning" data-testid="conformance-environment-warning">
+      <AlertTriangle />
+      <AlertDescription>{t('conformance.environmentWarning')}</AlertDescription>
+    </Alert>
+  );
 }
 
 function formatDuration(ms: number | null): string {
@@ -66,11 +85,15 @@ function formatDuration(ms: number | null): string {
 }
 
 export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  // Starting a run is company-wide: the API answers 404 to a site-restricted user.
+  const canRun = useHasCompanyWidePermission('conformance:write');
   const [selectedVersion, setSelectedVersion] = useState('all');
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ['octt-runs'],
@@ -102,7 +125,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         {!embedded && (
           <div>
             <h1 className="text-2xl md:text-3xl font-bold">{t('conformance.title')}</h1>
@@ -110,44 +133,63 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
           </div>
         )}
 
-        <div className="flex items-center gap-2 ml-auto">
-          <Select
-            aria-label={t('conformance.ocppVersion')}
-            className="w-[140px]"
-            value={selectedVersion}
-            onChange={(e) => {
-              setSelectedVersion(e.target.value);
-            }}
-          >
-            <option value="all">{t('conformance.runAll')}</option>
-            <option value="ocpp2.1">OCPP 2.1</option>
-            <option value="ocpp1.6">OCPP 1.6</option>
-          </Select>
-          <Button
-            disabled={hasRunningRun === true || triggerRun.isPending}
-            onClick={() => {
-              triggerRun.mutate({ ocppVersion: selectedVersion, sutType: 'csms' });
-            }}
-            className="relative"
-          >
-            {triggerRun.isPending && (
-              <div className="absolute inset-0 flex items-center justify-center">
-                <Spinner className="h-4 w-4" />
-              </div>
-            )}
-            <span
-              className={
-                triggerRun.isPending
-                  ? 'invisible flex items-center gap-2'
-                  : 'flex items-center gap-2'
-              }
+        {canRun && (
+          <div className="flex items-center gap-2 ml-auto">
+            <Select
+              aria-label={t('conformance.ocppVersion')}
+              className="w-[140px]"
+              value={selectedVersion}
+              onChange={(e) => {
+                setSelectedVersion(e.target.value);
+              }}
             >
-              <Play className="h-4 w-4" />
-              {t('conformance.runTests')}
-            </span>
-          </Button>
-        </div>
+              <option value="all">{t('conformance.runAll')}</option>
+              <option value="ocpp2.1">OCPP 2.1</option>
+              <option value="ocpp1.6">OCPP 1.6</option>
+            </Select>
+            <Button
+              disabled={hasRunningRun === true || triggerRun.isPending}
+              onClick={() => {
+                setConfirmOpen(true);
+              }}
+              className="relative"
+            >
+              {triggerRun.isPending && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Spinner className="h-4 w-4" />
+                </div>
+              )}
+              <span
+                className={
+                  triggerRun.isPending
+                    ? 'invisible flex items-center gap-2'
+                    : 'flex items-center gap-2'
+                }
+              >
+                <Play className="h-4 w-4" />
+                {t('conformance.runTests')}
+              </span>
+            </Button>
+          </div>
+        )}
       </div>
+
+      <EnvironmentWarning />
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t('conformance.startRunTitle')}
+        description={t('conformance.startRunDescription')}
+        confirmLabel={t('conformance.runTests')}
+        confirmIcon={<Play className="h-4 w-4" />}
+        variant="default"
+        onConfirm={() => {
+          triggerRun.mutate({ ocppVersion: selectedVersion, sutType: 'csms' });
+        }}
+      >
+        <EnvironmentWarning />
+      </ConfirmDialog>
 
       <Card>
         <CardContent className="overflow-x-auto p-0">
@@ -170,6 +212,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                     <TableHead className="text-right">{t('conformance.passed')}</TableHead>
                     <TableHead className="text-right">{t('conformance.failed')}</TableHead>
                     <TableHead className="text-right">{t('conformance.errors')}</TableHead>
+                    <TableHead className="text-right">{t('conformance.notApplicable')}</TableHead>
                     <TableHead className="text-right">{t('conformance.passRate')}</TableHead>
                     <TableHead className="text-right">{t('conformance.duration')}</TableHead>
                   </TableRow>
@@ -185,7 +228,7 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                       }}
                     >
                       <TableCell className="text-xs" data-testid="row-click-target">
-                        {new Date(run.createdAt).toLocaleString()}
+                        {formatDateTime(run.createdAt, timezone)}
                       </TableCell>
                       <TableCell>
                         <Badge variant="outline">{run.ocppVersion}</Badge>
@@ -195,6 +238,9 @@ export function Conformance({ embedded }: { embedded?: boolean } = {}): React.JS
                       <TableCell className="text-right text-destructive">{run.failed}</TableCell>
                       <TableCell className="text-right text-warning">
                         {run.skipped + run.errors}
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {run.notApplicable}
                       </TableCell>
                       <TableCell className="text-right font-medium">{passRate(run)}</TableCell>
                       <TableCell className="text-right text-xs text-muted-foreground">

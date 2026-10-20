@@ -11,6 +11,7 @@ import { EntityNavButtons } from '@/components/entity-nav-buttons';
 import { CopyableId } from '@/components/copyable-id';
 import { CreateButton } from '@/components/create-button';
 import { Badge } from '@/components/ui/badge';
+import { Toggle } from '@/components/ui/toggle';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
@@ -21,18 +22,25 @@ import { Select } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
 import { FilterPopover } from '@/components/FilterBar';
 import { api } from '@/lib/api';
-import { useHasPermission } from '@/lib/auth';
+import { useFeatureFlags } from '@/hooks/use-feature-flags';
+import { useGoogleMapsSettings } from '@/hooks/use-google-maps-settings';
+import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 import { Pagination } from '@/components/ui/pagination';
 import { SessionsTable, type Session } from '@/components/SessionsTable';
 import { ReservationsTable } from '@/components/ReservationsTable';
 import { SiteDetailsTab } from '@/components/site/SiteDetailsTab';
+import { RecordInsight } from '@/components/ai/insights/RecordInsight';
+import { RecordInsightsTab } from '@/components/ai/insights/RecordInsightsTab';
+import { SiteAiCard } from '@/components/ai/usage/SiteAiCard';
 import { SiteMetricsTab } from '@/components/site/SiteMetricsTab';
 import { SiteQrCodesTab } from '@/components/site/SiteQrCodesTab';
 import { SitePricingTab } from '@/components/site/SitePricingTab';
 import { SiteFreeVendTab } from '@/components/site/SiteFreeVendTab';
 import { SiteMaintenanceTab } from '@/components/SiteMaintenanceTab';
 import { SiteElectricityRatesTab } from '@/components/SiteElectricityRatesTab';
+import { SiteElectricityRatesNotice } from '@/components/ElectricityCostNotices';
 import { LoadingLogo } from '@/components/loading-logo';
+import { getErrorMessage } from '@/lib/error-message';
 
 interface Site {
   id: string;
@@ -54,7 +62,19 @@ interface Site {
   freeVendEnabled: boolean;
   freeVendTemplateId21: string | null;
   freeVendTemplateId16: string | null;
+  freeVendRestoreTemplateId21?: string | null;
+  freeVendRestoreTemplateId16?: string | null;
   carbonRegionCode: string | null;
+  stationMessageLanguage: string | null;
+  autochargeEnabled?: boolean | null;
+  aiInsightsEnabled?: boolean;
+  aiMonthlyTokenBudget?: number | null;
+  aiInsightsSuppressed?: boolean;
+  aiInsightsSuppressedSources?: string[];
+  aiInsightsSuppressedAt?: string | null;
+  aiInsightsSuppressedUntil?: string | null;
+  aiInsightsSuppressedByName?: string | null;
+  aiInsightsSuppressedReason?: string | null;
   stationCount: number;
   createdAt: string;
   updatedAt: string;
@@ -86,6 +106,23 @@ export function SiteDetail(): React.JSX.Element {
   const { t } = useTranslation();
   const canReadAudit = useHasPermission('audit:read');
   const canReadMaintenance = useHasPermission('maintenance:read');
+  // The AI tab follows the card's own gates: usage readers, or users with
+  // every site and sites:write who edit the budget and the insights switch.
+  const canReadAiUsage = useHasPermission('aiUsage:read');
+  const canWriteSites = useHasPermission('sites:write');
+  const canWriteStations = useHasPermission('stations:write');
+  const allSites = useHasAllSiteAccess();
+  const {
+    flags: { guestChargingEnabled, reservationEnabled, aiInsightsEnabled },
+  } = useFeatureFlags();
+  // AI Usage: the usage card with the site switch and budget. AI Insights: the site's insights.
+  const showSiteInsights = useHasPermission('aiInsights:read') && aiInsightsEnabled;
+  const showAiTab = canReadAiUsage || (allSites && canWriteSites);
+  // A ?tab=ai link opened by someone without the tab shows Details.
+  const shownTab =
+    (activeTab === 'ai' && !showAiTab) || (activeTab === 'ai-insights' && !showSiteInsights)
+      ? 'details'
+      : activeTab;
 
   const { data: site, isLoading } = useQuery({
     queryKey: ['sites', id],
@@ -100,13 +137,6 @@ export function SiteDetail(): React.JSX.Element {
     enabled: id != null && canReadMaintenance,
   });
   const underMaintenance = maintenanceStatus?.current != null;
-
-  const { data: settingsData } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => api.get<Record<string, unknown>>('/v1/settings'),
-  });
-  const guestChargingEnabled = settingsData?.['guest.enabled'] !== false;
-  const reservationEnabled = settingsData?.['reservation.enabled'] !== false;
 
   const stationsLimit = 10;
   const { data: stationsResponse } = useQuery({
@@ -147,15 +177,8 @@ export function SiteDetail(): React.JSX.Element {
   const sessionsData = sessionsResponse?.data;
   const sessionsTotalPages = Math.max(1, Math.ceil((sessionsResponse?.total ?? 0) / sessionsLimit));
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => api.get<Record<string, unknown>>('/v1/settings'),
-  });
-
-  const googleMapsApiKey =
-    settings != null && typeof settings['googleMaps.apiKeyEnc'] === 'string'
-      ? settings['googleMaps.apiKeyEnc']
-      : '';
+  const { data: mapsSettings } = useGoogleMapsSettings();
+  const googleMapsApiKey = mapsSettings?.apiKey ?? '';
 
   const deleteMutation = useMutation({
     mutationFn: () => api.delete<Site>(`/v1/sites/${id ?? ''}`),
@@ -183,11 +206,11 @@ export function SiteDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/sites" />
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl md:text-3xl font-bold">{site.name}</h1>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{site.name}</h1>
             {underMaintenance && <Badge variant="warning">{t('nav.maintenance')}</Badge>}
           </div>
           <CopyableId id={site.id} />
@@ -195,7 +218,24 @@ export function SiteDetail(): React.JSX.Element {
         <EntityNavButtons resource="sites" basePath="/sites" currentId={id} />
       </div>
 
-      <Tabs value={activeTab} onValueChange={setActiveTab}>
+      {activeTab !== 'electricity-rates' && (
+        <SiteElectricityRatesNotice
+          siteId={id ?? ''}
+          onOpenRates={() => {
+            setActiveTab('electricity-rates');
+          }}
+        />
+      )}
+
+      {showSiteInsights && id != null && (
+        <RecordInsight
+          filter={{ siteId: id }}
+          onOpen={() => {
+            setActiveTab('ai-insights');
+          }}
+        />
+      )}
+      <Tabs value={shownTab} onValueChange={setActiveTab}>
         <TabsList>
           <TabsTrigger value="details">{t('common.details')}</TabsTrigger>
           <TabsTrigger value="metrics">{t('sites.metrics')}</TabsTrigger>
@@ -208,6 +248,10 @@ export function SiteDetail(): React.JSX.Element {
           <TabsTrigger value="electricity-rates">{t('sites.electricityRates')}</TabsTrigger>
           {reservationEnabled && (
             <TabsTrigger value="reservations">{t('reservations.title')}</TabsTrigger>
+          )}
+          {showAiTab && <TabsTrigger value="ai">{t('sites.tabs.ai')}</TabsTrigger>}
+          {showSiteInsights && (
+            <TabsTrigger value="ai-insights">{t('aiInsights.list.title')}</TabsTrigger>
           )}
           <TabsTrigger value="free-vend">{t('sites.freeVend')}</TabsTrigger>
           {canReadMaintenance && (
@@ -224,18 +268,21 @@ export function SiteDetail(): React.JSX.Element {
             deleteMutation.mutate();
           }}
           deleteIsPending={deleteMutation.isPending}
+          deleteError={deleteMutation.error ?? undefined}
         />
 
         <TabsContent value="stations">
           <Card>
             <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <CardTitle>{t('nav.stations')}</CardTitle>
-              <CreateButton
-                label={t('stations.addStation')}
-                onClick={() => {
-                  void navigate(`/stations/new?siteId=${id ?? ''}`);
-                }}
-              />
+              {canWriteStations && (
+                <CreateButton
+                  label={t('stations.addStation')}
+                  onClick={() => {
+                    void navigate(`/stations/new?siteId=${id ?? ''}`);
+                  }}
+                />
+              )}
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="overflow-x-auto">
@@ -268,7 +315,7 @@ export function SiteDetail(): React.JSX.Element {
                     setSessionsStationId(e.target.value);
                     setSessionsPage(1);
                   }}
-                  className="h-9 sm:w-44"
+                  className="sm:w-44"
                 >
                   <option value="">{t('sessions.allStations')}</option>
                   {siteStationsForFilter?.data.map((s) => (
@@ -284,7 +331,7 @@ export function SiteDetail(): React.JSX.Element {
                     setSessionsStatus(e.target.value);
                     setSessionsPage(1);
                   }}
-                  className="h-9 sm:w-44"
+                  className="sm:w-44"
                 >
                   <option value="">{t('sessions.allStatuses')}</option>
                   <option value="active">{t('status.active')}</option>
@@ -304,7 +351,7 @@ export function SiteDetail(): React.JSX.Element {
                     setSessionsStationId(e.target.value);
                     setSessionsPage(1);
                   }}
-                  className="h-9 sm:w-44"
+                  className="sm:w-44"
                 >
                   <option value="">{t('sessions.allStations')}</option>
                   {siteStationsForFilter?.data.map((s) => (
@@ -320,7 +367,7 @@ export function SiteDetail(): React.JSX.Element {
                     setSessionsStatus(e.target.value);
                     setSessionsPage(1);
                   }}
-                  className="h-9 sm:w-44"
+                  className="sm:w-44"
                 >
                   <option value="">{t('sessions.allStatuses')}</option>
                   <option value="active">{t('status.active')}</option>
@@ -357,7 +404,7 @@ export function SiteDetail(): React.JSX.Element {
 
         <SiteQrCodesTab stations={stations} guestChargingEnabled={guestChargingEnabled} />
 
-        <SitePricingTab siteId={id ?? ''} />
+        <SitePricingTab siteId={id ?? ''} timezone={site.timezone} />
 
         {reservationEnabled && (
           <TabsContent value="reservations" className="space-y-6">
@@ -370,31 +417,43 @@ export function SiteDetail(): React.JSX.Element {
                       {t('sites.reservationsEnabledHelp')}
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={site.reservationsEnabled}
-                    onClick={() => {
+                  <Toggle
+                    aria-label={t('sites.reservationsEnabled')}
+                    size="lg"
+                    checked={site.reservationsEnabled}
+                    onCheckedChange={() => {
                       reservationToggleMutation.mutate(!site.reservationsEnabled);
                     }}
-                    disabled={reservationToggleMutation.isPending}
-                    className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${site.reservationsEnabled ? 'bg-primary' : 'bg-muted'}`}
-                  >
-                    <span
-                      className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${site.reservationsEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                    />
-                  </button>
+                    disabled={!canWriteSites || reservationToggleMutation.isPending}
+                  />
                 </div>
+                {reservationToggleMutation.isError && (
+                  <p className="mt-3 text-sm text-destructive">
+                    {getErrorMessage(reservationToggleMutation.error, t)}
+                  </p>
+                )}
               </CardContent>
             </Card>
             <ReservationsTable siteId={id} timezone={site.timezone} />
           </TabsContent>
         )}
 
+        {showAiTab && (
+          <TabsContent value="ai">
+            <SiteAiCard siteId={id ?? ''} site={site} />
+          </TabsContent>
+        )}
+
+        {showSiteInsights && id != null && (
+          <TabsContent value="ai-insights">
+            <RecordInsightsTab filter={{ siteId: id }} />
+          </TabsContent>
+        )}
+
         <SiteFreeVendTab site={site} siteId={id ?? ''} />
 
         <TabsContent value="electricity-rates">
-          <SiteElectricityRatesTab siteId={id ?? ''} />
+          <SiteElectricityRatesTab siteId={id ?? ''} siteName={site.name} />
         </TabsContent>
 
         {canReadMaintenance && (

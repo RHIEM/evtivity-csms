@@ -38,6 +38,11 @@ export const siteAuditActionEnum = pgEnum('site_audit_action', [
   'free_vend_toggled',
   'carbon_region_changed',
   'pricing_assignment_changed',
+  // Complete audit coverage (v0.1.46, 0475).
+  'load_management_changed',
+  'location_published_changed',
+  'electricity_rates_changed',
+  'payout_status_changed',
 ]);
 
 export const siteAuditLog = pgTable(
@@ -55,6 +60,8 @@ export const siteAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -76,6 +83,13 @@ export const stationAuditActionEnum = pgEnum('station_audit_action', [
   'configuration_pushed',
   'local_auth_pushed',
   'reset_triggered',
+  // Complete audit coverage (v0.1.46, 0475).
+  'display_message_set',
+  'display_message_cleared',
+  'nevi_data_changed',
+  'evse_changed',
+  'monitoring_changed',
+  'alert_acknowledged',
 ]);
 
 export const stationAuditLog = pgTable(
@@ -93,6 +107,8 @@ export const stationAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -111,6 +127,21 @@ export const driverAuditActionEnum = pgEnum('driver_audit_action', [
   'email_verified',
   'fleet_assignment_changed',
   'pricing_assignment_changed',
+  'portal_invited',
+  'portal_activated',
+  'billing_address_updated',
+  // Complete audit coverage (v0.1.46, 0475).
+  'payment_method_added',
+  'payment_method_removed',
+  'payment_method_default_changed',
+  'pnc_contract_issued',
+  'pnc_contract_revoked',
+  'login_succeeded',
+  'login_failed',
+  'mfa_enabled',
+  'mfa_disabled',
+  'roaming_session_started',
+  'erased',
 ]);
 
 export const driverAuditLog = pgTable(
@@ -128,6 +159,8 @@ export const driverAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -145,6 +178,8 @@ export const fleetAuditActionEnum = pgEnum('fleet_audit_action', [
   'station_added',
   'station_removed',
   'pricing_assignment_changed',
+  'billing_updated',
+  'member_billing_opt_out_changed',
 ]);
 
 export const fleetAuditLog = pgTable(
@@ -162,6 +197,8 @@ export const fleetAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -182,6 +219,11 @@ export const userAuditActionEnum = pgEnum('user_audit_action', [
   'site_access_changed',
   'login_succeeded',
   'login_failed',
+  // Complete audit coverage (v0.1.46, 0475).
+  'invite_resent',
+  // Operator access hardening (v0.1.46, 0475).
+  'mfa_reset',
+  'account_locked',
 ]);
 
 export const userAuditLog = pgTable(
@@ -199,6 +241,8 @@ export const userAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -211,6 +255,11 @@ export const vehicleAuditActionEnum = pgEnum('vehicle_audit_action', [
   'created',
   'updated',
   'deleted',
+  'autocharge_enabled',
+  'autocharge_disabled',
+  'autocharge_blocked',
+  'autocharge_unblocked',
+  'vehicle_id_claimed',
 ]);
 
 export const vehicleAuditLog = pgTable(
@@ -228,6 +277,8 @@ export const vehicleAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -249,6 +300,15 @@ export const supportCaseAuditActionEnum = pgEnum('support_case_audit_action', [
   'refund_issued',
   'sessions_linked',
   'sessions_unlinked',
+  // Driver AI support (0445).
+  'ai_consent_granted',
+  'ai_consent_declined',
+  'ai_answered',
+  'resolved_by_ai',
+  'escalated_from_ai',
+  'ai_failed',
+  // Complete audit coverage (v0.1.46, 0475).
+  'attachment_deleted',
 ]);
 
 export const supportCaseAuditLog = pgTable(
@@ -266,6 +326,8 @@ export const supportCaseAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -301,6 +363,8 @@ export const ocpiPartnerAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -318,6 +382,8 @@ export const certificateAuditActionEnum = pgEnum('certificate_audit_action', [
   'ca_certificate_deleted',
   'root_certificates_refreshed',
   'pnc_settings_updated',
+  // Complete audit coverage (v0.1.46, 0475).
+  'expired',
 ]);
 
 export const certificateAuditLog = pgTable(
@@ -335,6 +401,8 @@ export const certificateAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -365,6 +433,8 @@ export const roleAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -396,6 +466,8 @@ export const apiKeyAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -404,7 +476,7 @@ export const apiKeyAuditLog = pgTable(
   ],
 );
 
-export const settingAuditActionEnum = pgEnum('setting_audit_action', ['updated']);
+export const settingAuditActionEnum = pgEnum('setting_audit_action', ['updated', 'deleted']);
 
 export const settingAuditLog = pgTable(
   'setting_audit_log',
@@ -421,6 +493,8 @@ export const settingAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -451,6 +525,8 @@ export const smartChargingTemplateAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -481,6 +557,8 @@ export const configTemplateAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -517,6 +595,8 @@ export const firmwareCampaignAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -548,6 +628,8 @@ export const stationImageAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -578,6 +660,8 @@ export const localAuthListAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -612,6 +696,8 @@ export const tokenAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -628,6 +714,15 @@ export const reservationAuditActionEnum = pgEnum('reservation_audit_action', [
   'expired',
   'used',
   'session_failed',
+  // v0.1.45 (migration 0452). The reservation insights read these rows; the
+  // reason of a trigger row lives in after.reason (writeReservationAudit).
+  'station_rejected',
+  'station_cancel_failed',
+  'station_faulted',
+  'fee_charged',
+  'fee_failed',
+  'taken_by_other',
+  'activated',
 ]);
 
 export const reservationAuditLog = pgTable(
@@ -645,6 +740,8 @@ export const reservationAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -659,11 +756,15 @@ export const pricingGroupAuditActionEnum = pgEnum('pricing_group_audit_action', 
   'created',
   'updated',
   'deleted',
+  // Complete audit coverage (v0.1.46, 0475).
+  'tariff_mapping_changed',
 ]);
 export const tariffAuditActionEnum = pgEnum('tariff_audit_action', [
   'created',
   'updated',
   'deleted',
+  // Complete audit coverage (v0.1.46, 0475).
+  'tariff_mapping_changed',
 ]);
 export const holidayAuditActionEnum = pgEnum('holiday_audit_action', [
   'created',
@@ -691,6 +792,8 @@ export const pricingGroupAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -714,6 +817,8 @@ export const tariffAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -737,6 +842,8 @@ export const holidayAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -760,6 +867,8 @@ export const pricingAssignmentAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -795,11 +904,377 @@ export const maintenanceEventAuditLog = pgTable(
     before: jsonb('before'),
     after: jsonb('after'),
     notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     index('idx_maintenance_event_audit_event_id').on(table.maintenanceEventId),
     index('idx_maintenance_event_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Charging session audit. Operator actions on a session: the re-bill of a
+// session the CSMS gave up ending ('rebilled' when it was charged, debited or
+// had nothing to charge, 'manual_billing' when it falls back to manual billing).
+export const sessionAuditActionEnum = pgEnum('session_audit_action', [
+  'rebilled',
+  'manual_billing',
+  // Complete audit coverage (v0.1.46, 0475).
+  'cdr_credited',
+  'faulted',
+  'stopped_by_csms',
+  'vehicle_changed',
+  // Operator CDR reissue and push retry (v0.1.46, 0475).
+  'cdr_reissued',
+  'cdr_push_retried',
+  // An operator moved an unbilled account session between the fleet invoice
+  // and the member invoice (v0.1.47, 0477).
+  'billing_reassigned',
+]);
+
+export const sessionAuditLog = pgTable(
+  'session_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    sessionId: text('session_id'),
+    sessionIdSnapshot: text('session_id_snapshot').notNull(),
+    action: sessionAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_session_audit_session_id').on(table.sessionId),
+    index('idx_session_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Invoice audit. Operator actions on an issued invoice: 'marked_paid' (payment
+// received outside EVtivity), 'voided' (drafts only), and 'invoice_credited'
+// (a credit note credited it in full), 'invoice_generated' (a driver or fleet
+// invoice was created) and 'invoice_sent' (its email or SMS was accepted for
+// delivery, 0400).
+export const invoiceAuditActionEnum = pgEnum('invoice_audit_action', [
+  'marked_paid',
+  'voided',
+  'invoice_credited',
+  'invoice_generated',
+  'invoice_sent',
+]);
+
+export const invoiceAuditLog = pgTable(
+  'invoice_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    invoiceId: text('invoice_id'),
+    invoiceIdSnapshot: text('invoice_id_snapshot').notNull(),
+    action: invoiceAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_invoice_audit_invoice_id').on(table.invoiceId),
+    index('idx_invoice_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// AI conversation audit (migration 0379). Written by the API conversation
+// service: the conversation lifecycle, every tool call the model made, the
+// user's decision on a write it proposed, and attachments (lane L3).
+export const aiConversationAuditActionEnum = pgEnum('ai_conversation_audit_action', [
+  'created',
+  'renamed',
+  'deleted',
+  'tool_called',
+  'action_confirmed',
+  'action_rejected',
+  'attachment_added',
+  // Complete audit coverage (v0.1.46, 0475).
+  'attachment_deleted',
+]);
+
+export const aiConversationAuditLog = pgTable(
+  'ai_conversation_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    aiConversationId: text('ai_conversation_id'),
+    aiConversationIdSnapshot: text('ai_conversation_id_snapshot').notNull(),
+    action: aiConversationAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    /** Set when the change came from an AI assistant tool call: { conversationId, toolCallId }. */
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_ai_conversation_audit_conversation_id').on(table.aiConversationId),
+    index('idx_ai_conversation_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// AI proposal audit (migration 0432): every decision on a proposal from a
+// background AI worker or an MCP client. Written only by the proposal service
+// (@evtivity/services/ai-proposal.service).
+export const aiProposalAuditActionEnum = pgEnum('ai_proposal_audit_action', [
+  'created',
+  'confirmed',
+  'executed',
+  'failed',
+  'rejected',
+  'expired',
+  'stale',
+]);
+
+export const aiProposalAuditLog = pgTable(
+  'ai_proposal_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    aiProposalId: text('ai_proposal_id'),
+    aiProposalIdSnapshot: text('ai_proposal_id_snapshot').notNull(),
+    action: aiProposalAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_ai_proposal_audit_proposal_id').on(table.aiProposalId),
+    index('idx_ai_proposal_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Automatic insight audit (migration 0423): an operator regenerated or
+// dismissed an insight, or marked it helpful or wrong; `feedback_cleared`
+// (migration 0471) when the operator took the vote back. Written only by the
+// insight service (`@evtivity/services/ai-insight.service`).
+export const aiInsightAuditActionEnum = pgEnum('ai_insight_audit_action', [
+  'regenerated',
+  'dismissed',
+  'feedback_helpful',
+  'feedback_wrong',
+  'feedback_cleared',
+  'rejected',
+]);
+
+export const aiInsightAuditLog = pgTable(
+  'ai_insight_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    aiInsightId: text('ai_insight_id'),
+    aiInsightIdSnapshot: text('ai_insight_id_snapshot').notNull(),
+    action: aiInsightAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_ai_insight_audit_insight_id').on(table.aiInsightId),
+    index('idx_ai_insight_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Payment audit (v0.1.46, 0475): every transition of a payment record
+// (session, reservation fee, ad hoc and guest payments), whoever made it: an
+// operator, a driver, the worker, a provider webhook. Keyed by the payment
+// record id. Written by @evtivity/payments payment-records.ts.
+export const paymentAuditActionEnum = pgEnum('payment_audit_action', [
+  'created',
+  'pre_authorized',
+  'captured',
+  'partially_refunded',
+  'refunded',
+  'failed',
+  'cancelled',
+]);
+
+export const paymentAuditLog = pgTable(
+  'payment_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    paymentId: text('payment_id'),
+    paymentIdSnapshot: text('payment_id_snapshot').notNull(),
+    action: paymentAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_payment_audit_entity_id').on(table.paymentId),
+    index('idx_payment_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Notification configuration audit (v0.1.46, 0475): notification templates
+// (every channel and language) and the OCPP and driver event settings, keyed
+// by the event type, so one history covers an event.
+export const notificationTemplateAuditActionEnum = pgEnum('notification_template_audit_action', [
+  'updated',
+  'deleted',
+  'event_settings_changed',
+]);
+
+export const notificationTemplateAuditLog = pgTable(
+  'notification_template_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    notificationTemplateId: text('notification_template_id'),
+    notificationTemplateIdSnapshot: text('notification_template_id_snapshot').notNull(),
+    action: notificationTemplateAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_notification_template_audit_entity_id').on(table.notificationTemplateId),
+    index('idx_notification_template_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Station message template audit (v0.1.46, 0475), keyed by the state.
+export const stationMessageTemplateAuditActionEnum = pgEnum(
+  'station_message_template_audit_action',
+  ['updated', 'reset'],
+);
+
+export const stationMessageTemplateAuditLog = pgTable(
+  'station_message_template_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    stationMessageTemplateId: text('station_message_template_id'),
+    stationMessageTemplateIdSnapshot: text('station_message_template_id_snapshot').notNull(),
+    action: stationMessageTemplateAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_station_message_template_audit_entity_id').on(table.stationMessageTemplateId),
+    index('idx_station_message_template_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Station event alert rule audit (v0.1.46, 0475).
+export const eventAlertRuleAuditActionEnum = pgEnum('event_alert_rule_audit_action', [
+  'created',
+  'updated',
+  'deleted',
+]);
+
+export const eventAlertRuleAuditLog = pgTable(
+  'event_alert_rule_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    eventAlertRuleId: text('event_alert_rule_id'),
+    eventAlertRuleIdSnapshot: text('event_alert_rule_id_snapshot').notNull(),
+    action: eventAlertRuleAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_event_alert_rule_audit_entity_id').on(table.eventAlertRuleId),
+    index('idx_event_alert_rule_audit_created_at').on(table.createdAt),
+  ],
+);
+
+// Report schedule audit (v0.1.46, 0475): schedule changes, and a generated,
+// downloaded or deleted report as 'report_generated', 'report_downloaded' or
+// 'report_deleted' (the report id in notes).
+export const reportScheduleAuditActionEnum = pgEnum('report_schedule_audit_action', [
+  'created',
+  'updated',
+  'deleted',
+  'report_deleted',
+  'report_generated',
+  'report_downloaded',
+]);
+
+export const reportScheduleAuditLog = pgTable(
+  'report_schedule_audit_log',
+  {
+    id: serial('id').primaryKey(),
+    reportScheduleId: text('report_schedule_id'),
+    reportScheduleIdSnapshot: text('report_schedule_id_snapshot').notNull(),
+    action: reportScheduleAuditActionEnum('action').notNull(),
+    actor: auditActorEnum('actor').notNull(),
+    actorUserId: text('actor_user_id'),
+    actorDriverId: text('actor_driver_id'),
+    actorApiKeyId: text('actor_api_key_id'),
+    actorLabel: varchar('actor_label', { length: 100 }),
+    before: jsonb('before'),
+    after: jsonb('after'),
+    notes: text('notes'),
+    viaAi: jsonb('via_ai'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_report_schedule_audit_entity_id').on(table.reportScheduleId),
+    index('idx_report_schedule_audit_created_at').on(table.createdAt),
   ],
 );
 
@@ -831,6 +1306,16 @@ export const AUDIT_TABLES = {
   holiday: holidayAuditLog,
   pricing_assignment: pricingAssignmentAuditLog,
   maintenance_event: maintenanceEventAuditLog,
+  session: sessionAuditLog,
+  invoice: invoiceAuditLog,
+  ai_conversation: aiConversationAuditLog,
+  ai_proposal: aiProposalAuditLog,
+  ai_insight: aiInsightAuditLog,
+  payment: paymentAuditLog,
+  notification_template: notificationTemplateAuditLog,
+  station_message_template: stationMessageTemplateAuditLog,
+  event_alert_rule: eventAlertRuleAuditLog,
+  report_schedule: reportScheduleAuditLog,
 } as const;
 
 export type AuditEntityType = keyof typeof AUDIT_TABLES;

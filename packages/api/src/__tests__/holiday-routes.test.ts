@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -73,7 +77,9 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  // The real SQLSTATE readers, so the mocked errors map as in production.
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -83,6 +89,7 @@ vi.mock('@evtivity/database', () => ({
   pricingHolidays: { id: 'id', date: 'date' },
   holidayAuditLog: {},
   writeAudit: vi.fn().mockResolvedValue(undefined),
+  clearTariffResolutionCache: vi.fn(),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -93,6 +100,7 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 import { registerAuth } from '../plugins/auth.js';
+import { clearTariffResolutionCache } from '@evtivity/database';
 import { holidayRoutes } from '../routes/holidays.js';
 
 async function buildApp(): Promise<FastifyInstance> {
@@ -187,6 +195,8 @@ describe('Holiday routes', () => {
       const body = res.json();
       expect(body.name).toBe("New Year's Day");
       expect(body.date).toBe('2026-01-01');
+      // The new holiday applies to this pod's next tariff resolution at once.
+      expect(vi.mocked(clearTariffResolutionCache)).toHaveBeenCalled();
     });
 
     it('returns 400 when name is missing', async () => {

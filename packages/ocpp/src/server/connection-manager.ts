@@ -51,18 +51,44 @@ export class ConnectionManager {
     }
   }
 
-  remove(stationId: string): void {
+  // A replaced connection closes after its successor is stored. Only the socket
+  // that is still current may remove the entry, or the live station would look
+  // offline to every command until it reconnects again.
+  remove(stationId: string, ws?: WebSocket): boolean {
+    const current = this.connections.get(stationId);
+    if (ws != null && current != null && current.ws !== ws) return false;
     this.connections.delete(stationId);
     this.logger.info({ stationId, total: this.connections.size }, 'Station disconnected');
 
-    if (this.registry != null) {
-      void this.registry.unregister(stationId).catch((err: unknown) => {
+    if (this.registry != null && this.instanceId != null) {
+      void this.registry.unregister(stationId, this.instanceId).catch((err: unknown) => {
         this.logger.debug(
           { err, stationId },
           'Registry unregister failed on disconnect; continuing',
         );
       });
     }
+    return true;
+  }
+
+  /**
+   * Refreshes the registry entry of every station this process holds, so an
+   * entry never expires while the connection lives (the heartbeat interval can
+   * exceed the registry TTL). Entries that name another process are left
+   * alone. Fail-open: a failed refresh is retried on the next cycle.
+   */
+  refreshRegistry(): void {
+    const registry = this.registry;
+    const instanceId = this.instanceId;
+    if (registry?.refreshOwned == null || instanceId == null) return;
+    const stationIds = this.allStationIds();
+    if (stationIds.length === 0) return;
+    void registry.refreshOwned(stationIds, instanceId).catch((err: unknown) => {
+      this.logger.warn(
+        { err, instanceId, stations: stationIds.length },
+        'Registry refresh failed; retrying on the next cycle',
+      );
+    });
   }
 
   get(stationId: string): StationConnection | undefined {

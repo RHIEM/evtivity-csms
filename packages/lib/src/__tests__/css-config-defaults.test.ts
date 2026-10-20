@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect } from 'vitest';
-import { buildCssConfigDefaults, type CssConfigDefaultsInput } from '../css-config-defaults.js';
+import {
+  buildCssConfigDefaults,
+  CSS_RECONNECT_SPREAD_S,
+  type CssConfigDefaultsInput,
+} from '../css-config-defaults.js';
 
 function baseInput(overrides: Partial<CssConfigDefaultsInput> = {}): CssConfigDefaultsInput {
   return {
@@ -35,6 +39,29 @@ describe('buildCssConfigDefaults', () => {
       expect(m.get('ChargePointModel')).toBe('TestModel');
       expect(m.get('ChargePointSerialNumber')).toBe('SN-1');
       expect(m.get('FirmwareVersion')).toBe('1.0');
+    });
+
+    it('includes the Security Whitepaper keys', () => {
+      const defaults = buildCssConfigDefaults(baseInput({ ocppProtocol: 'ocpp1.6' }));
+      const byKey = new Map(defaults.map((d) => [d.key, d]));
+
+      expect(byKey.get('CpoName')).toEqual({
+        key: 'CpoName',
+        value: 'TestVendor',
+        readonly: false,
+      });
+      expect(byKey.get('CertificateStoreMaxLength')?.readonly).toBe(true);
+      expect(byKey.get('CertificateSignedMaxChainSize')?.value).toBe('10000');
+      expect(byKey.get('AdditionalRootCertificateCheck')?.value).toBe('false');
+    });
+
+    it('reports AuthorizeRemoteTxRequests as read-only false (no Authorize before a remote start)', () => {
+      const defaults = buildCssConfigDefaults(baseInput({ ocppProtocol: 'ocpp1.6' }));
+      expect(defaults.find((d) => d.key === 'AuthorizeRemoteTxRequests')).toEqual({
+        key: 'AuthorizeRemoteTxRequests',
+        value: 'false',
+        readonly: true,
+      });
     });
 
     it('reflects the EVSE count in NumberOfConnectors', () => {
@@ -70,6 +97,14 @@ describe('buildCssConfigDefaults', () => {
   });
 
   describe('OCPP 2.1', () => {
+    it('spreads reconnects through the factory back-off (Part 4 5.4)', () => {
+      const m = keyMap(buildCssConfigDefaults(baseInput()));
+      expect(m.get('OCPPCommCtrlr.RetryBackOffWaitMinimum')).toBe('2');
+      expect(m.get('OCPPCommCtrlr.RetryBackOffRandomRange')).toBe(String(CSS_RECONNECT_SPREAD_S));
+      expect(m.get('OCPPCommCtrlr.RetryBackOffRepeatTimes')).toBe('3');
+      expect(CSS_RECONNECT_SPREAD_S).toBe(15);
+    });
+
     it('includes the OCPP 2.1 device model keys', () => {
       const m = keyMap(buildCssConfigDefaults(baseInput()));
 
@@ -78,6 +113,17 @@ describe('buildCssConfigDefaults', () => {
       expect(m.get('ChargingStation.Model')).toBe('TestModel');
       expect(m.get('SecurityCtrlr.SecurityProfile')).toBe('1');
       expect(m.get('SecurityCtrlr.Identity')).toBe('TEST-001');
+      // Certificate signing (A02, A00.FR.509)
+      expect(m.get('SecurityCtrlr.OrganizationName')).toBe('TestVendor');
+      expect(m.get('SecurityCtrlr.CertSigningWaitMinimum')).toBe('60');
+      expect(m.get('SecurityCtrlr.CertSigningRepeatTimes')).toBe('3');
+    });
+
+    it('reports connector status with both messages by default', () => {
+      const m = keyMap(buildCssConfigDefaults(baseInput()));
+      expect(m.get('SimulatorCtrlr.StatusReporting')).toBe('Both');
+      const m16 = keyMap(buildCssConfigDefaults(baseInput({ ocppProtocol: 'ocpp1.6' })));
+      expect(m16.has('SimulatorCtrlr.StatusReporting')).toBe(false);
     });
 
     it('seeds NetworkConfiguration slot 1 with the simulator targetUrl', () => {

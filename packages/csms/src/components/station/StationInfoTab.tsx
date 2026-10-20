@@ -10,6 +10,7 @@ import { RemoveButton } from '@/components/remove-button';
 import { CopyableId } from '@/components/copyable-id';
 import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -21,8 +22,11 @@ import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { FileViewerDialog } from '@/components/FileViewerDialog';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { useToast } from '@/components/ui/toast';
 import { OCPP_BASE_URL } from '@/lib/config';
 import { formatDateTime } from '@/lib/timezone';
+import { StationAiInsightsRow } from './StationAiInsightsRow';
+import type { StationAiInsightsState } from './StationAiInsightsRow';
 
 interface Site {
   id: string;
@@ -30,7 +34,7 @@ interface Site {
   timezone: string;
 }
 
-interface Station {
+interface Station extends StationAiInsightsState {
   id: string;
   stationId: string;
   siteId: string | null;
@@ -43,6 +47,7 @@ interface Station {
   availability: string;
   onboardingStatus: string;
   status: string;
+  statusReason?: string | null | undefined;
   isOnline: boolean;
   isSimulator: boolean;
   lastHeartbeat: string | null;
@@ -88,6 +93,7 @@ export function StationInfoTab({
 }: StationInfoTabProps): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const { toast } = useToast();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [model, setModel] = useState('');
@@ -152,6 +158,9 @@ export function StationInfoTab({
       void queryClient.invalidateQueries({ queryKey: ['stations'] });
       void navigate('/stations');
     },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+    },
   });
 
   function startEdit(): void {
@@ -196,7 +205,9 @@ export function StationInfoTab({
           {editing ? (
             <form onSubmit={handleSave} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="edit-model">{t('stations.model')}</Label>
+                <Label htmlFor="edit-model" className="leading-6">
+                  {t('stations.model')}
+                </Label>
                 <Input
                   id="edit-model"
                   value={model}
@@ -206,7 +217,9 @@ export function StationInfoTab({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-serial">{t('stations.serialNumber')}</Label>
+                <Label htmlFor="edit-serial" className="leading-6">
+                  {t('stations.serialNumber')}
+                </Label>
                 <Input
                   id="edit-serial"
                   value={serialNumber}
@@ -216,14 +229,15 @@ export function StationInfoTab({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="edit-site">{t('stations.site')}</Label>
+                <Label htmlFor="edit-site" className="leading-6">
+                  {t('stations.site')}
+                </Label>
                 <Select
                   id="edit-site"
                   value={siteId}
                   onChange={(e) => {
                     setSiteId(e.target.value);
                   }}
-                  className="h-9"
                 >
                   <option value="">{t('common.noSite')}</option>
                   {sites?.map((s) => (
@@ -246,24 +260,22 @@ export function StationInfoTab({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="grid gap-2">
                   <Label htmlFor="edit-latitude">{t('stations.latitude')}</Label>
-                  <Input
+                  <DecimalInput
                     id="edit-latitude"
                     value={latitude}
-                    onChange={(e) => {
-                      setLatitude(e.target.value);
-                    }}
+                    onChange={setLatitude}
                     placeholder="43.338131"
+                    allowNegative
                   />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="edit-longitude">{t('stations.longitude')}</Label>
-                  <Input
+                  <DecimalInput
                     id="edit-longitude"
                     value={longitude}
-                    onChange={(e) => {
-                      setLongitude(e.target.value);
-                    }}
+                    onChange={setLongitude}
                     placeholder="-73.695849"
+                    allowNegative
                   />
                 </div>
               </div>
@@ -307,7 +319,7 @@ export function StationInfoTab({
                 <dt className="text-muted-foreground">{t('stations.site')}</dt>
                 <dd className="font-medium">
                   {station.siteId != null ? (
-                    <Link to={`/sites/${station.siteId}`} className="text-primary hover:underline">
+                    <Link to={`/sites/${station.siteId}`} className="text-link hover:underline">
                       {sites?.find((s) => s.id === station.siteId)?.name ?? station.siteId}
                     </Link>
                   ) : (
@@ -317,7 +329,15 @@ export function StationInfoTab({
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.status')}</dt>
-                <dd className="font-medium">{t(`status.${station.status}`, station.status)}</dd>
+                <dd className="font-medium">
+                  {t(`status.${station.status}`, station.status)}
+                  {station.statusReason != null &&
+                    (station.status === 'unavailable' || station.status === 'faulted') && (
+                      <span className="block text-sm font-normal text-muted-foreground">
+                        {t(`stations.statusReason.${station.statusReason}`, station.statusReason)}
+                      </span>
+                    )}
+                </dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('stations.vendor')}</dt>
@@ -392,6 +412,11 @@ export function StationInfoTab({
                   )}
                 </dd>
               </div>
+              <StationAiInsightsRow
+                stationId={station.id}
+                station={station}
+                timezone={siteTimezone}
+              />
             </dl>
           )}
         </CardContent>

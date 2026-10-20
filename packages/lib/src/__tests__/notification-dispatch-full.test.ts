@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { encryptString } from '../encryption.js';
 
 // --- Mocks ---
@@ -38,6 +38,12 @@ vi.mock('../encryption.js', async (importOriginal) => {
 const mockFetch = vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve('') });
 vi.stubGlobal('fetch', mockFetch);
 
+// The connect-time DNS guard of safeFetch has its own tests (safe-fetch.test.ts).
+vi.mock('../safe-fetch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../safe-fetch.js')>()),
+  safeFetch: (...args: unknown[]) => (globalThis.fetch as (...a: unknown[]) => unknown)(...args),
+}));
+
 // --- SQL mock ---
 
 const sqlCalls: Array<{ strings: TemplateStringsArray; values: unknown[] }> = [];
@@ -70,6 +76,11 @@ async function freshImport() {
 
 describe('notification-dispatch (full coverage)', () => {
   let sql: ReturnType<typeof createSqlMock>;
+
+  // Loaded once here, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+  beforeAll(async () => {
+    await freshImport();
+  }, 30_000);
 
   beforeEach(() => {
     sql = createSqlMock();
@@ -396,18 +407,45 @@ describe('notification-dispatch (full coverage)', () => {
       expect(result.body).toBe('SMS override text');
     });
 
-    it('uses defaultSubject when DB template has null subject', async () => {
+    it('uses the subject file when the DB template has a null subject', async () => {
       const { renderTemplate } = await freshImport();
       setupSqlResults([{ subject: null, body_html: '<p>Body only</p>' }]);
+      mockReadFile.mockImplementation((path: string) =>
+        path === '/subj-db/ko/session/Started/subject.hbs'
+          ? Promise.resolve('{{{companyName}}} - 충전 세션이 시작되었습니다\n')
+          : Promise.reject(new Error('ENOENT')),
+      );
       const result = await renderTemplate(
         'email',
         'session.Started',
-        'en',
+        'ko',
         { companyName: 'TestCo' },
         sql as never,
+        undefined,
+        '/subj-db',
       );
-      expect(result.subject).toContain('TestCo');
-      expect(result.subject).toContain('started');
+      expect(result.subject).toBe('TestCo - 충전 세션이 시작되었습니다');
+      expect(result.html).toBe('<p>Body only</p>');
+    });
+
+    it('prefers the DB subject over the subject file', async () => {
+      const { renderTemplate } = await freshImport();
+      setupSqlResults([{ subject: 'Custom {{companyName}}', body_html: '<p>Body</p>' }]);
+      mockReadFile.mockImplementation((path: string) =>
+        path.endsWith('subject.hbs')
+          ? Promise.resolve('File subject')
+          : Promise.reject(new Error('ENOENT')),
+      );
+      const result = await renderTemplate(
+        'email',
+        'session.Started',
+        'de',
+        { companyName: 'TestCo' },
+        sql as never,
+        undefined,
+        '/subj-db-wins',
+      );
+      expect(result.subject).toBe('Custom TestCo');
     });
 
     it('does not set html for sms channel from DB template', async () => {
@@ -509,29 +547,60 @@ describe('notification-dispatch (full coverage)', () => {
       expect(result.subject).toContain('Notification');
     });
 
-    it('uses friendly subject for all known event types', async () => {
+    it('renders the subject file in the recipient language without HTML escaping', async () => {
       const { renderTemplate } = await freshImport();
-      const knownTypes = [
-        'session.Completed',
-        'session.Updated',
-        'session.PaymentReceived',
-        'driver.Welcome',
-        'driver.ForgotPassword',
-        'driver.PasswordChanged',
-        'driver.AccountVerification',
+      mockReadFile.mockImplementation((path: string) => {
+        if (path === '/subj-lang/zh-TW/payment/Complete/email.hbs') {
+          return Promise.resolve('<p>{{amountFormatted}}</p>');
+        }
+        if (path === '/subj-lang/zh-TW/payment/Complete/subject.hbs') {
+          return Promise.resolve('{{{companyName}}} - 付款確認\n');
+        }
+        return Promise.reject(new Error('ENOENT'));
+      });
+      const result = await renderTemplate(
+        'email',
         'payment.Complete',
-        'payment.Refunded',
-        'reservation.Expiring',
-        'reservation.Expired',
+        'zh-TW',
+        { companyName: 'A & B', amountFormatted: '$1.00' },
+        undefined,
+        undefined,
+        '/subj-lang',
+      );
+      expect(result.subject).toBe('A & B - 付款確認');
+      expect(result.html).toBe('<p>$1.00</p>');
+    });
+
+    it('falls back to the en subject file when the language has none', async () => {
+      const { renderTemplate } = await freshImport();
+      mockReadFile.mockImplementation((path: string) =>
+        path === '/subj-fallback/en/session/Receipt/subject.hbs'
+          ? Promise.resolve('{{{companyName}}} - Charging session receipt')
+          : Promise.reject(new Error('ENOENT')),
+      );
+      const result = await renderTemplate(
+        'sms',
         'session.Receipt',
-        'operator.ForgotPassword',
-        'report.Scheduled',
-      ];
-      for (const eventType of knownTypes) {
-        const result = await renderTemplate('sms', eventType, 'en', { companyName: 'Acme' });
-        expect(result.subject).toContain('Acme');
-        expect(result.subject).not.toContain('Notification');
-      }
+        'ko',
+        { companyName: 'Acme' },
+        undefined,
+        undefined,
+        '/subj-fallback',
+      );
+      expect(result.subject).toBe('Acme - Charging session receipt');
+    });
+
+    it('searches the template directories in order for the subject', async () => {
+      const { loadSubjectTemplate } = await freshImport();
+      mockReadFile.mockImplementation((path: string) =>
+        path === '/subj-second/es/token/Added/subject.hbs'
+          ? Promise.resolve('  Segundo  \n')
+          : Promise.reject(new Error('ENOENT')),
+      );
+      await expect(
+        loadSubjectTemplate('token.Added', 'es', ['/subj-first', '/subj-second']),
+      ).resolves.toBe('Segundo');
+      await expect(loadSubjectTemplate('token.Added', 'es')).resolves.toBeNull();
     });
 
     it('skips DB lookup when sql is not provided', async () => {
@@ -618,11 +687,8 @@ describe('notification-dispatch (full coverage)', () => {
 
     it('falls through to JSON fallback when DB template has null bodyHtml', async () => {
       const { renderTemplate } = await freshImport();
-      // dbTemplate is found (not null) but bodyHtml is null.
-      // The fallback condition checks `dbTemplate == null` which is false,
-      // so no English fallback is attempted. The second condition
-      // `dbTemplate != null && dbTemplate.bodyHtml != null` is also false,
-      // so it falls through to file templates or JSON dump.
+      // A 'fr' row without a body does not count; the file has none either,
+      // so English is tried next (DB, then file) before the JSON dump.
       setupSqlResults([{ subject: 'Has Subject', body_html: null }]);
       const result = await renderTemplate(
         'email',
@@ -633,8 +699,8 @@ describe('notification-dispatch (full coverage)', () => {
       );
       // Falls through to JSON dump since no file templates either
       expect(JSON.parse(result.body)).toHaveProperty('companyName', 'Co');
-      // Only 1 SQL call (no English fallback since dbTemplate was found, just with null body)
-      expect(sqlCalls.length).toBe(1);
+      // 'fr' then 'en' DB lookups.
+      expect(sqlCalls.length).toBe(2);
     });
   });
 
@@ -856,7 +922,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notifications
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-1', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-1', {}, []);
       // Should reach the email send stage (6+ SQL calls)
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
@@ -887,7 +953,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notifications (sms)
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-2', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-2', {}, []);
       // No email SQL calls (no renderTemplate for email, no INSERT for email)
       // Should still process SMS
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
@@ -919,7 +985,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT email notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-3', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-3', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -949,7 +1015,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-4', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-4', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -979,7 +1045,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT email notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-5', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-5', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -1011,7 +1077,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-6', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-6', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(7);
 
       Date.now = realNow;
@@ -1049,7 +1115,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT email notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-7', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-7', {}, []);
       expect(mockSendMail).toHaveBeenCalled();
 
       Date.now = realNow;
@@ -1087,7 +1153,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notification (should have status 'failed')
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-8', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-8', {}, []);
       // The INSERT call should have 'failed' as the status
       const insertCall = sqlCalls.find((c) => c.values.some((v) => v === 'failed'));
       expect(insertCall).toBeTruthy();
@@ -1123,7 +1189,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-9', {});
+      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-9', {}, []);
       expect(mockFetch).toHaveBeenCalledWith(
         expect.stringContaining('twilio.com'),
         expect.objectContaining({ method: 'POST' }),
@@ -1166,7 +1232,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-10', {});
+      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-10', {}, []);
       const insertCall = sqlCalls.find((c) => c.values.some((v) => v === 'failed'));
       expect(insertCall).toBeTruthy();
 
@@ -1197,7 +1263,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT push notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-11', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-11', {}, []);
       // SMTP must not be called when it isn't configured, but the dispatcher
       // now always writes an audit row with failureReason='smtp_not_configured'
       // so operators can see the attempt in the Email Log.
@@ -1240,7 +1306,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT push notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-12', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-12', {}, []);
       // Twilio must not be called when it isn't configured, but the dispatcher
       // now always writes an audit row with failureReason='twilio_not_configured'.
       expect(mockFetch).not.toHaveBeenCalled();
@@ -1282,7 +1348,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-13', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-13', {}, []);
       // Email path skipped even though email_enabled is true because email is empty
       expect(mockSendMail).not.toHaveBeenCalled();
 
@@ -1313,7 +1379,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT email notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-14', {});
+      await dispatchDriverNotification(sql as never, 'session.Started', 'driver-14', {}, []);
       expect(mockFetch).not.toHaveBeenCalled();
 
       Date.now = realNow;
@@ -1344,7 +1410,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT email notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-15', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-15', {}, []);
       // Check that the renderTemplate DB lookup used 'es' language
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
@@ -1386,9 +1452,15 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-16', {
-        customVar: 'hello',
-      });
+      await dispatchDriverNotification(
+        sql as never,
+        'driver.Welcome',
+        'driver-16',
+        {
+          customVar: 'hello',
+        },
+        [],
+      );
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -1425,7 +1497,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-17', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-17', {}, []);
       // The sendEmail call should include wrapped HTML
       expect(mockSendMail).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1460,7 +1532,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT notification
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-18', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-18', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -1493,7 +1565,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-19', {});
+      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-19', {}, []);
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;
@@ -1535,7 +1607,7 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT sms notification
       );
 
-      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-20', {});
+      await dispatchDriverNotification(sql as never, 'session.Completed', 'driver-20', {}, []);
       expect(mockSendMail).toHaveBeenCalled();
       expect(mockFetch).toHaveBeenCalledWith(
         expect.stringContaining('twilio.com'),
@@ -1591,8 +1663,8 @@ describe('notification-dispatch (full coverage)', () => {
       }) as unknown;
 
       await expect(
-        dispatchDriverNotification(throwingSql as never, 'test.event', 'driver-err', {}),
-      ).resolves.toBeUndefined();
+        dispatchDriverNotification(throwingSql as never, 'test.event', 'driver-err', {}, []),
+      ).resolves.toEqual({ delivered: [] });
     });
 
     it('overrides enriched variables with caller-provided variables', async () => {
@@ -1621,9 +1693,15 @@ describe('notification-dispatch (full coverage)', () => {
         [], // INSERT
       );
 
-      await dispatchDriverNotification(sql as never, 'driver.Welcome', 'driver-22', {
-        companyName: 'OverrideCo',
-      });
+      await dispatchDriverNotification(
+        sql as never,
+        'driver.Welcome',
+        'driver-22',
+        {
+          companyName: 'OverrideCo',
+        },
+        [],
+      );
       expect(sqlCalls.length).toBeGreaterThanOrEqual(5);
 
       Date.now = realNow;

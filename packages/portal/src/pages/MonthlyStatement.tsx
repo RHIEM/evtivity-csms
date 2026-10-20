@@ -7,9 +7,18 @@ import { useQuery } from '@tanstack/react-query';
 import { PageHeader } from '@/components/PageHeader';
 import { Skeleton } from '@/components/ui/skeleton';
 import { api } from '@/lib/api';
-import { formatCents, formatEnergy, formatDuration, formatDistance, formatDate } from '@/lib/utils';
+import {
+  formatCents,
+  formatEnergy,
+  formatDuration,
+  formatDistance,
+  formatDate,
+  formatNumber,
+} from '@/lib/utils';
 import { useDriverTimezone } from '@/lib/timezone';
 import { useAuth } from '@/lib/auth';
+import { costContainsTax } from '@evtivity/lib/price-display';
+import type { SessionAccountBilling } from '@/lib/fleet-billing';
 
 interface StatementSession {
   id: string;
@@ -17,10 +26,12 @@ interface StatementSession {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   finalCostCents: number | null;
+  taxCents: number | null;
   currency: string;
   siteName: string | null;
   siteCity: string | null;
   co2AvoidedKg: number | null;
+  accountBilling: SessionAccountBilling | null;
 }
 
 interface StatementResponse {
@@ -33,6 +44,10 @@ interface StatementResponse {
     totalEnergyWh: number;
     sessionCount: number;
     totalCo2AvoidedKg: number | null;
+    /** Sessions billed in an earlier currency, left out of totalCostCents. */
+    otherCurrencySessionCount: number;
+    /** Sessions invoiced to a fleet, left out of totalCostCents. */
+    fleetBilledSessionCount: number;
   };
 }
 
@@ -40,8 +55,12 @@ function monthLabel(month: string, locale: string): string {
   const [yearStr, monthStr] = month.split('-');
   const date = new Date(Number(yearStr), Number(monthStr) - 1, 1);
   const end = new Date(Number(yearStr), Number(monthStr), 0);
-  const monthName = date.toLocaleDateString(locale, { month: 'long' });
-  return `${monthName} ${String(date.getDate())} - ${monthName} ${String(end.getDate())}, ${String(date.getFullYear())}`;
+  // e.g. "October 1 – 31, 2026" (en) or "1.–31. Oktober 2026" (de)
+  return new Intl.DateTimeFormat(locale, {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  }).formatRange(date, end);
 }
 
 export function MonthlyStatement(): React.JSX.Element {
@@ -67,6 +86,10 @@ export function MonthlyStatement(): React.JSX.Element {
   });
   const efficiency = efficiencyData?.efficiencyMiPerKwh ?? 3.5;
   const hasCo2Data = data?.sessions.some((s) => s.co2AvoidedKg != null) === true;
+  // The cost column (and its total) reads "incl. tax" only when a session's
+  // cost actually contains tax, the rule the session lists label each row by.
+  const costsIncludeTax =
+    data?.sessions.some((s) => costContainsTax(s.finalCostCents, s.taxCents)) === true;
 
   return (
     <div className="space-y-4">
@@ -108,7 +131,9 @@ export function MonthlyStatement(): React.JSX.Element {
                     <th className="hidden md:table-cell px-2 py-2 text-right">
                       {t('statement.miles')}
                     </th>
-                    <th className="px-2 py-2 text-right">{t('activity.cost')}</th>
+                    <th className="px-2 py-2 text-right">
+                      {costsIncludeTax ? t('statement.costInclTax') : t('statement.cost')}
+                    </th>
                     {hasCo2Data && (
                       <th className="hidden md:table-cell px-2 py-2 text-right">
                         {t('statement.co2Avoided')}
@@ -136,11 +161,16 @@ export function MonthlyStatement(): React.JSX.Element {
                         {formatDistance(s.energyDeliveredWh, efficiency, distanceUnit)}
                       </td>
                       <td className="px-2 py-2 text-right">
-                        {formatCents(s.finalCostCents, s.currency)}
+                        {/* A session invoiced to its fleet is not the driver's to
+                            pay: it is listed as billed to the fleet and stays out
+                            of the total. */}
+                        {s.accountBilling?.invoicedTo === 'fleet'
+                          ? t('fleetBilling.billedTo', { fleet: s.accountBilling.fleetName })
+                          : formatCents(s.finalCostCents, s.currency)}
                       </td>
                       {hasCo2Data && (
                         <td className="hidden md:table-cell px-2 py-2 text-right text-success">
-                          {s.co2AvoidedKg != null ? `${s.co2AvoidedKg.toFixed(2)} kg` : 'n/a'}
+                          {s.co2AvoidedKg != null ? `${formatNumber(s.co2AvoidedKg, 2)} kg` : 'n/a'}
                         </td>
                       )}
                       <td className="hidden md:table-cell px-2 py-2 text-right text-xs whitespace-nowrap">
@@ -165,7 +195,7 @@ export function MonthlyStatement(): React.JSX.Element {
                     {hasCo2Data && (
                       <td className="hidden md:table-cell px-2 py-2 text-right text-success">
                         {data.totals.totalCo2AvoidedKg != null
-                          ? `${data.totals.totalCo2AvoidedKg.toFixed(2)} kg`
+                          ? `${formatNumber(data.totals.totalCo2AvoidedKg, 2)} kg`
                           : 'n/a'}
                       </td>
                     )}
@@ -173,6 +203,14 @@ export function MonthlyStatement(): React.JSX.Element {
                   </tr>
                 </tfoot>
               </table>
+              {data.totals.otherCurrencySessionCount > 0 && (
+                <p className="px-2 pt-3 text-xs text-muted-foreground">
+                  {t('statement.otherCurrencyNote', {
+                    count: data.totals.otherCurrencySessionCount,
+                    currency: data.totals.currency,
+                  })}
+                </p>
+              )}
             </div>
           )}
         </>

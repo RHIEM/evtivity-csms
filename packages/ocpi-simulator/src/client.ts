@@ -3,6 +3,7 @@
 
 import crypto from 'node:crypto';
 import { state } from './state.js';
+import { outboundUrl } from './target-url.js';
 
 function buildHeaders(token: string): Record<string, string> {
   const tokenBase64 = Buffer.from(token).toString('base64');
@@ -45,12 +46,17 @@ function requireToken(): string {
 const OUTBOUND_TIMEOUT_MS = 10_000;
 
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  // Throws for a URL off the configured target, before any request is made.
+  const target = outboundUrl(url, process.env);
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
   }, OUTBOUND_TIMEOUT_MS);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(target, {
+      ...init,
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timer);
   }

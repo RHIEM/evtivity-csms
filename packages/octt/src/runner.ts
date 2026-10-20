@@ -3,17 +3,42 @@
 
 import crypto from 'node:crypto';
 import pino from 'pino';
-import { db, chargingStations, drivers, driverTokens } from '@evtivity/database';
-import { refreshTokens, users, OCTT_API_KEY_NAME } from '@evtivity/database';
+import {
+  db,
+  drivers,
+  driverTokens,
+  deleteConformanceStations,
+  deleteConformanceTestDriver,
+} from '@evtivity/database';
+import {
+  refreshTokens,
+  roles,
+  users,
+  OCTT_API_KEY_NAME,
+  PNC_SETTINGS_CACHE_TTL_MS,
+} from '@evtivity/database';
 import { createId } from '@evtivity/database/src/lib/id.js';
-import { like, eq, sql } from 'drizzle-orm';
+import { OCTT_TEST_DRIVER_EMAIL } from '@evtivity/lib';
+import { and, asc, eq, sql } from 'drizzle-orm';
 
-import type { RunConfig, RunSummary, TestCaseResult, TestCase, TriggerCommandFn } from './types.js';
+import type {
+  RunConfig,
+  RunSummary,
+  TestCaseResult,
+  TestCase,
+  TriggerCommandFn,
+  CallApiFn,
+} from './types.js';
 import { getRegistry } from './registry.js';
+import { OCTT_THRESHOLD_KWH } from './tariff-test-constants.js';
 import { executeTest } from './executor.js';
 import { createApiClient } from './api-client.js';
+import { startOcspTestService, type OcspTestService } from './ocsp-test-service.js';
+import { getNotApplicable } from './pics/index.js';
 
 const DEFAULT_CONCURRENCY = 3;
+/** Added to the CSMS settings cache TTL before the run relies on a changed setting. */
+const SETTINGS_CACHE_MARGIN_MS = 1_000;
 
 export async function runTests(
   config: RunConfig,
@@ -25,97 +50,9 @@ export async function runTests(
 
   const provisionStations = config.provisionStations ?? true;
   if (provisionStations) {
-    // Remove any OCTT artifacts left over from a previous crashed run.
-    await deleteOcttStationsAndArtifacts();
+    // Remove the stations, test driver and pricing group a crashed run left.
+    await deleteRunData(logger);
     logger.info('Stations will be auto-provisioned per test');
-  }
-
-  // Provision a test driver and tokens so Authorize requests return Accepted
-  let testDriverId = createId('driver');
-  let octtPricingGroupId: string | null = null;
-  let octtTariffId: string | null = null;
-  let pncBackup: { key: string; value: unknown }[] = [];
-  if (provisionStations) {
-    testDriverId = await provisionTestDriverAndTokens(testDriverId);
-    logger.info('Test driver and tokens provisioned');
-
-    // Provision a test pricing group and tariff for TC_I_109 (driver tariff in AuthorizeResponse)
-    const ids = await provisionTestTariff(testDriverId);
-    octtPricingGroupId = ids.pricingGroupId;
-    octtTariffId = ids.tariffId;
-    logger.info('Test pricing group and tariff provisioned');
-
-    // Capture prior PnC settings so the run can restore them afterwards.
-    pncBackup = (await db.execute(sql`
-      SELECT key, value FROM settings WHERE key IN ('pnc.enabled', 'pnc.provider')
-    `)) as unknown as { key: string; value: unknown }[];
-
-    // Enable PnC for M-certificate-management tests
-    await db.execute(sql`
-      INSERT INTO settings (key, value) VALUES ('pnc.enabled', 'true'::jsonb)
-      ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb
-    `);
-    // Set provider to manual so certificate signing flows work
-    await db.execute(sql`
-      INSERT INTO settings (key, value) VALUES ('pnc.provider', '"manual"'::jsonb)
-      ON CONFLICT (key) DO UPDATE SET value = '"manual"'::jsonb
-    `);
-    logger.info('PnC enabled for certificate management tests');
-  }
-
-  // Create a temporary API key for triggering CSMS-initiated commands
-  let triggerCommand: TriggerCommandFn | undefined;
-  let apiKeyId: number | undefined;
-  let adminUserId: string | undefined;
-  let priorAdminAllSiteAccess = false;
-  if (config.apiUrl != null) {
-    try {
-      // Find the first active admin user with all-site access
-      const [admin] = await db
-        .select({ id: users.id, hasAllSiteAccess: users.hasAllSiteAccess })
-        .from(users)
-        .where(eq(users.isActive, true))
-        .limit(1);
-      if (admin != null) {
-        // Grant all-site access for OCTT commands, remembering the prior value so
-        // it can be restored after the run.
-        adminUserId = admin.id;
-        priorAdminAllSiteAccess = admin.hasAllSiteAccess;
-        await db.update(users).set({ hasAllSiteAccess: true }).where(eq(users.id, admin.id));
-        // Create a temporary API key
-        const raw = crypto.randomBytes(32).toString('hex');
-        const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
-        const [row] = await db
-          .insert(refreshTokens)
-          .values({
-            userId: admin.id,
-            tokenHash,
-            type: 'api_key' as const,
-            name: OCTT_API_KEY_NAME,
-          })
-          .returning({ id: refreshTokens.id });
-        if (row != null) {
-          apiKeyId = row.id;
-          const apiClient = await createApiClient(config.apiUrl, raw, logger);
-          // Verify the API key works by hitting an authenticated endpoint
-          const testRes = await fetch(`${config.apiUrl}/v1/settings/system.timezone`, {
-            headers: { Authorization: `Bearer ${raw}` },
-          });
-          if (!testRes.ok) {
-            throw new Error(`API key verification failed (${String(testRes.status)})`);
-          }
-          triggerCommand = apiClient.triggerCommand;
-          logger.info(
-            'API key created and verified - CSMS-initiated commands will be triggered via REST API',
-          );
-        }
-      }
-    } catch (err) {
-      logger.warn(
-        { error: err instanceof Error ? err.message : String(err) },
-        'API client setup failed - CSMS-initiated tests will timeout',
-      );
-    }
   }
 
   const tests = allTests.filter((tc) => {
@@ -132,161 +69,450 @@ export async function runTests(
     failed: 0,
     skipped: 0,
     errors: 0,
+    notApplicable: 0,
     durationMs: 0,
   };
 
-  const start = Date.now();
+  // Everything the run changes, undone in the finally block below whatever
+  // happens during the run.
+  let testDriverId = createId('driver');
+  let settingsChanges: SettingChange[] = [];
+  let triggerCommand: TriggerCommandFn | undefined;
+  let callApi: CallApiFn | undefined;
+  let apiKeyId: number | undefined;
+  let adminUserId: string | undefined;
+  let priorAdminAllSiteAccess = false;
+  let ocsp: OcspTestService | undefined;
 
-  // Process tests with controlled concurrency
-  const queue = [...tests];
-  const running: Promise<void>[] = [];
+  try {
+    // Each CSMS process caches the pnc.* settings for PNC_SETTINGS_CACHE_TTL_MS,
+    // so a changed value takes effect only after that (see waitForSettings).
+    let settingsEffectiveAt = 0;
+    if (provisionStations) {
+      // The test driver that owns the per-test tokens (see executeTest)
+      testDriverId = await provisionTestDriver(testDriverId);
+      logger.info('Test driver provisioned');
 
-  while (queue.length > 0 || running.length > 0) {
-    while (running.length < concurrency && queue.length > 0) {
-      const testCase = queue.shift();
-      if (testCase == null) break;
-      const promise = processTest(testCase, config, logger, summary, onResult, triggerCommand).then(
-        () => {
+      // A test pricing group and tariff for TC_I_109 (driver tariff in AuthorizeResponse)
+      await provisionTestTariff(testDriverId);
+      logger.info('Test pricing group and tariff provisioned');
+
+      // PnC on with the local provider (it queues CSRs for signing like the
+      // manual provider and issues ISO 15118 contract certificates: TC_M_26,
+      // TC_M_28, TC_M_100), the test eMAID prefix unless the operator set one,
+      // and the Test System OCSP responder host allowed (TC_C_50/51/52, TC_M_24).
+      settingsChanges = await applyRunSettings(config.ocspResponderUrl);
+      if (settingsChanges.length > 0) {
+        settingsEffectiveAt = Date.now() + PNC_SETTINGS_CACHE_TTL_MS + SETTINGS_CACHE_MARGIN_MS;
+      }
+      logger.info(
+        { changed: settingsChanges.map((c) => c.key) },
+        'PnC settings set for certificate management tests',
+      );
+    }
+
+    // Create a temporary API key for triggering CSMS-initiated commands
+    if (config.apiUrl != null) {
+      try {
+        // Find the first active admin user with all-site access
+        const [admin] = await db
+          .select({ id: users.id, hasAllSiteAccess: users.hasAllSiteAccess })
+          .from(users)
+          .innerJoin(roles, eq(roles.id, users.roleId))
+          .where(and(eq(users.isActive, true), eq(roles.name, 'admin')))
+          .orderBy(asc(users.createdAt))
+          .limit(1);
+        if (admin != null) {
+          // Grant all-site access for OCTT commands, remembering the prior value so
+          // it can be restored after the run.
+          adminUserId = admin.id;
+          priorAdminAllSiteAccess = admin.hasAllSiteAccess;
+          await db.update(users).set({ hasAllSiteAccess: true }).where(eq(users.id, admin.id));
+          // Create a temporary API key
+          const raw = crypto.randomBytes(32).toString('hex');
+          const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
+          const [row] = await db
+            .insert(refreshTokens)
+            .values({
+              userId: admin.id,
+              tokenHash,
+              type: 'api_key' as const,
+              name: OCTT_API_KEY_NAME,
+            })
+            .returning({ id: refreshTokens.id });
+          if (row != null) {
+            apiKeyId = row.id;
+            const apiClient = await createApiClient(config.apiUrl, raw, logger);
+            // Verify the API key works by hitting an authenticated endpoint
+            const testRes = await fetch(`${config.apiUrl}/v1/settings/system.timezone`, {
+              headers: { Authorization: `Bearer ${raw}` },
+            });
+            if (!testRes.ok) {
+              throw new Error(`API key verification failed (${String(testRes.status)})`);
+            }
+            triggerCommand = apiClient.triggerCommand;
+            callApi = apiClient.callApi;
+            logger.info(
+              'API key created and verified - CSMS-initiated commands will be triggered via REST API',
+            );
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { error: err instanceof Error ? err.message : String(err) },
+          'API client setup failed - CSMS-initiated tests will timeout',
+        );
+      }
+    }
+
+    // Tests and the MO root upload below need the CSMS to see the settings.
+    await waitForSettings(settingsEffectiveAt, logger);
+
+    // The local contract CA the contract certificate tests need. Created through
+    // the operator route when the CSMS has none; the run end restores the
+    // previous setting, which removes it again.
+    if (callApi != null && provisionStations) {
+      const caChange = await ensureLocalContractCa(callApi, logger);
+      if (caChange != null) settingsChanges.push(caChange);
+    }
+
+    // The Test System OCSP service: a test PKI whose certificates name this
+    // responder, for the OCSP-backed certificate tests (TC_C_50/51, TC_M_24).
+    if (config.ocspResponderUrl != null) {
+      ocsp = await startOcspTestService(config.ocspResponderUrl);
+      logger.info({ url: config.ocspResponderUrl }, 'OCSP test responder started');
+      if (callApi != null) {
+        ocsp.installedMoRootId = await installMoRoot(callApi, ocsp, logger);
+      }
+    }
+
+    const start = Date.now();
+
+    // Process tests with controlled concurrency
+    const queue = [...tests];
+    const running: Promise<void>[] = [];
+
+    while (queue.length > 0 || running.length > 0) {
+      while (running.length < concurrency && queue.length > 0) {
+        const testCase = queue.shift();
+        if (testCase == null) break;
+        const promise = processTest(
+          testCase,
+          config,
+          logger,
+          summary,
+          onResult,
+          triggerCommand,
+          callApi,
+          provisionStations ? testDriverId : undefined,
+          ocsp,
+        ).then(() => {
           const idx = running.indexOf(promise);
           if (idx !== -1) void running.splice(idx, 1);
-        },
-      );
-      running.push(promise);
+        });
+        running.push(promise);
+      }
+      if (running.length > 0) {
+        await Promise.race(running);
+      }
     }
-    if (running.length > 0) {
-      await Promise.race(running);
+
+    summary.durationMs = Date.now() - start;
+  } finally {
+    // Each step on its own, so a failed one (the CSMS API unreachable at the
+    // end) never leaves the test stations, the driver or the settings behind.
+    const moRootId = ocsp?.installedMoRootId;
+    const api = callApi;
+    if (moRootId != null && api != null) {
+      await bestEffort(logger, 'Failed to remove the OCTT MO root certificate', async () => {
+        const res = await api('DELETE', `/pnc/ca-certificates/${String(moRootId)}`);
+        if (res.status >= 300) throw new Error(`status ${String(res.status)}`);
+      });
     }
-  }
-
-  summary.durationMs = Date.now() - start;
-
-  // Remove the temporary API key and restore the admin's prior site access.
-  if (apiKeyId != null) {
-    await db.delete(refreshTokens).where(eq(refreshTokens.id, apiKeyId));
-    logger.info('Temporary API key removed');
-  }
-  if (adminUserId != null && !priorAdminAllSiteAccess) {
-    await db.update(users).set({ hasAllSiteAccess: false }).where(eq(users.id, adminUserId));
-  }
-
-  // Clean up test driver and tokens (FK is ON DELETE SET NULL, so delete tokens first for clarity)
-  if (provisionStations) {
-    // Deferred to run end (not per-test) so the OCPP server's async projections
-    // finish before the rows are deleted. Removes OCTT stations plus the artifacts
-    // that do not cascade from them (CSRs, tariff segments, domain/authorize logs).
-    await deleteOcttStationsAndArtifacts();
-    logger.info('OCTT test stations cleaned up');
-
-    // Clean up tariff and pricing group (cascade deletes handle child records)
-    if (octtTariffId != null) {
-      await db.execute(sql`DELETE FROM tariffs WHERE id = ${octtTariffId}`);
+    const responder = ocsp?.responder;
+    if (responder != null) {
+      await bestEffort(logger, 'Failed to stop the OCSP test responder', () => responder.stop());
     }
-    if (octtPricingGroupId != null) {
-      await db.execute(sql`DELETE FROM pricing_groups WHERE id = ${octtPricingGroupId}`);
-    }
-    await db.delete(driverTokens).where(eq(driverTokens.driverId, testDriverId));
-    await db.delete(drivers).where(eq(drivers.id, testDriverId));
 
-    // Restore the PnC settings overwritten for the certificate tests.
-    await restorePncSettings(pncBackup);
-    logger.info('Test driver, tokens, tariff, and PnC settings cleaned up');
+    // Remove the temporary API key and restore the admin's prior site access.
+    const keyId = apiKeyId;
+    if (keyId != null) {
+      await bestEffort(logger, 'Failed to remove the temporary API key', async () => {
+        await db.delete(refreshTokens).where(eq(refreshTokens.id, keyId));
+        logger.info('Temporary API key removed');
+      });
+    }
+    const adminId = adminUserId;
+    if (adminId != null && !priorAdminAllSiteAccess) {
+      await bestEffort(logger, 'Failed to restore the admin site access', async () => {
+        await db.update(users).set({ hasAllSiteAccess: false }).where(eq(users.id, adminId));
+      });
+    }
+
+    if (provisionStations) {
+      // Deferred to run end (not per-test) so the OCPP server's async
+      // projections finish before the rows are deleted. A step that fails is
+      // retried by the worker sweep (`conformance-station-sweep`).
+      await deleteRunData(logger);
+      await bestEffort(logger, 'Failed to restore the PnC settings', async () => {
+        await restoreRunSettings(settingsChanges);
+        logger.info('PnC settings restored');
+      });
+    }
   }
 
   return summary;
 }
 
-async function deleteOcttStationsAndArtifacts(): Promise<void> {
-  // Rows that do not cascade from the station must be removed first, while the
-  // station and session rows still exist to identify them: session_tariff_segments
-  // has no session FK, and pki_csr_requests is ON DELETE SET NULL.
-  await db.execute(sql`
-    DELETE FROM session_tariff_segments
-    WHERE session_id IN (
-      SELECT cs.id FROM charging_sessions cs
-      JOIN charging_stations st ON st.id = cs.station_id
-      WHERE st.station_id LIKE 'OCTT-%'
-    )
-  `);
-  await db.execute(sql`
-    DELETE FROM pki_csr_requests
-    WHERE station_id IN (SELECT id FROM charging_stations WHERE station_id LIKE 'OCTT-%')
-  `);
-  // Keyed by the OCPP station id string / aggregate id (no FK), removable directly.
-  await db.execute(sql`DELETE FROM authorize_attempts WHERE station_id LIKE 'OCTT-%'`);
-  await db.execute(sql`DELETE FROM domain_events WHERE aggregate_id LIKE 'OCTT-%'`);
-  // Cascade clears evses, connectors, sessions, projection rows, and station certs.
-  await db.delete(chargingStations).where(like(chargingStations.stationId, 'OCTT-%'));
+/** Runs a teardown step, logging a failure at error instead of throwing. */
+async function bestEffort(
+  logger: pino.Logger,
+  message: string,
+  step: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await step();
+  } catch (err) {
+    logger.error({ err }, message);
+  }
 }
 
-async function restorePncSettings(backup: { key: string; value: unknown }[]): Promise<void> {
-  const saved = new Map(backup.map((row) => [row.key, row.value]));
-  for (const key of ['pnc.enabled', 'pnc.provider']) {
-    if (saved.has(key)) {
-      const value = JSON.stringify(saved.get(key) ?? null);
-      await db.execute(sql`UPDATE settings SET value = ${value}::jsonb WHERE key = ${key}`);
+/**
+ * Deletes the CSMS run's test stations (not the CS runner's `OCTT-CS-*`
+ * stations: a CS run may be going next to this one and deletes its own),
+ * then the test driver, its tokens and its pricing group. Runs at run start
+ * (leftovers of a crashed run) and at run end.
+ */
+async function deleteRunData(logger: pino.Logger): Promise<void> {
+  await bestEffort(logger, 'OCTT station cleanup failed', async () => {
+    const started = Date.now();
+    const stations = await deleteConformanceStations({ includeCs: false });
+    logger.info({ stations, durationMs: Date.now() - started }, 'OCTT test stations deleted');
+  });
+  await bestEffort(logger, 'OCTT test driver cleanup failed', async () => {
+    const result = await deleteConformanceTestDriver();
+    if (result.detachedRows > 0 || result.pricingGroupsKept > 0) {
+      logger.warn(result, 'OCTT test driver deleted; rows outside the run referenced it');
     } else {
+      logger.info(result, 'OCTT test driver, tokens and pricing group deleted');
+    }
+  });
+}
+
+/** Subject CN of the Test System MO root (see OcttTestPki). */
+const OCTT_MO_ROOT_CN = 'CN=OCTT MO Root CA';
+
+/**
+ * Deletes Test System MO roots a crashed run left in the CSMS, through the
+ * same product routes an operator uses.
+ */
+async function deleteLeftoverMoRoots(callApi: CallApiFn, logger: pino.Logger): Promise<void> {
+  const leftover: number[] = [];
+  for (let page = 1; ; page++) {
+    const res = await callApi(
+      'GET',
+      `/pnc/ca-certificates?certificateType=MORootCertificate&limit=100&page=${String(page)}`,
+    );
+    const rows = Array.isArray(res.body['data'])
+      ? (res.body['data'] as Record<string, unknown>[])
+      : [];
+    if (res.status >= 300) {
+      logger.warn({ status: res.status }, 'Could not list CA certificates for OCTT cleanup');
+      return;
+    }
+    for (const row of rows) {
+      if (
+        typeof row['id'] === 'number' &&
+        typeof row['subject'] === 'string' &&
+        row['subject'].includes(OCTT_MO_ROOT_CN)
+      ) {
+        leftover.push(row['id']);
+      }
+    }
+    if (rows.length < 100) break;
+  }
+  for (const id of leftover) {
+    const res = await callApi('DELETE', `/pnc/ca-certificates/${String(id)}`);
+    if (res.status >= 300) {
+      logger.warn({ status: res.status, id }, 'Could not delete a leftover OCTT MO root');
+    }
+  }
+  if (leftover.length > 0) {
+    logger.info({ count: leftover.length }, 'Deleted leftover OCTT MO root certificates');
+  }
+}
+
+/**
+ * Configures the Test System MO root in the CSMS the way an operator does
+ * (Certificates > Upload CA certificate), so a contract chain sent in
+ * AuthorizeRequest.certificate chains to a configured root (TC_C_52).
+ */
+async function installMoRoot(
+  callApi: CallApiFn,
+  ocsp: OcspTestService,
+  logger: pino.Logger,
+): Promise<number | null> {
+  await deleteLeftoverMoRoots(callApi, logger);
+  const res = await callApi('POST', '/pnc/ca-certificates', {
+    certificateType: 'MORootCertificate',
+    certificate: ocsp.pki.moRoot.cert.toString('pem'),
+  });
+  if (res.status < 300 && typeof res.body['id'] === 'number') {
+    logger.info('OCTT MO root certificate installed in the CSMS');
+    return res.body['id'];
+  }
+  logger.warn({ status: res.status, body: res.body }, 'Could not install the OCTT MO root');
+  return null;
+}
+
+const OCTT_EMAID_COUNTRY = 'US';
+const OCTT_EMAID_PROVIDER = 'OCT';
+
+/**
+ * Creates the local contract CA through the operator route when the CSMS has
+ * none. Returns the change to undo at run end (the previous `pnc.local.caEnc`)
+ * when it created one.
+ */
+async function ensureLocalContractCa(
+  callApi: CallApiFn,
+  logger: pino.Logger,
+): Promise<SettingChange | null> {
+  const status = await callApi('GET', '/pnc/settings/local-ca');
+  if (status.status >= 300) {
+    logger.warn({ status: status.status }, 'Could not read the local contract CA');
+    return null;
+  }
+  if (status.body['configured'] === true) return null;
+  const rows = (await db.execute(sql`
+    SELECT value FROM settings WHERE key = 'pnc.local.caEnc'
+  `)) as unknown as { value: unknown }[];
+  const created = await callApi('POST', '/pnc/settings/local-ca');
+  if (created.status < 300) {
+    logger.info('Local contract CA ready for the ISO 15118 contract certificate tests');
+    return { key: 'pnc.local.caEnc', previous: rows[0]?.value };
+  }
+  if (created.body['code'] === 'LOCAL_CA_EXISTS') {
+    logger.info('Local contract CA ready for the ISO 15118 contract certificate tests');
+  } else {
+    logger.warn({ status: created.status }, 'Could not create the local contract CA');
+  }
+  return null;
+}
+
+/** A setting the run changed: its key and the value before the run (undefined when unset). */
+export interface SettingChange {
+  key: string;
+  previous: unknown;
+}
+
+/**
+ * Sets what the certificate tests need: PnC on (`pnc.enabled`), the local PKI
+ * provider (`pnc.provider`: CSRs queue for the operator to sign through the
+ * API, and it issues ISO 15118 contract certificates), the test eMAID prefix
+ * when none is set (`pnc.local.emaidCountry`, `pnc.local.emaidProviderId`),
+ * and, with an OCSP responder, its host in `pnc.ocsp.allowedPrivateHosts` (the
+ * CSMS refuses OCSP requests to private addresses that are not listed). The
+ * tariff tests need split billing (`pricing.splitBillingEnabled`), which is
+ * on by default; the run leaves the operator's value alone.
+ * Returns the settings it changed, for restoreRunSettings.
+ */
+export async function applyRunSettings(ocspResponderUrl?: string): Promise<SettingChange[]> {
+  const rows = (await db.execute(sql`
+    SELECT key, value FROM settings
+    WHERE key IN ('pnc.enabled', 'pnc.provider', 'pnc.ocsp.allowedPrivateHosts',
+      'pnc.local.emaidCountry', 'pnc.local.emaidProviderId')
+  `)) as unknown as { key: string; value: unknown }[];
+  const current = new Map(rows.map((row) => [row.key, row.value]));
+
+  const wanted = new Map<string, unknown>([
+    ['pnc.enabled', true],
+    ['pnc.provider', 'local'],
+  ]);
+  // The eMAID prefix of the test contracts, unless the operator set one.
+  for (const [key, value] of [
+    ['pnc.local.emaidCountry', OCTT_EMAID_COUNTRY],
+    ['pnc.local.emaidProviderId', OCTT_EMAID_PROVIDER],
+  ] as const) {
+    const set = current.get(key);
+    if (typeof set !== 'string' || set === '') wanted.set(key, value);
+  }
+  if (ocspResponderUrl != null) {
+    const host = new URL(ocspResponderUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const hosts = current.get('pnc.ocsp.allowedPrivateHosts');
+    const list = Array.isArray(hosts)
+      ? hosts.filter((h): h is string => typeof h === 'string')
+      : [];
+    if (!list.map((h) => h.toLowerCase()).includes(host)) {
+      wanted.set('pnc.ocsp.allowedPrivateHosts', [...list, host]);
+    }
+  }
+
+  const changes: SettingChange[] = [];
+  for (const [key, value] of wanted) {
+    if (JSON.stringify(current.get(key)) === JSON.stringify(value)) continue;
+    const json = JSON.stringify(value);
+    await db.execute(sql`
+      INSERT INTO settings (key, value) VALUES (${key}, ${json}::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = ${json}::jsonb, updated_at = now()
+    `);
+    changes.push({ key, previous: current.get(key) });
+  }
+  return changes;
+}
+
+/** Puts back the settings applyRunSettings changed. */
+export async function restoreRunSettings(changes: SettingChange[]): Promise<void> {
+  for (const { key, previous } of changes) {
+    if (previous === undefined) {
       await db.execute(sql`DELETE FROM settings WHERE key = ${key}`);
+    } else {
+      const json = JSON.stringify(previous);
+      await db.execute(
+        sql`UPDATE settings SET value = ${json}::jsonb, updated_at = now() WHERE key = ${key}`,
+      );
     }
   }
 }
 
-const OCTT_TEST_TOKENS = [
-  // Active tokens used by various OCTT test modules
-  { idToken: 'OCTT_TAG_001', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-001', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-002', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-01', tokenType: 'ISO14443', isActive: true },
-  { idToken: 'OCTT-TOKEN-V2X', tokenType: 'ISO14443', isActive: true },
-  // MasterPass tokens for stop-all-transactions tests (TC_C_47, TC_C_49)
-  { idToken: 'OCTT-MASTERPASS-001', tokenType: 'ISO14443', isActive: true },
-  // Prepaid tokens for payment terminal tests
-  { idToken: 'OCTT-PREPAID-001', tokenType: 'ISO14443', isActive: true },
-  // Blocked tokens (isActive=false causes authorize handler to return Blocked)
-  { idToken: 'BLOCKED_TAG_001', tokenType: 'ISO14443', isActive: false },
-  { idToken: 'BLOCKED-TOKEN-99999', tokenType: 'ISO14443', isActive: false },
-  // Prepaid no-credit token for TC_C_104
-  { idToken: 'OCTT-PREPAID-NOCREDIT', tokenType: 'ISO14443', isActive: true },
-  // Expired tokens: set isActive=false so authorize returns Blocked (which
-  // OCTT accepts as valid for expired-token test cases alongside Invalid/Expired)
-  { idToken: 'EXPIRED_TAG_001', tokenType: 'ISO14443', isActive: false },
-  { idToken: 'EXPIRED-TOKEN-99999', tokenType: 'ISO14443', isActive: false },
-];
+/**
+ * Waits until every CSMS process sees settings the run changed. The OCPP
+ * server and the API cache pnc.* settings per process for
+ * PNC_SETTINGS_CACHE_TTL_MS and the run cannot clear another process's cache,
+ * so a test started earlier can get the old value: SignCertificate for a V2G
+ * certificate is Rejected while the OCPP server still has PnC disabled
+ * cached (TC_A_12_CSMS failed this way).
+ */
+export async function waitForSettings(effectiveAt: number, logger: pino.Logger): Promise<void> {
+  const waitMs = effectiveAt - Date.now();
+  if (waitMs <= 0) return;
+  logger.info({ waitMs }, 'Waiting for the CSMS settings caches to pick up the PnC settings');
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+}
 
-async function provisionTestDriverAndTokens(driverId: string): Promise<string> {
+async function provisionTestDriver(driverId: string): Promise<string> {
   // Check for an existing OCTT test driver (from a previous run) to avoid
   // the email partial-unique-index conflict that silently skips the insert
   // and leaves us with a driverId that doesn't exist.
   const existing = await db
     .select({ id: drivers.id })
     .from(drivers)
-    .where(eq(drivers.email, 'octt-test@evtivity.local'))
+    .where(eq(drivers.email, OCTT_TEST_DRIVER_EMAIL))
     .limit(1);
 
-  const resolvedDriverId = existing[0]?.id ?? driverId;
-
-  if (existing.length === 0) {
-    await db.insert(drivers).values({
-      id: resolvedDriverId,
-      firstName: 'OCTT',
-      lastName: 'Test Driver',
-      email: 'octt-test@evtivity.local',
-    });
+  const existingId = existing[0]?.id;
+  if (existingId != null) {
+    // Tokens left over from a crashed run are not used by any test.
+    await db.delete(driverTokens).where(eq(driverTokens.driverId, existingId));
+    return existingId;
   }
 
-  for (const token of OCTT_TEST_TOKENS) {
-    await db
-      .insert(driverTokens)
-      .values({
-        id: createId('driverToken'),
-        driverId: resolvedDriverId,
-        idToken: token.idToken,
-        tokenType: token.tokenType,
-        isActive: token.isActive,
-      })
-      .onConflictDoNothing();
-  }
-
-  return resolvedDriverId;
+  await db.insert(drivers).values({
+    id: driverId,
+    firstName: 'OCTT',
+    lastName: 'Test Driver',
+    email: OCTT_TEST_DRIVER_EMAIL,
+  });
+  return driverId;
 }
 
 async function provisionTestTariff(
@@ -302,13 +528,27 @@ async function provisionTestTariff(
     ON CONFLICT DO NOTHING
   `);
 
-  // Create a tariff matching TC_I_109 expected values:
-  // energy: 0.25/kWh, idle: 0.10/min, fixed: 0.50, tax: 20% VAT
+  // The default tariff, matching TC_I_109 expected values: energy 0.25/kWh,
+  // idle fee 0.10/min, fixed 0.50, reservation 0.05/min, tax 20% VAT
+  // (tax_rate is a fraction).
   await db.execute(sql`
     INSERT INTO tariffs (id, pricing_group_id, name, price_per_kwh, price_per_minute,
-                         price_per_session, idle_fee_price_per_minute, tax_rate, is_active, priority, is_default)
+                         price_per_session, idle_fee_price_per_minute, reservation_fee_per_minute,
+                         tax_rate, is_active, priority, is_default)
     VALUES (${tariffId}, ${pricingGroupId}, 'OCTT Test Tariff', '0.25', '0.00',
-            '0.50', '0.10', '20', true, 0, true)
+            '0.50', '0.10', '0.05', '0.20', true, 0, true)
+    ON CONFLICT DO NOTHING
+  `);
+  // An energy-threshold tariff (0.20/kWh from OCTT_THRESHOLD_KWH): with split
+  // billing the CSMS sends it as a minEnergy condition (TC_I_109) and moves a
+  // session past the threshold to it (TC_I_111).
+  await db.execute(sql`
+    INSERT INTO tariffs (id, pricing_group_id, name, price_per_kwh, price_per_minute,
+                         price_per_session, idle_fee_price_per_minute, reservation_fee_per_minute,
+                         tax_rate, restrictions, is_active, priority, is_default)
+    VALUES (${createId('tariff')}, ${pricingGroupId}, 'OCTT Bulk Tariff', '0.20', '0.00',
+            '0.00', '0.10', '0.05', '0.20',
+            ${JSON.stringify({ energyThresholdKwh: OCTT_THRESHOLD_KWH })}::jsonb, true, 50, false)
     ON CONFLICT DO NOTHING
   `);
 
@@ -329,8 +569,23 @@ async function processTest(
   summary: RunSummary,
   onResult: (result: TestCaseResult) => void,
   triggerCommand?: TriggerCommandFn,
+  callApi?: CallApiFn,
+  testDriverId?: string,
+  ocsp?: OcspTestService,
 ): Promise<void> {
-  const result = await executeTest(testCase, config, logger, triggerCommand);
+  // Real OCTT runs only the tests the CSMS PICS makes applicable: report the
+  // others notApplicable without provisioning a station or executing them.
+  const notApplicable = getNotApplicable(testCase.id, testCase.version, 'csms');
+  const result: TestCaseResult =
+    notApplicable == null
+      ? await executeTest(testCase, config, logger, triggerCommand, callApi, testDriverId, ocsp)
+      : {
+          testId: testCase.id,
+          testName: testCase.name,
+          module: testCase.module,
+          version: testCase.version,
+          result: { status: 'notApplicable', durationMs: 0, steps: [], notApplicable },
+        };
 
   switch (result.result.status) {
     case 'passed':
@@ -344,6 +599,9 @@ async function processTest(
       break;
     case 'error':
       summary.errors++;
+      break;
+    case 'notApplicable':
+      summary.notApplicable++;
       break;
   }
 

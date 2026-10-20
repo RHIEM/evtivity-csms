@@ -1,9 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../../../server/middleware/pipeline.js';
+import {
+  clearIssuedCentralTokens,
+  rememberIssuedCentralToken,
+} from '../../../authorization/issued-central-tokens.js';
 
 // db.select(...).from(...).where(...) is used for three different lookups in
 // the handler: driver_tokens (no .limit), ocpi_external_tokens (.limit(1)) and
@@ -12,7 +16,10 @@ import type { HandlerContext } from '../../../server/middleware/pipeline.js';
 // .limit() so both call shapes resolve to the same queued value.
 let whereQueue: Array<unknown[] | Error>;
 const insertValuesFn = vi.fn().mockResolvedValue(undefined);
-const executeFn = vi.fn();
+// The TariffType the shared builder (@evtivity/database ocpp-session-tariff)
+// returns; its mapping is tested in @evtivity/lib ocpp-tariff.test.ts.
+const buildStationOcppTariffMock = vi.fn();
+const clientMock = vi.fn(() => Promise.resolve([{ id: 'sta_cs001' }]));
 
 function nextResult(): PromiseLike<unknown[]> & { limit: () => Promise<unknown[]> } {
   const queued = whereQueue.shift();
@@ -27,7 +34,7 @@ function nextResult(): PromiseLike<unknown[]> & { limit: () => Promise<unknown[]
 }
 
 const whereFn = vi.fn((): unknown => nextResult());
-const fromFn = vi.fn(() => ({ where: whereFn }));
+const fromFn = vi.fn(() => ({ where: whereFn, leftJoin: () => ({ where: whereFn }) }));
 const selectFn = vi.fn(() => ({ from: fromFn }));
 
 const isRoamingEnabledMock = vi.fn().mockResolvedValue(false);
@@ -37,8 +44,9 @@ vi.mock('@evtivity/database', () => ({
   db: {
     select: selectFn,
     insert: vi.fn(() => ({ values: insertValuesFn })),
-    execute: executeFn,
   },
+  client: clientMock,
+  drivers: { id: 'drivers.id', isActive: 'drivers.is_active' },
   driverTokens: {
     id: 'id',
     driverId: 'driver_id',
@@ -60,10 +68,29 @@ vi.mock('@evtivity/database', () => ({
     status: 'status',
   },
   authorizeAttempts: {},
+  resolveOcpiTokenOwner: async () => {
+    const { ocpiOwnerFromRows } = await import('../../helpers/ocpi-token-owner.js');
+    const rows = await (nextResult() as { limit: () => Promise<unknown[]> }).limit();
+    return ocpiOwnerFromRows(rows);
+  },
   isRoamingEnabled: isRoamingEnabledMock,
   isSiteFreeVendEnabledByStation: isSiteFreeVendEnabledByStationMock,
-  getCompanyCurrency: vi.fn().mockResolvedValue('USD'),
+  buildStationOcppTariff: (...args: unknown[]) => buildStationOcppTariffMock(...args) as unknown,
 }));
+
+const validateContractCertificateMock = vi.fn();
+
+vi.mock('../../../services/pki/contract-certificate-validation.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../../../services/pki/contract-certificate-validation.js')
+    >();
+  return {
+    applyContractCertificateVerdict: actual.applyContractCertificateVerdict,
+    validateContractCertificate: (...args: unknown[]) =>
+      validateContractCertificateMock(...args) as unknown,
+  };
+});
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((a: unknown, b: unknown) => ({ type: 'eq', a, b })),
@@ -93,18 +120,27 @@ function makeCtx(payload: Record<string, unknown>): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'Authorize',
     protocolVersion: 'ocpp2.1',
     payload,
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };
   return { ctx, publishMock };
 }
+
+// The handler is imported after the mocks above are initialized. The first import loads the
+// whole handler graph, which under coverage on a busy machine took longer than one test's
+// 5 s timeout, so it happens once here with its own timeout instead of inside the first test.
+let handleAuthorize: typeof import('../../../handlers/v2_1/authorize.handler.js').handleAuthorize;
+beforeAll(async () => {
+  ({ handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js'));
+}, 30_000);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -112,13 +148,12 @@ beforeEach(() => {
   isRoamingEnabledMock.mockResolvedValue(false);
   isSiteFreeVendEnabledByStationMock.mockResolvedValue(false);
   insertValuesFn.mockResolvedValue(undefined);
-  executeFn.mockResolvedValue([]);
+  buildStationOcppTariffMock.mockResolvedValue(null);
 });
 
 describe('v2_1 Authorize handler', () => {
   it('publishes ocpp.Authorize domain event with normalized payload', async () => {
     whereQueue = [[]];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx, publishMock } = makeCtx({
       idToken: { idToken: 'unknown-rfid', type: 'ISO14443' },
     });
@@ -133,7 +168,6 @@ describe('v2_1 Authorize handler', () => {
   });
 
   it('accepts NoAuthorization token without DB lookup', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'no-auth', type: 'NoAuthorization' } });
     const response = await handleAuthorize(ctx);
 
@@ -142,7 +176,6 @@ describe('v2_1 Authorize handler', () => {
   });
 
   it('accepts MasterPass token without DB lookup and returns groupIdToken', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'master', type: 'MasterPass' } });
     const response = await handleAuthorize(ctx);
 
@@ -152,44 +185,146 @@ describe('v2_1 Authorize handler', () => {
     expect(selectFn).not.toHaveBeenCalled();
   });
 
-  it('accepts eMAID token without lookup and sets certificateStatus when certificate present', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+  it('looks up an eMAID token in driver_tokens like any other token', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-1', type: 'eMAID' } });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-1', type: 'eMAID' } },
+    });
+    expect(selectFn).toHaveBeenCalled();
+    expect(validateContractCertificateMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown eMAID as Invalid', async () => {
+    whereQueue = [[]];
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-unknown', type: 'eMAID' } });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({ idTokenInfo: { status: 'Invalid' } });
+  });
+
+  it('returns certificateStatus Accepted for a valid chain and an accepted eMAID (C07.FR.14)', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockResolvedValueOnce('Accepted');
+    const hashData = [
+      {
+        hashAlgorithm: 'SHA256',
+        issuerNameHash: 'aa',
+        issuerKeyHash: 'bb',
+        serialNumber: '1',
+        responderURL: 'https://ocsp.example.com',
+      },
+    ];
     const { ctx } = makeCtx({
-      idToken: { idToken: 'emaid-1', type: 'eMAID' },
+      idToken: { idToken: 'emaid-2', type: 'eMAID' },
+      iso15118CertificateHashData: hashData,
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(validateContractCertificateMock).toHaveBeenCalledWith(
+      { iso15118CertificateHashData: hashData },
+      expect.anything(),
+    );
+    expect(response).toMatchObject({
+      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-2', type: 'eMAID' } },
+      certificateStatus: 'Accepted',
+    });
+  });
+
+  it('returns Invalid and CertificateRevoked for a revoked chain on any token type (C07.FR.16)', async () => {
+    whereQueue = [
+      [{ id: 'tok-1', driverId: 'drv-1', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockResolvedValueOnce('CertificateRevoked');
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'rfid-1', type: 'ISO14443' },
+      iso15118CertificateHashData: [
+        {
+          hashAlgorithm: 'SHA256',
+          issuerNameHash: 'aa',
+          issuerKeyHash: 'bb',
+          serialNumber: '1',
+          responderURL: 'https://ocsp.example.com',
+        },
+      ],
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'CertificateRevoked',
+    });
+  });
+
+  it('returns ContractCancelled when the chain is valid but the eMAID is unknown (C07.FR.13)', async () => {
+    whereQueue = [[]];
+    validateContractCertificateMock.mockResolvedValueOnce('Accepted');
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'emaid-3', type: 'eMAID' },
+      certificate: 'cert-pem',
+    });
+    const response = await handleAuthorize(ctx);
+
+    expect(validateContractCertificateMock).toHaveBeenCalledWith(
+      { certificate: 'cert-pem' },
+      expect.anything(),
+    );
+    expect(response).toEqual({
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'ContractCancelled',
+    });
+  });
+
+  it('fails closed with CertChainError when the validation throws (C07.FR.17)', async () => {
+    whereQueue = [
+      [{ id: 'tok-e', driverId: 'drv-e', isActive: true, expiresAt: null, revokedAt: null }],
+      [],
+    ];
+    validateContractCertificateMock.mockRejectedValueOnce(new Error('db down'));
+    const { ctx } = makeCtx({
+      idToken: { idToken: 'emaid-4', type: 'eMAID' },
       certificate: 'cert-pem',
     });
     const response = await handleAuthorize(ctx);
 
     expect(response).toEqual({
-      idTokenInfo: { status: 'Accepted', groupIdToken: { idToken: 'emaid-1', type: 'eMAID' } },
-      certificateStatus: 'Accepted',
+      idTokenInfo: { status: 'Invalid' },
+      certificateStatus: 'CertChainError',
     });
   });
 
-  it('sets certificateStatus for eMAID when iso15118CertificateHashData present', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({
-      idToken: { idToken: 'emaid-2', type: 'eMAID' },
-      iso15118CertificateHashData: [{ hashAlgorithm: 'SHA256' }],
-    });
-    const response = await handleAuthorize(ctx);
-
-    expect(response).toMatchObject({ certificateStatus: 'Accepted' });
-  });
-
-  it('omits certificateStatus for eMAID when no certificate or hash data', async () => {
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-3', type: 'eMAID' } });
+  it('omits certificateStatus when no certificate or hash data is sent', async () => {
+    whereQueue = [[]];
+    const { ctx } = makeCtx({ idToken: { idToken: 'emaid-5', type: 'eMAID' } });
     const response = await handleAuthorize(ctx);
 
     expect(response).not.toHaveProperty('certificateStatus');
   });
 
-  it('accepts Central token not found in DB and returns groupIdToken', async () => {
+  it('answers Invalid for an unknown Central token (C05.FR.01)', async () => {
+    clearIssuedCentralTokens();
     whereQueue = [[]];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    const { ctx } = makeCtx({ idToken: { idToken: 'central-token', type: 'Central' } });
+    expect(await handleAuthorize(ctx)).toEqual({ idTokenInfo: { status: 'Invalid' } });
+  });
+
+  it('accepts a Central token the CSMS issued and returns groupIdToken', async () => {
+    rememberIssuedCentralToken('CS-001', 'RequestStartTransaction', {
+      idToken: { idToken: 'central-token', type: 'Central' },
+    });
+    whereQueue = [[]];
     const { ctx } = makeCtx({ idToken: { idToken: 'central-token', type: 'Central' } });
     const response = await handleAuthorize(ctx);
+    clearIssuedCentralTokens();
 
     expect(response).toEqual({
       idTokenInfo: {
@@ -201,7 +336,6 @@ describe('v2_1 Authorize handler', () => {
 
   it('returns Invalid for ISO14443 token not found in DB (roaming disabled)', async () => {
     whereQueue = [[]];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'unknown-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -216,7 +350,6 @@ describe('v2_1 Authorize handler', () => {
       [{ id: 'dtk_1', driverId: 'drv_1', isActive: true, expiresAt, revokedAt: null }],
       [],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'active-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -234,7 +367,6 @@ describe('v2_1 Authorize handler', () => {
       [{ id: 'dtk_2', driverId: 'drv_2', isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'active-no-exp', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -250,7 +382,6 @@ describe('v2_1 Authorize handler', () => {
     whereQueue = [
       [{ id: 'dtk_3', driverId: 'drv_3', isActive: false, expiresAt: null, revokedAt: null }],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'blocked-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -269,7 +400,6 @@ describe('v2_1 Authorize handler', () => {
         },
       ],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'revoked-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -288,7 +418,6 @@ describe('v2_1 Authorize handler', () => {
         },
       ],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'expired-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -300,7 +429,6 @@ describe('v2_1 Authorize handler', () => {
       [{ id: 'dtk_6', driverId: 'drv_6', isActive: true, expiresAt: null, revokedAt: null }],
       [{ id: 'ses_active' }],
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'busy-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -312,7 +440,6 @@ describe('v2_1 Authorize handler', () => {
       [{ id: 'dtk_7', driverId: 'drv_7', isActive: true, expiresAt: null, revokedAt: null }],
       new Error('session query failed'),
     ];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'rfid-7', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -321,148 +448,88 @@ describe('v2_1 Authorize handler', () => {
 
   it('falls open to Accepted when the driver_tokens lookup throws', async () => {
     whereQueue = [new Error('db down')];
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'rfid-err', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
     expect(response).toEqual({ idTokenInfo: { status: 'Accepted' } });
   });
 
-  it('attaches a tariff when one resolves for an accepted driver token', async () => {
+  const builtTariff = {
+    tariffId: 'evt-0123',
+    currency: 'USD',
+    energy: { prices: [{ priceKwh: 0.25 }], taxRates: [{ type: 'VAT', tax: 8 }] },
+    idleTime: {
+      prices: [{ priceMinute: 0.05, conditions: { minIdleTime: 300 } }, { priceMinute: 0 }],
+      taxRates: [{ type: 'VAT', tax: 8 }],
+    },
+  };
+
+  it('attaches the tariff the builder returns for an accepted driver token', async () => {
     whereQueue = [
       [{ id: 'dtk_8', driverId: 'drv_8', isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    executeFn.mockResolvedValue([
-      {
-        id: 'trf_1',
-        price_per_kwh: '0.25',
-        price_per_minute: '0.15',
-        price_per_session: '2.00',
-        idle_fee_price_per_minute: '0.05',
-        tax_rate: '0.08',
-        pricing_group_id: 'pgr_1',
-      },
-    ]);
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    buildStationOcppTariffMock.mockResolvedValue(builtTariff);
     const { ctx } = makeCtx({ idToken: { idToken: 'tariff-rfid', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
-    expect(response['tariff']).toEqual({
-      tariffId: 'trf_1',
-      currency: 'USD',
-      energy: { prices: [{ priceKwh: 0.25 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      chargingTime: { prices: [{ priceMinute: 0.15 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      idleTime: { prices: [{ priceMinute: 0.05 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
-      fixedFee: { prices: [{ priceFixed: 2 }], taxRates: [{ type: 'VAT', tax: 0.08 }] },
+    expect(response['tariff']).toEqual(builtTariff);
+    // Resolved like session pricing: the station's internal id and the token's driver.
+    expect(buildStationOcppTariffMock).toHaveBeenCalledWith(clientMock, {
+      stationUuid: 'sta_cs001',
+      driverUuid: 'drv_8',
     });
   });
 
-  it('builds a tariff with only the non-zero price components and no tax rates', async () => {
+  it('uses the station id from the connection without looking it up', async () => {
     whereQueue = [
-      [{ id: 'dtk_z', driverId: 'drv_z', isActive: true, expiresAt: null, revokedAt: null }],
+      [{ id: 'dtk_s', driverId: 'drv_s', isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    executeFn.mockResolvedValue([
-      {
-        id: 'trf_2',
-        price_per_kwh: '0.30',
-        price_per_minute: null,
-        price_per_session: '0',
-        idle_fee_price_per_minute: '0',
-        tax_rate: '0',
-        pricing_group_id: 'pgr_2',
-      },
-    ]);
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({ idToken: { idToken: 'tariff-min', type: 'ISO14443' } });
-    const response = await handleAuthorize(ctx);
+    const { ctx } = makeCtx({ idToken: { idToken: 'known-station', type: 'ISO14443' } });
+    ctx.stationDbId = 'sta_known';
+    await handleAuthorize(ctx);
 
-    // Tariffs carry no currency; the station receives the company currency.
-    expect(response['tariff']).toEqual({
-      tariffId: 'trf_2',
-      currency: 'USD',
-      energy: { prices: [{ priceKwh: 0.3 }] },
+    expect(clientMock).not.toHaveBeenCalled();
+    expect(buildStationOcppTariffMock).toHaveBeenCalledWith(clientMock, {
+      stationUuid: 'sta_known',
+      driverUuid: 'drv_s',
     });
   });
 
-  it('builds all four tariff components without tax rates when tax is zero', async () => {
-    whereQueue = [
-      [{ id: 'dtk_nt', driverId: 'drv_nt', isActive: true, expiresAt: null, revokedAt: null }],
-      [],
-    ];
-    executeFn.mockResolvedValue([
-      {
-        id: 'trf_nt',
-        price_per_kwh: '0.25',
-        price_per_minute: '0.15',
-        price_per_session: '2.00',
-        idle_fee_price_per_minute: '0.05',
-        tax_rate: '0',
-        pricing_group_id: 'pgr_nt',
-      },
-    ]);
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
-    const { ctx } = makeCtx({ idToken: { idToken: 'tariff-notax', type: 'ISO14443' } });
-    const response = await handleAuthorize(ctx);
-
-    expect(response['tariff']).toEqual({
-      tariffId: 'trf_nt',
-      currency: 'USD',
-      energy: { prices: [{ priceKwh: 0.25 }] },
-      chargingTime: { prices: [{ priceMinute: 0.15 }] },
-      idleTime: { prices: [{ priceMinute: 0.05 }] },
-      fixedFee: { prices: [{ priceFixed: 2 }] },
-    });
-  });
-
-  it('resolves a tariff for an accepted token whose driverId is null (station/site path)', async () => {
+  it('builds the tariff for an accepted token whose driverId is null (station/site path)', async () => {
     whereQueue = [
       [{ id: 'dtk_nd', driverId: null, isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    executeFn.mockResolvedValue([
-      {
-        id: 'trf_3',
-        price_per_kwh: '0.40',
-        price_per_minute: null,
-        price_per_session: null,
-        idle_fee_price_per_minute: null,
-        tax_rate: null,
-        pricing_group_id: 'pgr_3',
-      },
-    ]);
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    buildStationOcppTariffMock.mockResolvedValue(builtTariff);
     const { ctx } = makeCtx({ idToken: { idToken: 'tariff-nd', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
-    expect(response['tariff']).toEqual({
-      tariffId: 'trf_3',
-      currency: 'USD',
-      energy: { prices: [{ priceKwh: 0.4 }] },
+    expect(response['tariff']).toEqual(builtTariff);
+    expect(buildStationOcppTariffMock).toHaveBeenCalledWith(clientMock, {
+      stationUuid: 'sta_cs001',
+      driverUuid: null,
     });
   });
 
-  it('omits tariff when resolution returns no rows', async () => {
+  it('omits tariff when no tariff applies', async () => {
     whereQueue = [
       [{ id: 'dtk_9', driverId: 'drv_9', isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    executeFn.mockResolvedValue([]);
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
     const { ctx } = makeCtx({ idToken: { idToken: 'no-tariff', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
     expect(response).not.toHaveProperty('tariff');
   });
 
-  it('omits tariff (no crash) when resolution throws', async () => {
+  it('omits tariff (no crash) when the tariff build throws', async () => {
     whereQueue = [
       [{ id: 'dtk_10', driverId: 'drv_10', isActive: true, expiresAt: null, revokedAt: null }],
       [],
     ];
-    executeFn.mockRejectedValue(new Error('tariff query failed'));
-    const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
+    buildStationOcppTariffMock.mockRejectedValue(new Error('tariff query failed'));
     const { ctx } = makeCtx({ idToken: { idToken: 'tariff-err', type: 'ISO14443' } });
     const response = await handleAuthorize(ctx);
 
@@ -474,19 +541,17 @@ describe('v2_1 Authorize handler', () => {
     it('accepts any token when the site is free-vend, with a matched driver token', async () => {
       isSiteFreeVendEnabledByStationMock.mockResolvedValue(true);
       whereQueue = [[{ id: 'dtk_fv', driverId: 'drv_fv' }]];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'fv-rfid', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
       expect(response).toEqual({ idTokenInfo: { status: 'Accepted' } });
       // free-vend short-circuit returns before any tariff resolution
-      expect(executeFn).not.toHaveBeenCalled();
+      expect(buildStationOcppTariffMock).not.toHaveBeenCalled();
     });
 
     it('accepts free-vend when the matched token row has a null driverId', async () => {
       isSiteFreeVendEnabledByStationMock.mockResolvedValue(true);
       whereQueue = [[{ id: 'dtk_fv2', driverId: null }]];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'fv-null-driver', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -496,7 +561,6 @@ describe('v2_1 Authorize handler', () => {
     it('accepts free-vend when no matched token row exists', async () => {
       isSiteFreeVendEnabledByStationMock.mockResolvedValue(true);
       whereQueue = [[]];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'fv-nomatch', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -506,7 +570,6 @@ describe('v2_1 Authorize handler', () => {
     it('accepts free-vend even when the matched-token lookup throws', async () => {
       isSiteFreeVendEnabledByStationMock.mockResolvedValue(true);
       whereQueue = [new Error('lookup failed')];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'fv-err', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -521,7 +584,6 @@ describe('v2_1 Authorize handler', () => {
         [], // driver_tokens miss
         [{ isValid: true, whitelist: 'ALWAYS', tokenData: {} }], // ocpi lookup
       ];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-ok', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -531,7 +593,6 @@ describe('v2_1 Authorize handler', () => {
     it('blocks an external token with whitelist NEVER', async () => {
       isRoamingEnabledMock.mockResolvedValue(true);
       whereQueue = [[], [{ isValid: true, whitelist: 'NEVER', tokenData: {} }]];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-never', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -541,7 +602,6 @@ describe('v2_1 Authorize handler', () => {
     it('blocks an external token that is not valid', async () => {
       isRoamingEnabledMock.mockResolvedValue(true);
       whereQueue = [[], [{ isValid: false, whitelist: 'ALWAYS', tokenData: {} }]];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-invalid', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -560,7 +620,6 @@ describe('v2_1 Authorize handler', () => {
           },
         ],
       ];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-expired', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -570,7 +629,6 @@ describe('v2_1 Authorize handler', () => {
     it('returns Invalid when roaming enabled but no external token row exists', async () => {
       isRoamingEnabledMock.mockResolvedValue(true);
       whereQueue = [[], []];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-miss', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 
@@ -580,7 +638,6 @@ describe('v2_1 Authorize handler', () => {
     it('returns Invalid when the OCPI lookup throws (tables may not exist)', async () => {
       isRoamingEnabledMock.mockResolvedValue(true);
       whereQueue = [[], new Error('relation does not exist')];
-      const { handleAuthorize } = await import('../../../handlers/v2_1/authorize.handler.js');
       const { ctx } = makeCtx({ idToken: { idToken: 'ocpi-throw', type: 'ISO14443' } });
       const response = await handleAuthorize(ctx);
 

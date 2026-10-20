@@ -2,10 +2,31 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { DomainEvent, Logger } from '@evtivity/lib';
+import { transactionKey } from './projection-queue.js';
 
 interface BufferedEvent {
   event: DomainEvent;
   bufferedAt: number;
+}
+
+interface BufferedTransaction {
+  stationId: string;
+  transactionId: string;
+  entries: BufferedEvent[];
+}
+
+/**
+ * The identity of a dropped event for the warning: the TransactionEvent type,
+ * seqNo and timestamp. The event itself stays in domain_events (the event bus
+ * persists every ocpp.TransactionEvent at publish, aggregate Transaction keyed
+ * by the transactionId), so an operator can find and replay it.
+ */
+function droppedEventIdentity(event: DomainEvent): Record<string, unknown> {
+  return {
+    eventType: event.payload.eventType,
+    seqNo: event.payload.seqNo,
+    timestamp: event.payload.timestamp,
+  };
 }
 
 interface TransactionBufferOptions {
@@ -15,8 +36,13 @@ interface TransactionBufferOptions {
   logger?: Logger;
 }
 
+/**
+ * Events of a transaction that arrived before its Started was projected, held
+ * until Started drains them. Keyed by station and transactionId: an OCPP 2.1
+ * transactionId is unique per charging station only.
+ */
 export class TransactionBuffer {
-  private readonly buffer = new Map<string, BufferedEvent[]>();
+  private readonly buffer = new Map<string, BufferedTransaction>();
   private readonly maxSize: number;
   private readonly ttlMs: number;
   private readonly cleanupTimer: ReturnType<typeof setInterval>;
@@ -36,28 +62,47 @@ export class TransactionBuffer {
     return this.totalCount;
   }
 
-  add(transactionId: string, event: DomainEvent): boolean {
-    if (this.totalCount >= this.maxSize) return false;
+  add(stationId: string, transactionId: string, event: DomainEvent): boolean {
+    if (this.totalCount >= this.maxSize) {
+      this.logger?.warn(
+        {
+          stationId,
+          transactionId,
+          maxSize: this.maxSize,
+          dropped: [droppedEventIdentity(event)],
+        },
+        'Transaction event buffer full; event for a transaction without a Started dropped (kept in domain_events)',
+      );
+      return false;
+    }
 
-    const existing = this.buffer.get(transactionId) ?? [];
-    existing.push({ event, bufferedAt: Date.now() });
-    this.buffer.set(transactionId, existing);
+    const key = transactionKey(stationId, transactionId);
+    const existing = this.buffer.get(key) ?? { stationId, transactionId, entries: [] };
+    existing.entries.push({ event, bufferedAt: Date.now() });
+    this.buffer.set(key, existing);
     this.totalCount++;
     return true;
   }
 
-  drain(transactionId: string): DomainEvent[] {
-    const entries = this.buffer.get(transactionId);
+  drain(stationId: string, transactionId: string): DomainEvent[] {
+    const key = transactionKey(stationId, transactionId);
+    const entries = this.buffer.get(key)?.entries;
     if (entries == null) return [];
 
-    this.buffer.delete(transactionId);
+    this.buffer.delete(key);
     const now = Date.now();
     const valid = entries.filter((e) => now - e.bufferedAt < this.ttlMs);
-    const expired = entries.length - valid.length;
-    if (expired > 0) {
+    const expired = entries.filter((e) => now - e.bufferedAt >= this.ttlMs);
+    if (expired.length > 0) {
       this.logger?.warn(
-        { transactionId, expired, ttlMs: this.ttlMs },
-        'Buffered transaction events expired before Started arrived (dropped at drain)',
+        {
+          stationId,
+          transactionId,
+          expired: expired.length,
+          ttlMs: this.ttlMs,
+          dropped: expired.map((e) => droppedEventIdentity(e.event)),
+        },
+        'Buffered transaction events expired before Started arrived (dropped at drain, kept in domain_events)',
       );
     }
     this.totalCount -= entries.length;
@@ -66,25 +111,30 @@ export class TransactionBuffer {
 
   private cleanup(): void {
     const now = Date.now();
-    for (const [txId, entries] of this.buffer) {
+    for (const [key, { stationId, transactionId, entries }] of this.buffer) {
       const remaining = entries.filter((e) => now - e.bufferedAt < this.ttlMs);
-      const removed = entries.length - remaining.length;
-      this.totalCount -= removed;
-      if (removed > 0) {
+      const expired = entries.filter((e) => now - e.bufferedAt >= this.ttlMs);
+      this.totalCount -= expired.length;
+      if (expired.length > 0) {
         // Silent expiry hides cases where a station sends Updated/Ended for a
         // transaction whose Started never arrived: revenue loss with no signal
-        // to the operator. Log with a sample event type so an alert can be
-        // tuned.
-        const firstEventType = entries[0]?.event.eventType;
+        // to the operator. Each dropped event is named (type, seqNo,
+        // timestamp) so it can be found in domain_events.
         this.logger?.warn(
-          { transactionId: txId, expired: removed, firstEventType, ttlMs: this.ttlMs },
-          'Buffered transaction events expired in cleanup sweep (Started never arrived)',
+          {
+            stationId,
+            transactionId,
+            expired: expired.length,
+            ttlMs: this.ttlMs,
+            dropped: expired.map((e) => droppedEventIdentity(e.event)),
+          },
+          'Buffered transaction events expired in cleanup sweep (Started never arrived, kept in domain_events)',
         );
       }
       if (remaining.length === 0) {
-        this.buffer.delete(txId);
+        this.buffer.delete(key);
       } else {
-        this.buffer.set(txId, remaining);
+        this.buffer.set(key, { stationId, transactionId, entries: remaining });
       }
     }
   }

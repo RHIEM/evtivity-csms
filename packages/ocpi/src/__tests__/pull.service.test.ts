@@ -37,6 +37,11 @@ function makeInsertChain(): Record<string, unknown> {
       rec.upserted = true;
       return chain;
     }),
+    onConflictDoNothing: vi.fn(() => chain),
+    // The CDR insert returns one row per value (none conflicted).
+    returning: vi.fn(() =>
+      Promise.resolve(Array.isArray(rec.value) ? rec.value.map((_v, i) => ({ id: i })) : []),
+    ),
     then: (onF?: (v: unknown) => unknown, onR?: (r: unknown) => unknown): Promise<unknown> =>
       Promise.resolve(undefined).then(onF, onR),
   };
@@ -48,11 +53,11 @@ vi.mock('@evtivity/database', () => ({
     select: vi.fn(() => makeSelectChain()),
     insert: vi.fn(() => makeInsertChain()),
   },
-  ocpiPartners: { id: {}, countryCode: {}, partyId: {} },
+  ocpiPartners: { id: {}, countryCode: {}, partyId: {}, version: {} },
   ocpiPartnerEndpoints: { url: {}, partnerId: {}, module: {}, interfaceRole: {} },
   ocpiExternalLocations: { partnerId: {}, countryCode: {}, partyId: {}, locationId: {} },
   ocpiExternalTariffs: { partnerId: {}, countryCode: {}, partyId: {}, tariffId: {} },
-  ocpiCdrs: { partnerId: {}, ocpiCdrId: {} },
+  ocpiCdrs: { partnerId: {}, ocpiCdrId: {}, chargingSessionId: {} },
   ocpiSyncLog: {},
 }));
 
@@ -67,7 +72,7 @@ vi.mock('../lib/outbound-token.js', () => ({
   getOutboundToken: vi.fn(() => Promise.resolve('outbound-token')),
 }));
 
-import { pullLocations } from '../services/pull.service.js';
+import { pullCdrs, pullLocations } from '../services/pull.service.js';
 
 // Endpoint lookup then partner-info lookup (the two SELECTs in pullLocations).
 function primePartnerLookups(): void {
@@ -84,7 +89,7 @@ function validLocation(id: string): Record<string, unknown> {
     country_code: 'DE',
     party_id: 'ABC',
     name: `Loc ${id}`,
-    coordinates: { latitude: '52.5', longitude: '13.4' },
+    coordinates: { latitude: '52.520008', longitude: '13.404954' },
     evses: [],
   };
 }
@@ -123,6 +128,49 @@ describe('pullLocations', () => {
     expect(upserts[0]?.value).toHaveLength(2);
     // started + completed sync-log rows
     expect(syncLogRows()).toHaveLength(2);
+  });
+
+  it('skips rows with malformed coordinates or over-long ids and keeps the rest', async () => {
+    primePartnerLookups();
+    getPaginatedEachMock.mockImplementation(
+      async (_url: string, onPage: (p: unknown[]) => Promise<void>) => {
+        await onPage([
+          { ...validLocation('a'), coordinates: { latitude: '52.5', longitude: '13.4' } },
+          { ...validLocation('b'), coordinates: { latitude: 'north', longitude: '13.404954' } },
+          validLocation('x'.repeat(37)),
+          { ...validLocation('c'), party_id: 'ABCD' },
+          validLocation('ok'),
+        ]);
+      },
+    );
+
+    const res = await pullLocations('opr_1');
+
+    expect(res.objectsCount).toBe(1);
+    const rows = upsertedRows()[0]?.value as Array<Record<string, unknown>>;
+    expect(rows.map((r) => r['locationId'])).toEqual(['ok']);
+  });
+
+  it('upserts a location repeated in one page once, with its last version', async () => {
+    primePartnerLookups();
+    getPaginatedEachMock.mockImplementation(
+      async (_url: string, onPage: (p: unknown[]) => Promise<void>) => {
+        await onPage([
+          { ...validLocation('a'), name: 'first' },
+          validLocation('b'),
+          { ...validLocation('a'), name: 'second' },
+        ]);
+      },
+    );
+
+    const res = await pullLocations('opr_1');
+
+    expect(res.objectsCount).toBe(2);
+    const rows = upsertedRows()[0]?.value as Array<Record<string, unknown>>;
+    expect(rows.map((r) => [r['locationId'], r['name']])).toEqual([
+      ['b', 'Loc b'],
+      ['a', 'second'],
+    ]);
   });
 
   it('chunks large pages into multiple batched upserts of <= 500 rows', async () => {
@@ -194,5 +242,81 @@ describe('pullLocations', () => {
     expect(res.objectsCount).toBe(1);
     expect(getPaginatedEachMock).toHaveBeenCalledOnce();
     expect(freeRedis.eval).toHaveBeenCalled(); // lock released
+  });
+});
+
+describe('pullCdrs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    inserts = [];
+    getPaginatedEachMock.mockReset();
+  });
+
+  function cdr(id: string, totalCost: unknown): Record<string, unknown> {
+    return { id, total_energy: 10, currency: 'EUR', total_cost: totalCost };
+  }
+
+  function primeCdrLookups(version: string | null): void {
+    selectResults = [
+      [{ url: 'http://127.0.0.1/cdrs' }],
+      [{ countryCode: 'DE', partyId: 'ABC', version }],
+      [], // no CDR of the page stored yet
+    ];
+    selectIndex = 0;
+  }
+
+  const insertedCdrs = (): Array<Record<string, unknown>> =>
+    inserts
+      .filter((i) => !i.upserted && Array.isArray(i.value))
+      .flatMap((i) => i.value as Array<Record<string, unknown>>);
+
+  it('stores excl_vat from a 2.2.1 partner and skips CDRs without that Price', async () => {
+    primeCdrLookups('2.2.1');
+    getPaginatedEachMock.mockImplementation(
+      async (_url: string, onPage: (p: unknown[]) => Promise<void>) => {
+        await onPage([
+          cdr('a', { excl_vat: 4, incl_vat: 4.76 }),
+          cdr('b', { before_taxes: 4 }),
+          cdr('c', { excl_vat: '4.00' }),
+        ]);
+      },
+    );
+
+    const res = await pullCdrs('opr_1');
+
+    expect(res).toEqual({ module: 'cdrs', objectsCount: 1, status: 'completed' });
+    expect(insertedCdrs()).toEqual([expect.objectContaining({ ocpiCdrId: 'a', totalCost: '4' })]);
+  });
+
+  it('stores a CDR repeated in one page once and skips over-long ids', async () => {
+    primeCdrLookups('2.2.1');
+    getPaginatedEachMock.mockImplementation(
+      async (_url: string, onPage: (p: unknown[]) => Promise<void>) => {
+        await onPage([
+          cdr('a', { excl_vat: 4, incl_vat: 4.76 }),
+          cdr('a', { excl_vat: 5, incl_vat: 5.95 }),
+          cdr('x'.repeat(37), { excl_vat: 4, incl_vat: 4.76 }),
+        ]);
+      },
+    );
+
+    const res = await pullCdrs('opr_1');
+
+    expect(res.objectsCount).toBe(1);
+    expect(insertedCdrs()).toEqual([expect.objectContaining({ ocpiCdrId: 'a', totalCost: '4' })]);
+  });
+
+  it('stores before_taxes from a 2.3.0 partner', async () => {
+    primeCdrLookups('2.3.0');
+    getPaginatedEachMock.mockImplementation(
+      async (_url: string, onPage: (p: unknown[]) => Promise<void>) => {
+        await onPage([cdr('a', { before_taxes: 4, taxes: [{ name: 'VAT', amount: 0.76 }] })]);
+      },
+    );
+
+    const res = await pullCdrs('opr_1');
+
+    expect(res.objectsCount).toBe(1);
+    expect(insertedCdrs()).toEqual([expect.objectContaining({ ocpiCdrId: 'a', totalCost: '4' })]);
   });
 });

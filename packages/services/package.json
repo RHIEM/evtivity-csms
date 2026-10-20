@@ -1,0 +1,172 @@
+{
+  "name": "@evtivity/services",
+  "version": "0.1.47-beta.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./account-invoice-jobs": {
+      "import": "./src/account-invoice-jobs.ts"
+    },
+    "./ai-alerts": {
+      "import": "./src/ai-alerts.ts"
+    },
+    "./ai-evidence": {
+      "import": "./src/ai-evidence/index.ts"
+    },
+    "./ai-insight.service": {
+      "import": "./src/ai-insight.service.ts"
+    },
+    "./ai-ops-config": {
+      "import": "./src/ai-ops-config.ts"
+    },
+    "./ai-ops-prompt": {
+      "import": "./src/ai-ops-prompt.ts"
+    },
+    "./ai-proposal.service": {
+      "import": "./src/ai-proposal.service.ts"
+    },
+    "./ai-workers/*": {
+      "import": "./src/ai-workers/*.ts"
+    },
+    "./availability-command": {
+      "import": "./src/availability-command.ts"
+    },
+    "./cjk-fonts": {
+      "import": "./src/cjk-fonts.ts"
+    },
+    "./company-currency": {
+      "import": "./src/company-currency.ts"
+    },
+    "./credit-note.service": {
+      "import": "./src/credit-note.service.ts"
+    },
+    "./driver-ai-prompt": {
+      "import": "./src/driver-ai-prompt.ts"
+    },
+    "./driver-ai-config": {
+      "import": "./src/driver-ai-config.ts"
+    },
+    "./electricity-cost.service": {
+      "import": "./src/electricity-cost.service.ts"
+    },
+    "./fleet-billing-notice": {
+      "import": "./src/fleet-billing-notice.ts"
+    },
+    "./fleet-invoice-notice": {
+      "import": "./src/fleet-invoice-notice.ts"
+    },
+    "./fleet-invoice-run": {
+      "import": "./src/fleet-invoice-run.ts"
+    },
+    "./fleet-invoice.service": {
+      "import": "./src/fleet-invoice.service.ts"
+    },
+    "./fleet-reservation-status": {
+      "import": "./src/fleet-reservation-status.ts"
+    },
+    "./invoice-audit": {
+      "import": "./src/invoice-audit.ts"
+    },
+    "./invoice-labels": {
+      "import": "./src/invoice-labels.ts"
+    },
+    "./invoice-pdf.service": {
+      "import": "./src/invoice-pdf.service.ts"
+    },
+    "./invoice.service": {
+      "import": "./src/invoice.service.ts"
+    },
+    "./load-management.service": {
+      "import": "./src/load-management.service.ts"
+    },
+    "./maintenance-check": {
+      "import": "./src/maintenance-check.ts"
+    },
+    "./maintenance.service": {
+      "import": "./src/maintenance.service.ts"
+    },
+    "./ocpp-command": {
+      "import": "./src/ocpp-command.ts"
+    },
+    "./pdf-branding": {
+      "import": "./src/pdf-branding.ts"
+    },
+    "./pdf-fonts": {
+      "import": "./src/pdf-fonts.ts"
+    },
+    "./refused-start-stop": {
+      "import": "./src/refused-start-stop.ts"
+    },
+    "./report-audit": {
+      "import": "./src/report-audit.ts"
+    },
+    "./report-generators/*": {
+      "import": "./src/report-generators/*.ts"
+    },
+    "./report-registry": {
+      "import": "./src/report-registry.ts"
+    },
+    "./report-scope": {
+      "import": "./src/report-scope.ts"
+    },
+    "./report.service": {
+      "import": "./src/report.service.ts"
+    },
+    "./reservation-cancel": {
+      "import": "./src/reservation-cancel.ts"
+    },
+    "./s3-storage": {
+      "import": "./src/s3-storage.ts"
+    },
+    "./reservation-expiry": {
+      "import": "./src/reservation-expiry.ts"
+    },
+    "./reservation-notify": {
+      "import": "./src/reservation-notify.ts"
+    },
+    "./reservation.service": {
+      "import": "./src/reservation.service.ts"
+    },
+    "./session-revenue": {
+      "import": "./src/session-revenue.ts"
+    },
+    "./station-derived-status": {
+      "import": "./src/station-derived-status.ts"
+    },
+    "./station-message.service": {
+      "import": "./src/station-message.service.ts"
+    },
+    "./support-case-notify": {
+      "import": "./src/support-case-notify.ts"
+    },
+    "./support-case.service": {
+      "import": "./src/support-case.service.ts"
+    },
+    "./template-dirs": {
+      "import": "./src/template-dirs.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1149.0",
+    "@evtivity/ai": "*",
+    "@evtivity/database": "*",
+    "@evtivity/lib": "*",
+    "@evtivity/payments": "*",
+    "@resvg/resvg-js": "^2.6.2",
+    "drizzle-orm": "^0.45.2",
+    "exceljs": "^3.4.0",
+    "pdfkit": "^0.20.2",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "@types/pdfkit": "^0.17.6",
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.2"
+  }
+}

@@ -7,8 +7,9 @@
 <p align="center">
   <a href="https://github.com/EVtivity/evtivity-csms/releases/latest"><img src="https://img.shields.io/github/v/release/EVtivity/evtivity-csms?label=Release&color=4ade80" alt="Release" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml"><img src="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FEVtivity%2Fevtivity-csms%2Fbadges%2Fcoverage.json" alt="Coverage" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-BUSL--1.1-blue.svg" alt="License: BUSL-1.1" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/TypeScript-6.x-3178C6.svg" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-339933.svg" alt="Node.js" />
   <img src="https://img.shields.io/badge/OCPP-1.6%20%7C%202.1-4ade80.svg" alt="OCPP" />
   <img src="https://img.shields.io/badge/OCPI-2.2.1%20%7C%202.3.0-4ade80.svg" alt="OCPI" />
@@ -23,9 +24,9 @@
   <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
-An OCPP 1.6 and 2.1 compliant Charging Station Management System for managing EV charging infrastructure. Handles real-time WebSocket communication with charging stations, OCPI 2.2.1/2.3.0 roaming, ISO 15118 Plug and Charge, a REST API for operators, and two React frontends for operators and drivers.
+EVtivity is an AI-powered EV charging platform. At its core is an OCPP 1.6 and 2.1 compliant Charging Station Management System (CSMS) for EV charging infrastructure. It handles real-time WebSocket communication with charging stations, OCPI 2.2.1/2.3.0 roaming, ISO 15118 Plug and Charge, a REST API for operators, and two React frontends for operators and drivers.
 
-EVtivity integrates AI across the operator experience. A chatbot assistant answers natural-language questions about stations, sessions, revenue, and operations by calling API endpoints as tools. A support AI assistant drafts replies for customer support cases by gathering full case context. Both support multiple LLM providers (Anthropic, OpenAI, Gemini) with configurable parameters at system and per-user levels, respond in the operator's preferred language, and enforce security guardrails that prevent leaking sensitive data.
+AI is built into the operator dashboard. The AI assistant answers questions about stations, sessions, revenue, and operations, reads attachments such as a photo of a charger screen, a PDF, or a log, and proposes changes that run only after the operator confirms. The support assist drafts replies to support cases in the driver's language. Both work with Anthropic, OpenAI, Gemini, or DeepSeek, and secrets and personal data are masked before they reach the model.
 
 ## Architecture
 
@@ -68,6 +69,19 @@ graph TB
 ```
 
 ## Feature Overview
+
+### AI-Powered Operations
+
+| Feature                  | Description                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| AI Assistant             | Ask about stations, sessions, revenue, and operations in plain language. Answers stream, and conversations are kept with search, rename, and delete          |
+| Image and File Analysis  | Attach images (such as a photo of a charger screen), PDF, CSV, text, log, and JSON files                                                                     |
+| Confirmed Changes        | The assistant reads data through API tools. A change it proposes shows a confirmation card and runs only after the operator confirms                         |
+| Support Assist           | Drafts support case replies in the driver's language and internal notes in the operator's, with the sources it read                                          |
+| Provider Choice          | Anthropic, OpenAI, Google Gemini, or DeepSeek, set per surface or per user, with an effort level                                                             |
+| Redaction and Guardrails | Secrets and personal data are masked in tool results before they reach the model. Settings, secrets, users, payments, and station security stay out of reach |
+| Six Languages            | Answers in the operator's language: English, German, Spanish, Korean, Simplified Chinese, and Traditional Chinese                                            |
+| Limits and Audit         | Rate limits per user and per site, a daily token budget per user, and audit entries for changes made through the assistant                                   |
 
 ### OCPP Compliance
 
@@ -146,20 +160,6 @@ graph TB
 | Support Cases         | Support tickets with session linking, refund actions, and S3 file attachments     |
 | Notifications         | Email and SMS for session events, payment status, reservations, and support cases |
 
-### AI-Powered Operations
-
-| Feature                  | Description                                                                                            |
-| ------------------------ | ------------------------------------------------------------------------------------------------------ |
-| Chatbot Assistant        | Natural-language operator assistant with access to all API endpoints via auto-generated tool catalog   |
-| Two-tier Tool Selection  | Category-based tool routing keeps per-request tool count under provider limits (128)                   |
-| Support Case AI          | Draft customer replies and internal notes from full case context (messages, sessions, station, driver) |
-| Multi-provider Support   | Anthropic Claude, OpenAI GPT, and Google Gemini with per-user and system-level configuration           |
-| LLM Parameters           | Configurable temperature, top-p, top-k, system prompt, and tone at system and per-user levels          |
-| Language-aware Responses | AI responds in the operator's preferred language across all 6 supported locales                        |
-| Security Guardrails      | Blocks password and API key leaking, requires confirmation before data modifications                   |
-| Auto-generated Tools     | OpenAPI spec codegen produces typed tool definitions for all 500+ operator endpoints                   |
-| Editable Chat            | Edit and resend user messages, copy assistant responses, markdown rendering with scrollable tables     |
-
 ### Sustainability
 
 | Feature               | Description                                                                       |
@@ -217,11 +217,21 @@ graph TB
 | Multi-language UI   | 6 languages: English, German, Spanish, Korean, Simplified and Traditional Chinese                                                   |
 | Responsive Filters  | Filter controls collapse into dropdown on tablet and mobile for all list pages                                                      |
 | Server-down Page    | Friendly error page with retry when API is unreachable, on both CSMS and Portal                                                     |
-| Release Management  | Automated version bumping across all packages and Helm chart via release script                                                     |
+| Release Management  | Stable, alpha and beta channels. Each stable release bumps the Helm chart and AWS CDK app to its version                            |
 
-## Services
+## Deployment
 
-When deployed with the Helm chart, each service is exposed on its own subdomain via Gateway API:
+| Option                | Use it for                                           | Source                                                                        | Guide                                                                      |
+| --------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Docker Compose        | Local development and single-host installs           | `docker-compose.yml` in this repository                                       | [Docker Compose](https://www.evtivity.com/docs/deployment/docker-compose/) |
+| Kubernetes Helm chart | Production on Kubernetes (Istio or Envoy Gateway)    | [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm) | [Helm chart](https://www.evtivity.com/docs/deployment/helm-chart/)         |
+| AWS CDK               | Production on AWS (ECS Fargate, Aurora, ElastiCache) | [EVtivity/evtivity-csms-cdk](https://github.com/EVtivity/evtivity-csms-cdk)   | [AWS](https://www.evtivity.com/docs/deployment/aws/)                       |
+
+The Helm chart and the AWS CDK app track stable releases only. See [Helm chart and AWS CDK versions](#helm-chart-and-aws-cdk-versions).
+
+### Service endpoints
+
+With the Helm chart, each service is exposed on its own subdomain via Gateway API:
 
 | Service            | URL                                | Public Port | Internal Port |
 | ------------------ | ---------------------------------- | ----------- | ------------- |
@@ -237,9 +247,70 @@ When deployed with the Helm chart, each service is exposed on its own subdomain 
 
 All hostnames share a single load balancer IP. DNS records for each hostname must point to that IP. OCPP TLS (port 8443) is provisioned as a separate `LoadBalancer` service for direct station connections using Security Profile 3 (mTLS).
 
-## Helm Chart
+## Skills
 
-The Kubernetes Helm chart is maintained in a separate repository: [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm)
+[EVtivity Agent Skills](https://github.com/EVtivity/evtivity-skills) teach your AI coding agent to work with EVtivity. They follow the open [Agent Skills](https://agentskills.io) standard, so the same skills work in Claude Code, Codex, GitHub Copilot, Gemini CLI, Cursor and other agents.
+
+| Skill                      | Helps you                                                                   |
+| -------------------------- | --------------------------------------------------------------------------- |
+| `evtivity-getting-started` | Install and run EVtivity locally with Docker and sign in                    |
+| `evtivity-deployment`      | Deploy and upgrade with Docker Compose, Helm or AWS CDK                     |
+| `evtivity-configuration`   | Set environment variables, secrets, auth, database and station security     |
+| `evtivity-csms`            | Operate the dashboard: sites, stations, sessions, drivers, pricing, reports |
+| `evtivity-portal`          | Use the driver portal: find a station, charge, pay, manage cards            |
+| `evtivity-mobile-app`      | Build, brand and release the driver mobile app                              |
+| `evtivity-guides`          | Follow step-by-step guides such as station onboarding and stuck sessions    |
+| `evtivity-integrations`    | Set up Stripe, Adyen, the test payment provider and payouts                 |
+| `evtivity-api`             | Call the REST API: API keys, error codes, OCPP command routes               |
+| `evtivity-simulator`       | Run simulated OCPP 1.6 and 2.1 stations and charging sessions               |
+| `evtivity-conformance`     | Send OCPP commands, read message logs and run OCTT conformance tests        |
+| `evtivity-troubleshoot`    | Find and fix a failing service, station connection or sign-in               |
+| `evtivity-report-issue`    | Collect the version and redacted logs and draft a GitHub issue              |
+
+Install them for any agent:
+
+```bash
+npx skills add EVtivity/evtivity-skills
+```
+
+Skill releases use the same tags as EVtivity. Install the tag that matches your deployment. Pull requests and discussions for new skills are welcome.
+
+## Releases
+
+Versions follow [Semantic Versioning](https://semver.org): `vMAJOR.MINOR.PATCH`. Every release is a git tag and a GitHub release with notes.
+
+### Channels
+
+| Channel | Tag example       | Purpose                                                      | GitHub release |
+| ------- | ----------------- | ------------------------------------------------------------ | -------------- |
+| Stable  | `v0.1.38`         | Production release                                           | Latest         |
+| Beta    | `v0.1.38-beta.2`  | Feature-complete preview of the next stable release          | Pre-release    |
+| Alpha   | `v0.1.39-alpha.1` | Early preview while the version's features are still in work | Pre-release    |
+
+Prereleases rank below the stable version they lead to (`v0.1.38-beta.2` comes before `v0.1.38`). Run only stable releases in production.
+
+Once a version's betas start, it is feature-frozen: later betas carry only fixes, and new features go to the next version. The stable release is cut from the same code as the last beta.
+
+### Container images
+
+Images are published to `ghcr.io/evtivity/evtivity-csms/<service>` for `linux/amd64` and `linux/arm64`.
+
+- Every release has an exact, immutable tag: `0.1.38`, `0.1.38-beta.2`.
+- Stable releases also move `0.1`, `0`, `latest` and `stable`.
+- Prereleases move the alias of their channel only: `beta` or `alpha`.
+
+Aliases always point to the newest image of their channel, and a deployment picks up a new one only when it pulls the image again. Pin an exact tag in production.
+
+### Helm chart and AWS CDK versions
+
+The [Helm chart](https://github.com/EVtivity/evtivity-csms-helm) and the [AWS CDK app](https://github.com/EVtivity/evtivity-csms-cdk) follow stable releases only. Each stable release bumps them to its version. To try a prerelease, set the image tag yourself, for example `image.tag=0.1.38-beta.2`.
+
+### Release notes and upgrades
+
+- Every release note starts with a **Breaking changes** section: what changed, who is affected, and the action to take. It says "None." when there are none.
+- **Upgrade notes** give the steps for the upgrade, such as webhook moves, renamed settings, or chart values that changed.
+- Database changes that old and new versions must share during a rolling upgrade ship in two steps: one release adds the new structure while keeping the old one, and a later release removes the old one. When a release note says so, upgrade through each stable version in order instead of skipping one.
+- The dashboard shows an update notice when a newer stable release is available. Prereleases never trigger it.
 
 ## License
 

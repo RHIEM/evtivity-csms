@@ -26,13 +26,14 @@ function makeCtx(
       authenticated: true,
       pendingMessages: new Map(),
       bootStatus: null,
+      readyAnnounced: false,
     },
     protocolVersion,
     messageId: 'msg-1',
     action,
     payload,
     logger,
-    eventBus: { publish: vi.fn(), subscribe: vi.fn() },
+    eventBus: { publish: vi.fn(), subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };
@@ -47,6 +48,17 @@ describe('validateMiddleware', () => {
 
     expect(next).toHaveBeenCalled();
   });
+
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+    'treats the Object.prototype name %s as an action not in the registry',
+    async (action) => {
+      for (const version of ['ocpp2.1', 'ocpp1.6']) {
+        const next = vi.fn();
+        await validateMiddleware(makeCtx(action, {}, version), next);
+        expect(next).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
 
   it('throws OccurrenceConstraintViolation for missing required field', async () => {
     const ctx = makeCtx('BootNotification', {});

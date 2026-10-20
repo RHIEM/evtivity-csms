@@ -1,0 +1,112 @@
+// Copyright (c) 2024-2026 EVtivity. All rights reserved.
+// SPDX-License-Identifier: BUSL-1.1
+
+import { describe, it, expect, vi } from 'vitest';
+import { Bell } from 'lucide-react';
+
+vi.hoisted(() => {
+  // The auth store reads the color scheme when it loads.
+  Object.defineProperty(window, 'matchMedia', {
+    value: () => ({
+      matches: false,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }),
+  });
+});
+
+import { NAV_ENTRIES, visibleNavEntries, type NavEntry } from '../registry';
+
+const ALL_ON = {
+  roamingEnabled: true,
+  pncEnabled: true,
+  reservationEnabled: true,
+  supportEnabled: true,
+  fleetEnabled: true,
+  aiInsightsEnabled: true,
+};
+
+describe('NAV_ENTRIES', () => {
+  it('has unique routes and unique orders, listed in order', () => {
+    expect(new Set(NAV_ENTRIES.map((e) => e.to)).size).toBe(NAV_ENTRIES.length);
+    const orders = NAV_ENTRIES.map((e) => e.order);
+    expect(new Set(orders).size).toBe(orders.length);
+    expect(orders).toEqual([...orders].sort((a, b) => a - b));
+  });
+});
+
+describe('visibleNavEntries', () => {
+  it('sorts by order, accepts any permission of a list, and applies isVisible', () => {
+    const entries: NavEntry[] = [
+      { to: '/b', labelKey: 'nav.logs', icon: Bell, order: 2, requiredPermission: 'logs:read' },
+      {
+        to: '/a',
+        labelKey: 'nav.audit',
+        icon: Bell,
+        order: 1,
+        requiredPermission: ['audit:read', 'users:read'],
+      },
+      {
+        to: '/c',
+        labelKey: 'nav.users',
+        icon: Bell,
+        order: 3,
+        requiredPermission: 'users:read',
+        isVisible: (flags) => flags.fleetEnabled,
+      },
+    ];
+    expect(
+      visibleNavEntries(['users:write', 'logs:read'], ALL_ON, true, entries).map((e) => e.to),
+    ).toEqual(['/a', '/b', '/c']);
+    expect(
+      visibleNavEntries(['users:read'], { ...ALL_ON, fleetEnabled: false }, true, entries).map(
+        (e) => e.to,
+      ),
+    ).toEqual(['/a']);
+    expect(visibleNavEntries([], ALL_ON, true, entries)).toEqual([]);
+  });
+
+  it('hides company-wide entries from a site-restricted user', () => {
+    const entries: NavEntry[] = [
+      {
+        to: '/logs',
+        labelKey: 'nav.logs',
+        icon: Bell,
+        order: 1,
+        requiredPermission: 'logs:read',
+        requiresAllSiteAccess: true,
+      },
+      {
+        to: '/audit',
+        labelKey: 'nav.audit',
+        icon: Bell,
+        order: 2,
+        requiredPermission: 'audit:read',
+      },
+    ];
+    const perms = ['logs:read', 'audit:read'];
+    expect(visibleNavEntries(perms, ALL_ON, true, entries).map((e) => e.to)).toEqual([
+      '/logs',
+      '/audit',
+    ]);
+    expect(visibleNavEntries(perms, ALL_ON, false, entries).map((e) => e.to)).toEqual(['/audit']);
+  });
+
+  it('marks the logs entry as company-wide', () => {
+    expect(NAV_ENTRIES.find((e) => e.to === '/logs')?.requiresAllSiteAccess).toBe(true);
+  });
+});
+
+describe('AI Insights entry', () => {
+  it('shows only while AI Insights are on, and no AI Inbox entry remains', () => {
+    const on = visibleNavEntries(['aiInsights:read'], ALL_ON, true).map((e) => e.to);
+    expect(on).toContain('/ai/insights');
+    expect(NAV_ENTRIES.map((e) => e.to)).not.toContain('/ai/inbox');
+    const off = visibleNavEntries(
+      ['aiInsights:read'],
+      { ...ALL_ON, aiInsightsEnabled: false },
+      true,
+    );
+    expect(off.map((e) => e.to)).not.toContain('/ai/insights');
+  });
+});

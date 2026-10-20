@@ -6,8 +6,11 @@ import { z } from 'zod';
 import { inArray } from 'drizzle-orm';
 import { db, settings } from '@evtivity/database';
 import { authorize } from '../middleware/rbac.js';
-import { itemResponse } from '../lib/response-schemas.js';
+import { itemResponse, errorWith } from '../lib/response-schemas.js';
+import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { APP_VERSION } from '../lib/app-version.js';
+import { activePaymentProvider } from '../lib/payments.js';
 
 function envStr(key: string): string {
   return process.env[key] ?? '';
@@ -26,7 +29,9 @@ function envHasValue(key: string, defaultValueIfDev?: string): boolean {
 }
 
 const INTEGRATION_SETTING_KEYS = [
+  'payments.provider',
   'stripe.secretKeyEnc',
+  'adyen.apiKeyEnc',
   'smtp.host',
   'twilio.accountSid',
   's3.bucket',
@@ -55,7 +60,12 @@ const systemInfoResponse = z
     logLevel: z.string().describe('Pino log level in use'),
     network: z
       .object({
-        bindIp: z.string().nullable().describe('Bind IP override, when set'),
+        bindIp: z
+          .string()
+          .nullable()
+          .describe(
+            'Docker Compose host address the user-facing ports bind to (BIND_IP); null outside Docker Compose',
+          ),
         apiPort: z.string().describe('REST API listening port'),
         apiHost: z.string().describe('REST API listening host'),
         ocppPort: z.string().describe('OCPP WebSocket listening port'),
@@ -127,6 +137,17 @@ const systemInfoResponse = z
       })
       .passthrough()
       .describe('Database seeding configuration'),
+    payments: z
+      .object({
+        provider: z
+          .string()
+          .describe('Provider selected for new payments (payments.provider), or none'),
+        configured: z
+          .boolean()
+          .describe('The selected provider is available in this process and has its credentials'),
+      })
+      .passthrough()
+      .describe('Payment provider status'),
     secrets: z
       .object({
         jwtConfigured: z.boolean().describe('Whether JWT_SECRET is set to a non-default value'),
@@ -136,6 +157,9 @@ const systemInfoResponse = z
         stripeConfigured: z
           .boolean()
           .describe('Whether the Stripe secret key is configured in settings'),
+        adyenConfigured: z
+          .boolean()
+          .describe('Whether the Adyen API key is configured in settings'),
         smtpConfigured: z
           .boolean()
           .describe('Whether an SMTP host is configured (settings or SMTP_HOST override)'),
@@ -168,11 +192,24 @@ export function systemRoutes(app: FastifyInstance): void {
         summary: 'Runtime version and environment configuration (no secret values)',
         operationId: 'getSystemInfo',
         security: [{ bearerAuth: [] }],
-        response: { 200: itemResponse(systemInfoResponse) },
+        response: {
+          200: itemResponse(systemInfoResponse),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
+        },
       },
     },
-    async () => {
+    async (request, reply) => {
+      // Company-wide configuration (payment provider, integrations, URLs,
+      // CORS, rate limits): all-site access only (features/site-access-control.md).
+      if (
+        !(await requireAllSiteAccess(request, reply, {
+          error: 'Setting not found',
+          code: 'SETTING_NOT_FOUND',
+        }))
+      )
+        return;
       const integration = await loadIntegrationSettings();
+      const selected = integration.get('payments.provider');
       return {
         version: APP_VERSION,
         nodeEnv: envStr('NODE_ENV') || 'development',
@@ -219,10 +256,15 @@ export function systemRoutes(app: FastifyInstance): void {
         seed: {
           seedDemo: envStr('SEED_DEMO') || 'false',
         },
+        payments: {
+          provider: typeof selected === 'string' && selected !== '' ? selected : 'none',
+          configured: (await activePaymentProvider(request.log)) != null,
+        },
         secrets: {
           jwtConfigured: envHasValue('JWT_SECRET', 'dev-secret-change-in-production'),
           settingsEncryptionConfigured: envHasValue('SETTINGS_ENCRYPTION_KEY'),
           stripeConfigured: settingHasValue(integration, 'stripe.secretKeyEnc'),
+          adyenConfigured: settingHasValue(integration, 'adyen.apiKeyEnc'),
           smtpConfigured: envHasValue('SMTP_HOST') || settingHasValue(integration, 'smtp.host'),
           twilioConfigured: settingHasValue(integration, 'twilio.accountSid'),
           s3Configured: settingHasValue(integration, 's3.bucket'),

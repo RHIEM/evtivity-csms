@@ -3,9 +3,16 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, and, desc, sql, inArray } from 'drizzle-orm';
-import { db } from '@evtivity/database';
-import { stationWatches, chargingStations, sites, evses, connectors } from '@evtivity/database';
+import { eq, and, desc, sql, inArray, isNull } from 'drizzle-orm';
+import { db, availableEvseCountSql } from '@evtivity/database';
+import {
+  stationWatches,
+  chargingStations,
+  sites,
+  evses,
+  isOperatorStation,
+} from '@evtivity/database';
+import { publicStationListed } from '../../lib/public-station.js';
 import { zodSchema } from '../../lib/zod-schema.js';
 import {
   successResponse,
@@ -30,7 +37,13 @@ const watchItem = z
     siteState: z.string().max(100).nullable().describe('State or region'),
     isOnline: z.boolean().describe('Whether the station is currently online'),
     evseCount: z.number().int().min(0).describe('Total EVSEs at this station'),
-    availableCount: z.number().int().min(0).describe('Number of available EVSEs at this station'),
+    availableCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'Number of EVSEs a driver can use now: 0 when the station is offline, disabled, installing firmware, faulted at station level, or under maintenance; a reserved EVSE is not counted',
+      ),
     createdAt: z.coerce.date().describe('Timestamp when the watch was created'),
     expiresAt: z.coerce.date().describe('Timestamp when the watch auto-expires'),
   })
@@ -75,27 +88,27 @@ export function portalStationWatchRoutes(app: FastifyInstance): void {
           siteCity: sites.city,
           siteState: sites.state,
           isOnline: chargingStations.isOnline,
+          availableCount: sql<number>`${sql.raw(availableEvseCountSql('charging_stations'))}`,
           createdAt: stationWatches.createdAt,
           expiresAt: stationWatches.expiresAt,
         })
         .from(stationWatches)
         .innerJoin(chargingStations, eq(stationWatches.stationId, chargingStations.id))
         .leftJoin(sites, eq(chargingStations.siteId, sites.id))
-        .where(eq(stationWatches.driverId, driverId))
+        // A conformance (OCTT) station is never listed to a driver.
+        .where(and(eq(stationWatches.driverId, driverId), isOperatorStation()))
         .orderBy(desc(stationWatches.createdAt), desc(stationWatches.id));
 
       const stationUuids = rows.map((r) => r.stationUuid);
-      let evseCounts: Array<{ stationId: string; total: number; available: number }> = [];
+      let evseCounts: Array<{ stationId: string; total: number }> = [];
       if (stationUuids.length > 0) {
         evseCounts = await db
           .select({
             stationId: evses.stationId,
-            total: sql<number>`count(DISTINCT ${evses.id})::int`,
-            available: sql<number>`count(DISTINCT ${evses.id}) FILTER (WHERE ${connectors.status} = 'available')::int`,
+            total: sql<number>`count(*)::int`,
           })
           .from(evses)
-          .leftJoin(connectors, eq(connectors.evseId, evses.id))
-          .where(inArray(evses.stationId, stationUuids))
+          .where(and(inArray(evses.stationId, stationUuids), isNull(evses.retiredAt)))
           .groupBy(evses.stationId);
       }
 
@@ -112,7 +125,7 @@ export function portalStationWatchRoutes(app: FastifyInstance): void {
           siteState: r.siteState,
           isOnline: r.isOnline,
           evseCount: counts?.total ?? 0,
-          availableCount: counts?.available ?? 0,
+          availableCount: r.availableCount,
           createdAt: r.createdAt,
           expiresAt: r.expiresAt,
         };
@@ -206,19 +219,19 @@ export function portalStationWatchRoutes(app: FastifyInstance): void {
       const [station] = await db
         .select({ id: chargingStations.id })
         .from(chargingStations)
-        .where(eq(chargingStations.stationId, stationId));
+        .where(and(eq(chargingStations.stationId, stationId), publicStationListed()));
 
       if (station == null) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
 
-      // Already-free stations have nothing to wait for.
+      // Already-free stations have nothing to wait for. A disabled, offline or
+      // maintained station is not free, even when its connectors report Available.
       const availRows = await db
-        .select({ total: sql<number>`count(*)::int` })
-        .from(connectors)
-        .innerJoin(evses, eq(connectors.evseId, evses.id))
-        .where(and(eq(evses.stationId, station.id), sql`${connectors.status} = 'available'`));
+        .select({ total: sql<number>`${sql.raw(availableEvseCountSql('charging_stations'))}` })
+        .from(chargingStations)
+        .where(eq(chargingStations.id, station.id));
       if ((availRows[0]?.total ?? 0) > 0) {
         await reply.status(409).send({
           error: 'Station already has an available connector',

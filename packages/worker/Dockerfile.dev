@@ -1,12 +1,27 @@
 FROM node:24-slim
+# A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
+
+# Noto Sans CJK for Korean and Chinese scheduled report PDFs, as in the
+# production image (packages/worker/Dockerfile).
+RUN echo 'path-exclude=/usr/share/fonts/opentype/noto/NotoSerifCJK-*' > /etc/dpkg/dpkg.cfg.d/exclude-noto-serif-cjk \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
+COPY packages/payments/package.json packages/payments/
+COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
+COPY packages/v2g-exi/package.json packages/v2g-exi/
 COPY packages/ocpi/package.json packages/ocpi/
 COPY packages/csms/package.json packages/csms/
 COPY packages/portal/package.json packages/portal/
@@ -21,11 +36,17 @@ RUN npm ci --ignore-scripts
 COPY tsconfig.base.json tsconfig.json ./
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
-COPY packages/api/ packages/api/
+COPY packages/payments/ packages/payments/
+COPY packages/services/ packages/services/
+COPY packages/ai/ packages/ai/
+COPY packages/api/src/templates/ packages/api/src/templates/
 COPY packages/octt/ packages/octt/
 COPY packages/css/ packages/css/
+COPY packages/v2g-exi/ packages/v2g-exi/
 COPY packages/ocpp/ packages/ocpp/
 COPY packages/worker/ packages/worker/
-RUN npx tsc -b --force packages/lib packages/database packages/ocpp packages/api packages/css packages/octt
+# The database package tests import scripts/lib (the migration file helpers).
+COPY scripts/lib/ scripts/lib/
+RUN npx tsc -b --force packages/lib packages/database packages/payments packages/ocpp packages/css packages/octt
 
 CMD ["node", "--import", "tsx", "packages/worker/src/index.ts"]

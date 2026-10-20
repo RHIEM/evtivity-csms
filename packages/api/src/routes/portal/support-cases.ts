@@ -1,10 +1,9 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, and, desc, sql, count, inArray } from 'drizzle-orm';
+import { eq, and, desc, count, inArray } from 'drizzle-orm';
 import { db } from '@evtivity/database';
 import {
   supportCases,
@@ -20,12 +19,35 @@ import {
 } from '@evtivity/database';
 import { zodSchema } from '../../lib/zod-schema.js';
 import { ID_PARAMS } from '../../lib/id-validation.js';
-import { notifySupportCaseEvent } from '../../lib/support-case-events.js';
 import { paginatedResponse, itemResponse, errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { paginationQuery } from '../../lib/pagination.js';
 import type { PaginatedResponse } from '../../lib/pagination.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
+import {
+  addDriverMessage,
+  createSupportCase,
+  recordDriverAiFeedback,
+  recordSupportCaseAttachmentAdded,
+  requestDriverAiAnalysis,
+} from '@evtivity/services/support-case.service';
+import type { SupportCaseAiConsent } from '@evtivity/services/support-case.service';
+import {
+  DRIVER_ACTION_CODES,
+  DRIVER_AI_CONSENT_DECISIONS,
+  DRIVER_AI_STATE_REASONS,
+  DRIVER_AI_STATES,
+  SUPPORT_CASE_RESOLUTION_SOURCES,
+  driverAiCaseDetailSchema,
+  driverAiConsentInputSchema,
+  driverAiCreateStatusSchema,
+  driverAiFeedbackInputSchema,
+  isCurrentDriverAiNoticeVersion,
+} from '@evtivity/lib/driver-ai';
+import type { DriverAiStateReason } from '@evtivity/lib/driver-ai';
+import { readDriverAiAvailability } from '../../lib/driver-ai-availability.js';
+import { getAuditActor } from '../../lib/audit-actor.js';
+import { allowDriverAiCase } from '../../services/ai/engine/limits.js';
 
 const portalSupportCaseItem = z
   .object({
@@ -34,7 +56,9 @@ const portalSupportCaseItem = z
     subject: z.string().max(255).describe('Case subject line'),
     status: z
       .enum(supportCaseStatusEnum.enumValues)
-      .describe('Case status (open, in_progress, waiting_on_driver, resolved, closed)'),
+      .describe(
+        'Case status (open, in_progress, waiting_on_driver, resolved, closed; ai_assist while the automatic analysis handles it)',
+      ),
     category: z
       .enum(supportCaseCategoryEnum.enumValues)
       .describe(
@@ -64,7 +88,7 @@ const messageItem = z
     id: z.number().int().describe('Message ID'),
     senderType: z
       .enum(supportCaseMessageSenderEnum.enumValues)
-      .describe('Who sent the message (driver, operator, system)'),
+      .describe('Who sent the message (driver, operator, system, assistant: the automatic answer)'),
     body: z.string().describe('Message body text'),
     createdAt: z.coerce.date().describe('Timestamp the message was sent'),
     attachments: z
@@ -92,7 +116,12 @@ const portalSupportCaseDetail = portalSupportCaseItem
     messages: z
       .array(messageItem)
       .describe('Chronologically ordered driver-visible messages on the case'),
+    ai: driverAiCaseDetailSchema.passthrough(),
   })
+  .passthrough();
+
+const portalCreatedCase = portalSupportCaseItem
+  .extend({ ai: driverAiCreateStatusSchema.passthrough() })
   .passthrough();
 
 const portalMessageResponse = z
@@ -116,9 +145,16 @@ const portalMessageResponse = z
 
 const uploadUrlResponse = z
   .object({
-    uploadUrl: z.string().describe('Presigned S3 PUT URL valid for a short time'),
-    s3Key: z.string().describe('S3 object key the client must upload to'),
-    s3Bucket: z.string().describe('S3 bucket name the client must upload to'),
+    uploadUrl: z
+      .string()
+      .describe(
+        'Presigned S3 POST URL. Send a multipart/form-data POST with every entry of fields, then the file as the last field named file. S3 enforces the size limit and the Content-Type.',
+      ),
+    fields: z.record(z.string()).describe('Form fields to send unchanged before the file field'),
+    s3Key: z
+      .string()
+      .describe('Quarantine key of the upload. Pass it to the confirm endpoint after the POST.'),
+    expiresAt: z.coerce.date().describe('Time after which S3 refuses the POST'),
   })
   .passthrough();
 
@@ -128,12 +164,10 @@ const downloadUrlResponse = z
   })
   .passthrough();
 import {
-  getS3Config,
-  generateUploadUrl,
-  generateDownloadUrl,
-  buildS3Key,
-} from '../../services/s3.service.js';
-import { dispatchOperatorNotification } from '../../services/support-notification.service.js';
+  confirmSupportAttachment,
+  requestSupportAttachmentUpload,
+  supportAttachmentDownloadUrl,
+} from '../../services/ai/attachments/support-attachments.js';
 
 const caseIdParams = z.object({ id: ID_PARAMS.supportCaseId.describe('Support case ID') });
 const messageIdParams = z.object({
@@ -167,6 +201,11 @@ const createCaseBody = z.object({
     .max(255)
     .optional()
     .describe('Related station OCPP identity (e.g. CS-0439)'),
+  aiConsent: driverAiConsentInputSchema
+    .optional()
+    .describe(
+      'The driver choice on the AI analysis, sent only after the driver pressed a button. Omitted: the driver was not asked (a normal case)',
+    ),
 });
 
 const createMessageBody = z.object({
@@ -175,30 +214,68 @@ const createMessageBody = z.object({
 
 const requestUploadUrlBody = z.object({
   fileName: z.string().min(1).max(255),
-  contentType: z.string().min(1).max(100),
+  contentType: z
+    .string()
+    .max(100)
+    .describe(
+      'MIME type of the file: JPEG, PNG, WebP, GIF, PDF, CSV, plain text or log, JSON or JSONL. Empty or application/octet-stream falls back to the file extension.',
+    ),
   fileSize: z
     .number()
     .int()
     .min(1)
-    .max(10 * 1024 * 1024),
+    .describe('File size in bytes, at most the ai.attachments.maxBytes setting (default 10 MB)'),
 });
 
 const confirmAttachmentBody = z.object({
-  fileName: z.string().min(1).max(255),
-  fileSize: z
-    .number()
-    .int()
+  s3Key: z
+    .string()
     .min(1)
-    .max(10 * 1024 * 1024),
-  contentType: z.string().min(1).max(100),
-  s3Key: z.string().min(1),
-  s3Bucket: z.string().min(1),
+    .max(1024)
+    .describe('Quarantine key returned by the upload URL request for this message'),
 });
 
-async function getNextCaseNumber(): Promise<string> {
-  const result = await db.execute(sql`SELECT nextval('support_case_number_seq') as val`);
-  const seq = Number((result as unknown as Array<{ val: string }>)[0]?.val ?? 1);
-  return `CASE-${String(seq).padStart(5, '0')}`;
+/** SQL: the message is the driver's own, non-internal message on the case. */
+function driverOwnMessageCondition(caseId: string, messageId: number, driverId: string) {
+  return and(
+    eq(supportCaseMessages.id, messageId),
+    eq(supportCaseMessages.caseId, caseId),
+    eq(supportCaseMessages.senderType, 'driver'),
+    eq(supportCaseMessages.senderId, driverId),
+    eq(supportCaseMessages.isInternal, false),
+  );
+}
+
+function oneOf<T extends string>(values: readonly T[], value: unknown): T | null {
+  return typeof value === 'string' && (values as readonly string[]).includes(value)
+    ? (value as T)
+    : null;
+}
+
+/** The `ai` block of the driver's case detail (`driverAiCaseDetailSchema`). */
+function driverAiDetail(row: {
+  aiConsent: string | null;
+  aiState: string | null;
+  aiStateReason: string | null;
+  aiAnsweredAt: Date | null;
+  aiFeedbackAt: Date | null;
+  aiDriverActions: string[] | null;
+  aiNeedsOperator: boolean | null;
+  resolutionSource: string | null;
+}): z.infer<typeof driverAiCaseDetailSchema> {
+  return {
+    consent: oneOf(DRIVER_AI_CONSENT_DECISIONS, row.aiConsent),
+    state: oneOf(DRIVER_AI_STATES, row.aiState),
+    reason: oneOf(DRIVER_AI_STATE_REASONS, row.aiStateReason),
+    answeredAt: row.aiAnsweredAt?.toISOString() ?? null,
+    feedbackAt: row.aiFeedbackAt?.toISOString() ?? null,
+    resolutionSource: oneOf(SUPPORT_CASE_RESOLUTION_SOURCES, row.resolutionSource),
+    driverActions: (row.aiDriverActions ?? []).flatMap((code) => {
+      const known = oneOf(DRIVER_ACTION_CODES, code);
+      return known != null ? [known] : [];
+    }),
+    needsOperator: row.aiNeedsOperator,
+  };
 }
 
 export function portalSupportCaseRoutes(app: FastifyInstance): void {
@@ -283,6 +360,14 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
           resolvedAt: supportCases.resolvedAt,
           createdAt: supportCases.createdAt,
           updatedAt: supportCases.updatedAt,
+          aiConsent: supportCases.aiConsent,
+          aiState: supportCases.aiState,
+          aiStateReason: supportCases.aiStateReason,
+          aiAnsweredAt: supportCases.aiAnsweredAt,
+          aiFeedbackAt: supportCases.aiFeedbackAt,
+          aiDriverActions: supportCases.aiDriverActions,
+          aiNeedsOperator: supportCases.aiNeedsOperator,
+          resolutionSource: supportCases.resolutionSource,
         })
         .from(supportCases)
         .leftJoin(chargingStations, eq(supportCases.stationId, chargingStations.id))
@@ -313,7 +398,9 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
           })
           .from(supportCaseSessions)
           .innerJoin(chargingSessions, eq(supportCaseSessions.sessionId, chargingSessions.id))
-          .where(eq(supportCaseSessions.caseId, id)),
+          // Only the driver's own sessions: an operator could have linked a
+          // session of another driver before linking checked the driver.
+          .where(and(eq(supportCaseSessions.caseId, id), eq(chargingSessions.driverId, driverId))),
         // Exclude internal messages — drivers must not see operator notes.
         db
           .select({
@@ -363,7 +450,32 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         attachments: attachmentsByMessage.get(m.id) ?? [],
       }));
 
-      return { ...supportCase, sessions, messages: messagesWithAttachments };
+      const {
+        aiConsent,
+        aiState,
+        aiStateReason,
+        aiAnsweredAt,
+        aiFeedbackAt,
+        aiDriverActions,
+        aiNeedsOperator,
+        resolutionSource,
+        ...caseFields
+      } = supportCase;
+      return {
+        ...caseFields,
+        sessions,
+        messages: messagesWithAttachments,
+        ai: driverAiDetail({
+          aiConsent,
+          aiState,
+          aiStateReason,
+          aiAnsweredAt,
+          aiFeedbackAt,
+          aiDriverActions,
+          aiNeedsOperator,
+          resolutionSource,
+        }),
+      };
     },
   );
 
@@ -378,18 +490,47 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         operationId: 'portalCreateSupportCase',
         security: [{ bearerAuth: [] }],
         body: zodSchema(createCaseBody),
+        description:
+          'Creates a case. With aiConsent granted (and the AI analysis on, see GET /v1/portal/features driverAiSupport) the case is analyzed by the automatic support first (status ai_assist) and reaches the support team only when the driver says the answer did not help, or when the analysis cannot run. Declined, or aiConsent omitted: the case goes to the support team at once.',
         response: {
-          200: itemResponse(portalSupportCaseItem),
+          200: itemResponse(portalCreatedCase),
           404: errorWith('Session or station not found', [
             ERROR_CODES.SESSION_NOT_FOUND,
             ERROR_CODES.STATION_NOT_FOUND,
           ]),
+          409: errorWith('The consent names an outdated notice version', [
+            ERROR_CODES.DRIVER_AI_NOTICE_OUTDATED,
+          ]),
+        },
+      },
+      // 10 new cases per driver per hour (plan v0.1.45 2.7 #8, threat T5): every
+      // case can start an AI analysis or an operator notice.
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 hour',
+          keyGenerator: (request) => {
+            const driverId = (request.user as unknown as Record<string, unknown> | undefined)?.[
+              'driverId'
+            ];
+            return typeof driverId === 'string' ? `support-case:${driverId}` : request.ip;
+          },
         },
       },
     },
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
       const body = request.body as z.infer<typeof createCaseBody>;
+
+      // A consent must name the notice the driver saw; an outdated one writes
+      // nothing (threat T6), so the app shows the current notice again.
+      if (body.aiConsent != null && !isCurrentDriverAiNoticeVersion(body.aiConsent.noticeVersion)) {
+        await reply.status(409).send({
+          error: 'The AI notice changed. Review it and choose again',
+          code: 'DRIVER_AI_NOTICE_OUTDATED',
+        });
+        return;
+      }
 
       // Reject sessionId that does not belong to this driver. Without this
       // guard a driver can attach another driver's session to a case, polluting
@@ -423,54 +564,66 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
           await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
           return;
         }
+        // The case is scoped to its station's site on the operator side: a
+        // station that differs from the session's station would show the
+        // session's case to the operators of another site.
+        if (sessionStationId != null && station.id !== sessionStationId) {
+          await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+          return;
+        }
         resolvedStationId = station.id;
       }
 
-      const caseNumber = await getNextCaseNumber();
-
       const stationId = resolvedStationId ?? sessionStationId;
 
-      const [newCase] = await db
-        .insert(supportCases)
-        .values({
-          caseNumber,
-          subject: body.subject,
-          description: body.description,
-          category: body.category,
-          priority: 'medium',
-          driverId,
-          stationId,
-          createdByDriver: true,
-        })
-        .returning();
-
-      if (newCase == null) {
-        throw new Error('Failed to create support case');
+      // The consent counts only while the AI analysis is on (P11 layer 2): a
+      // granted choice for a feature that is off makes a normal case.
+      let aiConsent: SupportCaseAiConsent | null = null;
+      let aiSkipReason: DriverAiStateReason | null = null;
+      if (body.aiConsent != null) {
+        const availability = await readDriverAiAvailability();
+        if (availability.available) {
+          aiConsent = body.aiConsent;
+          if (
+            body.aiConsent.decision === 'granted' &&
+            !(await allowDriverAiCase(driverId, availability.perMinute))
+          ) {
+            aiSkipReason = 'rate_limited';
+          }
+        }
       }
 
-      // Link session via junction table
-      if (body.sessionId != null) {
-        await db.insert(supportCaseSessions).values({
-          caseId: newCase.id,
-          sessionId: body.sessionId,
-        });
-      }
-
-      // Create initial message
-      await db.insert(supportCaseMessages).values({
-        caseId: newCase.id,
-        senderType: 'driver',
-        senderId: driverId,
-        body: body.description,
-        isInternal: false,
+      const newCase = await createSupportCase({
+        subject: body.subject,
+        description: body.description,
+        category: body.category,
+        priority: 'medium',
+        driverId,
+        stationId,
+        assignedTo: null,
+        sessionIds: body.sessionId != null ? [body.sessionId] : [],
+        openedBy: { type: 'driver', driverId },
+        actor: { actor: 'driver', actorDriverId: driverId },
+        aiConsent,
+        aiSkipReason,
+        log: request.log,
       });
 
-      // Notify operators
-      void dispatchOperatorNotification('new_case', newCase.id, caseNumber, body.subject, null);
+      // The row exists before the request (P4); a lost request is queued
+      // again by the driver-ai-sweep cron.
+      if (newCase.aiState === 'queued') {
+        await requestDriverAiAnalysis(newCase.id, request.log);
+      }
 
-      void notifySupportCaseEvent('supportCase.created', newCase.id, driverId);
-
-      return newCase;
+      return {
+        ...newCase,
+        ai: {
+          state: (newCase.aiState ?? null) as z.infer<typeof driverAiCreateStatusSchema>['state'],
+          reason: (newCase.aiStateReason ?? null) as z.infer<
+            typeof driverAiCreateStatusSchema
+          >['reason'],
+        },
+      };
     },
   );
 
@@ -513,29 +666,100 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const [message] = await db
-        .insert(supportCaseMessages)
-        .values({
-          caseId: id,
-          senderType: 'driver',
-          senderId: driverId,
-          body: body.body,
-          isInternal: false,
+      return addDriverMessage({
+        supportCase,
+        driverId,
+        body: body.body,
+        log: request.log,
+      });
+    },
+  );
+
+  // Driver answer to "Did this solve your issue?" (asked once)
+  app.post(
+    '/portal/support-cases/:id/ai-feedback',
+    {
+      onRequest: [app.authenticateDriver],
+      schema: {
+        tags: ['Portal Support'],
+        summary: 'Answer whether the automatic answer solved the issue',
+        operationId: 'portalSupportCaseAiFeedback',
+        description:
+          'satisfied true resolves the case as resolved by the automatic answer. false sends the case and its transcript to the support team. Accepted once, while the case waits for the answer.',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(caseIdParams),
+        body: zodSchema(driverAiFeedbackInputSchema),
+        response: {
+          200: itemResponse(
+            z
+              .object({
+                id: z.string().describe('Support case ID'),
+                status: z
+                  .enum(supportCaseStatusEnum.enumValues)
+                  .describe('Case status after the answer (resolved or open)'),
+                ai: driverAiCaseDetailSchema.passthrough(),
+              })
+              .passthrough(),
+          ),
+          404: errorWith('Support case not found', [ERROR_CODES.SUPPORT_CASE_NOT_FOUND]),
+          409: errorWith('The case is not waiting for feedback', [
+            ERROR_CODES.SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { driverId } = request.user as DriverJwtPayload;
+      const { id } = request.params as z.infer<typeof caseIdParams>;
+      const { satisfied } = request.body as z.infer<typeof driverAiFeedbackInputSchema>;
+
+      const [owned] = await db
+        .select({ driverId: supportCases.driverId })
+        .from(supportCases)
+        .where(eq(supportCases.id, id));
+      if (owned?.driverId !== driverId) {
+        await reply
+          .status(404)
+          .send({ error: 'Support case not found', code: 'SUPPORT_CASE_NOT_FOUND' });
+        return;
+      }
+
+      const outcome = await recordDriverAiFeedback({
+        caseId: id,
+        driverId,
+        satisfied,
+        log: request.log,
+      });
+      if (outcome === 'not_awaiting') {
+        await reply.status(409).send({
+          error: 'The case is not waiting for feedback on an automatic answer',
+          code: 'SUPPORT_CASE_AI_NOT_AWAITING_FEEDBACK',
+        });
+        return;
+      }
+
+      const [row] = await db
+        .select({
+          id: supportCases.id,
+          status: supportCases.status,
+          aiConsent: supportCases.aiConsent,
+          aiState: supportCases.aiState,
+          aiStateReason: supportCases.aiStateReason,
+          aiAnsweredAt: supportCases.aiAnsweredAt,
+          aiFeedbackAt: supportCases.aiFeedbackAt,
+          aiDriverActions: supportCases.aiDriverActions,
+          aiNeedsOperator: supportCases.aiNeedsOperator,
+          resolutionSource: supportCases.resolutionSource,
         })
-        .returning();
-
-      // Notify operators
-      void dispatchOperatorNotification(
-        'driver_reply',
-        supportCase.id,
-        supportCase.caseNumber,
-        supportCase.subject,
-        supportCase.assignedTo,
-      );
-
-      void notifySupportCaseEvent('supportCase.newMessage', id, driverId);
-
-      return message;
+        .from(supportCases)
+        .where(eq(supportCases.id, id));
+      if (row == null) {
+        await reply
+          .status(404)
+          .send({ error: 'Support case not found', code: 'SUPPORT_CASE_NOT_FOUND' });
+        return;
+      }
+      return { id: row.id, status: row.status, ai: driverAiDetail(row) };
     },
   );
 
@@ -548,12 +772,18 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         tags: ['Portal Support'],
         summary: 'Request a presigned S3 upload URL for an attachment',
         operationId: 'portalRequestAttachmentUploadUrl',
+        description:
+          'Returns a presigned S3 POST into quarantine for an attachment on one of your own messages. The type must be allowlisted and the size within the limit; S3 enforces both. Confirm the upload afterwards.',
         security: [{ bearerAuth: [] }],
         params: zodSchema(messageIdParams),
         body: zodSchema(requestUploadUrlBody),
         response: {
           200: itemResponse(uploadUrlResponse),
-          400: errorWith('S3 not configured', [ERROR_CODES.STORAGE_NOT_CONFIGURED]),
+          400: errorWith('Storage not configured, or the file type or size is not allowed', [
+            ERROR_CODES.STORAGE_NOT_CONFIGURED,
+            ERROR_CODES.AI_ATTACHMENT_TYPE_NOT_ALLOWED,
+            ERROR_CODES.AI_ATTACHMENT_TOO_LARGE,
+          ]),
           404: errorWith('Not found', [
             ERROR_CODES.SUPPORT_CASE_NOT_FOUND,
             ERROR_CODES.MESSAGE_NOT_FOUND,
@@ -579,29 +809,19 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // A driver attaches files only to its own messages on the case, never
+      // to an operator message or an internal note.
       const [message] = await db
         .select({ id: supportCaseMessages.id })
         .from(supportCaseMessages)
-        .where(and(eq(supportCaseMessages.id, messageId), eq(supportCaseMessages.caseId, id)));
+        .where(driverOwnMessageCondition(id, messageId, driverId));
 
       if (message == null) {
         await reply.status(404).send({ error: 'Message not found', code: 'MESSAGE_NOT_FOUND' });
         return;
       }
 
-      const s3 = await getS3Config();
-      if (s3 == null) {
-        await reply
-          .status(400)
-          .send({ error: 'Attachment storage not configured', code: 'STORAGE_NOT_CONFIGURED' });
-        return;
-      }
-
-      const fileId = crypto.randomUUID();
-      const key = buildS3Key(id, messageId, fileId, body.fileName);
-      const uploadUrl = await generateUploadUrl(s3, key, body.contentType);
-
-      return { uploadUrl, s3Key: key, s3Bucket: s3.bucket };
+      return requestSupportAttachmentUpload(id, messageId, body);
     },
   );
 
@@ -614,12 +834,19 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         tags: ['Portal Support'],
         summary: 'Confirm an attachment after S3 upload',
         operationId: 'portalConfirmAttachment',
+        description:
+          'Reads the uploaded file, checks its bytes against the declared type, re-encodes images (metadata stripped), checks PDFs and text, stores the clean file and records it on the message. Confirming the same key again returns the stored attachment.',
         security: [{ bearerAuth: [] }],
         params: zodSchema(messageIdParams),
         body: zodSchema(confirmAttachmentBody),
         response: {
           200: itemResponse(attachmentItem),
-          400: errorWith('Attachment metadata invalid', [ERROR_CODES.VALIDATION_ERROR]),
+          400: errorWith('Upload key invalid, or the file was refused', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.AI_ATTACHMENT_REJECTED,
+            ERROR_CODES.AI_ATTACHMENT_TOO_LARGE,
+            ERROR_CODES.STORAGE_NOT_CONFIGURED,
+          ]),
           404: errorWith('Support case or message not found', [
             ERROR_CODES.SUPPORT_CASE_NOT_FOUND,
             ERROR_CODES.MESSAGE_NOT_FOUND,
@@ -645,43 +872,36 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // A driver attaches files only to its own messages on the case, never
+      // to an operator message or an internal note.
       const [message] = await db
         .select({ id: supportCaseMessages.id })
         .from(supportCaseMessages)
-        .where(and(eq(supportCaseMessages.id, messageId), eq(supportCaseMessages.caseId, id)));
+        .where(driverOwnMessageCondition(id, messageId, driverId));
 
       if (message == null) {
         await reply.status(404).send({ error: 'Message not found', code: 'MESSAGE_NOT_FOUND' });
         return;
       }
 
-      // Reject s3Key values that do not belong to this case+message. The
-      // download endpoint hands back a presigned GET against the stored s3Key
-      // verbatim, so trusting an arbitrary client-supplied key here would let
-      // a driver insert a row whose s3Key points at another driver's file
-      // path and then retrieve it via the matching download URL.
-      const expectedPrefix = `support-cases/${id}/${String(messageId)}/`;
-      const s3 = await getS3Config();
-      if (!body.s3Key.startsWith(expectedPrefix) || s3 == null || body.s3Bucket !== s3.bucket) {
-        await reply.status(400).send({
-          error: 'Attachment metadata does not match issued upload URL',
-          code: 'VALIDATION_ERROR',
-        });
-        return;
-      }
-
-      const [attachment] = await db
-        .insert(supportCaseAttachments)
-        .values({
+      // The service accepts only a quarantine key issued for this case and
+      // message, so a driver cannot register another driver's object and then
+      // download it through this case.
+      const { attachment, created } = await confirmSupportAttachment(
+        id,
+        messageId,
+        body.s3Key,
+        request.log,
+      );
+      if (created) {
+        await recordSupportCaseAttachmentAdded({
+          caseId: id,
           messageId,
-          fileName: body.fileName,
-          fileSize: body.fileSize,
-          contentType: body.contentType,
-          s3Key: body.s3Key,
-          s3Bucket: body.s3Bucket,
-        })
-        .returning();
-
+          attachment,
+          actor: getAuditActor(request),
+          log: request.log,
+        });
+      }
       return attachment;
     },
   );
@@ -755,16 +975,7 @@ export function portalSupportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const s3 = await getS3Config();
-      if (s3 == null) {
-        await reply
-          .status(400)
-          .send({ error: 'Attachment storage not configured', code: 'STORAGE_NOT_CONFIGURED' });
-        return;
-      }
-
-      const downloadUrl = await generateDownloadUrl(s3, attachment.s3Bucket, attachment.s3Key);
-      return { downloadUrl };
+      return { downloadUrl: await supportAttachmentDownloadUrl(attachment) };
     },
   );
 }

@@ -18,6 +18,9 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Label } from '@/components/ui/label';
+import { useHasPermission } from '@/lib/auth';
 import { useToast } from '@/components/ui/toast';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
 import { getErrorMessage } from '@/lib/error-message';
@@ -44,6 +47,8 @@ interface PartnerDetail {
   status: string;
   version: string | null;
   versionUrl: string | null;
+  allowPrivateNetwork: boolean;
+  allowRawToken: boolean;
   roles: unknown[];
   ourRoles: unknown[];
   createdAt: string;
@@ -71,6 +76,9 @@ export function RoamingPartnerDetail(): React.JSX.Element {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const [disconnectOpen, setDisconnectOpen] = useState(false);
+  const [newTokenOpen, setNewTokenOpen] = useState(false);
+  const [issuedToken, setIssuedToken] = useState<string | null>(null);
+  const canWrite = useHasPermission('roaming:write');
 
   const { data: partner, isLoading } = useQuery({
     queryKey: ['ocpi-partners', id],
@@ -91,6 +99,47 @@ export function RoamingPartnerDetail(): React.JSX.Element {
     mutationFn: () => api.post(`/v1/ocpi/partners/${id ?? ''}/register`, {}),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['ocpi-partners'] });
+    },
+  });
+
+  const privateNetworkMutation = useMutation({
+    mutationFn: (allowPrivateNetwork: boolean) =>
+      api.patch(`/v1/ocpi/partners/${id ?? ''}`, { allowPrivateNetwork }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['ocpi-partners'] });
+      toast({ title: t('roaming.partners.privateNetworkSaved') });
+    },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+    },
+  });
+
+  const rawTokenMutation = useMutation({
+    mutationFn: (allowRawToken: boolean) =>
+      api.patch(`/v1/ocpi/partners/${id ?? ''}`, { allowRawToken }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['ocpi-partners'] });
+      toast({ title: t('roaming.partners.rawTokenSaved') });
+    },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+    },
+  });
+
+  const newTokenMutation = useMutation({
+    mutationFn: () =>
+      api.post<{ registrationToken: string }>(
+        `/v1/ocpi/partners/${id ?? ''}/registration-token`,
+        {},
+      ),
+    onSuccess: (result) => {
+      setNewTokenOpen(false);
+      setIssuedToken(result.registrationToken);
+      void queryClient.invalidateQueries({ queryKey: ['ocpi-partners'] });
+    },
+    onError: (err) => {
+      setNewTokenOpen(false);
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
     },
   });
 
@@ -120,7 +169,17 @@ export function RoamingPartnerDetail(): React.JSX.Element {
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-          {partner.status !== 'connected' && partner.versionUrl != null && (
+          {canWrite && partner.status !== 'connected' && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                setNewTokenOpen(true);
+              }}
+            >
+              {t('roaming.partners.newRegistrationToken')}
+            </Button>
+          )}
+          {canWrite && partner.status !== 'connected' && partner.versionUrl != null && (
             // Register is also valid for disconnected/suspended partners that
             // need a fresh handshake; the API route accepts any status as long
             // as versionUrl is set.
@@ -135,7 +194,7 @@ export function RoamingPartnerDetail(): React.JSX.Element {
                 : t('roaming.partners.register')}
             </Button>
           )}
-          {partner.status !== 'disconnected' && (
+          {canWrite && partner.status !== 'disconnected' && (
             <Button
               variant="destructive"
               onClick={() => {
@@ -148,6 +207,16 @@ export function RoamingPartnerDetail(): React.JSX.Element {
           <EntityNavButtons resource="ocpi/partners" basePath="/roaming/partners" currentId={id} />
         </div>
       </div>
+
+      {issuedToken != null && (
+        <Card>
+          <CardContent className="space-y-3 pt-6">
+            <p className="text-sm">{t('roaming.partners.tokenIssued')}</p>
+            <div className="rounded bg-muted p-3 text-xs break-all select-all">{issuedToken}</div>
+            <p className="text-xs text-muted-foreground">{t('roaming.partners.tokenWarning')}</p>
+          </CardContent>
+        </Card>
+      )}
 
       {registerMutation.isError && (
         <p className="text-sm text-destructive">{getErrorMessage(registerMutation.error, t)}</p>
@@ -183,6 +252,39 @@ export function RoamingPartnerDetail(): React.JSX.Element {
       </div>
 
       <Card>
+        <CardContent className="space-y-1 pt-6">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="partner-allow-private-network"
+              checked={partner.allowPrivateNetwork}
+              disabled={!canWrite || privateNetworkMutation.isPending}
+              onChange={(e) => {
+                privateNetworkMutation.mutate(e.target.checked);
+              }}
+            />
+            <Label htmlFor="partner-allow-private-network">
+              {t('roaming.partners.allowPrivateNetwork')}
+            </Label>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t('roaming.partners.allowPrivateNetworkHint')}
+          </p>
+          <div className="flex items-center gap-2 pt-3">
+            <Checkbox
+              id="partner-allow-raw-token"
+              checked={partner.allowRawToken}
+              disabled={!canWrite || rawTokenMutation.isPending}
+              onChange={(e) => {
+                rawTokenMutation.mutate(e.target.checked);
+              }}
+            />
+            <Label htmlFor="partner-allow-raw-token">{t('roaming.partners.allowRawToken')}</Label>
+          </div>
+          <p className="text-xs text-muted-foreground">{t('roaming.partners.allowRawTokenHint')}</p>
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardHeader>
           <CardTitle>{t('roaming.partners.endpoints')}</CardTitle>
         </CardHeader>
@@ -216,7 +318,7 @@ export function RoamingPartnerDetail(): React.JSX.Element {
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('roaming.partners.syncHistory')}</CardTitle>
+          <CardTitle>{t('roaming.partners.syncs')}</CardTitle>
         </CardHeader>
         <CardContent>
           {syncLog == null || syncLog.length === 0 ? (
@@ -282,6 +384,18 @@ export function RoamingPartnerDetail(): React.JSX.Element {
           disconnectMutation.mutate();
         }}
         isPending={disconnectMutation.isPending}
+      />
+
+      <ConfirmDialog
+        open={newTokenOpen}
+        onOpenChange={setNewTokenOpen}
+        title={t('roaming.partners.newRegistrationTokenTitle')}
+        description={t('roaming.partners.newRegistrationTokenDescription')}
+        confirmLabel={t('roaming.partners.newRegistrationToken')}
+        onConfirm={() => {
+          newTokenMutation.mutate();
+        }}
+        isPending={newTokenMutation.isPending}
       />
 
       <EntityHistoryTab entityType="ocpi_partner" entityId={id ?? ''} />

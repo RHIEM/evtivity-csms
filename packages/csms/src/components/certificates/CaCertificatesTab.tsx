@@ -34,6 +34,7 @@ import { api } from '@/lib/api';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import { FilterPopover } from '@/components/FilterBar';
 import { certificateStatusVariant } from '@/lib/status-variants';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 
 interface CaCertificate {
   id: number;
@@ -58,6 +59,8 @@ export function CaCertificatesTab(): React.JSX.Element {
   const { t } = useTranslation();
   const timezone = useUserTimezone();
   const queryClient = useQueryClient();
+  // The trust store serves every station: its writes need access to every site.
+  const canManageTrustStore = useHasCompanyWidePermission('certificates:write');
 
   const [caStatusFilter, setCaStatusFilter] = useState('');
 
@@ -106,36 +109,40 @@ export function CaCertificatesTab(): React.JSX.Element {
           <CardHeader>
             <div className="flex flex-row items-center justify-between gap-2">
               <CardTitle>{t('pnc.caCertificates')}</CardTitle>
-              <div className="flex flex-col gap-2 [&>*]:w-full sm:flex-row sm:items-center sm:[&>*]:w-auto">
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    refreshRootsMutation.mutate();
-                  }}
-                  disabled={refreshRootsMutation.isPending}
-                >
-                  {refreshRootsMutation.isPending ? (
-                    <Spinner className="h-4 w-4" />
-                  ) : (
-                    <RefreshCw className="h-4 w-4" />
-                  )}
-                  {t('pnc.refreshRootCerts')}
-                </Button>
-                <Button
-                  onClick={() => {
-                    setUploadOpen(true);
-                  }}
-                >
-                  <Upload className="h-4 w-4" />
-                  {t('pnc.uploadCaCert')}
-                </Button>
+              <div className="flex flex-col gap-2 *:w-full sm:flex-row sm:items-center sm:*:w-auto">
+                {canManageTrustStore && (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        refreshRootsMutation.mutate();
+                      }}
+                      disabled={refreshRootsMutation.isPending}
+                    >
+                      {refreshRootsMutation.isPending ? (
+                        <Spinner className="h-4 w-4" />
+                      ) : (
+                        <RefreshCw className="h-4 w-4" />
+                      )}
+                      {t('pnc.refreshRootCerts')}
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        setUploadOpen(true);
+                      }}
+                    >
+                      <Upload className="h-4 w-4" />
+                      {t('pnc.uploadCaCert')}
+                    </Button>
+                  </>
+                )}
                 <Select
                   aria-label={t('common.status')}
                   value={caStatusFilter}
                   onChange={(e) => {
                     setCaStatusFilter(e.target.value);
                   }}
-                  className="hidden h-9 w-auto md:block"
+                  className="hidden w-auto md:block"
                 >
                   <option value="">{t('common.all')}</option>
                   <option value="active">{t('pnc.active')}</option>
@@ -150,14 +157,13 @@ export function CaCertificatesTab(): React.JSX.Element {
                   }}
                 >
                   <div className="space-y-2">
-                    <Label>{t('common.status')}</Label>
+                    <Label className="leading-6">{t('common.status')}</Label>
                     <Select
                       aria-label={t('common.status')}
                       value={caStatusFilter}
                       onChange={(e) => {
                         setCaStatusFilter(e.target.value);
                       }}
-                      className="h-10"
                     >
                       <option value="">{t('common.all')}</option>
                       <option value="active">{t('pnc.active')}</option>
@@ -215,17 +221,19 @@ export function CaCertificatesTab(): React.JSX.Element {
                         </TableCell>
                         <TableCell>{cert.source ?? '-'}</TableCell>
                         <TableCell>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={t('common.delete')}
-                            onClick={() => {
-                              deleteCaMutation.mutate(cert.id);
-                            }}
-                            disabled={deleteCaMutation.isPending}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
+                          {canManageTrustStore && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={t('common.delete')}
+                              onClick={() => {
+                                deleteCaMutation.mutate(cert.id);
+                              }}
+                              disabled={deleteCaMutation.isPending}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -246,14 +254,15 @@ export function CaCertificatesTab(): React.JSX.Element {
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="upload-cert-type">{t('pnc.certificateType')}</Label>
+              <Label htmlFor="upload-cert-type" className="leading-6">
+                {t('pnc.certificateType')}
+              </Label>
               <Select
                 id="upload-cert-type"
                 value={uploadCertType}
                 onChange={(e) => {
                   setUploadCertType(e.target.value);
                 }}
-                className="h-9"
               >
                 <option value="V2GRootCertificate">V2G Root Certificate</option>
                 <option value="MORootCertificate">MO Root Certificate</option>
@@ -262,7 +271,9 @@ export function CaCertificatesTab(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="upload-pem">PEM</Label>
+              <Label htmlFor="upload-pem" className="leading-6">
+                PEM
+              </Label>
               <textarea
                 id="upload-pem"
                 className="h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"

@@ -2,6 +2,45 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { defaultReply } from '../../../../default-replies.js';
+import { buildOcppTariff } from '@evtivity/lib';
+import type { OcppTariff, OcppTariffSource } from '@evtivity/lib';
+
+/** A pricing group of TC_I_101: 0.25/kWh from 08:00 to 20:00, 0.20/kWh otherwise. */
+function groupDerivedDayTariff(): OcppTariff {
+  const tariff = (overrides: Partial<OcppTariffSource>): OcppTariffSource => ({
+    id: 'octt-101-default',
+    pricePerKwh: '0.20',
+    pricePerMinute: null,
+    pricePerSession: null,
+    idleFeePricePerMinute: null,
+    reservationFeePerMinute: null,
+    taxRate: null,
+    restrictions: null,
+    priority: 0,
+    isDefault: true,
+    ...overrides,
+  });
+  const fallback = tariff({});
+  const day = tariff({
+    id: 'octt-101-day',
+    pricePerKwh: '0.25',
+    restrictions: { timeRange: { startTime: '08:00', endTime: '20:00' } },
+    priority: 10,
+    isDefault: false,
+  });
+  return buildOcppTariff({
+    current: fallback,
+    groupTariffs: [fallback, day],
+    graceMinutes: 0,
+    holidays: [],
+    at: new Date(),
+    timezone: 'UTC',
+    currency: 'USD',
+    taxBasis: 'net',
+    support: { conditions: true, maxElements: null },
+  });
+}
 
 /**
  * TC_I_101_CSMS: Set Default Tariff - startTimeOfDay, endTimeOfDay
@@ -38,31 +77,21 @@ export const TC_I_101_CSMS: TestCase = {
           tariffPayload = payload;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
     // Wait for CSMS to send SetDefaultTariffRequest (manual action trigger)
     if (ctx.triggerCommand != null) {
+      // The tariff is derived from a pricing group (a day window 08:00-20:00
+      // and the default) by the builder the CSMS sends tariffs with
+      // (AuthorizeResponse, ChangeTransactionTariff), so the window is the
+      // CSMS's own startTimeOfDay/endTimeOfDay mapping. A default tariff may
+      // carry validFrom (I07); a driver tariff never does (I08.FR.09).
       await ctx.triggerCommand('v21', 'SetDefaultTariff', {
         stationId: ctx.stationId,
         evseId: 0,
-        tariff: {
-          tariffId: 'octt-tariff-101',
-          currency: 'USD',
-          validFrom: new Date().toISOString(),
-          energy: {
-            prices: [
-              {
-                priceKwh: 0.25,
-                conditions: {
-                  startTimeOfDay: '08:00',
-                  endTimeOfDay: '20:00',
-                },
-              },
-            ],
-          },
-        },
+        tariff: { ...groupDerivedDayTariff(), validFrom: new Date().toISOString() },
       });
     } else {
       await new Promise((resolve) => setTimeout(resolve, 15000));
@@ -101,7 +130,10 @@ export const TC_I_101_CSMS: TestCase = {
       actual: validFrom != null ? `validFrom = ${String(validFrom)}` : 'validFrom omitted',
     });
 
-    const hasConditions = prices != null && prices.length >= 1 && prices[0]?.['conditions'] != null;
+    const firstConditions = prices?.[0]?.['conditions'] as Record<string, unknown> | undefined;
+    const hasConditions =
+      firstConditions?.['startTimeOfDay'] === '08:00' &&
+      firstConditions['endTimeOfDay'] === '20:00';
     steps.push({
       step: 4,
       description: 'tariff.energy.prices[0].conditions with startTimeOfDay and endTimeOfDay',
@@ -145,12 +177,12 @@ export const TC_I_102_CSMS: TestCase = {
     let receivedSetDefaultTariff = false;
 
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetDefaultTariff') {
           receivedSetDefaultTariff = true;
           return { status: 'TooManyElements' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -192,7 +224,7 @@ export const TC_I_102_CSMS: TestCase = {
  * Use case: I07
  * Scenario:
  *   1. CSMS sends SetDefaultTariffRequest
- *   2. Test System responds with SetDefaultTariffResponse ConditionsNotSupported
+ *   2. Test System responds with SetDefaultTariffResponse ConditionNotSupported
  */
 export const TC_I_105_CSMS: TestCase = {
   id: 'TC_I_105_CSMS',
@@ -214,12 +246,12 @@ export const TC_I_105_CSMS: TestCase = {
     let receivedSetDefaultTariff = false;
 
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetDefaultTariff') {
           receivedSetDefaultTariff = true;
-          return { status: 'ConditionsNotSupported' };
+          return { status: 'ConditionNotSupported' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -247,11 +279,11 @@ export const TC_I_105_CSMS: TestCase = {
 
     steps.push({
       step: 1,
-      description: 'CSMS sends SetDefaultTariffRequest, respond ConditionsNotSupported',
+      description: 'CSMS sends SetDefaultTariffRequest, respond ConditionNotSupported',
       status: receivedSetDefaultTariff ? 'passed' : 'failed',
       expected: 'SetDefaultTariffRequest received',
       actual: receivedSetDefaultTariff
-        ? 'Received, responded with ConditionsNotSupported'
+        ? 'Received, responded with ConditionNotSupported'
         : 'No SetDefaultTariffRequest received',
     });
 
@@ -326,7 +358,7 @@ export const TC_I_106_CSMS: TestCase = {
             ],
           };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

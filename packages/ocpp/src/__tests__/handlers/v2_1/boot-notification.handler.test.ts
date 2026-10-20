@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../../../server/middleware/pipeline.js';
 
@@ -13,18 +13,29 @@ const whereFn = vi.fn((): Promise<{ onboardingStatus: string }[]> => {
 const fromFn = vi.fn(() => ({ where: whereFn }));
 const selectFn = vi.fn(() => ({ from: fromFn }));
 
+// Open registration accepts a pending station with a compare-and-set UPDATE.
+let updateResult: { id: string }[] = [{ id: 'sta_4' }];
+const returningFn = vi.fn(() => Promise.resolve(updateResult));
+const updateWhereFn = vi.fn(() => ({ returning: returningFn }));
+const setFn = vi.fn((_values: Record<string, unknown>) => ({ where: updateWhereFn }));
+const updateFn = vi.fn(() => ({ set: setFn }));
+const writeAuditMock = vi.fn().mockResolvedValue(undefined);
+
 const getHeartbeatIntervalSecondsMock = vi.fn().mockResolvedValue(300);
 const getRegistrationPolicyMock = vi.fn().mockResolvedValue('auto-approve');
 
 vi.mock('@evtivity/database', () => ({
-  db: { select: selectFn },
+  db: { select: selectFn, update: updateFn },
   chargingStations: { id: 'id', onboardingStatus: 'onboarding_status' },
+  stationAuditLog: { __name: 'stationAuditLog' },
+  writeAudit: writeAuditMock,
   getHeartbeatIntervalSeconds: getHeartbeatIntervalSecondsMock,
   getRegistrationPolicy: getRegistrationPolicyMock,
 }));
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn((a: unknown, b: unknown) => ({ type: 'eq', a, b })),
+  and: vi.fn((...conds: unknown[]) => ({ type: 'and', conds })),
 }));
 
 const logger = pino({ level: 'silent' });
@@ -46,13 +57,14 @@ function makeCtx(
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'BootNotification',
     protocolVersion: 'ocpp2.1',
     payload,
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };
@@ -70,17 +82,24 @@ const bootPayload = {
   },
 };
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let bootNotificationHandlerModule: typeof import('../../../handlers/v2_1/boot-notification.handler.js');
+beforeAll(async () => {
+  bootNotificationHandlerModule =
+    await import('../../../handlers/v2_1/boot-notification.handler.js');
+}, 30_000);
+
 beforeEach(() => {
   vi.clearAllMocks();
   whereResult = [];
+  updateResult = [{ id: 'sta_4' }];
   getHeartbeatIntervalSecondsMock.mockResolvedValue(300);
-  getRegistrationPolicyMock.mockResolvedValue('auto-approve');
+  getRegistrationPolicyMock.mockResolvedValue('approval-required');
 });
 
 describe('v2_1 BootNotification handler', () => {
   it('publishes ocpp.BootNotification with normalized station fields', async () => {
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx, publishMock } = makeCtx(bootPayload);
     await handleBootNotification(ctx);
 
@@ -102,8 +121,7 @@ describe('v2_1 BootNotification handler', () => {
 
   it('accepts and returns the configured heartbeat interval when stationDbId is null', async () => {
     getHeartbeatIntervalSecondsMock.mockResolvedValue(120);
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload);
     const response = await handleBootNotification(ctx);
 
@@ -115,8 +133,7 @@ describe('v2_1 BootNotification handler', () => {
   });
 
   it('handles a boot payload with no modem (iccid/imsi undefined)', async () => {
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx, publishMock } = makeCtx({
       reason: 'PowerUp',
       chargingStation: { vendorName: 'V', model: 'M' },
@@ -132,8 +149,7 @@ describe('v2_1 BootNotification handler', () => {
 
   it('accepts an onboarded station (status not blocked/pending)', async () => {
     whereResult = [{ onboardingStatus: 'accepted' }];
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_1');
     const response = await handleBootNotification(ctx);
 
@@ -144,8 +160,7 @@ describe('v2_1 BootNotification handler', () => {
 
   it('rejects a blocked station', async () => {
     whereResult = [{ onboardingStatus: 'blocked' }];
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_2');
     const response = await handleBootNotification(ctx);
 
@@ -157,8 +172,7 @@ describe('v2_1 BootNotification handler', () => {
   it('returns Pending for a pending station when policy is approval-required', async () => {
     whereResult = [{ onboardingStatus: 'pending' }];
     getRegistrationPolicyMock.mockResolvedValue('approval-required');
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_3');
     const response = await handleBootNotification(ctx);
 
@@ -166,22 +180,59 @@ describe('v2_1 BootNotification handler', () => {
     expect(ctx.session.bootStatus).toBe('Pending');
   });
 
-  it('accepts a pending station when policy is auto-approve', async () => {
+  it('accepts a pending station and marks it accepted when the policy is open', async () => {
     whereResult = [{ onboardingStatus: 'pending' }];
-    getRegistrationPolicyMock.mockResolvedValue('auto-approve');
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
-    const { ctx } = makeCtx(bootPayload, 'sta_4');
+    getRegistrationPolicyMock.mockResolvedValue('open');
+    const { handleBootNotification } = bootNotificationHandlerModule;
+    const { ctx, publishMock } = makeCtx(bootPayload, 'sta_4');
     const response = await handleBootNotification(ctx);
 
     expect(response).toMatchObject({ status: 'Accepted' });
     expect(ctx.session.bootStatus).toBe('Accepted');
+    // The onboarding status changes before the event is published, so the
+    // boot projection runs the accepted-station path.
+    expect(setFn.mock.calls[0]?.[0]).toMatchObject({ onboardingStatus: 'accepted' });
+    expect(returningFn.mock.invocationCallOrder[0]).toBeLessThan(
+      publishMock.mock.invocationCallOrder[0] ?? 0,
+    );
+    expect(writeAuditMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        entityId: 'sta_4',
+        action: 'onboarding_status_changed',
+        actor: 'ocpp',
+        before: { onboardingStatus: 'pending' },
+        after: { onboardingStatus: 'accepted' },
+      }),
+      undefined,
+      expect.anything(),
+    );
+  });
+
+  it('answers Pending when the station left pending while it booted (open policy)', async () => {
+    whereResult = [{ onboardingStatus: 'pending' }];
+    updateResult = [];
+    getRegistrationPolicyMock.mockResolvedValue('open');
+    const { handleBootNotification } = bootNotificationHandlerModule;
+    const { ctx } = makeCtx(bootPayload, 'sta_4');
+    const response = await handleBootNotification(ctx);
+
+    expect(response).toMatchObject({ status: 'Pending' });
+    expect(writeAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('never changes the onboarding status when approval is required', async () => {
+    whereResult = [{ onboardingStatus: 'pending' }];
+    const { handleBootNotification } = bootNotificationHandlerModule;
+    const { ctx } = makeCtx(bootPayload, 'sta_3');
+    await handleBootNotification(ctx);
+
+    expect(updateFn).not.toHaveBeenCalled();
   });
 
   it('accepts when the station row is not found (undefined onboardingStatus)', async () => {
     whereResult = [];
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_missing');
     const response = await handleBootNotification(ctx);
 
@@ -191,8 +242,7 @@ describe('v2_1 BootNotification handler', () => {
 
   it('fails closed to Pending when the onboarding lookup throws', async () => {
     whereResult = new Error('db unreachable');
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_5');
     const response = await handleBootNotification(ctx);
 
@@ -202,8 +252,7 @@ describe('v2_1 BootNotification handler', () => {
 
   it('fails closed to Pending when the lookup rejects with a non-Error value', async () => {
     whereFn.mockRejectedValueOnce('string failure');
-    const { handleBootNotification } =
-      await import('../../../handlers/v2_1/boot-notification.handler.js');
+    const { handleBootNotification } = bootNotificationHandlerModule;
     const { ctx } = makeCtx(bootPayload, 'sta_6');
     const response = await handleBootNotification(ctx);
 

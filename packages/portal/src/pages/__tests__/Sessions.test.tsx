@@ -1,0 +1,147 @@
+// Copyright (c) 2024-2026 EVtivity. All rights reserved.
+// SPDX-License-Identifier: BUSL-1.1
+
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router';
+
+const { getMock } = vi.hoisted(() => ({ getMock: vi.fn() }));
+
+vi.mock('@/lib/api', () => ({
+  api: { get: getMock },
+  ApiError: class ApiError extends Error {},
+}));
+
+vi.mock('react-i18next', () => ({
+  initReactI18next: { type: '3rdParty', init: () => undefined },
+  useTranslation: () => ({
+    t: (key: string, options?: { amount?: string; fleet?: string; state?: string }) =>
+      options?.amount != null
+        ? `${key}:${options.amount}`
+        : options?.fleet != null
+          ? `${key}:${options.fleet}:${options.state ?? ''}`
+          : key,
+    i18n: { language: 'en', changeLanguage: vi.fn() },
+  }),
+}));
+
+import { Sessions } from '../Sessions';
+
+function session(
+  id: string,
+  finalCostCents: number | null,
+  taxCents: number | null,
+): Record<string, unknown> {
+  return {
+    id,
+    transactionId: `tx-${id}`,
+    status: finalCostCents == null ? 'active' : 'completed',
+    startedAt: '2026-01-01T10:00:00Z',
+    endedAt: finalCostCents == null ? null : '2026-01-01T11:00:00Z',
+    energyDeliveredWh: '10000',
+    finalCostCents,
+    taxCents,
+    currency: 'EUR',
+    stationName: `CS-${id}`,
+    siteName: null,
+  };
+}
+
+function renderPage(): void {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <Sessions />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+afterEach(() => {
+  cleanup();
+  getMock.mockReset();
+});
+
+describe('Sessions', () => {
+  it('shows the fleet and billing state of a session billed on account', async () => {
+    getMock.mockResolvedValue({
+      data: [
+        { ...session('5', 1000, null), accountBilling: { state: 'invoiced', fleetName: 'Acme' } },
+        { ...session('6', 1000, null), accountBilling: null },
+      ],
+      total: 2,
+    });
+    renderPage();
+    expect(
+      await screen.findByText('fleetBilling.sessionLine:Acme:fleetBilling.state.invoiced'),
+    ).toBeDefined();
+    expect(screen.getAllByText(/fleetBilling\.sessionLine/)).toHaveLength(1);
+  });
+
+  it('says a member-billed session is billed to the driver via the fleet', async () => {
+    getMock.mockResolvedValue({
+      data: [
+        {
+          ...session('7', 1000, null),
+          accountBilling: {
+            state: 'invoiced',
+            fleetName: 'Acme',
+            invoicedTo: 'member',
+            invoiceId: 'inv_1',
+            invoiceNumber: 'INV-1',
+          },
+        },
+      ],
+      total: 1,
+    });
+    renderPage();
+    expect(
+      await screen.findByText(
+        'fleetBilling.memberSessionLine:Acme:fleetBilling.stateMember.invoiced',
+      ),
+    ).toBeDefined();
+    expect(screen.queryByText(/fleetBilling\.sessionLine/)).toBeNull();
+  });
+
+  it('labels a taxed amount as including tax, through the interpolated key', async () => {
+    getMock.mockResolvedValue({ data: [session('1', 1190, 190)], total: 1 });
+    renderPage();
+    expect(await screen.findByText('common.amountInclTax:€11.90')).toBeDefined();
+  });
+
+  it('shows an untaxed amount without the label', async () => {
+    getMock.mockResolvedValue({ data: [session('2', 1000, null)], total: 1 });
+    renderPage();
+    expect(await screen.findByText('€10.00')).toBeDefined();
+    expect(screen.queryByText(/common\.amountInclTax/)).toBeNull();
+  });
+
+  it('shows no label when the stored tax is 0', async () => {
+    getMock.mockResolvedValue({ data: [session('4', 1000, 0)], total: 1 });
+    renderPage();
+    expect(await screen.findByText('€10.00')).toBeDefined();
+    expect(screen.queryByText(/common\.amountInclTax/)).toBeNull();
+  });
+
+  it('shows no label for an active session without a final cost', async () => {
+    getMock.mockResolvedValue({ data: [session('3', null, 190)], total: 1 });
+    renderPage();
+    expect(await screen.findByText('CS-3')).toBeDefined();
+    expect(screen.queryByText(/common\.amountInclTax/)).toBeNull();
+    expect(screen.queryByText(/incl/)).toBeNull();
+  });
+
+  it('labels a faulted or failed session that cost nothing Not Charged', async () => {
+    getMock.mockResolvedValue({
+      data: [
+        { ...session('7', null, null), status: 'faulted', endedAt: '2026-01-01T11:00:00Z' },
+        { ...session('8', 0, null), status: 'failed' },
+      ],
+      total: 2,
+    });
+    renderPage();
+    expect(await screen.findAllByText('common.notCharged')).toHaveLength(2);
+  });
+});

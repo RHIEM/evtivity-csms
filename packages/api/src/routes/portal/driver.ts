@@ -5,7 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import argon2 from 'argon2';
-import { db, client, getMfaConfig } from '@evtivity/database';
+import { db, client, getMfaConfig, writeAudit, driverAuditLog } from '@evtivity/database';
 import { drivers, driverNotificationPreferences } from '@evtivity/database';
 import {
   dispatchDriverNotification,
@@ -17,12 +17,14 @@ import {
   verifyTotpCode,
   createMfaChallenge,
   verifyMfaChallenge,
+  isValidTimezone,
 } from '@evtivity/lib';
 import QRCode from 'qrcode';
 import { zodSchema } from '../../lib/zod-schema.js';
 import { validatePasswordComplexity } from '../../lib/password-validation.js';
-import { ALL_TEMPLATES_DIRS } from '../../lib/template-dirs.js';
-import { getPubSub } from '../../lib/pubsub.js';
+import { PASSWORD_MIN_LENGTH } from '@evtivity/lib/password-policy';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import {
   successResponse,
   itemResponse,
@@ -33,6 +35,38 @@ import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import type { DriverJwtPayload } from '../../plugins/auth.js';
 import { config as apiConfig } from '../../lib/config.js';
 import { revokeAllDriverRefreshTokens } from '../../services/refresh-token.service.js';
+import { updateDriverBillingAddress } from '../../services/driver-billing.service.js';
+import {
+  driverBillingAddressBody,
+  driverBillingAddressItem,
+} from '../../lib/driver-billing-address-schema.js';
+import { getAuditActor } from '../../lib/audit-actor.js';
+import { changedFields } from '../../lib/audit-diff.js';
+import { hasMfaContact, mfaCodeRecipient, removesSmsMfaPhone } from '../../lib/mfa-contact.js';
+import { verifyPassword } from '../../lib/password-verify.js';
+
+/** The profile fields a portal profile update can change, audited when they do. */
+const PROFILE_AUDIT_KEYS = [
+  'firstName',
+  'lastName',
+  'phone',
+  'language',
+  'timezone',
+  'themePreference',
+  'distanceUnit',
+  'priceDisplay',
+] as const;
+
+const profileAuditColumns = {
+  firstName: drivers.firstName,
+  lastName: drivers.lastName,
+  phone: drivers.phone,
+  language: drivers.language,
+  timezone: drivers.timezone,
+  themePreference: drivers.themePreference,
+  distanceUnit: drivers.distanceUnit,
+  priceDisplay: drivers.priceDisplay,
+};
 
 const portalDriverProfile = z
   .object({
@@ -53,6 +87,12 @@ const portalDriverProfile = z
       .describe('Preferred IANA timezone (e.g. America/Los_Angeles)'),
     themePreference: z.enum(['light', 'dark']).describe('Preferred UI theme'),
     distanceUnit: z.enum(['miles', 'km']).describe('Preferred distance unit (miles or kilometers)'),
+    priceDisplay: z
+      .enum(['gross', 'net'])
+      .nullable()
+      .describe(
+        'Whether prices are shown including (gross) or excluding (net) tax. Null follows the company setting.',
+      ),
     isActive: z.boolean().describe('Whether the driver account is active'),
     createdAt: z.coerce.date().describe('Timestamp the driver account was created'),
   })
@@ -72,19 +112,32 @@ const notificationPrefsItem = z
 const updateProfileBody = z.object({
   firstName: z.string().min(1).max(100).optional(),
   lastName: z.string().min(1).max(100).optional(),
-  phone: z.string().max(50).optional(),
+  phone: z
+    .string()
+    .max(50)
+    .optional()
+    .describe(
+      'Phone number. An empty string removes it, refused while the driver signs in with SMS codes.',
+    ),
   // Restrict to the locales the portal/CSMS bundle ships translations for
   // (frontend/i18n.md). An arbitrary string would persist and then break
   // the i18n loader on the next session.
   language: z.enum(['en', 'de', 'es', 'ko', 'zh', 'zh-TW']).optional(),
-  timezone: z.string().max(50).optional(),
+  timezone: z.string().max(50).optional().describe('IANA timezone (e.g. Europe/Berlin)'),
   themePreference: z.enum(['light', 'dark']).optional(),
   distanceUnit: z.enum(['miles', 'km']).optional(),
+  priceDisplay: z
+    .enum(['gross', 'net'])
+    .nullable()
+    .optional()
+    .describe(
+      'Show prices including (gross) or excluding (net) tax. Null follows the company setting company.priceDisplay.',
+    ),
 });
 
 const changePasswordBody = z.object({
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(12),
+  newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 export function portalDriverRoutes(app: FastifyInstance): void {
@@ -100,6 +153,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         body: zodSchema(updateProfileBody),
         response: {
           200: itemResponse(portalDriverProfile),
+          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
         },
       },
@@ -108,14 +162,42 @@ export function portalDriverRoutes(app: FastifyInstance): void {
       const { driverId } = request.user as DriverJwtPayload;
       const body = request.body as z.infer<typeof updateProfileBody>;
 
+      // An unknown zone would break every date the portal and the
+      // notifications format for the driver (Intl throws a RangeError).
+      if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+        await reply.status(400).send({ error: 'Invalid IANA timezone', code: 'VALIDATION_ERROR' });
+        return;
+      }
+
+      const [before] = await db
+        .select({
+          ...profileAuditColumns,
+          mfaEnabled: drivers.mfaEnabled,
+          mfaMethod: drivers.mfaMethod,
+        })
+        .from(drivers)
+        .where(eq(drivers.id, driverId));
+
+      const phone =
+        body.phone === undefined ? undefined : body.phone.trim() === '' ? null : body.phone;
+      // SMS codes need the phone number: removing it would lock the driver out.
+      if (before != null && removesSmsMfaPhone(phone, before)) {
+        await reply.status(400).send({
+          error: 'Turn off SMS sign-in codes before you remove the phone number',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+
       const fields: Record<string, unknown> = { updatedAt: new Date() };
       if (body.firstName !== undefined) fields['firstName'] = body.firstName;
       if (body.lastName !== undefined) fields['lastName'] = body.lastName;
-      if (body.phone !== undefined) fields['phone'] = body.phone;
+      if (phone !== undefined) fields['phone'] = phone;
       if (body.language !== undefined) fields['language'] = body.language;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
       if (body.themePreference !== undefined) fields['themePreference'] = body.themePreference;
       if (body.distanceUnit !== undefined) fields['distanceUnit'] = body.distanceUnit;
+      if (body.priceDisplay !== undefined) fields['priceDisplay'] = body.priceDisplay;
 
       const [updated] = await db
         .update(drivers)
@@ -131,6 +213,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           timezone: drivers.timezone,
           themePreference: drivers.themePreference,
           distanceUnit: drivers.distanceUnit,
+          priceDisplay: drivers.priceDisplay,
           isActive: drivers.isActive,
           createdAt: drivers.createdAt,
         });
@@ -140,7 +223,59 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         return;
       }
 
+      const diff =
+        before == null
+          ? null
+          : changedFields(
+              before,
+              Object.fromEntries(PROFILE_AUDIT_KEYS.map((key) => [key, updated[key]])),
+            );
+      if (diff != null && Object.keys(diff.after).length > 0) {
+        await writeAudit(
+          { table: driverAuditLog, idColumn: 'driver_id' },
+          {
+            entityId: driverId,
+            entityIdSnapshot: driverId,
+            action: 'updated',
+            ...getAuditActor(request),
+            before: diff.before,
+            after: diff.after,
+            notes: 'Profile updated in the driver portal',
+          },
+          db,
+          request.log,
+        );
+      }
+
       return updated;
+    },
+  );
+
+  app.patch(
+    '/portal/driver/billing-address',
+    {
+      onRequest: [app.authenticateDriver],
+      schema: {
+        tags: ['Portal Driver'],
+        summary: 'Update the authenticated driver billing address',
+        description:
+          'Sets the bill-to block of the invoices a fleet addresses to the driver. Fields left out keep their value; null or a blank string clears a field. A change is audited; a request that changes nothing is not.',
+        operationId: 'portalUpdateBillingAddress',
+        security: [{ bearerAuth: [] }],
+        body: zodSchema(driverBillingAddressBody),
+        response: {
+          200: itemResponse(driverBillingAddressItem),
+          404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request) => {
+      const { driverId } = request.user as DriverJwtPayload;
+      const body = request.body as z.infer<typeof driverBillingAddressBody>;
+      return updateDriverBillingAddress(driverId, body, {
+        actor: getAuditActor(request),
+        log: request.log,
+      });
     },
   );
 
@@ -156,10 +291,16 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         body: zodSchema(changePasswordBody),
         response: {
           200: successResponse,
-          400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
+          400: errorWith('Weak or wrong password', [
+            ERROR_CODES.WEAK_PASSWORD,
+            ERROR_CODES.INVALID_PASSWORD,
+          ]),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
         },
       },
+      // Tight bucket so a stolen session cannot guess the current password,
+      // like DELETE /portal/driver/mfa.
+      config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
     },
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
@@ -175,7 +316,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const valid = await argon2.verify(driver.passwordHash, body.currentPassword);
+      const valid = await verifyPassword(driver.passwordHash, body.currentPassword, request.log);
       if (!valid) {
         await reply
           .status(400)
@@ -197,6 +338,19 @@ export function portalDriverRoutes(app: FastifyInstance): void {
 
       // Revoke all existing refresh tokens to invalidate other sessions
       await revokeAllDriverRefreshTokens(driverId);
+
+      await writeAudit(
+        { table: driverAuditLog, idColumn: 'driver_id' },
+        {
+          entityId: driverId,
+          entityIdSnapshot: driverId,
+          action: 'password_reset',
+          ...getAuditActor(request),
+          notes: 'Driver changed own password',
+        },
+        db,
+        request.log,
+      );
 
       void dispatchDriverNotification(
         client,
@@ -264,16 +418,17 @@ export function portalDriverRoutes(app: FastifyInstance): void {
       const { driverId } = request.user as DriverJwtPayload;
       const body = request.body as z.infer<typeof notificationPrefsItem>;
 
+      const [existing] = await db
+        .select({
+          emailEnabled: driverNotificationPreferences.emailEnabled,
+          smsEnabled: driverNotificationPreferences.smsEnabled,
+          pushEnabled: driverNotificationPreferences.pushEnabled,
+        })
+        .from(driverNotificationPreferences)
+        .where(eq(driverNotificationPreferences.driverId, driverId));
       // pushEnabled is optional: a client that does not manage native push (the
       // web portal) omits it, and we must not clobber a value the mobile app set.
-      let pushEnabled = body.pushEnabled;
-      if (pushEnabled === undefined) {
-        const [existing] = await db
-          .select({ pushEnabled: driverNotificationPreferences.pushEnabled })
-          .from(driverNotificationPreferences)
-          .where(eq(driverNotificationPreferences.driverId, driverId));
-        pushEnabled = existing?.pushEnabled ?? true;
-      }
+      const pushEnabled = body.pushEnabled ?? existing?.pushEnabled ?? true;
 
       await db
         .insert(driverNotificationPreferences)
@@ -293,7 +448,28 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           },
         });
 
-      return { emailEnabled: body.emailEnabled, smsEnabled: body.smsEnabled, pushEnabled };
+      const next = { emailEnabled: body.emailEnabled, smsEnabled: body.smsEnabled, pushEnabled };
+      // A driver without a stored row has every channel on.
+      const prev = existing ?? { emailEnabled: true, smsEnabled: true, pushEnabled: true };
+      const diff = changedFields(prev, next);
+      if (Object.keys(diff.after).length > 0) {
+        await writeAudit(
+          { table: driverAuditLog, idColumn: 'driver_id' },
+          {
+            entityId: driverId,
+            entityIdSnapshot: driverId,
+            action: 'updated',
+            ...getAuditActor(request),
+            before: { notificationPreferences: diff.before },
+            after: { notificationPreferences: diff.after },
+            notes: 'Notification preferences updated in the driver portal',
+          },
+          db,
+          request.log,
+        );
+      }
+
+      return next;
     },
   );
 
@@ -308,7 +484,9 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         .describe('Active MFA method (totp, email, sms) or null if MFA is disabled'),
       availableMethods: z
         .array(z.string())
-        .describe('MFA methods enabled by the system administrator (totp, email, sms)'),
+        .describe(
+          'MFA methods the driver can turn on: enabled by the administrator (totp, email, sms), email only with an email address and sms only with a phone number',
+        ),
     })
     .passthrough();
 
@@ -327,15 +505,25 @@ export function portalDriverRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
       const [driver] = await db
-        .select({ mfaEnabled: drivers.mfaEnabled, mfaMethod: drivers.mfaMethod })
+        .select({
+          mfaEnabled: drivers.mfaEnabled,
+          mfaMethod: drivers.mfaMethod,
+          email: drivers.email,
+          phone: drivers.phone,
+        })
         .from(drivers)
         .where(eq(drivers.id, driverId));
 
       const mfaConfig = await getMfaConfig();
+      const contact = { email: driver?.email ?? null, phone: driver?.phone ?? null };
       const availableMethods: string[] = [];
-      if (mfaConfig.emailEnabled) availableMethods.push('email');
+      if (mfaConfig.emailEnabled && hasMfaContact('email', contact)) {
+        availableMethods.push('email');
+      }
       if (mfaConfig.totpEnabled) availableMethods.push('totp');
-      if (mfaConfig.smsEnabled) availableMethods.push('sms');
+      if (mfaConfig.smsEnabled && hasMfaContact('sms', contact)) {
+        availableMethods.push('sms');
+      }
 
       return {
         mfaEnabled: driver?.mfaEnabled ?? false,
@@ -378,7 +566,10 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         body: zodSchema(mfaSetupBody),
         response: {
           200: itemResponse(mfaSetupResponse),
-          400: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          400: errorWith('Driver not found or no contact for the method', [
+            ERROR_CODES.DRIVER_NOT_FOUND,
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
           403: errorWith('MFA method disabled', [ERROR_CODES.MFA_METHOD_DISABLED]),
           409: errorResponse,
         },
@@ -426,6 +617,18 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // A code sent to nothing would leave the driver unable to confirm.
+      if (!hasMfaContact(method, driver)) {
+        await reply.status(400).send({
+          error:
+            method === 'sms'
+              ? 'Add a phone number before you turn on SMS codes'
+              : 'Add an email address before you turn on email codes',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+
       if (method === 'totp') {
         const secret = generateTotpSecret();
         const uri = generateTotpUri(secret, driver.email ?? '', 'EVtivity');
@@ -446,12 +649,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
       await dispatchSystemNotification(
         client,
         'mfa.VerificationCode',
-        {
-          email: driver.email ?? undefined,
-          phone: driver.phone ?? undefined,
-          firstName: driver.firstName,
-          language: driver.language,
-        },
+        mfaCodeRecipient(method, driver),
         { code: challenge.code },
         ALL_TEMPLATES_DIRS,
       );
@@ -482,6 +680,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
             ERROR_CODES.MFA_CODE_INVALID,
             ERROR_CODES.TOTP_NOT_CONFIGURED,
           ]),
+          409: errorWith('MFA is already enabled', [ERROR_CODES.MFA_ALREADY_ENABLED]),
         },
       },
     },
@@ -489,12 +688,21 @@ export function portalDriverRoutes(app: FastifyInstance): void {
       const { driverId } = request.user as DriverJwtPayload;
       const { method, code, challengeId } = request.body as z.infer<typeof mfaConfirmBody>;
 
+      const [driver] = await db
+        .select({ totpSecretEnc: drivers.totpSecretEnc, mfaEnabled: drivers.mfaEnabled })
+        .from(drivers)
+        .where(eq(drivers.id, driverId));
+      // Switching the method of an active MFA goes through disable (password
+      // gated) and setup, like the setup step itself.
+      if (driver?.mfaEnabled === true) {
+        await reply
+          .status(409)
+          .send({ error: 'MFA is already enabled', code: 'MFA_ALREADY_ENABLED' });
+        return;
+      }
+
       let verified = false;
       if (method === 'totp') {
-        const [driver] = await db
-          .select({ totpSecretEnc: drivers.totpSecretEnc })
-          .from(drivers)
-          .where(eq(drivers.id, driverId));
         if (driver?.totpSecretEnc == null) {
           await reply.status(400).send({ error: 'TOTP not set up', code: 'TOTP_NOT_CONFIGURED' });
           return;
@@ -512,7 +720,8 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           return;
         }
       } else if (challengeId != null) {
-        verified = await verifyMfaChallenge(client, challengeId, code, { driverId });
+        verified =
+          (await verifyMfaChallenge(client, challengeId, code, { driverId })) === 'verified';
       }
 
       if (!verified) {
@@ -526,6 +735,19 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         .update(drivers)
         .set({ mfaEnabled: true, mfaMethod: method, updatedAt: new Date() })
         .where(eq(drivers.id, driverId));
+
+      await writeAudit(
+        { table: driverAuditLog, idColumn: 'driver_id' },
+        {
+          entityId: driverId,
+          entityIdSnapshot: driverId,
+          action: 'mfa_enabled',
+          ...getAuditActor(request),
+          after: { mfaMethod: method },
+        },
+        db,
+        request.log,
+      );
 
       return { success: true };
     },
@@ -563,7 +785,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
       const { password } = request.body as z.infer<typeof mfaDisableBody>;
 
       const [driver] = await db
-        .select({ passwordHash: drivers.passwordHash })
+        .select({ passwordHash: drivers.passwordHash, mfaMethod: drivers.mfaMethod })
         .from(drivers)
         .where(eq(drivers.id, driverId));
 
@@ -572,7 +794,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const valid = await argon2.verify(driver.passwordHash, password);
+      const valid = await verifyPassword(driver.passwordHash, password, request.log);
       if (!valid) {
         await reply.status(400).send({ error: 'Invalid password', code: 'INVALID_PASSWORD' });
         return;
@@ -587,6 +809,19 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           updatedAt: new Date(),
         })
         .where(eq(drivers.id, driverId));
+
+      await writeAudit(
+        { table: driverAuditLog, idColumn: 'driver_id' },
+        {
+          entityId: driverId,
+          entityIdSnapshot: driverId,
+          action: 'mfa_disabled',
+          ...getAuditActor(request),
+          before: { mfaMethod: driver.mfaMethod },
+        },
+        db,
+        request.log,
+      );
 
       // Notify the driver out-of-band. If MFA was disabled by an attacker with
       // a stolen session, the legitimate owner sees the email/SMS/push and can

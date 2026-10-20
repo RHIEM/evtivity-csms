@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../../types.js';
 import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 export const TC_Q_109_CSMS: TestCase = {
   id: 'TC_Q_109_CSMS',
@@ -21,21 +22,23 @@ export const TC_Q_109_CSMS: TestCase = {
     let setProfileReceived = false;
     let updateCount = 0;
     let clearReceived = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'SetChargingProfile') {
-        setProfileReceived = true;
-        return { status: 'Accepted' };
-      }
-      if (action === 'UpdateDynamicSchedule') {
-        updateCount++;
-        return { status: 'Accepted' };
-      }
-      if (action === 'ClearChargingProfile') {
-        clearReceived = true;
-        return { status: 'Accepted' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'SetChargingProfile') {
+          setProfileReceived = true;
+          return { status: 'Accepted' };
+        }
+        if (action === 'UpdateDynamicSchedule') {
+          updateCount++;
+          return { status: 'Accepted' };
+        }
+        if (action === 'ClearChargingProfile') {
+          clearReceived = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'SetChargingProfile', {
         stationId: ctx.stationId,
@@ -118,7 +121,7 @@ export const TC_Q_110_CSMS: TestCase = {
           profileId = (p?.['id'] as number) ?? 1;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {
@@ -162,13 +165,13 @@ export const TC_Q_110_CSMS: TestCase = {
           expected: 'status = Rejected',
           actual: `status = ${status1}`,
         });
-      } catch {
+      } catch (err) {
         steps.push({
           step: 2,
           description: 'Pull with unknown profileId',
           status: 'failed',
           expected: 'Response received',
-          actual: 'Error',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
       try {
@@ -185,13 +188,13 @@ export const TC_Q_110_CSMS: TestCase = {
           'status = Accepted (not enforced)',
           `status = ${status2}`,
         );
-      } catch {
+      } catch (err) {
         steps.push({
           step: 3,
           description: 'Pull with valid profileId',
           status: 'failed',
           expected: 'Response received',
-          actual: 'Error',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }

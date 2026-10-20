@@ -19,7 +19,10 @@ export function isStartable(status: string | null | undefined): boolean {
 
 export interface SelectableEvse {
   connectors: { status: string | null }[];
-  reservationDriverId: string | null;
+  // An active reservation holds the EVSE.
+  reserved: boolean;
+  // The active reservation belongs to the signed-in driver.
+  reservedByMe: boolean;
 }
 
 // Whether the driver can act on an EVSE in the current mode. Charge mode: online,
@@ -33,17 +36,16 @@ export function isEvseSelectable(
     mode: 'charge' | 'reserve';
     isOnline: boolean;
     maintenanceActive: boolean;
-    currentDriverId: string | null;
+    // The whole station cannot charge (disabled, firmware install, or a
+    // station-level fault). Blocks charging and reserving.
+    stationUnavailable: boolean;
   },
 ): boolean {
-  if (opts.maintenanceActive || !opts.isOnline) return false;
-  if (opts.mode === 'reserve') return evse.reservationDriverId == null;
+  if (opts.maintenanceActive || !opts.isOnline || opts.stationUnavailable) return false;
+  if (opts.mode === 'reserve') return !evse.reserved;
   const connectorStatus = evse.connectors[0]?.status ?? 'unavailable';
-  const reservedByOther =
-    evse.reservationDriverId != null && evse.reservationDriverId !== opts.currentDriverId;
-  const reservedForMe =
-    evse.reservationDriverId != null && evse.reservationDriverId === opts.currentDriverId;
-  return !reservedByOther && (isStartable(connectorStatus) || reservedForMe);
+  const reservedByOther = evse.reserved && !evse.reservedByMe;
+  return !reservedByOther && (isStartable(connectorStatus) || evse.reservedByMe);
 }
 
 export function connectorStatusVariant(): 'secondary' {

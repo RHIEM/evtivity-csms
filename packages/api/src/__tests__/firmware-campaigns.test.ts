@@ -5,6 +5,30 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
+// Real self-signed test PEM so the X509Certificate check accepts it.
+const TEST_PEM_CERTIFICATE = `-----BEGIN CERTIFICATE-----
+MIIDYTCCAkmgAwIBAgIUTRwcMo/cq2a8TDMda6I+GpAzyJQwDQYJKoZIhvcNAQEL
+BQAwQDELMAkGA1UEBhMCVVMxFjAUBgNVBAoMDUVWdGl2aXR5IFRlc3QxGTAXBgNV
+BAMMEEVWdGl2aXR5IFRlc3QgQ0EwHhcNMjYwMjIxMTgxNjEzWhcNMzYwMjE5MTgx
+NjEzWjBAMQswCQYDVQQGEwJVUzEWMBQGA1UECgwNRVZ0aXZpdHkgVGVzdDEZMBcG
+A1UEAwwQRVZ0aXZpdHkgVGVzdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
+AQoCggEBANsDGoiIRlgTFls3z+pPNTFTG9lxQlXwBhlw9i/wV3yQJPdqSgxFDgp7
+PHCev7IHSgP0nBBfHQ560gFjtgMP+8Pgmeqtt8RGknxZPeSMePxwuzvkf1+XYfta
+Bg6QAgoChDJkdFbXlqANzE6BB685h+OKI6wDbvOqxFGReQHodBX2ENGk/c0p2BXn
+I/9IydpRL5FC918ex++GE9DAf9gZHO35J12WWp5QDmmZHBGrowFLv0nTuISZ0bQw
+U/vDGOVR8s/KJ4r0jyb9MuSQFJkg1VBM6j36Ge8vMrQmWoi2yZLGYYaKp+R1zN+V
+8DwkbXeQRy4jiqyBYApET5txG2uGuLECAwEAAaNTMFEwHQYDVR0OBBYEFH1zUD3V
+8/aR7jGSi5ptHCmMWIUDMB8GA1UdIwQYMBaAFH1zUD3V8/aR7jGSi5ptHCmMWIUD
+MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBADQ2+W8418Zkytha
+LIilVOLJdK+AKpWrZWRNYkb/JnEu/husUfZXaxxOUQB+/gEhh4EeFcTSWkEh2GiU
+XZbZ9zXDVqKLNBgubMKRjJh7XA4uASdP2dKt7u/aerYdBGPd2Uuku6IBLVNWxHap
+GYQS+sRDqF0Qhk6ZnPUUuqpEFcP7/Ib3/Bna1XC/6nitqfoF5jMPZcahQY9eOVR2
+2t30h0+FJcLlHC2Sit+scgqcNsIH7dLrn/DGBqRGuNDbLr0en7Gwr1AXUOSpc8/W
+43o8KYRCfMwahBKbuSBXvueAXJNpWYEPGxEcZc+sH/IqssqdzsqB8ZGZghiLh6uI
+qf/5BbM=
+-----END CERTIFICATE-----`;
+const TEST_SIGNATURE = 'c2lnbmF0dXJlLWJ5dGVz';
+
 // -- DB mock helpers --
 
 let dbResults: unknown[][] = [];
@@ -54,7 +78,8 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: {
     select: vi.fn(() => makeChain()),
     selectDistinct: vi.fn(() => makeChain()),
@@ -62,6 +87,10 @@ vi.mock('@evtivity/database', () => ({
     update: vi.fn(() => makeChain()),
     delete: vi.fn(() => makeChain()),
     execute: vi.fn(() => Promise.resolve([])),
+    // The transaction runs on the same mocked db.
+    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn((await import('@evtivity/database')).db),
+    ),
   },
   firmwareCampaigns: { id: 'id', createdAt: 'createdAt', status: 'status' },
   firmwareCampaignStatusEnum: {
@@ -82,8 +111,16 @@ vi.mock('@evtivity/database', () => ({
     siteId: 'siteId',
     vendorId: 'vendorId',
     model: 'model',
+    firmwareVersion: 'firmwareVersion',
   },
   firmwareUpdates: {},
+  client: {},
+  rejectFirmwareUpdate: vi.fn().mockResolvedValue(null),
+  dropQueuedCampaignFirmwareUpdates: vi.fn().mockResolvedValue(0),
+  newFirmwareRequestId: vi.fn(() => 4242),
+  applyFirmwareCampaignStationStatus: vi
+    .fn()
+    .mockResolvedValue({ changed: true, campaignCompleted: false }),
   sites: { id: 'id', name: 'name' },
   vendors: { id: 'id', name: 'name' },
   writeAudit: vi.fn().mockResolvedValue(undefined),
@@ -119,11 +156,13 @@ vi.mock('drizzle-orm', () => ({
   isNull: vi.fn(),
   isNotNull: vi.fn(),
   inArray: vi.fn(),
+  exists: vi.fn(),
+  notExists: vi.fn(),
 }));
 
 const mockPublish = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: mockPublish,
     subscribe: vi.fn(),
@@ -154,6 +193,9 @@ vi.mock('../middleware/rbac.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { firmwareCampaignRoutes } from '../routes/firmware-campaigns.js';
+import * as databaseModule from '@evtivity/database';
+import { eq } from 'drizzle-orm';
+import { getUserSiteIds } from '../lib/site-access.js';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -238,6 +280,11 @@ describe('Firmware campaign routes', () => {
         name: 'Firmware v2.0 rollout',
         firmwareUrl: 'https://example.com/fw.bin',
         version: '2.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
         status: 'draft',
         targetFilter: null,
         createdById: 'test-user-id',
@@ -309,6 +356,11 @@ describe('Firmware campaign routes', () => {
         name: 'Firmware v2.0 rollout',
         firmwareUrl: 'https://example.com/fw.bin',
         version: '2.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
         status: 'active',
         targetFilter: null,
         createdById: 'test-user-id',
@@ -364,6 +416,11 @@ describe('Firmware campaign routes', () => {
         name: 'New campaign',
         firmwareUrl: 'https://example.com/fw.bin',
         version: '1.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
         status: 'draft',
         targetFilter: null,
         createdById: 'test-user-id',
@@ -385,6 +442,8 @@ describe('Firmware campaign routes', () => {
           name: 'New campaign',
           firmwareUrl: 'https://example.com/fw.bin',
           version: '1.0.0',
+          signingCertificate: null,
+          signature: null,
         }),
       });
       expect(response.statusCode).toBe(201);
@@ -392,6 +451,151 @@ describe('Firmware campaign routes', () => {
       expect(body.id).toBe('camp-new');
       expect(body.name).toBe('New campaign');
       expect(body.status).toBe('draft');
+    });
+
+    it.each([
+      ['negative retries', { retries: -1 }],
+      ['too many retries', { retries: 101 }],
+      ['a zero retry interval', { retryInterval: 0 }],
+      ['a retry interval over a day', { retryInterval: 86_401 }],
+      ['an install time without a zone', { installDateTime: '2030-01-01T02:00:00' }],
+    ])('refuses %s', async (_label, fields) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Bad campaign',
+          firmwareUrl: 'https://example.com/fw.bin',
+          targetFilter: { siteId: 'site-001' },
+          ...fields,
+        }),
+      });
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('stores the retries, retry interval and install time', async () => {
+      const created = {
+        id: 'camp-sched',
+        name: 'Scheduled',
+        firmwareUrl: 'https://example.com/fw.bin',
+        version: null,
+        signingCertificate: null,
+        signature: null,
+        retries: 2,
+        retryInterval: 300,
+        installDateTime: '2030-01-01T02:00:00.000Z',
+        status: 'draft',
+        targetFilter: null,
+        createdById: 'test-user-id',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults([created]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Scheduled',
+          firmwareUrl: 'https://example.com/fw.bin',
+          retries: 2,
+          retryInterval: 300,
+          installDateTime: '2030-01-01T02:00:00Z',
+        }),
+      });
+      expect(response.statusCode).toBe(201);
+      const { db } = databaseModule;
+      const insertChain = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(insertChain.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          retries: 2,
+          retryInterval: 300,
+          installDateTime: new Date('2030-01-01T02:00:00Z'),
+        }),
+      );
+      expect(JSON.parse(response.body).retryInterval).toBe(300);
+    });
+
+    it('stores the signing certificate and signature of a secure update', async () => {
+      const created = {
+        id: 'camp-signed',
+        name: 'Signed campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        version: null,
+        signingCertificate: TEST_PEM_CERTIFICATE,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: TEST_SIGNATURE,
+        status: 'draft',
+        targetFilter: null,
+        createdById: 'test-user-id',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults([created]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Signed campaign',
+          firmwareUrl: 'https://example.com/fw.bin',
+          signingCertificate: TEST_PEM_CERTIFICATE,
+          signature: TEST_SIGNATURE,
+        }),
+      });
+
+      expect(response.statusCode).toBe(201);
+      const { db } = databaseModule;
+      const insertChain = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(insertChain.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          signingCertificate: TEST_PEM_CERTIFICATE,
+          signature: TEST_SIGNATURE,
+        }),
+      );
+      expect(JSON.parse(response.body).signature).toBe(TEST_SIGNATURE);
+    });
+
+    it.each([
+      ['a signature without a certificate', { signature: TEST_SIGNATURE }],
+      ['a certificate without a signature', { signingCertificate: TEST_PEM_CERTIFICATE }],
+      ['a certificate that is not PEM', { signingCertificate: 'abc', signature: TEST_SIGNATURE }],
+      [
+        'a PEM block that is not a certificate',
+        {
+          signingCertificate: '-----BEGIN CERTIFICATE-----\nTUlJQg==\n-----END CERTIFICATE-----',
+          signature: TEST_SIGNATURE,
+        },
+      ],
+      [
+        'a signature that is not base64',
+        { signingCertificate: TEST_PEM_CERTIFICATE, signature: 'not base64!' },
+      ],
+    ])('returns 400 for %s', async (_label, fields) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Signed campaign',
+          firmwareUrl: 'https://example.com/fw.bin',
+          ...fields,
+        }),
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+      const { db } = databaseModule;
+      expect(db.insert).not.toHaveBeenCalled();
     });
   });
 
@@ -461,6 +665,11 @@ describe('Firmware campaign routes', () => {
         name: 'Draft campaign',
         firmwareUrl: 'https://example.com/fw.bin',
         version: '1.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
         status: 'draft',
         targetFilter: null,
         createdById: 'test-user-id',
@@ -488,6 +697,114 @@ describe('Firmware campaign routes', () => {
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
       expect(body.name).toBe('Updated campaign');
+    });
+
+    it('returns 409 NOT_DRAFT when a Start commits between the read and the update', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Draft campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        version: '1.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
+        status: 'draft',
+        targetFilter: null,
+        createdById: 'test-user-id',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      // 1. select campaign (draft), 2. draft-guarded update matches nothing
+      setupDbResults([campaign], []);
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ firmwareUrl: 'https://example.com/other.bin' }),
+      });
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).code).toBe('NOT_DRAFT');
+    });
+
+    const signedDraft = {
+      id: 'camp-001',
+      name: 'Draft campaign',
+      firmwareUrl: 'https://example.com/fw.bin',
+      version: null,
+      signingCertificate: TEST_PEM_CERTIFICATE,
+      retries: null,
+      retryInterval: null,
+      installDateTime: null,
+      signature: TEST_SIGNATURE,
+      status: 'draft',
+      targetFilter: null,
+      createdById: 'test-user-id',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    it('returns 400 when an update leaves only one signing field', async () => {
+      setupDbResults([signedDraft]);
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ signature: null }),
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+    });
+
+    it('clears both signing fields', async () => {
+      setupDbResults(
+        [signedDraft],
+        [{ ...signedDraft, signingCertificate: null, signature: null }],
+      );
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ signingCertificate: null, signature: null }),
+      });
+
+      expect(response.statusCode).toBe(200);
+      const { db } = databaseModule;
+      const updateChain = vi.mocked(db.update).mock.results[0]?.value as {
+        set: ReturnType<typeof vi.fn>;
+      };
+      expect(updateChain.set).toHaveBeenCalledWith(
+        expect.objectContaining({ signingCertificate: null, signature: null }),
+      );
+    });
+
+    it('keeps the stored signing fields when the update does not name them', async () => {
+      setupDbResults([signedDraft], [{ ...signedDraft, name: 'Renamed' }]);
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed' }),
+      });
+
+      expect(response.statusCode).toBe(200);
+      const { db } = databaseModule;
+      const updateChain = vi.mocked(db.update).mock.results[0]?.value as {
+        set: ReturnType<typeof vi.fn>;
+      };
+      expect(updateChain.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Renamed',
+          signingCertificate: TEST_PEM_CERTIFICATE,
+          signature: TEST_SIGNATURE,
+        }),
+      );
     });
   });
 
@@ -551,8 +868,8 @@ describe('Firmware campaign routes', () => {
         updatedAt: new Date().toISOString(),
       };
 
-      // 1. select campaign, 2. delete
-      setupDbResults([campaign], []);
+      // 1. select campaign, 2. draft-guarded delete returning the row
+      setupDbResults([campaign], [{ id: 'camp-001' }]);
 
       const response = await app.inject({
         method: 'DELETE',
@@ -560,6 +877,27 @@ describe('Firmware campaign routes', () => {
         headers: { authorization: `Bearer ${token}` },
       });
       expect(response.statusCode).toBe(204);
+    });
+
+    it('returns 409 NOT_DRAFT when a Start commits between the read and the delete', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Draft campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        status: 'draft',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      // 1. select campaign (draft), 2. guarded delete matches nothing (now active)
+      setupDbResults([campaign], []);
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).code).toBe('NOT_DRAFT');
     });
   });
 
@@ -624,6 +962,27 @@ describe('Firmware campaign routes', () => {
       expect(body.data).toHaveLength(1);
       expect(body.data[0].stationId).toBe('STATION-001');
       expect(body.total).toBe(1);
+    });
+
+    it('filters by the current firmware version of the target filter', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Draft campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        status: 'draft',
+        targetFilter: { siteId: 'site-1', firmwareVersion: '1.0.0' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults([campaign], [], [{ total: 0 }]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/v1/firmware-campaigns/camp-001/matching-stations',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(eq)).toHaveBeenCalledWith('firmwareVersion', '1.0.0');
     });
   });
 
@@ -706,14 +1065,19 @@ describe('Firmware campaign routes', () => {
         name: 'Draft campaign',
         firmwareUrl: 'https://example.com/fw.bin',
         version: '2.0.0',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
         status: 'draft',
         targetFilter: { siteId: 'site-001' },
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
       const targets = [
-        { id: 'sta-uuid-001', stationId: 'STATION-001' },
-        { id: 'sta-uuid-002', stationId: 'STATION-002' },
+        { id: 'sta-uuid-001', stationId: 'STATION-001', isOnline: true },
+        { id: 'sta-uuid-002', stationId: 'STATION-002', isOnline: true },
       ];
 
       // 1. select campaign, 2. select target stations,
@@ -738,7 +1102,220 @@ describe('Firmware campaign routes', () => {
         const payload = JSON.parse(call[1] as string);
         expect(payload.action).toBe('UpdateFirmware');
         expect(payload.payload.firmware.location).toBe('https://example.com/fw.bin');
+        expect(payload.payload.firmware).not.toHaveProperty('signature');
       }
+    });
+
+    it('starts only the stations on the firmware version of the target filter', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Draft campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        status: 'draft',
+        targetFilter: { siteId: 'site-001', firmwareVersion: '1.0.0' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults([campaign], []);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(409);
+      expect(vi.mocked(eq)).toHaveBeenCalledWith('firmwareVersion', '1.0.0');
+    });
+
+    it('fails the station of a command that could not be published', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Draft campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        signingCertificate: null,
+        retries: null,
+        retryInterval: null,
+        installDateTime: null,
+        signature: null,
+        status: 'draft',
+        targetFilter: { siteId: 'site-001' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const targets = [
+        { id: 'sta-uuid-001', stationId: 'STATION-001', isOnline: true },
+        { id: 'sta-uuid-002', stationId: 'STATION-002', isOnline: true },
+      ];
+      setupDbResults([campaign], targets, [{ id: 'camp-001' }], [], []);
+      mockPublish.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('redis down'));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const reject = vi.mocked(databaseModule.rejectFirmwareUpdate);
+      expect(reject).toHaveBeenCalledTimes(1);
+      expect(reject).toHaveBeenCalledWith(
+        databaseModule.client,
+        expect.objectContaining({ stationUuid: 'sta-uuid-002', reasonCode: 'CommandFailed' }),
+      );
+      // The pre-insert did not link the update: the campaign station fails directly.
+      expect(vi.mocked(databaseModule.applyFirmwareCampaignStationStatus)).toHaveBeenCalledWith(
+        databaseModule.client,
+        expect.objectContaining({
+          campaignId: 'camp-001',
+          stationUuid: 'sta-uuid-002',
+          status: 'failed',
+        }),
+      );
+    });
+
+    it('sends the retries, retry interval and install time of the campaign', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Scheduled campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        signingCertificate: null,
+        signature: null,
+        retries: 3,
+        retryInterval: 600,
+        installDateTime: new Date('2030-01-01T02:00:00.000Z'),
+        status: 'draft',
+        targetFilter: { siteId: 'site-001' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults(
+        [campaign],
+        [{ id: 'sta-uuid-001', stationId: 'STATION-001', isOnline: true }],
+        [{ id: 'camp-001' }],
+        [],
+        [],
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const payload = JSON.parse(mockPublish.mock.calls[0]?.[1] as string).payload;
+      expect(payload.retries).toBe(3);
+      expect(payload.retryInterval).toBe(600);
+      expect(payload.firmware.installDateTime).toBe('2030-01-01T02:00:00.000Z');
+    });
+
+    it('records an offline station without sending it the update yet', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Mixed campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        signingCertificate: null,
+        signature: null,
+        status: 'draft',
+        targetFilter: { siteId: 'site-001' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults(
+        [campaign],
+        [
+          { id: 'sta-uuid-001', stationId: 'STATION-001', isOnline: true },
+          { id: 'sta-uuid-002', stationId: 'STATION-002', isOnline: false },
+        ],
+        [{ id: 'camp-001' }],
+        [],
+        [],
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mockPublish).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(mockPublish.mock.calls[0]?.[1] as string).stationId).toBe('STATION-001');
+      const { db } = databaseModule;
+      const stationInsert = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      const rows = stationInsert.values.mock.calls[0]?.[0] as Array<{
+        stationId: string;
+        dispatchedAt: Date | null;
+      }>;
+      expect(rows.find((r) => r.stationId === 'sta-uuid-001')?.dispatchedAt).toBeInstanceOf(Date);
+      expect(rows.find((r) => r.stationId === 'sta-uuid-002')?.dispatchedAt).toBeNull();
+    });
+
+    it('starts a campaign whose matching stations are all offline', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Offline campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        signingCertificate: null,
+        signature: null,
+        status: 'draft',
+        targetFilter: { siteId: 'site-001' },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults(
+        [campaign],
+        [{ id: 'sta-uuid-002', stationId: 'STATION-002', isOnline: false }],
+        [{ id: 'camp-001' }],
+        [],
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mockPublish).not.toHaveBeenCalled();
+    });
+
+    it('sends the signing certificate and signature of a signed campaign', async () => {
+      const campaign = {
+        id: 'camp-001',
+        name: 'Signed campaign',
+        firmwareUrl: 'https://example.com/fw.bin',
+        version: '2.0.0',
+        signingCertificate: TEST_PEM_CERTIFICATE,
+        signature: TEST_SIGNATURE,
+        status: 'draft',
+        targetFilter: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setupDbResults(
+        [campaign],
+        [{ id: 'sta-uuid-001', stationId: 'STATION-001', isOnline: true }],
+        [{ id: 'camp-001' }],
+        [],
+        [],
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns/camp-001/start',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockPublish).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(mockPublish.mock.calls[0]?.[1] as string);
+      expect(payload.version).toBeUndefined();
+      expect(payload.payload.firmware).toEqual(
+        expect.objectContaining({
+          location: 'https://example.com/fw.bin',
+          signingCertificate: TEST_PEM_CERTIFICATE,
+          signature: TEST_SIGNATURE,
+        }),
+      );
     });
   });
 
@@ -779,8 +1356,8 @@ describe('Firmware campaign routes', () => {
         updatedAt: new Date().toISOString(),
       };
 
-      // 1. select campaign, 2. update status to cancelled
-      setupDbResults([campaign], []);
+      // 1. select campaign, 2. guarded update returning the cancelled row
+      setupDbResults([campaign], [{ id: 'camp-001' }]);
 
       const response = await app.inject({
         method: 'POST',
@@ -790,6 +1367,81 @@ describe('Firmware campaign routes', () => {
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
       expect(body.success).toBe(true);
+    });
+
+    it.each(['draft', 'completed', 'cancelled'])(
+      'returns 409 CAMPAIGN_NOT_ACTIVE for a %s campaign',
+      async (status) => {
+        const campaign = {
+          id: 'camp-001',
+          name: 'Campaign',
+          firmwareUrl: 'https://example.com/fw.bin',
+          status,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        // 1. select campaign, 2. guarded update matches no row
+        setupDbResults([campaign], []);
+
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/firmware-campaigns/camp-001/cancel',
+          headers: { authorization: `Bearer ${token}` },
+        });
+        expect(response.statusCode).toBe(409);
+        expect(JSON.parse(response.body).code).toBe('CAMPAIGN_NOT_ACTIVE');
+      },
+    );
+  });
+
+  describe('company-wide campaigns for a site-restricted user', () => {
+    const draft = (targetFilter: Record<string, unknown> | null) => ({
+      id: 'camp-001',
+      name: 'Draft',
+      firmwareUrl: 'https://example.com/fw.bin',
+      status: 'draft',
+      targetFilter,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    it('refuses to create a campaign without a site or station', async () => {
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce(['site-a']);
+      setupDbResults();
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/firmware-campaigns',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'All', firmwareUrl: 'https://example.com/fw.bin' }),
+      });
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body).code).toBe('CAMPAIGN_NOT_FOUND');
+    });
+
+    it('refuses to widen a site draft to every site', async () => {
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce(['site-a']);
+      setupDbResults([draft({ siteId: 'site-a' })]);
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ targetFilter: null, firmwareUrl: 'https://evil.example/fw.bin' }),
+      });
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body).code).toBe('CAMPAIGN_NOT_FOUND');
+    });
+
+    it('refuses to edit a draft that targets every site', async () => {
+      vi.mocked(getUserSiteIds).mockResolvedValueOnce(['site-a']);
+      setupDbResults([draft(null)]);
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/v1/firmware-campaigns/camp-001',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ firmwareUrl: 'https://evil.example/fw.bin' }),
+      });
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body).code).toBe('CAMPAIGN_NOT_FOUND');
     });
   });
 });

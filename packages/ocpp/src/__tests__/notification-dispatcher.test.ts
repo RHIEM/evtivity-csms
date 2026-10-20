@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import type { DomainEvent } from '@evtivity/lib';
 
 const mockGetNotificationSettings = vi.fn();
@@ -13,6 +13,42 @@ const mockLogNotification = vi.fn();
 const mockWrapEmailHtml = vi.fn();
 const mockDispatchDriverNotification = vi.fn();
 const mockRecordNotificationAttempt = vi.fn();
+const mockClearContractValidationCaCache = vi.fn();
+const mockClearStationMessageCache = vi.fn();
+const mockClearStationMessageSettingsCache = vi.fn();
+const mockClearAutochargeCache = vi.fn();
+const mockGetWebhookAllowedPrivateHosts = vi.fn().mockResolvedValue([]);
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await vi.importActual<Record<string, unknown>>('../../../database/src/lib/pg-errors.js')),
+  clearStationMessageSettingsCache: () => {
+    mockClearStationMessageSettingsCache();
+  },
+  clearAutochargeCache: () => {
+    mockClearAutochargeCache();
+  },
+  getWebhookAllowedPrivateHosts: () => mockGetWebhookAllowedPrivateHosts(),
+}));
+const mockClearLocalContractCaCache = vi.fn();
+const mockClearOemTrustCache = vi.fn();
+
+vi.mock('../services/pki/contract-certificate-validation.js', () => ({
+  clearContractValidationCaCache: () => {
+    mockClearContractValidationCaCache();
+  },
+}));
+
+vi.mock('../services/pki/local-ca-store.js', () => ({
+  clearLocalContractCaCache: () => {
+    mockClearLocalContractCaCache();
+  },
+}));
+
+vi.mock('../services/pki/local-contract-provider.js', () => ({
+  clearOemTrustCache: () => {
+    mockClearOemTrustCache();
+  },
+}));
 
 vi.mock('@evtivity/lib', async () => {
   const actual = await vi.importActual<typeof import('@evtivity/lib')>('@evtivity/lib');
@@ -27,6 +63,9 @@ vi.mock('@evtivity/lib', async () => {
     wrapEmailHtml: mockWrapEmailHtml,
     recordNotificationAttempt: mockRecordNotificationAttempt,
     dispatchDriverNotification: mockDispatchDriverNotification,
+    clearStationMessageCache: () => {
+      mockClearStationMessageCache();
+    },
     createLogger: () => ({
       info: vi.fn(),
       error: vi.fn(),
@@ -80,6 +119,12 @@ function createSqlMock() {
   return fn;
 }
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let notificationDispatcherModule: typeof import('../server/notification-dispatcher.js');
+beforeAll(async () => {
+  notificationDispatcherModule = await import('../server/notification-dispatcher.js');
+}, 30_000);
+
 describe('dispatchOcppNotification', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -88,12 +133,12 @@ describe('dispatchOcppNotification', () => {
     sqlCallIndex = 0;
     mockRecordNotificationAttempt.mockResolvedValue(undefined);
     // Clear the in-memory settings cache between tests
-    const mod = await import('../server/notification-dispatcher.js');
+    const mod = notificationDispatcherModule;
     mod.clearOcppEventSettingsCache();
   });
 
   it('dispatches email notification when setting row exists', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     // Cache loads all ocpp_event_settings rows (row existence = active)
     setupSqlResults(
@@ -128,7 +173,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('skips when no setting row exists for the event type', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
     // Cache load returns no rows
     setupSqlResults([]);
 
@@ -140,7 +185,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('dispatches webhook when channel is webhook', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults(
       [
@@ -167,13 +212,20 @@ describe('dispatchOcppNotification', () => {
     mockSendWebhook.mockResolvedValue('ok');
 
     const sql = createSqlMock();
+    mockGetWebhookAllowedPrivateHosts.mockResolvedValueOnce(['n8n']);
     await dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification'));
 
-    expect(mockSendWebhook).toHaveBeenCalled();
+    expect(mockSendWebhook).toHaveBeenCalledWith(
+      'https://hook.test.com',
+      'Test',
+      'Body',
+      expect.any(Object),
+      ['n8n'],
+    );
   });
 
   it('falls back to log when SMTP not configured', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults(
       [
@@ -206,7 +258,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('dispatches to both email and webhook when both rows exist', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults(
       [
@@ -252,7 +304,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('serves the second dispatch from the in-memory settings cache', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -287,7 +339,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('uses the recipient language when the setting has no language override', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -323,8 +375,44 @@ describe('dispatchOcppNotification', () => {
     );
   });
 
-  it('logs and swallows a failure thrown after loading settings', async () => {
+  it('formats date variables in the language of each recipient', async () => {
     const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+
+    setupSqlResults([
+      {
+        event_type: 'ocpp.StatusNotification',
+        recipient: 'admin@test.com',
+        channel: 'webhook',
+        template_html: null,
+        language: null,
+      },
+    ]);
+    mockGetNotificationSettings.mockResolvedValue({
+      smtp: null,
+      twilio: null,
+      emailWrapperTemplate: null,
+    });
+    mockResolveRecipients.mockReturnValue([
+      { address: 'https://hook-en.test.com', language: 'en' },
+      { address: 'https://hook-de.test.com', language: 'de' },
+    ]);
+    mockRenderTemplate.mockResolvedValue({ subject: 'S', body: 'B' });
+    mockSendWebhook.mockResolvedValue('ok');
+
+    const sql = createSqlMock();
+    await dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification'));
+
+    const occurredAt = (call: unknown[]): unknown =>
+      (call[3] as Record<string, unknown>)['occurredAt'];
+    expect(mockRenderTemplate).toHaveBeenCalledTimes(2);
+    expect(occurredAt(mockRenderTemplate.mock.calls[0] as unknown[])).toMatch(/[A-Z][a-z]{2} \d/);
+    expect(occurredAt(mockRenderTemplate.mock.calls[1] as unknown[])).toMatch(
+      /^\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}$/,
+    );
+  });
+
+  it('logs and swallows a failure thrown after loading settings', async () => {
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -348,7 +436,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('records smtp_send_failed when sendEmail returns false', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -384,7 +472,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('records credentials_decrypt_failed when smtp credentials cannot decrypt', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -426,7 +514,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('records a webhook failure reason when sendWebhook does not return ok', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -461,7 +549,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('catches and logs a per-recipient render failure without throwing', async () => {
-    const { dispatchOcppNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification } = notificationDispatcherModule;
 
     setupSqlResults([
       {
@@ -491,8 +579,7 @@ describe('dispatchOcppNotification', () => {
   });
 
   it('returns an empty cache and skips dispatch when the settings query fails', async () => {
-    const { dispatchOcppNotification, clearOcppEventSettingsCache } =
-      await import('../server/notification-dispatcher.js');
+    const { dispatchOcppNotification, clearOcppEventSettingsCache } = notificationDispatcherModule;
     clearOcppEventSettingsCache();
 
     // SQL throws on the settings load -> loadSettingsCache catch returns an
@@ -515,8 +602,7 @@ describe('dispatchDriverNotification wrapper', () => {
   });
 
   it('forwards to the shared dispatcher with the default template dirs', async () => {
-    const { dispatchDriverNotification, ALL_TEMPLATES_DIRS } =
-      await import('../server/notification-dispatcher.js');
+    const { dispatchDriverNotification, ALL_TEMPLATES_DIRS } = notificationDispatcherModule;
     mockDispatchDriverNotification.mockResolvedValue(undefined);
 
     const sql = createSqlMock();
@@ -530,11 +616,12 @@ describe('dispatchDriverNotification wrapper', () => {
       variables,
       ALL_TEMPLATES_DIRS,
       undefined,
+      undefined,
     );
   });
 
   it('passes a caller-supplied templatesDir and pubsub through', async () => {
-    const { dispatchDriverNotification } = await import('../server/notification-dispatcher.js');
+    const { dispatchDriverNotification } = notificationDispatcherModule;
     mockDispatchDriverNotification.mockResolvedValue(undefined);
 
     const sql = createSqlMock();
@@ -555,6 +642,33 @@ describe('dispatchDriverNotification wrapper', () => {
       {},
       '/custom/dir',
       pubsub,
+      undefined,
+    );
+  });
+
+  it('passes the dispatch options through (no SMS for session.AutochargeStarted)', async () => {
+    const { dispatchDriverNotification } = notificationDispatcherModule;
+    mockDispatchDriverNotification.mockResolvedValue(undefined);
+
+    const sql = createSqlMock();
+    await dispatchDriverNotification(
+      sql as never,
+      'session.AutochargeStarted',
+      'drv_1',
+      {},
+      '/custom/dir',
+      undefined,
+      { sms: false },
+    );
+
+    expect(mockDispatchDriverNotification).toHaveBeenCalledWith(
+      sql,
+      'session.AutochargeStarted',
+      'drv_1',
+      {},
+      '/custom/dir',
+      undefined,
+      { sms: false },
     );
   });
 });
@@ -565,7 +679,7 @@ describe('subscribeOcppEventSettingsInvalidation', () => {
   });
 
   it('clears the OCPP event settings cache on a matching cache message', async () => {
-    const mod = await import('../server/notification-dispatcher.js');
+    const mod = notificationDispatcherModule;
 
     let handler: ((p: string) => void) | null = null;
     const unsubscribe = vi.fn().mockResolvedValue(undefined);
@@ -630,5 +744,160 @@ describe('subscribeOcppEventSettingsInvalidation', () => {
 
     await sub.unsubscribe();
     expect(unsubscribe).toHaveBeenCalled();
+  });
+
+  it('clears the contract validation CA cache on a pkiCaCertificates message', async () => {
+    const mod = notificationDispatcherModule;
+    let handler: ((p: string) => void) | null = null;
+    const pubsub = {
+      publish: vi.fn(),
+      subscribe: vi.fn((_channel: string, h: (p: string) => void) => {
+        handler = h;
+        return Promise.resolve({ unsubscribe: vi.fn().mockResolvedValue(undefined) });
+      }),
+      close: vi.fn(),
+    };
+    await mod.subscribeOcppEventSettingsInvalidation(pubsub);
+
+    handler!(JSON.stringify({ cache: 'ocppEventSettings' }));
+    expect(mockClearContractValidationCaCache).not.toHaveBeenCalled();
+    handler!(JSON.stringify({ cache: 'pkiCaCertificates' }));
+    expect(mockClearContractValidationCaCache).toHaveBeenCalledTimes(1);
+    expect(mockClearLocalContractCaCache).toHaveBeenCalledTimes(1);
+    expect(mockClearOemTrustCache).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears the station message caches on a station_message message', async () => {
+    const mod = notificationDispatcherModule;
+    let handler: ((p: string) => void) | null = null;
+    const pubsub = {
+      publish: vi.fn(),
+      subscribe: vi.fn((_channel: string, h: (p: string) => void) => {
+        handler = h;
+        return Promise.resolve({ unsubscribe: vi.fn().mockResolvedValue(undefined) });
+      }),
+      close: vi.fn(),
+    };
+    await mod.subscribeOcppEventSettingsInvalidation(pubsub);
+
+    handler!(JSON.stringify({ kind: 'notification_settings' }));
+    expect(mockClearStationMessageCache).not.toHaveBeenCalled();
+    handler!(JSON.stringify({ kind: 'station_message' }));
+    expect(mockClearStationMessageCache).toHaveBeenCalledTimes(1);
+    expect(mockClearStationMessageSettingsCache).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears the Autocharge readers on an autocharge message', async () => {
+    const mod = notificationDispatcherModule;
+    let handler: ((p: string) => void) | null = null;
+    const pubsub = {
+      publish: vi.fn(),
+      subscribe: vi.fn((_channel: string, h: (p: string) => void) => {
+        handler = h;
+        return Promise.resolve({ unsubscribe: vi.fn().mockResolvedValue(undefined) });
+      }),
+      close: vi.fn(),
+    };
+    await mod.subscribeOcppEventSettingsInvalidation(pubsub);
+    mockClearAutochargeCache.mockClear();
+    handler!(JSON.stringify({ kind: 'station_message' }));
+    expect(mockClearAutochargeCache).not.toHaveBeenCalled();
+    handler!(JSON.stringify({ kind: 'autocharge' }));
+    expect(mockClearAutochargeCache).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('dispatchOcppNotification on a retried projection', () => {
+  const runOptions = { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 };
+
+  function connectionError(code: string): Error {
+    return Object.assign(new Error(code), { code });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    notificationDispatcherModule.clearOcppEventSettingsCache();
+    setupSqlResults([
+      {
+        event_type: 'ocpp.StatusNotification',
+        recipient: 'admin@test.com',
+        channel: 'email',
+        template_html: null,
+        language: 'en',
+      },
+    ]);
+    mockGetNotificationSettings.mockResolvedValue({
+      smtp: { host: 'smtp.test.com', port: 587, username: '', password: '', from: 'a@test.com' },
+      twilio: null,
+      emailWrapperTemplate: null,
+    });
+    mockResolveRecipients.mockReturnValue([
+      { address: 'admin@test.com', language: 'en' },
+      { address: 'ops@test.com', language: 'en' },
+    ]);
+    mockRenderTemplate.mockResolvedValue({ subject: 'S', body: 'B', html: '<p>B</p>' });
+    mockWrapEmailHtml.mockReturnValue('<div><p>B</p></div>');
+    mockSendEmail.mockResolvedValue(true);
+    mockRecordNotificationAttempt.mockResolvedValue(undefined);
+  });
+
+  it('reruns after a notifications row that never reached the server, sending no email twice', async () => {
+    const { dispatchOcppNotification } = notificationDispatcherModule;
+    const { runProjectionWithRetry } = await import('../server/projection-retry.js');
+    mockRecordNotificationAttempt.mockRejectedValueOnce(connectionError('CONNECT_TIMEOUT'));
+
+    const sql = createSqlMock();
+    await runProjectionWithRetry(
+      (attempt) =>
+        dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification'), attempt),
+      runOptions,
+    );
+
+    expect(mockSendEmail.mock.calls.map((c) => c[1])).toEqual(['admin@test.com', 'ops@test.com']);
+    // The failed row, then the rerun's row for the first recipient, then the second.
+    expect(mockRecordNotificationAttempt).toHaveBeenCalledTimes(3);
+  });
+
+  it('reruns after a template read lost its connection', async () => {
+    const { dispatchOcppNotification } = notificationDispatcherModule;
+    const { runProjectionWithRetry } = await import('../server/projection-retry.js');
+    mockRenderTemplate.mockRejectedValueOnce(connectionError('CONNECTION_CLOSED'));
+
+    const sql = createSqlMock();
+    await runProjectionWithRetry(
+      (attempt) =>
+        dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification'), attempt),
+      runOptions,
+    );
+
+    expect(mockSendEmail.mock.calls.map((c) => c[1])).toEqual(['admin@test.com', 'ops@test.com']);
+    expect(mockRecordNotificationAttempt).toHaveBeenCalledTimes(2);
+  });
+
+  it('goes on to the next recipient when a notifications row may have committed', async () => {
+    const { dispatchOcppNotification } = notificationDispatcherModule;
+    const { runProjectionWithRetry } = await import('../server/projection-retry.js');
+    mockRecordNotificationAttempt.mockRejectedValueOnce(connectionError('CONNECTION_CLOSED'));
+
+    const sql = createSqlMock();
+    await runProjectionWithRetry(
+      (attempt) =>
+        dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification'), attempt),
+      runOptions,
+    );
+
+    expect(mockSendEmail.mock.calls.map((c) => c[1])).toEqual(['admin@test.com', 'ops@test.com']);
+    expect(mockRecordNotificationAttempt).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs a lost connection without an attempt and never throws', async () => {
+    const { dispatchOcppNotification } = notificationDispatcherModule;
+    mockRenderTemplate.mockRejectedValue(connectionError('CONNECT_TIMEOUT'));
+
+    const sql = createSqlMock();
+    await expect(
+      dispatchOcppNotification(sql as never, makeEvent('ocpp.StatusNotification')),
+    ).resolves.toBeUndefined();
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 });

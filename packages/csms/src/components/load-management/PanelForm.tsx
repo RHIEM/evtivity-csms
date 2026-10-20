@@ -12,11 +12,20 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { SaveButton } from '@/components/save-button';
 import { api } from '@/lib/api';
+import {
+  PANEL_VOLTAGES,
+  SUB_PANEL_PHASE_CONNECTIONS,
+  computeMaxContinuousKw,
+  isPanelVoltageAllowed,
+  isSubPanelPhaseConnectionAllowed,
+} from '@evtivity/lib/load-allocation';
+import { formatNumber } from '@/lib/formatting';
 
 interface PanelStatus {
   id: string;
@@ -27,6 +36,7 @@ interface PanelStatus {
   maxContinuousKw: number;
   safetyMarginKw: number;
   oversubscriptionRatio: number;
+  phaseConnections?: string | null;
   currentDrawKw: number;
   availableKw: number;
   utilization: number;
@@ -55,10 +65,6 @@ function flattenPanels(panels: PanelStatus[]): PanelStatus[] {
   return result;
 }
 
-function computeMaxContinuousKw(amps: number, voltage: number, phases: number): number {
-  return (amps * voltage * phases * 0.8) / 1000;
-}
-
 export function PanelForm({
   siteId,
   panel,
@@ -75,8 +81,10 @@ export function PanelForm({
   const [breakerRatingAmps, setBreakerRatingAmps] = useState(200);
   const [voltageV, setVoltageV] = useState(240);
   const [phases, setPhases] = useState(1);
-  const [safetyMarginKw, setSafetyMarginKw] = useState(0);
-  const [oversubscriptionRatio, setOversubscriptionRatio] = useState(1.0);
+  const [safetyMarginKw, setSafetyMarginKw] = useState('0');
+  const [oversubscriptionRatio, setOversubscriptionRatio] = useState('1');
+  const [phaseConnections, setPhaseConnections] = useState<string | null>(null);
+  const [hasSubmitted, setHasSubmitted] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -86,17 +94,20 @@ export function PanelForm({
         setBreakerRatingAmps(panel.breakerRatingAmps);
         setVoltageV(panel.voltageV);
         setPhases(panel.phases);
-        setSafetyMarginKw(panel.safetyMarginKw);
-        setOversubscriptionRatio(panel.oversubscriptionRatio);
+        setSafetyMarginKw(String(panel.safetyMarginKw));
+        setOversubscriptionRatio(String(panel.oversubscriptionRatio));
+        setPhaseConnections(panel.phaseConnections ?? null);
       } else {
         setName('');
         setParentPanelId(null);
         setBreakerRatingAmps(200);
         setVoltageV(240);
         setPhases(1);
-        setSafetyMarginKw(0);
-        setOversubscriptionRatio(1.0);
+        setSafetyMarginKw('0');
+        setOversubscriptionRatio('1');
+        setPhaseConnections(null);
       }
+      setHasSubmitted(false);
     }
   }, [open, panel]);
 
@@ -108,6 +119,17 @@ export function PanelForm({
     return flat;
   }, [panels, isEdit, panel]);
 
+  // The parent decides whether the feeding phases apply: the panel being
+  // edited keeps its parent, a new one takes the selected parent.
+  const parentPhases = useMemo(() => {
+    const flat = flattenPanels(panels);
+    if (isEdit) {
+      return flat.find((p) => p.childPanels.some((c) => c.id === panel.id))?.phases ?? null;
+    }
+    return flat.find((p) => p.id === parentPanelId)?.phases ?? null;
+  }, [panels, isEdit, panel, parentPanelId]);
+  const showPhaseConnections = isSubPanelPhaseConnectionAllowed(phases, parentPhases);
+
   const maxContinuousKw = computeMaxContinuousKw(breakerRatingAmps, voltageV, phases);
 
   const mutation = useMutation({
@@ -118,8 +140,15 @@ export function PanelForm({
         breakerRatingAmps,
         voltageV,
         phases,
-        safetyMarginKw,
-        oversubscriptionRatio,
+        safetyMarginKw: Number(safetyMarginKw),
+        oversubscriptionRatio: Number(oversubscriptionRatio),
+        // On edit, null clears the feeding phases (the load counts on every
+        // parent phase).
+        ...(showPhaseConnections && phaseConnections != null
+          ? { phaseConnections }
+          : isEdit
+            ? { phaseConnections: null }
+            : {}),
       };
       if (isEdit) {
         return api.patch(`/v1/sites/${siteId}/panels/${panel.id}`, body);
@@ -132,8 +161,33 @@ export function PanelForm({
     },
   });
 
+  function getValidationErrors(): Record<string, string> {
+    const errors: Record<string, string> = {};
+    if (!isPanelVoltageAllowed(voltageV, phases)) {
+      errors.voltageV = t('loadManagement.threePhaseVoltageHint');
+    }
+    const margin = Number(safetyMarginKw);
+    if (safetyMarginKw.trim() === '') errors.safetyMarginKw = t('validation.required');
+    else if (!Number.isFinite(margin)) errors.safetyMarginKw = t('validation.invalidNumber');
+    const ratio = Number(oversubscriptionRatio);
+    if (oversubscriptionRatio.trim() === '') {
+      errors.oversubscriptionRatio = t('validation.required');
+    } else if (!Number.isFinite(ratio)) {
+      errors.oversubscriptionRatio = t('validation.invalidNumber');
+    } else if (ratio < 1) {
+      errors.oversubscriptionRatio = t('validation.min', { min: 1 });
+    } else if (ratio > 3) {
+      errors.oversubscriptionRatio = t('validation.max', { max: 3 });
+    }
+    return errors;
+  }
+
+  const errors = getValidationErrors();
+
   function handleSubmit(e: React.SyntheticEvent): void {
     e.preventDefault();
+    setHasSubmitted(true);
+    if (Object.keys(errors).length > 0) return;
     mutation.mutate();
   }
 
@@ -206,12 +260,21 @@ export function PanelForm({
                   setVoltageV(Number(e.target.value));
                 }}
               >
-                <option value={120}>120V</option>
-                <option value={208}>208V</option>
-                <option value={240}>240V</option>
-                <option value={277}>277V</option>
-                <option value={480}>480V</option>
+                {PANEL_VOLTAGES.map((v) => (
+                  <option key={v} value={v}>
+                    {v}V
+                  </option>
+                ))}
               </Select>
+              {hasSubmitted && errors.voltageV != null ? (
+                <p className="text-sm text-destructive">{errors.voltageV}</p>
+              ) : (
+                phases === 3 && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('loadManagement.threePhaseVoltageHint')}
+                  </p>
+                )
+              )}
             </div>
           </div>
 
@@ -231,34 +294,56 @@ export function PanelForm({
             </div>
             <div className="grid gap-2">
               <Label htmlFor="safety-margin">{t('loadManagement.safetyMargin')}</Label>
-              <Input
+              <DecimalInput
                 id="safety-margin"
-                type="number"
-                min={0}
-                step={0.1}
                 value={safetyMarginKw}
-                onChange={(e) => {
-                  setSafetyMarginKw(Number(e.target.value));
-                }}
+                onChange={setSafetyMarginKw}
+                className={hasSubmitted && errors.safetyMarginKw ? 'border-destructive' : ''}
               />
+              {hasSubmitted && errors.safetyMarginKw && (
+                <p className="text-sm text-destructive">{errors.safetyMarginKw}</p>
+              )}
             </div>
           </div>
+
+          {showPhaseConnections && (
+            <div className="grid gap-2">
+              <Label htmlFor="panel-phase-connections">
+                {t('loadManagement.subPanelPhaseConnections')}
+              </Label>
+              <Select
+                id="panel-phase-connections"
+                value={phaseConnections ?? ''}
+                onChange={(e) => {
+                  setPhaseConnections(e.target.value || null);
+                }}
+              >
+                <option value="">{t('loadManagement.subPanelPhaseUnknown')}</option>
+                {SUB_PANEL_PHASE_CONNECTIONS.map((value) => (
+                  <option key={value} value={value}>
+                    {value.replace(/(L\d)(?=L)/g, '$1+')}
+                  </option>
+                ))}
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t('loadManagement.subPanelPhaseConnectionsHint')}
+              </p>
+            </div>
+          )}
 
           <div className="grid gap-2">
             <Label htmlFor="oversubscription-ratio">
               {t('loadManagement.oversubscriptionRatio')}
             </Label>
-            <Input
+            <DecimalInput
               id="oversubscription-ratio"
-              type="number"
-              min={1.0}
-              max={3.0}
-              step={0.1}
               value={oversubscriptionRatio}
-              onChange={(e) => {
-                setOversubscriptionRatio(Number(e.target.value));
-              }}
+              onChange={setOversubscriptionRatio}
+              className={hasSubmitted && errors.oversubscriptionRatio ? 'border-destructive' : ''}
             />
+            {hasSubmitted && errors.oversubscriptionRatio && (
+              <p className="text-sm text-destructive">{errors.oversubscriptionRatio}</p>
+            )}
             <p className="text-xs text-muted-foreground">
               {t('loadManagement.oversubscriptionWarning')}
             </p>
@@ -268,7 +353,7 @@ export function PanelForm({
             <p className="text-sm text-muted-foreground">
               {t('loadManagement.maxContinuousPower')}
             </p>
-            <p className="text-lg font-semibold">{maxContinuousKw.toFixed(1)} kW</p>
+            <p className="text-lg font-semibold">{formatNumber(maxContinuousKw, 1)} kW</p>
             <p className="text-xs text-muted-foreground">{t('loadManagement.necRule')}</p>
           </div>
 

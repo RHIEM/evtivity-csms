@@ -4,13 +4,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, and, sql, asc } from 'drizzle-orm';
-import { db, carbonIntensityFactors } from '@evtivity/database';
+import { db, carbonIntensityFactors, operatorStationIdSql } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { arrayResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
 import { getUserSiteIds } from '../lib/site-access.js';
-import { buildCsv } from '../services/report-generators/csv-builder.js';
+import { buildCsv } from '@evtivity/lib';
 
 const carbonFactorItem = z
   .object({
@@ -97,7 +97,7 @@ const TREES_KG_CO2_PER_YEAR = 21.77;
 
 // Shared WHERE-clause builder for the carbon report + CSV export. Both
 // endpoints aggregate against the same predicate set against
-// charging_sessions cs / charging_stations st, so duplicating the fragment
+// charging_sessions cs (by the site each session happened at), so duplicating the fragment
 // list would let the two drift apart silently.
 function buildCarbonWhereClause(opts: {
   from?: string | undefined;
@@ -105,7 +105,11 @@ function buildCarbonWhereClause(opts: {
   siteId?: string | undefined;
   userSiteIds: string[] | null;
 }): ReturnType<typeof sql.join> {
-  const fragments = [sql`cs.status = 'completed' AND cs.co2_avoided_kg IS NOT NULL`];
+  // Sessions of conformance (OCTT) stations are never counted.
+  const fragments = [
+    sql`cs.status = 'completed' AND cs.co2_avoided_kg IS NOT NULL`,
+    sql.raw(operatorStationIdSql('cs.station_id')),
+  ];
   if (opts.from != null) {
     fragments.push(sql`cs.ended_at >= ${opts.from}::timestamptz`);
   }
@@ -113,11 +117,11 @@ function buildCarbonWhereClause(opts: {
     fragments.push(sql`cs.ended_at <= ${`${opts.to}T23:59:59.999Z`}::timestamptz`);
   }
   if (opts.siteId != null) {
-    fragments.push(sql`st.site_id = ${opts.siteId}`);
+    fragments.push(sql`cs.site_id = ${opts.siteId}`);
   }
   if (opts.userSiteIds != null) {
     fragments.push(
-      sql`st.site_id IN (${sql.join(
+      sql`cs.site_id IN (${sql.join(
         opts.userSiteIds.map((id) => sql`${id}`),
         sql`, `,
       )})`,
@@ -246,21 +250,19 @@ export function carbonRoutes(app: FastifyInstance): void {
                  COALESCE(SUM(cs.energy_delivered_wh::numeric), 0) AS energy_wh,
                  COUNT(*)::int AS session_count
           FROM charging_sessions cs
-          JOIN charging_stations st ON st.id = cs.station_id
           WHERE ${whereClause}
           GROUP BY to_char(cs.ended_at, 'YYYY-MM')
           ORDER BY month
         `),
         db.execute(sql`
-          SELECT st.site_id, s.name AS site_name,
+          SELECT cs.site_id, s.name AS site_name,
                  COALESCE(SUM(cs.co2_avoided_kg::numeric), 0) AS co2_avoided_kg,
                  COALESCE(SUM(cs.energy_delivered_wh::numeric), 0) AS energy_wh,
                  COUNT(*)::int AS session_count
           FROM charging_sessions cs
-          JOIN charging_stations st ON st.id = cs.station_id
-          JOIN sites s ON s.id = st.site_id
+          JOIN sites s ON s.id = cs.site_id
           WHERE ${whereClause}
-          GROUP BY st.site_id, s.name
+          GROUP BY cs.site_id, s.name
           ORDER BY co2_avoided_kg DESC
         `),
       ]);
@@ -321,7 +323,7 @@ export function carbonRoutes(app: FastifyInstance): void {
           'Content-Disposition',
           'attachment; filename="sustainability-report.csv"',
         );
-        return 'Month,Site,CO₂ Avoided (kg),Energy (kWh),Sessions';
+        return buildCsv(['Month', 'Site', 'CO₂ Avoided (kg)', 'Energy (kWh)', 'Sessions'], []);
       }
 
       // Aggregate in SQL instead of pulling every session into JS. A
@@ -336,8 +338,7 @@ export function carbonRoutes(app: FastifyInstance): void {
                COALESCE(SUM(cs.energy_delivered_wh::numeric), 0) AS energy_wh,
                COUNT(*)::int AS session_count
         FROM charging_sessions cs
-        JOIN charging_stations st ON st.id = cs.station_id
-        JOIN sites s ON s.id = st.site_id
+        JOIN sites s ON s.id = cs.site_id
         WHERE ${whereClause}
         GROUP BY month, s.name
         ORDER BY month, s.name

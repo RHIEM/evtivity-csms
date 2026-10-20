@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { CsTestCase, StepResult } from '../../../../cs-types.js';
+import type { OcppTestServer } from '../../../../cs-server.js';
+import {
+  noTransactionAtTimeoutStep,
+  transactionStartsAtAuthorization,
+} from '../../../../cs-test-helpers.js';
 
 const defaultHandler = async (action: string): Promise<Record<string, unknown>> => {
   if (action === 'BootNotification')
@@ -48,11 +53,7 @@ export const TC_F_02_CS: CsTestCase = {
 
     // Plug in cable after remote start
     await ctx.station.plugIn(evseId);
-    try {
-      await ctx.server.waitForMessage('StatusNotification', 5000);
-    } catch {
-      /* may already be consumed */
-    }
+    await ctx.server.waitForMessageOrNull('StatusNotification', 5000);
 
     // Step 2: Execute Reusable State EnergyTransferStarted
     const txEvent = await ctx.server.waitForMessage('TransactionEvent', 30000);
@@ -104,11 +105,7 @@ export const TC_F_03_CS: CsTestCase = {
 
     // Plug in cable after remote start
     await ctx.station.plugIn(evseId);
-    try {
-      await ctx.server.waitForMessage('StatusNotification', 5000);
-    } catch {
-      /* may already be consumed */
-    }
+    await ctx.server.waitForMessageOrNull('StatusNotification', 5000);
 
     // Step 2: Execute Reusable State EnergyTransferStarted
     const txEvent = await ctx.server.waitForMessage('TransactionEvent', 30000);
@@ -125,6 +122,33 @@ export const TC_F_03_CS: CsTestCase = {
     return { status: allPassed ? 'passed' : 'failed', durationMs: 0, steps };
   },
 };
+
+/** TC_F_04_CS step 1 when the transaction started at the authorization: Ended with EVConnectTimeout. */
+async function evConnectTimeoutEndedStep(server: OcppTestServer): Promise<StepResult> {
+  // Skip any Started/Updated events that arrive before the timeout fires.
+  let txEvent: Record<string, unknown> | null = null;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const msg = await server.waitForMessageOrNull('TransactionEvent', remaining);
+    if (msg == null) break;
+    if (msg['triggerReason'] === 'EVConnectTimeout') {
+      txEvent = msg;
+      break;
+    }
+  }
+  const triggerReason = txEvent?.['triggerReason'] as string | undefined;
+  const eventType = txEvent?.['eventType'] as string | undefined;
+  return {
+    step: 1,
+    description:
+      'TransactionEventRequest - triggerReason must be EVConnectTimeout, eventType must be Ended',
+    status: triggerReason === 'EVConnectTimeout' && eventType === 'Ended' ? 'passed' : 'failed',
+    expected: 'triggerReason = EVConnectTimeout, eventType = Ended',
+    actual: `triggerReason = ${String(triggerReason)}, eventType = ${String(eventType)}`,
+  };
+}
 
 export const TC_F_04_CS: CsTestCase = {
   id: 'TC_F_04_CS',
@@ -172,40 +196,16 @@ export const TC_F_04_CS: CsTestCase = {
       return { status: 'failed', durationMs: 0, steps };
     }
 
-    // Step 1: Wait for TransactionEventRequest with EVConnectTimeout trigger.
-    // Skip any Started/Updated events that arrive before the timeout fires.
-    let txEvent: Record<string, unknown> | null = null;
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        if (msg['triggerReason'] === 'EVConnectTimeout') {
-          txEvent = msg;
-          break;
-        }
-      } catch {
-        break;
-      }
+    // Step 1 is executed only when the transaction started at the
+    // authorization (TxStartPoint contains ParkingBayOccupancy or Authorized).
+    if (transactionStartsAtAuthorization()) {
+      steps.push(await evConnectTimeoutEndedStep(ctx.server));
+    } else {
+      steps.push(await noTransactionAtTimeoutStep(ctx.server, 1, 3_000 + 3_000));
     }
-    const triggerReason = txEvent?.['triggerReason'] as string | undefined;
-    const eventType = txEvent?.['eventType'] as string | undefined;
-    steps.push({
-      step: 1,
-      description:
-        'TransactionEventRequest - triggerReason must be EVConnectTimeout, eventType must be Ended',
-      status: triggerReason === 'EVConnectTimeout' && eventType === 'Ended' ? 'passed' : 'failed',
-      expected: 'triggerReason = EVConnectTimeout, eventType = Ended',
-      actual: `triggerReason = ${String(triggerReason)}, eventType = ${String(eventType)}`,
-    });
 
     // Drain StatusNotification Available that comes after timeout cleanup
-    try {
-      await ctx.server.waitForMessage('StatusNotification', 5000);
-    } catch {
-      /* may already be consumed */
-    }
+    await ctx.server.waitForMessageOrNull('StatusNotification', 5000);
 
     // Step 3: Execute Reusable State Authorized (remote) to verify EVSE ready for new session
     const retryRes = await ctx.server.sendCommand('RequestStartTransaction', {

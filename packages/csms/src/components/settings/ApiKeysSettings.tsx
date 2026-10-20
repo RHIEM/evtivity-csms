@@ -4,9 +4,10 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Copy, Key, Trash2, AlertTriangle, Check, Pencil } from 'lucide-react';
+import { Plus, Key, Trash2, AlertTriangle, Pencil } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
+import { CopyButton } from '@/components/ui/copy-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -33,6 +34,7 @@ import { API_BASE_URL } from '@/lib/config';
 import { useAuth } from '@/lib/auth';
 import { useToast } from '@/components/ui/toast';
 import { PermissionEditor } from '@/components/PermissionEditor';
+import { formatDate, useUserTimezone } from '@/lib/timezone';
 
 const CODE_TABS = ['cURL', 'JavaScript', 'Python'] as const;
 type CodeTab = (typeof CODE_TABS)[number];
@@ -66,6 +68,7 @@ const EXPIRY_OPTIONS = [
 ] as const;
 
 export function ApiKeysSettings(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -86,7 +89,6 @@ export function ApiKeysSettings(): React.JSX.Element {
   const [editKey, setEditKey] = useState<ApiKey | null>(null);
   const [editPerms, setEditPerms] = useState<string[]>([]);
   const [codeTab, setCodeTab] = useState<CodeTab>('cURL');
-  const [codeCopied, setCodeCopied] = useState(false);
 
   const { data: keys = [] } = useQuery({
     queryKey: ['api-keys'],
@@ -150,12 +152,6 @@ export function ApiKeysSettings(): React.JSX.Element {
     });
   }
 
-  function handleCopy(): void {
-    void navigator.clipboard.writeText(createdToken).then(() => {
-      toast({ title: t('settings.apiKeyCopied'), variant: 'success' });
-    });
-  }
-
   function isExpired(expiresAt: string | null): boolean {
     if (expiresAt == null) return false;
     return new Date(expiresAt) < new Date();
@@ -193,15 +189,6 @@ response = requests.get(
 data = response.json()
 print(data)`;
     }
-  }
-
-  function handleCopyCode(): void {
-    void navigator.clipboard.writeText(getCodeExample(codeTab)).then(() => {
-      setCodeCopied(true);
-      setTimeout(() => {
-        setCodeCopied(false);
-      }, 2000);
-    });
   }
 
   return (
@@ -244,10 +231,10 @@ print(data)`;
                       <TableCell className="text-muted-foreground">
                         {key.tokenSuffix != null ? `...${key.tokenSuffix}` : 'n/a'}
                       </TableCell>
-                      <TableCell>{new Date(key.createdAt).toLocaleDateString()}</TableCell>
+                      <TableCell>{formatDate(key.createdAt, timezone)}</TableCell>
                       <TableCell>
                         {key.lastUsedAt != null
-                          ? new Date(key.lastUsedAt).toLocaleDateString()
+                          ? formatDate(key.lastUsedAt, timezone)
                           : t('settings.apiKeyNeverUsed')}
                       </TableCell>
                       <TableCell>
@@ -256,7 +243,7 @@ print(data)`;
                         ) : isExpired(key.expiresAt) ? (
                           <Badge variant="destructive">{t('settings.apiKeyExpired')}</Badge>
                         ) : (
-                          new Date(key.expiresAt).toLocaleDateString()
+                          formatDate(key.expiresAt, timezone)
                         )}
                       </TableCell>
                       <TableCell className="text-right">
@@ -414,9 +401,7 @@ print(data)`;
               </Alert>
               <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
                 <Input value={createdToken} readOnly className="flex-1" />
-                <Button variant="outline" size="icon" aria-label="Copy" onClick={handleCopy}>
-                  <Copy className="h-4 w-4" />
-                </Button>
+                <CopyButton value={createdToken} size="icon" />
               </div>
             </div>
             <DialogFooter>
@@ -518,7 +503,7 @@ print(data)`;
                     type="button"
                     className={`px-3 py-2 text-sm font-medium transition-colors ${
                       codeTab === tab
-                        ? 'text-primary border-b-2 border-primary'
+                        ? 'text-link border-b-2 border-primary'
                         : 'text-muted-foreground hover:text-foreground'
                     }`}
                     onClick={() => {
@@ -529,19 +514,13 @@ print(data)`;
                   </button>
                 ))}
               </div>
-              <Button
+              <CopyButton
+                value={getCodeExample(codeTab)}
+                label={t('settings.copyCode')}
                 variant="ghost"
-                size="icon"
-                className="h-8 w-8 mr-1"
-                aria-label="Copy code"
-                onClick={handleCopyCode}
-              >
-                {codeCopied ? (
-                  <Check className="h-4 w-4 text-success" />
-                ) : (
-                  <Copy className="h-4 w-4" />
-                )}
-              </Button>
+                size="icon-sm"
+                className="mr-1"
+              />
             </div>
             <pre className="p-4 text-sm overflow-x-auto bg-muted/30">
               <code>{getCodeExample(codeTab)}</code>

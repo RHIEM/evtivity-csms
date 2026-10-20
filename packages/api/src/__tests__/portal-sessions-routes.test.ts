@@ -49,7 +49,11 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('../lib/session-limit.js', () => ({ sessionLimitReached: vi.fn(async () => null) }));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
     select: vi.fn(() => makeChain()),
@@ -155,6 +159,7 @@ describe('Portal sessions routes - handler logic', () => {
             endedAt: '2024-01-01T01:00:00Z',
             energyDeliveredWh: 10000,
             finalCostCents: 500,
+            taxCents: 80,
             currency: 'USD',
             stationName: 'CS-001',
             siteName: 'Site A',
@@ -163,6 +168,7 @@ describe('Portal sessions routes - handler logic', () => {
             siteState: 'TX',
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [{ count: 1 }],
@@ -178,6 +184,77 @@ describe('Portal sessions routes - handler logic', () => {
       expect(body.total).toBe(1);
       expect(body.data[0].id).toBe(VALID_SESSION_ID);
       expect(body.data[0].status).toBe('completed');
+      expect(body.data[0].taxCents).toBe(80);
+    });
+
+    it('returns the account billing state of a session billed to a fleet', async () => {
+      const base = {
+        transactionId: 'tx-1',
+        status: 'completed',
+        startedAt: '2024-01-01T00:00:00Z',
+        endedAt: '2024-01-01T01:00:00Z',
+        energyDeliveredWh: 10000,
+        finalCostCents: 500,
+        taxCents: null,
+        currency: 'EUR',
+        stationName: 'CS-001',
+        siteName: null,
+        siteAddress: null,
+        siteCity: null,
+        siteState: null,
+        co2AvoidedKg: null,
+        reservationId: null,
+        autocharge: false,
+      };
+      setupDbResults(
+        [
+          {
+            ...base,
+            id: 'ses_a',
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: 'issued',
+            billingHasPaymentRecord: false,
+          },
+          {
+            ...base,
+            id: 'ses_b',
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: null,
+            billingHasPaymentRecord: true,
+          },
+          {
+            ...base,
+            id: 'ses_c',
+            billingMode: 'card',
+            billingFleetName: null,
+            billingInvoiceStatus: null,
+            billingHasPaymentRecord: true,
+          },
+        ],
+        [{ count: 3 }],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/sessions',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const [a, b, c] = response.json().data;
+      expect(a.accountBilling).toEqual({
+        state: 'invoiced',
+        fleetName: 'Acme',
+        invoicedTo: 'fleet',
+        invoiceId: null,
+        invoiceNumber: null,
+      });
+      // A payment record means the session was paid by card (an operator hold).
+      expect(b.accountBilling).toBeNull();
+      expect(c.accountBilling).toBeNull();
+      // The fleet invoice is the fleet's document: no invoice field reaches the driver.
+      expect(a).not.toHaveProperty('billingInvoiceStatus');
+      expect(a).not.toHaveProperty('invoiceId');
     });
 
     it('returns empty data with zero total when no sessions', async () => {
@@ -193,6 +270,19 @@ describe('Portal sessions routes - handler logic', () => {
       expect(body.total).toBe(0);
     });
 
+    it('never lists a session at a conformance station', async () => {
+      const database = await import('@evtivity/database');
+      vi.mocked(database.inOperatorStation).mockClear();
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/sessions',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(database.inOperatorStation)).toHaveBeenCalled();
+    });
+
     it('uses default pagination when no query params', async () => {
       setupDbResults([], [{ count: 0 }]);
       const response = await app.inject({
@@ -201,6 +291,15 @@ describe('Portal sessions routes - handler logic', () => {
         headers: { authorization: `Bearer ${driverToken}` },
       });
       expect(response.statusCode).toBe(200);
+    });
+
+    it('returns 400 for a month outside 01-12', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/sessions?month=2024-13',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(400);
     });
 
     it('returns 400 with invalid page parameter', async () => {
@@ -242,33 +341,17 @@ describe('Portal sessions routes - handler logic', () => {
       expect(response.json().code).toBe('SESSION_NOT_FOUND');
     });
 
-    it('returns 403 when session belongs to another driver', async () => {
-      setupDbResults([
-        {
-          id: VALID_SESSION_ID,
-          transactionId: 'tx-1',
-          status: 'completed',
-          startedAt: '2024-01-01T00:00:00Z',
-          endedAt: '2024-01-01T01:00:00Z',
-          energyDeliveredWh: 10000,
-          currentCostCents: null,
-          finalCostCents: 500,
-          currency: 'USD',
-          meterStart: 0,
-          meterStop: 10000,
-          stoppedReason: 'EVDisconnected',
-          stationName: 'CS-001',
-          siteName: 'Site A',
-          driverId: 'other-driver-id',
-        },
-      ]);
+    it('returns 404 when the session belongs to another driver (filtered by the query)', async () => {
+      // The driver id is part of the WHERE: another driver's session reads as
+      // no row, so its existence is not revealed.
+      setupDbResults([]);
       const response = await app.inject({
         method: 'GET',
         url: `/portal/sessions/${VALID_SESSION_ID}`,
         headers: { authorization: `Bearer ${driverToken}` },
       });
-      expect(response.statusCode).toBe(403);
-      expect(response.json().code).toBe('FORBIDDEN');
+      expect(response.statusCode).toBe(404);
+      expect(response.json().code).toBe('SESSION_NOT_FOUND');
     });
 
     it('returns session detail with payment when session belongs to driver', async () => {
@@ -283,6 +366,15 @@ describe('Portal sessions routes - handler logic', () => {
             energyDeliveredWh: 10000,
             currentCostCents: null,
             finalCostCents: 500,
+            // The split stored with the final cost (as read back from jsonb).
+            costBreakdown: {
+              basis: 'net',
+              netCents: 420,
+              taxCents: 80,
+              grossCents: 500,
+              taxLines: [{ taxRate: 0.19, netCents: 420, taxCents: 80 }],
+              components: null,
+            },
             currency: 'USD',
             meterStart: 0,
             meterStop: 10000,
@@ -297,6 +389,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [
@@ -324,8 +417,66 @@ describe('Portal sessions routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(VALID_SESSION_ID);
       expect(body.status).toBe('completed');
+      expect(body.netCents).toBe(420);
+      expect(body.taxCents).toBe(80);
+      expect(body.taxRate).toBe('0.19');
+      // The stored breakdown is not part of the response.
+      expect(body).not.toHaveProperty('costBreakdown');
       expect(body.payment).toBeDefined();
       expect(body.payment.status).toBe('captured');
+    });
+
+    it('returns no tax split when the cost contains no tax or the split is not known', async () => {
+      setupDbResults(
+        [
+          {
+            id: VALID_SESSION_ID,
+            transactionId: 'tx-1',
+            status: 'active',
+            startedAt: '2024-01-01T00:00:00Z',
+            endedAt: null,
+            energyDeliveredWh: 10000,
+            currentCostCents: 350,
+            finalCostCents: null,
+            // A breakdown stored for another amount is not used.
+            costBreakdown: {
+              basis: 'net',
+              netCents: 252,
+              taxCents: 48,
+              grossCents: 300,
+              taxLines: [{ taxRate: 0.19, netCents: 252, taxCents: 48 }],
+              components: null,
+            },
+            currency: 'USD',
+            meterStart: 0,
+            meterStop: null,
+            stoppedReason: null,
+            stationName: 'CS-001',
+            siteName: null,
+            siteAddress: null,
+            siteCity: null,
+            siteState: null,
+            driverId: DRIVER_ID,
+            updatedAt: '2024-01-01T01:00:00Z',
+            idleStartedAt: null,
+            co2AvoidedKg: null,
+            reservationId: null,
+            autocharge: false,
+          },
+        ],
+        [],
+        [],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: `/portal/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.netCents).toBeNull();
+      expect(body.taxCents).toBeNull();
+      expect(body.taxRate).toBeNull();
     });
 
     it('returns session detail with null payment when no payment record', async () => {
@@ -354,6 +505,7 @@ describe('Portal sessions routes - handler logic', () => {
             idleStartedAt: null,
             co2AvoidedKg: null,
             reservationId: null,
+            autocharge: false,
           },
         ],
         [],
@@ -368,6 +520,60 @@ describe('Portal sessions routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(VALID_SESSION_ID);
       expect(body.payment).toBeNull();
+    });
+
+    it('returns the paid account billing of a session on a paid fleet invoice', async () => {
+      setupDbResults(
+        [
+          {
+            id: VALID_SESSION_ID,
+            transactionId: 'tx-1',
+            status: 'completed',
+            startedAt: '2024-01-01T00:00:00Z',
+            endedAt: '2024-01-01T01:00:00Z',
+            energyDeliveredWh: 10000,
+            currentCostCents: null,
+            finalCostCents: 900,
+            currency: 'EUR',
+            meterStart: 0,
+            meterStop: 10000,
+            stoppedReason: null,
+            stationName: 'CS-001',
+            siteName: null,
+            siteAddress: null,
+            siteCity: null,
+            siteState: null,
+            driverId: DRIVER_ID,
+            updatedAt: '2024-01-01T01:00:00Z',
+            idleStartedAt: null,
+            co2AvoidedKg: null,
+            reservationId: null,
+            autocharge: false,
+            billingMode: 'account',
+            billingFleetName: 'Acme',
+            billingInvoiceStatus: 'paid',
+            billingHasPaymentRecord: false,
+          },
+        ],
+        [],
+        [],
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: `/portal/sessions/${VALID_SESSION_ID}`,
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.accountBilling).toEqual({
+        state: 'paid',
+        fleetName: 'Acme',
+        invoicedTo: 'fleet',
+        invoiceId: null,
+        invoiceNumber: null,
+      });
+      expect(body).not.toHaveProperty('billingMode');
+      expect(body).not.toHaveProperty('billingInvoiceStatus');
     });
 
     it('returns 400 with invalid id parameter', async () => {

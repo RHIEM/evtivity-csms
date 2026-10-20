@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_K_43_CSMS: Get Composite Schedule - Specific EVSE
@@ -33,12 +34,13 @@ export const TC_K_43_CSMS: TestCase = {
         if (action === 'GetCompositeSchedule') {
           received = true;
           reqPayload = payload;
-          const rateUnit = payload['chargingRateUnit'] as string;
+          const rateUnit = (payload['chargingRateUnit'] as string | undefined) ?? 'A';
           return {
             status: 'Accepted',
             schedule: {
               evseId: 1,
               duration: 300,
+              scheduleStart: new Date().toISOString(),
               chargingRateUnit: rateUnit,
               chargingSchedulePeriod: [
                 { startPeriod: 0, limit: rateUnit === 'W' ? 10000.0 : 10.0 },
@@ -46,7 +48,7 @@ export const TC_K_43_CSMS: TestCase = {
             },
           };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -108,12 +110,13 @@ export const TC_K_44_CSMS: TestCase = {
         if (action === 'GetCompositeSchedule') {
           received = true;
           reqPayload = payload;
-          const rateUnit = payload['chargingRateUnit'] as string;
+          const rateUnit = (payload['chargingRateUnit'] as string | undefined) ?? 'A';
           return {
             status: 'Accepted',
             schedule: {
               evseId: 0,
               duration: 300,
+              scheduleStart: new Date().toISOString(),
               chargingRateUnit: rateUnit,
               chargingSchedulePeriod: [
                 { startPeriod: 0, limit: rateUnit === 'W' ? 10000.0 : 10.0 },
@@ -121,7 +124,7 @@ export const TC_K_44_CSMS: TestCase = {
             },
           };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

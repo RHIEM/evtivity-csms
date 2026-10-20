@@ -6,6 +6,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Plus, Pencil, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
@@ -30,8 +31,11 @@ import { useCompanyCurrency } from '@/hooks/use-company-currency';
 import { formatRatePerKwh } from '@/lib/formatting';
 import { SaveButton } from '@/components/save-button';
 import { CancelButton } from '@/components/cancel-button';
-import { api, ApiError } from '@/lib/api';
+import { api } from '@/lib/api';
+import { useHasPermission } from '@/lib/auth';
+import { getErrorMessage } from '@/lib/error-message';
 import { useToast } from '@/components/ui/toast';
+import { RecalculateElectricityCostAction } from '@/components/ElectricityCostNotices';
 
 interface RateRestrictions {
   timeRange?: { startTime: string; endTime: string };
@@ -99,8 +103,15 @@ function buildRestrictions(form: FormState): RateRestrictions | null {
   }
 }
 
-export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.JSX.Element {
+export function SiteElectricityRatesTab({
+  siteId,
+  siteName,
+}: {
+  siteId: string;
+  siteName: string;
+}): React.JSX.Element {
   const { t } = useTranslation();
+  const canWrite = useHasPermission('sites:write');
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
@@ -158,8 +169,7 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
       invalidate();
     },
     onError: (err: unknown) => {
-      const message = err instanceof ApiError ? err.message : t('common.error');
-      toast({ title: message, variant: 'destructive' });
+      toast({ title: getErrorMessage(err, t), variant: 'destructive' });
     },
   });
 
@@ -172,8 +182,7 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
       invalidate();
     },
     onError: (err: unknown) => {
-      const message = err instanceof ApiError ? err.message : t('common.error');
-      toast({ title: message, variant: 'destructive' });
+      toast({ title: getErrorMessage(err, t), variant: 'destructive' });
     },
   });
 
@@ -221,10 +230,17 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>{t('sites.electricityRates')}</CardTitle>
-        <Button onClick={openCreate}>
-          <Plus className="h-4 w-4" />
-          {t('sites.addElectricityRate')}
-        </Button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {rates.length > 0 && (
+            <RecalculateElectricityCostAction siteId={siteId} siteName={siteName} size="default" />
+          )}
+          {canWrite && (
+            <Button onClick={openCreate}>
+              <Plus className="h-4 w-4" />
+              {t('sites.addElectricityRate')}
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? null : rates.length === 0 ? (
@@ -241,7 +257,7 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
                 <TableHead>{t('sites.electricityRateName')}</TableHead>
                 <TableHead className="text-right">{t('sites.ratePerKwh')}</TableHead>
                 <TableHead>{t('sites.electricityRateRestrictions')}</TableHead>
-                <TableHead className="text-right">{t('common.actions')}</TableHead>
+                {canWrite && <TableHead className="text-right">{t('common.actions')}</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -252,28 +268,30 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
                     {currency != null ? formatRatePerKwh(rate.ratePerKwh, currency) : '-'}
                   </TableCell>
                   <TableCell>{describeRestrictions(rate.restrictions)}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={t('common.edit')}
-                      onClick={() => {
-                        openEdit(rate);
-                      }}
-                    >
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={t('sites.deleteElectricityRate')}
-                      onClick={() => {
-                        setDeleteTarget(rate);
-                      }}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </TableCell>
+                  {canWrite && (
+                    <TableCell className="text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t('common.edit')}
+                        onClick={() => {
+                          openEdit(rate);
+                        }}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t('sites.deleteElectricityRate')}
+                        onClick={() => {
+                          setDeleteTarget(rate);
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </TableCell>
+                  )}
                 </TableRow>
               ))}
             </TableBody>
@@ -302,14 +320,11 @@ export function SiteElectricityRatesTab({ siteId }: { siteId: string }): React.J
             </div>
             <div className="grid gap-2">
               <Label htmlFor="rate-value">{t('sites.ratePerKwh')}</Label>
-              <Input
+              <DecimalInput
                 id="rate-value"
-                type="number"
-                step="0.000001"
-                min="0"
                 value={form.ratePerKwh}
-                onChange={(e) => {
-                  setForm((f) => ({ ...f, ratePerKwh: e.target.value }));
+                onChange={(value) => {
+                  setForm((f) => ({ ...f, ratePerKwh: value }));
                 }}
                 required
               />

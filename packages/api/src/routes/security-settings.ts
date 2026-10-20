@@ -11,7 +11,7 @@ import {
   writeAudit,
   settingAuditLog,
 } from '@evtivity/database';
-import { encryptString } from '@evtivity/lib';
+import { createLogger, encryptString } from '@evtivity/lib';
 import { decryptForRead } from '../lib/settings-crypto.js';
 import { zodSchema } from '../lib/zod-schema.js';
 import { successResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
@@ -19,14 +19,25 @@ import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { config as apiConfig } from '../lib/config.js';
-import { getPubSub } from '../lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { requireAllSiteAccess } from '../lib/site-access.js';
+
+// reCAPTCHA and MFA protect every operator and driver sign-in: company-wide,
+// so a site-restricted user gets this 404 before any read or write
+// (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_SETTING_NOT_FOUND = {
+  error: 'Setting not found',
+  code: 'SETTING_NOT_FOUND',
+} as const;
+
+const logger = createLogger('security-settings');
 
 async function invalidateSecuritySettings(): Promise<void> {
   clearSecuritySettingsCache();
   try {
     await getPubSub().publish('cache_invalidate', JSON.stringify({ kind: 'security_settings' }));
-  } catch {
-    // Non-critical: peers refresh from the 60s TTL anyway.
+  } catch (err) {
+    logger.warn({ err }, 'Security settings invalidation publish failed, peers refresh within 60s');
   }
 }
 
@@ -118,10 +129,14 @@ export function securitySettingsRoutes(app: FastifyInstance): void {
         summary: 'Get all security settings',
         operationId: 'getSecuritySettings',
         security: [{ bearerAuth: [] }],
-        response: { 200: itemResponse(z.record(z.unknown())) },
+        response: {
+          200: itemResponse(z.record(z.unknown())),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
+        },
       },
     },
-    async () => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const rows = await db.select().from(settings).where(like(settings.key, 'security.%'));
       const result: Record<string, unknown> = {};
       for (const row of rows) {
@@ -144,12 +159,33 @@ export function securitySettingsRoutes(app: FastifyInstance): void {
         body: zodSchema(recaptchaBody),
         response: {
           200: successResponse,
+          400: errorWith('Enabling reCAPTCHA without a secret key', [
+            ERROR_CODES.RECAPTCHA_SECRET_REQUIRED,
+          ]),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
           500: errorWith('Encryption key missing', [ERROR_CODES.ENCRYPTION_KEY_MISSING]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof recaptchaBody>;
+      const secretKey = body.secretKey ?? '';
+      const secretSent = secretKey !== '';
+
+      // Enabled with no secret fails closed at runtime (recaptcha-check.ts), so
+      // protected portal routes would return 500. Refuse the save instead.
+      if (body.enabled && !secretSent) {
+        const stored = await loadCurrentValues(['security.recaptcha.secretKeyEnc']);
+        const storedSecret = stored.get('security.recaptcha.secretKeyEnc');
+        if (typeof storedSecret !== 'string' || storedSecret === '') {
+          await reply.status(400).send({
+            error: 'A reCAPTCHA secret key is required to enable reCAPTCHA',
+            code: 'RECAPTCHA_SECRET_REQUIRED',
+          });
+          return;
+        }
+      }
 
       const upsert = (key: string, value: unknown) =>
         db
@@ -166,11 +202,15 @@ export function securitySettingsRoutes(app: FastifyInstance): void {
         { key: 'security.recaptcha.threshold', value: body.threshold },
       ];
 
-      if (body.secretKey !== undefined && body.secretKey !== '') {
+      if (secretSent) {
         try {
-          const encrypted = encryptString(body.secretKey, getEncryptionKey());
+          const encrypted = encryptString(secretKey, getEncryptionKey());
           written.push({ key: 'security.recaptcha.secretKeyEnc', value: encrypted });
-        } catch {
+        } catch (err) {
+          request.log.error(
+            { err, key: 'security.recaptcha.secretKeyEnc' },
+            'Encrypting the reCAPTCHA secret failed, nothing saved',
+          );
           await reply.status(500).send({
             error: 'SETTINGS_ENCRYPTION_KEY not configured on server',
             code: 'ENCRYPTION_KEY_MISSING',
@@ -197,10 +237,14 @@ export function securitySettingsRoutes(app: FastifyInstance): void {
         operationId: 'updateMfaSettings',
         security: [{ bearerAuth: [] }],
         body: zodSchema(mfaBody),
-        response: { 200: successResponse },
+        response: {
+          200: successResponse,
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof mfaBody>;
 
       const upsert = (key: string, value: unknown) =>

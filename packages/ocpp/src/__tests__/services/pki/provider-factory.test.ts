@@ -79,6 +79,18 @@ describe('getPkiProvider', () => {
     expect(sqlStrings.join('?')).toContain('SELECT key, value, updated_at FROM settings');
   });
 
+  it('returns a LocalContractProvider when pnc.provider is "local"', async () => {
+    queryMock.mockResolvedValueOnce([
+      settingsRow('pnc.provider', 'local', new Date('2026-01-01T00:00:00Z')),
+    ]);
+
+    const { getPkiProvider } = await loadFactory();
+    const { LocalContractProvider } =
+      await import('../../../services/pki/local-contract-provider.js');
+
+    expect(await getPkiProvider()).toBeInstanceOf(LocalContractProvider);
+  });
+
   it('defaults to ManualProvider when no pnc.provider row exists', async () => {
     queryMock.mockResolvedValueOnce([]);
 
@@ -256,7 +268,7 @@ describe('getPkiProvider', () => {
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({ access_token: 't', expires_in: 3600 }),
-      text: vi.fn().mockResolvedValue(''),
+      text: vi.fn().mockResolvedValue('-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----'),
     });
     vi.stubGlobal('fetch', fetchMock);
 

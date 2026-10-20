@@ -16,9 +16,9 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { SecurityProfileBadge } from '@/components/SecurityProfileBadge';
+import { StationStatusBadge } from '@/components/StationStatusBadge';
 import { SVG_COLORS } from '@/lib/chart-theme';
 import { formatDateTime, formatRelativeTime } from '@/lib/timezone';
-import { stationStatusVariant, stationStatusClassName } from '@/lib/status-variants';
 import type { ColumnMeta, ColumnVisibility } from '@/lib/column-visibility';
 import { LoadingLogo } from '@/components/loading-logo';
 
@@ -84,17 +84,20 @@ export interface Station {
   id: string;
   stationId: string;
   siteId?: string | null;
+  siteName?: string | null;
   vendorName?: string | null;
   model: string | null;
   securityProfile?: number | undefined;
   ocppProtocol?: string | null;
   status: string;
+  statusReason?: string | null;
   connectorCount: number;
   connectorTypes: string[] | null;
   isOnline: boolean;
   isSimulator?: boolean;
   siteFreeVendEnabled?: boolean;
   underMaintenance?: boolean;
+  aiInsightsSuppressed?: boolean;
   lastHeartbeat: string | null;
   createdAt: string | null;
 }
@@ -435,7 +438,7 @@ export function StationsTable({
               )}
               {isVisible('stationId') && (
                 <TableCell
-                  className="font-medium text-primary whitespace-nowrap"
+                  className="font-medium text-link whitespace-nowrap"
                   data-testid="row-click-target"
                 >
                   <span className="inline-flex items-center gap-1.5">
@@ -455,6 +458,15 @@ export function StationsTable({
                         {t('nav.maintenance')}
                       </Badge>
                     )}
+                    {station.aiInsightsSuppressed === true && (
+                      <Badge
+                        variant="secondary"
+                        className="text-[10px] px-1.5 py-0"
+                        data-testid="station-ai-suppressed-badge"
+                      >
+                        {t('stations.aiInsights.listBadge')}
+                      </Badge>
+                    )}
                   </span>
                 </TableCell>
               )}
@@ -463,12 +475,12 @@ export function StationsTable({
                   {station.siteId != null ? (
                     <Link
                       to={`/sites/${station.siteId}`}
-                      className="text-primary hover:underline"
+                      className="text-link hover:underline"
                       onClick={(e) => {
                         e.stopPropagation();
                       }}
                     >
-                      {siteMap.get(station.siteId) ?? station.siteId}
+                      {station.siteName ?? siteMap.get(station.siteId) ?? station.siteId}
                     </Link>
                   ) : (
                     '-'
@@ -496,12 +508,7 @@ export function StationsTable({
               {isVisible('ocppProtocol') && <TableCell>{station.ocppProtocol ?? '-'}</TableCell>}
               {isVisible('evseStatus') && (
                 <TableCell>
-                  <Badge
-                    variant={stationStatusVariant(station.status)}
-                    className={stationStatusClassName(station.status)}
-                  >
-                    {t(`status.${station.status}`, station.status)}
-                  </Badge>
+                  <StationStatusBadge status={station.status} statusReason={station.statusReason} />
                 </TableCell>
               )}
               {isVisible('connectors') && (

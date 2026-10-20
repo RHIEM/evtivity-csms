@@ -4,6 +4,14 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../config.js';
 import { settings } from '../schema/settings.js';
+import {
+  createLogger,
+  DEFAULT_STATION_MESSAGE_LANGUAGE,
+  isStationMessageLanguage,
+  type StationMessageLanguage,
+} from '@evtivity/lib';
+
+const logger = createLogger('station-message-settings');
 
 const TTL_MS = 60_000;
 
@@ -22,6 +30,9 @@ let cachedEventMessageTtlAt = 0;
 let cachedBrandLine: string | undefined;
 let cachedBrandLineAt = 0;
 
+let cachedLanguage: StationMessageLanguage | undefined;
+let cachedLanguageAt = 0;
+
 export async function isStationMessageEnabled(): Promise<boolean> {
   const now = Date.now();
   if (cachedEnabled !== undefined && now - cachedEnabledAt < TTL_MS) {
@@ -37,7 +48,11 @@ export async function isStationMessageEnabled(): Promise<boolean> {
     cachedEnabled = row != null && row.value === true;
     cachedEnabledAt = now;
     return cachedEnabled;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.enabled' },
+      'isStationMessageEnabled failed, using the cached value or default',
+    );
     return cachedEnabled ?? false;
   }
 }
@@ -57,7 +72,11 @@ export async function getStationMessagePricingFormat(): Promise<string> {
     cachedPricingFormat = row != null && typeof row.value === 'string' ? row.value : 'compact';
     cachedPricingFormatAt = now;
     return cachedPricingFormat;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.pricingFormat' },
+      'getStationMessagePricingFormat failed, using the cached value or default',
+    );
     return cachedPricingFormat ?? 'compact';
   }
 }
@@ -78,7 +97,11 @@ export async function getStationMessageRefreshSeconds(): Promise<number> {
     cachedRefreshSeconds = typeof value === 'number' ? value : 30;
     cachedRefreshSecondsAt = now;
     return cachedRefreshSeconds;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.charging.refreshSeconds' },
+      'getStationMessageRefreshSeconds failed, using the cached value or default',
+    );
     return cachedRefreshSeconds ?? 30;
   }
 }
@@ -105,7 +128,11 @@ export async function getStationMessageEventTtlSeconds(): Promise<number> {
     cachedEventMessageTtl = typeof value === 'number' && value > 0 ? value : 30;
     cachedEventMessageTtlAt = now;
     return cachedEventMessageTtl;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.eventMessageTtlSeconds' },
+      'getStationMessageEventTtlSeconds failed, using the cached value or default',
+    );
     return cachedEventMessageTtl ?? 30;
   }
 }
@@ -125,12 +152,47 @@ export async function getStationMessageBrandLine(): Promise<string> {
     cachedBrandLine = row != null && typeof row.value === 'string' ? row.value : '';
     cachedBrandLineAt = now;
     return cachedBrandLine;
-  } catch {
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.brandLine' },
+      'getStationMessageBrandLine failed, using the cached value or default',
+    );
     return cachedBrandLine ?? '';
   }
 }
 
+// Display language of every station message (stationMessage.language). The
+// renderer picks the template row for this language and formats prices,
+// numbers, and the tax rate in it.
+export async function getStationMessageLanguage(): Promise<StationMessageLanguage> {
+  const now = Date.now();
+  if (cachedLanguage !== undefined && now - cachedLanguageAt < TTL_MS) {
+    return cachedLanguage;
+  }
+
+  try {
+    const [row] = await db
+      .select({ value: settings.value })
+      .from(settings)
+      .where(eq(settings.key, 'stationMessage.language'));
+
+    cachedLanguage = isStationMessageLanguage(row?.value)
+      ? row.value
+      : DEFAULT_STATION_MESSAGE_LANGUAGE;
+    cachedLanguageAt = now;
+    return cachedLanguage;
+  } catch (err) {
+    logger.warn(
+      { err, key: 'stationMessage.language' },
+      'getStationMessageLanguage failed, using the cached value or default',
+    );
+    return cachedLanguage ?? DEFAULT_STATION_MESSAGE_LANGUAGE;
+  }
+}
+
 export function clearStationMessageSettingsCache(): void {
+  cachedLanguage = undefined;
+  cachedLanguageAt = 0;
   cachedEnabled = undefined;
   cachedEnabledAt = 0;
   cachedPricingFormat = undefined;

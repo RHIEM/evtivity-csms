@@ -3,6 +3,7 @@
 
 import type { CsTestCase, StepResult } from '../../../../cs-types.js';
 import { startAndWaitForCharging, drainMessages } from '../../../../cs-test-helpers.js';
+import { signedTxEndedMeterValues } from './signed-shared.js';
 
 function setupHandler(ctx: {
   server: {
@@ -52,31 +53,28 @@ export const TC_J_07_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const eventType = (msg as Record<string, unknown>).eventType;
-        if (eventType === 'Started') {
-          const meterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const sampledValue = meterValue?.[0]?.sampledValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const context = sampledValue?.[0]?.context;
-          steps.push({
-            step: 1,
-            description: 'TransactionEventRequest Started with Transaction.Begin meter values',
-            status:
-              meterValue != null && meterValue.length > 0 && context === 'Transaction.Begin'
-                ? 'passed'
-                : 'failed',
-            expected: 'eventType Started, context Transaction.Begin',
-            actual: `eventType: ${String(eventType)}, context: ${String(context)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const eventType = (msg as Record<string, unknown>).eventType;
+      if (eventType === 'Started') {
+        const meterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const sampledValue = meterValue?.[0]?.sampledValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const context = sampledValue?.[0]?.context;
+        steps.push({
+          step: 1,
+          description: 'TransactionEventRequest Started with Transaction.Begin meter values',
+          status:
+            meterValue != null && meterValue.length > 0 && context === 'Transaction.Begin'
+              ? 'passed'
+              : 'failed',
+          expected: 'eventType Started, context Transaction.Begin',
+          actual: `eventType: ${String(eventType)}, context: ${String(context)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -123,29 +121,26 @@ export const TC_J_08_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const eventType = (msg as Record<string, unknown>).eventType;
-        if (eventType === 'Started') {
-          const evse = (msg as Record<string, unknown>).evse as Record<string, unknown> | undefined;
-          const meterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const sampledValue = meterValue?.[0]?.sampledValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const context = sampledValue?.[0]?.context;
-          steps.push({
-            step: 1,
-            description: 'First TransactionEventRequest with evse and Transaction.Begin context',
-            status: evse != null && context === 'Transaction.Begin' ? 'passed' : 'failed',
-            expected: 'evse present, context Transaction.Begin',
-            actual: `hasEvse: ${String(evse != null)}, context: ${String(context)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const eventType = (msg as Record<string, unknown>).eventType;
+      if (eventType === 'Started') {
+        const evse = (msg as Record<string, unknown>).evse as Record<string, unknown> | undefined;
+        const meterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const sampledValue = meterValue?.[0]?.sampledValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const context = sampledValue?.[0]?.context;
+        steps.push({
+          step: 1,
+          description: 'First TransactionEventRequest with evse and Transaction.Begin context',
+          status: evse != null && context === 'Transaction.Begin' ? 'passed' : 'failed',
+          expected: 'evse present, context Transaction.Begin',
+          actual: `hasEvse: ${String(evse != null)}, context: ${String(context)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -198,29 +193,26 @@ export const TC_J_09_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const trigger = (msg as Record<string, unknown>).triggerReason;
-        if (trigger === 'MeterValuePeriodic') {
-          const meterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const sampledValue = meterValue?.[0]?.sampledValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const context = sampledValue?.[0]?.context;
-          steps.push({
-            step: 1,
-            description:
-              'TransactionEventRequest Updated with MeterValuePeriodic and Sample.Periodic',
-            status: context === 'Sample.Periodic' ? 'passed' : 'failed',
-            expected: 'triggerReason MeterValuePeriodic, context Sample.Periodic',
-            actual: `trigger: ${String(trigger)}, context: ${String(context)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const trigger = (msg as Record<string, unknown>).triggerReason;
+      if (trigger === 'MeterValuePeriodic') {
+        const meterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const sampledValue = meterValue?.[0]?.sampledValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const context = sampledValue?.[0]?.context;
+        steps.push({
+          step: 1,
+          description:
+            'TransactionEventRequest Updated with MeterValuePeriodic and Sample.Periodic',
+          status: context === 'Sample.Periodic' ? 'passed' : 'failed',
+          expected: 'triggerReason MeterValuePeriodic, context Sample.Periodic',
+          actual: `trigger: ${String(trigger)}, context: ${String(context)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -274,32 +266,27 @@ export const TC_J_10_CS: CsTestCase = {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      try {
-        const msg = await ctx.server.waitForMessage('TransactionEvent', remaining);
-        const eventType = (msg as Record<string, unknown>).eventType;
-        if (eventType === 'Ended') {
-          const meterValue = (msg as Record<string, unknown>).meterValue as
-            | Array<Record<string, unknown>>
-            | undefined;
-          const sampledValues =
-            meterValue?.flatMap(
-              (mv) => (mv.sampledValue as Array<Record<string, unknown>> | undefined) ?? [],
-            ) ?? [];
-          const hasTransactionEnd = sampledValues.some((sv) => sv.context === 'Transaction.End');
-          steps.push({
-            step: 1,
-            description: 'TransactionEventRequest Ended with Transaction.End context in meterValue',
-            status:
-              meterValue != null && meterValue.length > 0 && hasTransactionEnd
-                ? 'passed'
-                : 'failed',
-            expected: 'eventType Ended, context Transaction.End',
-            actual: `eventType: ${String(eventType)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}, hasTransactionEnd: ${String(hasTransactionEnd)}`,
-          });
-          found = true;
-          break;
-        }
-      } catch {
+      const msg = await ctx.server.waitForMessageOrNull('TransactionEvent', remaining);
+      if (msg == null) break;
+      const eventType = (msg as Record<string, unknown>).eventType;
+      if (eventType === 'Ended') {
+        const meterValue = (msg as Record<string, unknown>).meterValue as
+          | Array<Record<string, unknown>>
+          | undefined;
+        const sampledValues =
+          meterValue?.flatMap(
+            (mv) => (mv.sampledValue as Array<Record<string, unknown>> | undefined) ?? [],
+          ) ?? [];
+        const hasTransactionEnd = sampledValues.some((sv) => sv.context === 'Transaction.End');
+        steps.push({
+          step: 1,
+          description: 'TransactionEventRequest Ended with Transaction.End context in meterValue',
+          status:
+            meterValue != null && meterValue.length > 0 && hasTransactionEnd ? 'passed' : 'failed',
+          expected: 'eventType Ended, context Transaction.End',
+          actual: `eventType: ${String(eventType)}, hasMeterValue: ${String(meterValue != null && meterValue.length > 0)}, hasTransactionEnd: ${String(hasTransactionEnd)}`,
+        });
+        found = true;
         break;
       }
     }
@@ -322,8 +309,6 @@ export const TC_J_10_CS: CsTestCase = {
 /**
  * TC_J_11_CS: Sampled Meter Values - Signed
  * Use case: J02 (J02.FR.21)
- *
- * Skipped: CSS does not support signed meter values (no metering PKI).
  */
 export const TC_J_11_CS: CsTestCase = {
   id: 'TC_J_11_CS',
@@ -334,15 +319,5 @@ export const TC_J_11_CS: CsTestCase = {
   description: 'The Charging Station provides signed sampled meter values when a transaction ends.',
   purpose:
     'To verify if the Charging Station is able to send signed sampled Meter Values when a transaction ends.',
-  execute: async () => {
-    const steps: StepResult[] = [];
-    steps.push({
-      step: 1,
-      description: 'Signed meter values not supported by CSS (no metering PKI)',
-      status: 'skipped',
-      expected: 'signedMeterValue present',
-      actual: 'Test skipped: CSS does not support signed meter values',
-    });
-    return { status: 'skipped', durationMs: 0, steps };
-  },
+  execute: async (ctx) => signedTxEndedMeterValues(ctx, 'sampled'),
 };

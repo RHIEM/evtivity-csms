@@ -4,22 +4,34 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
-import { db } from '@evtivity/database';
+import {
+  db,
+  clearTariffResolutionCache,
+  pgErrorCode,
+  PG_UNIQUE_VIOLATION,
+} from '@evtivity/database';
 import { pricingHolidays, holidayAuditLog, writeAudit } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, arrayResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
-import { clearHolidayCache } from '../services/tariff.service.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { getAuditActor } from '../lib/audit-actor.js';
 
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_HOLIDAY_NOT_FOUND = {
+  error: 'Holiday not found',
+  code: 'HOLIDAY_NOT_FOUND',
+} as const;
+
 async function publishHolidayChanged(): Promise<void> {
-  // Clear the in-process holiday cache so the next resolveTariff() call on
-  // this pod reads fresh holiday data. Without this the 60s TTL would defer
-  // every operator-added or operator-deleted holiday for up to a minute
-  // before it takes effect.
-  clearHolidayCache();
+  // Clear the in-process holiday cache so the next tariff resolution on this
+  // pod reads fresh holiday data. Without this the 60s TTL would defer every
+  // operator-added or operator-deleted holiday for up to a minute before it
+  // takes effect. Other processes pick it up within the TTL.
+  clearTariffResolutionCache();
   await publishPricingChanged({ pricingGroupId: null, action: 'holiday.changed' });
 }
 
@@ -109,10 +121,14 @@ export function holidayRoutes(app: FastifyInstance): void {
         response: {
           201: itemResponse(holidayItem),
           409: errorWith('Duplicate holiday', [ERROR_CODES.DUPLICATE_HOLIDAY]),
+          404: errorWith('Holiday not found, or the user is restricted to some sites', [
+            ERROR_CODES.HOLIDAY_NOT_FOUND,
+          ]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_HOLIDAY_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof createHolidayBody>;
       try {
         const [holiday] = await db.insert(pricingHolidays).values(body).returning();
@@ -133,13 +149,7 @@ export function holidayRoutes(app: FastifyInstance): void {
         await publishHolidayChanged();
         await reply.status(201).send(holiday);
       } catch (err: unknown) {
-        const pgErr = err != null && typeof err === 'object' && 'cause' in err ? err.cause : err;
-        if (
-          pgErr != null &&
-          typeof pgErr === 'object' &&
-          'code' in pgErr &&
-          String(pgErr.code) === '23505'
-        ) {
+        if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
           await reply.status(409).send({
             error: 'A holiday already exists for this date',
             code: 'DUPLICATE_HOLIDAY',
@@ -168,6 +178,7 @@ export function holidayRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_HOLIDAY_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof idParams>;
       const [existing] = await db.select().from(pricingHolidays).where(eq(pricingHolidays.id, id));
       if (existing == null) {
@@ -202,10 +213,16 @@ export function holidayRoutes(app: FastifyInstance): void {
         operationId: 'bulkCreatePricingHolidays',
         security: [{ bearerAuth: [] }],
         body: zodSchema(bulkCreateBody),
-        response: { 201: itemResponse(bulkCreateResponse) },
+        response: {
+          201: itemResponse(bulkCreateResponse),
+          404: errorWith('Holiday not found, or the user is restricted to some sites', [
+            ERROR_CODES.HOLIDAY_NOT_FOUND,
+          ]),
+        },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_HOLIDAY_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof bulkCreateBody>;
       const result = await db
         .insert(pricingHolidays)

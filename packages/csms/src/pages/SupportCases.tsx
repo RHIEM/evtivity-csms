@@ -5,6 +5,8 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
+import { DRIVER_AI_STATES, SUPPORT_CASE_RESOLUTION_SOURCES } from '@evtivity/lib/driver-ai';
+import type { DriverAiState, SupportCaseResolutionSource } from '@evtivity/lib/driver-ai';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
@@ -26,6 +28,7 @@ import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import { cn } from '@/lib/utils';
 import { supportCaseStatusVariant, supportCasePriorityVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
+import { SupportCaseAiBadge } from '@/components/support/SupportCaseAiCard';
 
 interface User {
   id: string;
@@ -47,9 +50,19 @@ interface SupportCase {
   driverId: string | null;
   isRead: boolean;
   createdAt: string;
+  aiState?: DriverAiState | null;
+  resolutionSource?: SupportCaseResolutionSource | null;
 }
 
-const STATUS_OPTIONS = ['open', 'in_progress', 'waiting_on_driver', 'resolved', 'closed'] as const;
+// ai_assist: cases the driver AI still handles, left out of the default list (E4).
+const STATUS_OPTIONS = [
+  'open',
+  'in_progress',
+  'waiting_on_driver',
+  'resolved',
+  'closed',
+  'ai_assist',
+] as const;
 
 const CATEGORY_OPTIONS = [
   'billing_dispute',
@@ -71,6 +84,8 @@ export function SupportCases(): React.JSX.Element {
   const [categoryFilter, setCategoryFilter] = useState('');
   const [priorityFilter, setPriorityFilter] = useState('');
   const [assignedToFilter, setAssignedToFilter] = useState('');
+  const [aiStateFilter, setAiStateFilter] = useState('');
+  const [resolvedByFilter, setResolvedByFilter] = useState('');
 
   const { data: users } = useQuery({
     queryKey: ['users'],
@@ -90,11 +105,13 @@ export function SupportCases(): React.JSX.Element {
     category: categoryFilter,
     priority: priorityFilter,
     assignedTo: assignedToFilter,
+    aiState: aiStateFilter,
+    resolutionSource: resolvedByFilter,
   });
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('supportCases.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('supportCases.subtitle')}</p>
@@ -108,22 +125,25 @@ export function SupportCases(): React.JSX.Element {
       </div>
 
       <Card>
-        <CardContent className="grid grid-cols-1 gap-4 p-4 md:grid-cols-3 lg:grid-cols-5">
+        <CardContent className="grid grid-cols-1 gap-4 p-4 md:grid-cols-3 lg:grid-cols-4">
           <div className="space-y-2">
-            <Label htmlFor="cases-search">{t('supportCases.search')}</Label>
+            <Label htmlFor="cases-search" className="leading-6">
+              {t('supportCases.search')}
+            </Label>
             <SearchInput
               id="cases-search"
               value={search}
               onDebouncedChange={setSearch}
               placeholder={t('supportCases.searchPlaceholder')}
-              className="h-9 max-w-none"
+              className="max-w-none"
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cases-status">{t('common.status')}</Label>
+            <Label htmlFor="cases-status" className="leading-6">
+              {t('common.status')}
+            </Label>
             <Select
               id="cases-status"
-              className="h-9"
               value={statusFilter}
               onChange={(e) => {
                 setStatusFilter(e.target.value);
@@ -139,10 +159,11 @@ export function SupportCases(): React.JSX.Element {
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cases-category">{t('supportCases.category')}</Label>
+            <Label htmlFor="cases-category" className="leading-6">
+              {t('supportCases.category')}
+            </Label>
             <Select
               id="cases-category"
-              className="h-9"
               value={categoryFilter}
               onChange={(e) => {
                 setCategoryFilter(e.target.value);
@@ -158,10 +179,11 @@ export function SupportCases(): React.JSX.Element {
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cases-priority">{t('supportCases.priority')}</Label>
+            <Label htmlFor="cases-priority" className="leading-6">
+              {t('supportCases.priority')}
+            </Label>
             <Select
               id="cases-priority"
-              className="h-9"
               value={priorityFilter}
               onChange={(e) => {
                 setPriorityFilter(e.target.value);
@@ -177,10 +199,11 @@ export function SupportCases(): React.JSX.Element {
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cases-assignee">{t('supportCases.assignedTo')}</Label>
+            <Label htmlFor="cases-assignee" className="leading-6">
+              {t('supportCases.assignedTo')}
+            </Label>
             <Select
               id="cases-assignee"
-              className="h-9"
               value={assignedToFilter}
               onChange={(e) => {
                 setAssignedToFilter(e.target.value);
@@ -191,6 +214,46 @@ export function SupportCases(): React.JSX.Element {
               {users?.data.map((u) => (
                 <option key={u.id} value={u.id}>
                   {[u.firstName, u.lastName].filter(Boolean).join(' ')}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="cases-ai-state" className="leading-6">
+              {t('supportCases.ai.filterAiState')}
+            </Label>
+            <Select
+              id="cases-ai-state"
+              value={aiStateFilter}
+              onChange={(e) => {
+                setAiStateFilter(e.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">{t('supportCases.ai.allAiStates')}</option>
+              {DRIVER_AI_STATES.map((s) => (
+                <option key={s} value={s}>
+                  {t(`supportCases.ai.state.${s}`)}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="cases-resolved-by" className="leading-6">
+              {t('supportCases.ai.filterResolvedBy')}
+            </Label>
+            <Select
+              id="cases-resolved-by"
+              value={resolvedByFilter}
+              onChange={(e) => {
+                setResolvedByFilter(e.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">{t('supportCases.ai.allResolvedBy')}</option>
+              {SUPPORT_CASE_RESOLUTION_SOURCES.map((s) => (
+                <option key={s} value={s}>
+                  {t(`supportCases.ai.resolutionSource.${s}`)}
                 </option>
               ))}
             </Select>
@@ -234,7 +297,7 @@ export function SupportCases(): React.JSX.Element {
                   }}
                 >
                   <TableCell
-                    className="font-medium text-primary whitespace-nowrap"
+                    className="font-medium text-link whitespace-nowrap"
                     data-testid="row-click-target"
                   >
                     {c.caseNumber}
@@ -254,9 +317,15 @@ export function SupportCases(): React.JSX.Element {
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    <Badge variant={supportCaseStatusVariant(c.status)}>
-                      {t(`supportCases.statuses.${c.status}`, c.status)}
-                    </Badge>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <Badge variant={supportCaseStatusVariant(c.status)}>
+                        {t(`supportCases.statuses.${c.status}`, c.status)}
+                      </Badge>
+                      <SupportCaseAiBadge
+                        aiState={c.aiState ?? null}
+                        resolutionSource={c.resolutionSource ?? null}
+                      />
+                    </div>
                   </TableCell>
                   <TableCell>
                     {c.assignedToName ?? <span className="text-muted-foreground">-</span>}

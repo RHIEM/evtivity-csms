@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { motion, useMotionValue } from 'motion/react';
 import { MessageSquare, Plug, Zap, Circle, Plus, Minus, Power, Shield } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
-import { formatEnergy } from '@/lib/formatting';
+import { formatEnergy, formatNumber } from '@/lib/formatting';
 import { STATUS_COLORS, SVG_COLORS } from '@/lib/chart-theme';
 import { stationCardConnectorStatusVariant } from '@/lib/status-variants';
 
@@ -34,6 +35,7 @@ export interface LayoutStation {
   stationId: string;
   model: string | null;
   status: string;
+  statusReason?: string | null | undefined;
   isOnline: boolean;
   securityProfile: number;
   positionX: number;
@@ -80,7 +82,15 @@ function allConnectors(station: LayoutStation): ConnectorData[] {
   return result;
 }
 
-function stationLevel(station: LayoutStation): string {
+type StationLevel = 'dcFast' | 'level2' | 'level1' | '';
+
+const LEVEL_LABEL_KEYS = {
+  dcFast: 'sites.levelDcFast',
+  level2: 'sites.levelL2',
+  level1: 'sites.levelL1',
+} as const;
+
+function stationLevel(station: LayoutStation): StationLevel {
   let maxKw = 0;
   for (const evse of station.evses) {
     for (const conn of evse.connectors) {
@@ -89,9 +99,9 @@ function stationLevel(station: LayoutStation): string {
       }
     }
   }
-  if (maxKw >= 50) return 'DC Fast';
-  if (maxKw >= 7) return 'Level 2';
-  if (maxKw > 0) return 'Level 1';
+  if (maxKw >= 50) return 'dcFast';
+  if (maxKw >= 7) return 'level2';
+  if (maxKw > 0) return 'level1';
   return '';
 }
 
@@ -224,7 +234,7 @@ function Tooltip({
   return (
     <span className="group/tip relative inline-flex">
       {children}
-      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover/tip:block whitespace-nowrap rounded bg-popover px-1.5 py-0.5 text-xs text-popover-foreground shadow border z-[100]">
+      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover/tip:block whitespace-nowrap rounded bg-popover px-1.5 py-0.5 text-xs text-popover-foreground shadow-sm border z-100">
         {label}
       </span>
     </span>
@@ -273,7 +283,7 @@ function spColor(sp: number): string {
     case 0:
       return 'text-muted-foreground';
     case 1:
-      return 'text-primary';
+      return 'text-link';
     case 2:
       return 'text-success';
     case 3:
@@ -301,10 +311,21 @@ export function StationCard({
   allocatedLimitKw,
   collapseKey,
 }: StationCardProps): React.JSX.Element {
+  const { t } = useTranslation();
   const charging = isCharging(station);
   const energy = totalEnergy(station);
   const connectors = allConnectors(station);
   const level = stationLevel(station);
+  const reasonLabel =
+    station.statusReason != null &&
+    (station.status === 'unavailable' || station.status === 'faulted')
+      ? t(`stations.statusReason.${station.statusReason}`, station.statusReason)
+      : null;
+  const stationIcon = (
+    <StationIcon status={station.status} charging={charging} dc={level === 'dcFast'} />
+  );
+  const iconWithReason =
+    reasonLabel != null ? <Tooltip label={reasonLabel}>{stationIcon}</Tooltip> : stationIcon;
   const motionX = useMotionValue(station.positionX);
   const motionY = useMotionValue(station.positionY);
   const [zIndex, setZIndex] = useState(0);
@@ -351,7 +372,7 @@ export function StationCard({
         onDragEnd(station.id, snappedX, snappedY);
       }}
       className={cn(
-        'rounded-lg border bg-card text-card-foreground shadow-sm select-none',
+        'rounded-lg border bg-card text-card-foreground shadow-xs select-none',
         expanded ? 'w-[280px]' : 'w-[160px]',
         isDragging && 'ring-2 ring-primary shadow-lg',
       )}
@@ -360,7 +381,7 @@ export function StationCard({
         <div className="flex items-center gap-1.5">
           <span
             className="relative inline-flex h-2 w-2 shrink-0"
-            title={station.isOnline ? 'Online' : 'Offline'}
+            title={station.isOnline ? t('status.online') : t('status.offline')}
           >
             {station.isOnline && (
               <span className="absolute inset-0 rounded-full bg-success animate-ping opacity-75" />
@@ -411,9 +432,11 @@ export function StationCard({
         {expanded ? (
           <>
             <div className="flex items-center gap-2">
-              <StationIcon status={station.status} charging={charging} dc={level === 'DC Fast'} />
+              {iconWithReason}
               {level !== '' && (
-                <span className="text-xs font-medium text-muted-foreground">{level}</span>
+                <span className="text-xs font-medium text-muted-foreground">
+                  {t(LEVEL_LABEL_KEYS[level])}
+                </span>
               )}
             </div>
 
@@ -421,7 +444,7 @@ export function StationCard({
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="flex items-center justify-center gap-1 text-sm font-medium text-primary"
+                className="flex items-center justify-center gap-1 text-sm font-medium text-link"
               >
                 <Zap className="h-4 w-4" />
                 <span>{formatEnergy(energy)}</span>
@@ -430,8 +453,8 @@ export function StationCard({
 
             {station.displayMessage != null && (
               <div className="flex items-start gap-1.5 rounded border border-primary/20 bg-primary/5 px-2 py-1.5">
-                <MessageSquare className="h-3 w-3 shrink-0 mt-0.5 text-primary" />
-                <p className="text-xs leading-tight text-primary/70 line-clamp-2">
+                <MessageSquare className="h-3 w-3 shrink-0 mt-0.5 text-link" />
+                <p className="text-xs leading-tight text-link/70 line-clamp-2">
                   {station.displayMessage}
                 </p>
               </div>
@@ -454,7 +477,7 @@ export function StationCard({
                     />
                   </div>
                   <p className="text-xs text-muted-foreground text-center">
-                    {currentDrawKw.toFixed(1)} / {allocatedLimitKw.toFixed(1)} kW
+                    {formatNumber(currentDrawKw, 1)} / {formatNumber(allocatedLimitKw, 1)} kW
                   </p>
                 </div>
               )}
@@ -476,9 +499,7 @@ export function StationCard({
                       <div className="flex items-center gap-1.5">
                         <ConnectorIcon conn={conn} />
                         <span
-                          className={cn(
-                            conn.isPluggedIn ? 'text-primary' : 'text-muted-foreground',
-                          )}
+                          className={cn(conn.isPluggedIn ? 'text-link' : 'text-muted-foreground')}
                         >
                           {conn.connectorType ?? `#${String(conn.connectorId)}`}
                         </span>
@@ -493,7 +514,7 @@ export function StationCard({
                           <motion.span
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
-                            className="text-primary"
+                            className="text-link"
                           >
                             {formatEnergy(conn.energyDeliveredWh)}
                           </motion.span>
@@ -514,7 +535,7 @@ export function StationCard({
         ) : (
           <>
             <div className="flex items-center gap-2">
-              <StationIcon status={station.status} charging={charging} dc={level === 'DC Fast'} />
+              {iconWithReason}
               <div className="flex flex-col gap-1 min-w-0">
                 <div className="flex flex-wrap gap-1">
                   {connectors.map((conn, i) => (
@@ -525,7 +546,7 @@ export function StationCard({
                   <motion.div
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    className="flex items-center gap-0.5 text-xs font-medium text-primary"
+                    className="flex items-center gap-0.5 text-xs font-medium text-link"
                   >
                     <Zap className="h-3 w-3" />
                     <span>{formatEnergy(energy)}</span>
@@ -541,7 +562,7 @@ export function StationCard({
                     )}
                   >
                     <Zap className="h-2.5 w-2.5" />
-                    <span>{currentDrawKw.toFixed(1)} kW</span>
+                    <span>{formatNumber(currentDrawKw, 1)} kW</span>
                   </div>
                 )}
               </div>

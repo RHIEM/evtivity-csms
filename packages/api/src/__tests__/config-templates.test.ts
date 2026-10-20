@@ -53,7 +53,8 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: {
     select: vi.fn(() => makeChain()),
     selectDistinct: vi.fn(() => makeChain()),
@@ -106,7 +107,7 @@ vi.mock('drizzle-orm', () => ({
 
 const mockPublish = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: mockPublish,
     subscribe: vi.fn(),
@@ -118,7 +119,7 @@ const mockSendOcppCommand = vi
   .fn()
   .mockResolvedValue({ commandId: 'cmd-1', response: { status: 'Accepted' } });
 
-vi.mock('../lib/ocpp-command.js', () => ({
+vi.mock('@evtivity/services/ocpp-command', () => ({
   sendOcppCommandAndWait: (...args: unknown[]) => mockSendOcppCommand(...args),
 }));
 
@@ -153,6 +154,16 @@ async function buildApp(): Promise<FastifyInstance> {
   await app.ready();
   return app;
 }
+
+// Identity columns of a reported value with no instance, EVSE, or connector
+// (the row a template variable targets).
+const TOP_LEVEL = {
+  instance: null,
+  evseId: null,
+  connectorId: null,
+  variableInstance: null,
+  attributeType: 'Actual',
+};
 
 describe('Config template routes', () => {
   let app: FastifyInstance;
@@ -757,7 +768,7 @@ describe('Config template routes', () => {
       expect(res.statusCode).toBe(401);
     });
 
-    it('returns 200 with empty array when station not found', async () => {
+    it('returns 404 when the station is not found', async () => {
       setupDbResults([]);
 
       const res = await app.inject({
@@ -765,9 +776,8 @@ describe('Config template routes', () => {
         url: '/v1/stations/sta-1/config-drift',
         headers: { authorization: `Bearer ${token}` },
       });
-      expect(res.statusCode).toBe(200);
-      const body = res.json();
-      expect(body).toEqual([]);
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ code: 'STATION_NOT_FOUND' });
     });
 
     it('returns 200 with empty array when no templates match', async () => {
@@ -793,12 +803,48 @@ describe('Config template routes', () => {
       expect(body).toEqual([]);
     });
 
-    it('returns 200 with drift items when values differ', async () => {
-      const station = { id: 'sta-1', siteId: 'site-1', vendorId: 'vnd-1', model: 'Model X' };
+    it('ignores a template of another OCPP version than the station', async () => {
+      const station = {
+        id: 'sta-1',
+        siteId: 'site-1',
+        vendorId: 'vnd-1',
+        model: 'Model X',
+        ocppProtocol: 'ocpp1.6',
+      };
       const templates = [
         {
           id: 'tpl-1',
           name: 'Config',
+          ocppVersion: '2.1',
+          variables: [{ component: 'EVSE', variable: 'MaxCurrent', value: '32' }],
+          targetFilter: null,
+          stationId: null,
+        },
+      ];
+      setupDbResults([station], templates);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/stations/sta-1/config-drift',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual([]);
+    });
+
+    it('returns 200 with drift items when values differ', async () => {
+      const station = {
+        id: 'sta-1',
+        siteId: 'site-1',
+        vendorId: 'vnd-1',
+        model: 'Model X',
+        ocppProtocol: 'ocpp2.1',
+      };
+      const templates = [
+        {
+          id: 'tpl-1',
+          name: 'Config',
+          ocppVersion: '2.1',
           variables: [
             { component: 'EVSE', variable: 'MaxCurrent', value: '32' },
             { component: 'ChargingStation', variable: 'HeartbeatInterval', value: '60' },
@@ -808,8 +854,16 @@ describe('Config template routes', () => {
         },
       ];
       const actualVars = [
-        { component: 'EVSE', variable: 'MaxCurrent', value: '16' },
-        { component: 'EVSE', variable: 'MinCurrent', value: '6' },
+        { ...TOP_LEVEL, component: 'EVSE', variable: 'MaxCurrent', value: '16' },
+        { ...TOP_LEVEL, component: 'EVSE', variable: 'MinCurrent', value: '6' },
+        // Another instance of HeartbeatInterval is not the value the template sets.
+        {
+          ...TOP_LEVEL,
+          component: 'ChargingStation',
+          variable: 'HeartbeatInterval',
+          variableInstance: 'Other',
+          value: '60',
+        },
       ];
       // DB calls: 1. station, 2. templates, 3. station variables
       setupDbResults([station], templates, actualVars);
@@ -856,8 +910,8 @@ describe('Config template routes', () => {
         },
       ];
       const actualVars = [
-        { component: 'EVSE', variable: 'MaxCurrent', value: '32' },
-        { component: 'EVSE', variable: 'MinCurrent', value: '6' },
+        { ...TOP_LEVEL, component: 'EVSE', variable: 'MaxCurrent', value: '32' },
+        { ...TOP_LEVEL, component: 'EVSE', variable: 'MinCurrent', value: '6' },
       ];
       setupDbResults([station], templates, actualVars);
 

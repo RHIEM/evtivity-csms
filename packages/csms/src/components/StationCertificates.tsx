@@ -159,14 +159,15 @@ export function StationCertificates({ stationId }: StationCertificatesProps): Re
             </DialogHeader>
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="install-cert-type">{t('pnc.certificateType')}</Label>
+                <Label htmlFor="install-cert-type" className="leading-6">
+                  {t('pnc.certificateType')}
+                </Label>
                 <Select
                   id="install-cert-type"
                   value={installCertType}
                   onChange={(e) => {
                     setInstallCertType(e.target.value);
                   }}
-                  className="h-9"
                 >
                   <option value="V2GRootCertificate">V2G Root Certificate</option>
                   <option value="MORootCertificate">MO Root Certificate</option>
@@ -175,7 +176,9 @@ export function StationCertificates({ stationId }: StationCertificatesProps): Re
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="install-pem">PEM</Label>
+                <Label htmlFor="install-pem" className="leading-6">
+                  PEM
+                </Label>
                 <textarea
                   id="install-pem"
                   className="h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"

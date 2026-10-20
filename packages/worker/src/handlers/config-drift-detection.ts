@@ -2,9 +2,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { eq, and, inArray } from 'drizzle-orm';
-import { db, chargingStations, configTemplates, stationConfigurations } from '@evtivity/database';
+import {
+  db,
+  chargingStations,
+  configTemplates,
+  isOperatorStation,
+  stationConfigurations,
+} from '@evtivity/database';
 import type { Logger } from 'pino';
-import { getPubSub } from '@evtivity/api/src/lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { findTemplateTargetConfiguration, configTemplateTarget } from '@evtivity/lib';
 
 export async function configDriftDetectionHandler(log: Logger): Promise<void> {
   const templates = await db.select().from(configTemplates);
@@ -20,14 +27,18 @@ export async function configDriftDetectionHandler(log: Logger): Promise<void> {
     }>;
     if (variables.length === 0) continue;
 
-    const filter = template.targetFilter as Record<string, string> | null;
+    // A template bound to a station targets that station only. Any other
+    // template never targets a conformance test station.
+    const target = configTemplateTarget(template);
     const conditions = [eq(chargingStations.isOnline, true)];
-    if (filter?.siteId) conditions.push(eq(chargingStations.siteId, filter.siteId));
-    if (filter?.vendorId) conditions.push(eq(chargingStations.vendorId, filter.vendorId));
-    if (filter?.model) conditions.push(eq(chargingStations.model, filter.model));
+    if (target.stationId != null) conditions.push(eq(chargingStations.id, target.stationId));
+    else conditions.push(isOperatorStation());
+    if (target.siteId != null) conditions.push(eq(chargingStations.siteId, target.siteId));
+    if (target.vendorId != null) conditions.push(eq(chargingStations.vendorId, target.vendorId));
+    if (target.model != null) conditions.push(eq(chargingStations.model, target.model));
 
     const targetStations = await db
-      .select({ id: chargingStations.id })
+      .select({ id: chargingStations.id, siteId: chargingStations.siteId })
       .from(chargingStations)
       .where(and(...conditions));
 
@@ -49,8 +60,10 @@ export async function configDriftDetectionHandler(log: Logger): Promise<void> {
     for (const station of targetStations) {
       const actualVars = varsByStation.get(station.id) ?? [];
       for (const expected of variables) {
-        const actual = actualVars.find(
-          (v) => v.component === expected.component && v.variable === expected.variable,
+        const actual = findTemplateTargetConfiguration(
+          actualVars,
+          expected.component,
+          expected.variable,
         );
         if (actual == null || actual.value !== expected.value) {
           driftCount++;
@@ -61,11 +74,14 @@ export async function configDriftDetectionHandler(log: Logger): Promise<void> {
                 eventType: 'config.driftDetected',
                 stationId: station.id,
                 sessionId: null,
-                siteId: null,
+                siteId: station.siteId,
               }),
             );
-          } catch {
-            // Best-effort SSE notification
+          } catch (err) {
+            log.warn(
+              { err, stationId: station.id },
+              'Config drift event publish failed, the dashboard is not notified',
+            );
           }
           break;
         }

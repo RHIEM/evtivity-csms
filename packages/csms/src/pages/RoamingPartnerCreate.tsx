@@ -9,6 +9,7 @@ import { BackButton } from '@/components/back-button';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent } from '@/components/ui/card';
@@ -37,6 +38,8 @@ export function RoamingPartnerCreate(): React.JSX.Element {
   const [partyId, setPartyId] = useState('');
   const [versionUrl, setVersionUrl] = useState('');
   const [partnerRegistrationToken, setPartnerRegistrationToken] = useState('');
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
+  const [allowRawToken, setAllowRawToken] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [createdToken, setCreatedToken] = useState<string | null>(null);
   const [createdId, setCreatedId] = useState<string | null>(null);
@@ -48,6 +51,8 @@ export function RoamingPartnerCreate(): React.JSX.Element {
       partyId: string;
       versionUrl?: string;
       partnerRegistrationToken?: string;
+      allowPrivateNetwork: boolean;
+      allowRawToken: boolean;
     }) => api.post<CreateResult>('/v1/ocpi/partners', data),
     onSuccess: (result) => {
       setCreatedToken(result.registrationToken);
@@ -76,10 +81,14 @@ export function RoamingPartnerCreate(): React.JSX.Element {
       partyId: string;
       versionUrl?: string;
       partnerRegistrationToken?: string;
+      allowPrivateNetwork: boolean;
+      allowRawToken: boolean;
     } = {
       name,
       countryCode: countryCode.toUpperCase(),
       partyId: partyId.toUpperCase(),
+      allowPrivateNetwork,
+      allowRawToken,
     };
     if (versionUrl.trim() !== '') {
       data.versionUrl = versionUrl;
@@ -119,7 +128,9 @@ export function RoamingPartnerCreate(): React.JSX.Element {
           ) : (
             <form onSubmit={handleSubmit} noValidate className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="partner-name">{t('common.name')}</Label>
+                <Label htmlFor="partner-name" className="leading-6">
+                  {t('common.name')}
+                </Label>
                 <Input
                   id="partner-name"
                   value={name}
@@ -135,7 +146,9 @@ export function RoamingPartnerCreate(): React.JSX.Element {
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="partner-country">{t('roaming.partners.countryCode')}</Label>
+                  <Label htmlFor="partner-country" className="leading-6">
+                    {t('roaming.partners.countryCode')}
+                  </Label>
                   <Input
                     id="partner-country"
                     value={countryCode}
@@ -151,7 +164,9 @@ export function RoamingPartnerCreate(): React.JSX.Element {
                   )}
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="partner-party">{t('roaming.partners.partyIdLabel')}</Label>
+                  <Label htmlFor="partner-party" className="leading-6">
+                    {t('roaming.partners.partyIdLabel')}
+                  </Label>
                   <Input
                     id="partner-party"
                     value={partyId}
@@ -168,7 +183,9 @@ export function RoamingPartnerCreate(): React.JSX.Element {
                 </div>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="partner-version-url">{t('roaming.partners.versionsUrl')}</Label>
+                <Label htmlFor="partner-version-url" className="leading-6">
+                  {t('roaming.partners.versionsUrl')}
+                </Label>
                 <Input
                   id="partner-version-url"
                   value={versionUrl}
@@ -179,7 +196,7 @@ export function RoamingPartnerCreate(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="partner-registration-token">
+                <Label htmlFor="partner-registration-token" className="leading-6">
                   {t('roaming.partners.partnerRegistrationToken')}
                 </Label>
                 <Input
@@ -194,6 +211,40 @@ export function RoamingPartnerCreate(): React.JSX.Element {
                 />
                 <p className="text-xs text-muted-foreground">
                   {t('roaming.partners.partnerRegistrationTokenHint')}
+                </p>
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="partner-allow-private-network"
+                    checked={allowPrivateNetwork}
+                    onChange={(e) => {
+                      setAllowPrivateNetwork(e.target.checked);
+                    }}
+                  />
+                  <Label htmlFor="partner-allow-private-network">
+                    {t('roaming.partners.allowPrivateNetwork')}
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t('roaming.partners.allowPrivateNetworkHint')}
+                </p>
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="partner-allow-raw-token"
+                    checked={allowRawToken}
+                    onChange={(e) => {
+                      setAllowRawToken(e.target.checked);
+                    }}
+                  />
+                  <Label htmlFor="partner-allow-raw-token">
+                    {t('roaming.partners.allowRawToken')}
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t('roaming.partners.allowRawTokenHint')}
                 </p>
               </div>
               {createMutation.isError && (

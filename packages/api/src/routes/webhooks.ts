@@ -2,171 +2,169 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { FastifyInstance } from 'fastify';
-import type Stripe from 'stripe';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
-import { db, paymentRecords, webhookEvents } from '@evtivity/database';
-import { verifyWebhookSignature } from '../services/stripe.service.js';
+import {
+  dispatchPaymentWebhookNotices,
+  ingestPaymentWebhook,
+  paymentWebhookActor,
+  WebhookNotConfiguredError,
+  WebhookSignatureError,
+} from '@evtivity/payments';
 import { itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { config as apiConfig } from '../lib/config.js';
+import { paymentContext } from '../lib/payments.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
+import { zodSchema } from '../lib/zod-schema.js';
 
-const webhookResponse = z
-  .object({ received: z.literal(true).describe('Acknowledgement that the webhook was processed') })
-  .passthrough();
+const stripeAck = itemResponse(
+  z
+    .object({
+      received: z.literal(true).describe('Acknowledgement that the webhook was processed'),
+    })
+    .passthrough(),
+);
 
-export function webhookRoutes(app: FastifyInstance): void {
-  // Use string parsing for raw body access (needed for Stripe signature verification).
-  // This is encapsulated by Fastify's plugin scope and does not affect other routes.
-  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
-    done(null, body);
-  });
+const adyenAck = zodSchema(
+  z.string().describe('The text/plain acknowledgement [accepted] that Adyen expects'),
+);
 
+interface WebhookRouteDoc {
+  providerId: 'stripe' | 'adyen';
+  summary: string;
+  description: string;
+  operationId: string;
+  ack: Record<string, unknown>;
+}
+
+const STRIPE_DOC: WebhookRouteDoc = {
+  providerId: 'stripe',
+  summary: 'Handle Stripe webhook events',
+  description:
+    'Receives the events of both EVtivity endpoints in Stripe: the platform endpoint (signed with stripe.webhookSecretEnc) and the Connect endpoint (signed with stripe.connectWebhookSecretEnc). Verifies the stripe-signature header with either secret, records each event id once (a replay is acknowledged and skipped), then applies payment_intent.payment_failed (only to pending or pre-authorized payments), charge.refunded (never lowering the refunded total), logs charge.dispute.created and passes account.updated to the site payout accounts. Answers {"received":true}.',
+  operationId: 'handleStripeWebhook',
+  ack: stripeAck,
+};
+
+const ADYEN_DOC: WebhookRouteDoc = {
+  providerId: 'adyen',
+  summary: 'Handle Adyen webhook events',
+  description:
+    'Receives Adyen standard webhooks (JSON). Checks the Basic auth credentials (adyen.webhookUsername, adyen.webhookPasswordEnc; 401 when missing or wrong), the HMAC signature of every notification item (adyen.hmacKeyEnc, or adyen.hmacKeyPreviousEnc during a key rotation), the merchant account and the live flag, records each event once (a replay is acknowledged and skipped) and answers the text [accepted].',
+  operationId: 'handleAdyenWebhook',
+  ack: adyenAck,
+};
+
+function headerMap(headers: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value === 'string') out[name] = value;
+    else if (Array.isArray(value)) out[name] = value.join(',');
+  }
+  return out;
+}
+
+/**
+ * One route per provider at /webhooks/payments/<provider>, all through
+ * ingestPaymentWebhook. A failed verification answers 4xx; any other error
+ * reaches the global 500 handler so the provider retries (P9).
+ */
+function registerPaymentWebhookRoute(app: FastifyInstance, doc: WebhookRouteDoc): void {
   app.post(
-    '/webhooks/stripe',
+    `/webhooks/payments/${doc.providerId}`,
     {
       schema: {
         tags: ['Webhooks'],
-        summary: 'Handle Stripe webhook events',
-        operationId: 'handleStripeWebhook',
+        summary: doc.summary,
+        description: doc.description,
+        operationId: doc.operationId,
         security: [],
         response: {
-          200: itemResponse(webhookResponse),
-          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
-          500: errorWith('Internal server error', [ERROR_CODES.INTERNAL_ERROR]),
+          200: doc.ack,
+          400: errorWith('Validation error', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.WEBHOOK_SIGNATURE_MISSING,
+            ERROR_CODES.WEBHOOK_SIGNATURE_INVALID,
+          ]),
+          401: errorWith('Webhook credentials missing or wrong', [
+            ERROR_CODES.WEBHOOK_SIGNATURE_MISSING,
+            ERROR_CODES.WEBHOOK_SIGNATURE_INVALID,
+          ]),
+          500: errorWith('Internal server error', [
+            ERROR_CODES.INTERNAL_ERROR,
+            ERROR_CODES.WEBHOOK_NOT_CONFIGURED,
+          ]),
         },
       },
     },
     async (request, reply) => {
-      const webhookSecret = process.env['STRIPE_WEBHOOK_SECRET'] ?? apiConfig.STRIPE_WEBHOOK_SECRET;
-      if (webhookSecret == null || webhookSecret === '') {
-        app.log.error('STRIPE_WEBHOOK_SECRET not configured');
-        await reply
-          .status(500)
-          .send({ error: 'Webhook not configured', code: 'WEBHOOK_NOT_CONFIGURED' });
-        return;
-      }
-
-      const signature = request.headers['stripe-signature'];
-      if (signature == null || typeof signature !== 'string') {
-        await reply
-          .status(400)
-          .send({ error: 'Missing stripe-signature header', code: 'WEBHOOK_SIGNATURE_MISSING' });
-        return;
-      }
-
-      const rawBody = request.body as string;
-
-      let event: Stripe.Event;
+      let result;
       try {
-        event = verifyWebhookSignature(rawBody, signature, webhookSecret);
-      } catch (err) {
-        app.log.warn(
-          { error: err instanceof Error ? err.message : String(err) },
-          'Webhook signature verification failed',
+        result = await ingestPaymentWebhook(
+          doc.providerId,
+          request.body as string,
+          headerMap(request.headers),
+          paymentContext(request.log, paymentWebhookActor(doc.providerId)),
         );
-        await reply
-          .status(400)
-          .send({ error: 'Invalid signature', code: 'WEBHOOK_SIGNATURE_INVALID' });
-        return;
-      }
-
-      app.log.info({ type: event.type, id: event.id }, 'Stripe webhook received');
-
-      // Deduplicate: reject events we have already processed.
-      // Stripe may replay webhooks on timeout or network errors. Use a
-      // single INSERT ... ON CONFLICT DO NOTHING + RETURNING to avoid the
-      // SELECT-then-INSERT race that would 500 the second concurrent
-      // delivery on the unique constraint.
-      const inserted = await db
-        .insert(webhookEvents)
-        .values({ eventId: event.id, eventType: event.type })
-        .onConflictDoNothing()
-        .returning({ eventId: webhookEvents.eventId });
-      if (inserted.length === 0) {
-        app.log.info({ eventId: event.id }, 'Duplicate webhook event, skipping');
-        await reply.status(200).send({ received: true });
-        return;
-      }
-
-      switch (event.type) {
-        case 'payment_intent.payment_failed': {
-          const pi = event.data.object;
-          const [record] = await db
-            .select()
-            .from(paymentRecords)
-            .where(eq(paymentRecords.stripePaymentIntentId, pi.id));
-          if (record != null) {
-            const stripeFailureMessage =
-              pi.last_payment_error?.message ?? pi.last_payment_error?.code ?? null;
-            const failureReason =
-              stripeFailureMessage != null
-                ? `Stripe webhook: ${stripeFailureMessage.slice(0, 480)}`
-                : 'Stripe webhook: payment_intent.payment_failed';
-            await db
-              .update(paymentRecords)
-              .set({
-                status: 'failed',
-                failureReason,
-                updatedAt: new Date(),
-              })
-              .where(eq(paymentRecords.id, record.id));
-            app.log.info(
-              { paymentIntentId: pi.id, reason: stripeFailureMessage },
-              'Payment marked as failed via webhook',
-            );
-          }
-          break;
+      } catch (err) {
+        if (err instanceof WebhookNotConfiguredError) {
+          request.log.error(
+            { provider: doc.providerId },
+            'Payment webhook secret or credentials are not configured',
+          );
+          await reply
+            .status(500)
+            .send({ error: 'Webhook not configured', code: 'WEBHOOK_NOT_CONFIGURED' });
+          return;
         }
-        case 'charge.refunded': {
-          const charge = event.data.object;
-          if (charge.payment_intent != null) {
-            const piId =
-              typeof charge.payment_intent === 'string'
-                ? charge.payment_intent
-                : charge.payment_intent.id;
-            const [record] = await db
-              .select()
-              .from(paymentRecords)
-              .where(eq(paymentRecords.stripePaymentIntentId, piId));
-            if (record != null) {
-              const refundedAmount = charge.amount_refunded;
-              const newStatus = refundedAmount >= charge.amount ? 'refunded' : 'partially_refunded';
-              await db
-                .update(paymentRecords)
-                .set({
-                  status: newStatus,
-                  refundedAmountCents: refundedAmount,
-                  updatedAt: new Date(),
-                })
-                .where(eq(paymentRecords.id, record.id));
-              app.log.info(
-                { paymentIntentId: piId, status: newStatus, refundedAmount },
-                'Payment refund status updated via webhook',
-              );
-            }
+        if (err instanceof WebhookSignatureError) {
+          request.log.warn(
+            {
+              provider: doc.providerId,
+              error: err.message,
+              ...(err.unverified != null ? { unverified: err.unverified } : {}),
+            },
+            'Payment webhook verification failed',
+          );
+          const status = err.kind === 'auth' ? 401 : 400;
+          if (err.reason === 'missing') {
+            await reply.status(status).send({
+              error: 'Missing webhook signature or credentials',
+              code: 'WEBHOOK_SIGNATURE_MISSING',
+            });
+          } else {
+            await reply
+              .status(status)
+              .send({ error: 'Invalid signature', code: 'WEBHOOK_SIGNATURE_INVALID' });
           }
-          break;
+          return;
         }
-        case 'charge.dispute.created': {
-          const dispute = event.data.object;
-          if (dispute.payment_intent != null) {
-            const piId =
-              typeof dispute.payment_intent === 'string'
-                ? dispute.payment_intent
-                : dispute.payment_intent.id;
-            app.log.warn(
-              { paymentIntentId: piId, disputeId: dispute.id, reason: dispute.reason },
-              'Payment dispute created',
-            );
-          }
-          break;
-        }
-        default:
-          app.log.debug({ type: event.type }, 'Unhandled webhook event type');
+        throw err;
       }
-
-      await reply.status(200).send({ received: true });
+      // Driver notifications and the operator UI refresh for what the events
+      // changed (fail-open, never delays the acknowledgement on an error).
+      if (result.notices.length > 0) {
+        await dispatchPaymentWebhookNotices(result.notices, {
+          templatesDirs: ALL_TEMPLATES_DIRS,
+          pubsub: getPubSub(),
+          logger: request.log,
+        });
+      }
+      // Every provider acknowledges with 200 (the only success the route
+      // documents) and its own body. A string body with an explicit content
+      // type is sent as is, without the response serializer.
+      await reply.status(200).type(result.ack.contentType).send(result.ack.body);
     },
   );
+}
+
+export function webhookRoutes(app: FastifyInstance): void {
+  // Raw body for the signature check. Scoped to this plugin, so other routes
+  // keep JSON parsing.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    done(null, body);
+  });
+
+  registerPaymentWebhookRoute(app, STRIPE_DOC);
+  registerPaymentWebhookRoute(app, ADYEN_DOC);
 }

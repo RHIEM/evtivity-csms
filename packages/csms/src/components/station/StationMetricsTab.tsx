@@ -31,7 +31,10 @@ interface StationMetrics {
   avgRevenueCentsPerSession: number;
   totalTransactions: number;
   totalElectricityCostCents: number;
+  totalNetRevenueCents: number;
+  totalTaxCents: number;
   totalProfitCents: number;
+  costMissingSessionCount?: number;
   currency: string;
   periodMonths: number;
 }
@@ -181,6 +184,18 @@ export function StationMetricsTab({ stationId }: StationMetricsTabProps): React.
                 </p>
               </div>
               <div className="space-y-1">
+                <p className="text-sm text-muted-foreground">{t('metrics.netRevenue')}</p>
+                <p className="text-2xl font-bold">
+                  {formatCents(metrics.totalNetRevenueCents, metrics.currency)}
+                </p>
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm text-muted-foreground">{t('metrics.taxCollected')}</p>
+                <p className="text-2xl font-bold">
+                  {formatCents(metrics.totalTaxCents, metrics.currency)}
+                </p>
+              </div>
+              <div className="space-y-1">
                 <p className="text-sm text-muted-foreground">{t('metrics.revenuePerSession')}</p>
                 <p className="text-2xl font-bold">
                   {formatCents(metrics.avgRevenueCentsPerSession, metrics.currency)}
@@ -203,6 +218,11 @@ export function StationMetricsTab({ stationId }: StationMetricsTabProps): React.
                 >
                   {formatCents(metrics.totalProfitCents, metrics.currency)}
                 </p>
+                {(metrics.costMissingSessionCount ?? 0) > 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('metrics.costMissing', { count: metrics.costMissingSessionCount })}
+                  </p>
+                )}
               </div>
             </div>
           </CardContent>

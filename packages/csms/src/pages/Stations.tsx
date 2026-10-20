@@ -34,6 +34,7 @@ export function Stations(): React.JSX.Element {
   const [filterOnboardingStatus, setFilterOnboardingStatus] = useState('');
   const [filterOnline, setFilterOnline] = useState('');
   const [filterSimulator, setFilterSimulator] = useState('');
+  const [filterAiInsights, setFilterAiInsights] = useState('');
 
   const { data: sites } = useQuery({
     queryKey: ['sites'],
@@ -49,8 +50,16 @@ export function Stations(): React.JSX.Element {
     if (filterOnboardingStatus !== '') params.onboardingStatus = filterOnboardingStatus;
     if (filterOnline !== '') params.isOnline = filterOnline;
     if (filterSimulator !== '') params.isSimulator = filterSimulator;
+    if (filterAiInsights !== '') params.aiInsights = filterAiInsights;
     return Object.keys(params).length > 0 ? params : undefined;
-  }, [filterSiteId, filterStatus, filterOnboardingStatus, filterOnline, filterSimulator]);
+  }, [
+    filterSiteId,
+    filterStatus,
+    filterOnboardingStatus,
+    filterOnline,
+    filterSimulator,
+    filterAiInsights,
+  ]);
 
   const {
     data: stations,
@@ -73,7 +82,7 @@ export function Stations(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('stations.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('stations.subtitle')}</p>
@@ -92,16 +101,15 @@ export function Stations(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('stations.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('sites.title')}</Label>
+              <Label className="leading-6">{t('sites.title')}</Label>
               <Select
                 aria-label={t('sites.title')}
-                className="h-10"
                 value={filterSiteId}
                 onChange={(e) => {
                   setFilterSiteId(e.target.value);
@@ -116,10 +124,9 @@ export function Stations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('common.status')}</Label>
+              <Label className="leading-6">{t('common.status')}</Label>
               <Select
                 aria-label={t('common.status')}
-                className="h-10"
                 value={filterStatus}
                 onChange={(e) => {
                   setFilterStatus(e.target.value);
@@ -134,10 +141,9 @@ export function Stations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('stations.connectivity')}</Label>
+              <Label className="leading-6">{t('stations.connectivity')}</Label>
               <Select
                 aria-label={t('stations.connectivity')}
-                className="h-10"
                 value={filterOnline}
                 onChange={(e) => {
                   setFilterOnline(e.target.value);
@@ -149,10 +155,9 @@ export function Stations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('stations.onboardingStatus')}</Label>
+              <Label className="leading-6">{t('stations.onboardingStatus')}</Label>
               <Select
                 aria-label={t('stations.onboardingStatus')}
-                className="h-10"
                 value={filterOnboardingStatus}
                 onChange={(e) => {
                   setFilterOnboardingStatus(e.target.value);
@@ -165,10 +170,9 @@ export function Stations(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('stations.type')}</Label>
+              <Label className="leading-6">{t('stations.type')}</Label>
               <Select
                 aria-label={t('stations.type')}
-                className="h-10"
                 value={filterSimulator}
                 onChange={(e) => {
                   setFilterSimulator(e.target.value);
@@ -179,6 +183,20 @@ export function Stations(): React.JSX.Element {
                 <option value="false">{t('stations.realOnly')}</option>
               </Select>
             </div>
+            <div className="space-y-2">
+              <Label className="leading-6">{t('stations.aiInsights.label')}</Label>
+              <Select
+                aria-label={t('stations.aiInsights.label')}
+                value={filterAiInsights}
+                onChange={(e) => {
+                  setFilterAiInsights(e.target.value);
+                }}
+              >
+                <option value="">{t('stations.aiInsights.allScopes')}</option>
+                <option value="in_scope">{t('stations.aiInsights.inScope')}</option>
+                <option value="suppressed">{t('stations.aiInsights.suppressed')}</option>
+              </Select>
+            </div>
           </>
         );
         const activeFilterCount =
@@ -186,7 +204,8 @@ export function Stations(): React.JSX.Element {
           (filterStatus !== '' ? 1 : 0) +
           (filterOnline !== '' ? 1 : 0) +
           (filterOnboardingStatus !== '' ? 1 : 0) +
-          (filterSimulator !== '' ? 1 : 0);
+          (filterSimulator !== '' ? 1 : 0) +
+          (filterAiInsights !== '' ? 1 : 0);
         const columnsToggle = (
           <ColumnVisibilityToggle
             tableKey="stations"
@@ -208,6 +227,7 @@ export function Stations(): React.JSX.Element {
                     setFilterOnline('');
                     setFilterOnboardingStatus('');
                     setFilterSimulator('');
+                    setFilterAiInsights('');
                   }}
                 >
                   {filters}
@@ -215,9 +235,9 @@ export function Stations(): React.JSX.Element {
                 {columnsToggle}
               </div>
               <div className="hidden items-end gap-4 lg:flex">
-                <div className="grid flex-1 grid-cols-6 gap-4">
+                <div className="grid flex-1 grid-cols-7 gap-4">
                   <div className="space-y-2">
-                    <Label>{t('stations.search')}</Label>
+                    <Label className="leading-6">{t('stations.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}

@@ -1,21 +1,26 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Local dev seed (npm run db:seed). Always upserts settings, roles, admin user,
-// and permissions. When SEED_DEMO=true also generates the full demo dataset
-// (sites, 2000 stations, sessions, drivers, etc.) into an empty inventory.
-// Idempotent and non-destructive: never truncates or deletes existing rows.
+// Local dev seed (npm run db:seed). Adds missing settings, roles, the admin
+// user, and permissions. When SEED_DEMO=true also generates the full demo
+// dataset (sites, 2000 stations, sessions, drivers, etc.) into an empty
+// inventory. Idempotent and non-destructive: never truncates or deletes, and
+// never overwrites an existing setting, role, or user. The one exception is
+// `--apply-config`, which writes the values of seed.config.json (and
+// REGISTRATION_POLICY) over existing settings on purpose.
 // Demo generation is skipped when sites or stations already exist; for a clean
 // slate, drop and recreate the database (or the docker volume), run
 // db:migrate, then re-run this seed. For production initial setup see
 // seed-admin.ts; for the docker-build dev station fixture see seed-dev-stations.ts.
 
+import { randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, client } from './config.js';
-import { sql, eq, and, isNotNull, isNull } from 'drizzle-orm';
-import { createId } from './lib/id.js';
+import { sql, eq, and, inArray, isNotNull, isNull } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
+import { sessionSiteIdSql } from './lib/session-site.js';
 import { getCompanyCurrency, clearSystemSettingsCache } from './lib/system-settings.js';
 import {
   settings,
@@ -41,7 +46,6 @@ import {
   fleetStations,
   chargingSessions,
   transactionEvents,
-  meterValues,
   reservations,
   sitePowerLimits,
   siteLoadManagement,
@@ -53,10 +57,10 @@ import {
   supportCaseMessages,
   ocpiPartners,
   ocpiPartnerEndpoints,
-  ocpiCredentialsTokens,
   pkiCaCertificates,
   stationCertificates,
   driverPaymentMethods,
+  driverPaymentCustomers,
   notifications,
   firmwareCampaigns,
   firmwareCampaignStations,
@@ -87,16 +91,51 @@ import {
   invoices,
   invoiceLineItems,
 } from './schema/index.js';
+import { acceptPendingFixtureStations } from './lib/fixture-stations.js';
+import { issueOcpiRegistrationToken } from './lib/ocpi-registration-token.js';
+import { REBILL_DEMO_METHOD_ID } from './seed-demo-cards.js';
+import { insertDemoMeterValues, type DemoMeterValueRow } from './seed-meter-values.js';
+import {
+  ensureSiteElectricityRates,
+  seedElectricityRateRows,
+  seedSessionElectricityCostCents,
+} from './seed-electricity-rates.js';
+import { mapSeedSettings, seedSettingRows } from './seed-settings.js';
 import argon2 from 'argon2';
 import {
-  encryptString,
   calculateCo2AvoidedKg,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
+  permissionCatalog,
   STATION_MESSAGE_DEFAULTS,
+  STATION_MESSAGE_LANGUAGES,
+  DEFAULT_STATION_MESSAGE_LANGUAGE,
   mapConnectorTypeToCss,
   DEFAULT_CURRENCY,
+  DEFAULT_PRICE_DISPLAY,
+  DEFAULT_TAX_BASIS,
+  splitGrossByTaxRate,
+  taxTotals,
+  chargedCostBreakdown,
+  LOAD_ALLOCATION_STRATEGIES,
 } from '@evtivity/lib';
+import { STATION_PASSWORD_HASH_OPTIONS } from '@evtivity/lib';
+import type {
+  ElectricityRatePeriod,
+  ElectricityRatePeriodRestrictions,
+  SessionCostBreakdown,
+} from '@evtivity/lib';
+
+/**
+ * The stored split of a demo session cost (net_cents, tax_cents,
+ * cost_breakdown), as the cost assembly writes it with every cost: the
+ * charged amount split at the session's tax rate.
+ */
+function demoCostSplit(
+  costCents: number,
+  taxRate: number,
+): { netCents: number; taxCents: number; costBreakdown: SessionCostBreakdown } {
+  const costBreakdown = chargedCostBreakdown(costCents, taxRate, DEFAULT_TAX_BASIS);
+  return { netCents: costBreakdown.netCents, taxCents: costBreakdown.taxCents, costBreakdown };
+}
 
 // Helper data
 const US_CITIES = [
@@ -368,6 +407,8 @@ function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)] as T;
 }
 
+const DEMO_ACTIVE_SESSION_COUNT = 20;
+
 function at<T>(arr: T[], index: number): T {
   return arr[index % arr.length] as T;
 }
@@ -387,10 +428,47 @@ function padNum(n: number, digits: number): string {
 }
 
 const seedDemo = process.env['SEED_DEMO'] === 'true';
+// Opt-in: write the explicit configuration (seed.config.json, REGISTRATION_POLICY)
+// over existing settings. Migrations insert every settings key before the seed
+// runs, so without it a fresh database keeps the migration defaults.
+// scripts/docker-build.sh passes it only when it has just wiped the database.
+const applyConfig = process.argv.includes('--apply-config');
+const configArgIndex = process.argv.indexOf('--config');
+const configArg = configArgIndex === -1 ? undefined : process.argv[configArgIndex + 1];
+if (configArgIndex !== -1 && configArg === undefined) {
+  throw new Error('--config needs a path to a seed config JSON file.');
+}
 // Same env vars seed-admin.ts honors, so all entry points agree on the admin
 // account. Defaults match the historical dev credentials.
 const initialAdminEmail = process.env['INITIAL_ADMIN_EMAIL'] ?? 'admin@evtivity.local';
 const initialAdminPassword = process.env['INITIAL_ADMIN_PASSWORD'] ?? 'admin123';
+
+// Built-in roles are inserted when missing and never updated. RBAC reads
+// user_permissions and the role defaults in @evtivity/lib by role name, not
+// roles.permissions, so an existing row needs no refresh (migration 0001
+// inserts the three roles with an empty list on every install).
+async function ensureRole(
+  name: string,
+  description: string,
+  permissions: readonly string[],
+): Promise<string> {
+  await db
+    .insert(roles)
+    .values({ name, description, permissions: [...permissions] })
+    .onConflictDoNothing({ target: roles.name });
+  const [row] = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, name));
+  if (row == null) throw new Error(`Role ${name} lookup failed after insert`);
+  return row.id;
+}
+
+// Users are inserted when missing. An existing user keeps every column,
+// including the password an operator may have changed.
+async function ensureUser(values: typeof users.$inferInsert): Promise<string> {
+  await db.insert(users).values(values).onConflictDoNothing({ target: users.email });
+  const [row] = await db.select({ id: users.id }).from(users).where(eq(users.email, values.email));
+  if (row == null) throw new Error(`User ${values.email} lookup failed after insert`);
+  return row.id;
+}
 
 async function seed(): Promise<void> {
   console.log(`Seeding database...${seedDemo ? '' : ' (demo data disabled)'}`);
@@ -404,8 +482,13 @@ async function seed(): Promise<void> {
   const animatedLogoSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120"><defs><mask id="logoRingGaps"><rect width="120" height="120" fill="white"/><polygon points="68.82,-8.24 76.70,-6.86 69.82,32.54 61.94,31.16" fill="black"/><polygon points="52.08,87.46 59.96,88.84 53.08,128.24 45.20,126.86" fill="black"/></mask><style>@keyframes evtivity-logo-spin{0%{transform:rotate(0deg)}12%{transform:rotate(360deg)}100%{transform:rotate(360deg)}}@keyframes evtivity-logo-pulse{0%,100%{fill:#22c55e;transform:scale(0.95);filter:drop-shadow(0 0 0 rgba(34,197,94,0))}50%{fill:#16a34a;transform:scale(0.9);filter:drop-shadow(0 0 6px rgba(34,197,94,0.7))}}.evtivity-logo-ring{transform-origin:60px 60px;animation:evtivity-logo-spin 10s ease-in-out infinite}.evtivity-logo-bolt{transform-origin:60px 60px;transform:scale(0.95);fill:#22c55e;animation:evtivity-logo-pulse 5s ease-in-out infinite}@media (prefers-reduced-motion:reduce){.evtivity-logo-ring{animation:none}.evtivity-logo-bolt{animation:none}}</style></defs><g class="evtivity-logo-ring"><circle cx="60" cy="60" r="50" fill="none" stroke="#22c55e" stroke-width="12" mask="url(#logoRingGaps)"/></g><path class="evtivity-logo-bolt" d="M68 20L38 68h22l-6 32 30-48H62l6-32z"/></svg>`;
   const animatedLogoDataUri = `data:image/svg+xml;base64,${Buffer.from(animatedLogoSvg).toString('base64')}`;
 
-  // Load overrides from seed.config.json (gitignored, not committed)
-  const seedConfigPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'seed.config.json');
+  // Load overrides from seed.config.json (gitignored, not committed), or from
+  // the file `--config <path>` names (tests).
+  const seedConfigPath =
+    configArg ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', 'seed.config.json');
+  if (configArg !== undefined && !existsSync(configArg)) {
+    throw new Error(`--config: ${configArg} does not exist.`);
+  }
   let seedOverrides: Record<string, unknown> = {};
   if (existsSync(seedConfigPath)) {
     const raw = JSON.parse(readFileSync(seedConfigPath, 'utf-8')) as {
@@ -417,14 +500,11 @@ async function seed(): Promise<void> {
     );
   }
 
-  // Allow first-install env override for the registration policy. After seed
-  // runs, the value lives in the settings table and is edited via dashboard,
-  // API, or Helm appSettings -- not via this env var.
+  // Explicit env override for the registration policy. It fills a missing key
+  // and, with --apply-config, replaces the stored value. Otherwise the value
+  // lives in the settings table and is edited via dashboard, API, or Helm
+  // appSettings -- not via this env var.
   const envRegistrationPolicy = process.env['REGISTRATION_POLICY'];
-  const registrationPolicy =
-    envRegistrationPolicy === 'open' || envRegistrationPolicy === 'approval-required'
-      ? envRegistrationPolicy
-      : 'approval-required';
 
   const defaultSettings: Record<string, unknown> = {
     'system.name': 'EVtivity CSMS',
@@ -440,7 +520,7 @@ async function seed(): Promise<void> {
     'ocpp.connectionTimeout': 120,
     'ocpp.resetRetries': 3,
     'ocpp.offlineCommandTtlHours': 24,
-    'ocpp.registrationPolicy': registrationPolicy,
+    'ocpp.registrationPolicy': 'approval-required',
     'security.autoDisableOnCritical': true,
     'pricing.splitBillingEnabled': true,
     'stationMessage.enabled': false,
@@ -448,9 +528,11 @@ async function seed(): Promise<void> {
     'stationMessage.charging.refreshSeconds': 30,
     'stationMessage.eventMessageTtlSeconds': 30,
     'stationMessage.brandLine': '',
+    'stationMessage.language': DEFAULT_STATION_MESSAGE_LANGUAGE,
     'maintenance.defaultMessageTemplate':
       'This site is temporarily unavailable for maintenance. {{reason}}',
     'notifications.emailEnabled': true,
+    'notifications.webhookAllowedPrivateHosts': [],
     'ftp.host': 'ftp',
     'ftp.port': 21,
     'ftp.username': 'evtivity',
@@ -468,10 +550,31 @@ async function seed(): Promise<void> {
     's3.region': '',
     's3.accessKeyIdEnc': '',
     's3.secretAccessKeyEnc': '',
+    // Provider for new payments; 'none' turns payments off (migration 0116).
+    'payments.provider': 'none',
+    // Default hold amount and platform fee, any provider (migration 0125).
+    'payments.preAuthAmountCents': 5000,
+    'payments.platformFeePercent': 0,
     'stripe.secretKeyEnc': '',
     'stripe.publishableKey': '',
-    'stripe.preAuthAmountCents': 5000,
-    'stripe.platformFeePercent': 0,
+    'stripe.webhookSecretEnc': '',
+    'stripe.connectWebhookSecretEnc': '',
+    // Adyen payment provider (migration 0117).
+    'adyen.apiKeyEnc': '',
+    'adyen.merchantAccount': '',
+    'adyen.clientKey': '',
+    'adyen.environment': 'test',
+    'adyen.liveUrlPrefix': '',
+    'adyen.liveRegion': 'eu',
+    'adyen.hmacKeyEnc': '',
+    'adyen.hmacKeyPreviousEnc': '',
+    'adyen.webhookUsername': '',
+    'adyen.webhookPasswordEnc': '',
+    'adyen.authorisationAdjustment': false,
+    // Test (simulated) provider, where PAYMENTS_ALLOW_SIMULATED is true (migration 0125).
+    'simulated.resultMode': 'sync',
+    'simulated.asyncDelaySeconds': 3,
+    'simulated.randomFailureRate': 0.2,
     'roaming.enabled': false,
     'pnc.enabled': false,
     'pnc.provider': 'manual',
@@ -481,8 +584,14 @@ async function seed(): Promise<void> {
     'pnc.hubject.tokenUrl': '',
     'pnc.expirationWarningDays': 30,
     'pnc.expirationCriticalDays': 7,
+    'pnc.ocsp.allowedPrivateHosts': [],
+    'pnc.local.emaidCountry': '',
+    'pnc.local.emaidProviderId': '',
+    'pnc.local.caEnc': '',
     'company.name': 'EVtivity',
     'company.currency': DEFAULT_CURRENCY,
+    'company.priceDisplay': DEFAULT_PRICE_DISPLAY,
+    'company.taxBasis': DEFAULT_TAX_BASIS,
     'company.contactEmail': 'contact@evtivity.local',
     'company.supportEmail': 'support@evtivity.local',
     'company.supportPhone': '+1 (555) 123-4567',
@@ -491,6 +600,15 @@ async function seed(): Promise<void> {
     'company.state': 'CA',
     'company.zip': '94105',
     'company.country': 'US',
+    'company.taxId': '',
+    'company.taxIdLabel': '',
+    'company.registrationNumber': '',
+    'company.invoiceEmail': '',
+    'company.invoicePhone': '',
+    'company.bankAccountHolder': '',
+    'company.iban': '',
+    'company.bic': '',
+    'company.bankName': '',
     'company.logo': animatedLogoDataUri,
     'company.favicon': logoDataUri,
     qr_code_icon: logoSvg,
@@ -504,7 +622,17 @@ async function seed(): Promise<void> {
     'sustainability.gasolineEmissionFactor': '8.887',
     'sustainability.avgMpg': '25.4',
     'idling.gracePeriodMinutes': 30,
+    'prepaid.lowCreditThresholdCents': 500,
+    'invoice.paymentTermsDays': 30,
+    'invoice.epcQrEnabled': true,
+    'fleet.invoiceRunDay': 1,
+    // Every generated PDF: '' is the default EVtivity logo; '' as a footer prints none.
+    'pdf.logo': '',
+    'pdf.footer': 'www.evtivity.com',
     'session.staleTimeoutHours': 24,
+    // Connection timeout (s) assumed for a station that has not reported its own,
+    // when the CSMS closes a remote start the driver never plugged in for.
+    'session.evConnectionTimeoutSeconds': 180,
     'security.recaptcha.enabled': false,
     'security.recaptcha.siteKey': '',
     'security.recaptcha.secretKeyEnc': '',
@@ -528,6 +656,11 @@ async function seed(): Promise<void> {
     'mobile.attestation.android.cloudProjectNumber': '',
     'mobile.attestation.android.packageName': '',
     'mobile.attestation.android.serviceAccountEnc': '',
+    // The operator's mobile app builds, so the API accepts a 3D Secure return
+    // URL from the app only when it leads back to one of them. Defaults match
+    // the default brand in the mobile repo (brands/index.js).
+    'mobile.app.urlSchemes': ['evtivity'],
+    'mobile.app.androidPackageNames': ['com.evtivity.driver'],
     'audit.retentionDays': 1095,
     'refreshTokens.retentionDays': 30,
     // Per-log retention. Worker prunes each table on the daily cron; set 0 to
@@ -545,6 +678,8 @@ async function seed(): Promise<void> {
     'logs.securityEvents.retentionDays': 365,
     'logs.portStatus.retentionDays': 30,
     'logs.workerJob.retentionDays': 30,
+    'logs.loadAllocation.retentionDays': 90,
+    'logs.loginAudit.retentionDays': 90,
     'reservation.enabled': true,
     'reservation.bufferMinutes': 0,
     'reservation.cancellationWindowMinutes': 0,
@@ -552,8 +687,12 @@ async function seed(): Promise<void> {
     'reservation.maxHours': 3,
     'reservation.activeSessionCheckHours': 3,
     'fleet.enabled': true,
+    'fleet.creditReservationCents': 5000,
     'support.enabled': true,
     'guest.enabled': true,
+    'guest.startsPerIpPerHour': 30,
+    'guest.declinesPerIpPerHour': 5,
+    'autocharge.enabled': false,
     'ocpp.commandRetryMaxAttempts': 3,
     'ocpp.commandRetryBaseDelayMs': 1000,
     'ocpp.commandRetryMaxDelayMs': 30000,
@@ -566,23 +705,73 @@ async function seed(): Promise<void> {
     'googleMaps.defaultLat': '39.8283',
     'googleMaps.defaultLng': '-98.5795',
     'googleMaps.defaultZoom': '4',
+    'ai.anthropic.apiKeyEnc': '',
+    'ai.anthropic.baseUrl': '',
+    'ai.openai.apiKeyEnc': '',
+    'ai.openai.baseUrl': '',
+    'ai.gemini.apiKeyEnc': '',
+    'ai.gemini.baseUrl': '',
+    'ai.deepseek.apiKeyEnc': '',
+    'ai.deepseek.baseUrl': '',
+    'ai.rateLimit.userPerMinute': 10,
+    'ai.rateLimit.sitePerMinute': 60,
+    'ai.budget.userDailyTokens': 2000000,
+    'ai.maxToolCallsPerTurn': 20,
+    'ai.conversationRetentionDays': 30,
+    'ai.attachments.maxBytes': 10485760,
+    'ai.attachments.maxPerMessage': 5,
+    'ai.budget.companyMonthlyTokens': 0,
+    'ai.budget.siteMonthlyTokens': 0,
+    'ai.budget.siteDailyTokens': 300000,
+    'ai.budget.warnPercent': 80,
+    'ai.mcp.enabled': false,
+    'ai.mcp.rateLimitPerMinute': 60,
+    'ai.mcp.dailyCallsPerKey': 5000,
+    'ai.mcp.allowWrites': false,
+    'ai.mcp.allowedOrigins': [],
     'chatbotAi.enabled': false,
     'chatbotAi.provider': 'anthropic',
-    'chatbotAi.apiKeyEnc': '',
     'chatbotAi.model': '',
-    'chatbotAi.temperature': '',
-    'chatbotAi.topP': '',
-    'chatbotAi.topK': '',
+    'chatbotAi.effort': 'medium',
     'chatbotAi.systemPrompt': '',
     'supportAi.enabled': true,
     'supportAi.provider': '',
-    'supportAi.apiKeyEnc': '',
     'supportAi.model': '',
-    'supportAi.temperature': '',
-    'supportAi.topP': '',
-    'supportAi.topK': '',
+    'supportAi.effort': 'medium',
     'supportAi.systemPrompt': '',
     'supportAi.tone': 'professional',
+    'opsAi.enabled': false,
+    'opsAi.provider': 'anthropic',
+    'opsAi.model': '',
+    'opsAi.effort': 'low',
+    'opsAi.systemPrompt': '',
+    'driverAi.enabled': false,
+    'driverAi.provider': 'anthropic',
+    'driverAi.model': '',
+    'driverAi.effort': 'low',
+    'driverAi.systemPrompt': '',
+    'driverAi.maxCasesPerDriverPerDay': 3,
+    'driverAi.feedbackTimeoutHours': 24,
+    'ai.budget.driverDailyTokens': 40000,
+    'ai.rateLimit.driverPerMinute': 2,
+    'aiInsights.station.enabled': true,
+    'aiInsights.session.enabled': true,
+    'aiInsights.authorization.enabled': true,
+    'aiInsights.reservation.enabled': true,
+    'aiInsights.debounceSeconds': 120,
+    'aiInsights.cooldownMinutes': 60,
+    'aiInsights.siteIncidentThreshold': 3,
+    'aiInsights.maxPerSitePerDay': 50,
+    'aiInsights.primaryLanguage': 'en',
+    'aiInsights.retentionDays': 90,
+    'aiInsights.expireAfterDays': 7,
+    'aiWorkers.networkSummary.enabled': false,
+    'aiWorkers.stuckSessions.enabled': false,
+    'aiWorkers.stuckSessions.idleMinutes': 90,
+    'aiWorkers.stuckSessions.useModel': false,
+    'aiWorkers.stuckSessions.offlineEndAfterHours': 24,
+    'aiWorkers.tariffAnomalies.enabled': false,
+    'aiWorkers.proposalTtlHours': 24,
     'sso.enabled': false,
     'sso.provider': '',
     'sso.entryPoint': '',
@@ -593,63 +782,72 @@ async function seed(): Promise<void> {
     'sso.attributeMapping': '{"email":"email","firstName":"firstName","lastName":"lastName"}',
   };
 
-  // Config file uses plaintext key names (no Enc suffix). Map them to DB key names.
-  const encryptedKeyMap: Record<string, string> = {
-    's3.accessKeyId': 's3.accessKeyIdEnc',
-    's3.secretAccessKey': 's3.secretAccessKeyEnc',
-    'stripe.secretKey': 'stripe.secretKeyEnc',
-    'security.recaptcha.secretKey': 'security.recaptcha.secretKeyEnc',
-    'pnc.hubject.clientSecret': 'pnc.hubject.clientSecretEnc',
-    'chatbotAi.apiKey': 'chatbotAi.apiKeyEnc',
-    'supportAi.apiKey': 'supportAi.apiKeyEnc',
-    'sso.cert': 'sso.certEnc',
-    // Operators editing seed.config.json keep the plaintext key names; the
-    // seed maps them to the *Enc db keys and the auto-encrypt loop below
-    // encrypts the value.
-    'smtp.password': 'smtp.passwordEnc',
-    'twilio.authToken': 'twilio.authTokenEnc',
-    'ftp.password': 'ftp.passwordEnc',
-    'googleMaps.apiKey': 'googleMaps.apiKeyEnc',
-    'mobile.attestation.android.serviceAccount': 'mobile.attestation.android.serviceAccountEnc',
-  };
-
-  // Remap config file keys to their Enc DB counterparts
-  const remappedOverrides: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(seedOverrides)) {
-    const dbKey = encryptedKeyMap[key] ?? key;
-    remappedOverrides[dbKey] = value;
+  // Remap config file keys to their Enc DB counterparts (seed-settings.ts).
+  // The explicit configuration is the env registration policy (when set) plus
+  // the config file, which wins. A removed key and a secret-looking key with
+  // no Enc mapping are skipped, so no secret lands as a plaintext row.
+  const explicitSettings: Record<string, unknown> = {};
+  if (envRegistrationPolicy === 'open' || envRegistrationPolicy === 'approval-required') {
+    explicitSettings['ocpp.registrationPolicy'] = envRegistrationPolicy;
   }
+  const mappedSeedSettings = mapSeedSettings(seedOverrides);
+  for (const warning of mappedSeedSettings.warnings) console.warn(`  ${warning}`);
+  Object.assign(explicitSettings, mappedSeedSettings.settings);
 
-  // Merge: config file overrides win over defaults
-  const mergedSettings = { ...defaultSettings, ...remappedOverrides };
+  // Merge: explicit configuration wins over built-in defaults for missing keys
+  const mergedSettings = { ...defaultSettings, ...explicitSettings };
 
-  // Auto-encrypt keys ending in "Enc" when they have a non-empty plaintext value.
-  // Fail loud if any Enc key has a non-empty value but SETTINGS_ENCRYPTION_KEY is
-  // missing -- the alternative is silently persisting credentials as plaintext,
-  // which breaks the "Enc suffix == encrypted at rest" contract and then makes
-  // every subsequent decryption attempt at runtime fail with a confusing error.
-  const encryptionKey = process.env['SETTINGS_ENCRYPTION_KEY'] ?? '';
-  const settingsRows = Object.entries(mergedSettings).map(([key, value]) => {
-    if (key.endsWith('Enc') && typeof value === 'string' && value !== '') {
-      if (encryptionKey === '') {
-        throw new Error(
-          `Cannot seed ${key} with a non-empty value when SETTINGS_ENCRYPTION_KEY is missing. ` +
-            `Set the env var or clear ${key} in seed.config.json.`,
-        );
-      }
-      return { key, value: encryptString(value, encryptionKey) };
-    }
-    return { key, value };
-  });
+  // Encrypts every non-empty Enc value with SETTINGS_ENCRYPTION_KEY and fails
+  // loud without the key: persisting credentials as plaintext would break the
+  // "Enc suffix == encrypted at rest" contract (P12).
+  const settingsRows = seedSettingRows(
+    mergedSettings,
+    process.env['SETTINGS_ENCRYPTION_KEY'] ?? '',
+  );
 
-  await db
+  // Only missing keys are added. An existing value is the operator's (or the
+  // migration default) and a rerun must not reset it (P7).
+  const addedSettings = await db
     .insert(settings)
     .values(settingsRows)
-    .onConflictDoUpdate({
-      target: settings.key,
-      set: { value: sql`EXCLUDED.value`, updatedAt: new Date() },
-    });
-  console.log(`  ${String(settingsRows.length)} settings created.`);
+    .onConflictDoNothing({ target: settings.key })
+    .returning({ key: settings.key });
+  console.log(
+    `  ${String(addedSettings.length)} settings added, ${String(settingsRows.length - addedSettings.length)} existing kept.`,
+  );
+  const explicitRows = settingsRows.filter((row) => row.key in explicitSettings);
+  if (applyConfig && explicitRows.length > 0) {
+    await db
+      .insert(settings)
+      .values(explicitRows)
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: sql`EXCLUDED.value`, updatedAt: new Date() },
+      });
+    console.log(`  ${String(explicitRows.length)} settings applied from seed.config.json and env.`);
+  } else if (explicitRows.length > 0) {
+    console.log(
+      '  seed.config.json and env values only filled missing settings; pass --apply-config to overwrite existing ones.',
+    );
+  }
+  if (applyConfig) {
+    // Migrations insert some connection settings as blank placeholders
+    // (smtp.host, smtp.port, smtp.from, ftp.*). On the freshly wiped database
+    // the built-in defaults fill those, so a checkout without seed.config.json
+    // still sends mail to Mailpit and uploads logs to the compose FTP server.
+    // A non-blank value (migration or operator) is never replaced here.
+    let filled = 0;
+    for (const row of settingsRows) {
+      if (row.key in explicitSettings || row.value === '' || row.value == null) continue;
+      const updated = await db
+        .update(settings)
+        .set({ value: row.value, updatedAt: new Date() })
+        .where(and(eq(settings.key, row.key), sql`${settings.value} = '""'::jsonb`))
+        .returning({ key: settings.key });
+      filled += updated.length;
+    }
+    console.log(`  ${String(filled)} blank settings filled with built-in defaults.`);
+  }
   // Demo money uses the operator's currency, whatever the config set it to.
   clearSystemSettingsCache();
   const companyCurrency = await getCompanyCurrency();
@@ -700,72 +898,53 @@ async function seed(): Promise<void> {
   );
 
   // ------ Station Message Templates (always seeded) ------
-  // One row per OCPP MessageState slot. ON CONFLICT DO NOTHING so re-runs
+  // One row per state and display language. ON CONFLICT DO NOTHING so re-runs
   // don't overwrite operator edits. Defaults sourced from @evtivity/lib so
   // the API "Reset to default" handler can re-insert the same content.
-  const stationMessageTemplateRows = (
-    Object.entries(STATION_MESSAGE_DEFAULTS) as Array<
-      [keyof typeof STATION_MESSAGE_DEFAULTS, string]
-    >
-  ).map(([state, body]) => ({ state, body }));
+  const stationMessageTemplateRows = STATION_MESSAGE_LANGUAGES.flatMap((language) =>
+    Object.entries(STATION_MESSAGE_DEFAULTS[language]).map(([state, body]) => ({
+      state,
+      language,
+      body,
+    })),
+  );
   await db
     .insert(stationMessageTemplates)
     .values(stationMessageTemplateRows)
-    .onConflictDoNothing({ target: stationMessageTemplates.state });
+    .onConflictDoNothing({
+      target: [stationMessageTemplates.state, stationMessageTemplates.language],
+    });
   console.log(`  ${String(stationMessageTemplateRows.length)} station message templates seeded.`);
+
+  // The migration 0001 Main Office site gets the seeded electricity rates when
+  // it has none (an operator's rates stay), with and without demo data.
+  const mainOfficeRates = await ensureSiteElectricityRates(db, 'sit_000000000001');
+  if (mainOfficeRates > 0) {
+    console.log(`  ${String(mainOfficeRates)} electricity rate periods added to Main Office.`);
+  }
 
   if (!seedDemo) {
     // When SEED_DEMO=false, only create roles, admin user, and permissions, then exit
     const argon2 = await import('argon2');
     const passwordHash = await argon2.hash(initialAdminPassword);
 
-    const [adminRole] = await db
-      .insert(roles)
-      .values({
-        name: 'admin',
-        description: 'Full system access',
-        permissions: JSON.stringify(['*']),
-      })
-      .onConflictDoUpdate({
-        target: roles.name,
-        set: { permissions: JSON.stringify(['*']), updatedAt: new Date() },
-      })
-      .returning({ id: roles.id });
-    await db
-      .insert(roles)
-      .values({
-        name: 'operator',
-        description: 'Operational access',
-        permissions: JSON.stringify(OPERATOR_DEFAULT_PERMISSIONS),
-      })
-      .onConflictDoUpdate({
-        target: roles.name,
-        set: { permissions: JSON.stringify(OPERATOR_DEFAULT_PERMISSIONS), updatedAt: new Date() },
-      });
-    console.log('  2 roles created.');
+    const adminRoleId = await ensureRole('admin', 'Full system access', ['*']);
+    await ensureRole('operator', 'Operational access', permissionCatalog.defaultsFor('operator'));
+    console.log('  2 roles ensured.');
 
-    const [adminUser] = await db
-      .insert(users)
+    // An existing admin keeps its password: a rerun must never reset it.
+    const adminUserId = await ensureUser({
+      email: initialAdminEmail,
+      passwordHash,
+      firstName: 'Admin',
+      lastName: 'User',
+      roleId: adminRoleId,
+      hasAllSiteAccess: true,
+    });
+    console.log(`  Admin user ensured (${initialAdminEmail}).`);
 
-      .values({
-        email: initialAdminEmail,
-        passwordHash,
-        firstName: 'Admin',
-        lastName: 'User',
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        roleId: adminRole!.id,
-        hasAllSiteAccess: true,
-      })
-      .onConflictDoUpdate({
-        target: users.email,
-        set: { passwordHash: sql`EXCLUDED.password_hash`, updatedAt: new Date() },
-      })
-      .returning({ id: users.id });
-    console.log(`  1 admin user created (${initialAdminEmail}).`);
-
-    const permRows = ADMIN_DEFAULT_PERMISSIONS.map((perm) => ({
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      userId: adminUser!.id,
+    const permRows = permissionCatalog.defaultsFor('admin').map((perm) => ({
+      userId: adminUserId,
       permission: perm,
     }));
     await db.insert(userPermissions).values(permRows).onConflictDoNothing();
@@ -774,6 +953,14 @@ async function seed(): Promise<void> {
     console.log('Seed complete (SEED_DEMO=false).');
     await client.end();
     return;
+  }
+
+  // Demo installs run the CS-0001/CS-0002 simulators (fixtures of migration
+  // 0001, inserted pending) like the compose dev fixture does. Before the demo
+  // marker check, so a rerun also fixes a demo install seeded before this.
+  const acceptedFixtures = await acceptPendingFixtureStations();
+  if (acceptedFixtures.length > 0) {
+    console.log(`  Accepted pending fixture stations: ${acceptedFixtures.join(', ')}.`);
   }
 
   // The demo rows have no natural keys (random sessions, generated IDs), so
@@ -865,15 +1052,11 @@ async function seed(): Promise<void> {
   // ------ Charging Stations (2000) ------
   // Stations 1-1000 (indices 0-999): OCPP 2.1
   // Stations 1001-2000 (indices 1000-1999): OCPP 1.6
-  const stationStatuses: Array<'available' | 'unavailable' | 'faulted'> = [
-    'available',
-    'available',
-    'available',
-    'unavailable',
-    'faulted',
-  ];
+  // About 1 in 5 demo stations is switched off by an operator. Availability is
+  // computed from that and the connectors, so it is not seeded directly.
+  const disabledReasons: Array<'operator' | null> = [null, null, null, null, 'operator'];
   // Hash default password for SP1/SP2 stations (matches simulator default STATION_PASSWORD=password)
-  const stationPasswordHash = await argon2.hash('password');
+  const stationPasswordHash = await argon2.hash('password', { ...STATION_PASSWORD_HASH_OPTIONS });
   // Track Saratoga Springs site IDs for station-level coordinate assignment
   const saratogaSiteIds = new Set(createdSites.slice(0, 5).map((s) => s.id));
   const saratogaSiteCoords = new Map<string, { lat: number; lng: number }>();
@@ -890,7 +1073,7 @@ async function seed(): Promise<void> {
     const siteRef = pick(createdSites);
     const modelInfo = is16 ? pick(STATION_MODELS_16) : pick(STATION_MODELS);
     stationModels.push(modelInfo);
-    const availability = pick(stationStatuses);
+    const disabledReason = pick(disabledReasons);
     // Simulator stations start offline; the CSS process sets them online when it connects.
     const isOnline = false;
     // Vary load priority: ~15% high (8-10), ~15% low (1-3), rest default (5)
@@ -940,7 +1123,8 @@ async function seed(): Promise<void> {
         0,
         15,
       ),
-      availability,
+      disabledReason,
+      availability: disabledReason == null ? ('available' as const) : ('unavailable' as const),
       onboardingStatus: 'accepted' as const,
       isOnline,
       lastHeartbeat: null,
@@ -997,7 +1181,6 @@ async function seed(): Promise<void> {
   }
 
   // ------ Site Power Limits (first 8 sites) ------
-  const strategies: Array<'equal_share' | 'priority_based'> = ['equal_share', 'priority_based'];
   const powerLimitRows = createdSites.slice(0, 8).map((site, i) => {
     // Count stations assigned to this site
     const stationCount = stationRows.filter((s) => s.siteId === site.id).length;
@@ -1008,7 +1191,7 @@ async function seed(): Promise<void> {
       siteId: site.id,
       maxPowerKw: String(maxPowerKw),
       safetyMarginKw: String(randomInt(5, 15)),
-      strategy: strategies[i % 2] as 'equal_share' | 'priority_based',
+      strategy: LOAD_ALLOCATION_STRATEGIES[i % LOAD_ALLOCATION_STRATEGIES.length] ?? 'equal_share',
       isEnabled: i < 5,
     };
   });
@@ -1020,7 +1203,7 @@ async function seed(): Promise<void> {
   // ------ Site Load Management (hierarchical model, mirrors sitePowerLimits) ------
   const loadMgmtRows = createdSites.slice(0, 8).map((site, i) => ({
     siteId: site.id,
-    strategy: strategies[i % 2] as 'equal_share' | 'priority_based',
+    strategy: LOAD_ALLOCATION_STRATEGIES[i % LOAD_ALLOCATION_STRATEGIES.length] ?? 'equal_share',
     isEnabled: i < 5,
   }));
   await db.insert(siteLoadManagement).values(loadMgmtRows);
@@ -1123,8 +1306,8 @@ async function seed(): Promise<void> {
   // simulator hardware, so the simulator reports them and CSMS auto-creates.
   const autoCreateGapEvses: Array<{ stationIdx: number; evseId: number }> = [];
   for (let i = 0; i < createdStations.length; i++) {
-    const is16 = i >= 160;
-    // 1.6 stations get 1-2 connectors, each with its own EVSE (1:1 mapping)
+    const is16 = at(stationRows, i).ocppProtocol === 'ocpp1.6';
+    // 1.6 stations get 1-2 connectors, each with its own EVSE (EVSE N / connector N)
     // 2.1 stations get 2-3 EVSEs
     const numEvses = is16 ? randomInt(1, 2) : i % 5 === 0 ? 3 : 2;
     // For every 10th 2.1 station, skip the last EVSE so the simulator triggers auto-creation
@@ -1164,14 +1347,16 @@ async function seed(): Promise<void> {
   }> = [];
   for (let i = 0; i < createdEvses.length; i++) {
     const stationIdx = at(evseStationIdx, i);
-    const is16 = stationIdx >= 160;
+    const is16 = at(stationRows, stationIdx).ocppProtocol === 'ocpp1.6';
     const modelInfo = at(stationModels, stationIdx);
     const evse = at(createdEvses, i);
 
-    // Primary connector
+    // Primary connector. OCPP 1.6 connector N is EVSE N / connector N, the
+    // numbering the 1.6 StatusNotification handler and the simulator use.
+    // 2.1 connectors start at 1 per EVSE.
     connectorRows.push({
       evseId: evse.id,
-      connectorId: 1,
+      connectorId: is16 ? at(evseRows, i).evseId : 1,
       status: pick(connectorStatuses),
       connectorType: modelInfo.type,
       maxPowerKw: String(modelInfo.power),
@@ -1269,22 +1454,9 @@ async function seed(): Promise<void> {
   }
 
   // ------ Roles ------
-  // Upsert by name: the migrate container's seed:admin step may have already
-  // created the admin role before this script runs.
-  const [adminRole] = await db
-    .insert(roles)
-    .values({
-      name: 'admin',
-      description: 'Full system access',
-      permissions: JSON.stringify(['*']),
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { permissions: JSON.stringify(['*']), updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  const operatorPermissions = JSON.stringify([
+  // Insert when missing: migration 0001 and the migrate container's
+  // seed:admin step create these roles before this script runs.
+  const operatorPermissions = [
     'stations:*',
     'sessions:*',
     'drivers:*',
@@ -1301,36 +1473,15 @@ async function seed(): Promise<void> {
     'payments:*',
     'load-management:*',
     'logs:*',
-  ]);
-  const [operatorRole] = await db
-    .insert(roles)
-    .values({
-      name: 'operator',
-      description: 'Day-to-day operations access',
-      permissions: operatorPermissions,
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { permissions: operatorPermissions, updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  const [viewerRole] = await db
-    .insert(roles)
-    .values({
-      name: 'viewer',
-      description: 'Read-only access',
-    })
-    .onConflictDoUpdate({
-      target: roles.name,
-      set: { updatedAt: new Date() },
-    })
-    .returning({ id: roles.id });
-
-  if (adminRole == null || operatorRole == null || viewerRole == null) {
-    throw new Error('Failed to create roles');
-  }
-  console.log('  3 roles created.');
+  ];
+  const adminRoleId = await ensureRole('admin', 'Full system access', ['*']);
+  const operatorRoleId = await ensureRole(
+    'operator',
+    'Day-to-day operations access',
+    operatorPermissions,
+  );
+  await ensureRole('viewer', 'Read-only access', []);
+  console.log('  3 roles ensured.');
 
   // ------ Users (20) ------
   const passwordHash = await argon2.hash('admin123');
@@ -1341,7 +1492,7 @@ async function seed(): Promise<void> {
       passwordHash: adminPasswordHash,
       firstName: 'Admin',
       lastName: 'User',
-      roleId: adminRole.id,
+      roleId: adminRoleId,
       hasAllSiteAccess: true,
     },
     // Operators 1-3: all-site access
@@ -1350,7 +1501,7 @@ async function seed(): Promise<void> {
       passwordHash,
       firstName: at(FIRST_NAMES, i),
       lastName: at(LAST_NAMES, i),
-      roleId: operatorRole.id,
+      roleId: operatorRoleId,
       hasAllSiteAccess: true,
     })),
     // Operators 4-9: specific site assignments (added below)
@@ -1359,25 +1510,23 @@ async function seed(): Promise<void> {
       passwordHash,
       firstName: at(FIRST_NAMES, i + 3),
       lastName: at(LAST_NAMES, i + 3),
-      roleId: operatorRole.id,
+      roleId: operatorRoleId,
     })),
   ];
-  await db
+  // Existing users (the admin from seed:admin) keep their password.
+  const createdUserRows = await db
     .insert(users)
     .values(userRows)
-    .onConflictDoUpdate({
-      target: users.email,
-      set: { passwordHash: sql`EXCLUDED.password_hash`, updatedAt: new Date() },
-    });
-  console.log('  10 users created.');
+    .onConflictDoNothing({ target: users.email })
+    .returning({ id: users.id });
+  console.log(`  ${String(createdUserRows.length)} users created.`);
 
   // ------ User Permissions ------
   const createdUsers = await db.select({ id: users.id, roleId: users.roleId }).from(users);
 
   const permRows: { userId: string; permission: string }[] = [];
   for (const u of createdUsers) {
-    const defaults =
-      u.roleId === adminRole.id ? ADMIN_DEFAULT_PERMISSIONS : OPERATOR_DEFAULT_PERMISSIONS;
+    const defaults = permissionCatalog.defaultsFor(u.roleId === adminRoleId ? 'admin' : 'operator');
     for (const perm of defaults) {
       permRows.push({ userId: u.id, permission: perm });
     }
@@ -1492,13 +1641,24 @@ async function seed(): Promise<void> {
   const cardBrands = ['visa', 'mastercard', 'amex'];
   const paymentMethodRows = createdDrivers.map((driver, i) => ({
     driverId: driver.id,
-    stripeCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
-    stripePaymentMethodId: `pm_sim_${padNum(i + 1, 6)}`,
+    provider: 'simulated',
+    providerCustomerId: `cus_sim_${padNum(i + 1, 6)}`,
+    providerPaymentMethodId: i === 0 ? REBILL_DEMO_METHOD_ID : `pm_sim_${padNum(i + 1, 6)}`,
     cardBrand: cardBrands[i % cardBrands.length] ?? 'visa',
     cardLast4: '4242',
     isDefault: true,
   }));
   await db.insert(driverPaymentMethods).values(paymentMethodRows);
+  await db
+    .insert(driverPaymentCustomers)
+    .values(
+      paymentMethodRows.map((row) => ({
+        driverId: row.driverId,
+        provider: row.provider,
+        providerCustomerId: row.providerCustomerId,
+      })),
+    )
+    .onConflictDoNothing();
   console.log(`  ${String(paymentMethodRows.length)} driver payment methods created.`);
 
   // ------ Vehicles (120) ------
@@ -1612,30 +1772,30 @@ async function seed(): Promise<void> {
   console.log(`  ${String(pgSiteRows.length)} pricing-group-site assignments created.`);
 
   // ------ Electricity rate periods (one default + one weekday peak per site) ------
-  const electricityRateRows = createdSites.flatMap((site) => [
-    {
-      siteId: site.id,
-      name: 'Standard',
-      ratePerKwh: '0.120000',
-      restrictions: null,
-      priority: 0,
-      isDefault: true,
-    },
-    {
-      siteId: site.id,
-      name: 'Weekday Peak',
-      ratePerKwh: '0.220000',
-      restrictions: {
-        timeRange: { startTime: '16:00', endTime: '21:00' },
-        daysOfWeek: [1, 2, 3, 4, 5],
-      },
-      priority: 20,
-      isDefault: false,
-    },
-  ]);
+  const electricityRateRows = createdSites.flatMap((site) => seedElectricityRateRows(site.id));
+  const siteRatePeriods = new Map<string, ElectricityRatePeriod[]>();
   for (let i = 0; i < electricityRateRows.length; i += 500) {
-    await db.insert(siteElectricityRatePeriods).values(electricityRateRows.slice(i, i + 500));
+    const inserted = await db
+      .insert(siteElectricityRatePeriods)
+      .values(electricityRateRows.slice(i, i + 500))
+      .returning();
+    for (const row of inserted) {
+      const list = siteRatePeriods.get(row.siteId) ?? [];
+      list.push({
+        id: row.id,
+        siteId: row.siteId,
+        name: row.name,
+        ratePerKwh: row.ratePerKwh,
+        restrictions: row.restrictions as ElectricityRatePeriodRestrictions | null,
+        priority: row.priority,
+        isDefault: row.isDefault,
+      });
+      siteRatePeriods.set(row.siteId, list);
+    }
   }
+  const siteTimezones = new Map(
+    createdSites.map((site, i) => [site.id, at(siteRows, i).timezone] as const),
+  );
   console.log(
     `  ${String(electricityRateRows.length)} electricity rate periods created across ${String(createdSites.length)} sites.`,
   );
@@ -1647,8 +1807,8 @@ async function seed(): Promise<void> {
   });
   console.log('  VIP pricing group assigned to driver@evtivity.local.');
 
-  // ------ Charging Sessions (10000) ------
-  const sessionStatuses: Array<'active' | 'completed' | 'faulted'> = [
+  // ------ Charging Sessions (10000 ended, plus a few active) ------
+  const sessionStatuses: Array<'completed' | 'faulted'> = [
     'completed',
     'completed',
     'completed',
@@ -1657,8 +1817,29 @@ async function seed(): Promise<void> {
     'completed',
     'completed',
     'completed',
-    'active',
+    'completed',
     'faulted',
+  ];
+  // Active sessions go only on security profile 3 stations: their simulators are disabled,
+  // so a seeded session never holds an EVSE that a simulator or a portal driver starts on.
+  const activeSessionStationIdxs = stationRows
+    .flatMap((s, idx) => (s.securityProfile === 3 ? [idx] : []))
+    .slice(0, DEMO_ACTIVE_SESSION_COUNT);
+  const sessionPlans: Array<{
+    status: 'active' | 'completed' | 'faulted';
+    stationIdx: number;
+    startedAt: Date;
+  }> = [
+    ...Array.from({ length: 10000 }, (_, i) => ({
+      status: pick(sessionStatuses),
+      stationIdx: i % createdStations.length,
+      startedAt: randomDate(90),
+    })),
+    ...activeSessionStationIdxs.map((stationIdx) => ({
+      status: 'active' as const,
+      stationIdx,
+      startedAt: new Date(Date.now() - randomInt(5, 60) * 60 * 1000),
+    })),
   ];
   const stopReasons = [
     'EVDisconnected',
@@ -1672,6 +1853,7 @@ async function seed(): Promise<void> {
   const sessionRows: Array<{
     currency: string;
     stationId: string;
+    siteId: SQL<string | null>;
     evseId: string;
     connectorId: string;
     driverId: string;
@@ -1685,18 +1867,19 @@ async function seed(): Promise<void> {
     stoppedReason: string | null;
     currentCostCents: number | null;
     finalCostCents: number | null;
+    netCents: number;
+    taxCents: number;
+    costBreakdown: SessionCostBreakdown;
     electricityCostCents: number | null;
   }> = [];
 
-  for (let i = 0; i < 10000; i++) {
-    const status = pick(sessionStatuses);
-    const stationIdx = i % createdStations.length;
+  for (let i = 0; i < sessionPlans.length; i++) {
+    const { status, stationIdx, startedAt } = at(sessionPlans, i);
     const stationEvses = createdEvses.filter(
       (e) => e.stationId === at(createdStations, stationIdx).id,
     );
     const evse = stationEvses.length > 0 ? pick(stationEvses) : at(createdEvses, i);
     const driver = pick(createdDrivers);
-    const startedAt = randomDate(90);
     const durationMinutes = randomInt(5, 240);
     const endedAt =
       status !== 'active' ? new Date(startedAt.getTime() + durationMinutes * 60 * 1000) : null;
@@ -1705,16 +1888,32 @@ async function seed(): Promise<void> {
     const meterStop = status !== 'active' ? meterStart + energyWh : null;
     // Cost: ~$0.15-0.30/kWh, so cents = energyWh / 1000 * 15-30
     const costCents = Math.round((energyWh / 1000) * randomInt(15, 30));
-    // Operator electricity cost at the seeded $0.12/kWh Standard rate.
-    const electricityCostCents = status !== 'active' ? Math.round((energyWh / 1000) * 12) : null;
+    // A faulted session is not billed: it costs nothing, as the payment gate
+    // and the stale-session cleanup leave a real one.
+    const billedCents = status === 'faulted' ? 0 : costCents;
+    // Operator electricity cost from the site's rate periods, as the session
+    // end projection computes it (the period in force at the end time).
+    const stationSiteId = at(stationRows, stationIdx).siteId;
+    const electricityCostCents =
+      endedAt != null
+        ? seedSessionElectricityCostCents(
+            siteRatePeriods.get(stationSiteId) ?? [],
+            energyWh,
+            endedAt,
+            siteTimezones.get(stationSiteId),
+          )
+        : null;
 
     sessionRows.push({
       currency: companyCurrency,
       stationId: at(createdStations, stationIdx).id,
+      siteId: sessionSiteIdSql(sql, at(createdStations, stationIdx).id),
       evseId: evse.id,
       connectorId: at(connectorRows, createdEvses.indexOf(evse)).evseId,
       driverId: driver.id,
-      transactionId: createId('session'),
+      // What a real station sends: an integer on OCPP 1.6, a UUID on 2.1.
+      transactionId:
+        at(stationRows, stationIdx).ocppProtocol === 'ocpp1.6' ? String(100000 + i) : randomUUID(),
       status,
       startedAt,
       endedAt,
@@ -1723,7 +1922,9 @@ async function seed(): Promise<void> {
       energyDeliveredWh: status !== 'active' ? String(energyWh) : null,
       stoppedReason: status === 'completed' ? pick(stopReasons) : null,
       currentCostCents: status === 'active' ? costCents : null,
-      finalCostCents: status !== 'active' ? costCents : null,
+      finalCostCents: status !== 'active' ? billedCents : null,
+      // Demo sessions have no tariff snapshot, so no tax rate.
+      ...demoCostSplit(billedCents, 0),
       electricityCostCents,
     });
   }
@@ -1777,8 +1978,9 @@ async function seed(): Promise<void> {
         return {
           sessionId: session.id,
           driverId,
-          stripePaymentIntentId: intentId,
-          stripeCustomerId: customerId,
+          provider: 'simulated',
+          providerPaymentId: intentId,
+          providerCustomerId: customerId,
           paymentSource: 'web_portal' as const,
           currency: companyCurrency,
           preAuthAmountCents: 5000,
@@ -1793,8 +1995,9 @@ async function seed(): Promise<void> {
         return {
           sessionId: session.id,
           driverId,
-          stripePaymentIntentId: intentId,
-          stripeCustomerId: customerId,
+          provider: 'simulated',
+          providerPaymentId: intentId,
+          providerCustomerId: customerId,
           paymentSource: 'web_portal' as const,
           currency: companyCurrency,
           preAuthAmountCents: 5000,
@@ -1875,16 +2078,7 @@ async function seed(): Promise<void> {
     'Voltage',
     'SoC',
   ];
-  const meterValueRows: Array<{
-    stationId: string;
-    sessionId: string;
-    timestamp: Date;
-    measurand: string;
-    unit: string;
-    value: string;
-    context: string;
-    location: string;
-  }> = [];
+  const meterValueRows: DemoMeterValueRow[] = [];
 
   for (const session of createdSessions.slice(0, 8000)) {
     const start = session.startedAt ?? new Date();
@@ -1931,10 +2125,8 @@ async function seed(): Promise<void> {
     }
   }
 
-  for (let i = 0; i < meterValueRows.length; i += 500) {
-    await db.insert(meterValues).values(meterValueRows.slice(i, i + 500));
-  }
-  console.log(`  ${String(meterValueRows.length)} meter values created.`);
+  const meterValueCount = await insertDemoMeterValues(client, meterValueRows);
+  console.log(`  ${String(meterValueCount)} meter values created.`);
 
   // ------ Reservations (30) ------
   const reservationStatuses: Array<'active' | 'used' | 'cancelled' | 'expired'> = [
@@ -2169,11 +2361,9 @@ async function seed(): Promise<void> {
 
   // ------ OCPI Simulator Partner ------
   // Pre-seeds a partner record for the ocpi-simulator (NL/SIM, eMSP role).
-  // The registration token 'ocpi-sim-reg-token' lets the simulator complete the
-  // credentials handshake. Set OCPI_REGISTRATION_TOKEN=ocpi-sim-reg-token in
-  // the simulator's env and point OCPI_TARGET_URL at the OCPI server.
-  const SIM_REG_TOKEN = 'ocpi-sim-reg-token';
-  const simTokenHash = await argon2.hash(SIM_REG_TOKEN);
+  // Its registration token is generated here, bound to the partner, and
+  // printed once: pass it to the simulator (OCPI_REGISTRATION_TOKEN or POST
+  // /sim/register). Roaming > Partners issues a new one at any time.
   const [simPartner] = await db
     .insert(ocpiPartners)
     .values({
@@ -2185,20 +2375,14 @@ async function seed(): Promise<void> {
       status: 'pending',
       version: '2.2.1',
       versionUrl: 'http://localhost:7105/ocpi/versions',
+      // Local simulator on localhost or a Docker name: a private address.
+      allowPrivateNetwork: true,
     })
     .returning({ id: ocpiPartners.id });
 
   if (simPartner == null) throw new Error('Failed to create OCPI simulator partner');
 
-  // Registration token: partnerId is null until the handshake completes.
-  // handleRegistration will match the partner by country_code/party_id and deactivate this token.
-  await db.insert(ocpiCredentialsTokens).values({
-    partnerId: null,
-    tokenHash: simTokenHash,
-    tokenPrefix: SIM_REG_TOKEN.slice(0, 8),
-    direction: 'issued',
-    isActive: true,
-  });
+  const simRegToken = await issueOcpiRegistrationToken(simPartner.id, db);
 
   // Pre-seed the endpoints the simulator will advertise once registered
   const simBase = 'http://localhost:7105/ocpi/2.2.1';
@@ -2240,14 +2424,12 @@ async function seed(): Promise<void> {
       url: `${simBase}/credentials`,
     },
   ]);
-  console.log(`  OCPI simulator partner seeded (NL/SIM). Registration token: ${SIM_REG_TOKEN}`);
+  console.log(`  OCPI simulator partner seeded (NL/SIM). Registration token: ${simRegToken}`);
 
   // ------ OCPI CPO Simulator Partner ------
   // Pre-seeds a partner record for the CPO simulator (DE/CPO, CPO role).
   // Run with: npm run dev:ocpi-sim-cpo
   // OCPI_SIM_AUTO_SESSION=true triggers the auto-session loop after registration.
-  const CPO_SIM_REG_TOKEN = 'ocpi-cpo-sim-reg-token';
-  const cpoSimTokenHash = await argon2.hash(CPO_SIM_REG_TOKEN);
   const [cpoSimPartner] = await db
     .insert(ocpiPartners)
     .values({
@@ -2259,18 +2441,14 @@ async function seed(): Promise<void> {
       status: 'pending',
       version: '2.2.1',
       versionUrl: 'http://localhost:7106/ocpi/versions',
+      // Local simulator on localhost or a Docker name: a private address.
+      allowPrivateNetwork: true,
     })
     .returning({ id: ocpiPartners.id });
 
   if (cpoSimPartner == null) throw new Error('Failed to create OCPI CPO simulator partner');
 
-  await db.insert(ocpiCredentialsTokens).values({
-    partnerId: null,
-    tokenHash: cpoSimTokenHash,
-    tokenPrefix: CPO_SIM_REG_TOKEN.slice(0, 8),
-    direction: 'issued',
-    isActive: true,
-  });
+  const cpoSimRegToken = await issueOcpiRegistrationToken(cpoSimPartner.id, db);
 
   const cpoSimBase = 'http://localhost:7106/ocpi/2.2.1';
   await db.insert(ocpiPartnerEndpoints).values([
@@ -2312,7 +2490,7 @@ async function seed(): Promise<void> {
     },
   ]);
   console.log(
-    `  OCPI CPO simulator partner seeded (DE/CPO). Registration token: ${CPO_SIM_REG_TOKEN}`,
+    `  OCPI CPO simulator partner seeded (DE/CPO). Registration token: ${cpoSimRegToken}`,
   );
 
   // ------ SP3 Test CA Certificate ------
@@ -2321,8 +2499,8 @@ async function seed(): Promise<void> {
   let caCertPem: string;
   try {
     caCertPem = readFileSync(resolve(testCertsDir, 'ca.pem'), 'utf-8');
-  } catch {
-    console.log('  Skipping SP3 cert seeding: test-certs/ca.pem not found.');
+  } catch (err) {
+    console.log(`  Skipping SP3 cert seeding: cannot read test-certs/ca.pem (${String(err)}).`);
     caCertPem = '';
   }
 
@@ -2344,7 +2522,10 @@ async function seed(): Promise<void> {
     let clientCertPem: string;
     try {
       clientCertPem = readFileSync(resolve(testCertsDir, 'client.pem'), 'utf-8');
-    } catch {
+    } catch (err) {
+      console.log(
+        `  Skipping SP3 station certificates: cannot read test-certs/client.pem (${String(err)}).`,
+      );
       clientCertPem = '';
     }
 
@@ -2373,7 +2554,7 @@ async function seed(): Promise<void> {
   const portalDriverId = portalTestDriver.id;
   const portalSessionRows: Array<{
     stationId: string;
-    siteId: string;
+    siteId: SQL<string | null>;
     evseId: string;
     driverId: string;
     transactionId: string;
@@ -2384,8 +2565,13 @@ async function seed(): Promise<void> {
     meterStop: number;
     energyDeliveredWh: string;
     finalCostCents: number;
+    tariffTaxRate: string;
+    netCents: number;
+    taxCents: number;
+    costBreakdown: SessionCostBreakdown;
     currency: string;
     stoppedReason: string;
+    electricityCostCents: number | null;
   }> = [];
 
   // Dates are relative to the seed run so the portal Activity page (which
@@ -2415,10 +2601,13 @@ async function seed(): Promise<void> {
     const station = at(createdStations, stationIdx);
     const stationEvses = createdEvses.filter((e) => e.stationId === station.id);
     const evse = stationEvses.length > 0 ? at(stationEvses, 0) : at(createdEvses, 0);
+    // Operator electricity cost from the station's site rates, as the session
+    // end projection computes it (the period in force at the end time).
+    const stationSiteId = at(stationRows, stationIdx).siteId;
 
     portalSessionRows.push({
       stationId: station.id,
-      siteId: at(createdSites, stationIdx % createdSites.length).id,
+      siteId: sessionSiteIdSql(sql, station.id),
       evseId: evse.id,
       driverId: portalDriverId,
       transactionId: `txn_portal_${String(i + 1).padStart(3, '0')}`,
@@ -2429,8 +2618,17 @@ async function seed(): Promise<void> {
       meterStop: i * 10000 + energyWh,
       energyDeliveredWh: String(energyWh),
       finalCostCents: costCents,
+      // The demo invoices below bill these sessions at 8%.
+      tariffTaxRate: '0.08',
+      ...demoCostSplit(costCents, 0.08),
       currency: companyCurrency,
       stoppedReason: 'EVDisconnected',
+      electricityCostCents: seedSessionElectricityCostCents(
+        siteRatePeriods.get(stationSiteId) ?? [],
+        energyWh,
+        endedAt,
+        siteTimezones.get(stationSiteId),
+      ),
     });
   }
 
@@ -2443,9 +2641,10 @@ async function seed(): Promise<void> {
   const portalPaymentRows = portalCreatedSessions.map((session, i) => ({
     sessionId: session.id,
     driverId: portalDriverId,
-    stripePaymentIntentId: `pi_portal_${padNum(i + 1, 4)}`,
-    stripeCustomerId: 'cus_U443UCZOsb72EL',
-    paymentSource: 'stripe' as const,
+    provider: 'stripe',
+    providerPaymentId: `pi_portal_${padNum(i + 1, 4)}`,
+    providerCustomerId: 'cus_U443UCZOsb72EL',
+    paymentSource: 'web_portal' as const,
     currency: companyCurrency,
     preAuthAmountCents: 5000,
     capturedAmountCents: portalSessionRows[i]?.finalCostCents ?? 200,
@@ -2457,13 +2656,132 @@ async function seed(): Promise<void> {
   // Portal driver payment method
   await db.insert(driverPaymentMethods).values({
     driverId: portalDriverId,
-    stripeCustomerId: 'cus_U443UCZOsb72EL',
-    stripePaymentMethodId: 'pm_portal_test',
+    provider: 'stripe',
+    providerCustomerId: 'cus_U443UCZOsb72EL',
+    providerPaymentMethodId: 'pm_portal_test',
     cardBrand: 'visa',
     cardLast4: '4242',
     isDefault: true,
   });
+  await db
+    .insert(driverPaymentCustomers)
+    .values({
+      driverId: portalDriverId,
+      provider: 'stripe',
+      providerCustomerId: 'cus_U443UCZOsb72EL',
+    })
+    .onConflictDoNothing();
   console.log('  Portal test driver payment method created.');
+
+  // ------ Re-bill sessions (session detail Billing card) ------
+  // One session the CSMS gave up ending (an operator can bill it) and one left
+  // to manual billing after a declined re-bill, for the first demo driver
+  // (simulated saved card REBILL_DEMO_METHOD_ID, always approved) on the first
+  // demo station.
+  const [rebillTariff] = await db
+    .select({
+      id: tariffs.id,
+      pricePerKwh: tariffs.pricePerKwh,
+      pricePerMinute: tariffs.pricePerMinute,
+      pricePerSession: tariffs.pricePerSession,
+      idleFeePricePerMinute: tariffs.idleFeePricePerMinute,
+      reservationFeePerMinute: tariffs.reservationFeePerMinute,
+      taxRate: tariffs.taxRate,
+    })
+    .from(tariffs)
+    .where(isNotNull(tariffs.pricePerKwh))
+    .orderBy(tariffs.name)
+    .limit(1);
+  const rebillStation = at(createdStations, 0);
+  const rebillEvse = createdEvses.find((e) => e.stationId === rebillStation.id);
+  if (rebillTariff != null && rebillEvse != null) {
+    const [rebillActor] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, initialAdminEmail));
+    const { seedRebillSessions } = await import('./seed-rebill-sessions.js');
+    const rebillSessionIds = await seedRebillSessions(client, {
+      stationId: rebillStation.id,
+      evseId: rebillEvse.id,
+      driverId: at(createdDrivers, 0).id,
+      customerId: `cus_sim_${padNum(1, 6)}`,
+      methodId: REBILL_DEMO_METHOD_ID,
+      currency: companyCurrency,
+      tariff: rebillTariff,
+      actorUserId: rebillActor?.id ?? null,
+      now: seedNow,
+    });
+    console.log(`  ${String(rebillSessionIds.length)} re-bill sessions created.`);
+  }
+
+  // ------ Fleet account billing (charge on account) ------
+  // One fleet billed on account with a billing profile and a credit limit, its
+  // unbilled sessions this month, last month's issued fleet invoice, and a
+  // credited earlier invoice with its credit note (seed-fleet-billing.ts).
+  {
+    const accountStation = at(createdStations, 0);
+    const accountEvse = createdEvses.find((e) => e.stationId === accountStation.id);
+    const { seedFleetBillingDemo } = await import('./seed-fleet-billing.js');
+    const accountSessions = await seedFleetBillingDemo(client, {
+      stationId: accountStation.id,
+      evseId: accountEvse?.id ?? null,
+      currency: companyCurrency,
+      now: seedNow,
+    });
+    console.log(`  Fleet billing demo created (${String(accountSessions)} account sessions).`);
+    // A second fleet that invoices each member: a German driver with a billing
+    // address and her member invoice, an English driver without one whose
+    // member invoice was credited, and unbilled member sessions of both
+    // (seed-member-invoices.ts).
+    const { seedMemberInvoiceDemo } = await import('./seed-member-invoices.js');
+    const memberSessions = await seedMemberInvoiceDemo(client, {
+      stationId: accountStation.id,
+      evseId: accountEvse?.id ?? null,
+      currency: companyCurrency,
+      now: seedNow,
+    });
+    console.log(`  Member invoice demo created (${String(memberSessions)} member sessions).`);
+  }
+
+  // ------ Reservation insights ------
+  // One reservation audit trigger of each kind and its stored rule insight
+  // (seed-reservation-insights.ts), so the insight lists show reservation
+  // insights without a model call. On an SP3 station past the ones holding
+  // the seeded active sessions: its simulator is disabled, so the station
+  // never comes online and the station fault insight stays open.
+  {
+    const insightStation = at(createdStations, 990);
+    const insightEvse = createdEvses.find((e) => e.stationId === insightStation.id);
+    const { seedReservationInsightsDemo } = await import('./seed-reservation-insights.js');
+    const reservationInsights = await seedReservationInsightsDemo(client, {
+      stationId: insightStation.id,
+      evseId: insightEvse?.id ?? null,
+      driverId: at(createdDrivers, 1).id,
+      currency: companyCurrency,
+      now: seedNow,
+    });
+    console.log(`  ${String(reservationInsights)} reservation insights created.`);
+  }
+
+  // ------ AI insights ------
+  // At least one insight of every other kind and every shown status, with
+  // their trigger rows, demo sessions and actions (seed-ai-insights.ts), so
+  // the AI Insights page shows data without a model call.
+  {
+    const [insightActor] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, initialAdminEmail));
+    const { seedAiInsightsDemo } = await import('./seed-ai-insights.js');
+    const aiInsights = await seedAiInsightsDemo(client, {
+      now: seedNow,
+      currency: companyCurrency,
+      driverId: at(createdDrivers, 2).id,
+      actorUserId: insightActor?.id ?? null,
+      subjectSecret: process.env['SETTINGS_ENCRYPTION_KEY'] ?? '',
+    });
+    console.log(`  ${String(aiInsights)} AI insights created.`);
+  }
 
   // Portal driver support cases (the portal Support page should show data)
   const portalCaseRows = [
@@ -2552,13 +2870,18 @@ async function seed(): Promise<void> {
 
   // Invoices for the portal test driver (the driver detail Invoices tab and
   // the invoice detail page should show data). Numbers use a 9xxx suffix so
-  // they never collide with app-generated invoice_number_seq values.
+  // they never collide with numbers from invoice_number_counters.
   const invoiceMonth = (offset: number): string => {
     const d = new Date(Date.UTC(curYear, curMonth - offset, 1));
     return `${String(d.getUTCFullYear())}${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   };
   const invoiceSessions = portalCreatedSessions.slice(0, 3);
-  const subtotal = portalSessionRows.slice(0, 3).reduce((sum, row) => sum + row.finalCostCents, 0);
+  // Session costs include tax: each line holds the net amount and the tax
+  // contained in the charged amount, at the demo rate of 8%.
+  const invoiceTaxLines = portalSessionRows
+    .slice(0, invoiceSessions.length)
+    .map((row) => splitGrossByTaxRate(row.finalCostCents, 0.08));
+  const invoiceTotals = taxTotals(invoiceTaxLines);
   const [issuedInvoice] = await db
     .insert(invoices)
     .values([
@@ -2569,9 +2892,9 @@ async function seed(): Promise<void> {
         issuedAt: new Date(Date.UTC(curYear, curMonth, 1)),
         dueAt: new Date(Date.UTC(curYear, curMonth, 1) + 30 * 86400000),
         currency: companyCurrency,
-        subtotalCents: subtotal,
-        taxCents: Math.round(subtotal * 0.08),
-        totalCents: subtotal + Math.round(subtotal * 0.08),
+        subtotalCents: invoiceTotals.netCents,
+        taxCents: invoiceTotals.taxCents,
+        totalCents: invoiceTotals.grossCents,
       },
       {
         invoiceNumber: `INV-${invoiceMonth(2)}-9001`,
@@ -2579,6 +2902,7 @@ async function seed(): Promise<void> {
         status: 'paid' as const,
         issuedAt: new Date(Date.UTC(curYear, curMonth - 1, 1)),
         dueAt: new Date(Date.UTC(curYear, curMonth - 1, 1) + 30 * 86400000),
+        paidAt: new Date(Date.UTC(curYear, curMonth - 1, 1)),
         currency: companyCurrency,
         subtotalCents: 3185,
         taxCents: 255,
@@ -2590,17 +2914,32 @@ async function seed(): Promise<void> {
     await db.insert(invoiceLineItems).values(
       invoiceSessions.map((session, i) => {
         const row = at(portalSessionRows, i);
+        const line = at(invoiceTaxLines, i);
         return {
           invoiceId: issuedInvoice.id,
           sessionId: session.id,
           description: `Charging session ${row.transactionId}`,
           quantity: '1',
-          unitPriceCents: row.finalCostCents,
-          totalCents: row.finalCostCents,
-          taxCents: Math.round(row.finalCostCents * 0.08),
+          unitPriceCents: line.netCents,
+          totalCents: line.netCents,
+          taxCents: line.taxCents,
+          taxRate: '0.08',
         };
       }),
     );
+    // Claim the billed sessions, as the invoice service does.
+    await db
+      .update(chargingSessions)
+      .set({ invoiceId: issuedInvoice.id })
+      .where(
+        and(
+          inArray(
+            chargingSessions.id,
+            invoiceSessions.map((session) => session.id),
+          ),
+          isNull(chargingSessions.invoiceId),
+        ),
+      );
   }
   console.log('  Portal test driver invoices created.');
 
@@ -2714,7 +3053,9 @@ async function seed(): Promise<void> {
   // Roaming demo data so the OCPI sessions, CDRs, and tariff-mapping pages
   // have rows. Linked to the simulator partners seeded above. The demo
   // dataset ships roaming rows, so enable the feature toggle for demo
-  // installs (the production default stays false).
+  // installs (the production default stays false). The one setting the seed
+  // writes over an existing value: migration 0001 always inserts it as false,
+  // and this demo block runs once per inventory (CS-0003 marker above).
   await db
     .insert(settings)
     .values({ key: 'roaming.enabled', value: true })
@@ -2760,21 +3101,24 @@ async function seed(): Promise<void> {
   });
   await db.insert(ocpiCdrs).values(cdrRows);
 
-  const mappableTariffs = await db.select({ id: tariffs.id }).from(tariffs).limit(2);
-  if (mappableTariffs.length > 0) {
-    await db.insert(ocpiTariffMappings).values(
-      mappableTariffs.map((tariff, i) => ({
-        tariffId: tariff.id,
-        partnerId: i === 0 ? simPartner.id : cpoSimPartner.id,
-        ocpiTariffId: `EVT-TARIFF-${padNum(i + 1, 3)}`,
-        ocpiTariffData: {
-          country_code: 'US',
-          party_id: 'EVT',
-          id: `EVT-TARIFF-${padNum(i + 1, 3)}`,
-          currency: companyCurrency,
+  // Published OCPI tariffs are generated from internal pricing: one partner
+  // gets a single tariff, the other a pricing group with its restrictions.
+  const [mappableTariff] = await db
+    .select({ id: tariffs.id, pricingGroupId: tariffs.pricingGroupId })
+    .from(tariffs)
+    .limit(1);
+  if (mappableTariff != null) {
+    await db
+      .insert(ocpiTariffMappings)
+      .values([
+        { tariffId: mappableTariff.id, partnerId: simPartner.id, ocpiTariffId: 'EVT-TARIFF-001' },
+        {
+          pricingGroupId: mappableTariff.pricingGroupId,
+          partnerId: cpoSimPartner.id,
+          ocpiTariffId: 'EVT-TARIFF-002',
         },
-      })),
-    );
+      ])
+      .onConflictDoNothing();
   }
   console.log('  Roaming demo data created (sessions, CDRs, tariff mappings).');
 
@@ -3580,9 +3924,7 @@ async function seed(): Promise<void> {
   console.log(
     `  ${String(createdConfigTemplates.length)} config templates (${String(totalPushes)} pushes, ${String(totalPushStations)} push stations)`,
   );
-  console.log(
-    '  2 OCPI simulator partners (NL/SIM token: ocpi-sim-reg-token, DE/CPO token: ocpi-cpo-sim-reg-token)',
-  );
+  console.log('  2 OCPI simulator partners (NL/SIM, DE/CPO; registration tokens printed above)');
   console.log('  Dashboard snapshots seeded for the last 14 days (see seedDashboardSnapshots).');
 
   await client.end();

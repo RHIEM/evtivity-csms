@@ -5,9 +5,10 @@ import { useState } from 'react';
 import { Link } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { RefreshCw, Upload, Eye, Trash2, Copy } from 'lucide-react';
+import { RefreshCw, Upload, Eye, Trash2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CopyButton } from '@/components/ui/copy-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Select } from '@/components/ui/select';
 import {
@@ -28,9 +29,12 @@ import {
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Pagination } from '@/components/ui/pagination';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
 import { useToast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/timezone';
 import { LoadingLogo } from '@/components/loading-logo';
+import { uiLocale } from '@/lib/formatting';
+import { compositeScheduleAnchor, ocppProfileId } from '@/lib/charging-profile-display';
 
 interface ChargingProfile {
   id: number;
@@ -43,16 +47,6 @@ interface ChargingProfile {
   createdAt: string;
   templateId: string | null;
   templateName: string | null;
-}
-
-// `profile.id` is the CSMS database row PK. The OCPP profile id (which a station
-// uses to identify a profile when clearing) lives inside `profile_data.id`.
-// Returns null when the station-reported profile has no numeric id.
-function ocppProfileId(profile: ChargingProfile): number | null {
-  const raw = profile.profileData['id'];
-  if (typeof raw === 'number' && Number.isInteger(raw)) return raw;
-  if (typeof raw === 'string' && /^-?\d+$/.test(raw)) return Number(raw);
-  return null;
 }
 
 interface ChargingProfileTemplate {
@@ -68,16 +62,17 @@ interface CompositeSchedulePeriod {
   numberPhases?: number;
 }
 
+// OCPP 2.1 GetCompositeScheduleResponse. The OCPP server returns a 1.6
+// station's answer in this shape too.
 interface CompositeResponse {
   status?: string;
   schedule?: {
+    evseId?: number;
     chargingSchedulePeriod?: CompositeSchedulePeriod[];
     chargingRateUnit?: string;
     duration?: number;
-    startSchedule?: string;
+    scheduleStart?: string;
   };
-  scheduleStart?: string;
-  evseId?: number;
 }
 
 interface Props {
@@ -175,8 +170,10 @@ export function StationChargingProfilesTab({
         queryKey: ['stations', stationId, 'charging-profiles'],
       });
     },
-    onError: () => {
-      setPushResult({ success: false, status: 'Failed', errorInfo: 'Request failed' });
+    onError: (err: unknown) => {
+      // A refused push (offline station, an id the station reserves for its
+      // external constraints) shows the translated API error.
+      setPushResult({ success: false, status: 'Failed', errorInfo: getErrorMessage(err, t) });
     },
   });
 
@@ -280,25 +277,27 @@ export function StationChargingProfilesTab({
                     <TableRow key={profile.id}>
                       <TableCell>
                         <Badge variant={profile.source === 'csms_set' ? 'default' : 'secondary'}>
-                          {profile.source === 'csms_set' ? 'CSMS' : 'Station'}
+                          {profile.source === 'csms_set'
+                            ? t('stations.profileSourceCsms')
+                            : t('stations.profileSourceStation')}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-xs">
-                        {profile.evseId != null ? String(profile.evseId) : 'n/a'}
+                        {profile.evseId != null ? String(profile.evseId) : t('common.na')}
                       </TableCell>
                       <TableCell className="text-xs">
-                        {profile.chargingLimitSource ?? 'n/a'}
+                        {profile.chargingLimitSource ?? t('common.na')}
                       </TableCell>
                       <TableCell className="text-xs">
                         {profile.templateId != null ? (
                           <Link
                             to={`/smart-charging/${profile.templateId}`}
-                            className="text-primary hover:underline"
+                            className="text-link hover:underline"
                           >
                             {profile.templateName ?? profile.templateId}
                           </Link>
                         ) : (
-                          'n/a'
+                          t('common.na')
                         )}
                       </TableCell>
                       <TableCell className="text-xs">
@@ -452,28 +451,30 @@ export function StationChargingProfilesTab({
                     variant={viewProfile.source === 'csms_set' ? 'default' : 'secondary'}
                     className="ml-1"
                   >
-                    {viewProfile.source === 'csms_set' ? 'CSMS' : 'Station'}
+                    {viewProfile.source === 'csms_set'
+                      ? t('stations.profileSourceCsms')
+                      : t('stations.profileSourceStation')}
                   </Badge>
                 </div>
                 <div>
                   <span className="text-muted-foreground">EVSE: </span>
-                  {viewProfile.evseId != null ? String(viewProfile.evseId) : 'n/a'}
+                  {viewProfile.evseId != null ? String(viewProfile.evseId) : t('common.na')}
                 </div>
                 <div>
                   <span className="text-muted-foreground">{t('stations.limitSource')}: </span>
-                  {viewProfile.chargingLimitSource ?? 'n/a'}
+                  {viewProfile.chargingLimitSource ?? t('common.na')}
                 </div>
                 <div>
                   <span className="text-muted-foreground">{t('smartCharging.template')}: </span>
                   {viewProfile.templateId != null ? (
                     <Link
                       to={`/smart-charging/${viewProfile.templateId}`}
-                      className="text-primary hover:underline"
+                      className="text-link hover:underline"
                     >
                       {viewProfile.templateName ?? viewProfile.templateId}
                     </Link>
                   ) : (
-                    'n/a'
+                    t('common.na')
                   )}
                 </div>
               </div>
@@ -483,19 +484,13 @@ export function StationChargingProfilesTab({
             </div>
           )}
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                if (viewProfile != null) {
-                  void navigator.clipboard.writeText(
-                    JSON.stringify(viewProfile.profileData, null, 2),
-                  );
-                }
-              }}
-            >
-              <Copy className="h-4 w-4" />
-              {t('common.copy')}
-            </Button>
+            {viewProfile != null && (
+              <CopyButton
+                value={JSON.stringify(viewProfile.profileData, null, 2)}
+                text={t('common.copy')}
+                size="default"
+              />
+            )}
             <Button
               onClick={() => {
                 setViewProfile(null);
@@ -519,14 +514,10 @@ export function StationChargingProfilesTab({
             <p className="text-sm text-destructive">{t('common.error')}</p>
           ) : compositeSchedule != null ? (
             (() => {
-              // Composite schedules can carry the anchor on `schedule.startSchedule`
-              // or `scheduleStart`. If neither is present, do NOT fabricate one
-              // from `Date.now()` — render offsets directly so the display stays
-              // truthful.
-              const anchorIso =
-                compositeSchedule.schedule?.startSchedule ??
-                compositeSchedule.scheduleStart ??
-                null;
+              // The composite schedule's anchor is `schedule.scheduleStart`. If it
+              // is missing, do NOT fabricate one from `Date.now()`: render
+              // offsets directly so the display stays truthful.
+              const anchorIso = compositeScheduleAnchor(compositeSchedule);
               const rateUnit = compositeSchedule.schedule?.chargingRateUnit ?? 'W';
               const status = compositeSchedule.status;
               return (
@@ -561,7 +552,7 @@ export function StationChargingProfilesTab({
                               if (anchorIso != null) {
                                 const ms =
                                   new Date(anchorIso).getTime() + period.startPeriod * 1000;
-                                const wallClock = new Date(ms).toLocaleString('en-US', {
+                                const wallClock = new Date(ms).toLocaleString(uiLocale(), {
                                   timeZone: timezone,
                                   hour: 'numeric',
                                   minute: '2-digit',
@@ -579,7 +570,7 @@ export function StationChargingProfilesTab({
                                   <TableCell className="text-xs">
                                     {period.numberPhases != null
                                       ? String(period.numberPhases)
-                                      : 'n/a'}
+                                      : t('common.na')}
                                   </TableCell>
                                 </TableRow>
                               );

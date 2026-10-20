@@ -1,21 +1,26 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import crypto from 'node:crypto';
-import { eq, and, sql, lte } from 'drizzle-orm';
+import { eq, and, lte, isNull, sql } from 'drizzle-orm';
 import {
   db,
+  client,
   chargingSessions,
   chargingStations,
   getStaleSessionTimeoutHours,
-  getIdlingGracePeriodMinutes,
-  isSplitBillingEnabled,
   writeReservationAudit,
+  closeSegmentsAt,
+  faultUnbilledSession,
+  sessionIdleMinutesAt,
+  publishOcpiSessionPush,
+  writeCsmsSessionAudit,
+  STALE_CLEANUP_IN_TRANSACTION_STATUSES,
 } from '@evtivity/database';
-import { calculateSessionCost, calculateSplitSessionCost } from '@evtivity/lib';
-import type { TariffSegment } from '@evtivity/lib';
+import { publishOcppCommand } from '@evtivity/lib';
+import { cancelOpenSessionHold, failGuestSessionOfFaultedSession } from '@evtivity/payments';
 import type { Logger } from 'pino';
-import { getPubSub } from '@evtivity/api/src/lib/pubsub.js';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
+import { paymentContext } from '../lib/payments.js';
 
 export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
   const timeoutHours = await getStaleSessionTimeoutHours();
@@ -25,8 +30,17 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
   }
 
   const cutoff = new Date(Date.now() - timeoutHours * 60 * 60 * 1000);
+  const cutoffIso = cutoff.toISOString();
+  const inTransactionStatuses = sql.join(
+    STALE_CLEANUP_IN_TRANSACTION_STATUSES.map((status) => sql`${status}`),
+    sql`, `,
+  );
 
-  // Find active sessions not updated since the cutoff
+  // Find active sessions not updated since the cutoff. A session whose station
+  // is online and still reports the transaction (its connector in a
+  // transaction status, or a transaction event received after the cutoff) is
+  // not stale (owner decision 2026-10-14): only sessions on an offline or
+  // silent station are faulted.
   const staleSessions = await db
     .select({
       id: chargingSessions.id,
@@ -36,23 +50,38 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       startedAt: chargingSessions.startedAt,
       updatedAt: chargingSessions.updatedAt,
       energyDeliveredWh: chargingSessions.energyDeliveredWh,
-      currentCostCents: chargingSessions.currentCostCents,
       tariffId: chargingSessions.tariffId,
-      tariffPricePerKwh: chargingSessions.tariffPricePerKwh,
-      tariffPricePerMinute: chargingSessions.tariffPricePerMinute,
-      tariffPricePerSession: chargingSessions.tariffPricePerSession,
-      tariffIdleFeePricePerMinute: chargingSessions.tariffIdleFeePricePerMinute,
-      tariffTaxRate: chargingSessions.tariffTaxRate,
       idleStartedAt: chargingSessions.idleStartedAt,
       idleMinutes: chargingSessions.idleMinutes,
       reservationId: chargingSessions.reservationId,
       stationIsOnline: chargingStations.isOnline,
       stationOcppId: chargingStations.stationId,
       ocppProtocol: chargingStations.ocppProtocol,
+      stillReported: sql<boolean>`(${chargingStations.isOnline} AND (
+        EXISTS (
+          SELECT 1 FROM connectors c
+          WHERE (c.id = ${chargingSessions.connectorId}
+              OR (${chargingSessions.connectorId} IS NULL AND c.evse_id = ${chargingSessions.evseId}))
+            AND c.status::text IN (${inTransactionStatuses})
+        )
+        OR EXISTS (
+          SELECT 1 FROM transaction_events te
+          WHERE te.session_id = ${chargingSessions.id}
+            AND te.created_at > ${cutoffIso}::timestamptz
+        )
+      ))`,
     })
     .from(chargingSessions)
     .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
-    .where(and(eq(chargingSessions.status, 'active'), lte(chargingSessions.updatedAt, cutoff)));
+    .where(
+      and(
+        eq(chargingSessions.status, 'active'),
+        lte(chargingSessions.updatedAt, cutoff),
+        // A session the operator asked to end billed (ghost, superseded) is
+        // ended by the OCPP server, never faulted here.
+        isNull(chargingSessions.endRequestReason),
+      ),
+    );
 
   if (staleSessions.length === 0) {
     return;
@@ -60,134 +89,73 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
 
   log.info({ count: staleSessions.length, timeoutHours }, 'Found stale sessions to clean up');
 
-  const gracePeriod = await getIdlingGracePeriodMinutes();
-  const splitEnabled = await isSplitBillingEnabled();
-
   for (const session of staleSessions) {
+    if (session.stillReported) {
+      log.info(
+        {
+          sessionId: session.id,
+          stationId: session.stationId,
+          transactionId: session.transactionId,
+          lastUpdate: session.updatedAt.toISOString(),
+        },
+        'Stale session skipped: the online station still reports its transaction',
+      );
+      continue;
+    }
     try {
       // Use the last updated_at as the session end time
       const endedAt = session.updatedAt;
       const energyWh = Number(session.energyDeliveredWh ?? 0);
 
-      // Calculate final cost if tariff snapshot exists
-      let finalCostCents = session.currentCostCents;
+      // A stale session is faulted and not billed (owner decision, audit
+      // N6): its cost is zeroed with the status, like the payment gate's stop
+      // (P4). A session that ended meanwhile keeps its own end and cost (P5).
+      // No receipt or completion notification is sent.
+      const faulted = await faultUnbilledSession(client, {
+        sessionId: session.id,
+        reason: 'StaleSession',
+        endedAt,
+        // A meter value or event that refreshed the session after the list
+        // was read keeps it running.
+        notUpdatedSince: cutoff,
+      });
 
-      if (session.tariffId != null && session.startedAt != null) {
-        // Calculate idle minutes
-        const accumulatedIdle = Number(session.idleMinutes);
-        const idleMinutes =
-          session.idleStartedAt != null
-            ? accumulatedIdle + (endedAt.getTime() - session.idleStartedAt.getTime()) / 60000
-            : accumulatedIdle;
-
-        // Close any open tariff segment. idle_minutes here is the WHOLE-
-        // session accumulator (plus any open idle period). For multi-segment
-        // sessions, earlier segments were already closed by the boundary cron
-        // with per-segment deltas; assigning the full accumulated idle to the
-        // last segment would double-count the portions already attributed
-        // earlier. Subtract closed-segment idle so this last segment carries
-        // only the idle from its own window. Mirrors the same pattern in
-        // event-projections.ts session-end and the boundary-check cron.
-        const closedIdleAggRows = await db.execute<{ total: string }>(sql`
-          SELECT COALESCE(SUM(idle_minutes), 0)::text AS total
-          FROM session_tariff_segments
-          WHERE session_id = ${session.id} AND ended_at IS NOT NULL
-        `);
-        const closedIdleSum = Number(closedIdleAggRows[0]?.total ?? 0);
-        const segmentIdleMinutes = Math.max(0, idleMinutes - closedIdleSum);
-        const endedAtIso = endedAt.toISOString();
-        await db.execute(sql`
-          UPDATE session_tariff_segments
-          SET ended_at = ${endedAtIso},
-              energy_wh_end = ${energyWh},
-              duration_minutes = EXTRACT(EPOCH FROM (${endedAtIso}::timestamptz - started_at)) / 60,
-              idle_minutes = ${segmentIdleMinutes}
-          WHERE session_id = ${session.id} AND ended_at IS NULL
-        `);
-
-        // Check for split billing segments
-        let computed = false;
-        if (splitEnabled) {
-          const segments = await db.execute(sql`
-            SELECT sts.started_at, sts.ended_at, sts.energy_wh_start, sts.energy_wh_end,
-                   sts.idle_minutes AS seg_idle_minutes,
-                   t.price_per_kwh, t.price_per_minute, t.price_per_session,
-                   t.idle_fee_price_per_minute, t.tax_rate
-            FROM session_tariff_segments sts
-            JOIN tariffs t ON t.id = sts.tariff_id
-            WHERE sts.session_id = ${session.id}
-            ORDER BY sts.started_at
-          `);
-
-          if (segments.length > 1) {
-            const tariffSegments: TariffSegment[] = segments.map(
-              (seg: Record<string, unknown>, index: number) => {
-                const segStart = new Date(seg.started_at as string).getTime();
-                const segEnd = new Date(seg.ended_at as string).getTime();
-                return {
-                  tariff: {
-                    pricePerKwh: seg.price_per_kwh as string | null,
-                    pricePerMinute: seg.price_per_minute as string | null,
-                    pricePerSession: seg.price_per_session as string | null,
-                    idleFeePricePerMinute: seg.idle_fee_price_per_minute as string | null,
-                    reservationFeePerMinute: null,
-                    taxRate: seg.tax_rate as string | null,
-                  },
-                  durationMinutes: (segEnd - segStart) / 60000,
-                  // Defensive fallback: a stale session's segments may not
-                  // all be cleanly closed. Falling back to energy_wh_start
-                  // yields a 0 delta for an unclosed segment instead of a
-                  // large negative that would multiply into a refund.
-                  energyDeliveredWh:
-                    Number(seg.energy_wh_end ?? seg.energy_wh_start ?? 0) -
-                    Number(seg.energy_wh_start ?? 0),
-                  idleMinutes: Number(seg.seg_idle_minutes ?? 0),
-                  isFirstSegment: index === 0,
-                };
-              },
-            );
-            finalCostCents = calculateSplitSessionCost(tariffSegments, gracePeriod).totalCents;
-            computed = true;
-          }
-        }
-
-        if (!computed) {
-          const durationMinutes = (endedAt.getTime() - session.startedAt.getTime()) / 60000;
-          const accIdle = Number(session.idleMinutes);
-          const totalIdle =
-            session.idleStartedAt != null
-              ? accIdle + (endedAt.getTime() - session.idleStartedAt.getTime()) / 60000
-              : accIdle;
-
-          finalCostCents = calculateSessionCost(
-            {
-              pricePerKwh: session.tariffPricePerKwh,
-              pricePerMinute: session.tariffPricePerMinute,
-              pricePerSession: session.tariffPricePerSession,
-              idleFeePricePerMinute: session.tariffIdleFeePricePerMinute,
-              reservationFeePerMinute: null,
-              taxRate: session.tariffTaxRate,
-            },
-            energyWh,
-            durationMinutes,
-            totalIdle,
-            gracePeriod,
-          ).totalCents;
-        }
+      // The tariff segments end at the last update, so the segment trail
+      // shows how long the session ran. Only when this run faulted it: a
+      // session that ended meanwhile keeps the segments its end closed.
+      if (faulted && session.tariffId != null && session.startedAt != null) {
+        const idleMinutes = sessionIdleMinutesAt(
+          { idleStartedAt: session.idleStartedAt, idleMinutes: Number(session.idleMinutes) },
+          endedAt,
+        );
+        await closeSegmentsAt(client, session.id, endedAt, energyWh, idleMinutes);
       }
 
-      // Mark session as faulted
-      await db
-        .update(chargingSessions)
-        .set({
-          status: 'faulted',
-          stoppedReason: 'StaleSession',
-          endedAt,
-          finalCostCents: finalCostCents ?? session.currentCostCents,
-          currentCostCents: finalCostCents ?? session.currentCostCents,
-          updatedAt: new Date(),
-        })
-        .where(eq(chargingSessions.id, session.id));
+      // Its open hold (a portal start whose 1.6 ConnectionTimeOut expired, a
+      // session the station lost) is cancelled now instead of staying held
+      // until the provider expires it (P4). Only when this run faulted it.
+      // Fail-open (P9): the record stays pre_authorized and the hold expires
+      // at the provider.
+      if (faulted) {
+        try {
+          await cancelOpenSessionHold(
+            session.id,
+            'Stale session faulted',
+            paymentContext(log, 'stale-session-cleanup'),
+          );
+        } catch (holdErr: unknown) {
+          log.warn(
+            { sessionId: session.id, err: holdErr },
+            'Failed to cancel the hold of a stale session',
+          );
+        }
+        // A guest session of the faulted session fails with it, so the guest
+        // page stops showing it as charging (fail-open, logged inside).
+        await failGuestSessionOfFaultedSession(
+          session.id,
+          paymentContext(log, 'stale-session-cleanup'),
+        );
+      }
 
       // Audit the reservation linkage so the reservation timeline shows why
       // this session terminated. Mirrors the projection-side fault paths.
@@ -212,18 +180,16 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
       }
 
       // Send RequestStopTransaction to online stations to clear the station-side transaction
+      let stopSent = false;
       if (session.stationIsOnline) {
         try {
-          const commandId = crypto.randomUUID();
-          const pubsub = getPubSub();
-          const notification = JSON.stringify({
-            commandId,
+          await publishOcppCommand(getPubSub(), {
             stationId: session.stationOcppId,
             action: 'RequestStopTransaction',
             payload: { transactionId: session.transactionId },
-            ...(session.ocppProtocol != null ? { version: session.ocppProtocol } : {}),
+            version: session.ocppProtocol,
           });
-          await pubsub.publish('ocpp_commands', notification);
+          stopSent = true;
           log.info(
             { sessionId: session.id, transactionId: session.transactionId },
             'Sent RequestStopTransaction for stale session on online station',
@@ -236,6 +202,31 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
         }
       }
 
+      // A roaming session's partner gets the INVALID session (fail-open).
+      if (faulted) await publishOcpiSessionPush(getPubSub(), session.id, log);
+
+      // Only the run whose fault changed the session audits it (P7).
+      if (faulted) {
+        await writeCsmsSessionAudit(
+          {
+            sessionId: session.id,
+            action: 'faulted',
+            actor: 'system',
+            actorLabel: 'stale-session-cleanup',
+            before: { status: 'active' },
+            after: { status: 'faulted', stoppedReason: 'StaleSession', finalCostCents: 0 },
+            notes: [
+              `No update since ${session.updatedAt.toISOString()} (timeout ${String(timeoutHours)} h)`,
+              ...(stopSent
+                ? [`RequestStopTransaction sent for transaction ${session.transactionId}`]
+                : []),
+            ].join('; '),
+          },
+          undefined,
+          log,
+        );
+      }
+
       log.info(
         {
           sessionId: session.id,
@@ -243,7 +234,7 @@ export async function staleSessionCleanupHandler(log: Logger): Promise<void> {
           transactionId: session.transactionId,
           stationOnline: session.stationIsOnline,
           lastUpdate: session.updatedAt.toISOString(),
-          finalCostCents,
+          faulted,
         },
         'Closed stale session',
       );

@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import pino from 'pino';
 import type { HandlerContext } from '../../../server/middleware/pipeline.js';
 
@@ -40,13 +40,14 @@ function makeCtx(payload: Record<string, unknown>): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'Get15118EVCertificate',
     protocolVersion: 'ocpp2.1',
     payload,
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };
@@ -59,6 +60,13 @@ const reqPayload = {
   exiRequest: 'exi-blob',
 };
 
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let get15118EvCertificateHandlerModule: typeof import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+beforeAll(async () => {
+  get15118EvCertificateHandlerModule =
+    await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+}, 30_000);
+
 beforeEach(() => {
   vi.clearAllMocks();
   isPncEnabledMock.mockResolvedValue(true);
@@ -68,8 +76,7 @@ beforeEach(() => {
 describe('v2_1 Get15118EVCertificate handler', () => {
   it('rejects with Failed when PnC is disabled and publishes nothing', async () => {
     isPncEnabledMock.mockResolvedValue(false);
-    const { handleGet15118EVCertificate } =
-      await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
     const { ctx, publishMock } = makeCtx(reqPayload);
     const response = await handleGet15118EVCertificate(ctx);
 
@@ -79,13 +86,17 @@ describe('v2_1 Get15118EVCertificate handler', () => {
   });
 
   it('publishes ocpp.Get15118EVCertificate and returns provider exiResponse on Accepted', async () => {
-    const { handleGet15118EVCertificate } =
-      await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
     const { ctx, publishMock } = makeCtx(reqPayload);
     const response = await handleGet15118EVCertificate(ctx);
 
     expect(response).toEqual({ status: 'Accepted', exiResponse: 'exi-resp' });
-    expect(getContractCertificateMock).toHaveBeenCalledWith('exi-blob');
+    expect(getContractCertificateMock).toHaveBeenCalledWith({
+      stationDbId: 'sta_db_1',
+      iso15118SchemaVersion: reqPayload.iso15118SchemaVersion,
+      action: 'Install',
+      exiRequest: 'exi-blob',
+    });
     expect(publishMock).toHaveBeenCalledWith({
       eventType: 'ocpp.Get15118EVCertificate',
       aggregateType: 'ChargingStation',
@@ -100,10 +111,33 @@ describe('v2_1 Get15118EVCertificate handler', () => {
     });
   });
 
+  it('forwards the ISO 15118-20 fields and returns remainingContracts', async () => {
+    getContractCertificateMock.mockResolvedValue({
+      status: 'Accepted',
+      exiResponse: 'exi-20',
+      remainingContracts: 2,
+    });
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
+    const payload = {
+      iso15118SchemaVersion: 'urn:iso:std:iso:15118:-20:CommonMessages',
+      action: 'Install',
+      exiRequest: 'exi-blob-20',
+      maximumContractCertificateChains: 10,
+      prioritizedEMAIDs: ['USEVTC000000001'],
+    };
+    const { ctx } = makeCtx(payload);
+    const response = await handleGet15118EVCertificate(ctx);
+
+    expect(response).toEqual({ status: 'Accepted', exiResponse: 'exi-20', remainingContracts: 2 });
+    expect(getContractCertificateMock).toHaveBeenCalledWith({
+      stationDbId: 'sta_db_1',
+      ...payload,
+    });
+  });
+
   it('returns Failed when the provider responds Accepted but with an empty exiResponse', async () => {
     getContractCertificateMock.mockResolvedValue({ status: 'Accepted', exiResponse: '' });
-    const { handleGet15118EVCertificate } =
-      await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
     const { ctx } = makeCtx(reqPayload);
     const response = await handleGet15118EVCertificate(ctx);
 
@@ -112,8 +146,7 @@ describe('v2_1 Get15118EVCertificate handler', () => {
 
   it('returns Failed when the provider responds with non-Accepted status', async () => {
     getContractCertificateMock.mockResolvedValue({ status: 'Failed', exiResponse: '' });
-    const { handleGet15118EVCertificate } =
-      await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
     const { ctx } = makeCtx(reqPayload);
     const response = await handleGet15118EVCertificate(ctx);
 
@@ -122,8 +155,7 @@ describe('v2_1 Get15118EVCertificate handler', () => {
 
   it('returns Failed when the provider throws', async () => {
     getContractCertificateMock.mockRejectedValue(new Error('provider error'));
-    const { handleGet15118EVCertificate } =
-      await import('../../../handlers/v2_1/get-15118-ev-certificate.handler.js');
+    const { handleGet15118EVCertificate } = get15118EvCertificateHandlerModule;
     const { ctx, publishMock } = makeCtx(reqPayload);
     const response = await handleGet15118EVCertificate(ctx);
 

@@ -9,7 +9,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { AuthBranding, AuthFooter, useAuthBranding } from '@/components/AuthBranding';
-import { api, ApiError } from '@/lib/api';
+import { api } from '@/lib/api';
+import { rateLimitedMessage } from '@/lib/error-message';
 import { executeRecaptcha } from '@/lib/recaptcha';
 
 interface SecurityPublic {
@@ -59,11 +60,7 @@ export function ForgotPassword(): React.JSX.Element {
       await api.post('/v1/portal/auth/forgot-password', { email, recaptchaToken });
       setSent(true);
     } catch (err) {
-      if (err instanceof ApiError) {
-        setError(t('errors.unknown'));
-      } else {
-        setError(t('errors.unknown'));
-      }
+      setError(rateLimitedMessage(err, t) ?? t('errors.unknown'));
     } finally {
       setLoading(false);
     }
@@ -88,7 +85,7 @@ export function ForgotPassword(): React.JSX.Element {
             className="space-y-4"
           >
             <div className="space-y-2">
-              <label htmlFor="email" className="text-sm font-medium leading-none">
+              <label htmlFor="email" className="block text-sm font-medium leading-6">
                 {t('auth.email')}
               </label>
               <Input
@@ -111,7 +108,7 @@ export function ForgotPassword(): React.JSX.Element {
             </Button>
             <Link
               to="/login"
-              className="block text-center text-sm font-medium text-primary hover:underline"
+              className="block text-center text-sm font-medium text-link hover:underline"
             >
               {t('auth.backToLogin')}
             </Link>

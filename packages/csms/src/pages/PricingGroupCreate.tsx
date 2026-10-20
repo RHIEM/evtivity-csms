@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useState } from 'react';
-import { useNavigate } from 'react-router';
+import { Navigate, useNavigate } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { BackButton } from '@/components/back-button';
@@ -13,12 +13,14 @@ import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Card, CardContent } from '@/components/ui/card';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
+import { useHasCompanyWidePermission } from '@/lib/auth';
 import type { PricingGroup } from '@/lib/types';
 
 export function PricingGroupCreate(): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const canWrite = useHasCompanyWidePermission('pricing:write');
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -52,6 +54,9 @@ export function PricingGroupCreate(): React.JSX.Element {
     createMutation.mutate(body);
   }
 
+  // Pricing writes are company-wide: the API answers 404 to a site-restricted user.
+  if (!canWrite) return <Navigate to="/pricing" replace />;
+
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2">
@@ -63,7 +68,9 @@ export function PricingGroupCreate(): React.JSX.Element {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="group-name">{t('common.name')}</Label>
+              <Label htmlFor="group-name" className="leading-6">
+                {t('common.name')}
+              </Label>
               <Input
                 id="group-name"
                 value={name}
@@ -77,7 +84,9 @@ export function PricingGroupCreate(): React.JSX.Element {
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="group-description">{t('common.description')}</Label>
+              <Label htmlFor="group-description" className="leading-6">
+                {t('common.description')}
+              </Label>
               <Input
                 id="group-description"
                 value={description}

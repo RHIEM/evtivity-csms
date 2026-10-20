@@ -3,7 +3,7 @@
 
 import { Link, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Badge } from '@/components/ui/badge';
+import { TokenStatusBadge } from '@/components/token/TokenStatusBadge';
 import {
   Table,
   TableBody,
@@ -128,7 +128,7 @@ export function TokensTable({
                 )}
                 {isVisible('token') && (
                   <TableCell>
-                    <CopyableId id={token.idToken} variant="table" className="text-primary" />
+                    <CopyableId id={token.idToken} variant="table" className="text-link" />
                   </TableCell>
                 )}
                 {showDriver && isVisible('driver') && (
@@ -136,7 +136,7 @@ export function TokensTable({
                     {token.driverId != null && token.driverFirstName != null ? (
                       <Link
                         to={`/drivers/${token.driverId}`}
-                        className="text-primary hover:underline"
+                        className="text-link hover:underline"
                         onClick={(e) => {
                           e.stopPropagation();
                         }}
@@ -151,24 +151,7 @@ export function TokensTable({
                 {isVisible('type') && <TableCell>{token.tokenType}</TableCell>}
                 {isVisible('status') && (
                   <TableCell data-testid="row-click-target">
-                    {(() => {
-                      const now = Date.now();
-                      const expiresAt =
-                        token.expiresAt != null ? new Date(token.expiresAt).getTime() : null;
-                      const isExpired = expiresAt != null && expiresAt <= now;
-                      const isRevoked = token.revokedAt != null;
-                      if (!token.isActive && isExpired) {
-                        return <Badge variant="warning">{t('tokens.expiredBadge')}</Badge>;
-                      }
-                      if (!token.isActive && isRevoked) {
-                        return <Badge variant="destructive">{t('tokens.revokedBadge')}</Badge>;
-                      }
-                      return (
-                        <Badge variant={token.isActive ? 'default' : 'secondary'}>
-                          {token.isActive ? t('common.active') : t('common.inactive')}
-                        </Badge>
-                      );
-                    })()}
+                    <TokenStatusBadge token={token} />
                   </TableCell>
                 )}
                 {isVisible('expiresAt') && (

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { TestCase, StepResult } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
 
 export const TC_C_113_CSMS: TestCase = {
   id: 'TC_C_113_CSMS',
@@ -37,7 +37,7 @@ export const TC_C_113_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     const pspRef = `PSP-${String(Date.now())}`;
 
     // Step 2: Send TransactionEvent Started with DirectPayment
@@ -121,13 +121,13 @@ export const TC_C_113_CSMS: TestCase = {
         'NotifySettlementResponse received',
         `Response keys: ${Object.keys(settlementRes).join(', ')}`,
       );
-    } catch {
+    } catch (err) {
       steps.push({
         step: 4,
         description: 'Send NotifySettlement with status Canceled',
         status: 'failed',
         expected: 'NotifySettlementResponse received',
-        actual: 'NotifySettlement call failed or not supported',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 

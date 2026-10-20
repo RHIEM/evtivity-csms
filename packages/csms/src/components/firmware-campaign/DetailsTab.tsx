@@ -12,11 +12,24 @@ import { RemoveButton } from '@/components/remove-button';
 import { SaveButton } from '@/components/save-button';
 import { StartButton } from '@/components/start-button';
 import { TargetFilterFields, type TargetFilterValue } from '@/components/TargetFilterFields';
+import {
+  FirmwareSignatureFields,
+  getFirmwareSignatureErrors,
+  type FirmwareSignatureValue,
+} from '@/components/FirmwareSignatureFields';
+import {
+  FirmwareDeliveryFields,
+  firmwareDeliveryPayload,
+  firmwareDeliveryValue,
+  getFirmwareDeliveryErrors,
+  type FirmwareDeliveryValue,
+} from '@/components/FirmwareDeliveryFields';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { api } from '@/lib/api';
+import { useHasAllSiteAccess } from '@/lib/auth';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 
 export interface CampaignDetail {
@@ -24,6 +37,11 @@ export interface CampaignDetail {
   name: string;
   firmwareUrl: string;
   version: string | null;
+  signingCertificate: string | null;
+  signature: string | null;
+  retries: number | null;
+  retryInterval: number | null;
+  installDateTime: string | null;
   status: string;
   targetFilter: Record<string, string> | null;
   createdAt: string;
@@ -41,6 +59,18 @@ interface Props {
   campaign: CampaignDetail;
 }
 
+interface UpdateCampaignBody {
+  name?: string;
+  firmwareUrl?: string;
+  version?: string;
+  signingCertificate?: string | null;
+  signature?: string | null;
+  retries?: number | null;
+  retryInterval?: number | null;
+  installDateTime?: string | null;
+  targetFilter?: TargetFilterValue | null;
+}
+
 export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const timezone = useUserTimezone();
@@ -52,10 +82,18 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
   const [editName, setEditName] = useState('');
   const [editFirmwareUrl, setEditFirmwareUrl] = useState('');
   const [editVersion, setEditVersion] = useState('');
+  const [editSigning, setEditSigning] = useState<FirmwareSignatureValue>({
+    signingCertificate: '',
+    signature: '',
+  });
+  const [editDelivery, setEditDelivery] = useState<FirmwareDeliveryValue>(
+    firmwareDeliveryValue(campaign),
+  );
   const [editFilter, setEditFilter] = useState<TargetFilterValue>({});
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [startOpen, setStartOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const hasAllSiteAccess = useHasAllSiteAccess();
 
   // Lookup options for resolving filter ids -> display names in the read view.
   const { data: filterOptions } = useQuery({
@@ -64,12 +102,7 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
   });
 
   const updateMutation = useMutation({
-    mutationFn: (body: {
-      name?: string;
-      firmwareUrl?: string;
-      version?: string;
-      targetFilter?: TargetFilterValue | null;
-    }) => api.patch(`/v1/firmware-campaigns/${id}`, body),
+    mutationFn: (body: UpdateCampaignBody) => api.patch(`/v1/firmware-campaigns/${id}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['firmware-campaigns', id] });
       setEditing(false);
@@ -98,22 +131,34 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
     if (!editName.trim()) errors.editName = t('validation.required');
     if (!editFirmwareUrl.trim()) {
       errors.editFirmwareUrl = t('validation.required');
-    } else {
-      try {
-        new URL(editFirmwareUrl);
-      } catch {
-        errors.editFirmwareUrl = t('validation.invalidUrl');
-      }
+    } else if (!URL.canParse(editFirmwareUrl)) {
+      errors.editFirmwareUrl = t('validation.invalidUrl');
+    }
+    // A campaign without a site or station targets every site: only all-site
+    // users give it that reach (the API answers others 404).
+    if (!hasAllSiteAccess && editFilter.siteId == null && editFilter.stationId == null) {
+      errors.editTargetFilter = t('validation.selectRequired');
     }
     return errors;
   }
 
-  const validationErrors = getValidationErrors();
+  const signingErrors = getFirmwareSignatureErrors(editSigning, t);
+  const deliveryErrors = getFirmwareDeliveryErrors(editDelivery, t);
+  const validationErrors: Record<string, string> = {
+    ...getValidationErrors(),
+    ...signingErrors,
+    ...deliveryErrors,
+  };
 
   function startEdit(): void {
     setEditName(campaign.name);
     setEditFirmwareUrl(campaign.firmwareUrl);
     setEditVersion(campaign.version ?? '');
+    setEditSigning({
+      signingCertificate: campaign.signingCertificate ?? '',
+      signature: campaign.signature ?? '',
+    });
+    setEditDelivery(firmwareDeliveryValue(campaign));
     setEditFilter({
       ...(campaign.targetFilter?.siteId != null ? { siteId: campaign.targetFilter.siteId } : {}),
       ...(campaign.targetFilter?.vendorId != null
@@ -146,6 +191,12 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
       campaign.targetFilter.vendorId != null ||
       campaign.targetFilter.model != null ||
       campaign.targetFilter.stationId != null);
+  // A campaign without a site or station targets every site: only all-site
+  // users edit it (the API answers others 404).
+  const canEditCampaign =
+    hasAllSiteAccess ||
+    campaign.targetFilter?.siteId != null ||
+    campaign.targetFilter?.stationId != null;
 
   return (
     <>
@@ -153,7 +204,7 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
         <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle>{t('common.details')}</CardTitle>
           <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-            {campaign.status === 'draft' && !editing && (
+            {campaign.status === 'draft' && !editing && canEditCampaign && (
               <EditButton label={t('common.edit')} onClick={startEdit} />
             )}
             {campaign.status === 'draft' && !editing && (
@@ -183,14 +234,16 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
                 e.preventDefault();
                 setHasSubmitted(true);
                 if (Object.keys(validationErrors).length > 0) return;
-                const body: {
-                  name?: string;
-                  firmwareUrl?: string;
-                  version?: string;
-                  targetFilter?: TargetFilterValue | null;
-                } = {
+                const signingCertificate = editSigning.signingCertificate.trim();
+                const signature = editSigning.signature.trim();
+                const body: UpdateCampaignBody = {
                   name: editName,
                   firmwareUrl: editFirmwareUrl,
+                  // Both empty clears them (an unsigned update).
+                  signingCertificate: signingCertificate !== '' ? signingCertificate : null,
+                  signature: signature !== '' ? signature : null,
+                  // An empty field clears the stored value.
+                  ...firmwareDeliveryPayload(editDelivery, true),
                 };
                 if (editVersion !== '') body.version = editVersion;
                 body.targetFilter = Object.keys(editFilter).length > 0 ? editFilter : null;
@@ -242,13 +295,31 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
                 </div>
               </div>
 
+              <FirmwareDeliveryFields
+                value={editDelivery}
+                onChange={setEditDelivery}
+                idPrefix="fcd-edit"
+                errors={hasSubmitted ? deliveryErrors : {}}
+              />
+
+              <FirmwareSignatureFields
+                value={editSigning}
+                onChange={setEditSigning}
+                idPrefix="fcd-edit"
+                errors={hasSubmitted ? signingErrors : {}}
+              />
+
               <TargetFilterFields
                 endpoint="/v1/firmware-campaigns/filter-options"
                 queryKeyPrefix={['firmware-campaign-filter-options']}
                 value={editFilter}
                 onChange={setEditFilter}
                 idPrefix="fw-edit-filter"
+                helpText={t('firmwareCampaigns.targetFilterHelp')}
               />
+              {hasSubmitted && validationErrors.editTargetFilter && (
+                <p className="text-sm text-destructive">{validationErrors.editTargetFilter}</p>
+              )}
 
               <div className="flex justify-end gap-2">
                 <CancelButton
@@ -269,6 +340,34 @@ export function FirmwareCampaignDetailsTab({ campaign }: Props): React.JSX.Eleme
               <div>
                 <dt className="text-muted-foreground">{t('firmwareCampaigns.version')}</dt>
                 <dd className="font-medium">{campaign.version ?? 'n/a'}</dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('firmwareCampaigns.signatureStatus')}</dt>
+                <dd className="font-medium">
+                  {campaign.signingCertificate != null && campaign.signature != null
+                    ? t('firmwareCampaigns.signed')
+                    : t('firmwareCampaigns.unsigned')}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('firmwareCampaigns.retries')}</dt>
+                <dd className="font-medium">
+                  {campaign.retries ?? t('firmwareCampaigns.stationDecides')}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('firmwareCampaigns.retryInterval')}</dt>
+                <dd className="font-medium">
+                  {campaign.retryInterval ?? t('firmwareCampaigns.stationDecides')}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">{t('firmwareCampaigns.installDateTime')}</dt>
+                <dd className="font-medium">
+                  {campaign.installDateTime != null
+                    ? formatDateTime(campaign.installDateTime, timezone)
+                    : t('firmwareCampaigns.afterDownload')}
+                </dd>
               </div>
               <div>
                 <dt className="text-muted-foreground">{t('common.created')}</dt>

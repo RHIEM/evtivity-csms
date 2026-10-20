@@ -8,12 +8,14 @@ import { useInfiniteQuery, useQuery, useQueries } from '@tanstack/react-query';
 import { ChevronLeft, ChevronRight, FileText, Leaf } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { api } from '@/lib/api';
+import { costContainsTax } from '@evtivity/lib/price-display';
 import {
   formatCents,
   formatEnergy,
   formatDuration,
   formatDistance,
   formatMonthYear,
+  formatNumber,
 } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
@@ -24,6 +26,7 @@ interface Session {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   finalCostCents: number | null;
+  taxCents: number | null;
   currency: string;
   stationName: string | null;
   siteName: string | null;
@@ -66,6 +69,7 @@ function formatMonthParam(date: Date): string {
 
 // Trailing-trend chart height in px (matches the mobile app's 6-month bars).
 const CHART_HEIGHT = 110;
+const ACTIVITY_PAGE_SIZE = 10;
 
 function shiftMonthParam(date: Date, delta: number): string {
   return formatMonthParam(new Date(date.getFullYear(), date.getMonth() + delta, 1));
@@ -76,12 +80,12 @@ function monthParamToDate(param: string): Date {
   return new Date(Number(y), Number(m) - 1, 1);
 }
 
-function monthAbbrev(param: string): string {
-  return monthParamToDate(param).toLocaleDateString('en-US', { month: 'short' });
+function monthAbbrev(param: string, locale: string): string {
+  return monthParamToDate(param).toLocaleDateString(locale, { month: 'short' });
 }
 
 export function Activity(): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const distanceUnit = useAuth((s) => s.driver?.distanceUnit ?? 'miles');
   const [selectedMonth, setSelectedMonth] = useState(() => new Date());
@@ -115,12 +119,13 @@ export function Activity(): React.JSX.Element {
     queryKey: ['portal-sessions-month', monthParam],
     queryFn: ({ pageParam }) =>
       api.get<SessionsResponse>(
-        `/v1/portal/sessions?month=${monthParam}&limit=10&offset=${String(pageParam)}`,
+        `/v1/portal/sessions?month=${monthParam}&limit=${String(ACTIVITY_PAGE_SIZE)}&page=${String(pageParam)}`,
       ),
-    initialPageParam: 0,
+    // The API pages by page number from 1 (it reads no offset).
+    initialPageParam: 1,
     getNextPageParam: (lastPage, allPages) => {
       const fetched = allPages.reduce((sum, p) => sum + p.data.length, 0);
-      return fetched < lastPage.total ? fetched : undefined;
+      return fetched < lastPage.total && lastPage.data.length > 0 ? allPages.length + 1 : undefined;
     },
   });
 
@@ -171,9 +176,9 @@ export function Activity(): React.JSX.Element {
     centerText = formatEnergy(totalEnergyWh);
   } else if (distanceUnit === 'km') {
     const totalKm = totalMiles * 1.60934;
-    centerText = `${totalKm.toFixed(0)} ${t('activity.km')}`;
+    centerText = `${formatNumber(totalKm, 0)} ${t('activity.km')}`;
   } else {
-    centerText = `${totalMiles.toFixed(0)} ${t('activity.miles')}`;
+    centerText = `${formatNumber(totalMiles, 0)} ${t('activity.miles')}`;
   }
 
   // Per-month value for the trend bars. Energy and distance scale together, so
@@ -196,7 +201,7 @@ export function Activity(): React.JSX.Element {
         <button
           onClick={prevMonth}
           className="rounded-full p-1 text-muted-foreground transition-colors hover:text-foreground"
-          aria-label="Previous month"
+          aria-label={t('activity.previousMonth')}
         >
           <ChevronLeft className="h-5 w-5" />
         </button>
@@ -204,7 +209,7 @@ export function Activity(): React.JSX.Element {
         <button
           onClick={nextMonth}
           className="rounded-full p-1 text-muted-foreground transition-colors hover:text-foreground"
-          aria-label="Next month"
+          aria-label={t('activity.nextMonth')}
         >
           <ChevronRight className="h-5 w-5" />
         </button>
@@ -234,6 +239,9 @@ export function Activity(): React.JSX.Element {
         <CardContent className="space-y-4 py-6">
           <div className="text-center">
             <p className="text-xl font-bold">{centerText}</p>
+            {selectedMetric === 'cost' && (
+              <p className="text-xs text-muted-foreground">{t('common.inclTax')}</p>
+            )}
             <p className="text-xs text-muted-foreground">
               {summary?.sessionCount ?? 0} {t('activity.sessions')}
             </p>
@@ -272,7 +280,7 @@ export function Activity(): React.JSX.Element {
                         active ? 'font-semibold text-foreground' : 'text-muted-foreground'
                       }`}
                     >
-                      {monthAbbrev(m)}
+                      {monthAbbrev(m, i18n.language)}
                     </span>
                   </button>
                 );
@@ -289,7 +297,7 @@ export function Activity(): React.JSX.Element {
             <Leaf className="h-5 w-5 text-success" />
             <span className="text-sm font-medium text-success">
               {t('activity.co2AvoidedMessage', {
-                amount: summary.totalCo2AvoidedKg.toFixed(1),
+                amount: formatNumber(summary.totalCo2AvoidedKg, 1),
               })}
             </span>
           </CardContent>
@@ -304,7 +312,7 @@ export function Activity(): React.JSX.Element {
         }}
       >
         <CardContent className="flex items-center gap-3 p-3">
-          <FileText className="h-5 w-5 text-primary" />
+          <FileText className="h-5 w-5 text-link" />
           <span className="flex-1 text-sm font-medium">{t('activity.monthlyStatement')}</span>
           <ChevronRight className="h-4 w-4 text-muted-foreground" />
         </CardContent>
@@ -329,7 +337,9 @@ export function Activity(): React.JSX.Element {
                 className={`h-2 w-2 rounded-full ${statusDotColor(session.status)}`}
                 aria-hidden="true"
               />
-              <span className="sr-only">{session.status}</span>
+              <span className="sr-only">
+                {t(`sessionStatus.${session.status}`, { defaultValue: session.status })}
+              </span>
               <div className="flex-1 min-w-0">
                 <p className="truncate text-sm font-medium">
                   {session.siteName ?? session.stationName ?? t('activity.unknownStation')}
@@ -344,6 +354,9 @@ export function Activity(): React.JSX.Element {
                 <p className="text-sm font-medium">
                   {formatCents(session.finalCostCents, session.currency)}
                 </p>
+                {costContainsTax(session.finalCostCents, session.taxCents) && (
+                  <p className="text-xs text-muted-foreground">{t('common.inclTax')}</p>
+                )}
                 <p className="text-xs text-muted-foreground">
                   {formatDuration(session.startedAt, session.endedAt)}
                 </p>

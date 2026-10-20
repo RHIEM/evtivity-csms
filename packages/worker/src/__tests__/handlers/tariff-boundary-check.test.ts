@@ -1,61 +1,22 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { Logger } from 'pino';
 
-// `db.select(...)` is used twice with different chain shapes:
-//   1. active sessions: .from().innerJoin().where()  -> session list
-//   2. closedIdleAgg:    .from().where()             -> [{ total }]
-// A queued-result model keyed by call order drives both. `db.transaction(cb)`
-// invokes cb with a tx that exposes update/insert chains (all no-ops here;
-// the test asserts the tx ops were issued, not their SQL).
+// `db.select(...).from().innerJoin().where()` resolves to the active sessions.
+// The segment switch and the cost assembly (@evtivity/database
+// session-pricing) are mocked; they are tested in @evtivity/database.
 
-let selectQueue: unknown[][] = [];
-let selectIndex = 0;
-function setSelectResults(...results: unknown[][]): void {
-  selectQueue = results;
-  selectIndex = 0;
-}
-function nextSelectResult(): unknown[] {
-  const r = selectQueue[selectIndex] ?? [];
-  selectIndex++;
-  return r;
-}
-
-// A thenable chain whose terminal resolves to the next queued select result.
-function makeSelectChain(): Record<string, unknown> {
-  const result = nextSelectResult();
+let activeSessions: unknown[] = [];
+const mockSelect = vi.fn(() => {
   const chain: Record<string, unknown> = {};
   for (const m of ['from', 'innerJoin', 'where']) {
     chain[m] = vi.fn(() => chain);
   }
   chain['then'] = (onF?: (v: unknown) => unknown, onR?: (r: unknown) => unknown) =>
-    Promise.resolve(result).then(onF, onR);
+    Promise.resolve(activeSessions).then(onF, onR);
   return chain;
-}
-const mockSelect = vi.fn(() => makeSelectChain());
-
-const txUpdateSet = vi.fn();
-const txInsertValues = vi.fn();
-function makeTx(): Record<string, unknown> {
-  return {
-    update: vi.fn(() => ({
-      set: vi.fn((arg: unknown) => {
-        txUpdateSet(arg);
-        return { where: vi.fn(() => Promise.resolve()) };
-      }),
-    })),
-    insert: vi.fn(() => ({
-      values: vi.fn((arg: unknown) => {
-        txInsertValues(arg);
-        return Promise.resolve();
-      }),
-    })),
-  };
-}
-const mockTransaction = vi.fn(async (cb: (tx: unknown) => Promise<void>) => {
-  await cb(makeTx());
 });
 
 const {
@@ -64,50 +25,60 @@ const {
   mockResolveTariff,
   mockPushAll,
   mockPublish,
+  mockHeartbeat,
+  mockSwitchTariffSegment,
+  mockPriceSessionAt,
+  mockStoreRunningCost,
+  mockSendTariffChange,
+  mockClient,
+  mockUpdateSet,
 } = vi.hoisted(() => ({
   mockIsSplitBillingEnabled: vi.fn(),
   mockIsStationMessageEnabled: vi.fn(),
   mockResolveTariff: vi.fn(),
   mockPushAll: vi.fn().mockResolvedValue(undefined),
   mockPublish: vi.fn().mockResolvedValue(undefined),
+  mockHeartbeat: vi.fn(),
+  mockSwitchTariffSegment: vi.fn(),
+  mockPriceSessionAt: vi.fn(),
+  mockStoreRunningCost: vi.fn(),
+  mockSendTariffChange: vi.fn(),
+  mockClient: { __client: true },
+  mockUpdateSet: vi.fn(),
+}));
+
+const mockUpdate = vi.fn(() => ({
+  set: (values: unknown) => {
+    mockUpdateSet(values);
+    return { where: vi.fn(() => Promise.resolve()) };
+  },
 }));
 
 vi.mock('@evtivity/database', () => ({
-  db: {
-    select: mockSelect,
-    transaction: mockTransaction,
-  },
+  db: { select: mockSelect, update: mockUpdate },
+  client: mockClient,
   chargingSessions: { id: 'cs.id', status: 'cs.status', stationId: 'cs.stationId' },
   chargingStations: { id: 'st.id', stationId: 'st.stationId', ocppProtocol: 'st.ocppProtocol' },
-  sessionTariffSegments: {
-    sessionId: 'sts.sessionId',
-    endedAt: 'sts.endedAt',
-    idleMinutes: 'sts.idleMinutes',
-  },
   isSplitBillingEnabled: mockIsSplitBillingEnabled,
   isStationMessageEnabled: mockIsStationMessageEnabled,
+  getHeartbeatIntervalSeconds: mockHeartbeat,
+  switchTariffSegment: mockSwitchTariffSegment,
+  priceSessionAt: mockPriceSessionAt,
+  storeRunningCost: mockStoreRunningCost,
+  resolveStationTariff: mockResolveTariff,
+  sendSessionTariffChange: mockSendTariffChange,
 }));
 
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(),
-  and: vi.fn(),
-  isNull: vi.fn(),
-  isNotNull: vi.fn(),
-  sql: Object.assign(
-    (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
-    { raw: vi.fn() },
-  ),
+  sql: vi.fn(() => 'sql'),
 }));
 
-vi.mock('@evtivity/api/src/lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: () => ({ publish: mockPublish }),
 }));
 
-vi.mock('@evtivity/api/src/services/tariff.service.js', () => ({
-  resolveTariff: mockResolveTariff,
-}));
-
-vi.mock('@evtivity/api/src/services/station-message.service.js', () => ({
+vi.mock('@evtivity/services/station-message.service', () => ({
   pushAllMessagesToAllStations: mockPushAll,
 }));
 
@@ -122,12 +93,19 @@ function activeSession(overrides: Record<string, unknown> = {}): Record<string, 
     transactionId: 'tx-001',
     stationUuid: 'sta_1',
     driverId: 'drv_1',
-    tariffId: 'tar_old',
+    tariffId: 'tar_start',
+    pricingGroupId: 'pgr_1',
+    tariffPricePerKwh: '0.25',
+    tariffPricePerMinute: null,
+    tariffPricePerSession: null,
+    tariffIdleFeePricePerMinute: null,
+    tariffReservationFeePerMinute: null,
+    tariffTaxRate: '0.08',
     energyDeliveredWh: '1500',
-    idleMinutes: '0',
-    currentCostCents: 650,
     stationOcppId: 'CS-001',
     ocppProtocol: 'ocpp2.1',
+    stationOnline: true,
+    stationLastActivityAt: new Date(Date.now() - 30_000),
     ...overrides,
   };
 }
@@ -139,22 +117,43 @@ function newTariff(overrides: Record<string, unknown> = {}): Record<string, unkn
     pricePerMinute: '0',
     pricePerSession: '0',
     idleFeePricePerMinute: '0',
+    reservationFeePerMinute: null,
     taxRate: '0.08',
     ...overrides,
   };
 }
 
+const breakdown = (grossCents: number) => ({
+  basis: 'net',
+  netCents: grossCents,
+  taxCents: 0,
+  grossCents,
+  taxLines: [{ taxRate: 0, netCents: grossCents, taxCents: 0 }],
+  components: null,
+});
+
+// The module is imported after the mocks above are initialized. The first import loads the
+// whole module graph, which under coverage on a busy machine took longer than one test's
+// 5 s timeout, so it happens once here with its own timeout instead of inside the first test.
+let mod: typeof import('../../handlers/tariff-boundary-check.js');
+beforeAll(async () => {
+  mod = await import('../../handlers/tariff-boundary-check.js');
+}, 30_000);
+
 describe('tariffBoundaryCheckHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    setSelectResults();
+    activeSessions = [];
     mockIsSplitBillingEnabled.mockResolvedValue(true);
     mockIsStationMessageEnabled.mockResolvedValue(false);
     mockResolveTariff.mockResolvedValue(null);
     mockPushAll.mockResolvedValue(undefined);
     mockPublish.mockResolvedValue(undefined);
-    txUpdateSet.mockClear();
-    txInsertValues.mockClear();
+    mockHeartbeat.mockResolvedValue(300);
+    mockSwitchTariffSegment.mockResolvedValue({ fromTariffId: 'tar_old' });
+    mockPriceSessionAt.mockResolvedValue(breakdown(712));
+    mockStoreRunningCost.mockResolvedValue(true);
+    mockSendTariffChange.mockResolvedValue('unchanged');
   });
 
   it('returns early when both split-billing and station messages are disabled', async () => {
@@ -162,72 +161,106 @@ describe('tariffBoundaryCheckHandler', () => {
     mockIsStationMessageEnabled.mockResolvedValue(false);
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
     expect(mockSelect).not.toHaveBeenCalled();
-    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
     expect(mockPushAll).not.toHaveBeenCalled();
   });
 
-  it('does not split or publish when the resolved tariff is unchanged', async () => {
-    setSelectResults([activeSession({ tariffId: 'tar_same' })]);
-    mockResolveTariff.mockResolvedValue(newTariff({ id: 'tar_same' }));
+  it('changes nothing when the open segment already has the tariff (the switch returns null)', async () => {
+    // The session started on tar_start; its open segment is already tar_new,
+    // or a MeterValues projection switched it first (B1).
+    activeSessions = [activeSession()];
+    mockSwitchTariffSegment.mockResolvedValue(null);
+    mockResolveTariff.mockResolvedValue(newTariff());
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockResolveTariff).toHaveBeenCalledWith('sta_1', 'drv_1');
-    expect(mockTransaction).not.toHaveBeenCalled();
+    // The session's energy so far (1500 Wh) selects energy-threshold tariffs.
+    expect(mockResolveTariff).toHaveBeenCalledWith(
+      {
+        stationUuid: 'sta_1',
+        driverUuid: 'drv_1',
+        at: expect.any(Date) as Date,
+        sessionEnergyKwh: 1.5,
+        pricingGroupId: 'pgr_1',
+      },
+      mockClient,
+    );
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
+    expect(mockPriceSessionAt).not.toHaveBeenCalled();
+    expect(mockPublish).not.toHaveBeenCalled();
+  });
+
+  it('resolves a session without energy at 0 kWh', async () => {
+    activeSessions = [activeSession({ energyDeliveredWh: null })];
+    const { tariffBoundaryCheckHandler } = mod;
+    await tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockResolveTariff).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stationUuid: 'sta_1',
+        driverUuid: 'drv_1',
+        sessionEnergyKwh: 0,
+        pricingGroupId: 'pgr_1',
+      }),
+      mockClient,
+    );
+  });
+
+  it('leaves the sessions of an offline or silent station alone (B6)', async () => {
+    activeSessions = [
+      activeSession({ stationOnline: false }),
+      activeSession({ sessionId: 'ses_2', stationLastActivityAt: new Date(Date.now() - 600_000) }),
+      activeSession({ sessionId: 'ses_3', stationLastActivityAt: null }),
+    ];
+    mockResolveTariff.mockResolvedValue(newTariff());
+
+    const { tariffBoundaryCheckHandler } = mod;
+    await tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockResolveTariff).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
     expect(mockPublish).not.toHaveBeenCalled();
   });
 
   it('does not split or publish when no tariff resolves (null)', async () => {
-    setSelectResults([activeSession()]);
+    activeSessions = [activeSession()];
     mockResolveTariff.mockResolvedValue(null);
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
     expect(mockPublish).not.toHaveBeenCalled();
   });
 
-  it('closes/opens segments, snapshots the new tariff, and publishes CostUpdated to OCPP 2.1', async () => {
-    setSelectResults(
-      [activeSession()], // active sessions
-      [{ total: '0' }], // closedIdleAgg
-    );
-    mockResolveTariff.mockResolvedValue(newTariff());
+  it('switches segments, stores the running cost, and publishes CostUpdated to OCPP 2.1', async () => {
+    activeSessions = [activeSession()];
+    const tariff = newTariff();
+    mockResolveTariff.mockResolvedValue(tariff);
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockTransaction).toHaveBeenCalledTimes(1);
-    // Inside the tx: close-segment UPDATE, snapshot-session UPDATE, plus the
-    // open-segment INSERT.
-    expect(txInsertValues).toHaveBeenCalledTimes(1);
-    expect(txInsertValues).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: 'ses_1',
-        tariffId: 'tar_new',
-        energyWhStart: '1500',
-      }),
-    );
-    expect(txUpdateSet).toHaveBeenCalledTimes(2);
-    // The session snapshot update carries the new tariff fields.
-    const snapshotSet = txUpdateSet.mock.calls.find(
-      (c) => (c[0] as Record<string, unknown>).tariffId === 'tar_new',
-    );
-    expect(snapshotSet).toBeDefined();
-    expect(snapshotSet![0]).toMatchObject({
-      tariffId: 'tar_new',
-      tariffPricePerKwh: '0.30',
-      tariffTaxRate: '0.08',
-    });
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
+    const [client, params] = mockSwitchTariffSegment.mock.calls[0] as [
+      unknown,
+      Record<string, unknown>,
+    ];
+    expect(client).toBe(mockClient);
+    expect(params).toMatchObject({ sessionId: 'ses_1', tariff, energyWh: 1500 });
+    // The switch computes the idle under the session row lock.
+    expect(params).not.toHaveProperty('sessionIdleMinutes');
+
+    expect(mockPriceSessionAt).toHaveBeenCalledWith(mockClient, 'ses_1', params.at, 1500);
+    expect(mockStoreRunningCost).toHaveBeenCalledWith(mockClient, 'ses_1', breakdown(712));
 
     expect(log.info).toHaveBeenCalledWith(
       { sessionId: 'ses_1', oldTariffId: 'tar_old', newTariffId: 'tar_new' },
@@ -241,82 +274,104 @@ describe('tariffBoundaryCheckHandler', () => {
     expect(body).toMatchObject({
       stationId: 'CS-001',
       action: 'CostUpdated',
-      payload: { totalCost: 6.5, transactionId: 'tx-001' },
+      payload: { totalCost: 7.12, transactionId: 'tx-001' },
       version: 'ocpp2.1',
     });
     expect(typeof body.commandId).toBe('string');
   });
 
-  it('handles null energy and missing closedIdleAgg row, and CostUpdated with null cost defaults to 0', async () => {
-    setSelectResults(
-      [activeSession({ energyDeliveredWh: null, currentCostCents: null })], // active sessions
-      [], // closedIdleAgg returns no row -> total defaults to 0
-    );
+  it('sends the station the tariff from the boundary after switching segments (I11)', async () => {
+    activeSessions = [activeSession()];
     mockResolveTariff.mockResolvedValue(newTariff());
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
-    await tariffBoundaryCheckHandler(log);
+    await mod.tariffBoundaryCheckHandler(log);
 
-    // Null energy -> 0; the open segment records energyWhStart '0'.
-    expect(txInsertValues).toHaveBeenCalledWith(expect.objectContaining({ energyWhStart: '0' }));
-    expect(mockPublish).toHaveBeenCalledTimes(1);
-    const body = JSON.parse((mockPublish.mock.calls[0] as [string, string])[1]) as {
-      payload: { totalCost: number };
-    };
-    // currentCostCents null -> totalCost 0.
-    expect(body.payload.totalCost).toBe(0);
+    const switchedAt = (mockSwitchTariffSegment.mock.calls[0] as [unknown, { at: Date }])[1].at;
+    expect(mockSendTariffChange).toHaveBeenCalledWith(
+      mockClient,
+      expect.objectContaining({ publish: mockPublish }),
+      { sessionId: 'ses_1', at: switchedAt, energyWh: 1500 },
+    );
+  });
+
+  it('sends no tariff change without a segment switch', async () => {
+    activeSessions = [activeSession()];
+    mockResolveTariff.mockResolvedValue(newTariff({ id: 'tar_old' }));
+    mockSwitchTariffSegment.mockResolvedValue(null);
+
+    await mod.tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockSendTariffChange).not.toHaveBeenCalled();
+  });
+
+  it('skips CostUpdated when the session cannot be priced or ended meanwhile (B14)', async () => {
+    activeSessions = [activeSession({ energyDeliveredWh: null })];
+    mockResolveTariff.mockResolvedValue(newTariff());
+    mockPriceSessionAt.mockResolvedValue(null);
+    const log = makeLog();
+
+    await mod.tariffBoundaryCheckHandler(log);
+
+    expect(mockSwitchTariffSegment).toHaveBeenCalledWith(
+      mockClient,
+      expect.objectContaining({ energyWh: 0 }),
+    );
+    expect(mockStoreRunningCost).not.toHaveBeenCalled();
+    expect(mockPublish).not.toHaveBeenCalled();
+
+    // storeRunningCost writes active sessions only: false means the session
+    // ended after the select, and the station keeps its final cost.
+    activeSessions = [activeSession()];
+    mockPriceSessionAt.mockResolvedValue(breakdown(712));
+    mockStoreRunningCost.mockResolvedValue(false);
+    await mod.tariffBoundaryCheckHandler(log);
+    expect(mockStoreRunningCost).toHaveBeenCalled();
+    expect(mockPublish).not.toHaveBeenCalled();
   });
 
   it('splits the session but skips CostUpdated for OCPP 1.6 stations', async () => {
-    setSelectResults([activeSession({ ocppProtocol: 'ocpp1.6' })], [{ total: '0' }]);
+    activeSessions = [activeSession({ ocppProtocol: 'ocpp1.6' })];
     mockResolveTariff.mockResolvedValue(newTariff());
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockTransaction).toHaveBeenCalledTimes(1);
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
     expect(mockPublish).not.toHaveBeenCalled();
   });
 
   it('skips CostUpdated when ocppProtocol is null', async () => {
-    setSelectResults([activeSession({ ocppProtocol: null })], [{ total: '0' }]);
+    activeSessions = [activeSession({ ocppProtocol: null })];
     mockResolveTariff.mockResolvedValue(newTariff());
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockTransaction).toHaveBeenCalledTimes(1);
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
     expect(mockPublish).not.toHaveBeenCalled();
   });
 
   it('logs the failed session and continues when one session in the batch rejects', async () => {
-    // Two sessions: first's transaction rejects, second succeeds.
-    setSelectResults(
-      [
-        activeSession({ sessionId: 'ses_bad' }),
-        activeSession({ sessionId: 'ses_good', stationUuid: 'sta_2' }),
-      ],
-      [{ total: '0' }], // closedIdleAgg for ses_bad
-      [{ total: '0' }], // closedIdleAgg for ses_good
-    );
+    activeSessions = [
+      activeSession({ sessionId: 'ses_bad' }),
+      activeSession({ sessionId: 'ses_good', stationUuid: 'sta_2' }),
+    ];
     mockResolveTariff.mockResolvedValue(newTariff());
-    mockTransaction.mockImplementationOnce(async () => {
-      throw new Error('tx failed');
-    });
+    mockSwitchTariffSegment.mockRejectedValueOnce(new Error('tx failed'));
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
     expect(log.error).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: 'ses_bad' }),
       'Tariff boundary check failed for session',
     );
-    // The second session still ran its transaction.
-    expect(mockTransaction).toHaveBeenCalledTimes(2);
+    // The second session still switched.
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(2);
   });
 
   it('skips the split path entirely but still pushes messages when only station messages are enabled', async () => {
@@ -324,38 +379,69 @@ describe('tariffBoundaryCheckHandler', () => {
     mockIsStationMessageEnabled.mockResolvedValue(true);
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
     expect(mockSelect).not.toHaveBeenCalled();
-    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
     expect(mockPushAll).toHaveBeenCalledTimes(1);
     expect(mockPushAll).toHaveBeenCalledWith(log);
   });
 
   it('runs both the split path and the station-message push when both are enabled', async () => {
     mockIsStationMessageEnabled.mockResolvedValue(true);
-    setSelectResults([activeSession()], [{ total: '0' }]);
+    activeSessions = [activeSession()];
     mockResolveTariff.mockResolvedValue(newTariff());
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
-    expect(mockTransaction).toHaveBeenCalledTimes(1);
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
     expect(mockPushAll).toHaveBeenCalledTimes(1);
   });
 
   it('does nothing per-session when there are no active sessions but still pushes messages if enabled', async () => {
     mockIsStationMessageEnabled.mockResolvedValue(true);
-    setSelectResults([]); // no active sessions
     const log = makeLog();
 
-    const { tariffBoundaryCheckHandler } = await import('../../handlers/tariff-boundary-check.js');
+    const { tariffBoundaryCheckHandler } = mod;
     await tariffBoundaryCheckHandler(log);
 
     expect(mockResolveTariff).not.toHaveBeenCalled();
-    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
     expect(mockPushAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the payment gate due when a free start moves to a paid tariff (B3, TC-T3-08)', async () => {
+    activeSessions = [
+      activeSession({ tariffPricePerKwh: '0', tariffTaxRate: null, tariffPricePerSession: '0' }),
+    ];
+    mockResolveTariff.mockResolvedValue(newTariff());
+
+    await mod.tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSet).toHaveBeenCalledWith({ paymentGateDueAt: expect.any(Date) });
+  });
+
+  it('marks nothing when the session started on a paid tariff', async () => {
+    activeSessions = [activeSession()];
+    mockResolveTariff.mockResolvedValue(newTariff());
+
+    await mod.tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockSwitchTariffSegment).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSet).not.toHaveBeenCalled();
+  });
+
+  it('leaves a session without a pricing group unpriced (B7)', async () => {
+    activeSessions = [activeSession({ pricingGroupId: null, tariffId: null })];
+    mockResolveTariff.mockResolvedValue(newTariff());
+
+    await mod.tariffBoundaryCheckHandler(makeLog());
+
+    expect(mockResolveTariff).not.toHaveBeenCalled();
+    expect(mockSwitchTariffSegment).not.toHaveBeenCalled();
   });
 });

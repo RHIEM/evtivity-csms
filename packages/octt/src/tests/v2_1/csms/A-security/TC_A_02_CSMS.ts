@@ -5,6 +5,7 @@ import { OcppClient } from '@evtivity/css/ocpp-client';
 import { db, chargingStations } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
 import { hash } from 'argon2';
+import { STATION_PASSWORD_HASH_OPTIONS } from '@evtivity/lib';
 import type { TestCase, StepResult } from '../../../../types.js';
 
 const KNOWN_PASSWORD = 'test-password-tc-a02';
@@ -24,7 +25,7 @@ export const TC_A_02_CSMS: TestCase = {
 
     // The executor provisions the station as SP0 (no auth). Update it to SP1
     // with a known password so the CSMS enforces Basic Auth.
-    const passwordHash = await hash(KNOWN_PASSWORD);
+    const passwordHash = await hash(KNOWN_PASSWORD, { ...STATION_PASSWORD_HASH_OPTIONS });
     await db
       .update(chargingStations)
       .set({ securityProfile: 1, basicAuthPasswordHash: passwordHash })
@@ -41,13 +42,15 @@ export const TC_A_02_CSMS: TestCase = {
     });
 
     let rejected = false;
+    let rejectedError: string | null = null;
     try {
       await badClient.connect();
       // Give the server a moment to close the connection if it accepted the upgrade
       await new Promise((resolve) => setTimeout(resolve, 1000));
       rejected = !badClient.isConnected;
-    } catch {
+    } catch (err) {
       rejected = true;
+      rejectedError = err instanceof Error ? err.message : String(err);
     } finally {
       badClient.disconnect();
     }
@@ -57,7 +60,9 @@ export const TC_A_02_CSMS: TestCase = {
       description: 'CSMS rejects connection with invalid password',
       status: rejected ? 'passed' : 'failed',
       expected: 'Connection rejected (not connected)',
-      actual: rejected ? 'Connection rejected' : 'Connection unexpectedly accepted',
+      actual: rejected
+        ? `Connection rejected${rejectedError != null ? `: ${rejectedError}` : ''}`
+        : 'Connection unexpectedly accepted',
     });
 
     // Step 2: Verify valid connection works with correct credentials.
@@ -72,12 +77,13 @@ export const TC_A_02_CSMS: TestCase = {
     });
 
     let validConnected = false;
+    let validConnectError: string | null = null;
     try {
       await validClient.connect();
       await new Promise((resolve) => setTimeout(resolve, 500));
       validConnected = validClient.isConnected;
-    } catch {
-      validConnected = false;
+    } catch (err) {
+      validConnectError = err instanceof Error ? err.message : String(err);
     } finally {
       validClient.disconnect();
     }
@@ -87,7 +93,9 @@ export const TC_A_02_CSMS: TestCase = {
       description: 'CSMS accepts connection with valid credentials',
       status: validConnected ? 'passed' : 'failed',
       expected: 'Connected with valid credentials',
-      actual: validConnected ? 'Connected with valid credentials' : 'Not connected',
+      actual: validConnected
+        ? 'Connected with valid credentials'
+        : (validConnectError ?? 'Not connected'),
     });
 
     return {

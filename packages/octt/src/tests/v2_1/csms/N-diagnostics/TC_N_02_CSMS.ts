@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../../types.js';
 import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 const makeMonitoringReportTest = (id: string, name: string, description: string): TestCase => ({
   id,
@@ -19,13 +20,15 @@ const makeMonitoringReportTest = (id: string, name: string, description: string)
       reason: 'PowerUp',
     });
     let received = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'GetMonitoringReport') {
-        received = true;
-        return { status: 'Accepted' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'GetMonitoringReport') {
+          received = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'GetMonitoringReport', {
         stationId: ctx.stationId,
@@ -66,13 +69,13 @@ const makeMonitoringReportTest = (id: string, name: string, description: string)
           ],
         });
         pushSendAckStep(steps, 2, 'Send NotifyMonitoringReportRequest', resp2);
-      } catch {
+      } catch (err) {
         steps.push({
           step: 2,
           description: 'Send NotifyMonitoringReportRequest',
           status: 'failed',
           expected: 'Response received',
-          actual: 'Error',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }

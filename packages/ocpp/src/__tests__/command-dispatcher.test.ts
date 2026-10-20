@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import pino from 'pino';
 import { CommandDispatcher } from '../server/command-dispatcher.js';
+import * as commandTranslationModule from '../server/command-translation.js';
 
 vi.mock('../server/command-translation.js', () => ({
   translateCommand: vi.fn(
@@ -53,9 +54,29 @@ describe('CommandDispatcher', () => {
       const response = await dispatcher.sendCommand('CS-001', 'Reset', { type: 'Soft' });
 
       expect(response).toEqual({ status: 'Accepted' });
-      expect(correlator.sendCall).toHaveBeenCalledWith(conn.ws, conn.session, 'Reset', {
-        type: 'Soft',
-      });
+      expect(correlator.sendCall).toHaveBeenCalledWith(
+        conn.ws,
+        conn.session,
+        'Reset',
+        { type: 'Soft' },
+        undefined,
+      );
+    });
+
+    it('passes the send options to the correlator', async () => {
+      const conn = makeConnection();
+      connectionManager.get.mockReturnValue(conn);
+      const options = { onSend: vi.fn() };
+
+      await dispatcher.sendCommand('CS-001', 'Reset', { type: 'Soft' }, options);
+
+      expect(correlator.sendCall).toHaveBeenCalledWith(
+        conn.ws,
+        conn.session,
+        'Reset',
+        { type: 'Soft' },
+        options,
+      );
     });
 
     it('throws when station is not connected', async () => {
@@ -91,7 +112,7 @@ describe('CommandDispatcher', () => {
       const conn = makeConnection();
       connectionManager.get.mockReturnValue(conn);
 
-      const { translateCommand } = await import('../server/command-translation.js');
+      const { translateCommand } = commandTranslationModule;
       vi.mocked(translateCommand).mockReturnValueOnce(null);
 
       await expect(
@@ -103,7 +124,7 @@ describe('CommandDispatcher', () => {
       const conn = makeConnection('ocpp1.6');
       connectionManager.get.mockReturnValue(conn);
 
-      const { translateCommand } = await import('../server/command-translation.js');
+      const { translateCommand } = commandTranslationModule;
       vi.mocked(translateCommand).mockReturnValueOnce({ action: 'NotSupported', payload: {} });
 
       await expect(

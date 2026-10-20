@@ -4,13 +4,17 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTab } from '@/hooks/use-tab';
+import { AutochargeSettings } from '@/components/settings/AutochargeSettings';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Send, ChevronDown } from 'lucide-react';
 import { SaveButton } from '@/components/save-button';
 import { Spinner } from '@/components/ui/spinner';
+import { Toggle } from '@/components/ui/toggle';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -19,6 +23,8 @@ import { api } from '@/lib/api';
 import { ReservationSettings } from '@/components/settings/ReservationSettings';
 import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { StationMessageSettings } from '@/components/settings/StationMessageSettings';
+import { PncLocalCaSection } from '@/components/settings/PncLocalCaSection';
+import { FleetCreditReservationSettings } from '@/components/settings/FleetCreditReservationSettings';
 
 interface IntegrationsSettingsProps {
   settings: Record<string, unknown> | undefined;
@@ -50,10 +56,13 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const [supportEnabled, setSupportEnabled] = useState(true);
   const [fleetEnabled, setFleetEnabled] = useState(true);
   const [guestChargingEnabled, setGuestChargingEnabled] = useState(true);
+  const [guestStartsPerIp, setGuestStartsPerIp] = useState('30');
+  const [guestDeclinesPerIp, setGuestDeclinesPerIp] = useState('5');
 
   // Idling and session
   const [idlingGracePeriod, setIdlingGracePeriod] = useState('30');
   const [staleSessionTimeout, setStaleSessionTimeout] = useState('24');
+  const [evConnectionTimeout, setEvConnectionTimeout] = useState('180');
 
   // Pricing
   const [splitBillingEnabled, setSplitBillingEnabled] = useState(true);
@@ -100,6 +109,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const [pncHubjectTokenUrl, setPncHubjectTokenUrl] = useState('');
   const [pncWarningDays, setPncWarningDays] = useState('30');
   const [pncCriticalDays, setPncCriticalDays] = useState('7');
+  const [pncOcspAllowedHosts, setPncOcspAllowedHosts] = useState('');
+  const [pncEmaidCountry, setPncEmaidCountry] = useState('');
+  const [pncEmaidProviderId, setPncEmaidProviderId] = useState('');
 
   const roamingEnabled = settings != null && settings['roaming.enabled'] === true;
 
@@ -116,6 +128,12 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setPncHubjectTokenUrl(s('pnc.hubject.tokenUrl'));
     setPncWarningDays(s('pnc.expirationWarningDays') || '30');
     setPncCriticalDays(s('pnc.expirationCriticalDays') || '7');
+    setPncEmaidCountry(s('pnc.local.emaidCountry'));
+    setPncEmaidProviderId(s('pnc.local.emaidProviderId'));
+    const hosts = pncSettings['pnc.ocsp.allowedPrivateHosts'];
+    setPncOcspAllowedHosts(
+      Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string').join('\n') : '',
+    );
   }, [pncSettings]);
 
   useEffect(() => {
@@ -137,10 +155,17 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     setSupportEnabled(settings['support.enabled'] !== false);
     setFleetEnabled(settings['fleet.enabled'] !== false);
     setGuestChargingEnabled(settings['guest.enabled'] !== false);
+    const gsl = settings['guest.startsPerIpPerHour'];
+    setGuestStartsPerIp(typeof gsl === 'number' ? String(gsl) : '30');
+    const gdl = settings['guest.declinesPerIpPerHour'];
+    setGuestDeclinesPerIp(typeof gdl === 'number' ? String(gdl) : '5');
     const gp = settings['idling.gracePeriodMinutes'];
     setIdlingGracePeriod(gp != null ? Number(gp).toString() : '30');
     const sst = settings['session.staleTimeoutHours'];
     setStaleSessionTimeout(sst != null ? Number(sst).toString() : '24');
+    const ect = settings['session.evConnectionTimeoutSeconds'];
+    setEvConnectionTimeout(ect != null ? Number(ect).toString() : '180');
+    // On unless stored as false, as the server reads it (isSplitBillingEnabled).
     setSplitBillingEnabled(settings['pricing.splitBillingEnabled'] !== false);
     const mapsKey = settings['googleMaps.apiKeyEnc'];
     setGoogleMapsApiKey(typeof mapsKey === 'string' ? mapsKey : '');
@@ -293,6 +318,16 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
     },
   });
 
+  const guestLimitsMutation = useMutation({
+    mutationFn: async (limits: { starts: number; declines: number }) => {
+      await api.put('/v1/settings/guest.startsPerIpPerHour', { value: limits.starts });
+      await api.put('/v1/settings/guest.declinesPerIpPerHour', { value: limits.declines });
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   const idlingGracePeriodMutation = useMutation({
     mutationFn: (minutes: number) =>
       api.put('/v1/settings/idling.gracePeriodMinutes', { value: minutes }),
@@ -304,6 +339,14 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
   const staleSessionTimeoutMutation = useMutation({
     mutationFn: (hours: number) =>
       api.put('/v1/settings/session.staleTimeoutHours', { value: hours }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
+  const evConnectionTimeoutMutation = useMutation({
+    mutationFn: (seconds: number) =>
+      api.put('/v1/settings/session.evConnectionTimeoutSeconds', { value: seconds }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['settings'] });
     },
@@ -356,6 +399,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
       hubjectTokenUrl: string;
       expirationWarningDays: number;
       expirationCriticalDays: number;
+      ocspAllowedPrivateHosts: string[];
+      localEmaidCountry?: string;
+      localEmaidProviderId?: string;
     }) => api.put('/v1/pnc/settings', vals),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['pnc-settings'] });
@@ -380,6 +426,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
         <TabsTrigger value="ocppDefaults">{t('settings.ocppDefaults')}</TabsTrigger>
         <TabsTrigger value="roaming">{t('settings.roaming')}</TabsTrigger>
         <TabsTrigger value="pnc">{t('settings.pnc')}</TabsTrigger>
+        <TabsTrigger value="autocharge">{t('settings.autocharge')}</TabsTrigger>
         <TabsTrigger value="reservation">{t('settings.reservation')}</TabsTrigger>
         <TabsTrigger value="support">{t('settings.support')}</TabsTrigger>
         <TabsTrigger value="fleet">{t('settings.fleet')}</TabsTrigger>
@@ -566,19 +613,14 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     {t('settings.ocppApprovalRequiredHelp')}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={ocppApprovalRequired}
-                  onClick={() => {
+                <Toggle
+                  aria-label={t('settings.ocppApprovalRequired')}
+                  size="lg"
+                  checked={ocppApprovalRequired}
+                  onCheckedChange={() => {
                     setOcppApprovalRequired(!ocppApprovalRequired);
                   }}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${ocppApprovalRequired ? 'bg-primary' : 'bg-muted'}`}
-                >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${ocppApprovalRequired ? 'translate-x-5' : 'translate-x-0'}`}
-                  />
-                </button>
+                />
               </div>
             </div>
           </CardContent>
@@ -622,22 +664,17 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.roamingEnabled')}</Label>
+                <Label className="leading-6">{t('settings.roamingEnabled')}</Label>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={roamingEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.roamingEnabled')}
+                size="lg"
+                checked={roamingEnabled}
+                onCheckedChange={() => {
                   roamingMutation.mutate(!roamingEnabled);
                 }}
                 disabled={roamingMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${roamingEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${roamingEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
           </CardContent>
         </Card>
@@ -652,44 +689,41 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.pncEnabled')}</Label>
+                <Label className="leading-6">{t('settings.pncEnabled')}</Label>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={pncEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.pncEnabled')}
+                size="lg"
+                checked={pncEnabled}
+                onCheckedChange={() => {
                   pncToggleMutation.mutate(!pncEnabled);
                 }}
                 disabled={pncToggleMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${pncEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${pncEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
 
             {pncEnabled && (
               <>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-provider">{t('settings.pncProvider')}</Label>
+                    <Label htmlFor="pnc-provider" className="leading-6">
+                      {t('settings.pncProvider')}
+                    </Label>
                     <Select
                       id="pnc-provider"
                       value={pncProvider}
                       onChange={(e) => {
                         setPncProvider(e.target.value);
                       }}
-                      className="h-9"
                     >
                       <option value="manual">{t('settings.pncProviderManual')}</option>
                       <option value="hubject">{t('settings.pncProviderHubject')}</option>
+                      <option value="local">{t('settings.pncProviderLocal')}</option>
                     </Select>
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-warning-days">
+                    <Label htmlFor="pnc-warning-days" className="leading-6">
                       {t('settings.pncExpirationWarningDays')}
                     </Label>
                     <Input
@@ -705,7 +739,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="pnc-critical-days">
+                    <Label htmlFor="pnc-critical-days" className="leading-6">
                       {t('settings.pncExpirationCriticalDays')}
                     </Label>
                     <Input
@@ -721,10 +755,37 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </div>
                 </div>
 
+                <div className="space-y-2">
+                  <Label htmlFor="pnc-ocsp-allowed-hosts" className="leading-6">
+                    {t('settings.pncOcspAllowedPrivateHosts')}
+                  </Label>
+                  <Textarea
+                    id="pnc-ocsp-allowed-hosts"
+                    rows={3}
+                    value={pncOcspAllowedHosts}
+                    onChange={(e) => {
+                      setPncOcspAllowedHosts(e.target.value);
+                    }}
+                    placeholder="ocsp.internal.example"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.pncOcspAllowedPrivateHostsHint')}
+                  </p>
+                </div>
+
+                {pncProvider === 'local' && (
+                  <PncLocalCaSection
+                    emaidCountry={pncEmaidCountry}
+                    emaidProviderId={pncEmaidProviderId}
+                    onEmaidCountryChange={setPncEmaidCountry}
+                    onEmaidProviderIdChange={setPncEmaidProviderId}
+                  />
+                )}
+
                 {pncProvider === 'hubject' && (
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-base-url">
+                      <Label htmlFor="pnc-hubject-base-url" className="leading-6">
                         {t('settings.pncHubjectBaseUrl')}
                       </Label>
                       <Input
@@ -738,7 +799,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-client-id">
+                      <Label htmlFor="pnc-hubject-client-id" className="leading-6">
                         {t('settings.pncHubjectClientId')}
                       </Label>
                       <Input
@@ -751,7 +812,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-client-secret">
+                      <Label htmlFor="pnc-hubject-client-secret" className="leading-6">
                         {t('settings.pncHubjectClientSecret')}
                       </Label>
                       <PasswordInput
@@ -770,7 +831,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="pnc-hubject-token-url">
+                      <Label htmlFor="pnc-hubject-token-url" className="leading-6">
                         {t('settings.pncHubjectTokenUrl')}
                       </Label>
                       <Input
@@ -798,6 +859,16 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                         hubjectTokenUrl: pncHubjectTokenUrl,
                         expirationWarningDays: Number(pncWarningDays),
                         expirationCriticalDays: Number(pncCriticalDays),
+                        ocspAllowedPrivateHosts: pncOcspAllowedHosts
+                          .split(/[\s,]+/)
+                          .map((h) => h.trim())
+                          .filter((h) => h !== ''),
+                        ...(pncProvider === 'local'
+                          ? {
+                              localEmaidCountry: pncEmaidCountry,
+                              localEmaidProviderId: pncEmaidProviderId,
+                            }
+                          : {}),
                       });
                     }}
                   />
@@ -837,26 +908,21 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.reservationEnabled')}</Label>
+                <Label className="leading-6">{t('settings.reservationEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">
                   {t('settings.reservationEnabledDesc')}
                 </p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={reservationEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.reservationEnabled')}
+                size="lg"
+                checked={reservationEnabled}
+                onCheckedChange={() => {
                   setReservationEnabled(!reservationEnabled);
                   reservationMutation.mutate(!reservationEnabled);
                 }}
                 disabled={reservationMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${reservationEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${reservationEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
             <div className="mt-4">
               <ReservationSettings settings={settings} />
@@ -872,24 +938,19 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.supportEnabled')}</Label>
+                <Label className="leading-6">{t('settings.supportEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.supportEnabledDesc')}</p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={supportEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.supportEnabled')}
+                size="lg"
+                checked={supportEnabled}
+                onCheckedChange={() => {
                   setSupportEnabled(!supportEnabled);
                   supportMutation.mutate(!supportEnabled);
                 }}
                 disabled={supportMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${supportEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${supportEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
           </CardContent>
         </Card>
@@ -902,27 +963,28 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.fleetEnabled')}</Label>
+                <Label className="leading-6">{t('settings.fleetEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.fleetEnabledDesc')}</p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={fleetEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.fleetEnabled')}
+                size="lg"
+                checked={fleetEnabled}
+                onCheckedChange={() => {
                   setFleetEnabled(!fleetEnabled);
                   fleetMutation.mutate(!fleetEnabled);
                 }}
                 disabled={fleetMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${fleetEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${fleetEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
+            </div>
+            <div className="mt-4">
+              <FleetCreditReservationSettings settings={settings} />
             </div>
           </CardContent>
         </Card>
+      </TabsContent>
+      <TabsContent value="autocharge" className="mt-4">
+        <AutochargeSettings settings={settings} />
       </TabsContent>
       <TabsContent value="guest" className="mt-4">
         <Card>
@@ -932,26 +994,81 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
           <CardContent>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.guestChargingEnabled')}</Label>
+                <Label className="leading-6">{t('settings.guestChargingEnabled')}</Label>
                 <p className="text-xs text-muted-foreground">
                   {t('settings.guestChargingEnabledDesc')}
                 </p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={guestChargingEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.guestChargingEnabled')}
+                size="lg"
+                checked={guestChargingEnabled}
+                onCheckedChange={() => {
                   setGuestChargingEnabled(!guestChargingEnabled);
                   guestChargingMutation.mutate(!guestChargingEnabled);
                 }}
                 disabled={guestChargingMutation.isPending}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${guestChargingEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${guestChargingEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
+            </div>
+            <div className="mt-4 space-y-4">
+              <p className="text-sm text-muted-foreground">
+                {t('settings.guestLimitsDescription')}
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="guest-starts-per-ip">
+                    {t('settings.guestStartsPerIpPerHour')}
+                  </Label>
+                  <Input
+                    id="guest-starts-per-ip"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    step={1}
+                    value={guestStartsPerIp}
+                    onChange={(e) => {
+                      setGuestStartsPerIp(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.guestStartsPerIpPerHourHelp')}
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="guest-declines-per-ip">
+                    {t('settings.guestDeclinesPerIpPerHour')}
+                  </Label>
+                  <Input
+                    id="guest-declines-per-ip"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    step={1}
+                    value={guestDeclinesPerIp}
+                    onChange={(e) => {
+                      setGuestDeclinesPerIp(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('settings.guestDeclinesPerIpPerHourHelp')}
+                  </p>
+                </div>
+              </div>
+              <SaveButton
+                isPending={guestLimitsMutation.isPending}
+                type="button"
+                onClick={() => {
+                  const starts = Number(guestStartsPerIp);
+                  const declines = Number(guestDeclinesPerIp);
+                  const valid = (n: number): boolean => Number.isInteger(n) && n >= 0 && n <= 10000;
+                  if (valid(starts) && valid(declines)) {
+                    guestLimitsMutation.mutate({ starts, declines });
+                  }
+                }}
+              />
+              {guestLimitsMutation.isSuccess && (
+                <p className="text-sm text-success">{t('common.saved')}</p>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -1031,6 +1148,37 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
             {staleSessionTimeoutMutation.isSuccess && (
               <p className="text-sm text-success">{t('common.saved')}</p>
             )}
+            <div className="grid gap-2 max-w-xs">
+              <Label htmlFor="ev-connection-timeout">
+                {t('settings.evConnectionTimeoutSeconds')}
+              </Label>
+              <Input
+                id="ev-connection-timeout"
+                type="number"
+                min={1}
+                step={1}
+                value={evConnectionTimeout}
+                onChange={(e) => {
+                  setEvConnectionTimeout(e.target.value);
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.evConnectionTimeoutHelp')}
+              </p>
+            </div>
+            <SaveButton
+              isPending={evConnectionTimeoutMutation.isPending}
+              type="button"
+              onClick={() => {
+                const seconds = parseInt(evConnectionTimeout, 10);
+                if (!isNaN(seconds) && seconds >= 1) {
+                  evConnectionTimeoutMutation.mutate(seconds);
+                }
+              }}
+            />
+            {evConnectionTimeoutMutation.isSuccess && (
+              <p className="text-sm text-success">{t('common.saved')}</p>
+            )}
           </CardContent>
         </Card>
       </TabsContent>
@@ -1044,22 +1192,17 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.splitBilling')}</Label>
+                <Label className="leading-6">{t('settings.splitBilling')}</Label>
                 <p className="text-xs text-muted-foreground">{t('settings.splitBillingDesc')}</p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={splitBillingEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.splitBilling')}
+                size="lg"
+                checked={splitBillingEnabled}
+                onCheckedChange={() => {
                   setSplitBillingEnabled((v) => !v);
                 }}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${splitBillingEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${splitBillingEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
 
             <SaveButton
@@ -1106,32 +1249,22 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="grid gap-2">
                     <Label htmlFor="google-maps-lat">{t('settings.googleMapsDefaultLat')}</Label>
-                    <Input
+                    <DecimalInput
                       id="google-maps-lat"
-                      type="number"
-                      step="0.0001"
-                      min={-90}
-                      max={90}
                       placeholder="39.8283"
                       value={googleMapsDefaultLat}
-                      onChange={(e) => {
-                        setGoogleMapsDefaultLat(e.target.value);
-                      }}
+                      onChange={setGoogleMapsDefaultLat}
+                      allowNegative
                     />
                   </div>
                   <div className="grid gap-2">
                     <Label htmlFor="google-maps-lng">{t('settings.googleMapsDefaultLng')}</Label>
-                    <Input
+                    <DecimalInput
                       id="google-maps-lng"
-                      type="number"
-                      step="0.0001"
-                      min={-180}
-                      max={180}
                       placeholder="-98.5795"
                       value={googleMapsDefaultLng}
-                      onChange={(e) => {
-                        setGoogleMapsDefaultLng(e.target.value);
-                      }}
+                      onChange={setGoogleMapsDefaultLng}
+                      allowNegative
                     />
                   </div>
                 </div>
@@ -1196,7 +1329,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="s3-bucket">{t('settings.s3Bucket')}</Label>
+                <Label htmlFor="s3-bucket" className="leading-6">
+                  {t('settings.s3Bucket')}
+                </Label>
                 <Input
                   id="s3-bucket"
                   value={s3Bucket}
@@ -1208,7 +1343,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-region">{t('settings.s3Region')}</Label>
+                <Label htmlFor="s3-region" className="leading-6">
+                  {t('settings.s3Region')}
+                </Label>
                 <Input
                   id="s3-region"
                   value={s3Region}
@@ -1220,7 +1357,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-access-key">{t('settings.s3AccessKeyId')}</Label>
+                <Label htmlFor="s3-access-key" className="leading-6">
+                  {t('settings.s3AccessKeyId')}
+                </Label>
                 <Input
                   id="s3-access-key"
                   value={s3AccessKeyId}
@@ -1231,7 +1370,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="s3-secret-key">{t('settings.s3SecretAccessKey')}</Label>
+                <Label htmlFor="s3-secret-key" className="leading-6">
+                  {t('settings.s3SecretAccessKey')}
+                </Label>
                 <PasswordInput
                   id="s3-secret-key"
                   value={s3SecretAccessKey}
@@ -1380,7 +1521,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="ftp-host">{t('settings.ftpHost')}</Label>
+                <Label htmlFor="ftp-host" className="leading-6">
+                  {t('settings.ftpHost')}
+                </Label>
                 <Input
                   id="ftp-host"
                   value={ftpHost}
@@ -1391,7 +1534,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-port">{t('settings.ftpPort')}</Label>
+                <Label htmlFor="ftp-port" className="leading-6">
+                  {t('settings.ftpPort')}
+                </Label>
                 <Input
                   id="ftp-port"
                   type="number"
@@ -1403,7 +1548,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-username">{t('settings.ftpUsername')}</Label>
+                <Label htmlFor="ftp-username" className="leading-6">
+                  {t('settings.ftpUsername')}
+                </Label>
                 <Input
                   id="ftp-username"
                   value={ftpUsername}
@@ -1414,7 +1561,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ftp-password">{t('settings.ftpPassword')}</Label>
+                <Label htmlFor="ftp-password" className="leading-6">
+                  {t('settings.ftpPassword')}
+                </Label>
                 <PasswordInput
                   id="ftp-password"
                   value={ftpPassword}
@@ -1425,7 +1574,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               </div>
 
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="ftp-path">{t('settings.ftpPath')}</Label>
+                <Label htmlFor="ftp-path" className="leading-6">
+                  {t('settings.ftpPath')}
+                </Label>
                 <Input
                   id="ftp-path"
                   value={ftpPath}
@@ -1468,21 +1619,16 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
 
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
-                <Label>{t('settings.sentryEnabled')}</Label>
+                <Label className="leading-6">{t('settings.sentryEnabled')}</Label>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={sentryEnabled}
-                onClick={() => {
+              <Toggle
+                aria-label={t('settings.sentryEnabled')}
+                size="lg"
+                checked={sentryEnabled}
+                onCheckedChange={() => {
                   setSentryEnabled(!sentryEnabled);
                 }}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${sentryEnabled ? 'bg-primary' : 'bg-muted'}`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${sentryEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-                />
-              </button>
+              />
             </div>
 
             <div className="grid gap-4 max-w-md">

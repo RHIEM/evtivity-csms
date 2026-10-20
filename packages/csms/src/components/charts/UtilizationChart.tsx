@@ -7,6 +7,8 @@ import type { ApexOptions } from 'apexcharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { useTranslation } from 'react-i18next';
+import { ChartBody, type QueryState } from './ChartBody';
+import { formatUtilizationPercent, relativeBarLengths } from './utilization-format';
 import { useAuth } from '@/lib/auth';
 import { CHART_COLORS, getGridColor } from '@/lib/chart-theme';
 
@@ -14,14 +16,17 @@ interface UtilizationChartProps {
   data: { site: string; utilization: number }[];
   actions?: React.ReactNode;
   info?: string;
+  /** The state of the query behind the chart; omitted, the chart shows as given. */
+  state?: QueryState;
 }
 
 export function UtilizationChart({
   data,
   actions,
   info,
+  state,
 }: UtilizationChartProps): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
   const options = useMemo<ApexOptions>(
     () => ({
@@ -50,23 +55,21 @@ export function UtilizationChart({
         // back to numeric row indexes for the category labels.
         type: 'category',
         categories: data.map((d) => d.site),
-        labels: {
-          formatter: (val: string) => `${val}%`,
-        },
+        // Bars are relative to the busiest site, so the axis has no percent scale.
+        max: 100,
+        labels: { show: false },
       },
       yaxis: {
         labels: {
           maxWidth: 150,
         },
       },
-      dataLabels: {
-        enabled: true,
-        formatter: (val: number) => `${String(val)}%`,
-        style: { fontSize: '12px', fontWeight: 600 },
-      },
+      dataLabels: { enabled: false },
       tooltip: {
         y: {
-          formatter: (val: number) => `${String(val)}%`,
+          // The real utilization of the site, not the relative bar length.
+          formatter: (_val: number, opts?: { dataPointIndex?: number }) =>
+            formatUtilizationPercent(data[opts?.dataPointIndex ?? -1]?.utilization ?? 0),
         },
       },
       colors: [CHART_COLORS.violet],
@@ -79,14 +82,14 @@ export function UtilizationChart({
         },
       ],
     }),
-    [isDark, data],
+    [isDark, data, i18n.language],
   );
 
   const series = useMemo(
     () => [
       {
         name: t('charts.utilization'),
-        data: data.map((d) => d.utilization),
+        data: relativeBarLengths(data.map((d) => d.utilization)),
       },
     ],
     [t, data],
@@ -102,7 +105,9 @@ export function UtilizationChart({
         {actions}
       </CardHeader>
       <CardContent>
-        <ReactApexChart options={options} series={series} type="bar" height={300} />
+        <ChartBody state={state} isEmpty={data.length === 0} emptyText={t('charts.noData')}>
+          <ReactApexChart options={options} series={series} type="bar" height={300} />
+        </ChartBody>
       </CardContent>
     </Card>
   );

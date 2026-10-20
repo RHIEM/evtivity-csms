@@ -1,8 +1,10 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { useState } from 'react';
 import { useParams } from 'react-router';
 import { useTab } from '@/hooks/use-tab';
+import { stationAvailabilityActions } from '@/lib/station-availability-actions';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { BackButton } from '@/components/back-button';
@@ -21,6 +23,9 @@ import { StationDisplayMessages } from '@/components/StationDisplayMessages';
 import { StationCertificates } from '@/components/StationCertificates';
 import { StationLocalAuthList } from '@/components/StationLocalAuthList';
 import { AuthorizeLogView } from '@/components/AuthorizeLogView';
+import { ExplainButton } from '@/components/ai/ExplainButton';
+import { RecordInsight } from '@/components/ai/insights/RecordInsight';
+import { RecordInsightsTab } from '@/components/ai/insights/RecordInsightsTab';
 import { MeterValuesTable } from '@/components/MeterValuesTable';
 import { StationEventsTab } from '@/components/StationEventsTab';
 import { StationConfigurationsTab } from '@/components/StationConfigurationsTab';
@@ -34,15 +39,18 @@ import { StationSessionsTab } from '@/components/station/StationSessionsTab';
 import { StationQrTab } from '@/components/station/StationQrTab';
 import { StationPricingTab } from '@/components/station/StationPricingTab';
 import { StationReservationsTab } from '@/components/station/StationReservationsTab';
+import { StationSimulatorConflict } from '@/components/station/StationSimulatorConflict';
 import { api } from '@/lib/api';
+import { useFeatureFlags } from '@/hooks/use-feature-flags';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { DisableButton } from '@/components/disable-button';
+import { EnableButton } from '@/components/enable-button';
+import { useToast } from '@/components/ui/toast';
+import { getErrorMessage } from '@/lib/error-message';
+import { StationStatusBadge } from '@/components/StationStatusBadge';
+import { StationChargingNeedsTab } from '@/components/StationChargingNeedsTab';
 import { useHasPermission } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
-
-interface Site {
-  id: string;
-  name: string;
-  timezone: string;
-}
 
 interface Station {
   id: string;
@@ -57,16 +65,23 @@ interface Station {
   availability: string;
   onboardingStatus: string;
   status: string;
+  statusReason: string | null;
+  disabledReason: string | null;
+  firmwareState: string | null;
+  reportedStatus: string | null;
   isOnline: boolean;
   isSimulator: boolean;
+  simulatorConflictAt: string | null;
   lastHeartbeat: string | null;
   ocppProtocol: string | null;
   securityProfile: number;
+  pendingSecurityProfile: number | null;
   hasPassword: boolean;
   latitude: string | null;
   longitude: string | null;
   reservationsEnabled: boolean;
   siteHoursOfOperation: string | null;
+  siteTimezone: string | null;
   siteFreeVendEnabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -94,19 +109,17 @@ export function StationDetail(): React.JSX.Element {
   const { t } = useTranslation();
   const canReadAuthorizeLog = useHasPermission('drivers:read');
   const canReadAudit = useHasPermission('audit:read');
+  const canWriteStations = useHasPermission('stations:write');
+  const { toast } = useToast();
+  const [availabilityConfirm, setAvailabilityConfirm] = useState<
+    'available' | 'unavailable' | null
+  >(null);
+  const [rejectConfirmOpen, setRejectConfirmOpen] = useState(false);
 
-  const { data: sitesResponse } = useQuery({
-    queryKey: ['sites'],
-    queryFn: () => api.get<{ data: Site[]; total: number }>('/v1/sites?limit=100'),
-  });
-
-  const { data: settingsData } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => api.get<Record<string, unknown>>('/v1/settings'),
-  });
-  const guestChargingEnabled = settingsData?.['guest.enabled'] !== false;
-  const reservationEnabled = settingsData?.['reservation.enabled'] !== false;
-  const sites = sitesResponse?.data;
+  const {
+    flags: { guestChargingEnabled, reservationEnabled, aiInsightsEnabled },
+  } = useFeatureFlags();
+  const showInsightsTab = useHasPermission('aiInsights:read') && aiInsightsEnabled;
 
   const { data: station, isLoading } = useQuery({
     queryKey: ['stations', id],
@@ -120,25 +133,58 @@ export function StationDetail(): React.JSX.Element {
     enabled: id != null,
   });
 
+  // Approve, reject and unblock: a refused change (another operator acted
+  // first) is shown, and the station reloads either way.
+  function onboardingMutationOptions(
+    successKey:
+      | 'stations.approvedSuccess'
+      | 'stations.rejectedSuccess'
+      | 'stations.unblockedSuccess',
+  ) {
+    return {
+      onSuccess: () => {
+        toast({ variant: 'success', title: t(successKey) });
+      },
+      onError: (err: unknown) => {
+        toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+      },
+      onSettled: () => {
+        void queryClient.invalidateQueries({ queryKey: ['stations'] });
+      },
+    };
+  }
+
   const approveMutation = useMutation({
     mutationFn: () => api.post(`/v1/stations/${id ?? ''}/approve`, {}),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['stations'] });
-    },
+    ...onboardingMutationOptions('stations.approvedSuccess'),
   });
 
   const rejectMutation = useMutation({
     mutationFn: () => api.post(`/v1/stations/${id ?? ''}/reject`, {}),
-    onSuccess: () => {
+    ...onboardingMutationOptions('stations.rejectedSuccess'),
+  });
+
+  const availabilityMutation = useMutation({
+    mutationFn: (availability: 'available' | 'unavailable') =>
+      api.patch(`/v1/stations/${id ?? ''}`, { availability }),
+    onSuccess: (_data, availability) => {
       void queryClient.invalidateQueries({ queryKey: ['stations'] });
+      toast({
+        variant: 'success',
+        title: t(
+          availability === 'unavailable' ? 'stations.disabledSuccess' : 'stations.enabledSuccess',
+        ),
+      });
+      setAvailabilityConfirm(null);
+    },
+    onError: (err) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
     },
   });
 
   const unblockMutation = useMutation({
     mutationFn: () => api.post(`/v1/stations/${id ?? ''}/unblock`, {}),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['stations'] });
-    },
+    ...onboardingMutationOptions('stations.unblockedSuccess'),
   });
 
   if (isLoading) {
@@ -149,20 +195,23 @@ export function StationDetail(): React.JSX.Element {
     return <p className="text-destructive">{t('stations.stationNotFound')}</p>;
   }
 
-  const siteTimezone = sites?.find((s) => s.id === station.siteId)?.timezone ?? 'America/New_York';
+  const siteTimezone = station.siteTimezone ?? 'America/New_York';
+  const availabilityActions = stationAvailabilityActions(station);
+  const explainContext = { kind: 'station' as const, id: station.id, label: station.stationId };
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
           <BackButton to="/stations" />
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold">{station.stationId}</h1>
+          <div className="min-w-0">
+            <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{station.stationId}</h1>
             <CopyableId id={station.id} />
           </div>
           <Badge variant={station.isOnline ? 'success' : 'destructive'}>
             {station.isOnline ? t('status.online') : t('status.offline')}
           </Badge>
+          <StationStatusBadge status={station.status} statusReason={station.statusReason} />
           {station.isSimulator && <Badge variant="info">{t('stations.simulator')}</Badge>}
           {station.siteFreeVendEnabled && <Badge variant="info">{t('stations.freeVend')}</Badge>}
           {station.onboardingStatus === 'pending' && (
@@ -172,34 +221,115 @@ export function StationDetail(): React.JSX.Element {
             <Badge variant="destructive">{t('status.blocked')}</Badge>
           )}
         </div>
-        <EntityNavButtons resource="stations" basePath="/stations" currentId={id} />
+        {/* items-start: the buttons line up with the Prev and Next buttons, not their labels. */}
+        <div className="flex flex-wrap items-start gap-2" data-testid="station-header-actions">
+          {(!station.isOnline || station.status === 'faulted') && (
+            <ExplainButton context={explainContext} size="header" />
+          )}
+          {canWriteStations && availabilityActions.enable && (
+            <EnableButton
+              label={t('stations.enableStation')}
+              size="header"
+              onClick={() => {
+                setAvailabilityConfirm('available');
+              }}
+            />
+          )}
+          {canWriteStations && availabilityActions.disable && (
+            <DisableButton
+              label={t('stations.disableStation')}
+              size="header"
+              onClick={() => {
+                setAvailabilityConfirm('unavailable');
+              }}
+            />
+          )}
+          <EntityNavButtons resource="stations" basePath="/stations" currentId={id} />
+        </div>
       </div>
+
+      <ConfirmDialog
+        open={availabilityConfirm != null}
+        onOpenChange={(open) => {
+          if (!open) setAvailabilityConfirm(null);
+        }}
+        title={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStationTitle')
+            : t('stations.disableStationTitle')
+        }
+        description={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStationDescription')
+            : t('stations.disableStationDescription')
+        }
+        confirmLabel={
+          availabilityConfirm === 'available'
+            ? t('stations.enableStation')
+            : t('stations.disableStation')
+        }
+        variant={availabilityConfirm === 'available' ? 'default' : 'destructive'}
+        isPending={availabilityMutation.isPending}
+        onConfirm={() => {
+          if (availabilityConfirm != null) availabilityMutation.mutate(availabilityConfirm);
+          return false;
+        }}
+      />
+
+      <ConfirmDialog
+        open={rejectConfirmOpen}
+        onOpenChange={setRejectConfirmOpen}
+        title={t('stations.rejectStationTitle')}
+        description={t('stations.rejectStationDescription')}
+        confirmLabel={t('stations.reject')}
+        variant="destructive"
+        isPending={rejectMutation.isPending}
+        onConfirm={() => {
+          rejectMutation.mutate(undefined, {
+            onSettled: () => {
+              setRejectConfirmOpen(false);
+            },
+          });
+          return false;
+        }}
+      />
+
+      {station.isSimulator && station.simulatorConflictAt != null && (
+        <StationSimulatorConflict
+          stationDbId={station.id}
+          stationId={station.stationId}
+          conflictAt={station.simulatorConflictAt}
+          timezone={siteTimezone}
+        />
+      )}
 
       {station.onboardingStatus === 'pending' && (
         <Card className="border-warning">
           <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm">{t('stations.pendingApproval')}</p>
-            <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex sm:shrink-0">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  rejectMutation.mutate();
-                }}
-                disabled={rejectMutation.isPending}
-              >
-                {t('stations.reject')}
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => {
-                  approveMutation.mutate();
-                }}
-                disabled={approveMutation.isPending}
-              >
-                {t('stations.approve')}
-              </Button>
-            </div>
+            {canWriteStations && (
+              <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex sm:shrink-0">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setRejectConfirmOpen(true);
+                  }}
+                  disabled={rejectMutation.isPending}
+                >
+                  {t('stations.reject')}
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    approveMutation.mutate();
+                  }}
+                  disabled={approveMutation.isPending}
+                >
+                  {t('stations.approve')}
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
@@ -207,17 +337,28 @@ export function StationDetail(): React.JSX.Element {
         <Card className="border-destructive">
           <CardContent className="flex items-center justify-between p-4">
             <p className="text-sm">{t('stations.blockedInfo')}</p>
-            <Button
-              size="sm"
-              onClick={() => {
-                unblockMutation.mutate();
-              }}
-              disabled={unblockMutation.isPending}
-            >
-              {t('stations.unblock')}
-            </Button>
+            {canWriteStations && (
+              <Button
+                size="sm"
+                onClick={() => {
+                  unblockMutation.mutate();
+                }}
+                disabled={unblockMutation.isPending}
+              >
+                {t('stations.unblock')}
+              </Button>
+            )}
           </CardContent>
         </Card>
+      )}
+
+      {showInsightsTab && (
+        <RecordInsight
+          filter={{ stationId: station.id }}
+          onOpen={() => {
+            setDetailsTab('ai-insights');
+          }}
+        />
       )}
 
       <Tabs value={detailsTab} onValueChange={setDetailsTab}>
@@ -241,8 +382,11 @@ export function StationDetail(): React.JSX.Element {
             <TabsTrigger value="events">{t('stations.events')}</TabsTrigger>
           )}
           <TabsTrigger value="configurations">{t('stations.configurations')}</TabsTrigger>
-          <TabsTrigger value="firmware-history">{t('stations.firmwareHistory')}</TabsTrigger>
+          <TabsTrigger value="firmware-history">{t('stations.firmwareUpdates')}</TabsTrigger>
           <TabsTrigger value="charging-profiles">{t('stations.chargingProfiles')}</TabsTrigger>
+          {station.ocppProtocol !== 'ocpp1.6' && (
+            <TabsTrigger value="charging-needs">{t('stations.chargingNeedsTab')}</TabsTrigger>
+          )}
           <TabsTrigger value="qr">{t('stations.qrCodes')}</TabsTrigger>
           <TabsTrigger value="pricing">{t('stations.pricing')}</TabsTrigger>
           <TabsTrigger value="local-auth">{t('stations.localAuthList')}</TabsTrigger>
@@ -251,6 +395,9 @@ export function StationDetail(): React.JSX.Element {
           )}
           {reservationEnabled && (
             <TabsTrigger value="reservations">{t('reservations.title')}</TabsTrigger>
+          )}
+          {showInsightsTab && (
+            <TabsTrigger value="ai-insights">{t('aiInsights.list.title')}</TabsTrigger>
           )}
           {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
@@ -294,6 +441,7 @@ export function StationDetail(): React.JSX.Element {
             stationId={station.stationId}
             stationDbId={station.id}
             securityProfile={station.securityProfile}
+            pendingSecurityProfile={station.pendingSecurityProfile}
             hasPassword={station.hasPassword}
             isOnline={station.isOnline}
             timezone={siteTimezone}
@@ -319,7 +467,7 @@ export function StationDetail(): React.JSX.Element {
 
         <TabsContent value="meter-values">
           <MeterValuesTable
-            queryKey="station-meter-values"
+            queryKey={['stations', station.id, 'meter-values']}
             url={`/v1/stations/${station.id}/standalone-meter-values`}
             description={t('stations.meterValuesDescription')}
           />
@@ -351,16 +499,31 @@ export function StationDetail(): React.JSX.Element {
           />
         </TabsContent>
 
+        {station.ocppProtocol !== 'ocpp1.6' && (
+          <TabsContent value="charging-needs" className="space-y-6">
+            <StationChargingNeedsTab
+              stationId={station.id}
+              isOnline={station.isOnline}
+              timezone={siteTimezone}
+            />
+          </TabsContent>
+        )}
+
         <TabsContent value="qr">
           <StationQrTab
             stationId={id ?? ''}
             stationOcppId={station.stationId}
             guestChargingEnabled={guestChargingEnabled}
+            ocppProtocol={station.ocppProtocol}
+            isOnline={station.isOnline}
           />
         </TabsContent>
 
         <TabsContent value="pricing" className="space-y-6">
-          <StationPricingTab stationId={id ?? ''} />
+          <StationPricingTab
+            stationId={id ?? ''}
+            siteTimezone={station.siteTimezone ?? undefined}
+          />
         </TabsContent>
 
         <TabsContent value="local-auth">
@@ -398,6 +561,11 @@ export function StationDetail(): React.JSX.Element {
           </TabsContent>
         )}
 
+        {showInsightsTab && (
+          <TabsContent value="ai-insights">
+            <RecordInsightsTab filter={{ stationId: station.id }} />
+          </TabsContent>
+        )}
         <TabsContent value="history">
           <EntityHistoryTab entityType="station" entityId={station.id} />
         </TabsContent>

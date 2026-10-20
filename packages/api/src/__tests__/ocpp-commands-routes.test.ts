@@ -22,7 +22,7 @@ vi.mock('../middleware/rbac.js', () => ({
 }));
 
 // Mock the pubsub singleton used by ocpp-commands route
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
@@ -55,6 +55,7 @@ vi.mock('../lib/site-access.js', () => ({
 
 import { registerAuth } from '../plugins/auth.js';
 import { ocppCommandRoutes } from '../routes/ocpp-commands.js';
+import * as ocppModule from '@evtivity/ocpp';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -109,6 +110,45 @@ describe('OCPP command routes', () => {
     expect(response.statusCode).toBe(400);
   });
 
+  it('rejects a v21 UpdateFirmware with a signature but no signing certificate', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/ocpp/commands/v21/UpdateFirmware',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        stationId: 'STATION-001',
+        requestId: 1,
+        firmware: {
+          location: 'https://example.com/fw.bin',
+          retrieveDateTime: '2026-01-01T00:00:00Z',
+          signature: 'c2lnbmF0dXJl',
+        },
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects a v16 SignedUpdateFirmware whose signing certificate is not PEM', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/ocpp/commands/v16/SignedUpdateFirmware',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        stationId: 'STATION-001',
+        requestId: 1,
+        firmware: {
+          location: 'https://example.com/fw.bin',
+          retrieveDateTime: '2026-01-01T00:00:00Z',
+          signingCertificate: 'not a certificate',
+          signature: 'c2lnbmF0dXJl',
+        },
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('VALIDATION_ERROR');
+  });
+
   it('returns 404 for unknown v21 action (no route)', async () => {
     const response = await app.inject({
       method: 'POST',
@@ -131,7 +171,7 @@ describe('OCPP command routes', () => {
 
   it('returns 400 when v21 payload validation fails', async () => {
     // Override validateRequest to return false for this test
-    const { ActionRegistry } = await import('@evtivity/ocpp');
+    const { ActionRegistry } = ocppModule;
     const originalValidate = ActionRegistry['Reset'].validateRequest;
     (
       ActionRegistry['Reset'] as unknown as { validateRequest: ReturnType<typeof vi.fn> }

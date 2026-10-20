@@ -5,10 +5,11 @@ set -euo pipefail
 # docker compose with a clean Postgres volume, then seeds the database.
 # Used to smoke-test the build images locally before tagging a release.
 #
-# Seed strategy: `npm run db:seed` (admin + roles + settings, honors SEED_DEMO
-# from .env) then `npm run db:seed:dev` (minimal dev fixture from
-# packages/database/src/seed-dev-stations.ts) for testing without the full demo
-# dataset.
+# Seed strategy: `npm run db:seed -- --apply-config` (admin + roles +
+# settings with seed.config.json applied, honors SEED_DEMO from .env) then
+# `npm run db:seed:dev` (minimal dev fixture from
+# packages/database/src/seed-dev-stations.ts) for testing without the full
+# demo dataset.
 
 unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD
 
@@ -54,10 +55,15 @@ if [ -z "${BIND_IP:-}" ]; then
   fi
 fi
 
-# Tools: pgadmin, mailpit, ftp
-read -rp "Start dev tools (pgadmin, mailpit, ftp)? [y/N] " tools
+# Tools: pgadmin, mailpit, notify-sink (driver SMS and push), ftp
+read -rp "Start dev tools (pgadmin, mailpit, notify-sink, ftp)? [y/N] " tools
 if [[ "$tools" == "y" || "$tools" == "Y" ]]; then
   PROFILES+=(--profile tools)
+  # Send driver SMS and push from api, ocpp and worker to notify-sink instead of
+  # Twilio and Expo (off in docker-compose.yml otherwise). A value from .env wins:
+  # NOTIFICATIONS_TEST_SINK_URL= (empty) keeps Twilio and Expo with the tools.
+  export NOTIFICATIONS_ALLOW_TEST_SINK="${NOTIFICATIONS_ALLOW_TEST_SINK:-true}"
+  export NOTIFICATIONS_TEST_SINK_URL="${NOTIFICATIONS_TEST_SINK_URL-http://notify-sink:8080}"
 fi
 
 # OCPI: ocpi server + simulators
@@ -83,6 +89,7 @@ fi
 echo ""
 if [ "$BIND_IP" != "127.0.0.1" ]; then
   echo "Bind IP: $BIND_IP (LAN)"
+  echo "Infrastructure ports (postgres, tools, monitoring): ${INFRA_BIND_IP:-127.0.0.1}"
 fi
 echo "Profiles: ${PROFILES[*]:-none}"
 echo "Restart data services: $RESTART_DATA"
@@ -100,11 +107,11 @@ else
   docker compose --profile tools --profile ocpi --profile monitoring stop --timeout 10 \
     api ocpp csms portal simulator worker migrate \
     ocpi ocpi-simulator ocpi-cpo-sim \
-    pgadmin mailpit ftp prometheus grafana loki alloy 2>/dev/null || true
+    pgadmin mailpit notify-sink ftp prometheus grafana loki alloy 2>/dev/null || true
   docker compose --profile tools --profile ocpi --profile monitoring rm -f \
     api ocpp csms portal simulator worker migrate \
     ocpi ocpi-simulator ocpi-cpo-sim \
-    pgadmin mailpit ftp prometheus grafana loki alloy 2>/dev/null || true
+    pgadmin mailpit notify-sink ftp prometheus grafana loki alloy 2>/dev/null || true
 fi
 
 # Wait for TLS port to free up
@@ -118,6 +125,15 @@ while lsof -i :8443 >/dev/null 2>&1; do sleep 1; done
 # .env via docker-compose's automatic .env loading. To enable dev auto-login,
 # set VITE_CSMS_AUTO_LOGIN / VITE_PORTAL_AUTO_LOGIN in .env.
 docker compose up -d postgres redis
+
+# A preserved Redis keeps the ACL it loaded at start. Load the current
+# docker/redis/acl-rules.conf, so a new key prefix or channel of this version
+# reaches the service users without restarting Redis.
+echo "Waiting for redis to be ready..."
+until docker compose exec -T redis redis-cli ping >/dev/null 2>&1; do
+  sleep 1
+done
+docker compose exec -T redis sh /usr/local/etc/redis/start.sh --reload
 
 # Wait for postgres to be healthy before running migrations and seeds. The
 # migrate container has its own healthcheck dependency, but the host-side
@@ -145,7 +161,10 @@ if [ "$RESTART_DATA" = "y" ]; then
 
   echo ""
   echo "Seeding database..."
-  npm run db:seed
+  # The database was just wiped, so seed.config.json (and REGISTRATION_POLICY)
+  # replace the migration defaults. A plain `npm run db:seed` only adds
+  # missing settings and never overwrites existing ones.
+  npm run db:seed -- --apply-config
   npm run db:seed:dev
 else
   echo ""

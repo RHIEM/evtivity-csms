@@ -46,7 +46,15 @@ export interface Driver {
   email: string | null;
   phone: string | null;
   isActive: boolean;
+  /** Set when the personal data was erased: the name is blank. */
+  erasedAt?: string | null;
   createdAt: string;
+}
+
+/** An extra column a caller adds before the remove button (the fleet member billing switch). */
+export interface DriversTableExtraColumn {
+  header: string;
+  render: (driver: Driver) => React.ReactNode;
 }
 
 interface DriversTableProps {
@@ -60,6 +68,7 @@ interface DriversTableProps {
   onRemove?: (driverId: string) => void;
   removeDisabled?: boolean;
   visibility?: ColumnVisibility;
+  extraColumn?: DriversTableExtraColumn;
 }
 
 export function DriversTable({
@@ -70,13 +79,14 @@ export function DriversTable({
   onRemove,
   removeDisabled,
   visibility,
+  extraColumn,
 }: DriversTableProps): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const hasRemove = onRemove != null;
   const isVisible = (key: string): boolean => visibility == null || visibility[key] !== false;
   const visibleCount = DRIVERS_COLUMNS.filter((c) => isVisible(c.key)).length;
-  const colSpan = visibleCount + (hasRemove ? 1 : 0);
+  const colSpan = visibleCount + (extraColumn != null ? 1 : 0) + (hasRemove ? 1 : 0);
 
   return (
     <>
@@ -90,6 +100,7 @@ export function DriversTable({
               {isVisible('phone') && <TableHead>{t('drivers.phone')}</TableHead>}
               {isVisible('status') && <TableHead>{t('common.status')}</TableHead>}
               {isVisible('created') && <TableHead>{t('common.created')}</TableHead>}
+              {extraColumn != null && <TableHead>{extraColumn.header}</TableHead>}
               {hasRemove && <TableHead />}
             </TableRow>
           </TableHeader>
@@ -114,8 +125,10 @@ export function DriversTable({
                   <TableCell className="text-muted-foreground">{driver.id}</TableCell>
                 )}
                 {isVisible('driverName') && (
-                  <TableCell className="font-medium text-primary" data-testid="row-click-target">
-                    {driver.firstName} {driver.lastName}
+                  <TableCell className="font-medium text-link" data-testid="row-click-target">
+                    {driver.erasedAt != null
+                      ? t('drivers.erasedName')
+                      : `${driver.firstName} ${driver.lastName}`}
                   </TableCell>
                 )}
                 {isVisible('email') && <TableCell>{driver.email ?? '-'}</TableCell>}
@@ -129,6 +142,15 @@ export function DriversTable({
                 )}
                 {isVisible('created') && (
                   <TableCell>{formatDate(driver.createdAt, timezone)}</TableCell>
+                )}
+                {extraColumn != null && (
+                  <TableCell
+                    onClick={(e) => {
+                      e.stopPropagation();
+                    }}
+                  >
+                    {extraColumn.render(driver)}
+                  </TableCell>
                 )}
                 {hasRemove && (
                   <TableCell>

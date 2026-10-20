@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { readFileSync } from 'node:fs';
-import { connect as tlsConnect, type TLSSocket } from 'node:tls';
 import type postgres from 'postgres';
-import type { PubSubClient } from '@evtivity/lib';
-import { StationSimulator, type StationConfig } from './station-simulator.js';
+import { CSS_RECONNECT_SPREAD_S, tryParseJson, type PubSubClient } from '@evtivity/lib';
+import {
+  StationSimulator,
+  type PluggedInEv,
+  type ReservationReply,
+  type StationConfig,
+} from './station-simulator.js';
 import { ClockAlignedScheduler } from './clock-aligned-scheduler.js';
+import { isTlsReachable } from './tls-probe.js';
 import { config as cssConfig } from './lib/config.js';
+import { logger } from './lib/logger.js';
 import { isStationStuck, MAX_HEAL_ATTEMPTS, MAX_HEAL_PER_TICK } from './simulator-heal.js';
 
 // Resolve the SP3 PEM bundle from env: prefer the inlined *_PEM variants
@@ -60,6 +66,14 @@ interface CssCommand {
 // failure result throttles that without slowing recovery much: a station
 // whose TLS server came up still boots within TTL of the next poll.
 const TLS_PROBE_FAILURE_TTL_MS = 15_000;
+
+// When the OCPP server restarts, every simulator in a 2000-station fleet sees
+// the close at the same instant; with only the 20% backoff jitter they all
+// reconnect within ~2 seconds, which saturates postgres on the server side.
+// A 1.6 station's first reconnect attempt spreads uniformly over this window
+// instead. A 2.1 station spreads through its own RetryBackOffRandomRange (factory
+// default the same window, CSS_RETRY_BACK_OFF_DEFAULTS), not through this.
+const FLEET_RECONNECT_SPREAD_MS = CSS_RECONNECT_SPREAD_S * 1000;
 
 export class SimulatorManager {
   readonly simulators = new Map<string, StationSimulator>();
@@ -116,13 +130,12 @@ export class SimulatorManager {
   }
 
   async handleCommand(raw: string): Promise<void> {
-    let cmd: CssCommand;
-    try {
-      cmd = JSON.parse(raw) as CssCommand;
-    } catch {
+    const parsed = tryParseJson(raw);
+    if (parsed === undefined) {
       console.log('[simulator-manager] Failed to parse command JSON');
       return;
     }
+    const cmd = parsed as CssCommand;
 
     const sim = this.simulators.get(cmd.stationId);
     if (!sim) {
@@ -151,8 +164,8 @@ export class SimulatorManager {
           ...(data != null ? { data } : {}),
         }),
       );
-    } catch {
-      // Best-effort: a missed result message just falls back to the API timeout.
+    } catch (err) {
+      logger.warn({ err, commandId }, 'Publish of the command result failed, the API times out');
     }
   }
 
@@ -312,6 +325,8 @@ export class SimulatorManager {
       // cycle so a TLS server coming online is picked up without restarting
       // CSS -- with a short negative-cache TTL so we don't open a 3s probe
       // every 5s for every unreachable station while the TLS server is down.
+      // The probe does not verify the certificate; the station's OcppClient
+      // does (see tls-probe.ts).
       if (targetUrl.startsWith('wss://')) {
         const cachedFailureExpiresAt = this.tlsProbeFailureCache.get(targetUrl);
         const isCachedFailure =
@@ -319,7 +334,7 @@ export class SimulatorManager {
         if (isCachedFailure) {
           continue;
         }
-        const reachable = await this.isTlsReachable(targetUrl);
+        const reachable = await isTlsReachable(targetUrl);
         if (!reachable) {
           this.tlsProbeFailureCache.set(targetUrl, Date.now() + TLS_PROBE_FAILURE_TTL_MS);
           console.log(
@@ -364,18 +379,22 @@ export class SimulatorManager {
         ...(clientCertVal != null ? { clientCert: clientCertVal } : {}),
         ...(clientKeyVal != null ? { clientKey: clientKeyVal } : {}),
         ...(caCertVal != null ? { caCert: caCertVal } : {}),
+        reconnectSpreadMs: FLEET_RECONNECT_SPREAD_MS,
       };
 
+      const sim = this.makeSimulator(config, this.sql);
       try {
-        const sim = this.makeSimulator(config, this.sql);
         // Add to map BEFORE start() to prevent duplicate creation during async boot
         this.simulators.set(stationId, sim);
         await sim.start();
         this.clockAlignedScheduler.register(sim);
         console.log(`[simulator-manager] Started simulator: ${stationId}`);
       } catch (err: unknown) {
-        // Remove from map on failure so it can be retried next sync
+        // Remove from map on failure so it can be retried next sync. Stop it
+        // first: its client keeps retrying the connection in the background,
+        // and the next sync starts a fresh simulator for the station.
         this.simulators.delete(stationId);
+        await sim.stop().catch(() => {});
         const msg = err instanceof Error ? err.message : String(err);
         console.log(`[simulator-manager] Failed to start simulator ${stationId}: ${msg}`);
       }
@@ -398,38 +417,6 @@ export class SimulatorManager {
     }
   }
 
-  private async isTlsReachable(url: string): Promise<boolean> {
-    try {
-      const parsed = new URL(url);
-      const host = parsed.hostname;
-      const port = Number(parsed.port) || 443;
-      return await new Promise<boolean>((resolve) => {
-        const socket: TLSSocket = tlsConnect(
-          {
-            host,
-            port,
-            rejectUnauthorized: process.env['TLS_REJECT_UNAUTHORIZED'] === 'true',
-            timeout: 3000,
-          },
-          () => {
-            socket.destroy();
-            resolve(true);
-          },
-        );
-        socket.on('error', () => {
-          socket.destroy();
-          resolve(false);
-        });
-        socket.on('timeout', () => {
-          socket.destroy();
-          resolve(false);
-        });
-      });
-    } catch {
-      return false;
-    }
-  }
-
   private async dispatchAction(
     sim: StationSimulator,
     action: string,
@@ -439,9 +426,16 @@ export class SimulatorManager {
     let resultData: Record<string, unknown> | undefined;
     try {
       switch (action) {
-        case 'plugIn':
-          await sim.plugIn(params.evseId as number);
+        case 'plugIn': {
+          const ev = params.ev as PluggedInEv | undefined;
+          if (ev == null) {
+            await sim.plugIn(params.evseId as number);
+            break;
+          }
+          const autocharge = await sim.plugInEv(params.evseId as number, ev);
+          if (autocharge != null) resultData = { autocharge };
           break;
+        }
         case 'authorize':
           await sim.authorize(
             params.evseId as number,
@@ -464,11 +458,56 @@ export class SimulatorManager {
         case 'unplug':
           await sim.unplug(params.evseId as number);
           break;
+        case 'suspendCharging':
+          await sim.suspendCharging(params.evseId as number, params.by as 'EV' | 'EVSE');
+          break;
+        case 'resumeCharging':
+          await sim.resumeCharging(params.evseId as number);
+          break;
+        case 'evFull':
+          await sim.evFull(params.evseId as number);
+          break;
+        case 'powerCycle': {
+          const powerOffMs = (params.powerOffMs as number | undefined) ?? 0;
+          if (params.preserveTransactions === false) {
+            await sim.simulatePowerCycle('PowerLoss', powerOffMs);
+          } else {
+            await sim.simulatePowerCyclePreserveTransactions(powerOffMs);
+          }
+          break;
+        }
+        case 'createPncEv':
+          resultData = await sim.createPncEv(
+            params.evseId as number,
+            (params.edition as 2 | 20 | undefined) ?? 2,
+          );
+          break;
+        case 'installPncContract':
+          resultData = await sim.installPncContract(params.evseId as number);
+          break;
+        case 'updatePncContract':
+          resultData = await sim.updatePncContract(params.evseId as number);
+          break;
+        case 'authorizePnc':
+          resultData = await sim.authorizePnc(params.evseId as number);
+          break;
+        case 'startPncCharging': {
+          const txId = await sim.startPncCharging(params.evseId as number);
+          resultData = { transactionId: txId };
+          break;
+        }
         case 'injectFault':
-          await sim.injectFault(params.evseId as number, params.errorCode as string);
+          await sim.injectFault(
+            params.evseId as number,
+            params.errorCode as string,
+            (params.mode as 'end' | 'suspend' | undefined) ?? 'end',
+          );
           break;
         case 'clearFault':
           await sim.clearFault(params.evseId as number);
+          break;
+        case 'reservationReply':
+          sim.setNextReservationReply(params.reply as ReservationReply);
           break;
         case 'goOffline':
           await sim.goOffline();
@@ -633,9 +672,6 @@ export class SimulatorManager {
             params.activated as boolean,
           );
           break;
-        case 'sendNotifyQRCodeScanned':
-          await sim.sendNotifyQRCodeScanned(params.evseId as number, params.timeout as number);
-          break;
         case 'sendNotifyAllowedEnergyTransfer':
           await sim.sendNotifyAllowedEnergyTransfer(
             params.allowedEnergyTransfer as string[],
@@ -657,9 +693,6 @@ export class SimulatorManager {
             params.status as string,
             params.requestId as number | undefined,
           );
-          break;
-        case 'sendNotifyWebPaymentStarted':
-          await sim.sendNotifyWebPaymentStarted(params.evseId as number, params.timeout as number);
           break;
         case 'sendNotifyPeriodicEventStream':
           await sim.sendNotifyPeriodicEventStream(params);

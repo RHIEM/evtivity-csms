@@ -7,8 +7,9 @@
 <p align="center">
   <a href="https://github.com/EVtivity/evtivity-csms/releases/latest"><img src="https://img.shields.io/github/v/release/EVtivity/evtivity-csms?label=Release&color=4ade80" alt="Release" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml"><img src="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/EVtivity/evtivity-csms/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FEVtivity%2Fevtivity-csms%2Fbadges%2Fcoverage.json" alt="Coverage" /></a>
   <a href="https://github.com/EVtivity/evtivity-csms/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-BUSL--1.1-blue.svg" alt="License: BUSL-1.1" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/TypeScript-6.x-3178C6.svg" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-339933.svg" alt="Node.js" />
   <img src="https://img.shields.io/badge/OCPP-1.6%20%7C%202.1-4ade80.svg" alt="OCPP" />
   <img src="https://img.shields.io/badge/OCPI-2.2.1%20%7C%202.3.0-4ade80.svg" alt="OCPI" />
@@ -23,9 +24,9 @@
   <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
-EV 충전 인프라를 관리하기 위한 OCPP 1.6 및 2.1 호환 충전소 관리 시스템(CSMS)입니다. 충전소와의 실시간 WebSocket 통신, OCPI 2.2.1/2.3.0 로밍, ISO 15118 Plug and Charge, 운영자용 REST API, 그리고 운영자와 드라이버를 위한 두 개의 React 프런트엔드를 제공합니다.
+EVtivity는 AI 기반 EV 충전 플랫폼입니다. 핵심은 EV 충전 인프라를 위한 OCPP 1.6 및 2.1 호환 충전소 관리 시스템(CSMS)입니다. 충전소와의 실시간 WebSocket 통신, OCPI 2.2.1/2.3.0 로밍, ISO 15118 Plug and Charge, 운영자용 REST API, 그리고 운영자와 운전자를 위한 두 개의 React 프런트엔드를 제공합니다.
 
-EVtivity는 운영 경험 전반에 AI를 통합합니다. 챗봇 어시스턴트는 API 엔드포인트를 도구로 호출하여 충전소, 세션, 매출, 운영에 대한 자연어 질문에 답합니다. 지원 AI 어시스턴트는 케이스의 전체 컨텍스트를 수집해 고객 지원 답변 초안을 작성합니다. 두 어시스턴트 모두 다중 LLM 공급자(Anthropic, OpenAI, Gemini)를 지원하며 시스템 및 사용자별 매개변수 설정이 가능하고, 운영자의 선호 언어로 답하며, 민감 정보 유출을 방지하는 보안 가드레일을 적용합니다.
+AI는 운영자 대시보드에 내장되어 있습니다. AI 어시스턴트는 충전소, 세션, 매출, 운영에 대한 질문에 답하고, 충전기 화면 사진, PDF, 로그 같은 첨부 파일을 읽으며, 운영자가 확인한 후에만 실행되는 변경 사항을 제안합니다. 지원 어시스트는 운전자의 언어로 지원 케이스 답변 초안을 작성합니다. 두 기능 모두 Anthropic, OpenAI, Gemini, DeepSeek와 함께 작동하며, 비밀 정보와 개인 데이터는 모델에 전달되기 전에 마스킹됩니다.
 
 ## 아키텍처
 
@@ -68,6 +69,19 @@ graph TB
 ```
 
 ## 기능 개요
+
+### AI 기반 운영
+
+| 기능                | 설명                                                                                                                                         |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| AI 어시스턴트       | 충전소, 세션, 매출, 운영에 대해 자연어로 질문합니다. 답변은 스트리밍되고, 대화는 검색, 이름 변경, 삭제와 함께 보관됩니다                     |
+| 이미지 및 파일 분석 | 이미지(충전기 화면 사진 등), PDF, CSV, 텍스트, 로그, JSON 파일을 첨부합니다                                                                  |
+| 확인 후 변경        | 어시스턴트는 API 도구로 데이터를 읽습니다. 제안한 변경 사항은 확인 카드로 표시되며 운영자가 확인한 후에만 실행됩니다                         |
+| 지원 어시스트       | 지원 케이스 답변은 운전자의 언어로, 내부 메모는 운영자의 언어로 초안을 작성하고 참고한 출처를 보여줍니다                                     |
+| 공급자 선택         | Anthropic, OpenAI, Google Gemini, DeepSeek 중에서 기능별 또는 사용자별로 선택하고 노력 수준을 설정합니다                                     |
+| 마스킹 및 보호 장치 | 비밀 정보와 개인 데이터는 모델에 전달되기 전에 도구 결과에서 마스킹됩니다. 설정, 비밀 정보, 사용자, 결제, 충전소 보안에는 접근할 수 없습니다 |
+| 6개 언어            | 운영자의 언어로 답합니다: 영어, 독일어, 스페인어, 한국어, 중국어 간체, 중국어 번체                                                           |
+| 제한 및 감사        | 사용자별 및 사이트별 속도 제한, 사용자별 일일 토큰 예산, 어시스턴트를 통한 변경 사항의 감사 기록                                             |
 
 ### OCPP 준수
 
@@ -146,20 +160,6 @@ graph TB
 | 지원 케이스        | 세션 연결, 환불 작업, S3 첨부가 가능한 지원 티켓       |
 | 알림               | 세션, 결제, 예약, 지원 이벤트에 대한 이메일/SMS        |
 
-### AI 기반 운영
-
-| 기능                | 설명                                                                                        |
-| ------------------- | ------------------------------------------------------------------------------------------- |
-| 챗봇 어시스턴트     | 자동 생성된 도구 카탈로그를 통해 모든 API 엔드포인트에 접근하는 자연어 운영자 어시스턴트    |
-| 2단계 도구 선택     | 카테고리 기반 라우팅으로 요청당 도구 수를 공급자 한도(128) 이내로 유지                      |
-| 지원 케이스 AI      | 메시지·세션·스테이션·드라이버까지 포함한 전체 케이스 컨텍스트로 응답 초안 및 내부 메모 작성 |
-| 다중 공급자 지원    | Anthropic Claude, OpenAI GPT, Google Gemini, 시스템 및 사용자 단위 구성                     |
-| LLM 매개변수        | temperature, top-p, top-k, 시스템 프롬프트, 톤을 시스템 및 사용자 단위로 구성               |
-| 언어 인식 응답      | AI가 운영자의 선호 언어(6개 로케일)로 응답                                                  |
-| 보안 가드레일       | 비밀번호와 API 키 노출 차단, 데이터 변경 전 확인 요구                                       |
-| 자동 생성 도구      | OpenAPI 스펙 코드젠으로 500+ 운영자 엔드포인트의 타입 도구 정의 생성                        |
-| 편집 가능한 채팅 UI | 사용자 메시지 편집·재전송, 어시스턴트 응답 복사, 스크롤 가능한 표를 포함한 마크다운 렌더링  |
-
 ### 지속 가능성
 
 | 기능              | 설명                                                                   |
@@ -217,11 +217,21 @@ graph TB
 | 다국어 UI        | 6개 언어: 영어, 독일어, 스페인어, 한국어, 간체/번체 중국어                                         |
 | 반응형 필터      | 모든 목록 페이지의 필터가 태블릿/모바일에서 드롭다운으로 접힘                                      |
 | 서버 다운 페이지 | API 미응답 시 CSMS/포털에서 재시도 가능한 친절한 에러 페이지                                       |
-| 릴리스 관리      | 릴리스 스크립트로 전체 패키지와 Helm 차트의 버전 자동 올림                                         |
+| 릴리스 관리      | stable, alpha, beta 채널. 각 stable 릴리스가 Helm 차트와 AWS CDK 앱을 해당 버전으로 올림           |
 
-## 서비스
+## 배포
 
-Helm 차트로 배포할 때 각 서비스는 Gateway API를 통해 자체 하위 도메인으로 노출됩니다:
+| 옵션                 | 용도                                            | 소스                                                                          | 가이드                                                                        |
+| -------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Docker Compose       | 로컬 개발과 단일 호스트 설치                    | 이 저장소의 `docker-compose.yml`                                              | [Docker Compose](https://www.evtivity.com/ko/docs/deployment/docker-compose/) |
+| Kubernetes Helm 차트 | Kubernetes 프로덕션 (Istio 또는 Envoy Gateway)  | [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm) | [Helm 차트](https://www.evtivity.com/ko/docs/deployment/helm-chart/)          |
+| AWS CDK              | AWS 프로덕션 (ECS Fargate, Aurora, ElastiCache) | [EVtivity/evtivity-csms-cdk](https://github.com/EVtivity/evtivity-csms-cdk)   | [AWS](https://www.evtivity.com/ko/docs/deployment/aws/)                       |
+
+Helm 차트와 AWS CDK 앱은 stable 릴리스만 따릅니다. 각 stable 릴리스가 둘을 해당 버전으로 올립니다.
+
+### 서비스 엔드포인트
+
+Helm 차트를 사용하면 각 서비스는 Gateway API를 통해 자체 하위 도메인으로 노출됩니다:
 
 | 서비스             | URL                                | 공개 포트 | 내부 포트 |
 | ------------------ | ---------------------------------- | --------- | --------- |
@@ -237,9 +247,33 @@ Helm 차트로 배포할 때 각 서비스는 Gateway API를 통해 자체 하�
 
 모든 호스트네임은 단일 로드 밸런서 IP를 공유합니다. 각 호스트네임의 DNS 레코드를 해당 IP로 지정해야 합니다. OCPP TLS(포트 8443)는 Security Profile 3(mTLS)을 사용한 스테이션 직접 연결을 위해 별도의 `LoadBalancer` 서비스로 프로비저닝됩니다.
 
-## Helm 차트
+## Skills
 
-Kubernetes Helm 차트는 별도 저장소에서 관리됩니다: [EVtivity/evtivity-csms-helm](https://github.com/EVtivity/evtivity-csms-helm)
+[EVtivity Agent Skills](https://github.com/EVtivity/evtivity-skills)는 AI 코딩 에이전트가 EVtivity를 다룰 수 있게 해 줍니다. 공개 표준 [Agent Skills](https://agentskills.io)를 따르므로 같은 스킬이 Claude Code, Codex, GitHub Copilot, Gemini CLI, Cursor 등 여러 에이전트에서 동작합니다.
+
+| 스킬                       | 도움                                                      |
+| -------------------------- | --------------------------------------------------------- |
+| `evtivity-getting-started` | Docker로 EVtivity를 로컬에 설치하고 실행한 뒤 로그인      |
+| `evtivity-deployment`      | Docker Compose, Helm 또는 AWS CDK로 배포하고 업그레이드   |
+| `evtivity-configuration`   | 환경 변수, 시크릿, 인증, 데이터베이스, 충전소 보안 설정   |
+| `evtivity-csms`            | 대시보드 운영: 사이트, 충전소, 세션, 운전자, 요금, 보고서 |
+| `evtivity-portal`          | 운전자 포털 사용: 충전소 찾기, 충전, 결제, 카드 관리      |
+| `evtivity-mobile-app`      | 운전자 모바일 앱 빌드, 브랜딩, 출시                       |
+| `evtivity-guides`          | 충전소 등록, 멈춘 세션 같은 단계별 가이드 따르기          |
+| `evtivity-integrations`    | Stripe, Adyen, 테스트 결제 제공자, 정산 설정              |
+| `evtivity-api`             | REST API 호출: API 키, 오류 코드, OCPP 명령 경로          |
+| `evtivity-simulator`       | 시뮬레이션 OCPP 1.6 및 2.1 충전소와 충전 세션 실행        |
+| `evtivity-conformance`     | OCPP 명령 전송, 메시지 로그 확인, OCTT 적합성 테스트 실행 |
+| `evtivity-troubleshoot`    | 장애가 난 서비스, 충전소 연결, 로그인 문제를 찾아 해결    |
+| `evtivity-report-issue`    | 버전과 민감 정보를 지운 로그를 모아 GitHub 이슈 초안 작성 |
+
+모든 에이전트에 설치:
+
+```bash
+npx skills add EVtivity/evtivity-skills
+```
+
+스킬 릴리스는 EVtivity와 같은 태그를 사용합니다. 배포한 버전에 맞는 태그를 설치하세요. 새 스킬에 대한 풀 리퀘스트와 토론을 환영합니다.
 
 ## 라이선스
 

@@ -49,6 +49,10 @@ function makeChain() {
   return chain;
 }
 
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
+
 vi.mock('@evtivity/database', () => ({
   db: {
     select: vi.fn(() => makeChain()),
@@ -68,7 +72,53 @@ vi.mock('@evtivity/database', () => ({
   },
   settings: {},
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getCompanyPriceDisplay: vi.fn(() => Promise.resolve('gross')),
+  getCompanyTaxBasis: vi.fn(() => Promise.resolve('gross')),
   clearSystemSettingsCache: vi.fn(),
+  clearMobileAppConfigCache: vi.fn(),
+  clearStationMessageSettingsCache: vi.fn(),
+  clearWebhookSettingsCache: vi.fn(),
+  clearRoamingCache: vi.fn(),
+  clearSupportCache: vi.fn(),
+  clearFleetCache: vi.fn(),
+  WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY: 'notifications.webhookAllowedPrivateHosts',
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY: 'guest.startsPerIpPerHour',
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY: 'guest.declinesPerIpPerHour',
+  MAX_GUEST_VELOCITY_LIMIT: 10_000,
+  parseGuestVelocityLimit: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000
+      ? value
+      : null,
+  clearGuestVelocityCache: vi.fn(),
+  clearGuestChargingCache: vi.fn(),
+  PREPAID_LOW_CREDIT_THRESHOLD_KEY: 'prepaid.lowCreditThresholdCents',
+  MAX_PREPAID_LOW_CREDIT_THRESHOLD_CENTS: 100_000_000,
+  parsePrepaidLowCreditThresholdCents: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100_000_000
+      ? value
+      : null,
+  clearPrepaidSettingsCache: vi.fn(),
+  INVOICE_PAYMENT_TERMS_DAYS_KEY: 'invoice.paymentTermsDays',
+  MAX_INVOICE_PAYMENT_TERMS_DAYS: 365,
+  parseInvoicePaymentTermsDays: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 365
+      ? value
+      : null,
+  FLEET_INVOICE_RUN_DAY_KEY: 'fleet.invoiceRunDay',
+  MAX_FLEET_INVOICE_RUN_DAY: 28,
+  parseFleetInvoiceRunDay: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 28
+      ? value
+      : null,
+  clearInvoiceSettingsCache: vi.fn(),
+  FLEET_CREDIT_RESERVATION_KEY: 'fleet.creditReservationCents',
+  MAX_FLEET_CREDIT_RESERVATION_CENTS: 100_000_000,
+  parseFleetCreditReservationCents: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100_000_000
+      ? value
+      : null,
+  clearFleetCreditSettingsCache: vi.fn(),
+  invalidateReservationSettingsCache: vi.fn(),
   writeAudit: vi.fn().mockResolvedValue(undefined),
   siteAuditLog: {},
   stationAuditLog: {},
@@ -120,9 +170,36 @@ vi.mock('../middleware/rbac.js', () => ({
     },
 }));
 
+vi.mock('../lib/payments.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/payments.js')>()),
+  clearPaymentCaches: vi.fn(),
+}));
+
+vi.mock('@evtivity/services/station-message.service', () => ({
+  requestStationMessageRepush: vi.fn().mockResolvedValue(undefined),
+}));
+
+// The provider-switch guard has its own tests (settings-routes-full, provider-switch).
+vi.mock('../lib/provider-switch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/provider-switch.js')>()),
+  assertPaymentProviderWritable: vi.fn(),
+}));
+
 import { registerAuth } from '../plugins/auth.js';
 import { settingsRoutes } from '../routes/settings.js';
-import { db, clearSystemSettingsCache } from '@evtivity/database';
+import { clearPaymentCaches } from '../lib/payments.js';
+import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
+import {
+  db,
+  clearSystemSettingsCache,
+  clearMobileAppConfigCache,
+  clearStationMessageSettingsCache,
+  invalidateReservationSettingsCache,
+  clearPrepaidSettingsCache,
+  clearGuestVelocityCache,
+  clearInvoiceSettingsCache,
+  clearFleetCreditSettingsCache,
+} from '@evtivity/database';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -355,6 +432,700 @@ describe('Settings routes', () => {
       set: ReturnType<typeof vi.fn>;
     };
     expect(updateChain.set).toHaveBeenCalledWith(expect.objectContaining({ value: 'GBP' }));
+  });
+
+  it('PUT /v1/settings/company.priceDisplay rejects a value other than gross or net', async () => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.priceDisplay',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'brutto' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain('company.priceDisplay');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/company.priceDisplay stores gross and clears the cache', async () => {
+    vi.mocked(db.insert).mockClear();
+    vi.mocked(clearSystemSettingsCache).mockClear();
+    setupDbResults([], [{ key: 'company.priceDisplay', value: 'gross' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.priceDisplay',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'gross' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({
+      key: 'company.priceDisplay',
+      value: 'gross',
+    });
+    expect(clearSystemSettingsCache).toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/stationMessage.language rejects an unsupported language', async () => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/stationMessage.language',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'fr' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain('stationMessage.language');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/stationMessage.language stores the language and clears the cache', async () => {
+    vi.mocked(db.insert).mockClear();
+    vi.mocked(clearStationMessageSettingsCache).mockClear();
+    vi.mocked(clearSystemSettingsCache).mockClear();
+    setupDbResults([], [{ key: 'stationMessage.language', value: 'zh-TW' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/stationMessage.language',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'zh-TW' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({
+      key: 'stationMessage.language',
+      value: 'zh-TW',
+    });
+    expect(clearStationMessageSettingsCache).toHaveBeenCalled();
+    expect(clearSystemSettingsCache).not.toHaveBeenCalled();
+  });
+
+  it.each([-1, 2.5, '30', 10_001])(
+    'PUT /v1/settings/guest.startsPerIpPerHour rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/guest.startsPerIpPerHour',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('guest.startsPerIpPerHour');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it('PUT /v1/settings/guest.declinesPerIpPerHour stores 0 (no limit) and clears the cache', async () => {
+    vi.mocked(clearGuestVelocityCache).mockClear();
+    setupDbResults([], [{ key: 'guest.declinesPerIpPerHour', value: 0 }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/guest.declinesPerIpPerHour',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 0 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearGuestVelocityCache).toHaveBeenCalled();
+  });
+
+  it.each([-1, 2.5, '500', 100_000_001])(
+    'PUT /v1/settings/prepaid.lowCreditThresholdCents rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/prepaid.lowCreditThresholdCents',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('prepaid.lowCreditThresholdCents');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it('PUT /v1/settings/prepaid.lowCreditThresholdCents stores the threshold and clears the cache', async () => {
+    vi.mocked(db.insert).mockClear();
+    vi.mocked(clearPrepaidSettingsCache).mockClear();
+    setupDbResults([], [{ key: 'prepaid.lowCreditThresholdCents', value: 1000 }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/prepaid.lowCreditThresholdCents',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 1000 },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({
+      key: 'prepaid.lowCreditThresholdCents',
+      value: 1000,
+    });
+    expect(clearPrepaidSettingsCache).toHaveBeenCalled();
+  });
+
+  it.each([-1, 1.5, '30', 366, null])(
+    'PUT /v1/settings/invoice.paymentTermsDays rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/invoice.paymentTermsDays',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('invoice.paymentTermsDays');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([0, 14, 365])(
+    'PUT /v1/settings/invoice.paymentTermsDays stores %s days and clears the cache',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      vi.mocked(clearInvoiceSettingsCache).mockClear();
+      setupDbResults([], [{ key: 'invoice.paymentTermsDays', value }]);
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/invoice.paymentTermsDays',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(200);
+      const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(insertChain.values).toHaveBeenCalledWith({ key: 'invoice.paymentTermsDays', value });
+      expect(clearInvoiceSettingsCache).toHaveBeenCalled();
+    },
+  );
+
+  it('PUT /v1/settings/pdf.logo stores an SVG sanitized as a base64 data URI', async () => {
+    vi.mocked(db.insert).mockClear();
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script><rect width="4" height="2" fill="url(https://x.test/p)"/><circle r="1"/></svg>';
+    const stored = `data:image/svg+xml;base64,${Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="2"/><circle r="1"/></svg>',
+    ).toString('base64')}`;
+    setupDbResults([], [{ key: 'pdf.logo', value: stored }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/pdf.logo',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: `data:image/svg+xml,${encodeURIComponent(svg)}` },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key: 'pdf.logo', value: stored });
+  });
+
+  it.each([
+    ['an empty string (the default logo)', '', ''],
+    [
+      'a PNG',
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    ],
+  ])('PUT /v1/settings/pdf.logo stores %s', async (_label, value, stored) => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key: 'pdf.logo', value: stored }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/pdf.logo',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key: 'pdf.logo', value: stored });
+  });
+
+  it.each([
+    ['a GIF', `data:image/gif;base64,${Buffer.from('GIF89a').toString('base64')}`],
+    ['a JPEG', `data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, 0xff]).toString('base64')}`],
+    ['a URL', 'https://example.com/logo.png'],
+    ['an HTML page', `data:image/svg+xml,${encodeURIComponent('<html><body/></html>')}`],
+    [
+      'an SVG with an entity declaration',
+      `data:image/svg+xml,${encodeURIComponent('<!DOCTYPE svg [<!ENTITY a "b">]><svg xmlns="http://www.w3.org/2000/svg"/>')}`,
+    ],
+    [
+      'a PNG over 512 KB',
+      `data:image/png;base64,${Buffer.alloc(512 * 1024 + 1).toString('base64')}`,
+    ],
+    ['a number', 5],
+  ])('PUT /v1/settings/pdf.logo rejects %s', async (_label, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/pdf.logo',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain('pdf.logo');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/pdf.footer stores the normalized footer', async () => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key: 'pdf.footer', value: 'Acme GmbH\nMain St 1' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/pdf.footer',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: '\r\nAcme GmbH  \r\nMain St 1\n\n' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({
+      key: 'pdf.footer',
+      value: 'Acme GmbH\nMain St 1',
+    });
+  });
+
+  it.each([
+    ['over 500 characters', 'x'.repeat(501)],
+    ['over 5 lines', 'a\nb\nc\nd\ne\nf'],
+    ['a non-string', 42],
+  ])('PUT /v1/settings/pdf.footer rejects %s', async (_label, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/pdf.footer',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain('pdf.footer');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/company.taxId stores the trimmed tax ID', async () => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key: 'company.taxId', value: 'DE123456789' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.taxId',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: '  DE123456789 ' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key: 'company.taxId', value: 'DE123456789' });
+  });
+
+  it('PUT /v1/settings/company.invoiceEmail accepts an empty value', async () => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key: 'company.invoiceEmail', value: '' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.invoiceEmail',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: ' ' },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it.each([
+    ['company.taxId', 'x'.repeat(65)],
+    ['company.taxId', 'DE1\nDE2'],
+    ['company.taxIdLabel', 'x'.repeat(41)],
+    ['company.registrationNumber', 42],
+    ['company.invoiceEmail', 'billing'],
+    ['company.invoicePhone', 'x'.repeat(41)],
+  ])('PUT /v1/settings/%s rejects an invalid value', async (key, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain(key);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['company.iban', ' de89 3704 0044 0532 0130 00 ', 'DE89370400440532013000'],
+    ['company.bic', 'cobadeffxxx', 'COBADEFFXXX'],
+    ['company.bankAccountHolder', '  Acme Charging GmbH ', 'Acme Charging GmbH'],
+    ['company.iban', '', ''],
+    ['invoice.epcQrEnabled', false, false],
+  ])('PUT /v1/settings/%s stores the normalized value', async (key, value, stored) => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key, value: stored }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key, value: stored });
+  });
+
+  it.each([
+    ['company.iban', 'DE89370400440532013001'],
+    ['company.iban', 'DE89-3704'],
+    ['company.bic', 'COBADEF'],
+    ['company.bic', 'COBA1EFF'],
+    ['company.bankAccountHolder', 'x'.repeat(71)],
+    ['company.bankName', 'Bank\nName'],
+    ['invoice.epcQrEnabled', 'yes'],
+  ])('PUT /v1/settings/%s rejects %j', async (key, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain(key);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5, '5000', 100_000_001, null])(
+    'PUT /v1/settings/fleet.creditReservationCents rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/fleet.creditReservationCents',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('fleet.creditReservationCents');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([1, 5000, 100_000_000])(
+    'PUT /v1/settings/fleet.creditReservationCents stores %s cents and clears the cache',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      vi.mocked(clearFleetCreditSettingsCache).mockClear();
+      setupDbResults([], [{ key: 'fleet.creditReservationCents', value }]);
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/fleet.creditReservationCents',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(200);
+      const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(insertChain.values).toHaveBeenCalledWith({
+        key: 'fleet.creditReservationCents',
+        value,
+      });
+      expect(clearFleetCreditSettingsCache).toHaveBeenCalled();
+    },
+  );
+
+  it.each([0, 29, 2.5, '1', null])(
+    'PUT /v1/settings/fleet.invoiceRunDay rejects %s',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/fleet.invoiceRunDay',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(response.json().error).toContain('fleet.invoiceRunDay');
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([1, 28])(
+    'PUT /v1/settings/fleet.invoiceRunDay stores day %s and clears the cache',
+    async (value) => {
+      vi.mocked(db.insert).mockClear();
+      vi.mocked(clearInvoiceSettingsCache).mockClear();
+      setupDbResults([], [{ key: 'fleet.invoiceRunDay', value }]);
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/settings/fleet.invoiceRunDay',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { value },
+      });
+      expect(response.statusCode).toBe(200);
+      const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(insertChain.values).toHaveBeenCalledWith({ key: 'fleet.invoiceRunDay', value });
+      expect(clearInvoiceSettingsCache).toHaveBeenCalled();
+    },
+  );
+
+  it('PUT /v1/settings/stationMessage.language re-renders station screens when the value changes', async () => {
+    vi.mocked(requestStationMessageRepush).mockClear();
+    setupDbResults(
+      [{ key: 'stationMessage.language', value: 'en' }],
+      [{ key: 'stationMessage.language', value: 'de' }],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/stationMessage.language',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'de' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(requestStationMessageRepush).toHaveBeenCalledTimes(1);
+  });
+
+  it('PUT /v1/settings/company.name does not re-render station screens for an unchanged value', async () => {
+    vi.mocked(requestStationMessageRepush).mockClear();
+    setupDbResults(
+      [{ key: 'company.name', value: 'ACME' }],
+      [{ key: 'company.name', value: 'ACME' }],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.name',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'ACME' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(requestStationMessageRepush).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/smtp.host does not re-render station screens', async () => {
+    vi.mocked(requestStationMessageRepush).mockClear();
+    setupDbResults([], [{ key: 'smtp.host', value: 'mail.example.com' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/smtp.host',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'mail.example.com' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(requestStationMessageRepush).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/reservation.cancellationFeeCents clears the reservation settings cache', async () => {
+    vi.mocked(invalidateReservationSettingsCache).mockClear();
+    vi.mocked(clearStationMessageSettingsCache).mockClear();
+    setupDbResults([], [{ key: 'reservation.cancellationFeeCents', value: 500 }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/reservation.cancellationFeeCents',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 500 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(invalidateReservationSettingsCache).toHaveBeenCalled();
+    expect(clearStationMessageSettingsCache).not.toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/stripe.webhookSecretEnc encrypts the secret and clears the payment caches', async () => {
+    vi.mocked(db.insert).mockClear();
+    // The returned row passes through decryptForRead; '' passes through unchanged.
+    setupDbResults([], [{ key: 'stripe.webhookSecretEnc', value: '' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/stripe.webhookSecretEnc',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'whsec_generic' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    const stored = (insertChain.values.mock.calls[0]?.[0] as { value: unknown }).value;
+    expect(stored).not.toBe('whsec_generic');
+    expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['payments.provider', 'simulated'],
+    ['stripe.publishableKey', 'pk_test_1'],
+    ['adyen.merchantAccount', 'EVtivityECOM'],
+    ['simulated.resultMode', 'approve'],
+  ])('PUT /v1/settings/%s clears the payment caches', async (key, value) => {
+    setupDbResults([], [{ key, value }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+    expect(clearSystemSettingsCache).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /v1/settings/payments.provider clears the payment caches', async () => {
+    setupDbResults([], [{ key: 'payments.provider', value: 'stripe' }]);
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/settings/payments.provider',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'stripe' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+  });
+
+  it('DELETE /v1/settings/adyen.merchantAccount clears the payment caches', async () => {
+    setupDbResults([{ key: 'adyen.merchantAccount', value: 'EVtivityECOM' }]);
+    const response = await app.inject({
+      method: 'DELETE',
+      url: '/settings/adyen.merchantAccount',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+  });
+
+  it('PUT /v1/settings/smtp.host does not clear the payment caches', async () => {
+    setupDbResults([], [{ key: 'smtp.host', value: 'mail.example.com' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/smtp.host',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'mail.example.com' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(clearPaymentCaches).not.toHaveBeenCalled();
+  });
+
+  it('GET /v1/portal/branding includes the company price display', async () => {
+    setupDbResults([{ key: 'company.priceDisplay', value: 'gross' }]);
+    const response = await app.inject({ method: 'GET', url: '/portal/branding' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().priceDisplay).toBe('gross');
+  });
+
+  it('GET /v1/portal/branding returns the normalized price display, not the stored value', async () => {
+    // The cached reader (mocked to 'gross') resolves an invalid stored value.
+    setupDbResults([{ key: 'company.priceDisplay', value: 'brutto' }]);
+    const response = await app.inject({ method: 'GET', url: '/portal/branding' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().priceDisplay).toBe('gross');
+  });
+
+  it('PUT /v1/settings/company.taxBasis rejects a value other than net or gross', async () => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.taxBasis',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'inclusive' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toBe('company.taxBasis must be one of: net, gross');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /v1/settings/company.taxBasis rejects a value other than net or gross', async () => {
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/settings/company.taxBasis',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'Gross' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+  });
+
+  it('PUT /v1/settings/company.taxBasis stores gross and clears the cache', async () => {
+    vi.mocked(db.insert).mockClear();
+    vi.mocked(clearSystemSettingsCache).mockClear();
+    setupDbResults([], [{ key: 'company.taxBasis', value: 'gross' }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/company.taxBasis',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: 'gross' },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key: 'company.taxBasis', value: 'gross' });
+    expect(clearSystemSettingsCache).toHaveBeenCalled();
+  });
+
+  it('PUT /v1/settings/mobile.app.urlSchemes stores normalized schemes and clears the cache', async () => {
+    vi.mocked(db.insert).mockClear();
+    vi.mocked(clearMobileAppConfigCache).mockClear();
+    setupDbResults([], [{ key: 'mobile.app.urlSchemes', value: ['myapp'] }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/settings/mobile.app.urlSchemes',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value: [' MyApp ', 'myapp'] },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({
+      key: 'mobile.app.urlSchemes',
+      value: ['myapp'],
+    });
+    expect(clearMobileAppConfigCache).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['mobile.app.urlSchemes', ['https'], 'mobile.app.urlSchemes must be'],
+    ['mobile.app.urlSchemes', 'myapp', 'mobile.app.urlSchemes must be'],
+    ['mobile.app.androidPackageNames', ['driver'], 'mobile.app.androidPackageNames must be'],
+  ])('PUT /v1/settings/%s refuses %j', async (key, value, message) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain(message);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('GET /v1/portal/branding returns the normalized tax basis', async () => {
+    setupDbResults([{ key: 'company.taxBasis', value: 'brutto' }]);
+    const response = await app.inject({ method: 'GET', url: '/portal/branding' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().taxBasis).toBe('gross');
   });
 
   it('DELETE /v1/settings/:key deletes a setting', async () => {

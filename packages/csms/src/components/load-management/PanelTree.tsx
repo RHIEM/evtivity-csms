@@ -14,6 +14,7 @@ import { PanelForm } from './PanelForm';
 import { CircuitForm } from './CircuitForm';
 import { UnmanagedLoadForm } from './UnmanagedLoadForm';
 import { AssignStationDialog } from './AssignStationDialog';
+import { formatNumber } from '@/lib/formatting';
 
 interface UnmanagedLoad {
   id: number;
@@ -39,6 +40,7 @@ interface CircuitStatus {
   currentDrawKw: number;
   availableKw: number;
   phaseConnections?: string | null;
+  voltageV?: number | null;
   stations: CircuitStation[];
   unmanagedLoads: UnmanagedLoad[];
 }
@@ -58,6 +60,7 @@ interface PanelStatus {
   maxContinuousKw: number;
   safetyMarginKw: number;
   oversubscriptionRatio: number;
+  phaseConnections?: string | null;
   currentDrawKw: number;
   availableKw: number;
   utilization: number;
@@ -214,13 +217,18 @@ function PanelNode({
               <span className="text-xs text-muted-foreground">
                 {panel.voltageV}V {panel.phases}ph
               </span>
+              {panel.phaseConnections != null && (
+                <Badge variant="outline" className="text-xs px-1.5 py-0">
+                  {panel.phaseConnections}
+                </Badge>
+              )}
               <span className="text-xs text-muted-foreground">
-                {panel.maxContinuousKw.toFixed(1)} kW max
+                {formatNumber(panel.maxContinuousKw, 1)} kW max
               </span>
               {panel.totalConnectedKw > panel.maxContinuousKw && (
                 <Badge variant="warning" className="text-xs">
                   {t('loadManagement.oversubscribed')}{' '}
-                  {(panel.totalConnectedKw / panel.maxContinuousKw).toFixed(2)}x
+                  {formatNumber(panel.totalConnectedKw / panel.maxContinuousKw, 2)}x
                 </Badge>
               )}
             </div>
@@ -263,8 +271,7 @@ function PanelNode({
           <div className="flex items-center gap-1">
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.editPanel')}
               onClick={() => {
                 setEditPanelOpen(true);
@@ -274,8 +281,7 @@ function PanelNode({
             </Button>
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.addCircuit')}
               onClick={() => {
                 setAddCircuitOpen(true);
@@ -285,8 +291,7 @@ function PanelNode({
             </Button>
             <Button
               variant="ghost"
-              size="icon"
-              className="h-8 w-8"
+              size="icon-sm"
               aria-label={t('loadManagement.deletePanel')}
               onClick={() => {
                 setDeleteOpen(true);
@@ -480,8 +485,13 @@ function CircuitNode({
                 {circuit.phaseConnections}
               </Badge>
             )}
+            {circuit.voltageV != null && (
+              <Badge variant="outline" className="text-xs px-1.5 py-0">
+                {circuit.voltageV}V
+              </Badge>
+            )}
             <span className="text-xs text-muted-foreground">
-              {circuit.maxContinuousKw.toFixed(1)} kW max
+              {formatNumber(circuit.maxContinuousKw, 1)} kW max
             </span>
           </div>
           <div className="mt-1.5">
@@ -496,8 +506,7 @@ function CircuitNode({
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.editCircuit')}
             onClick={() => {
               setEditOpen(true);
@@ -507,8 +516,7 @@ function CircuitNode({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.assignStation')}
             onClick={() => {
               setAssignOpen(true);
@@ -518,8 +526,7 @@ function CircuitNode({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-sm"
             aria-label={t('loadManagement.deleteCircuit')}
             onClick={() => {
               setDeleteOpen(true);
@@ -543,12 +550,14 @@ function CircuitNode({
                 {station.isOnline ? 'Online' : 'Offline'}
               </Badge>
               {station.hasActiveSession && (
-                <span className="text-muted-foreground">{station.currentDrawKw.toFixed(1)} kW</span>
+                <span className="text-muted-foreground">
+                  {formatNumber(station.currentDrawKw, 1)} kW
+                </span>
               )}
               <Button
                 variant="ghost"
-                size="icon"
-                className="h-5 w-5 ml-auto"
+                size="icon-xs"
+                className="ml-auto"
                 aria-label={t('loadManagement.unassignStation')}
                 onClick={() => {
                   unassignMutation.mutate(station.id);
@@ -572,11 +581,10 @@ function CircuitNode({
       <div className="mt-2 pl-2">
         <Button
           variant="outline"
-          size="sm"
+          size="xs"
           onClick={() => {
             setAddLoadOpen(true);
           }}
-          className="text-xs h-6"
         >
           <Plus className="h-3 w-3" />
           {t('loadManagement.addUnmanagedLoad')}
@@ -643,6 +651,7 @@ function UnmanagedLoadItem({
   load: UnmanagedLoad;
   onRefresh: () => void;
 }): React.JSX.Element {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
 
   const deleteMutation = useMutation({
@@ -656,12 +665,11 @@ function UnmanagedLoadItem({
   return (
     <div className="flex items-center gap-2 text-xs">
       <span className="text-muted-foreground">{load.name}</span>
-      <span className="text-muted-foreground">({load.estimatedDrawKw.toFixed(1)} kW)</span>
+      <span className="text-muted-foreground">({formatNumber(load.estimatedDrawKw, 1)} kW)</span>
       <Button
         variant="ghost"
-        size="icon"
-        className="h-5 w-5"
-        aria-label="Remove"
+        size="icon-xs"
+        aria-label={t('loadManagement.deleteLoad', { name: load.name })}
         onClick={() => {
           deleteMutation.mutate();
         }}

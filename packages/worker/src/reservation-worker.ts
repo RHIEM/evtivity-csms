@@ -11,6 +11,51 @@ import { handleReservationActivate } from './handlers/reservation-activate.js';
 const log = createLogger('reservation-worker');
 
 /**
+ * Adds the delayed activation job of a scheduled reservation. One job per
+ * reservation (P7): every worker replica receives each pub/sub message, and
+ * the Redis recovery rebuilds the same job id from the database.
+ */
+export async function enqueueReservationActivation(
+  reservationQueue: Queue,
+  reservationDbId: string,
+  delayMs: number,
+): Promise<void> {
+  await reservationQueue.add(
+    'reservation-activate',
+    { reservationDbId },
+    {
+      jobId: `reservation-activate-${reservationDbId}`,
+      delay: delayMs,
+      attempts: 3,
+    },
+  );
+}
+
+let reservationQueue: Queue | null = null;
+
+/** Sets the reservation queue the expiry cron adds overdue activations to. Call once at startup. */
+export function setReservationQueue(queue: Queue | null): void {
+  reservationQueue = queue;
+}
+
+/**
+ * Adds the activation of a scheduled reservation whose start has passed
+ * (G6: the reservation_schedule message was lost), to run now. The job id is
+ * the one the bridge uses, so a job that already exists is not added again.
+ * A job that failed all its attempts (kept by BullMQ under that id, so an add
+ * is a no-op) is retried instead, so the row does not stay scheduled.
+ */
+export async function enqueueOverdueReservationActivation(reservationDbId: string): Promise<void> {
+  if (reservationQueue == null) throw new Error('Reservation queue is not set');
+  const existing = await reservationQueue.getJob(`reservation-activate-${reservationDbId}`);
+  if (existing != null && (await existing.isFailed())) {
+    await existing.retry();
+    return;
+  }
+  await enqueueReservationActivation(reservationQueue, reservationDbId, 0);
+}
+
+/**
  * Subscribes to the reservation_schedule pub/sub channel and enqueues delayed
  * BullMQ jobs that fire at the reservation's startsAt time.
  */
@@ -27,22 +72,14 @@ export async function startReservationBridge(
       return;
     }
 
-    void reservationQueue
-      .add(
-        'reservation-activate',
-        { reservationDbId: data.reservationDbId },
-        {
-          jobId: `reservation-activate-${data.reservationDbId}`,
-          delay: data.delayMs,
-          attempts: 3,
-        },
-      )
-      .catch((err: unknown) => {
+    enqueueReservationActivation(reservationQueue, data.reservationDbId, data.delayMs).catch(
+      (err: unknown) => {
         log.error(
           { err, reservationDbId: data.reservationDbId },
           'Failed to enqueue reservation-activate job',
         );
-      });
+      },
+    );
   });
 
   log.info('Reservation schedule bridge started');

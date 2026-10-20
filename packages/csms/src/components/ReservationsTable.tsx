@@ -100,7 +100,7 @@ export function ReservationsTable({
               setStatusFilter(e.target.value);
               setPage(1);
             }}
-            className="hidden h-9 sm:w-44 md:block"
+            className="hidden sm:w-44 md:block"
           >
             <option value="">{t('reservations.allStatuses')}</option>
             <option value="scheduled">{t('reservations.scheduled')}</option>
@@ -118,7 +118,7 @@ export function ReservationsTable({
                 setStatusFilter(e.target.value);
                 setPage(1);
               }}
-              className="h-9 sm:w-44"
+              className="sm:w-44"
             >
               <option value="">{t('reservations.allStatuses')}</option>
               <option value="scheduled">{t('reservations.scheduled')}</option>
@@ -172,7 +172,7 @@ export function ReservationsTable({
                       <TableCell className="whitespace-nowrap">
                         <Link
                           to={`/stations/${r.stationId}`}
-                          className="text-primary hover:underline"
+                          className="text-link hover:underline"
                           onClick={(e) => {
                             e.stopPropagation();
                           }}
@@ -187,7 +187,7 @@ export function ReservationsTable({
                       {r.driverFirstName != null ? (
                         <Link
                           to={`/drivers/${r.driverId ?? ''}`}
-                          className="text-primary hover:underline"
+                          className="text-link hover:underline"
                           onClick={(e) => {
                             e.stopPropagation();
                           }}
@@ -207,7 +207,7 @@ export function ReservationsTable({
                       {r.sessionId != null ? (
                         <Link
                           to={`/sessions/${r.sessionId}`}
-                          className="text-primary hover:underline"
+                          className="text-link hover:underline"
                           onClick={(e) => {
                             e.stopPropagation();
                           }}

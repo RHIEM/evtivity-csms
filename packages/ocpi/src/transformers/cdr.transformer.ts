@@ -1,27 +1,37 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { toIso3166Alpha3 } from '@evtivity/lib';
+import { toOcpiPrice } from '../lib/ocpi-price.js';
+import { ocpiCoordinate } from '../lib/geo-location.js';
+import type { OcpiCdrCost } from '../lib/ocpi-price.js';
+import { chargingPeriods, cdrToken, sessionTimes, whToKwh } from '../lib/charging-periods.js';
+import type { CdrTokenSource } from '../lib/charging-periods.js';
+import { ocpiAuthMethod } from './session.transformer.js';
 import type {
   OcpiCdr,
   OcpiCdrLocation,
-  OcpiCdrToken,
   OcpiChargingPeriod,
   OcpiTariff,
   OcpiVersion,
 } from '../types/ocpi.js';
+import type { Ocpi230Tariff } from '../types/ocpi-2.3.0.js';
 
 interface CdrInput {
   sessionId: string;
-  transactionId: string;
+  /** The OCPI Session id the CDR belongs to (the CPO session link's id). */
+  ocpiSessionId: string;
   startedAt: Date;
   endedAt: Date;
   energyDeliveredWh: string | null;
-  finalCostCents: number | null;
   currency: string;
+  /** Minutes the EV was connected without charging. */
+  idleMinutes: number;
 }
 
 interface CdrLocationInput {
-  siteId: string;
+  /** The OCPI location id (the published id, else the site id). */
+  locationId: string;
   siteName: string;
   address: string | null;
   city: string | null;
@@ -38,26 +48,26 @@ interface CdrLocationInput {
 
 interface CdrTransformInput {
   session: CdrInput;
+  /** The final cost split into net and tax, in total and per dimension (`ocpiCdrCost`). */
+  cost: OcpiCdrCost;
   location: CdrLocationInput;
   countryCode: string;
   partyId: string;
   cdrId: string;
-  tokenUid: string;
-  tokenCountryCode: string;
-  tokenPartyId: string;
-  tariff?: OcpiTariff;
-}
-
-function whToKwh(wh: string | null): number {
-  if (wh == null) return 0;
-  const parsed = parseFloat(wh);
-  if (isNaN(parsed)) return 0;
-  return Math.round((parsed / 1000) * 10000) / 10000;
-}
-
-function centsToCost(cents: number | null): number {
-  if (cents == null) return 0;
-  return cents / 100;
+  /** When the CDR is created: its last_updated (a CDR never changes). */
+  issuedAt: Date;
+  token: CdrTokenSource;
+  /** `ocpi_roaming_sessions.auth_method` (see the session transformer). */
+  authMethod?: string | null;
+  /** The eMSP's authorization_reference from the StartSession. */
+  authorizationReference?: string | null;
+  /** The tariffs the session was billed with (its price snapshots), as the partner sees them. */
+  tariffs?: Array<OcpiTariff | Ocpi230Tariff>;
+  /**
+   * The charging periods per priced part (cdrChargingPeriods). Without them,
+   * one period with the session's energy and charging time, and its parking.
+   */
+  chargingPeriods?: OcpiChargingPeriod[];
 }
 
 function mapConnectorStandard(
@@ -93,29 +103,26 @@ export function transformCdr(input: CdrTransformInput, version: OcpiVersion): Oc
   const { session, location, countryCode, partyId, cdrId } = input;
 
   const totalEnergy = whToKwh(session.energyDeliveredWh);
-  const totalCost = centsToCost(session.finalCostCents);
   const currency = session.currency;
 
-  const durationMs = session.endedAt.getTime() - session.startedAt.getTime();
-  const totalTimeHours = Math.round((durationMs / 3600000) * 10000) / 10000;
-
-  const cdrToken: OcpiCdrToken = {
-    country_code: input.tokenCountryCode,
-    party_id: input.tokenPartyId,
-    uid: input.tokenUid,
-    type: 'RFID',
-    contract_id: input.tokenUid,
+  const volumes = {
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    kwh: totalEnergy,
+    idleMinutes: session.idleMinutes,
   };
+  const times = sessionTimes(volumes);
 
   const cdrLocation: OcpiCdrLocation = {
-    id: location.siteId,
+    id: location.locationId,
     name: location.siteName,
     address: location.address ?? 'Unknown',
     city: location.city ?? 'Unknown',
-    country: location.country ?? 'US',
+    // ISO 3166-1 alpha-3 (10.4.4 CdrLocation); the operator's country when unknown.
+    country: toIso3166Alpha3(location.country) ?? toIso3166Alpha3(countryCode) ?? 'USA',
     coordinates: {
-      latitude: location.latitude ?? '0',
-      longitude: location.longitude ?? '0',
+      latitude: ocpiCoordinate(location.latitude ?? '0'),
+      longitude: ocpiCoordinate(location.longitude ?? '0'),
     },
     evse_uid: location.evseUid,
     evse_id: location.evseId,
@@ -132,40 +139,42 @@ export function transformCdr(input: CdrTransformInput, version: OcpiVersion): Oc
     cdrLocation.state = location.state;
   }
 
-  const chargingPeriods: OcpiChargingPeriod[] = [
-    {
-      start_date_time: session.startedAt.toISOString(),
-      dimensions: [
-        { type: 'ENERGY', volume: totalEnergy },
-        { type: 'TIME', volume: totalTimeHours },
-      ],
-    },
-  ];
-
   const cdr: OcpiCdr = {
     country_code: countryCode,
     party_id: partyId,
     id: cdrId,
     start_date_time: session.startedAt.toISOString(),
     end_date_time: session.endedAt.toISOString(),
-    session_id: session.transactionId,
-    cdr_token: cdrToken,
-    auth_method: 'AUTH_REQUEST',
+    session_id: session.ocpiSessionId,
+    cdr_token: cdrToken(input.token),
+    auth_method: ocpiAuthMethod(input.authMethod),
+    ...(input.authorizationReference != null
+      ? { authorization_reference: input.authorizationReference }
+      : {}),
     cdr_location: cdrLocation,
     currency,
-    charging_periods: chargingPeriods,
-    total_cost: { excl_vat: totalCost },
+    charging_periods: input.chargingPeriods ?? chargingPeriods(volumes),
+    total_cost: toOcpiPrice(input.cost.total, version),
     total_energy: totalEnergy,
-    total_time: totalTimeHours,
-    last_updated: session.endedAt.toISOString(),
+    total_time: times.totalHours,
+    last_updated: input.issuedAt.toISOString(),
   };
 
-  if (input.tariff != null) {
-    cdr.tariffs = [input.tariff];
+  // Dimension costs (all Price, optional): fixed is the session fee, time the
+  // time price while charging, parking the time price while idle plus the
+  // idle fee, reservation the reservation holding fee.
+  const { cost } = input;
+  if (cost.fixed != null) cdr.total_fixed_cost = toOcpiPrice(cost.fixed, version);
+  if (cost.energy != null) cdr.total_energy_cost = toOcpiPrice(cost.energy, version);
+  if (cost.time != null) cdr.total_time_cost = toOcpiPrice(cost.time, version);
+  if (times.parkingHours > 0) cdr.total_parking_time = times.parkingHours;
+  if (cost.parking != null) cdr.total_parking_cost = toOcpiPrice(cost.parking, version);
+  if (cost.reservation != null) {
+    cdr.total_reservation_cost = toOcpiPrice(cost.reservation, version);
   }
 
-  if (version === '2.3.0') {
-    // 2.3.0-specific CDR fields (AFIR, parking, NA tax) will be added here
+  if (input.tariffs != null && input.tariffs.length > 0) {
+    cdr.tariffs = input.tariffs as OcpiTariff[];
   }
 
   return cdr;

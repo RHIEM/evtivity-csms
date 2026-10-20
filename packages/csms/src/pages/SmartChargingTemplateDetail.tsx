@@ -14,6 +14,7 @@ import { SaveButton } from '@/components/save-button';
 import { CancelButton } from '@/components/cancel-button';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CopyButton } from '@/components/ui/copy-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -37,7 +38,10 @@ import { api, getApiErrorCode } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatDateTime } from '@/lib/timezone';
 import { useUserTimezone } from '@/lib/timezone';
+import { fromDatetimeLocalInTimezone, toDatetimeLocalInTimezone } from '@/lib/schedule-anchor';
 import { LoadingLogo } from '@/components/loading-logo';
+import { uiLocale } from '@/lib/formatting';
+import { useHasAllSiteAccess } from '@/lib/auth';
 
 type OcppVersion = '2.1' | '1.6';
 
@@ -48,7 +52,9 @@ const PURPOSES_21 = [
   'LocalGeneration',
 ];
 
-const PURPOSES_16 = ['ChargePointMaxProfile', 'TxDefaultProfile'];
+// Templates store the 2.1 purpose names; the OCPP server sends
+// ChargingStationMaxProfile to a 1.6 station as ChargePointMaxProfile.
+const PURPOSES_16 = ['ChargingStationMaxProfile', 'TxDefaultProfile'];
 
 interface TemplateDetail {
   id: string;
@@ -108,7 +114,7 @@ function formatPeriodStart(
 ): string {
   if (startSchedule == null) return secondsToTimeString(startPeriodSec);
   const ms = new Date(startSchedule).getTime() + startPeriodSec * 1000;
-  return new Date(ms).toLocaleString('en-US', {
+  return new Date(ms).toLocaleString(uiLocale(), {
     timeZone: timezone,
     hour: 'numeric',
     minute: '2-digit',
@@ -143,6 +149,7 @@ function buildSetChargingProfilePayload(template: TemplateDetail): Record<string
 
 export function SmartChargingTemplateDetail(): React.JSX.Element {
   const { t } = useTranslation();
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const timezone = useUserTimezone();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -173,8 +180,8 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
   const [duplicateOpen, setDuplicateOpen] = useState(false);
   const [pushOpen, setPushOpen] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
-  const [pushHistoryPage, setPushHistoryPage] = useState(1);
-  const pushHistoryLimit = 10;
+  const [pushesPage, setPushesPage] = useState(1);
+  const pushesLimit = 10;
 
   const { data: template, isLoading } = useQuery({
     queryKey: ['smart-charging-templates', id],
@@ -187,14 +194,16 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
     queryFn: () => api.get<FilterOptions>('/v1/smart-charging/filter-options'),
   });
 
-  const { data: pushHistory } = useQuery({
-    queryKey: ['smart-charging-templates', id, 'pushes', pushHistoryPage],
+  const { data: pushes } = useQuery({
+    queryKey: ['smart-charging-templates', id, 'pushes', pushesPage],
     queryFn: () =>
       api.get<{ data: PushRecord[]; total: number }>(
-        `/v1/smart-charging/templates/${id ?? ''}/pushes?page=${String(pushHistoryPage)}&limit=${String(pushHistoryLimit)}`,
+        `/v1/smart-charging/templates/${id ?? ''}/pushes?page=${String(pushesPage)}&limit=${String(pushesLimit)}`,
       ),
     enabled: id != null,
-    refetchInterval: 5000,
+    // Poll only while an operation on this page is still running.
+    refetchInterval: (query) =>
+      query.state.data?.data.some((p) => p.status === 'active') === true ? 5000 : false,
   });
 
   const updateMutation = useMutation({
@@ -263,16 +272,21 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
   function getValidationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
     if (!editName.trim()) errors.editName = t('validation.required');
+    // Absolute and Recurring profiles both need a start (OCPP 2.1 K01.FR.40).
+    if (!editStartSchedule) errors.editStartSchedule = t('validation.required');
     return errors;
   }
 
   const validationErrors = getValidationErrors();
 
+  // The form shows and reads dates in the user's timezone, like the create page.
   function formatDatetimeLocal(iso: string | null): string {
     if (iso == null) return '';
-    const d = new Date(iso);
-    const pad = (n: number): string => String(n).padStart(2, '0');
-    return `${String(d.getFullYear())}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return toDatetimeLocalInTimezone(new Date(iso), timezone);
+  }
+
+  function datetimeLocalToIso(value: string): string {
+    return fromDatetimeLocalInTimezone(value, timezone).toISOString();
   }
 
   function startEdit(): void {
@@ -321,6 +335,10 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
       template.targetFilter.vendorId != null ||
       template.targetFilter.model != null);
 
+  // A template without a site targets every site: only all-site users manage
+  // it (the API answers others 404).
+  const canManageTemplate = hasAllSiteAccess || template.targetFilter?.siteId != null;
+
   const editPurposes = editOcppVersion === '1.6' ? PURPOSES_16 : PURPOSES_21;
 
   return (
@@ -341,48 +359,50 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
       <Card>
         <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle>{t('common.details')}</CardTitle>
-          <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-            {!editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
-            {!editing && (
+          {canManageTemplate && (
+            <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
+              {!editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
+              {!editing && (
+                <Button
+                  variant="outline"
+                  className="gap-1.5"
+                  disabled={duplicateMutation.isPending}
+                  onClick={() => {
+                    setDuplicateOpen(true);
+                  }}
+                >
+                  <Copy className="h-4 w-4" />
+                  {t('common.duplicate')}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 className="gap-1.5"
-                disabled={duplicateMutation.isPending}
                 onClick={() => {
-                  setDuplicateOpen(true);
+                  setPushOpen(true);
                 }}
               >
-                <Copy className="h-4 w-4" />
-                {t('common.duplicate')}
+                <Upload className="h-4 w-4" />
+                {t('smartCharging.push')}
               </Button>
-            )}
-            <Button
-              variant="outline"
-              className="gap-1.5"
-              onClick={() => {
-                setPushOpen(true);
-              }}
-            >
-              <Upload className="h-4 w-4" />
-              {t('smartCharging.push')}
-            </Button>
-            <Button
-              variant="outline"
-              className="gap-1.5 text-destructive hover:text-destructive"
-              onClick={() => {
-                setClearOpen(true);
-              }}
-            >
-              <Eraser className="h-4 w-4" />
-              {t('smartCharging.clearFromStations')}
-            </Button>
-            <RemoveButton
-              label={t('common.delete')}
-              onClick={() => {
-                setDeleteOpen(true);
-              }}
-            />
-          </div>
+              <Button
+                variant="outline"
+                className="gap-1.5 text-destructive hover:text-destructive"
+                onClick={() => {
+                  setClearOpen(true);
+                }}
+              >
+                <Eraser className="h-4 w-4" />
+                {t('smartCharging.clearFromStations')}
+              </Button>
+              <RemoveButton
+                label={t('common.delete')}
+                onClick={() => {
+                  setDeleteOpen(true);
+                }}
+              />
+            </div>
+          )}
         </CardHeader>
         <CardContent>
           {editing ? (
@@ -408,14 +428,13 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
                 else body.description = null;
                 if (editKind === 'Recurring') body.recurrencyKind = editRecurrency;
                 else body.recurrencyKind = null;
-                if (editStartSchedule)
-                  body.startSchedule = new Date(editStartSchedule).toISOString();
+                if (editStartSchedule) body.startSchedule = datetimeLocalToIso(editStartSchedule);
                 else body.startSchedule = null;
                 if (editDuration) body.duration = parseInt(editDuration, 10);
                 else body.duration = null;
-                if (editValidFrom) body.validFrom = new Date(editValidFrom).toISOString();
+                if (editValidFrom) body.validFrom = datetimeLocalToIso(editValidFrom);
                 else body.validFrom = null;
-                if (editValidTo) body.validTo = new Date(editValidTo).toISOString();
+                if (editValidTo) body.validTo = datetimeLocalToIso(editValidTo);
                 else body.validTo = null;
                 const filter: Record<string, string> = {};
                 if (editFilterSiteId) filter.siteId = editFilterSiteId;
@@ -620,7 +639,13 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
                     onChange={(e) => {
                       setEditStartSchedule(e.target.value);
                     }}
+                    className={
+                      hasSubmitted && validationErrors.editStartSchedule ? 'border-destructive' : ''
+                    }
                   />
+                  {hasSubmitted && validationErrors.editStartSchedule && (
+                    <p className="text-sm text-destructive">{validationErrors.editStartSchedule}</p>
+                  )}
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="scd-edit-valid-from">{t('smartCharging.validFrom')}</Label>
@@ -663,7 +688,7 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
                 periods={editPeriods}
                 onChange={setEditPeriods}
                 rateUnit={editRateUnit}
-                startSchedule={editStartSchedule ? new Date(editStartSchedule).toISOString() : null}
+                startSchedule={editStartSchedule ? datetimeLocalToIso(editStartSchedule) : null}
                 timezone={timezone}
               />
 
@@ -908,18 +933,10 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
         <Card>
           <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <CardTitle>{t('smartCharging.rawProfile')}</CardTitle>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                void navigator.clipboard.writeText(
-                  JSON.stringify(buildSetChargingProfilePayload(template), null, 2),
-                );
-              }}
-            >
-              <Copy className="h-4 w-4" />
-              {t('common.copy')}
-            </Button>
+            <CopyButton
+              value={JSON.stringify(buildSetChargingProfilePayload(template), null, 2)}
+              text={t('common.copy')}
+            />
           </CardHeader>
           <CardContent>
             <pre className="overflow-x-auto rounded-md bg-muted p-4 text-xs font-mono">
@@ -931,10 +948,10 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('smartCharging.pushHistory')}</CardTitle>
+          <CardTitle>{t('smartCharging.pushes')}</CardTitle>
         </CardHeader>
         <CardContent>
-          {(pushHistory?.total ?? 0) === 0 ? (
+          {(pushes?.total ?? 0) === 0 ? (
             <p className="text-center text-sm text-muted-foreground">
               {t('smartCharging.noPushes')}
             </p>
@@ -954,7 +971,7 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pushHistory?.data.map((push) => (
+                    {pushes?.data.map((push) => (
                       <TableRow
                         key={push.id}
                         className="cursor-pointer"
@@ -1000,9 +1017,9 @@ export function SmartChargingTemplateDetail(): React.JSX.Element {
                 </Table>
               </div>
               <Pagination
-                page={pushHistoryPage}
-                totalPages={Math.ceil((pushHistory?.total ?? 0) / pushHistoryLimit)}
-                onPageChange={setPushHistoryPage}
+                page={pushesPage}
+                totalPages={Math.ceil((pushes?.total ?? 0) / pushesLimit)}
+                onPageChange={setPushesPage}
               />
             </>
           )}

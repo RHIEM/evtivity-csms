@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { CsTestCase, StepResult } from '../../../../cs-types.js';
-import { waitForChargingState } from '../../../../cs-test-helpers.js';
+import {
+  collectMessages,
+  waitForChargingState,
+  waitForTransactionEventAfterQueue,
+} from '../../../../cs-test-helpers.js';
 
 function makeDefaultHandler(authStatus: string = 'Accepted') {
   return async (action: string): Promise<Record<string, unknown>> => {
@@ -110,11 +114,8 @@ export const TC_C_09_CS: CsTestCase = {
 
     // Station should NOT start a transaction
     let txReceived = false;
-    try {
-      await ctx.server.waitForMessage('TransactionEvent', 5000);
+    if ((await ctx.server.waitForMessageOrNull('TransactionEvent', 5000)) != null) {
       txReceived = true;
-    } catch {
-      // Expected
     }
     steps.push({
       step: 2,
@@ -170,11 +171,8 @@ export const TC_C_10_CS: CsTestCase = {
     });
 
     let txReceived = false;
-    try {
-      await ctx.server.waitForMessage('TransactionEvent', 5000);
+    if ((await ctx.server.waitForMessageOrNull('TransactionEvent', 5000)) != null) {
       txReceived = true;
-    } catch {
-      // Expected
     }
     steps.push({
       step: 2,
@@ -230,11 +228,8 @@ export const TC_C_11_CS: CsTestCase = {
     });
 
     let txReceived = false;
-    try {
-      await ctx.server.waitForMessage('TransactionEvent', 5000);
+    if ((await ctx.server.waitForMessageOrNull('TransactionEvent', 5000)) != null) {
       txReceived = true;
-    } catch {
-      // Expected
     }
     steps.push({
       step: 2,
@@ -409,15 +404,12 @@ export const TC_C_14_CS: CsTestCase = {
     let stopAuthorized = false;
     let lastTrigger = '';
     for (let i = 0; i < 10; i++) {
-      try {
-        const tx = await ctx.server.waitForMessage('TransactionEvent', 5000);
-        const trigger = tx['triggerReason'] as string | undefined;
-        lastTrigger = String(trigger);
-        if (trigger === 'StopAuthorized') {
-          stopAuthorized = true;
-          break;
-        }
-      } catch {
+      const tx = await ctx.server.waitForMessageOrNull('TransactionEvent', 5000);
+      if (tx == null) break;
+      const trigger = tx['triggerReason'] as string | undefined;
+      lastTrigger = String(trigger);
+      if (trigger === 'StopAuthorized') {
+        stopAuthorized = true;
         break;
       }
     }
@@ -510,18 +502,12 @@ export const TC_C_15_CS: CsTestCase = {
 
     // Step 4: CSMS responds with Invalid (handled by message handler)
     // Validate: no Deauthorized or SuspendedEVSE (StopTxOnInvalidId=false, MaxEnergyOnInvalidId>0)
-    let deauthorized = false;
-    try {
-      const txNext = await ctx.server.waitForMessage('TransactionEvent', 5000);
-      const nextTrigger = txNext['triggerReason'] as string | undefined;
-      const nextTxInfo = txNext['transactionInfo'] as Record<string, unknown> | undefined;
-      const chargingState = nextTxInfo?.['chargingState'] as string | undefined;
-      if (nextTrigger === 'Deauthorized' || chargingState === 'SuspendedEVSE') {
-        deauthorized = true;
-      }
-    } catch {
-      // Expected: no deauthorization
-    }
+    // Every TransactionEvent of the next seconds (queue and live) is checked.
+    const following = await collectMessages(ctx.server, 'TransactionEvent', 5000, 8000);
+    const deauthorized = following.some((m) => {
+      const info = m['transactionInfo'] as Record<string, unknown> | undefined;
+      return m['triggerReason'] === 'Deauthorized' || info?.['chargingState'] === 'SuspendedEVSE';
+    });
     steps.push({
       step: 4,
       description:
@@ -606,8 +592,8 @@ export const TC_C_16_CS: CsTestCase = {
       actual: `received: ${tx != null}`,
     });
 
-    // Step 5: Station sends Deauthorized after CSMS returns Invalid
-    const txDeauth = await ctx.server.waitForMessage('TransactionEvent', 10000);
+    // Step 5: after emptying its queue, the station sends Deauthorized
+    const txDeauth = await waitForTransactionEventAfterQueue(ctx.server, 10000);
     const deauthTrigger = txDeauth['triggerReason'] as string | undefined;
     steps.push({
       step: 5,
@@ -693,16 +679,9 @@ export const TC_C_17_CS: CsTestCase = {
     });
 
     // Validate: no Deauthorized trigger (StopTxOnInvalidId=false means suspend, not stop)
-    let deauthorized = false;
-    try {
-      const txNext = await ctx.server.waitForMessage('TransactionEvent', 5000);
-      const nextTrigger = txNext['triggerReason'] as string | undefined;
-      if (nextTrigger === 'Deauthorized') {
-        deauthorized = true;
-      }
-    } catch {
-      // Expected
-    }
+    // Every TransactionEvent of the next seconds (queue and live) is checked.
+    const following = await collectMessages(ctx.server, 'TransactionEvent', 5000, 8000);
+    const deauthorized = following.some((m) => m['triggerReason'] === 'Deauthorized');
     steps.push({
       step: 3,
       description: 'Station does NOT send Deauthorized (StopTxOnInvalidId=false, suspends instead)',
@@ -787,8 +766,8 @@ export const TC_C_18_CS: CsTestCase = {
       actual: `received: ${tx != null}`,
     });
 
-    // Step 5: Station sends Deauthorized
-    const txDeauth = await ctx.server.waitForMessage('TransactionEvent', 10000);
+    // Step 5: after emptying its queue, the station sends Deauthorized
+    const txDeauth = await waitForTransactionEventAfterQueue(ctx.server, 10000);
     const trigger = txDeauth['triggerReason'] as string | undefined;
     steps.push({
       step: 5,
@@ -849,11 +828,8 @@ export const TC_C_57_CS: CsTestCase = {
 
     // Station should NOT send AuthorizeRequest (DisablePostAuthorize = true)
     let authReceived = false;
-    try {
-      await ctx.server.waitForMessage('Authorize', 5000);
+    if ((await ctx.server.waitForMessageOrNull('Authorize', 5000)) != null) {
       authReceived = true;
-    } catch {
-      // Expected: no AuthorizeRequest
     }
     steps.push({
       step: 3,
@@ -865,13 +841,11 @@ export const TC_C_57_CS: CsTestCase = {
 
     // Station should NOT start charging
     let txStarted = false;
-    try {
-      const tx = await ctx.server.waitForMessage('TransactionEvent', 5000);
+    const tx = await ctx.server.waitForMessageOrNull('TransactionEvent', 5000);
+    if (tx != null) {
       const txInfo = tx['transactionInfo'] as Record<string, unknown> | undefined;
       const chargingState = txInfo?.['chargingState'] as string | undefined;
       if (chargingState === 'Charging') txStarted = true;
-    } catch {
-      // Expected
     }
     steps.push({
       step: 5,

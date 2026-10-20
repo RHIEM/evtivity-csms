@@ -57,7 +57,20 @@ vi.mock('../middleware/rbac.js', () => ({
     },
 }));
 
+const { mockActivePaymentProvider } = vi.hoisted(() => ({
+  mockActivePaymentProvider: vi.fn(),
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: mockActivePaymentProvider,
+}));
+
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
+
 import { registerAuth } from '../plugins/auth.js';
+import { resetSiteAccessMock, setMockUserSiteIds } from './helpers/site-access-mock.js';
 import { systemRoutes } from '../routes/system.js';
 
 const VALID_USER_ID = 'usr_000000000001';
@@ -74,7 +87,6 @@ async function buildApp(): Promise<FastifyInstance> {
 describe('System routes', () => {
   let app: FastifyInstance;
   let token: string;
-  const savedEnv: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
     app = await buildApp();
@@ -86,22 +98,54 @@ describe('System routes', () => {
   });
 
   beforeEach(() => {
+    resetSiteAccessMock();
     setupDbResults();
-    savedEnv['SMTP_HOST'] = process.env['SMTP_HOST'];
-    delete process.env['SMTP_HOST'];
+    mockActivePaymentProvider.mockReset();
+    mockActivePaymentProvider.mockResolvedValue(null);
+    vi.stubEnv('SMTP_HOST', undefined);
+    vi.stubEnv('BIND_IP', undefined);
   });
 
   afterEach(() => {
-    if (savedEnv['SMTP_HOST'] == null) {
-      delete process.env['SMTP_HOST'];
-    } else {
-      process.env['SMTP_HOST'] = savedEnv['SMTP_HOST'];
-    }
+    vi.unstubAllEnvs();
+  });
+
+  it('reports the Docker Compose bind address from BIND_IP', async () => {
+    vi.stubEnv('BIND_IP', '192.168.1.234');
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().network.bindIp).toBe('192.168.1.234');
+  });
+
+  it('reports no bind address outside Docker Compose', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().network.bindIp).toBeNull();
   });
 
   it('GET /system/info returns 401 without auth', async () => {
     const response = await app.inject({ method: 'GET', url: '/system/info' });
     expect(response.statusCode).toBe(401);
+  });
+
+  it('GET /system/info answers 404 SETTING_NOT_FOUND to a site-restricted user', async () => {
+    setMockUserSiteIds(['sit_a']);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: 'Setting not found', code: 'SETTING_NOT_FOUND' });
+    expect(mockActivePaymentProvider).not.toHaveBeenCalled();
   });
 
   it('reports integrations as not configured when no settings rows exist', async () => {
@@ -114,6 +158,8 @@ describe('System routes', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.secrets.stripeConfigured).toBe(false);
+    expect(body.secrets.adyenConfigured).toBe(false);
+    expect(body.payments).toEqual({ provider: 'none', configured: false });
     expect(body.secrets.smtpConfigured).toBe(false);
     expect(body.secrets.twilioConfigured).toBe(false);
     expect(body.secrets.s3Configured).toBe(false);
@@ -124,7 +170,9 @@ describe('System routes', () => {
 
   it('reports integrations as configured from settings rows', async () => {
     setupDbResults([
+      { key: 'payments.provider', value: 'stripe' },
       { key: 'stripe.secretKeyEnc', value: 'ciphertext' },
+      { key: 'adyen.apiKeyEnc', value: 'ciphertext' },
       { key: 'smtp.host', value: 'smtp.example.com' },
       { key: 'twilio.accountSid', value: 'AC123' },
       { key: 's3.bucket', value: 'attachments' },
@@ -132,6 +180,7 @@ describe('System routes', () => {
       { key: 'pnc.hubject.baseUrl', value: 'https://hubject.example.com' },
       { key: 'googleMaps.apiKeyEnc', value: 'ciphertext' },
     ]);
+    mockActivePaymentProvider.mockResolvedValue({ id: 'stripe' });
     const response = await app.inject({
       method: 'GET',
       url: '/system/info',
@@ -140,6 +189,8 @@ describe('System routes', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.secrets.stripeConfigured).toBe(true);
+    expect(body.secrets.adyenConfigured).toBe(true);
+    expect(body.payments).toEqual({ provider: 'stripe', configured: true });
     expect(body.secrets.smtpConfigured).toBe(true);
     expect(body.secrets.twilioConfigured).toBe(true);
     expect(body.secrets.s3Configured).toBe(true);
@@ -165,7 +216,7 @@ describe('System routes', () => {
   });
 
   it('honors the SMTP_HOST env override when the setting is absent', async () => {
-    process.env['SMTP_HOST'] = 'mailpit';
+    vi.stubEnv('SMTP_HOST', 'mailpit');
     setupDbResults([]);
     const response = await app.inject({
       method: 'GET',
@@ -175,5 +226,16 @@ describe('System routes', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.secrets.smtpConfigured).toBe(true);
+  });
+
+  it('reports a selected provider that is not usable as not configured', async () => {
+    setupDbResults([{ key: 'payments.provider', value: 'adyen' }]);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().payments).toEqual({ provider: 'adyen', configured: false });
   });
 });

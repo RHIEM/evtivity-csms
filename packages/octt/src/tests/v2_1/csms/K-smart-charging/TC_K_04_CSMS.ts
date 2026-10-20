@@ -1,17 +1,11 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import type { StepResult, TestCase, TestContext } from '../../../../types.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
-async function boot(ctx: {
-  client: {
-    sendCall: (
-      action: string,
-      payload: Record<string, unknown>,
-    ) => Promise<Record<string, unknown>>;
-  };
-}) {
+async function boot(ctx: TestContext) {
   await ctx.client.sendCall('BootNotification', {
     chargingStation: { model: 'OCTT-Virtual', vendorName: 'OCTT' },
     reason: 'PowerUp',
@@ -24,15 +18,8 @@ async function boot(ctx: {
   });
 }
 
-async function startTx(ctx: {
-  client: {
-    sendCall: (
-      action: string,
-      payload: Record<string, unknown>,
-    ) => Promise<Record<string, unknown>>;
-  };
-}) {
-  const txId = `OCTT-TX-${String(Date.now())}`;
+async function startTx(ctx: TestContext) {
+  const txId = newTransactionId('OCTT-TX');
   await ctx.client.sendCall('TransactionEvent', {
     eventType: 'Started',
     timestamp: new Date().toISOString(),
@@ -40,7 +27,7 @@ async function startTx(ctx: {
     seqNo: 0,
     transactionInfo: { transactionId: txId, chargingState: 'Charging' },
     evse: { id: 1, connectorId: 1 },
-    idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+    idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
   });
   return txId;
 }
@@ -85,7 +72,7 @@ export const TC_K_04_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -182,7 +169,7 @@ export const TC_K_70_CSMS: TestCase = {
           }
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -280,7 +267,7 @@ export const TC_K_118_CSMS: TestCase = {
           activateValue = payload['activate'] as boolean;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -331,13 +318,13 @@ export const TC_K_118_CSMS: TestCase = {
         resp3,
         'NotifyPriorityChargingResponse received',
       );
-    } catch {
+    } catch (err) {
       steps.push({
         step: 3,
         description: 'Send NotifyPriorityChargingRequest with activated = true',
         status: 'failed',
         expected: 'NotifyPriorityChargingResponse received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
@@ -377,7 +364,7 @@ export const TC_K_121_CSMS: TestCase = {
           dynamicProfileId = profile?.['id'] as number | null;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -430,13 +417,13 @@ export const TC_K_121_CSMS: TestCase = {
         'PullDynamicScheduleUpdateResponse received',
         `Response keys: ${Object.keys(pullRes1).join(', ')}`,
       );
-    } catch {
+    } catch (err) {
       steps.push({
         step: 2,
         description: 'Send PullDynamicScheduleUpdate with unknown chargingProfileId',
         status: 'failed',
         expected: 'PullDynamicScheduleUpdateResponse received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
@@ -453,13 +440,13 @@ export const TC_K_121_CSMS: TestCase = {
         'PullDynamicScheduleUpdateResponse with schedule data',
         `Response keys: ${Object.keys(pullRes2).join(', ')}`,
       );
-    } catch {
+    } catch (err) {
       steps.push({
         step: 3,
         description: 'Send PullDynamicScheduleUpdate with correct chargingProfileId',
         status: 'failed',
         expected: 'PullDynamicScheduleUpdateResponse received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 

@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../../types.js';
 import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 export const TC_N_25_CSMS: TestCase = {
   id: 'TC_N_25_CSMS',
@@ -27,7 +28,7 @@ export const TC_N_25_CSMS: TestCase = {
           requestId = (payload['requestId'] as number) ?? 0;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {
@@ -61,13 +62,13 @@ export const TC_N_25_CSMS: TestCase = {
           expected: 'Response received',
           actual: resp52 != null ? 'Response received' : 'No response',
         });
-      } catch {
+      } catch (err) {
         steps.push({
           step: steps.length + 1,
           description: `Send LogStatusNotification ${logStatus}`,
           status: 'failed',
           expected: 'Response received',
-          actual: 'Error',
+          actual: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -94,13 +95,15 @@ export const TC_N_34_CSMS: TestCase = {
       reason: 'PowerUp',
     });
     let received = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'GetLog') {
-        received = true;
-        return { status: 'Rejected' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'GetLog') {
+          received = true;
+          return { status: 'Rejected' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'GetLog', {
         stationId: ctx.stationId,
@@ -149,7 +152,7 @@ export const TC_N_35_CSMS: TestCase = {
           logType = (payload['logType'] as string) ?? '';
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
     if (ctx.triggerCommand != null) {
@@ -192,13 +195,15 @@ export const TC_N_36_CSMS: TestCase = {
       reason: 'PowerUp',
     });
     let logRequestCount = 0;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'GetLog') {
-        logRequestCount++;
-        return { status: logRequestCount === 1 ? 'Accepted' : 'AcceptedCanceled' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'GetLog') {
+          logRequestCount++;
+          return { status: logRequestCount === 1 ? 'Accepted' : 'AcceptedCanceled' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'GetLog', {
         stationId: ctx.stationId,
@@ -276,13 +281,13 @@ export const TC_N_100_CSMS: TestCase = {
         ],
       });
       pushSendAckStep(steps, 1, 'Send NotifyEventRequest with trigger Periodic', resp1);
-    } catch {
+    } catch (err) {
       steps.push({
         step: 1,
         description: 'Send NotifyEventRequest',
         status: 'failed',
         expected: 'Response received',
-        actual: 'Error',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
     return {
@@ -308,13 +313,15 @@ export const TC_N_102_CSMS: TestCase = {
       reason: 'PowerUp',
     });
     let received = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'GetLog') {
-        received = true;
-        return { status: 'Accepted' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'GetLog') {
+          received = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'GetLog', {
         stationId: ctx.stationId,
@@ -355,13 +362,15 @@ export const TC_N_102_2_CSMS: TestCase = {
       reason: 'PowerUp',
     });
     let received = false;
-    ctx.client.setIncomingCallHandler(async (_mid: string, action: string) => {
-      if (action === 'GetLog') {
-        received = true;
-        return { status: 'Accepted' };
-      }
-      return {};
-    });
+    ctx.client.setIncomingCallHandler(
+      async (_mid: string, action: string, payload: Record<string, unknown>) => {
+        if (action === 'GetLog') {
+          received = true;
+          return { status: 'Accepted' };
+        }
+        return defaultReply('ocpp2.1', action, payload);
+      },
+    );
     if (ctx.triggerCommand != null) {
       await ctx.triggerCommand('v21', 'GetLog', {
         stationId: ctx.stationId,

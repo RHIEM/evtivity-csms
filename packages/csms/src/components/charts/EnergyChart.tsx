@@ -7,18 +7,28 @@ import type { ApexOptions } from 'apexcharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { useTranslation } from 'react-i18next';
+import { ChartBody, type QueryState } from './ChartBody';
 import { useAuth } from '@/lib/auth';
 import { CHART_COLORS, getGridColor, formatChartDateLabel } from '@/lib/chart-theme';
+import { formatNumber } from '@/lib/formatting';
 
 interface EnergyChartProps {
   data: { date: string; energyWh: number }[];
   title?: string;
   actions?: React.ReactNode;
   info?: string;
+  /** The state of the query behind the chart; omitted, the chart shows as given. */
+  state?: QueryState;
 }
 
-export function EnergyChart({ data, title, actions, info }: EnergyChartProps): React.JSX.Element {
-  const { t } = useTranslation();
+export function EnergyChart({
+  data,
+  title,
+  actions,
+  info,
+  state,
+}: EnergyChartProps): React.JSX.Element {
+  const { t, i18n } = useTranslation();
   const isDark = useAuth((s) => s.theme) === 'dark';
   const resolvedTitle = title ?? t('charts.energyDelivered');
   const options = useMemo<ApexOptions>(
@@ -46,12 +56,13 @@ export function EnergyChart({ data, title, actions, info }: EnergyChartProps): R
       yaxis: {
         title: { text: t('charts.kWh') },
         labels: {
-          formatter: (val: number) => (val / 1000).toFixed(1),
+          formatter: (val: number) => formatNumber(val / 1000, 1),
         },
       },
       tooltip: {
         y: {
-          formatter: (val: number) => t('charts.energyValue', { value: (val / 1000).toFixed(2) }),
+          formatter: (val: number) =>
+            t('charts.energyValue', { value: formatNumber(val / 1000, 2) }),
         },
       },
       colors: [CHART_COLORS.primary],
@@ -64,7 +75,7 @@ export function EnergyChart({ data, title, actions, info }: EnergyChartProps): R
         },
       ],
     }),
-    [isDark, data, t],
+    [isDark, data, t, i18n.language],
   );
 
   const series = useMemo(
@@ -82,7 +93,9 @@ export function EnergyChart({ data, title, actions, info }: EnergyChartProps): R
         {actions}
       </CardHeader>
       <CardContent>
-        <ReactApexChart options={options} series={series} type="line" height={300} />
+        <ChartBody state={state} isEmpty={data.length === 0} emptyText={t('charts.noEnergyData')}>
+          <ReactApexChart options={options} series={series} type="line" height={300} />
+        </ChartBody>
       </CardContent>
     </Card>
   );

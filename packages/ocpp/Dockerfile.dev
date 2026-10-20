@@ -1,12 +1,20 @@
 FROM node:24-slim
+# A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
+COPY packages/payments/package.json packages/payments/
+COPY packages/services/package.json packages/services/
+COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
 COPY packages/ocpp/package.json packages/ocpp/
+COPY packages/v2g-exi/package.json packages/v2g-exi/
 COPY packages/ocpi/package.json packages/ocpi/
 COPY packages/csms/package.json packages/csms/
 COPY packages/portal/package.json packages/portal/
@@ -21,8 +29,17 @@ RUN npm ci --ignore-scripts
 COPY tsconfig.base.json tsconfig.json ./
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
+COPY packages/payments/ packages/payments/
+COPY packages/services/ packages/services/
+COPY packages/ai/ packages/ai/
+COPY packages/v2g-exi/ packages/v2g-exi/
 COPY packages/ocpp/ packages/ocpp/
-RUN npx tsc -b --force packages/lib packages/database
+# Notification templates of events the OCPP process sends from the API template
+# set (fleet credit limit notices), found through the default API_TEMPLATES_DIR.
+COPY packages/api/src/templates/ packages/api/src/templates/
+# The database package tests import scripts/lib (the migration file helpers).
+COPY scripts/lib/ scripts/lib/
+RUN npx tsc -b --force packages/lib packages/database packages/payments packages/v2g-exi
 
 COPY scripts/generate-test-certs.sh scripts/generate-test-certs.sh
 RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/* \
@@ -30,4 +47,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -
 
 EXPOSE 7103 8081 8443 9229
 
-CMD ["sh", "-c", "node --max-old-space-size=3584 ${NODE_INSPECT:-} --import tsx packages/ocpp/src/start.ts"]
+# exec: node replaces the shell as PID 1, so docker stop delivers SIGTERM to it and the
+# graceful shutdown (socket close + event drain) runs instead of a SIGKILL after the grace period.
+CMD ["sh", "-c", "exec node --max-old-space-size=3584 ${NODE_INSPECT:-} --import tsx packages/ocpp/src/start.ts"]

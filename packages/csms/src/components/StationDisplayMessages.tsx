@@ -4,8 +4,10 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { RefreshCw, Send, Trash2 } from 'lucide-react';
+import { Trash2 } from 'lucide-react';
 import { CancelButton } from '@/components/cancel-button';
+import { RefreshButton } from '@/components/refresh-button';
+import { SendButton } from '@/components/send-button';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -29,6 +31,8 @@ import {
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Pagination } from '@/components/ui/pagination';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
+import { useToast } from '@/components/ui/toast';
 import { Select } from '@/components/ui/select';
 import { formatDateTime } from '@/lib/timezone';
 
@@ -59,6 +63,21 @@ const PRIORITIES = ['AlwaysFront', 'InFront', 'NormalCycle'] as const;
 const FORMATS = ['ASCII', 'HTML', 'URI', 'UTF8', 'QRCODE'] as const;
 const STATES = ['Charging', 'Faulted', 'Idle', 'Unavailable', 'Suspended', 'Discharging'] as const;
 
+// 202 body when the station is offline: the OCPP server queued the command
+// and sends it on reconnect (same shape as /v1/ocpp/commands).
+interface QueuedCommand {
+  status: 'queued';
+  code: 'COMMAND_QUEUED';
+}
+
+function isQueued(result: unknown): result is QueuedCommand {
+  return (
+    result != null &&
+    typeof result === 'object' &&
+    (result as { status?: unknown }).status === 'queued'
+  );
+}
+
 const STATUS_VARIANTS: Record<string, 'default' | 'outline' | 'destructive' | 'secondary'> = {
   pending: 'outline',
   accepted: 'default',
@@ -74,6 +93,7 @@ export function StationDisplayMessages({
 }: StationDisplayMessagesProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { toast } = useToast();
   const [page, setPage] = useState(1);
   const [createOpen, setCreateOpen] = useState(false);
   const [clearTarget, setClearTarget] = useState<DisplayMessage | null>(null);
@@ -105,12 +125,17 @@ export function StationDisplayMessages({
 
   const createMutation = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
-      api.post<DisplayMessage>(`/v1/stations/${stationId}/display-messages`, body),
-    onSuccess: () => {
+      api.post<DisplayMessage | QueuedCommand>(`/v1/stations/${stationId}/display-messages`, body),
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ['display-messages', stationId] });
       setCreateOpen(false);
       resetForm();
       setHasSubmitted(false);
+      if (isQueued(result))
+        toast({ title: t('stations.messageCommandQueued'), variant: 'warning' });
+    },
+    onError: (err: unknown) => {
+      toast({ title: getErrorMessage(err, t), variant: 'destructive' });
     },
   });
 
@@ -119,16 +144,26 @@ export function StationDisplayMessages({
       api.delete<{ status: string }>(
         `/v1/stations/${stationId}/display-messages/${String(messageId)}`,
       ),
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ['display-messages', stationId] });
+      if (isQueued(result))
+        toast({ title: t('stations.messageCommandQueued'), variant: 'warning' });
+    },
+    onError: (err: unknown) => {
+      toast({ title: getErrorMessage(err, t), variant: 'destructive' });
     },
   });
 
   const refreshMutation = useMutation({
     mutationFn: () =>
       api.post<{ status: string }>(`/v1/stations/${stationId}/display-messages/refresh`, {}),
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ['display-messages', stationId] });
+      if (isQueued(result))
+        toast({ title: t('stations.messageCommandQueued'), variant: 'warning' });
+    },
+    onError: (err: unknown) => {
+      toast({ title: getErrorMessage(err, t), variant: 'destructive' });
     },
   });
 
@@ -177,29 +212,24 @@ export function StationDisplayMessages({
       <CardHeader className="flex flex-col md:flex-row items-start md:items-center justify-between gap-2 md:gap-4">
         <CardTitle>{t('stations.displayMessages')}</CardTitle>
         <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!isOnline || refreshMutation.isPending}
+          <RefreshButton
+            label={
+              refreshMutation.isPending ? t('stations.refreshing') : t('stations.refreshMessages')
+            }
+            disabled={!isOnline}
+            isPending={refreshMutation.isPending}
             onClick={() => {
               refreshMutation.mutate();
             }}
-          >
-            <RefreshCw className={`h-4 w-4 ${refreshMutation.isPending ? 'animate-spin' : ''}`} />
-            {refreshMutation.isPending ? t('stations.refreshing') : t('stations.refreshMessages')}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
+          />
+          <SendButton
+            label={t('stations.sendMessage')}
             disabled={!isOnline}
             onClick={() => {
               setHasSubmitted(false);
               setCreateOpen(true);
             }}
-          >
-            <Send className="h-4 w-4" />
-            {t('stations.sendMessage')}
-          </Button>
+          />
         </div>
       </CardHeader>
       <CardContent>
@@ -236,10 +266,13 @@ export function StationDisplayMessages({
                     <TableCell>{formatDateTime(msg.createdAt, timezone)}</TableCell>
                     <TableCell>
                       {msg.status === 'accepted' && (
+                        // Enabled offline too: the OCPP server queues the clear
+                        // and sends it when the station reconnects.
                         <Button
                           variant="ghost"
                           size="sm"
-                          disabled={!isOnline || clearMutation.isPending}
+                          aria-label={t('stations.clearMessage')}
+                          disabled={clearMutation.isPending}
                           onClick={() => {
                             setClearTarget(msg);
                           }}
@@ -268,14 +301,15 @@ export function StationDisplayMessages({
           <form onSubmit={handleCreate} noValidate className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="display-msg-priority">{t('stations.messagePriority')}</Label>
+                <Label htmlFor="display-msg-priority" className="leading-6">
+                  {t('stations.messagePriority')}
+                </Label>
                 <Select
                   id="display-msg-priority"
                   value={priority}
                   onChange={(e) => {
                     setPriority(e.target.value);
                   }}
-                  className="h-9"
                 >
                   {PRIORITIES.map((p) => (
                     <option key={p} value={p}>
@@ -285,14 +319,15 @@ export function StationDisplayMessages({
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="display-msg-format">{t('stations.messageFormat')}</Label>
+                <Label htmlFor="display-msg-format" className="leading-6">
+                  {t('stations.messageFormat')}
+                </Label>
                 <Select
                   id="display-msg-format"
                   value={format}
                   onChange={(e) => {
                     setFormat(e.target.value);
                   }}
-                  className="h-9"
                 >
                   {FORMATS.map((f) => (
                     <option key={f} value={f}>
@@ -303,7 +338,9 @@ export function StationDisplayMessages({
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="msg-content">{t('stations.messageContent')}</Label>
+              <Label htmlFor="msg-content" className="leading-6">
+                {t('stations.messageContent')}
+              </Label>
               <textarea
                 id="msg-content"
                 value={content}
@@ -320,7 +357,9 @@ export function StationDisplayMessages({
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="msg-language">{t('stations.messageLanguage')}</Label>
+                <Label htmlFor="msg-language" className="leading-6">
+                  {t('stations.messageLanguage')}
+                </Label>
                 <Input
                   id="msg-language"
                   value={language}
@@ -332,14 +371,15 @@ export function StationDisplayMessages({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="display-msg-state">{t('stations.messageState')}</Label>
+                <Label htmlFor="display-msg-state" className="leading-6">
+                  {t('stations.messageState')}
+                </Label>
                 <Select
                   id="display-msg-state"
                   value={state}
                   onChange={(e) => {
                     setState(e.target.value);
                   }}
-                  className="h-9"
                 >
                   <option value="">-</option>
                   {STATES.map((s) => (
@@ -352,7 +392,9 @@ export function StationDisplayMessages({
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="msg-start-time">{t('stations.messageStartTime')}</Label>
+                <Label htmlFor="msg-start-time" className="leading-6">
+                  {t('stations.messageStartTime')}
+                </Label>
                 <Input
                   id="msg-start-time"
                   type="datetime-local"
@@ -363,7 +405,9 @@ export function StationDisplayMessages({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="msg-end-time">{t('stations.messageEndTime')}</Label>
+                <Label htmlFor="msg-end-time" className="leading-6">
+                  {t('stations.messageEndTime')}
+                </Label>
                 <Input
                   id="msg-end-time"
                   type="datetime-local"
@@ -376,7 +420,9 @@ export function StationDisplayMessages({
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="msg-transaction-id">{t('stations.messageTransactionId')}</Label>
+                <Label htmlFor="msg-transaction-id" className="leading-6">
+                  {t('stations.messageTransactionId')}
+                </Label>
                 <Input
                   id="msg-transaction-id"
                   value={transactionId}
@@ -387,7 +433,9 @@ export function StationDisplayMessages({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="msg-evse-id">{t('stations.messageEvseId')}</Label>
+                <Label htmlFor="msg-evse-id" className="leading-6">
+                  {t('stations.messageEvseId')}
+                </Label>
                 <Input
                   id="msg-evse-id"
                   type="number"

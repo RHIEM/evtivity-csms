@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const originalEnv = process.env['SETTINGS_ENCRYPTION_KEY'];
 
@@ -20,9 +20,16 @@ vi.mock('../schema/settings.js', () => ({
   settings: { key: 'key', value: 'value' },
 }));
 
-vi.mock('@evtivity/lib', () => ({
-  decryptString: vi.fn((val: string) => `decrypted:${val}`),
-}));
+const mockWarn = vi.fn();
+const mockDecrypt = vi.fn((val: string) => `decrypted:${val}`);
+vi.mock('@evtivity/lib', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@evtivity/lib')>();
+  return {
+    tryParseJson: actual.tryParseJson,
+    decryptString: mockDecrypt,
+    createLogger: () => ({ warn: mockWarn }),
+  };
+});
 
 function makeChain(result: unknown[]) {
   const chain: Record<string, unknown> = {};
@@ -30,6 +37,13 @@ function makeChain(result: unknown[]) {
   chain['where'] = vi.fn(() => Promise.resolve(result));
   return chain;
 }
+
+// Under load (a full run) the first import of the module graph can outlast
+// the 5 s test timeout. Load it once here with a longer hook timeout; each
+// test still imports a fresh copy after vi.resetModules, from the warm cache.
+beforeAll(async () => {
+  await import('../lib/sso-settings.js');
+}, 30_000);
 
 describe('getSsoConfig', () => {
   beforeAll(() => {
@@ -47,6 +61,7 @@ describe('getSsoConfig', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    mockSelect.mockReset();
   });
 
   it('returns null when sso.enabled is false', async () => {
@@ -126,6 +141,45 @@ describe('getSsoConfig', () => {
     const { getSsoConfig } = await import('../lib/sso-settings.js');
     const result = await getSsoConfig();
     expect(result).toBeNull();
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'sso.*' }),
+      expect.stringContaining('getSsoConfig failed'),
+    );
+  });
+
+  it('keeps the default attribute mapping when the stored JSON is invalid', async () => {
+    mockSelect.mockReturnValue(
+      makeChain([
+        { key: 'sso.enabled', value: true },
+        { key: 'sso.attributeMapping', value: '{not json' },
+      ]),
+    );
+    const { getSsoConfig } = await import('../lib/sso-settings.js');
+    const result = await getSsoConfig();
+    expect(result?.attributeMapping).toEqual({
+      email: 'email',
+      firstName: 'firstName',
+      lastName: 'lastName',
+    });
+  });
+
+  it('logs and uses an empty certificate when decryption fails', async () => {
+    mockDecrypt.mockImplementationOnce(() => {
+      throw new Error('bad auth tag');
+    });
+    mockSelect.mockReturnValue(
+      makeChain([
+        { key: 'sso.enabled', value: true },
+        { key: 'sso.certEnc', value: 'ciphertext' },
+      ]),
+    );
+    const { getSsoConfig } = await import('../lib/sso-settings.js');
+    const result = await getSsoConfig();
+    expect(result?.cert).toBe('');
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'sso.certEnc' }),
+      expect.stringContaining('decryption failed'),
+    );
   });
 
   it('handles attributeMapping as object (not string)', async () => {

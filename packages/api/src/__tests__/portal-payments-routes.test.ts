@@ -1,106 +1,87 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
+import type { DriverPaymentMethod } from '@evtivity/payments';
 
-// DB mock helpers
-let dbResults: unknown[][] = [];
-let dbCallIndex = 0;
-function setupDbResults(...results: unknown[][]) {
-  dbResults = results;
-  dbCallIndex = 0;
-}
-function makeChain() {
-  const chain: Record<string, unknown> = {};
-  const methods = [
-    'select',
-    'from',
-    'where',
-    'orderBy',
-    'limit',
-    'offset',
-    'innerJoin',
-    'leftJoin',
-    'groupBy',
-    'values',
-    'returning',
-    'set',
-    'onConflictDoUpdate',
-    'delete',
-    'insert',
-    'update',
-  ];
-  for (const m of methods) {
-    chain[m] = vi.fn(() => chain);
-  }
-  let awaited = false;
-  chain['then'] = (resolve?: (v: unknown) => unknown, reject?: (r: unknown) => unknown) => {
-    if (!awaited) {
-      awaited = true;
-      const r = dbResults[dbCallIndex] ?? [];
-      dbCallIndex++;
-      return Promise.resolve(r).then(resolve, reject);
-    }
-    return Promise.resolve([]).then(resolve, reject);
-  };
-  chain['catch'] = (reject?: (r: unknown) => unknown) => Promise.resolve([]).catch(reject);
-  return chain;
-}
-
-vi.mock('@evtivity/database', () => ({
-  db: {
-    select: vi.fn(() => makeChain()),
-    insert: vi.fn(() => makeChain()),
-    update: vi.fn(() => makeChain()),
-    delete: vi.fn(() => makeChain()),
-    execute: vi.fn(() => Promise.resolve([])),
-    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
-      const tx = {
-        select: vi.fn(() => makeChain()),
-        insert: vi.fn(() => makeChain()),
-        update: vi.fn(() => makeChain()),
-        delete: vi.fn(() => makeChain()),
-      };
-      return fn(tx);
-    }),
-  },
-  drivers: {},
-  driverPaymentMethods: {},
+const {
+  mockListDriverMethods,
+  mockStartDriverMethodSetup,
+  mockSaveDriverMethod,
+  mockRemoveDriverMethod,
+  mockSetDefaultDriverMethod,
+  mockSubmitDriverMethodSetup,
+  mockContinueDriverMethodSetup,
+  mockPaymentContext,
+  mockGetMobileAppConfig,
+} = vi.hoisted(() => ({
+  mockListDriverMethods: vi.fn(),
+  mockStartDriverMethodSetup: vi.fn(),
+  mockSaveDriverMethod: vi.fn(),
+  mockRemoveDriverMethod: vi.fn(),
+  mockSetDefaultDriverMethod: vi.fn(),
+  mockSubmitDriverMethodSetup: vi.fn(),
+  mockContinueDriverMethodSetup: vi.fn(),
+  mockPaymentContext: vi.fn((logger: unknown, actor: unknown) => ({
+    registry: 'registry',
+    logger,
+    actor,
+  })),
+  mockGetMobileAppConfig: vi.fn(),
 }));
 
-vi.mock('drizzle-orm', () => ({
-  eq: vi.fn(),
-  and: vi.fn(),
-  or: vi.fn(),
-  ilike: vi.fn(),
-  sql: vi.fn(),
-  desc: vi.fn(),
-  count: vi.fn(),
-  asc: vi.fn(),
+vi.mock('@evtivity/payments', () => ({
+  listDriverMethods: mockListDriverMethods,
+  startDriverMethodSetup: mockStartDriverMethodSetup,
+  saveDriverMethod: mockSaveDriverMethod,
+  removeDriverMethod: mockRemoveDriverMethod,
+  setDefaultDriverMethod: mockSetDefaultDriverMethod,
+  submitDriverMethodSetup: mockSubmitDriverMethodSetup,
+  continueDriverMethodSetup: mockContinueDriverMethodSetup,
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn().mockResolvedValue(null),
-  createSetupIntent: vi.fn().mockResolvedValue({ client_secret: 'seti_secret_test' }),
-  createCustomer: vi.fn().mockResolvedValue({ id: 'cus_test_123' }),
-  detachPaymentMethod: vi.fn().mockResolvedValue({}),
+vi.mock('@evtivity/database', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@evtivity/database')>()),
+  getMobileAppConfig: mockGetMobileAppConfig,
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  paymentContext: mockPaymentContext,
 }));
 
 import { registerAuth } from '../plugins/auth.js';
 import { portalPaymentRoutes } from '../routes/portal/payments.js';
-import {
-  getStripeConfig,
-  createSetupIntent,
-  createCustomer,
-  detachPaymentMethod,
-} from '../services/stripe.service.js';
+import { config as apiConfig } from '../lib/config.js';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
 const DRIVER_ID = 'drv_000000000001';
 const VALID_PM_ID = '1';
+
+// The payment context names the request's actor on the audit rows it writes.
+const CTX = {
+  registry: 'registry',
+  logger: expect.anything(),
+  actor: expect.objectContaining({ actor: 'driver' }),
+};
+
+function methodRow(overrides: Partial<DriverPaymentMethod> = {}): DriverPaymentMethod {
+  return {
+    id: 1,
+    driverId: DRIVER_ID,
+    provider: 'stripe',
+    providerCustomerId: 'cus_123',
+    providerPaymentMethodId: 'pm_123',
+    cardBrand: 'visa',
+    cardLast4: '4242',
+    isDefault: true,
+    createdAt: new Date('2026-01-01T00:00:00Z'),
+    updatedAt: new Date('2026-01-01T00:00:00Z'),
+    ...overrides,
+  };
+}
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -123,17 +104,13 @@ describe('Portal payment routes - handler logic', () => {
     await app.close();
   });
 
-  beforeEach(() => {
-    setupDbResults();
-    vi.mocked(getStripeConfig).mockResolvedValue(null);
-  });
+  function authHeaders(): { authorization: string } {
+    return { authorization: `Bearer ${driverToken}` };
+  }
 
   describe('GET /v1/portal/payment-methods', () => {
     it('returns 401 without token', async () => {
-      const response = await app.inject({
-        method: 'GET',
-        url: '/portal/payment-methods',
-      });
+      const response = await app.inject({ method: 'GET', url: '/portal/payment-methods' });
       expect(response.statusCode).toBe(401);
     });
 
@@ -145,43 +122,50 @@ describe('Portal payment routes - handler logic', () => {
         headers: { authorization: `Bearer ${operatorToken}` },
       });
       expect(response.statusCode).toBe(403);
+      expect(mockListDriverMethods).not.toHaveBeenCalled();
     });
 
     it('returns empty array when no payment methods', async () => {
-      setupDbResults([]);
+      mockListDriverMethods.mockResolvedValueOnce([]);
       const response = await app.inject({
         method: 'GET',
         url: '/portal/payment-methods',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(200);
       expect(response.json()).toEqual([]);
+      expect(mockListDriverMethods).toHaveBeenCalledWith(DRIVER_ID, CTX);
     });
 
-    it('returns payment methods for driver', async () => {
-      setupDbResults([
-        {
-          id: VALID_PM_ID,
-          driverId: DRIVER_ID,
-          stripeCustomerId: 'cus_test',
-          stripePaymentMethodId: 'pm_test',
-          cardBrand: 'visa',
-          cardLast4: '4242',
-          isDefault: true,
-          createdAt: '2024-01-01T00:00:00.000Z',
-          updatedAt: '2024-01-01T00:00:00.000Z',
-        },
+    it('returns payment methods without provider identifiers', async () => {
+      mockListDriverMethods.mockResolvedValueOnce([
+        methodRow(),
+        methodRow({ id: 2, isDefault: false, cardBrand: 'mastercard', cardLast4: '5555' }),
       ]);
       const response = await app.inject({
         method: 'GET',
         url: '/portal/payment-methods',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(200);
-      const body = response.json();
-      expect(body).toHaveLength(1);
-      expect(body[0].cardBrand).toBe('visa');
-      expect(body[0].cardLast4).toBe('4242');
+      const body = response.json<Array<Record<string, unknown>>>();
+      expect(body).toHaveLength(2);
+      expect(body[0]).toEqual({
+        id: '1',
+        driverId: DRIVER_ID,
+        cardBrand: 'visa',
+        cardLast4: '4242',
+        isDefault: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      });
+      expect(body[1]).toMatchObject({ id: '2', isDefault: false, cardLast4: '5555' });
+      for (const row of body) {
+        expect(row).not.toHaveProperty('stripeCustomerId');
+        expect(row).not.toHaveProperty('stripePaymentMethodId');
+        expect(row).not.toHaveProperty('providerCustomerId');
+        expect(row).not.toHaveProperty('providerPaymentMethodId');
+      }
     });
   });
 
@@ -194,150 +178,209 @@ describe('Portal payment routes - handler logic', () => {
       expect(response.statusCode).toBe(401);
     });
 
-    it('returns 404 when driver not found', async () => {
-      setupDbResults([]);
+    it('starts a web setup and returns the Stripe fields', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({
+        status: 'started',
+        providerId: 'stripe',
+        customerId: 'cus_123',
+        session: {
+          provider: 'stripe',
+          clientSecret: 'seti_secret_test',
+          customerId: 'cus_123',
+          publishableKey: 'pk_test_123',
+        },
+      });
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        provider: 'stripe',
+        clientSecret: 'seti_secret_test',
+        customerId: 'cus_123',
+        publishableKey: 'pk_test_123',
+        session: {
+          provider: 'stripe',
+          clientSecret: 'seti_secret_test',
+          customerId: 'cus_123',
+          publishableKey: 'pk_test_123',
+        },
+      });
+      expect(mockStartDriverMethodSetup).toHaveBeenCalledWith(
+        { driverId: DRIVER_ID, channel: 'web' },
+        CTX,
+      );
+    });
+
+    it('returns the provider session and empty Stripe fields for a non-Stripe session', async () => {
+      const session = {
+        provider: 'adyen',
+        customerId: 'drv_1',
+        clientKey: 'test_CLIENTKEY',
+        environment: 'test',
+        countryCode: 'NL',
+        currency: 'EUR',
+        paymentMethodsResponse: { paymentMethods: [{ type: 'scheme' }] },
+      };
+      mockStartDriverMethodSetup.mockResolvedValueOnce({
+        status: 'started',
+        providerId: 'adyen',
+        customerId: 'drv_1',
+        session,
+      });
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/payment-methods/setup-intent',
+        headers: authHeaders(),
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        provider: 'adyen',
+        clientSecret: null,
+        customerId: 'drv_1',
+        publishableKey: '',
+        session,
+      });
+    });
+
+    it('returns 404 when driver not found', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({ status: 'driver_not_found' });
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/payment-methods/setup-intent',
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(404);
-      expect(response.json().code).toBe('DRIVER_NOT_FOUND');
+      expect(response.json()).toEqual({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
     });
 
-    it('returns 400 when stripe is not configured', async () => {
-      setupDbResults([
-        { id: DRIVER_ID, email: 'john@example.com', firstName: 'John', lastName: 'Doe' },
-      ]);
-      vi.mocked(getStripeConfig).mockResolvedValue(null);
-
+    it('returns 400 when no payment provider is configured', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({ status: 'not_configured' });
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('PAYMENT_PROVIDER_NOT_CONFIGURED');
+      expect(response.json()).toEqual({
+        error: 'Payment provider not configured',
+        code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+      });
     });
 
-    it('creates setup intent with existing customer', async () => {
-      setupDbResults(
-        [{ id: DRIVER_ID, email: 'john@example.com', firstName: 'John', lastName: 'Doe' }],
-        [{ stripeCustomerId: 'cus_existing_123' }],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test_abc',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: null,
-        connectedAccountId: null,
-        platformFeePercent: 0,
+    it('returns 400 with a generic message when the provider setup fails', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({
+        status: 'failed',
+        reason: 'No such customer: cus_secret_detail',
       });
-
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
-      });
-      expect(response.statusCode).toBe(200);
-      const body = response.json();
-      expect(body.clientSecret).toBe('seti_secret_test');
-      expect(body.customerId).toBe('cus_existing_123');
-      expect(body.publishableKey).toBe('pk_test_abc');
-    });
-
-    it('creates new customer when no existing payment methods', async () => {
-      setupDbResults(
-        [{ id: DRIVER_ID, email: 'john@example.com', firstName: 'John', lastName: 'Doe' }],
-        [],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test_abc',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: null,
-        connectedAccountId: null,
-        platformFeePercent: 0,
-      });
-      vi.mocked(createCustomer).mockResolvedValue({ id: 'cus_new_456' } as never);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
-      });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().customerId).toBe('cus_new_456');
-    });
-
-    it('returns 400 PAYMENT_PROVIDER_NOT_CONFIGURED when Stripe SDK throws', async () => {
-      setupDbResults(
-        [{ id: DRIVER_ID, email: 'john@example.com', firstName: 'John', lastName: 'Doe' }],
-        [],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test_abc',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: null,
-        connectedAccountId: null,
-        platformFeePercent: 0,
-      });
-      vi.mocked(createCustomer).mockRejectedValueOnce(new Error('Invalid API Key provided'));
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('PAYMENT_PROVIDER_NOT_CONFIGURED');
-      // Error message is intentionally generic (no provider name or upstream
-      // detail) so the API does not leak Stripe internals to clients.
-      expect(response.json().error).toBe('Payment setup failed');
-    });
-
-    it('returns 400 PAYMENT_PROVIDER_NOT_CONFIGURED when SetupIntent has empty client_secret', async () => {
-      setupDbResults(
-        [{ id: DRIVER_ID, email: 'john@example.com', firstName: 'John', lastName: 'Doe' }],
-        [{ stripeCustomerId: 'cus_existing_123' }],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test_abc',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: null,
-        connectedAccountId: null,
-        platformFeePercent: 0,
+      expect(response.json()).toEqual({
+        error: 'Payment setup failed',
+        code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
       });
-      vi.mocked(createSetupIntent).mockResolvedValueOnce({
-        id: 'seti_test',
-        client_secret: null,
-      } as never);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/payment-methods/setup-intent',
-        headers: { authorization: `Bearer ${driverToken}` },
-      });
-      expect(response.statusCode).toBe(400);
-      expect(response.json().code).toBe('PAYMENT_PROVIDER_NOT_CONFIGURED');
+      expect(response.body).not.toContain('cus_secret_detail');
     });
   });
 
+  describe('POST /v1/portal/payment-methods/ephemeral-key', () => {
+    const url = '/portal/payment-methods/ephemeral-key?stripeVersion=2026-01-28.clover';
+
+    it('returns 401 without token', async () => {
+      const response = await app.inject({ method: 'POST', url });
+      expect(response.statusCode).toBe(401);
+    });
+
+    it('rejects a request without stripeVersion', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/payment-methods/ephemeral-key',
+        headers: authHeaders(),
+      });
+      expect(response.statusCode).toBe(400);
+      expect(mockStartDriverMethodSetup).not.toHaveBeenCalled();
+    });
+
+    it('starts a native setup and returns the ephemeral key', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({
+        status: 'started',
+        providerId: 'stripe',
+        customerId: 'cus_123',
+        session: {
+          provider: 'stripe',
+          clientSecret: 'seti_secret_native',
+          customerId: 'cus_123',
+          publishableKey: 'pk_test_123',
+          ephemeralKey: 'ek_test_123',
+        },
+      });
+      const response = await app.inject({ method: 'POST', url, headers: authHeaders() });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        provider: 'stripe',
+        ephemeralKey: 'ek_test_123',
+        customerId: 'cus_123',
+        publishableKey: 'pk_test_123',
+        setupIntentClientSecret: 'seti_secret_native',
+      });
+      expect(mockStartDriverMethodSetup).toHaveBeenCalledWith(
+        { driverId: DRIVER_ID, channel: 'native', nativeSdkVersion: '2026-01-28.clover' },
+        CTX,
+      );
+    });
+
+    it('returns 404 when driver not found', async () => {
+      mockStartDriverMethodSetup.mockResolvedValueOnce({ status: 'driver_not_found' });
+      const response = await app.inject({ method: 'POST', url, headers: authHeaders() });
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({ error: 'Driver not found', code: 'DRIVER_NOT_FOUND' });
+    });
+
+    it.each([
+      ['not configured', { status: 'not_configured' }],
+      ['failed', { status: 'failed', reason: 'boom' }],
+      [
+        'started without an ephemeral key',
+        {
+          status: 'started',
+          providerId: 'simulated',
+          customerId: 'sim_cus_1',
+          session: { provider: 'simulated' },
+        },
+      ],
+    ])(
+      'returns 400 PAYMENT_PROVIDER_NOT_CONFIGURED when the setup is %s',
+      async (_label, outcome) => {
+        mockStartDriverMethodSetup.mockResolvedValueOnce(outcome);
+        const response = await app.inject({ method: 'POST', url, headers: authHeaders() });
+        expect(response.statusCode).toBe(400);
+        expect(response.json()).toEqual({
+          error: 'Payment provider not configured',
+          code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+        });
+      },
+    );
+  });
+
   describe('POST /v1/portal/payment-methods', () => {
+    const payload = {
+      stripePaymentMethodId: 'pm_new',
+      stripeCustomerId: 'cus_123',
+      cardBrand: 'amex',
+      cardLast4: '0005',
+    };
+
     it('returns 401 without token', async () => {
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods',
-        payload: {
-          stripePaymentMethodId: 'pm_test',
-          stripeCustomerId: 'cus_test',
-        },
+        payload,
       });
       expect(response.statusCode).toBe(401);
     });
@@ -346,75 +389,272 @@ describe('Portal payment routes - handler logic', () => {
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods',
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
         payload: {},
       });
       expect(response.statusCode).toBe(400);
+      expect(mockSaveDriverMethod).not.toHaveBeenCalled();
     });
 
-    it('saves payment method as default when first one', async () => {
-      const savedMethod = {
-        id: VALID_PM_ID,
-        driverId: DRIVER_ID,
-        stripeCustomerId: 'cus_test',
-        stripePaymentMethodId: 'pm_test',
+    it('saves the method with the driver customer and never the client card details', async () => {
+      mockSaveDriverMethod.mockResolvedValueOnce({
+        status: 'saved',
+        method: methodRow({ id: 3, providerPaymentMethodId: 'pm_new' }),
+      });
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/payment-methods',
+        headers: authHeaders(),
+        payload,
+      });
+      expect(response.statusCode).toBe(201);
+      const body = response.json<Record<string, unknown>>();
+      expect(body).toMatchObject({
+        id: '3',
         cardBrand: 'visa',
         cardLast4: '4242',
         isDefault: true,
-        createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
-      };
-      // Query order in handler after the cross-driver-charge fix:
-      // (1) SELECT drivers.stripeCustomerId — must be set to bind the
-      //     authoritative customer to this driver.
-      // (2) SELECT existingMethods to derive isDefault.
-      // (3) INSERT and return the new row.
-      setupDbResults([{ stripeCustomerId: 'cus_test' }], [], [savedMethod]);
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/payment-methods',
-        headers: { authorization: `Bearer ${driverToken}` },
-        payload: {
-          stripePaymentMethodId: 'pm_test',
-          stripeCustomerId: 'cus_test',
-          cardBrand: 'visa',
-          cardLast4: '4242',
-        },
       });
-      expect(response.statusCode).toBe(201);
-      expect(response.json().isDefault).toBe(true);
-      // Response strips internal Stripe identifiers per the
-      // toPublicPaymentMethod helper.
-      expect(response.json().stripeCustomerId).toBeUndefined();
-      expect(response.json().stripePaymentMethodId).toBeUndefined();
+      expect(body).not.toHaveProperty('stripePaymentMethodId');
+      expect(mockSaveDriverMethod).toHaveBeenCalledWith(
+        { driverId: DRIVER_ID, customerId: 'cus_123', methodId: 'pm_new', adoptCustomer: false },
+        CTX,
+      );
     });
 
-    it('saves payment method as non-default when others exist', async () => {
-      const savedMethod = {
-        id: VALID_PM_ID,
-        driverId: DRIVER_ID,
-        stripeCustomerId: 'cus_test',
-        stripePaymentMethodId: 'pm_test_2',
-        cardBrand: 'mastercard',
-        cardLast4: '5555',
-        isDefault: false,
-        createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
-      };
-      setupDbResults([{ stripeCustomerId: 'cus_test' }], [{ id: 'existing-pm' }], [savedMethod]);
+    it.each([
+      ['driver_not_found', 404, { error: 'Driver not found', code: 'DRIVER_NOT_FOUND' }],
+      ['forbidden', 403, { error: 'Forbidden', code: 'FORBIDDEN' }],
+      [
+        'not_initialized',
+        400,
+        { error: 'Payment setup not initialized', code: 'PAYMENT_PROVIDER_NOT_CONFIGURED' },
+      ],
+      [
+        'not_configured',
+        400,
+        { error: 'Payment provider not configured', code: 'PAYMENT_PROVIDER_NOT_CONFIGURED' },
+      ],
+      [
+        'verify_failed',
+        400,
+        { error: 'Could not verify payment method', code: 'PAYMENT_PROVIDER_NOT_CONFIGURED' },
+      ],
+    ])('maps the %s outcome to %i', async (status, statusCode, body) => {
+      mockSaveDriverMethod.mockResolvedValueOnce(
+        status === 'verify_failed' ? { status, reason: 'pm belongs to cus_other' } : { status },
+      );
       const response = await app.inject({
         method: 'POST',
         url: '/portal/payment-methods',
-        headers: { authorization: `Bearer ${driverToken}` },
-        payload: {
-          stripePaymentMethodId: 'pm_test_2',
-          stripeCustomerId: 'cus_test',
-          cardBrand: 'mastercard',
-          cardLast4: '5555',
-        },
+        headers: authHeaders(),
+        payload,
+      });
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual(body);
+    });
+  });
+
+  describe('POST /v1/portal/payment-methods/setup/submit and setup/details', () => {
+    const ATTEMPT = '0b6f3c2e-6a51-4a55-9a77-2f4d3d6c1e10';
+
+    function post(step: 'submit' | 'details', payload: Record<string, unknown>) {
+      return app.inject({
+        method: 'POST',
+        url: `/portal/payment-methods/setup/${step}`,
+        headers: authHeaders(),
+        payload,
+      });
+    }
+
+    it('returns 401 without token', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/payment-methods/setup/submit',
+        payload: { provider: 'simulated', attemptId: ATTEMPT, payload: {} },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(mockSubmitDriverMethodSetup).not.toHaveBeenCalled();
+    });
+
+    it('rejects a body without a UUID attemptId', async () => {
+      const response = await post('submit', { provider: 'simulated', attemptId: 'x', payload: {} });
+      expect(response.statusCode).toBe(400);
+      expect(mockSubmitDriverMethodSetup).not.toHaveBeenCalled();
+    });
+
+    it('submits for the driver without adopting a customer and returns 201 without provider ids', async () => {
+      mockSubmitDriverMethodSetup.mockResolvedValueOnce({ status: 'saved', method: methodRow() });
+      const response = await post('submit', {
+        provider: 'simulated',
+        attemptId: ATTEMPT,
+        payload: { testCard: '4242424242424242' },
       });
       expect(response.statusCode).toBe(201);
-      expect(response.json().isDefault).toBe(false);
+      const body = response.json();
+      expect(body.status).toBe('saved');
+      expect(body.method).toMatchObject({ id: '1', cardLast4: '4242', isDefault: true });
+      expect(body.method).not.toHaveProperty('providerCustomerId');
+      expect(body.method).not.toHaveProperty('stripePaymentMethodId');
+      expect(mockSubmitDriverMethodSetup).toHaveBeenCalledWith(
+        {
+          driverId: DRIVER_ID,
+          providerId: 'simulated',
+          attemptId: ATTEMPT,
+          payload: { testCard: '4242424242424242' },
+          adoptCustomer: false,
+        },
+        CTX,
+      );
+    });
+
+    it('passes the browser with a return URL built from PORTAL_URL', async () => {
+      const action = { provider: 'adyen', data: { type: 'redirect' } };
+      mockSubmitDriverMethodSetup.mockResolvedValueOnce({ status: 'action_required', action });
+      const origin = new URL(apiConfig.PORTAL_URL).origin;
+      const response = await post('submit', {
+        provider: 'adyen',
+        attemptId: ATTEMPT,
+        payload: { paymentMethod: { type: 'scheme' }, currency: 'EUR' },
+        browser: { origin, info: { language: 'en' } },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ status: 'action_required', action });
+      const returnUrl = new URL('/payments/return', apiConfig.PORTAL_URL);
+      returnUrl.searchParams.set('flow', 'method');
+      returnUrl.searchParams.set('provider', 'adyen');
+      returnUrl.searchParams.set('attemptId', ATTEMPT);
+      expect(mockSubmitDriverMethodSetup).toHaveBeenCalledWith(
+        expect.objectContaining({
+          browser: { origin, returnUrl: returnUrl.toString(), info: { language: 'en' } },
+        }),
+        CTX,
+      );
+    });
+
+    it('refuses a browser origin other than the portal', async () => {
+      const response = await post('submit', {
+        provider: 'adyen',
+        attemptId: ATTEMPT,
+        payload: {},
+        browser: { origin: 'https://evil.example' },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
+      expect(mockSubmitDriverMethodSetup).not.toHaveBeenCalled();
+    });
+
+    describe('from the mobile app', () => {
+      const apps = { urlSchemes: ['evtivity'], androidPackageNames: ['com.evtivity.driver'] };
+      const payload = { paymentMethod: { type: 'scheme' }, currency: 'EUR' };
+
+      it.each([
+        ['ios', 'evtivity://payments/adyen'],
+        ['android', 'adyencheckout://com.evtivity.driver'],
+        ['android', 'evtivity://payments/adyen'],
+      ] as const)(
+        'passes the %s channel and the SDK return URL %s',
+        async (platform, returnUrl) => {
+          mockGetMobileAppConfig.mockResolvedValueOnce(apps);
+          const action = { provider: 'adyen', data: { type: 'redirect' } };
+          mockSubmitDriverMethodSetup.mockResolvedValueOnce({ status: 'action_required', action });
+          const response = await post('submit', {
+            provider: 'adyen',
+            attemptId: ATTEMPT,
+            payload,
+            browser: { platform, returnUrl, info: { userAgent: 'app' } },
+          });
+          expect(response.statusCode).toBe(200);
+          expect(mockSubmitDriverMethodSetup).toHaveBeenCalledWith(
+            expect.objectContaining({
+              browser: { channel: platform, returnUrl, info: { userAgent: 'app' } },
+            }),
+            CTX,
+          );
+        },
+      );
+
+      it.each([
+        ['ios', 'adyencheckout://com.evtivity.driver'],
+        ['android', 'adyencheckout://com.other.app'],
+        ['android', 'adyencheckout://com.evtivity.driver/path'],
+        ['android', 'adyencheckout://user@com.evtivity.driver'],
+        ['ios', 'otherapp://payments/adyen'],
+        ['ios', 'https://portal.example/payments/return'],
+        ['ios', 'not a url'],
+      ] as const)('refuses the %s return URL %s', async (platform, returnUrl) => {
+        mockGetMobileAppConfig.mockResolvedValueOnce(apps);
+        const response = await post('submit', {
+          provider: 'adyen',
+          attemptId: ATTEMPT,
+          payload,
+          browser: { platform, returnUrl },
+        });
+        expect(response.statusCode).toBe(400);
+        expect(response.json().code).toBe('VALIDATION_ERROR');
+        expect(mockSubmitDriverMethodSetup).not.toHaveBeenCalled();
+      });
+
+      it('refuses every app return URL when no app build is configured', async () => {
+        mockGetMobileAppConfig.mockResolvedValueOnce({ urlSchemes: [], androidPackageNames: [] });
+        const response = await post('submit', {
+          provider: 'adyen',
+          attemptId: ATTEMPT,
+          payload,
+          browser: { platform: 'ios', returnUrl: 'evtivity://payments/adyen' },
+        });
+        expect(response.statusCode).toBe(400);
+        expect(mockSubmitDriverMethodSetup).not.toHaveBeenCalled();
+      });
+    });
+
+    it('returns 200 with the action', async () => {
+      const action = { provider: 'simulated', data: { challenge: 'method_setup', methodId: 'm' } };
+      mockSubmitDriverMethodSetup.mockResolvedValueOnce({ status: 'action_required', action });
+      const response = await post('submit', {
+        provider: 'simulated',
+        attemptId: ATTEMPT,
+        payload: { testCard: '4000002500003155' },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ status: 'action_required', action });
+    });
+
+    it('continues with the details', async () => {
+      mockContinueDriverMethodSetup.mockResolvedValueOnce({ status: 'saved', method: methodRow() });
+      const details = { methodId: 'm', outcome: 'approve' };
+      const response = await post('details', {
+        provider: 'simulated',
+        attemptId: ATTEMPT,
+        details,
+      });
+      expect(response.statusCode).toBe(201);
+      expect(mockContinueDriverMethodSetup).toHaveBeenCalledWith(
+        { driverId: DRIVER_ID, providerId: 'simulated', attemptId: ATTEMPT, details },
+        CTX,
+      );
+    });
+
+    it.each([
+      [{ status: 'refused', reason: 'card_declined' }, 400, 'PAYMENT_FAILED'],
+      [{ status: 'invalid', reason: 'Unknown test card' }, 400, 'VALIDATION_ERROR'],
+      [{ status: 'not_configured' }, 400, 'PAYMENT_PROVIDER_NOT_CONFIGURED'],
+      [{ status: 'provider_mismatch' }, 400, 'PAYMENT_PROVIDER_NOT_CONFIGURED'],
+      [{ status: 'not_initialized' }, 400, 'PAYMENT_PROVIDER_NOT_CONFIGURED'],
+      [{ status: 'forbidden' }, 403, 'FORBIDDEN'],
+      [{ status: 'driver_not_found' }, 404, 'DRIVER_NOT_FOUND'],
+    ])('maps %j to %i %s', async (outcome, status, code) => {
+      mockSubmitDriverMethodSetup.mockResolvedValueOnce(outcome);
+      const response = await post('submit', {
+        provider: 'simulated',
+        attemptId: ATTEMPT,
+        payload: {},
+      });
+      expect(response.statusCode).toBe(status);
+      expect(response.json().code).toBe(code);
+      if (outcome.status === 'refused') {
+        expect(response.json().details).toEqual({ reason: 'card_declined' });
+      }
     });
   });
 
@@ -428,55 +668,56 @@ describe('Portal payment routes - handler logic', () => {
     });
 
     it('returns 404 when payment method not found', async () => {
-      setupDbResults([]);
+      mockRemoveDriverMethod.mockResolvedValueOnce({ status: 'not_found' });
       const response = await app.inject({
         method: 'DELETE',
         url: `/portal/payment-methods/${VALID_PM_ID}`,
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(404);
-      expect(response.json().code).toBe('PAYMENT_METHOD_NOT_FOUND');
+      expect(response.json()).toEqual({
+        error: 'Payment method not found',
+        code: 'PAYMENT_METHOD_NOT_FOUND',
+      });
     });
 
-    it('deletes payment method and detaches from stripe', async () => {
-      setupDbResults(
-        [{ id: VALID_PM_ID, stripePaymentMethodId: 'pm_stripe_123', driverId: DRIVER_ID }],
-        [],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue({
-        stripe: {} as never,
-        publishableKey: 'pk_test',
-        currency: 'USD',
-        preAuthAmountCents: 5000,
-        configId: null,
-        connectedAccountId: null,
-        platformFeePercent: 0,
-      });
-
+    it('returns 409 when the method holds an active session payment', async () => {
+      mockRemoveDriverMethod.mockResolvedValueOnce({ status: 'in_use' });
       const response = await app.inject({
         method: 'DELETE',
         url: `/portal/payment-methods/${VALID_PM_ID}`,
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().success).toBe(true);
-      expect(detachPaymentMethod).toHaveBeenCalled();
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({
+        error: 'Payment method is in use by an active charging session',
+        code: 'PAYMENT_METHOD_IN_USE',
+      });
     });
 
-    it('deletes payment method even when stripe not configured', async () => {
-      setupDbResults(
-        [{ id: VALID_PM_ID, stripePaymentMethodId: 'pm_stripe_123', driverId: DRIVER_ID }],
-        [],
-      );
-      vi.mocked(getStripeConfig).mockResolvedValue(null);
-
+    it('removes the method, blocking removal while it is in use', async () => {
+      mockRemoveDriverMethod.mockResolvedValueOnce({ status: 'removed' });
       const response = await app.inject({
         method: 'DELETE',
         url: `/portal/payment-methods/${VALID_PM_ID}`,
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(200);
-      expect(response.json().success).toBe(true);
+      expect(response.json()).toEqual({ success: true });
+      expect(mockRemoveDriverMethod).toHaveBeenCalledWith(
+        { driverId: DRIVER_ID, methodRowId: 1, blockWhenInUse: true },
+        CTX,
+      );
+    });
+
+    it('rejects a non-numeric method id', async () => {
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/portal/payment-methods/abc',
+        headers: authHeaders(),
+      });
+      expect(response.statusCode).toBe(400);
+      expect(mockRemoveDriverMethod).not.toHaveBeenCalled();
     });
   });
 
@@ -490,36 +731,38 @@ describe('Portal payment routes - handler logic', () => {
     });
 
     it('returns 404 when payment method not found', async () => {
-      setupDbResults([]);
+      mockSetDefaultDriverMethod.mockResolvedValueOnce(null);
       const response = await app.inject({
         method: 'PATCH',
         url: `/portal/payment-methods/${VALID_PM_ID}/default`,
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(404);
-      expect(response.json().code).toBe('PAYMENT_METHOD_NOT_FOUND');
+      expect(response.json()).toEqual({
+        error: 'Payment method not found',
+        code: 'PAYMENT_METHOD_NOT_FOUND',
+      });
     });
 
     it('sets payment method as default', async () => {
-      const updatedMethod = {
-        id: VALID_PM_ID,
-        driverId: DRIVER_ID,
-        stripeCustomerId: 'cus_test',
-        stripePaymentMethodId: 'pm_test',
-        isDefault: true,
-        cardBrand: 'visa',
-        cardLast4: '4242',
-        createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
-      };
-      setupDbResults([{ id: VALID_PM_ID }], [], [updatedMethod]);
+      mockSetDefaultDriverMethod.mockResolvedValueOnce(methodRow({ isDefault: true }));
       const response = await app.inject({
         method: 'PATCH',
         url: `/portal/payment-methods/${VALID_PM_ID}/default`,
-        headers: { authorization: `Bearer ${driverToken}` },
+        headers: authHeaders(),
       });
       expect(response.statusCode).toBe(200);
-      expect(response.json().isDefault).toBe(true);
+      const body = response.json<Record<string, unknown>>();
+      expect(body).toMatchObject({ id: '1', isDefault: true });
+      expect(body).not.toHaveProperty('stripeCustomerId');
+      expect(body).not.toHaveProperty('providerCustomerId');
+      expect(mockSetDefaultDriverMethod).toHaveBeenCalledWith(
+        DRIVER_ID,
+        1,
+        expect.objectContaining({
+          actor: expect.objectContaining({ actor: 'driver', actorDriverId: DRIVER_ID }),
+        }),
+      );
     });
   });
 });

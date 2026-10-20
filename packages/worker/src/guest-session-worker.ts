@@ -2,21 +2,53 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { Worker, type Queue, type ConnectionOptions } from 'bullmq';
-import { eq, and } from 'drizzle-orm';
 import type { PubSubClient } from '@evtivity/lib';
-import { createLogger } from '@evtivity/lib';
-import { db, guestSessions, paymentRecords } from '@evtivity/database';
-import { QUEUE_NAMES } from './queues.js';
+import { createLogger, tryParseJson } from '@evtivity/lib';
+import { failExhaustedGuestCapture, handleGuestSessionEvent } from '@evtivity/payments';
+import { GUEST_SESSION_JOB_ATTEMPTS, GUEST_SESSION_JOB_BACKOFF, QUEUE_NAMES } from './queues.js';
 import { logJobStarted, logJobCompleted, logJobFailed } from './job-logger.js';
-import { handleGuestSessionEvent } from '@evtivity/api/src/services/guest-session.service.js';
+import { guestEventDeps, paymentContext } from './lib/payments.js';
 
 const log = createLogger('guest-session-worker');
 
-interface CsmsEvent {
+export interface CsmsEvent {
   type: string;
   sessionId?: string;
   idToken?: { idToken: string; type: string };
   [key: string]: unknown;
+}
+
+/** Adds the job that links a guest session to its started transaction (bridge and Redis recovery). */
+export async function enqueueGuestSessionStarted(
+  guestSessionQueue: Queue,
+  event: CsmsEvent & { idToken: { idToken: string; type: string } },
+): Promise<void> {
+  await guestSessionQueue.add(
+    'guest-session-started',
+    { event },
+    // BullMQ refuses a job id with a colon, and Autocharge tokens are `vid:<mac>`.
+    {
+      jobId: `guest-session-started-${encodeURIComponent(event.idToken.idToken)}`,
+      attempts: GUEST_SESSION_JOB_ATTEMPTS,
+      backoff: GUEST_SESSION_JOB_BACKOFF,
+    },
+  );
+}
+
+/** Adds the job that captures or cancels a guest hold when its transaction ended (bridge and Redis recovery). */
+export async function enqueueGuestSessionEnded(
+  guestSessionQueue: Queue,
+  sessionId: string,
+): Promise<void> {
+  await guestSessionQueue.add(
+    'guest-session-ended',
+    { sessionId },
+    {
+      jobId: `guest-session-ended-${sessionId}`,
+      attempts: GUEST_SESSION_JOB_ATTEMPTS,
+      backoff: GUEST_SESSION_JOB_BACKOFF,
+    },
+  );
 }
 
 /**
@@ -29,35 +61,22 @@ export async function startGuestSessionBridge(
   guestSessionQueue: Queue,
 ): Promise<() => Promise<void>> {
   const subscription = await pubsub.subscribe('csms_events', (payload: string) => {
-    let event: CsmsEvent;
-    try {
-      event = JSON.parse(payload) as CsmsEvent;
-    } catch {
-      return;
-    }
+    const event = tryParseJson(payload) as CsmsEvent | null | undefined;
+    if (event == null || typeof event !== 'object') return;
 
     if (event.type === 'TransactionStarted' && event.idToken?.idToken != null) {
-      void guestSessionQueue
-        .add(
-          'guest-session-started',
-          { event },
-          { jobId: `guest-session-started-${event.idToken.idToken}`, attempts: 3 },
-        )
-        .catch((err: unknown) => {
-          log.error({ err }, 'Failed to enqueue guest-session-started job');
-        });
+      enqueueGuestSessionStarted(guestSessionQueue, {
+        ...event,
+        idToken: event.idToken,
+      }).catch((err: unknown) => {
+        log.error({ err }, 'Failed to enqueue guest-session-started job');
+      });
     }
 
     if (event.type === 'TransactionEnded' && event.sessionId != null) {
-      void guestSessionQueue
-        .add(
-          'guest-session-ended',
-          { sessionId: event.sessionId },
-          { jobId: `guest-session-ended-${event.sessionId}`, attempts: 3 },
-        )
-        .catch((err: unknown) => {
-          log.error({ err }, 'Failed to enqueue guest-session-ended job');
-        });
+      enqueueGuestSessionEnded(guestSessionQueue, event.sessionId).catch((err: unknown) => {
+        log.error({ err }, 'Failed to enqueue guest-session-ended job');
+      });
     }
   });
 
@@ -81,11 +100,11 @@ export function createGuestSessionWorker(connection: ConnectionOptions): Worker 
       try {
         const data = job.data as Record<string, unknown>;
         if (job.name === 'guest-session-started') {
-          await handleGuestSessionEvent(data.event as CsmsEvent, log);
+          await handleGuestSessionEvent(data.event as CsmsEvent, guestEventDeps(log));
         } else if (job.name === 'guest-session-ended') {
           await handleGuestSessionEvent(
             { type: 'TransactionEnded', sessionId: data.sessionId as string },
-            log,
+            guestEventDeps(log),
           );
         }
         await logJobCompleted(logId, Date.now() - startTime);
@@ -105,13 +124,10 @@ export function createGuestSessionWorker(connection: ConnectionOptions): Worker 
       'Guest session job failed',
     );
 
-    // After the final retry, flip the guest session to `failed`, mark the
-    // payment record `failed` with a clear reason, and cancel the Stripe
-    // pre-auth so the cardholder's hold releases immediately rather than
-    // waiting for Stripe's 7-day natural expiry. Without this, the portal
-    // would show "completed" while Stripe still has the hold and the
-    // payment_records row stays `pre_authorized` until the daily
-    // reconciliation cron eventually catches it.
+    // After the final retry: the guest session fails, its open hold is
+    // recorded failed and cancelled at once (P4), so the portal leaves its
+    // waiting loop and the cardholder's hold is released instead of waiting
+    // for the provider's expiry (Stripe: 7 days).
     const maxAttempts = job.opts.attempts ?? 1;
     if (job.attemptsMade < maxAttempts) return;
     if (job.name !== 'guest-session-ended') return;
@@ -121,65 +137,16 @@ export function createGuestSessionWorker(connection: ConnectionOptions): Worker 
     if (sessionId == null) return;
 
     const failureReason = err instanceof Error ? err.message.slice(0, 500) : 'Unknown error';
-
-    void (async () => {
-      try {
-        await db
-          .update(guestSessions)
-          .set({ status: 'failed', updatedAt: new Date() })
-          .where(eq(guestSessions.chargingSessionId, sessionId));
-
-        const [pr] = await db
-          .select({
-            id: paymentRecords.id,
-            stripePaymentIntentId: paymentRecords.stripePaymentIntentId,
-            sitePaymentConfigId: paymentRecords.sitePaymentConfigId,
-            status: paymentRecords.status,
-          })
-          .from(paymentRecords)
-          .where(
-            and(
-              eq(paymentRecords.sessionId, sessionId),
-              eq(paymentRecords.status, 'pre_authorized'),
-            ),
-          )
-          .limit(1);
-
-        if (pr == null) return;
-
-        await db
-          .update(paymentRecords)
-          .set({
-            status: 'failed',
-            failureReason: `Capture worker exhausted retries: ${failureReason}`,
-            updatedAt: new Date(),
-          })
-          .where(eq(paymentRecords.id, pr.id));
-
-        if (pr.stripePaymentIntentId != null) {
-          try {
-            // Lazy-load to avoid pulling the API service's env-validating
-            // config module into the worker's module graph at import time
-            // (it crashes if API_PORT etc. aren't set, e.g. in unit tests).
-            const stripeService = await import('@evtivity/api/src/services/stripe.service.js');
-            const config = await stripeService.getStripeConfig(null);
-            if (config != null) {
-              await stripeService.cancelPaymentIntent(config, pr.stripePaymentIntentId);
-            }
-          } catch (cancelErr: unknown) {
-            log.warn(
-              { sessionId, paymentRecordId: pr.id, err: cancelErr },
-              'Failed to cancel Stripe pre-auth after exhausted retries; hold will expire naturally in 7 days',
-            );
-          }
-        }
-      } catch (cleanupErr: unknown) {
-        log.error(
-          { sessionId, err: cleanupErr },
-          'Failed to clean up after exhausted guest capture retries',
-        );
-      }
-    })();
+    failExhaustedGuestCapture(
+      sessionId,
+      failureReason,
+      paymentContext(log, 'guest-session-worker'),
+    ).catch((cleanupErr: unknown) => {
+      log.error(
+        { sessionId, err: cleanupErr },
+        'Failed to clean up after exhausted guest capture retries',
+      );
+    });
   });
 
   return worker;

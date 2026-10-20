@@ -74,6 +74,8 @@ vi.mock('@evtivity/database', () => ({
     execute: vi.fn(() => Promise.resolve([{ val: '1' }])),
   },
   client: {},
+  writeAudit: vi.fn(() => Promise.resolve()),
+  supportCaseAuditLog: {},
   supportCases: {},
   supportCaseMessages: {},
   supportCaseAttachments: {},
@@ -115,13 +117,16 @@ vi.mock('drizzle-orm', () => ({
   desc: vi.fn(),
   count: vi.fn(),
   inArray: vi.fn(),
+  isNull: vi.fn(),
 }));
 
-vi.mock('@evtivity/lib', () => ({
+vi.mock('@evtivity/lib', async () => ({
   dispatchDriverNotification: vi.fn(),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  tryParseJson: (await import('@evtivity/lib/safe-json')).tryParseJson,
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
@@ -136,9 +141,12 @@ vi.mock('../services/s3.service.js', () => ({
   buildS3Key: vi.fn(),
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn(),
-  createRefund: vi.fn(),
+vi.mock('@evtivity/payments', () => ({
+  refundPaymentRecord: vi.fn(),
+}));
+
+vi.mock('../lib/payments.js', () => ({
+  paymentContext: vi.fn(() => ({})),
 }));
 
 vi.mock('../lib/site-access.js', () => ({
@@ -222,6 +230,31 @@ describe('Support Case Read Tracking', () => {
     });
   });
 
+  describe('GET /v1/support-cases/unassigned-count', () => {
+    it('returns the unassigned open case count', async () => {
+      setupDbResults([{ count: 11 }]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/support-cases/unassigned-count',
+        headers: { authorization: authHeader(app) },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.payload) as { count: number };
+      expect(body.count).toBe(11);
+    });
+
+    it('requires authentication', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/support-cases/unassigned-count',
+      });
+
+      expect(res.statusCode).toBe(401);
+    });
+  });
+
   describe('POST /v1/support-cases/:id/read', () => {
     it('marks case as read', async () => {
       setupDbResults([{ success: true }]);
@@ -260,6 +293,8 @@ describe('Support Case Read Tracking', () => {
             category: 'general_inquiry',
             priority: 'medium',
             createdByDriver: false,
+            aiState: null,
+            resolutionSource: null,
             driverName: null,
             assignedToName: null,
             assignedTo: null,

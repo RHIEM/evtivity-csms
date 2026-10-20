@@ -1,7 +1,6 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import crypto from 'node:crypto';
 import Fastify from 'fastify';
 import type { FastifyInstance, FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
@@ -16,12 +15,14 @@ import {
   isFleetEnabled,
   isGuestChargingEnabled,
 } from '@evtivity/database';
-import { accessLogs, drivers } from '@evtivity/database';
+import { drivers } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
-import { getPubSub } from './lib/pubsub.js';
+import { registerApiAccessLog } from './plugins/api-access-log.js';
 import { registerCors } from './plugins/cors.js';
+import { CSRF_SKIP_METHODS, csrfTokensMatch, registerPortalCsrf } from './plugins/csrf.js';
 import { registerHelmet } from './plugins/helmet.js';
 import { registerRateLimit } from './plugins/rate-limit.js';
+import { registerAiToolCallContext } from './services/ai/tools/execute.js';
 import { registerAuth } from './plugins/auth.js';
 import { config } from './lib/config.js';
 import { registerOpenApi } from './plugins/openapi.js';
@@ -42,16 +43,23 @@ import { tokenRoutes } from './routes/tokens.js';
 import { authorizeAttemptRoutes } from './routes/authorize-attempts.js';
 import { dashboardRoutes } from './routes/dashboard.js';
 import { settingsRoutes } from './routes/settings.js';
+import { aiDefaultsRoutes } from './routes/ai-defaults.js';
+import { docsSearchRoutes } from './routes/docs-search.js';
 import { paymentRoutes } from './routes/payments.js';
+import { adyenSettingsRoutes } from './routes/adyen-settings.js';
+import { payoutAccountRoutes } from './routes/payout-accounts.js';
+import { paymentSettingsRoutes } from './routes/payment-settings.js';
 import { eventStreamRoutes } from './routes/events.js';
 import { loadManagementRoutes } from './routes/load-management.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { portalAuthRoutes } from './routes/portal/auth.js';
 import { portalDriverRoutes } from './routes/portal/driver.js';
 import { portalPaymentRoutes } from './routes/portal/payments.js';
+import { portalPaymentProviderRoutes } from './routes/portal/payment-provider.js';
 import { portalSessionRoutes } from './routes/portal/sessions.js';
 import { portalChargerRoutes } from './routes/portal/charger.js';
 import { portalGuestRoutes } from './routes/portal/guest.js';
+import { portalPayoutOnboardingRoutes } from './routes/portal/payout-onboarding.js';
 import { reservationRoutes } from './routes/reservations.js';
 import { maintenanceRoutes, maintenancePreviewRoutes } from './routes/maintenance.js';
 import { accessLogRoutes } from './routes/access-logs.js';
@@ -60,9 +68,13 @@ import { reportRoutes } from './routes/reports.js';
 import { neviRoutes } from './routes/nevi.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { invoiceRoutes } from './routes/invoices.js';
+import { fleetInvoiceRoutes } from './routes/fleet-invoices.js';
+import { adHocPaymentRoutes } from './routes/ad-hoc-payments.js';
+import { stationWebPaymentRoutes } from './routes/station-web-payments.js';
 import { supportCaseRoutes } from './routes/support-cases.js';
 import { portalSupportCaseRoutes } from './routes/portal/support-cases.js';
 import { portalVehicleRoutes } from './routes/portal/vehicles.js';
+import { portalInvoiceRoutes } from './routes/portal/invoices.js';
 import { portalTokenRoutes } from './routes/portal/tokens.js';
 import { portalNotificationRoutes } from './routes/portal/notifications.js';
 import { portalRoamingChargerRoutes } from './routes/portal/roaming-chargers.js';
@@ -77,6 +89,7 @@ import { ocpiCdrRoutes } from './routes/ocpi-cdrs.js';
 import { ocpiTariffRoutes } from './routes/ocpi-tariffs.js';
 import { pncSettingsRoutes } from './routes/pnc-settings.js';
 import { pncCertificateRoutes } from './routes/pnc-certificates.js';
+import { pncLocalRoutes } from './routes/pnc-local.js';
 import { securitySettingsRoutes } from './routes/security-settings.js';
 import { securityPublicRoutes } from './routes/security-public.js';
 import { systemRoutes } from './routes/system.js';
@@ -98,21 +111,14 @@ import { panelRoutes } from './routes/panels.js';
 import { circuitRoutes } from './routes/circuits.js';
 import { unmanagedLoadRoutes } from './routes/unmanaged-loads.js';
 import { assistantRoutes } from './routes/assistant.js';
+import { aiUsageRoutes } from './routes/ai-usage.js';
+import { aiAlertsRoutes } from './routes/ai-alerts.js';
+import { mcpRoutes } from './routes/mcp.js';
+import { aiInsightRoutes } from './routes/ai-insights.js';
+import { assistantAttachmentRoutes } from './routes/assistant-attachments.js';
 import { octtRoutes } from './routes/octt.js';
 import { auditRoutes } from './routes/audit.js';
 import { entityNeighborRoutes } from './routes/entity-neighbors.js';
-
-function csrfTokensMatch(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-// The 'api' access-log category fires on every request, so its SSE fan-out is
-// throttled to one publish per window to avoid flooding the channel.
-const API_ACCESS_LOG_SSE_THROTTLE_MS = 5_000;
-let lastApiAccessLogSsePublish = 0;
 
 export async function buildApp(opts: FastifyServerOptions = {}): Promise<FastifyInstance> {
   // Default body size limit: 1 MB. Individual routes can override with
@@ -127,6 +133,8 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
   await app.register(formbody);
   await registerCors(app);
   await registerHelmet(app);
+  // First: the rate limiter and the audit writes read the AI tool call context.
+  registerAiToolCallContext(app);
   await registerRateLimit(app);
   await registerAuth(app);
   await registerOpenApi(app);
@@ -160,7 +168,7 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       }
       const body: Record<string, unknown> = {
         error: fastifyError.message,
-        code: 'VALIDATION_ERROR',
+        code: fastifyError.statusCode === 429 ? 'RATE_LIMITED' : 'VALIDATION_ERROR',
       };
       if (Object.keys(details).length > 0) {
         body['details'] = details;
@@ -193,7 +201,12 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       await v1.register(authorizeAttemptRoutes);
       await v1.register(dashboardRoutes);
       await v1.register(settingsRoutes);
+      await v1.register(aiDefaultsRoutes);
+      await v1.register(docsSearchRoutes);
       await v1.register(paymentRoutes);
+      await v1.register(adyenSettingsRoutes);
+      await v1.register(payoutAccountRoutes);
+      await v1.register(paymentSettingsRoutes);
       await v1.register(eventStreamRoutes);
       await v1.register(loadManagementRoutes);
       await v1.register(notificationRoutes);
@@ -203,17 +216,23 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       await v1.register(portalAuthRoutes);
       await v1.register(portalDriverRoutes);
       await v1.register(portalPaymentRoutes);
+      await v1.register(portalPaymentProviderRoutes);
       await v1.register(portalSessionRoutes);
       await v1.register(portalChargerRoutes);
       await v1.register(portalGuestRoutes);
+      await v1.register(portalPayoutOnboardingRoutes);
       await v1.register(accessLogRoutes);
       await v1.register(displayMessageRoutes);
       await v1.register(reportRoutes);
       await v1.register(neviRoutes);
       await v1.register(webhookRoutes);
       await v1.register(invoiceRoutes);
+      await v1.register(fleetInvoiceRoutes);
+      await v1.register(adHocPaymentRoutes);
+      await v1.register(stationWebPaymentRoutes);
       await v1.register(supportCaseRoutes);
       await v1.register(portalVehicleRoutes);
+      await v1.register(portalInvoiceRoutes);
       await v1.register(portalTokenRoutes);
       await v1.register(portalNotificationRoutes);
       await v1.register(portalSupportCaseRoutes);
@@ -229,6 +248,7 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       await v1.register(ocpiTariffRoutes);
       await v1.register(pncSettingsRoutes);
       await v1.register(pncCertificateRoutes);
+      await v1.register(pncLocalRoutes);
       await v1.register(securitySettingsRoutes);
       await v1.register(securityPublicRoutes);
       await v1.register(systemRoutes);
@@ -250,6 +270,11 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
       await v1.register(circuitRoutes);
       await v1.register(unmanagedLoadRoutes);
       await v1.register(assistantRoutes);
+      await v1.register(aiUsageRoutes);
+      await v1.register(aiAlertsRoutes);
+      await v1.register(mcpRoutes);
+      await v1.register(aiInsightRoutes);
+      await v1.register(assistantAttachmentRoutes);
       await v1.register(octtRoutes);
       await v1.register(auditRoutes);
       await v1.register(cacheRoutes);
@@ -331,52 +356,7 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
   });
 
   // CSRF validation for portal mutating requests
-  const CSRF_SKIP_PATHS = new Set([
-    '/v1/portal/auth/login',
-    '/v1/portal/auth/register',
-    '/v1/portal/auth/refresh',
-    '/v1/portal/auth/verify-email',
-    '/v1/portal/auth/forgot-password',
-    '/v1/portal/auth/reset-password',
-    '/v1/portal/auth/mfa/verify',
-    '/v1/portal/auth/mfa/resend',
-    '/v1/portal/auth/attest/challenge',
-    '/v1/portal/auth/attest/register',
-  ]);
-  const CSRF_SKIP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
-
-  app.addHook('onRequest', async (request, reply) => {
-    const url = request.url.split('?')[0] ?? request.url;
-    if (!url.startsWith('/v1/portal/')) return;
-    if (CSRF_SKIP_METHODS.has(request.method)) return;
-    if (CSRF_SKIP_PATHS.has(url)) return;
-    if (url.startsWith('/v1/portal/guest/')) return;
-
-    // Bearer-authenticated, cookie-less clients (native mobile app) are not
-    // subject to CSRF: CSRF defends ambient cookie sessions, and a Bearer token
-    // is never auto-attached by a browser to a cross-site request. Requiring no
-    // portal_token cookie keeps CSRF in force for any cookie session.
-    const authz = request.headers.authorization;
-    if (
-      typeof authz === 'string' &&
-      authz.startsWith('Bearer ') &&
-      request.cookies['portal_token'] == null
-    ) {
-      return;
-    }
-
-    const cookieToken = request.cookies['portal_csrf'];
-    const headerToken = request.headers['x-csrf-token'];
-    if (
-      cookieToken == null ||
-      headerToken == null ||
-      typeof headerToken !== 'string' ||
-      cookieToken === '' ||
-      !csrfTokensMatch(cookieToken, headerToken)
-    ) {
-      await reply.status(403).send({ error: 'Invalid CSRF token', code: 'CSRF_INVALID' });
-    }
-  });
+  registerPortalCsrf(app);
 
   // CSRF validation for CSMS cookie-authenticated mutating requests
   const CSMS_CSRF_SKIP_PATHS = new Set([
@@ -450,116 +430,7 @@ export async function buildApp(opts: FastifyServerOptions = {}): Promise<Fastify
   });
 
   // Access log: record all API requests
-  const SKIP_LOG_PATHS = new Set([
-    '/v1/health',
-    '/v1/events',
-    // Long-lived SSE. Without this skip, every operator dashboard tab logs
-    // an access-log row each time the EventSource closes (network blip,
-    // navigation, reload), with a multi-hour `durationMs` that's
-    // meaningless. Path comes from packages/api/src/routes/events.ts.
-    '/v1/events/stream',
-    '/v1/access-logs',
-    '/v1/portal/access-logs',
-  ]);
-
-  app.addHook('onResponse', async (request, reply) => {
-    try {
-      const url = request.url;
-      if (!url.startsWith('/v1/')) return;
-      const pathOnly = url.split('?')[0] ?? url;
-      if (SKIP_LOG_PATHS.has(pathOnly)) return;
-
-      let userId: string | null = null;
-      let authType: string = 'anonymous';
-      let apiKeyName: string | null = null;
-      try {
-        const payload = request.user as unknown as Record<string, unknown> | undefined;
-        if (payload != null && typeof payload['userId'] === 'string') {
-          userId = payload['userId'];
-          if (payload['isApiKey'] === true) {
-            authType = 'api_key';
-            apiKeyName = typeof payload['apiKeyName'] === 'string' ? payload['apiKeyName'] : null;
-          } else {
-            authType = 'session';
-          }
-        }
-      } catch {
-        // Unauthenticated request
-      }
-
-      const hasBody = request.method !== 'GET' && request.method !== 'DELETE';
-      let metadata: Record<string, unknown> | undefined;
-      if (hasBody && request.body != null && typeof request.body === 'object') {
-        const SENSITIVE_KEYS = new Set([
-          'password',
-          'currentPassword',
-          'newPassword',
-          'confirmPassword',
-          'token',
-          'secret',
-          'secretKey',
-          'recaptchaToken',
-          'code',
-          'certificate',
-        ]);
-        const raw = request.body as Record<string, unknown>;
-        const sanitized: Record<string, unknown> = {};
-        // PATCH/PUT /v1/settings/<key> carries the secret in `value`. Per
-        // Principle 12 the runtime encrypts <key>Enc at rest, but the
-        // access log captured the plaintext request body. Operators with
-        // access-log read could read each others' newly-set SMTP passwords,
-        // Stripe keys, etc. for the retention window. Redact `value` on
-        // any settings PATCH/PUT so the access log keeps the audit trail
-        // (who/when/what-key) without the secret material.
-        const redactValue = pathOnly.startsWith('/v1/settings/');
-        for (const [k, v] of Object.entries(raw)) {
-          if (SENSITIVE_KEYS.has(k) || (redactValue && k === 'value')) {
-            sanitized[k] = '[REDACTED]';
-          } else {
-            sanitized[k] = v;
-          }
-        }
-        metadata = sanitized;
-      }
-
-      // Fire-and-forget so the onResponse hook doesn't keep the request
-      // alive waiting on an INSERT. Best-effort logging: failures are
-      // swallowed (.catch ignored), but the connection pool isn't held
-      // hostage by access-log writes under load.
-      void db
-        .insert(accessLogs)
-        .values({
-          userId,
-          action: `${request.method} ${pathOnly}`,
-          category: 'api',
-          authType,
-          apiKeyName,
-          method: request.method,
-          path: pathOnly,
-          statusCode: reply.statusCode,
-          durationMs: Math.round(reply.elapsedTime),
-          remoteAddress: request.ip,
-          userAgent: request.headers['user-agent'] ?? null,
-          metadata,
-        })
-        .catch(() => {
-          /* best-effort */
-        });
-
-      // Throttled SSE so the Access Logs 'api' tab reloads itself.
-      const now = Date.now();
-      if (now - lastApiAccessLogSsePublish >= API_ACCESS_LOG_SSE_THROTTLE_MS) {
-        lastApiAccessLogSsePublish = now;
-        void getPubSub()
-          .publish('csms_events', JSON.stringify({ eventType: 'access.log', category: 'api' }))
-          .catch(() => {
-            /* best-effort */
-          });
-      }
-    } catch {
-      // Best-effort logging: do not break responses
-    }
-  });
+  registerApiAccessLog(app);
 
   return app;
 }

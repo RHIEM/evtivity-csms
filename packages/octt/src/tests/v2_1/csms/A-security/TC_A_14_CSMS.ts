@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { TestCase, StepResult } from '../../../../types.js';
+import { OCTT_CSR, OCTT_SIGNED_CERTIFICATE_CHAIN } from '../../../../certificate-fixtures.js';
+import { signPendingCsr, waitFor } from '../../../../security-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 export const TC_A_14_CSMS: TestCase = {
   id: 'TC_A_14_CSMS',
@@ -45,7 +48,7 @@ export const TC_A_14_CSMS: TestCase = {
         // Step 6: Reject the certificate as invalid
         return { status: 'Rejected' };
       }
-      return { status: 'NotSupported' };
+      return defaultReply('ocpp2.1', action, payload);
     });
 
     // Wait for the CSMS to send TriggerMessage
@@ -70,7 +73,7 @@ export const TC_A_14_CSMS: TestCase = {
 
       // Step 2-3: Send SignCertificateRequest
       const signRes = await ctx.client.sendCall('SignCertificate', {
-        csr: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Z3VS5JJcds3xfn/ygWeCXIQP+cFgMB+no',
+        csr: OCTT_CSR,
         certificateType: 'ChargingStationCertificate',
       });
 
@@ -85,7 +88,9 @@ export const TC_A_14_CSMS: TestCase = {
       });
 
       // Step 5: Wait for CertificateSignedRequest from CSMS
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      // Manual action: the operator signs the queued CSR (manual PKI provider).
+      const signError = await signPendingCsr(ctx, OCTT_SIGNED_CERTIFICATE_CHAIN);
+      if (signError == null) await waitFor(() => certificateSignedReceived);
 
       steps.push({
         step: 3,
@@ -94,7 +99,7 @@ export const TC_A_14_CSMS: TestCase = {
         expected: 'CertificateSignedRequest received',
         actual: certificateSignedReceived
           ? 'CertificateSignedRequest received'
-          : 'No CertificateSignedRequest within timeout',
+          : (signError ?? 'No CertificateSignedRequest within timeout'),
       });
 
       // Step 6: CertificateSignedResponse with Rejected (handled above)
@@ -113,14 +118,14 @@ export const TC_A_14_CSMS: TestCase = {
             expected: 'SecurityEventNotificationResponse received',
             actual: resp4 != null ? 'Response received' : 'No response',
           });
-        } catch {
+        } catch (err) {
           steps.push({
             step: 4,
             description:
               'Send SecurityEventNotificationRequest with type InvalidChargingStationCertificate',
             status: 'failed',
             expected: 'SecurityEventNotificationResponse received',
-            actual: 'Error or rejection',
+            actual: err instanceof Error ? err.message : String(err),
           });
         }
       }
@@ -135,7 +140,7 @@ export const TC_A_14_CSMS: TestCase = {
     }
 
     return {
-      status: steps.every((s) => s.status === 'passed') ? 'passed' : 'failed',
+      status: steps.every((s) => s.status !== 'failed') ? 'passed' : 'failed',
       durationMs: 0,
       steps,
     };

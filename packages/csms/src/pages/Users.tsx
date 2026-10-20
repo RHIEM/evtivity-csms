@@ -83,7 +83,7 @@ export function UsersPage(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 [&>*]:w-full sm:flex-row sm:items-start sm:justify-between sm:[&>*]:w-auto">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">{t('users.title')}</h1>
           <p className="text-sm text-muted-foreground">{t('users.subtitle')}</p>
@@ -102,16 +102,15 @@ export function UsersPage(): React.JSX.Element {
             value={search}
             onDebouncedChange={setSearch}
             placeholder={t('users.searchPlaceholder')}
-            className="h-10 w-full"
+            className="w-full"
           />
         );
         const filters = (
           <>
             <div className="space-y-2">
-              <Label>{t('users.role')}</Label>
+              <Label className="leading-6">{t('users.role')}</Label>
               <Select
                 aria-label={t('users.role')}
-                className="h-10"
                 value={filterRoleId}
                 onChange={(e) => {
                   setFilterRoleId(e.target.value);
@@ -126,10 +125,9 @@ export function UsersPage(): React.JSX.Element {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{t('common.status')}</Label>
+              <Label className="leading-6">{t('common.status')}</Label>
               <Select
                 aria-label={t('common.status')}
-                className="h-10"
                 value={filterStatus}
                 onChange={(e) => {
                   setFilterStatus(e.target.value);
@@ -161,7 +159,7 @@ export function UsersPage(): React.JSX.Element {
               <div className="hidden items-end gap-4 md:flex">
                 <div className="grid flex-1 grid-cols-1 gap-4 md:grid-cols-3">
                   <div className="space-y-2">
-                    <Label>{t('users.search')}</Label>
+                    <Label className="leading-6">{t('users.search')}</Label>
                     {searchInput}
                   </div>
                   {filters}
@@ -214,7 +212,7 @@ export function UsersPage(): React.JSX.Element {
                 >
                   <TableCell className="text-muted-foreground">{user.id}</TableCell>
                   <TableCell
-                    className="font-medium text-primary whitespace-nowrap"
+                    className="font-medium text-link whitespace-nowrap"
                     data-testid="row-click-target"
                   >
                     {[user.firstName, user.lastName].filter(Boolean).join(' ') || '-'}

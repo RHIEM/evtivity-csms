@@ -6,12 +6,10 @@ import {
   hasPermission,
   isSubsetOf,
   hasAnySettingsPermission,
-  PERMISSIONS,
-  PAGE_PERMISSIONS,
-  SETTINGS_PERMISSIONS,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
-  PERMISSION_GROUPS,
+  createPermissionCatalog,
+  permissionCatalog,
+  PermissionCatalog,
+  AI_MCP_USE_PERMISSION,
 } from '../permissions.js';
 
 describe('hasPermission', () => {
@@ -92,75 +90,172 @@ describe('hasAnySettingsPermission', () => {
   });
 });
 
-describe('permission catalog constants', () => {
-  it('PERMISSIONS includes all page and settings permissions', () => {
-    expect(PERMISSIONS.length).toBe(PAGE_PERMISSIONS.length + SETTINGS_PERMISSIONS.length);
-    for (const p of PAGE_PERMISSIONS) {
-      expect(PERMISSIONS).toContain(p);
-    }
-    for (const p of SETTINGS_PERMISSIONS) {
-      expect(PERMISSIONS).toContain(p);
-    }
+describe('built-in permission catalog', () => {
+  const all = permissionCatalog.all();
+
+  it('holds 37 resources with read and write each', () => {
+    expect(permissionCatalog.groups()).toHaveLength(37);
+    expect(all).toHaveLength(74);
+    expect(new Set(all).size).toBe(all.length);
   });
 
-  it('all permissions follow resource:action format', () => {
-    for (const p of PERMISSIONS) {
+  it('lists every permission in resource:action format without wildcards', () => {
+    for (const p of all) {
       expect(p).toMatch(/^[\w.]+:(read|write)$/);
-    }
-  });
-
-  it('every resource has both read and write', () => {
-    const resources = new Set(PERMISSIONS.map((p) => p.replace(/:(read|write)$/, '')));
-    for (const r of resources) {
-      expect(PERMISSIONS).toContain(`${r}:read`);
-      expect(PERMISSIONS).toContain(`${r}:write`);
-    }
-  });
-
-  it('ADMIN_DEFAULT_PERMISSIONS includes all permissions', () => {
-    expect(ADMIN_DEFAULT_PERMISSIONS.length).toBe(PERMISSIONS.length);
-    for (const p of PERMISSIONS) {
-      expect(ADMIN_DEFAULT_PERMISSIONS).toContain(p);
-    }
-  });
-
-  it('OPERATOR_DEFAULT_PERMISSIONS is a subset of all permissions', () => {
-    for (const p of OPERATOR_DEFAULT_PERMISSIONS) {
-      expect(PERMISSIONS).toContain(p);
-    }
-  });
-
-  it('OPERATOR_DEFAULT_PERMISSIONS does not include users:write', () => {
-    expect(OPERATOR_DEFAULT_PERMISSIONS).not.toContain('users:write');
-  });
-
-  it('OPERATOR_DEFAULT_PERMISSIONS does not include any settings permissions', () => {
-    for (const p of OPERATOR_DEFAULT_PERMISSIONS) {
-      expect(p.startsWith('settings.')).toBe(false);
-    }
-  });
-
-  it('OPERATOR_DEFAULT_PERMISSIONS includes notifications read and write', () => {
-    expect(OPERATOR_DEFAULT_PERMISSIONS).toContain('notifications:read');
-    expect(OPERATOR_DEFAULT_PERMISSIONS).toContain('notifications:write');
-  });
-
-  it('no wildcards exist in any permission constant', () => {
-    for (const p of PERMISSIONS) {
-      expect(p).not.toContain('*');
-    }
-    for (const p of ADMIN_DEFAULT_PERMISSIONS) {
-      expect(p).not.toContain('*');
-    }
-    for (const p of OPERATOR_DEFAULT_PERMISSIONS) {
       expect(p).not.toContain('*');
     }
   });
 
-  it('PERMISSION_GROUPS covers all permissions', () => {
-    const grouped = PERMISSION_GROUPS.flatMap((g) => g.permissions);
-    for (const p of PERMISSIONS) {
-      expect(grouped).toContain(p);
+  it('gives every group its read and write permission, kind and label key', () => {
+    for (const g of permissionCatalog.groups()) {
+      expect(g.permissions).toEqual([`${g.resource}:read`, `${g.resource}:write`]);
+      expect(g.kind).toBe(g.resource.startsWith('settings.') ? 'settings' : 'page');
+      expect(g.labelKey).toBe(`users.permissionGroups.${g.resource}`);
     }
+  });
+
+  it('lists all permissions in group order', () => {
+    expect(all).toEqual(permissionCatalog.groups().flatMap((g) => [...g.permissions]));
+  });
+
+  it('knows its permissions and nothing else', () => {
+    expect(permissionCatalog.isKnown('stations:read')).toBe(true);
+    expect(permissionCatalog.isKnown('settings.payment:write')).toBe(true);
+    expect(permissionCatalog.isKnown('stations:delete')).toBe(false);
+    expect(permissionCatalog.isKnown('unknown:read')).toBe(false);
+    expect(permissionCatalog.isKnown('')).toBe(false);
+  });
+
+  it('gives admin every permission', () => {
+    expect(permissionCatalog.defaultsFor('admin')).toEqual(all);
+  });
+
+  it('gives operator operational access without settings or users:write', () => {
+    const operator = permissionCatalog.defaultsFor('operator');
+    expect(operator).toHaveLength(45);
+    expect(operator).toContain('aiAssistant:read');
+    expect(operator).toContain('aiAssistant:write');
+    expect(operator).not.toContain('users:write');
+    expect(operator.some((p) => p.startsWith('settings.'))).toBe(false);
+    expect(operator).toContain('notifications:read');
+    expect(operator).toContain('notifications:write');
+    expect(operator).toContain('conformance:read');
+    expect(operator).not.toContain('conformance:write');
+    for (const p of operator) expect(permissionCatalog.isKnown(p)).toBe(true);
+  });
+
+  it('gives viewer read-only access to every page but AI usage and MCP', () => {
+    const viewer = permissionCatalog.defaultsFor('viewer');
+    const pageReads = permissionCatalog
+      .groups()
+      .filter((g) => g.kind === 'page')
+      .map((g) => g.permissions[0])
+      .filter((p) => p !== 'aiUsage:read' && p !== 'aiMcp:read');
+    expect([...viewer].sort()).toEqual([...pageReads].sort());
+    // A viewer can read AI conversations but not chat (aiAssistant:write).
+    expect(viewer).toContain('aiAssistant:read');
+    expect(viewer).not.toContain('aiAssistant:write');
+  });
+
+  it('gives any other role the operator defaults', () => {
+    expect(permissionCatalog.defaultsFor('custom')).toEqual(
+      permissionCatalog.defaultsFor('operator'),
+    );
+    expect(permissionCatalog.defaultsFor(undefined)).toEqual(
+      permissionCatalog.defaultsFor('operator'),
+    );
+  });
+
+  it('returns copies callers cannot use to change the catalog', () => {
+    permissionCatalog.all().push('x:read');
+    permissionCatalog.defaultsFor('operator').push('x:read');
+    const [first] = permissionCatalog.groups();
+    if (first != null) first.resource = 'changed';
+    expect(permissionCatalog.all()).toHaveLength(74);
+    expect(permissionCatalog.defaultsFor('operator')).toHaveLength(45);
+    expect(permissionCatalog.groups()[0]?.resource).toBe('dashboard');
+  });
+});
+
+describe('PermissionCatalog.register', () => {
+  it('adds a resource with read and write, known and granted to admin', () => {
+    const catalog = createPermissionCatalog();
+    catalog.register({ resource: 'chargers', kind: 'page', labelKey: 'plugin.chargers' });
+    expect(catalog.isKnown('chargers:read')).toBe(true);
+    expect(catalog.isKnown('chargers:write')).toBe(true);
+    expect(catalog.groups().at(-1)).toEqual({
+      resource: 'chargers',
+      kind: 'page',
+      labelKey: 'plugin.chargers',
+      permissions: ['chargers:read', 'chargers:write'],
+    });
+    expect(catalog.defaultsFor('admin')).toContain('chargers:write');
+    expect(catalog.defaultsFor('operator')).not.toContain('chargers:read');
+    expect(permissionCatalog.isKnown('chargers:read')).toBe(false);
+  });
+
+  it('adds a settings resource', () => {
+    const catalog = new PermissionCatalog();
+    catalog.register({ resource: 'settings.plugin', kind: 'settings', labelKey: 'plugin.tab' });
+    expect(catalog.all()).toEqual(['settings.plugin:read', 'settings.plugin:write']);
+  });
+
+  it('refuses a duplicate resource', () => {
+    const catalog = createPermissionCatalog();
+    expect(() => {
+      catalog.register({ resource: 'stations', kind: 'page', labelKey: 'x' });
+    }).toThrow('already registered');
+  });
+
+  it('refuses a kind that does not match the settings prefix', () => {
+    const catalog = new PermissionCatalog();
+    expect(() => {
+      catalog.register({ resource: 'settings.plugin', kind: 'page', labelKey: 'x' });
+    }).toThrow('does not match kind');
+    expect(() => {
+      catalog.register({ resource: 'plugin', kind: 'settings', labelKey: 'x' });
+    }).toThrow('does not match kind');
+  });
+
+  it('refuses a resource name that is not a plain identifier', () => {
+    const catalog = new PermissionCatalog();
+    for (const resource of ['', 'a:b', 'a*', 'Plugin', 'a.b', 'settings.', 'a b']) {
+      expect(() => {
+        catalog.register({ resource, kind: 'page', labelKey: 'x' });
+      }).toThrow('Invalid permission resource');
+    }
+  });
+});
+
+describe('AI roadmap permissions (TC-AI-C-12)', () => {
+  it('registers the insight group: operators read and write, viewers read', () => {
+    expect(permissionCatalog.isKnown('aiInsights:read')).toBe(true);
+    expect(permissionCatalog.isKnown('aiInsights:write')).toBe(true);
+    const operator = permissionCatalog.defaultsFor('operator');
+    expect(operator).toContain('aiInsights:read');
+    expect(operator).toContain('aiInsights:write');
+    const viewer = permissionCatalog.defaultsFor('viewer');
+    expect(viewer).toContain('aiInsights:read');
+    expect(viewer).not.toContain('aiInsights:write');
+  });
+
+  it('TC-AI-IA-06 registers the usage and MCP groups, and no AI Inbox proposal permission', () => {
+    expect(permissionCatalog.isKnown('aiProposals:read')).toBe(false);
+    expect(permissionCatalog.isKnown('aiProposals:write')).toBe(false);
+    for (const p of ['aiUsage:read', 'aiMcp:read', 'aiMcp:write']) {
+      expect(permissionCatalog.isKnown(p)).toBe(true);
+    }
+    expect(AI_MCP_USE_PERMISSION).toBe('aiMcp:read');
+  });
+
+  it('gives operators every AI permission but aiUsage:write, viewers no usage or MCP', () => {
+    const operator = permissionCatalog.defaultsFor('operator');
+    expect(operator.filter((p) => /^ai(Usage|Mcp):/.test(p)).sort()).toEqual([
+      'aiMcp:read',
+      'aiMcp:write',
+      'aiUsage:read',
+    ]);
+    const viewer = permissionCatalog.defaultsFor('viewer');
+    expect(viewer.filter((p) => /^ai(Usage|Mcp):/.test(p))).toEqual([]);
   });
 });

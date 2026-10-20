@@ -4,8 +4,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, desc, sql, and } from 'drizzle-orm';
-import * as argon2 from 'argon2';
-import { randomBytes } from 'node:crypto';
 import {
   db,
   ocpiPartners,
@@ -14,6 +12,7 @@ import {
   ocpiSyncLog,
   writeAudit,
   ocpiPartnerAuditLog,
+  issueOcpiRegistrationToken,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -27,10 +26,11 @@ import {
   errorWith,
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { isPrivateUrl, encryptString } from '@evtivity/lib';
-import { getPubSub } from '../lib/pubsub.js';
+import { isPrivateUrl, encryptString, OCPI_PULL_MODULES } from '@evtivity/lib';
+import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { config as apiConfig } from '../lib/config.js';
 import { authorize } from '../middleware/rbac.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
 
 const ocpiPartnerItem = z
   .object({
@@ -45,6 +45,16 @@ const ocpiPartnerItem = z
       .describe('Partner connection status'),
     version: z.string().max(20).nullable().describe('Negotiated OCPI version'),
     versionUrl: z.string().max(2048).nullable().describe('OCPI versions endpoint URL'),
+    allowPrivateNetwork: z
+      .boolean()
+      .describe(
+        'True when outbound OCPI requests and command callbacks to this partner may reach loopback and private addresses (private peering, local simulators). False: public addresses only.',
+      ),
+    allowRawToken: z
+      .boolean()
+      .describe(
+        'True when this partner may send its credentials token without Base64 encoding (OCPI 2.1.1 and 2.2 peers) and gets ours the same way. False: Base64 only (OCPI 2.2-d2 and later).',
+      ),
     hasPartnerRegistrationToken: z
       .boolean()
       .describe(
@@ -65,6 +75,8 @@ interface PartnerRow {
   status: 'pending' | 'connected' | 'suspended' | 'disconnected';
   version: string | null;
   versionUrl: string | null;
+  allowPrivateNetwork: boolean;
+  allowRawToken: boolean;
   partnerRegistrationTokenEnc: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -122,6 +134,18 @@ const createPartnerBody = z.object({
   countryCode: z.string().length(2).describe('ISO 3166-1 alpha-2 country code'),
   partyId: z.string().min(1).max(3).describe('OCPI party identifier'),
   versionUrl: z.string().url().max(2048).optional().describe('OCPI versions endpoint URL'),
+  allowPrivateNetwork: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow outbound OCPI requests and command callbacks to this partner to reach loopback and private addresses. Default false (public addresses only).',
+    ),
+  allowRawToken: z
+    .boolean()
+    .optional()
+    .describe(
+      "Accept this partner's credentials token without Base64 encoding and send ours the same way (OCPI 2.1.1 and 2.2 peers). Default false.",
+    ),
   partnerRegistrationToken: z
     .string()
     .min(1)
@@ -137,8 +161,22 @@ const updatePartnerBody = z.object({
   status: z
     .enum(['pending', 'connected', 'suspended', 'disconnected'])
     .optional()
-    .describe('Partner connection status'),
+    .describe(
+      'Partner connection status. connected only resumes a suspended partner that completed the credentials handshake; a partner becomes connected through the handshake.',
+    ),
   versionUrl: z.string().url().max(2048).optional().describe('OCPI versions endpoint URL'),
+  allowPrivateNetwork: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow outbound OCPI requests and command callbacks to this partner to reach loopback and private addresses. Default false (public addresses only).',
+    ),
+  allowRawToken: z
+    .boolean()
+    .optional()
+    .describe(
+      "Accept this partner's credentials token without Base64 encoding and send ours the same way (OCPI 2.1.1 and 2.2 peers). Default false.",
+    ),
   partnerRegistrationToken: z
     .string()
     .min(1)
@@ -149,16 +187,45 @@ const updatePartnerBody = z.object({
     ),
 });
 
+const registrationTokenResponse = z
+  .object({
+    registrationToken: z
+      .string()
+      .max(255)
+      .describe('New one-time registration token to share with the partner'),
+  })
+  .passthrough();
+
+/** Whether the partner holds an active credentials token we issued (it registered). */
+async function hasIssuedCredentialsToken(partnerId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: ocpiCredentialsTokens.id })
+    .from(ocpiCredentialsTokens)
+    .where(
+      and(
+        eq(ocpiCredentialsTokens.partnerId, partnerId),
+        eq(ocpiCredentialsTokens.direction, 'issued'),
+        eq(ocpiCredentialsTokens.kind, 'credentials'),
+        eq(ocpiCredentialsTokens.isActive, true),
+      ),
+    )
+    .limit(1);
+  return row != null;
+}
+
 const syncParams = z.object({
   id: ID_PARAMS.ocpiPartnerId.describe('OCPI partner ID'),
   module: z
-    .enum(['locations', 'tariffs', 'cdrs', 'tokens', 'sessions'])
-    .describe('OCPI module name to sync'),
+    .enum(OCPI_PULL_MODULES)
+    .describe('OCPI module to pull from the partner (locations, tariffs, or cdrs)'),
 });
 
 const syncLogQuery = paginationQuery.extend({
   partnerId: ID_PARAMS.ocpiPartnerId.optional().describe('Filter sync logs by partner ID'),
 });
+
+// OCPI partners are company-wide roaming configuration: site-restricted users get 404.
+const PARTNER_SCOPE_NOT_FOUND = { error: 'Partner not found', code: 'PARTNER_NOT_FOUND' } as const;
 
 export function ocpiPartnerRoutes(app: FastifyInstance): void {
   // GET /ocpi/partners - list partners
@@ -172,10 +239,14 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         operationId: 'listOcpiPartners',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(paginationQuery),
-        response: { 200: paginatedResponse(ocpiPartnerItem) },
+        response: {
+          200: paginatedResponse(ocpiPartnerItem),
+          404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { page, limit, search } = request.query as z.infer<typeof paginationQuery>;
       const offset = (page - 1) * limit;
 
@@ -227,6 +298,7 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof partnerParams>;
 
       const [partner] = await db
@@ -263,12 +335,14 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         response: {
           201: itemResponse(createPartnerResponse),
           400: errorWith('Private url', [ERROR_CODES.PRIVATE_URL]),
+          404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
           409: errorWith('Duplicate partner', [ERROR_CODES.DUPLICATE_PARTNER]),
           500: errorWith('Internal error', [ERROR_CODES.INTERNAL_ERROR]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof createPartnerBody>;
 
       // Check for duplicate
@@ -291,7 +365,8 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         return;
       }
 
-      if (body.versionUrl != null && isPrivateUrl(body.versionUrl)) {
+      const allowPrivateNetwork = body.allowPrivateNetwork ?? false;
+      if (body.versionUrl != null && !allowPrivateNetwork && isPrivateUrl(body.versionUrl)) {
         await reply.status(400).send({
           error: 'Version URL must not point to a private or internal address',
           code: 'PRIVATE_URL',
@@ -304,36 +379,36 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
           ? encryptString(body.partnerRegistrationToken, apiConfig.SETTINGS_ENCRYPTION_KEY)
           : null;
 
-      const [partner] = await db
-        .insert(ocpiPartners)
-        .values({
-          name: body.name,
-          countryCode: body.countryCode,
-          partyId: body.partyId,
-          versionUrl: body.versionUrl,
-          status: 'pending',
-          roles: [],
-          ourRoles: [],
-          partnerRegistrationTokenEnc,
-        })
-        .returning();
+      // The partner and its registration token commit together. The token is
+      // bound to the partner: the OCPI server accepts it on versions,
+      // version details and credentials only, for this country code and
+      // party id.
+      const created = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .insert(ocpiPartners)
+          .values({
+            name: body.name,
+            countryCode: body.countryCode,
+            partyId: body.partyId,
+            versionUrl: body.versionUrl,
+            allowPrivateNetwork,
+            allowRawToken: body.allowRawToken ?? false,
+            status: 'pending',
+            roles: [],
+            ourRoles: [],
+            partnerRegistrationTokenEnc,
+          })
+          .returning();
+        if (row == null) return null;
+        const token = await issueOcpiRegistrationToken(row.id, tx);
+        return { partner: row, registrationToken: token };
+      });
 
-      if (partner == null) {
+      if (created == null) {
         await reply.status(500).send({ error: 'Failed to create partner', code: 'INTERNAL_ERROR' });
         return;
       }
-
-      // Generate registration token for the partner to use
-      const registrationToken = randomBytes(32).toString('hex');
-      const tokenHash = await argon2.hash(registrationToken);
-
-      await db.insert(ocpiCredentialsTokens).values({
-        partnerId: partner.id,
-        tokenHash,
-        tokenPrefix: registrationToken.slice(0, 8),
-        direction: 'received',
-        isActive: true,
-      });
+      const { partner, registrationToken } = created;
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -372,10 +447,12 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
           200: itemResponse(ocpiPartnerItem),
           400: errorWith('Private url', [ERROR_CODES.PRIVATE_URL]),
           404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
+          409: errorWith('Partner not registered', [ERROR_CODES.PARTNER_NOT_REGISTERED]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof partnerParams>;
       const body = request.body as z.infer<typeof updatePartnerBody>;
 
@@ -388,10 +465,25 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         return;
       }
 
-      if (body.versionUrl != null && isPrivateUrl(body.versionUrl)) {
+      const allowPrivateNetwork = body.allowPrivateNetwork ?? before.allowPrivateNetwork;
+      if (body.versionUrl != null && !allowPrivateNetwork && isPrivateUrl(body.versionUrl)) {
         await reply.status(400).send({
           error: 'Version URL must not point to a private or internal address',
           code: 'PRIVATE_URL',
+        });
+        return;
+      }
+
+      // A partner becomes connected through the credentials handshake. By
+      // hand, connected only resumes a suspended partner that registered.
+      if (
+        body.status === 'connected' &&
+        before.status !== 'connected' &&
+        (before.status !== 'suspended' || !(await hasIssuedCredentialsToken(id)))
+      ) {
+        await reply.status(409).send({
+          error: 'A partner becomes connected through the OCPI credentials handshake',
+          code: 'PARTNER_NOT_REGISTERED',
         });
         return;
       }
@@ -400,6 +492,12 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
       if (body.name != null) updateData['name'] = body.name;
       if (body.status != null) updateData['status'] = body.status;
       if (body.versionUrl != null) updateData['versionUrl'] = body.versionUrl;
+      if (body.allowPrivateNetwork != null) {
+        updateData['allowPrivateNetwork'] = body.allowPrivateNetwork;
+      }
+      if (body.allowRawToken != null) {
+        updateData['allowRawToken'] = body.allowRawToken;
+      }
       if (body.partnerRegistrationToken != null) {
         updateData['partnerRegistrationTokenEnc'] = encryptString(
           body.partnerRegistrationToken,
@@ -452,6 +550,7 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof partnerParams>;
 
       const [existing] = await db
@@ -512,10 +611,12 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
           200: successResponse,
           400: errorWith('Missing version url', [ERROR_CODES.MISSING_VERSION_URL]),
           404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
+          409: errorWith('Partner already connected', [ERROR_CODES.PARTNER_ALREADY_CONNECTED]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof partnerParams>;
 
       const [partner] = await db
@@ -526,6 +627,14 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
 
       if (partner == null) {
         await reply.status(404).send({ error: 'Partner not found', code: 'PARTNER_NOT_FOUND' });
+        return;
+      }
+
+      if (partner.status === 'connected') {
+        await reply.status(409).send({
+          error: 'Partner is already connected',
+          code: 'PARTNER_ALREADY_CONNECTED',
+        });
         return;
       }
 
@@ -544,20 +653,88 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         JSON.stringify({ partnerId: id, versionUrl: partner.versionUrl }),
       );
 
+      // The request only: the OCPI server writes `registered` when the
+      // handshake completes.
       const actor = getAuditActor(request);
       await writeAudit(
         { table: ocpiPartnerAuditLog, idColumn: 'ocpi_partner_id' },
         {
           entityId: id,
           entityIdSnapshot: id,
-          action: 'registered',
+          action: 'updated',
           ...actor,
+          notes: 'Outbound registration requested',
         },
         db,
         request.log,
       );
 
       return { success: true };
+    },
+  );
+
+  // POST /ocpi/partners/:id/registration-token - a new registration token
+  app.post(
+    '/ocpi/partners/:id/registration-token',
+    {
+      onRequest: [authorize('roaming:write')],
+      schema: {
+        tags: ['OCPI'],
+        summary: 'Issue a new OCPI registration token',
+        description:
+          'Retires the open registration tokens of a partner that is not connected and returns a new one, shown once. The partner registers with it (POST credentials); it is accepted on versions, version details and credentials only, for the partner country code and party id. 409 PARTNER_ALREADY_CONNECTED for a connected partner.',
+        operationId: 'issueOcpiPartnerRegistrationToken',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(partnerParams),
+        response: {
+          201: itemResponse(registrationTokenResponse),
+          404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
+          409: errorWith('Partner already connected', [ERROR_CODES.PARTNER_ALREADY_CONNECTED]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof partnerParams>;
+
+      const result = await db.transaction(async (tx) => {
+        const [partner] = await tx
+          .select({ id: ocpiPartners.id, status: ocpiPartners.status })
+          .from(ocpiPartners)
+          .where(eq(ocpiPartners.id, id))
+          .for('update');
+        if (partner == null) return 'not_found' as const;
+        if (partner.status === 'connected') return 'connected' as const;
+        return { token: await issueOcpiRegistrationToken(id, tx) };
+      });
+
+      if (result === 'not_found') {
+        await reply.status(404).send({ error: 'Partner not found', code: 'PARTNER_NOT_FOUND' });
+        return;
+      }
+      if (result === 'connected') {
+        await reply.status(409).send({
+          error: 'Partner is already connected',
+          code: 'PARTNER_ALREADY_CONNECTED',
+        });
+        return;
+      }
+
+      const actor = getAuditActor(request);
+      await writeAudit(
+        { table: ocpiPartnerAuditLog, idColumn: 'ocpi_partner_id' },
+        {
+          entityId: id,
+          entityIdSnapshot: id,
+          action: 'updated',
+          ...actor,
+          notes: 'Registration token issued',
+        },
+        db,
+        request.log,
+      );
+
+      await reply.status(201).send({ registrationToken: result.token });
     },
   );
 
@@ -570,7 +747,7 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         tags: ['OCPI'],
         summary: 'Trigger manual OCPI module sync',
         description:
-          'Publishes an ocpi_sync event so the OCPI server pulls the requested module (locations, tariffs, cdrs, tokens) from the partner sender endpoint. Results are upserted into the corresponding ocpi_external_* tables. Returns immediately; track sync progress via the sync log endpoint.',
+          'Publishes an ocpi_sync event so the OCPI server pulls the requested module (locations, tariffs, or cdrs) from the partner sender endpoint. Locations and tariffs are upserted into ocpi_external_locations and ocpi_external_tariffs; CDRs not stored yet are inserted into ocpi_cdrs. Any other module returns 400 VALIDATION_ERROR. Returns immediately; track sync progress via the sync log endpoint.',
         operationId: 'syncOcpiPartnerModule',
         security: [{ bearerAuth: [] }],
         params: zodSchema(syncParams),
@@ -582,6 +759,7 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { id, module } = request.params as z.infer<typeof syncParams>;
 
       const [partner] = await db
@@ -635,10 +813,14 @@ export function ocpiPartnerRoutes(app: FastifyInstance): void {
         operationId: 'listOcpiSyncLog',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(syncLogQuery),
-        response: { 200: paginatedResponse(syncLogItem) },
+        response: {
+          200: paginatedResponse(syncLogItem),
+          404: errorWith('Partner not found', [ERROR_CODES.PARTNER_NOT_FOUND]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, PARTNER_SCOPE_NOT_FOUND))) return;
       const { page, limit, partnerId } = request.query as z.infer<typeof syncLogQuery>;
       const offset = (page - 1) * limit;
 

@@ -51,6 +51,13 @@ function makeChain() {
 }
 
 vi.mock('@evtivity/database', () => ({
+  writeAudit: vi.fn(() => Promise.resolve()),
+  userAuditLog: { _table: 'user_audit_log' },
+  driverAuditLog: { _table: 'driver_audit_log' },
+  stationAuditLog: { _table: 'station_audit_log' },
+  sessionAuditLog: { _table: 'session_audit_log' },
+  apiKeyAuditLog: { _table: 'api_key_audit_log' },
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -68,10 +75,11 @@ vi.mock('@evtivity/database', () => ({
     }),
   },
   client: {},
-  drivers: {},
+  drivers: { passwordHash: 'drivers.password_hash', registrationSource: 'drivers.source' },
   userTokens: {},
   getRecaptchaConfig: vi.fn().mockResolvedValue(null),
   isPortalRegistrationEnabled: vi.fn().mockResolvedValue(true),
+  resolveAccountBilling: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -80,6 +88,8 @@ vi.mock('drizzle-orm', () => ({
   or: vi.fn(),
   ilike: vi.fn(),
   isNull: vi.fn(),
+  isNotNull: vi.fn(),
+  gt: vi.fn(),
   sql: vi.fn(),
   desc: vi.fn(),
   count: vi.fn(),
@@ -94,12 +104,22 @@ vi.mock('argon2', () => ({
 }));
 
 vi.mock('@evtivity/lib', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  AppError: class AppError extends Error {
+    constructor(
+      message: string,
+      public readonly statusCode: number,
+      public readonly code: string,
+    ) {
+      super(message);
+    }
+  },
   dispatchDriverNotification: vi.fn(),
   dispatchSystemNotification: vi.fn().mockResolvedValue(undefined),
   verifyRecaptcha: vi.fn().mockResolvedValue({ success: true }),
   decryptString: vi.fn().mockReturnValue('decrypted'),
   createMfaChallenge: vi.fn().mockResolvedValue({ challengeId: 1, code: '123456' }),
-  verifyMfaChallenge: vi.fn().mockResolvedValue(true),
+  verifyMfaChallenge: vi.fn().mockResolvedValue('verified'),
   verifyTotpCode: vi.fn().mockReturnValue(true),
 }));
 
@@ -111,29 +131,75 @@ vi.mock('../services/refresh-token.service.js', () => ({
   revokeRefreshToken: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
   })),
 }));
 
-vi.mock('../lib/template-dirs.js', () => ({
+vi.mock('@evtivity/services/template-dirs', () => ({
   ALL_TEMPLATES_DIRS: ['/mock/templates'],
   API_TEMPLATES_DIR: '/mock/templates',
   OCPP_TEMPLATES_DIR: '/mock/templates',
 }));
 
+const signupLimits = vi.hoisted(() => ({
+  registrationPhone: vi.fn((phone: string | undefined) =>
+    phone == null || phone === '' ? null : phone,
+  ),
+  isPhoneRegistrationLimited: vi.fn().mockResolvedValue(false),
+  verificationResendRetryAfter: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../lib/signup-limits.js', () => signupLimits);
+
+const { activateDriverPortalMock } = vi.hoisted(() => ({
+  activateDriverPortalMock: vi.fn(),
+}));
+
+vi.mock('../services/driver-portal-access.service.js', () => ({
+  activateDriverPortal: activateDriverPortalMock,
+}));
+
+import { eq, isNotNull } from 'drizzle-orm';
+import { AppError, dispatchSystemNotification } from '@evtivity/lib';
+import { db, resolveAccountBilling, writeAudit, driverAuditLog } from '@evtivity/database';
 import { registerAuth } from '../plugins/auth.js';
 import { portalAuthRoutes } from '../routes/portal/auth.js';
+import * as argon2Module from 'argon2';
+
+/** The audit rows written through the mocked writeAudit: [table, args]. */
+function auditCalls(): { table: unknown; args: Record<string, unknown> }[] {
+  return vi.mocked(writeAudit).mock.calls.map(([config, args]) => ({
+    table: (config as { table: unknown }).table,
+    args: args as unknown as Record<string, unknown>,
+  }));
+}
 
 const VALID_DRIVER_ID = 'drv_000000000001';
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
+// The billing address columns of a driver row (GET /v1/portal/auth/me).
+const NO_BILLING_ADDRESS = {
+  billingName: null,
+  billingStreet: null,
+  billingCity: null,
+  billingState: null,
+  billingZip: null,
+  billingCountry: null,
+};
 const DRIVER_ID = 'drv_000000000001';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof AppError) {
+      void reply.status(error.statusCode).send({ error: error.message, code: error.code });
+      return;
+    }
+    void reply.send(error);
+  });
   await app.register(cookie, { secret: 'test-cookie-secret-12345' });
   await registerAuth(app);
   await app.register(portalAuthRoutes);
@@ -180,6 +246,7 @@ describe('Portal auth routes - handler logic', () => {
 
   beforeEach(() => {
     setupDbResults();
+    vi.mocked(writeAudit).mockClear();
   });
 
   describe('POST /v1/portal/auth/register', () => {
@@ -223,8 +290,16 @@ describe('Portal auth routes - handler logic', () => {
       expect(response.statusCode).toBe(400);
     });
 
-    it('returns 409 when email already registered', async () => {
-      setupDbResults([{ id: VALID_DRIVER_ID }]);
+    it('answers 202 for an already registered email, like a new one', async () => {
+      setupDbResults([
+        {
+          id: VALID_DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'existing@example.com',
+          language: 'en',
+        },
+      ]);
       const response = await app.inject({
         method: 'POST',
         url: '/portal/auth/register',
@@ -235,11 +310,12 @@ describe('Portal auth routes - handler logic', () => {
           password: 'TestPassword1',
         },
       });
-      expect(response.statusCode).toBe(409);
-      expect(response.json().code).toBe('EMAIL_EXISTS');
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toEqual({ success: true });
+      expect(auditCalls()).toEqual([]);
     });
 
-    it('registers a new driver and sets auth cookies', async () => {
+    it('registers a new driver without signing in', async () => {
       const driverRow = {
         id: DRIVER_ID,
         firstName: 'John',
@@ -250,11 +326,12 @@ describe('Portal auth routes - handler logic', () => {
         timezone: 'America/New_York',
         themePreference: 'light',
         distanceUnit: 'miles',
+        priceDisplay: null,
         isActive: true,
         emailVerified: false,
         createdAt: '2024-01-01',
       };
-      setupDbResults([], [driverRow], []);
+      setupDbResults([], [driverRow], [], []);
       const response = await app.inject({
         method: 'POST',
         url: '/portal/auth/register',
@@ -265,19 +342,24 @@ describe('Portal auth routes - handler logic', () => {
           password: 'TestPassword1',
         },
       });
-      expect(response.statusCode).toBe(201);
-      const body = response.json();
-      expect(body.token).toBeUndefined();
-      expect(body.driver.id).toBe(DRIVER_ID);
-      expect(body.driver.firstName).toBe('John');
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toEqual({ success: true });
+      expect(auditCalls()).toEqual([
+        {
+          table: driverAuditLog,
+          args: expect.objectContaining({
+            entityId: DRIVER_ID,
+            action: 'created',
+            actor: 'driver',
+            actorDriverId: DRIVER_ID,
+          }),
+        },
+      ]);
 
+      // The driver signs in after opening the verification link.
       const cookies = parseCookies(response);
-      expect(cookies.has('portal_token')).toBe(true);
-      expect(cookies.get('portal_token')?.httpOnly).toBe(true);
-      expect(cookies.has('portal_refresh')).toBe(true);
-      expect(cookies.get('portal_refresh')?.httpOnly).toBe(true);
-      expect(cookies.has('portal_csrf')).toBe(true);
-      expect(cookies.get('portal_csrf')?.httpOnly).toBe(false);
+      expect(cookies.has('portal_token')).toBe(false);
+      expect(cookies.has('portal_refresh')).toBe(false);
     });
 
     it('returns 500 when insert returns no rows', async () => {
@@ -321,6 +403,36 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(401);
       expect(response.json().code).toBe('INVALID_CREDENTIALS');
+      // An unknown email has no driver to key on: no audit row.
+      expect(auditCalls()).toEqual([]);
+      // A password check still runs (against a dummy hash), so the answer
+      // takes as long as a wrong password and does not reveal the email.
+      expect(argon2Module.default.verify).toHaveBeenCalledWith(expect.any(String), 'TestPassword1');
+    });
+
+    it('records a refused login on an inactive driver', async () => {
+      // The active-account lookup finds nothing; the email names an inactive driver.
+      setupDbResults([], [{ id: DRIVER_ID, isActive: false }]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/login',
+        headers: { 'user-agent': 'portal-test' },
+        payload: { email: 'john@example.com', password: 'TestPassword1' },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(auditCalls()).toEqual([
+        {
+          table: driverAuditLog,
+          args: expect.objectContaining({
+            entityId: DRIVER_ID,
+            action: 'login_failed',
+            actor: 'system',
+            actorLabel: 'login',
+            notes: 'inactive',
+            after: { method: 'password', ip: '127.0.0.1', userAgent: 'portal-test' },
+          }),
+        },
+      ]);
     });
 
     it('returns 401 when driver has no password hash', async () => {
@@ -352,7 +464,7 @@ describe('Portal auth routes - handler logic', () => {
     });
 
     it('returns 401 when password is invalid', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(false);
 
       setupDbResults([
@@ -380,10 +492,19 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(401);
       expect(response.json().code).toBe('INVALID_CREDENTIALS');
+      const [row] = auditCalls();
+      expect(row?.args).toMatchObject({
+        entityId: DRIVER_ID,
+        action: 'login_failed',
+        actor: 'system',
+        notes: 'bad_password',
+      });
+      // Never the password.
+      expect(JSON.stringify(row?.args)).not.toContain('WrongPassword1');
     });
 
     it('returns driver and sets auth cookies on successful login', async () => {
-      const argon2 = await import('argon2');
+      const argon2 = argon2Module;
       vi.mocked(argon2.default.verify).mockResolvedValueOnce(true);
 
       setupDbResults([
@@ -398,6 +519,7 @@ describe('Portal auth routes - handler logic', () => {
           timezone: 'America/New_York',
           themePreference: 'light',
           distanceUnit: 'miles',
+          priceDisplay: null,
           isActive: true,
           emailVerified: true,
           createdAt: '2024-01-01',
@@ -418,6 +540,18 @@ describe('Portal auth routes - handler logic', () => {
       expect(body.driver.id).toBe(DRIVER_ID);
       expect(body.driver.email).toBe('john@example.com');
       expect(body.driver.firstName).toBe('John');
+      expect(auditCalls()).toEqual([
+        {
+          table: driverAuditLog,
+          args: expect.objectContaining({
+            entityId: DRIVER_ID,
+            action: 'login_succeeded',
+            actor: 'driver',
+            actorDriverId: DRIVER_ID,
+            after: expect.objectContaining({ method: 'password' }),
+          }),
+        },
+      ]);
 
       const cookies = parseCookies(response);
       expect(cookies.has('portal_token')).toBe(true);
@@ -426,6 +560,106 @@ describe('Portal auth routes - handler logic', () => {
       expect(cookies.get('portal_refresh')?.httpOnly).toBe(true);
       expect(cookies.has('portal_csrf')).toBe(true);
       expect(cookies.get('portal_csrf')?.httpOnly).toBe(false);
+    });
+  });
+
+  describe('portal access requires a password', () => {
+    const sourceFilter = (): unknown[] =>
+      vi.mocked(eq).mock.calls.filter(([column]) => (column as unknown) === 'drivers.source');
+
+    it('login looks up only drivers with a password, whatever their origin', async () => {
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/login',
+        payload: { email: 'admin-created@example.com', password: 'TestPassword1' },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(isNotNull).toHaveBeenCalledWith('drivers.password_hash');
+      expect(sourceFilter()).toHaveLength(0);
+    });
+
+    it('forgot-password sends nothing to a driver without a password', async () => {
+      setupDbResults([]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/forgot-password',
+        payload: { email: 'admin-created@example.com' },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true });
+      expect(isNotNull).toHaveBeenCalledWith('drivers.password_hash');
+      expect(sourceFilter()).toHaveLength(0);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('forgot-password issues a reset token to a driver with a password', async () => {
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          language: 'en',
+          phone: null,
+        },
+      ]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/forgot-password',
+        payload: { email: 'john@example.com' },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(db.insert).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('POST /v1/portal/auth/activate', () => {
+    const STRONG = 'Str0ng!Password';
+
+    it('activates with the token and password', async () => {
+      activateDriverPortalMock.mockResolvedValueOnce(undefined);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/activate',
+        payload: { token: 'raw-token', password: STRONG },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true });
+      expect(activateDriverPortalMock).toHaveBeenCalledWith('raw-token', STRONG, expect.anything());
+    });
+
+    it.each(['INVALID_TOKEN', 'WEAK_PASSWORD'])('returns 400 %s from the service', async (code) => {
+      activateDriverPortalMock.mockRejectedValueOnce(new AppError('rejected', 400, code));
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/activate',
+        payload: { token: 'raw-token', password: STRONG },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe(code);
+    });
+
+    it('rejects a missing token or short password before calling the service', async () => {
+      for (const payload of [{ password: STRONG }, { token: 'raw-token', password: 'short' }]) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/portal/auth/activate',
+          payload,
+        });
+        expect(response.statusCode).toBe(400);
+      }
+      expect(activateDriverPortalMock).not.toHaveBeenCalled();
+    });
+
+    it('does not require a driver session', async () => {
+      activateDriverPortalMock.mockResolvedValueOnce(undefined);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/activate',
+        payload: { token: 'raw-token', password: STRONG },
+      });
+      expect(response.statusCode).not.toBe(401);
     });
   });
 
@@ -487,9 +721,11 @@ describe('Portal auth routes - handler logic', () => {
           timezone: 'America/New_York',
           themePreference: 'light',
           distanceUnit: 'miles',
+          priceDisplay: null,
           isActive: true,
           emailVerified: true,
           createdAt: '2024-01-01',
+          ...NO_BILLING_ADDRESS,
         },
       ]);
       const response = await app.inject({
@@ -524,9 +760,11 @@ describe('Portal auth routes - handler logic', () => {
           timezone: 'America/New_York',
           themePreference: 'light',
           distanceUnit: 'miles',
+          priceDisplay: null,
           isActive: true,
           emailVerified: true,
           createdAt: '2024-01-01',
+          ...NO_BILLING_ADDRESS,
         },
       ]);
       const response = await app.inject({
@@ -538,6 +776,87 @@ describe('Portal auth routes - handler logic', () => {
       const body = response.json();
       expect(body.id).toBe(DRIVER_ID);
       expect(body.email).toBe('john@example.com');
+      expect(body.billing).toEqual({ mode: 'card', fleetName: null, invoicedTo: null });
+    });
+
+    it('returns the billing address with the profile', async () => {
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'Erika',
+          lastName: 'Muster',
+          email: 'erika@example.com',
+          phone: null,
+          language: 'de',
+          timezone: null,
+          themePreference: 'light',
+          distanceUnit: 'km',
+          priceDisplay: null,
+          isActive: true,
+          emailVerified: true,
+          createdAt: '2024-01-01',
+          billingName: null,
+          billingStreet: 'Hauptstrasse 1',
+          billingCity: 'Berlin',
+          billingState: null,
+          billingZip: '10115',
+          billingCountry: 'Germany',
+        },
+      ]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/auth/me',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.billingAddress).toEqual({
+        billingName: null,
+        billingStreet: 'Hauptstrasse 1',
+        billingCity: 'Berlin',
+        billingState: null,
+        billingZip: '10115',
+        billingCountry: 'Germany',
+      });
+      expect(body).not.toHaveProperty('billingCity');
+    });
+
+    it('returns account billing for a driver whose fleet bills on account', async () => {
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          phone: null,
+          language: 'en',
+          timezone: null,
+          themePreference: 'light',
+          distanceUnit: 'miles',
+          priceDisplay: null,
+          isActive: true,
+          emailVerified: true,
+          createdAt: '2024-01-01',
+          ...NO_BILLING_ADDRESS,
+        },
+      ]);
+      vi.mocked(resolveAccountBilling).mockResolvedValueOnce({
+        fleetId: 'flt_1',
+        fleetName: 'Acme Logistics',
+        recipient: 'fleet',
+      });
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/auth/me',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().billing).toEqual({
+        mode: 'account',
+        fleetName: 'Acme Logistics',
+        invoicedTo: 'fleet',
+      });
+      expect(resolveAccountBilling).toHaveBeenCalledWith(expect.anything(), DRIVER_ID);
     });
   });
 
@@ -562,8 +881,10 @@ describe('Portal auth routes - handler logic', () => {
       expect(response.json().code).toBe('INVALID_TOKEN');
     });
 
-    it('returns 400 when token is expired', async () => {
-      setupDbResults([{ id: 1, driverId: DRIVER_ID, expiresAt: new Date(Date.now() - 60000) }]);
+    it('returns 400 and verifies nothing when the token is expired or already used', async () => {
+      // The guarded consume (unrevoked, unexpired) matches no row: a second
+      // click on the link sends no second welcome email.
+      setupDbResults([]);
       const response = await app.inject({
         method: 'POST',
         url: '/portal/auth/verify-email',
@@ -571,13 +892,13 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(400);
       expect(response.json().code).toBe('INVALID_TOKEN');
+      expect(auditCalls()).toEqual([]);
     });
 
     it('verifies email with valid token', async () => {
       setupDbResults(
-        [{ id: 1, driverId: DRIVER_ID, expiresAt: new Date(Date.now() + 3600000) }],
+        [{ driverId: DRIVER_ID }], // consume the token
         [], // update drivers
-        [], // revoke token
         [{ id: DRIVER_ID, firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
       );
       const response = await app.inject({
@@ -587,6 +908,17 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().success).toBe(true);
+      expect(auditCalls()).toEqual([
+        {
+          table: driverAuditLog,
+          args: expect.objectContaining({
+            entityId: DRIVER_ID,
+            action: 'email_verified',
+            actor: 'driver',
+            after: expect.objectContaining({ method: 'verification_token' }),
+          }),
+        },
+      ]);
     });
   });
 
@@ -646,6 +978,38 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().success).toBe(true);
+      const call = vi.mocked(dispatchSystemNotification).mock.calls.at(-1);
+      expect(call?.[1]).toBe('driver.AccountVerification');
+      expect(call?.[2]).not.toHaveProperty('phone');
+    });
+
+    it('refuses a resend over the per-driver cap with 429 and Retry-After', async () => {
+      signupLimits.verificationResendRetryAfter.mockResolvedValueOnce(42);
+      vi.mocked(dispatchSystemNotification).mockClear();
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          language: 'en',
+          emailVerified: false,
+        },
+      ]);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/resend-verification',
+        cookies: { portal_token: signedDriverToken },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(429);
+      expect(response.headers['retry-after']).toBe('42');
+      expect(response.json()).toMatchObject({
+        code: 'VERIFICATION_RESEND_LIMITED',
+        retryAfterSeconds: 42,
+      });
+      expect(signupLimits.verificationResendRetryAfter).toHaveBeenCalledWith(DRIVER_ID);
+      expect(dispatchSystemNotification).not.toHaveBeenCalled();
     });
   });
 
@@ -662,9 +1026,11 @@ describe('Portal auth routes - handler logic', () => {
           timezone: 'America/New_York',
           themePreference: 'light',
           distanceUnit: 'miles',
+          priceDisplay: null,
           isActive: true,
           emailVerified: true,
           createdAt: '2024-01-01',
+          ...NO_BILLING_ADDRESS,
         },
       ]);
       const response = await app.inject({
@@ -674,42 +1040,6 @@ describe('Portal auth routes - handler logic', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(response.json().emailVerified).toBe(true);
-    });
-  });
-
-  describe('Registration - emailVerified', () => {
-    it('returns emailVerified: false for new registrations', async () => {
-      const driverRow = {
-        id: DRIVER_ID,
-        firstName: 'John',
-        lastName: 'Doe',
-        email: 'john@example.com',
-        phone: null,
-        language: 'en',
-        timezone: 'America/New_York',
-        themePreference: 'light',
-        distanceUnit: 'miles',
-        isActive: true,
-        emailVerified: false,
-        createdAt: '2024-01-01',
-      };
-      setupDbResults(
-        [], // no existing driver
-        [driverRow], // insert returns driver
-        [], // insert verification token
-      );
-      const response = await app.inject({
-        method: 'POST',
-        url: '/portal/auth/register',
-        payload: {
-          firstName: 'John',
-          lastName: 'Doe',
-          email: 'john@example.com',
-          password: 'TestPassword1',
-        },
-      });
-      expect(response.statusCode).toBe(201);
-      expect(response.json().driver.emailVerified).toBe(false);
     });
   });
 
@@ -811,9 +1141,11 @@ describe('Portal auth routes - handler logic', () => {
           timezone: 'America/New_York',
           themePreference: 'light',
           distanceUnit: 'miles',
+          priceDisplay: null,
           isActive: true,
           emailVerified: true,
           createdAt: '2024-01-01',
+          ...NO_BILLING_ADDRESS,
         },
       ]);
       const response = await csrfApp.inject({

@@ -4,6 +4,7 @@
 import { useState, useCallback } from 'react';
 import { Link, useParams } from 'react-router';
 import { useMutation } from '@tanstack/react-query';
+import { tryParseJson } from '@evtivity/lib/safe-json';
 import { useTranslation, Trans } from 'react-i18next';
 import { Info } from 'lucide-react';
 import { Spinner } from '@/components/ui/spinner';
@@ -27,13 +28,22 @@ import { useOcppSchema } from '@/hooks/use-ocpp-schema';
 import {
   resolveFields,
   formValuesToPayload,
-  generateJsonStub,
+  formToPayloadJson,
+  payloadToFormValues,
   validatePayload,
 } from '@/lib/ocpp-schema';
 import type { ValidationErrors } from '@/lib/ocpp-schema';
+import { CSMS_ACTIONS, CSMS_ACTIONS_16 } from '@/lib/ocpp-command-actions';
 import { SchemaForm } from '@/components/SchemaForm';
 import { OCPP_21_VARIABLES, OCPP_16_KEYS } from '@/lib/ocpp-variables';
 import { LoadingLogo } from '@/components/loading-logo';
+import { newOcppRequestId } from '@/lib/ocpp-request-id';
+import {
+  FirmwareSignatureFields,
+  firmwareSignaturePayload,
+  getFirmwareSignatureErrors,
+  type FirmwareSignatureValue,
+} from '@/components/FirmwareSignatureFields';
 
 const RESET_TYPES = ['Immediate', 'OnIdle'] as const;
 
@@ -79,87 +89,6 @@ const TRIGGER_MESSAGE_TYPES_16 = [
   'Heartbeat',
   'MeterValues',
   'StatusNotification',
-] as const;
-
-const CSMS_ACTIONS = [
-  'AdjustPeriodicEventStream',
-  'AFRRSignal',
-  'CancelReservation',
-  'CertificateSigned',
-  'ChangeAvailability',
-  'ChangeTransactionTariff',
-  'ClearCache',
-  'ClearChargingProfile',
-  'ClearDERControl',
-  'ClearDisplayMessage',
-  'ClearTariffs',
-  'ClearVariableMonitoring',
-  'ClosePeriodicEventStream',
-  'CostUpdated',
-  'CustomerInformation',
-  'DataTransfer',
-  'DeleteCertificate',
-  'Get15118EVCertificate',
-  'GetBaseReport',
-  'GetCertificateChainStatus',
-  'GetChargingProfiles',
-  'GetCompositeSchedule',
-  'GetDERControl',
-  'GetDisplayMessages',
-  'GetInstalledCertificateIds',
-  'GetLocalListVersion',
-  'GetLog',
-  'GetMonitoringReport',
-  'GetPeriodicEventStream',
-  'GetReport',
-  'GetTariffs',
-  'GetVariables',
-  'InstallCertificate',
-  'OpenPeriodicEventStream',
-  'PublishFirmware',
-  'RequestBatterySwap',
-  'RequestStartTransaction',
-  'RequestStopTransaction',
-  'ReserveNow',
-  'Reset',
-  'SendLocalList',
-  'SetChargingProfile',
-  'SetDERControl',
-  'SetDefaultTariff',
-  'SetDisplayMessage',
-  'SetMonitoringBase',
-  'SetMonitoringLevel',
-  'SetNetworkProfile',
-  'SetVariableMonitoring',
-  'SetVariables',
-  'TriggerMessage',
-  'UnlockConnector',
-  'UnpublishFirmware',
-  'UpdateDynamicSchedule',
-  'UpdateFirmware',
-  'UsePriorityCharging',
-] as const;
-
-const CSMS_ACTIONS_16 = [
-  'CancelReservation',
-  'ChangeAvailability',
-  'ChangeConfiguration',
-  'ClearCache',
-  'ClearChargingProfile',
-  'DataTransfer',
-  'GetCompositeSchedule',
-  'GetConfiguration',
-  'GetDiagnostics',
-  'GetLocalListVersion',
-  'RemoteStartTransaction',
-  'RemoteStopTransaction',
-  'ReserveNow',
-  'Reset',
-  'SendLocalList',
-  'SetChargingProfile',
-  'TriggerMessage',
-  'UnlockConnector',
-  'UpdateFirmware',
 ] as const;
 
 interface CommandResponse {
@@ -219,6 +148,8 @@ interface FormState {
   getConfigKey: string;
   firmwareRetries: string;
   firmwareRetryInterval: string;
+  firmwareSigningCertificate: string;
+  firmwareSignature: string;
 }
 
 const INITIAL_FORM: FormState = {
@@ -241,7 +172,31 @@ const INITIAL_FORM: FormState = {
   getConfigKey: '',
   firmwareRetries: '',
   firmwareRetryInterval: '',
+  firmwareSigningCertificate: '',
+  firmwareSignature: '',
 };
+
+function firmwareSigning(form: FormState): FirmwareSignatureValue {
+  return { signingCertificate: form.firmwareSigningCertificate, signature: form.firmwareSignature };
+}
+
+/**
+ * A signed firmware update for a 1.6 station is a SignedUpdateFirmware (1.6
+ * Security Whitepaper), which has the 2.1 UpdateFirmware payload shape.
+ */
+function buildSignedUpdateFirmware16(form: FormState): Record<string, unknown> {
+  const p: Record<string, unknown> = {
+    requestId: newOcppRequestId(),
+    firmware: {
+      location: form.firmwareUrl,
+      retrieveDateTime: new Date(form.retrieveDateTime).toISOString(),
+      ...firmwareSignaturePayload(firmwareSigning(form)),
+    },
+  };
+  if (form.firmwareRetries !== '') p['retries'] = Number(form.firmwareRetries);
+  if (form.firmwareRetryInterval !== '') p['retryInterval'] = Number(form.firmwareRetryInterval);
+  return p;
+}
 
 const INITIAL_FORM_16: FormState = {
   ...INITIAL_FORM,
@@ -310,8 +265,9 @@ function buildPayload(action: QuickAction, form: FormState): Record<string, unkn
         firmware: {
           location: form.firmwareUrl,
           retrieveDateTime: new Date(form.retrieveDateTime).toISOString(),
+          ...firmwareSignaturePayload(firmwareSigning(form)),
         },
-        requestId: Date.now(),
+        requestId: newOcppRequestId(),
       };
   }
 }
@@ -413,14 +369,15 @@ function QuickActionForm({
     case 'Reset':
       return (
         <div className="space-y-2">
-          <Label htmlFor="reset-type-select">{t('commands.type')}</Label>
+          <Label htmlFor="reset-type-select" className="leading-6">
+            {t('commands.type')}
+          </Label>
           <Select
             id="reset-type-select"
             value={form.resetType}
             onChange={(e) => {
               onChange({ resetType: e.target.value });
             }}
-            className="h-9"
           >
             {RESET_TYPES.map((rt) => (
               <option key={rt} value={rt}>
@@ -434,21 +391,24 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="operational-status-select">{t('commands.operationalStatus')}</Label>
+            <Label htmlFor="operational-status-select" className="leading-6">
+              {t('commands.operationalStatus')}
+            </Label>
             <Select
               id="operational-status-select"
               value={form.operationalStatus}
               onChange={(e) => {
                 onChange({ operationalStatus: e.target.value });
               }}
-              className="h-9"
             >
               <option value="Operative">{t('commands.operative')}</option>
               <option value="Inoperative">{t('commands.inoperative')}</option>
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-avail-evse-id">{t('commands.evseIdOptional')}</Label>
+            <Label htmlFor="cmd-avail-evse-id" className="leading-6">
+              {t('commands.evseIdOptional')}
+            </Label>
             <Input
               id="cmd-avail-evse-id"
               type="number"
@@ -465,7 +425,9 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd-unlock-evse-id">{t('commands.evseId')}</Label>
+            <Label htmlFor="cmd-unlock-evse-id" className="leading-6">
+              {t('commands.evseId')}
+            </Label>
             <Input
               id="cmd-unlock-evse-id"
               type="number"
@@ -476,7 +438,9 @@ function QuickActionForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-unlock-connector-id">{t('commands.connectorId')}</Label>
+            <Label htmlFor="cmd-unlock-connector-id" className="leading-6">
+              {t('commands.connectorId')}
+            </Label>
             <Input
               id="cmd-unlock-connector-id"
               type="number"
@@ -492,7 +456,9 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd-start-id-token">{t('commands.idToken')}</Label>
+            <Label htmlFor="cmd-start-id-token" className="leading-6">
+              {t('commands.idToken')}
+            </Label>
             <Input
               id="cmd-start-id-token"
               value={form.idToken}
@@ -502,14 +468,15 @@ function QuickActionForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="token-type-select">{t('commands.tokenType')}</Label>
+            <Label htmlFor="token-type-select" className="leading-6">
+              {t('commands.tokenType')}
+            </Label>
             <Select
               id="token-type-select"
               value={form.idTokenType}
               onChange={(e) => {
                 onChange({ idTokenType: e.target.value });
               }}
-              className="h-9"
             >
               {ID_TOKEN_TYPES.map((tt) => (
                 <option key={tt} value={tt}>
@@ -519,7 +486,9 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-start-evse-id">{t('commands.evseIdOptional')}</Label>
+            <Label htmlFor="cmd-start-evse-id" className="leading-6">
+              {t('commands.evseIdOptional')}
+            </Label>
             <Input
               id="cmd-start-evse-id"
               type="number"
@@ -534,7 +503,9 @@ function QuickActionForm({
     case 'RequestStopTransaction':
       return (
         <div className="space-y-2">
-          <Label htmlFor="cmd-stop-transaction-id">{t('commands.transactionId')}</Label>
+          <Label htmlFor="cmd-stop-transaction-id" className="leading-6">
+            {t('commands.transactionId')}
+          </Label>
           <Input
             id="cmd-stop-transaction-id"
             value={form.transactionId}
@@ -548,14 +519,15 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="trigger-message-select">{t('commands.requestedMessage')}</Label>
+            <Label htmlFor="trigger-message-select" className="leading-6">
+              {t('commands.requestedMessage')}
+            </Label>
             <Select
               id="trigger-message-select"
               value={form.triggerMessage}
               onChange={(e) => {
                 onChange({ triggerMessage: e.target.value });
               }}
-              className="h-9"
             >
               {TRIGGER_MESSAGE_TYPES.map((tm) => (
                 <option key={tm} value={tm}>
@@ -565,7 +537,7 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-trigger-evse-id">
+            <Label htmlFor="cmd-trigger-evse-id" className="leading-6">
               {t('commands.evseId')} ({t('common.optional')})
             </Label>
             <Input
@@ -588,14 +560,15 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="get-component-name-select">{t('commands.componentName')}</Label>
+            <Label htmlFor="get-component-name-select" className="leading-6">
+              {t('commands.componentName')}
+            </Label>
             <Select
               id="get-component-name-select"
               value={form.componentName}
               onChange={(e) => {
                 onChange({ componentName: e.target.value, variableName: '' });
               }}
-              className="h-9"
             >
               <option value="">{t('common.select')}</option>
               {OCPP_COMPONENTS.map((c) => (
@@ -606,14 +579,15 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="get-variable-name-select">{t('commands.variableName')}</Label>
+            <Label htmlFor="get-variable-name-select" className="leading-6">
+              {t('commands.variableName')}
+            </Label>
             <Select
               id="get-variable-name-select"
               value={form.variableName}
               onChange={(e) => {
                 onChange({ variableName: e.target.value });
               }}
-              className="h-9"
             >
               <option value="">{t('common.select')}</option>
               {getVarOptions.map((v) => (
@@ -624,14 +598,15 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="get-attribute-type-select">{t('commands.attributeType')}</Label>
+            <Label htmlFor="get-attribute-type-select" className="leading-6">
+              {t('commands.attributeType')}
+            </Label>
             <Select
               id="get-attribute-type-select"
               value={form.attributeType}
               onChange={(e) => {
                 onChange({ attributeType: e.target.value });
               }}
-              className="h-9"
             >
               {ATTRIBUTE_TYPES.map((a) => (
                 <option key={a} value={a}>
@@ -666,14 +641,15 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="set-component-name-select">{t('commands.componentName')}</Label>
+            <Label htmlFor="set-component-name-select" className="leading-6">
+              {t('commands.componentName')}
+            </Label>
             <Select
               id="set-component-name-select"
               value={form.componentName}
               onChange={(e) => {
                 onChange({ componentName: e.target.value, variableName: '' });
               }}
-              className="h-9"
             >
               <option value="">{t('common.select')}</option>
               {OCPP_COMPONENTS.map((c) => (
@@ -684,14 +660,15 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="set-variable-name-select">{t('commands.variableName')}</Label>
+            <Label htmlFor="set-variable-name-select" className="leading-6">
+              {t('commands.variableName')}
+            </Label>
             <Select
               id="set-variable-name-select"
               value={form.variableName}
               onChange={(e) => {
                 onChange({ variableName: e.target.value });
               }}
-              className="h-9"
             >
               <option value="">{t('common.select')}</option>
               {setVarOptions.map((v) => (
@@ -702,14 +679,15 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="set-attribute-type-select">{t('commands.attributeType')}</Label>
+            <Label htmlFor="set-attribute-type-select" className="leading-6">
+              {t('commands.attributeType')}
+            </Label>
             <Select
               id="set-attribute-type-select"
               value={form.attributeType}
               onChange={(e) => {
                 onChange({ attributeType: e.target.value });
               }}
-              className="h-9"
             >
               {ATTRIBUTE_TYPES.map((a) => (
                 <option key={a} value={a}>
@@ -719,7 +697,9 @@ function QuickActionForm({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-set-var-value">{t('commands.value')}</Label>
+            <Label htmlFor="cmd-set-var-value" className="leading-6">
+              {t('commands.value')}
+            </Label>
             <Input
               id="cmd-set-var-value"
               value={form.variableValue}
@@ -751,7 +731,9 @@ function QuickActionForm({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd-fw-url">{t('commands.firmwareLocationUrl')}</Label>
+            <Label htmlFor="cmd-fw-url" className="leading-6">
+              {t('commands.firmwareLocationUrl')}
+            </Label>
             <Input
               id="cmd-fw-url"
               value={form.firmwareUrl}
@@ -762,7 +744,9 @@ function QuickActionForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd-fw-retrieve-dt">{t('commands.retrieveDateTime')}</Label>
+            <Label htmlFor="cmd-fw-retrieve-dt" className="leading-6">
+              {t('commands.retrieveDateTime')}
+            </Label>
             <Input
               id="cmd-fw-retrieve-dt"
               type="datetime-local"
@@ -772,6 +756,17 @@ function QuickActionForm({
               }}
             />
           </div>
+          <FirmwareSignatureFields
+            value={firmwareSigning(form)}
+            onChange={(v) => {
+              onChange({
+                firmwareSigningCertificate: v.signingCertificate,
+                firmwareSignature: v.signature,
+              });
+            }}
+            idPrefix="cmd-fw"
+            errors={getFirmwareSignatureErrors(firmwareSigning(form), t)}
+          />
         </div>
       );
   }
@@ -794,14 +789,15 @@ function QuickActionForm16({
     case 'Reset':
       return (
         <div className="space-y-2">
-          <Label htmlFor="reset-type-16-select">{t('commands.type')}</Label>
+          <Label htmlFor="reset-type-16-select" className="leading-6">
+            {t('commands.type')}
+          </Label>
           <Select
             id="reset-type-16-select"
             value={form.resetType}
             onChange={(e) => {
               onChange({ resetType: e.target.value });
             }}
-            className="h-9"
           >
             {RESET_TYPES_16.map((rt) => (
               <option key={rt} value={rt}>
@@ -815,7 +811,9 @@ function QuickActionForm16({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd16-avail-connector-id">{t('commands.connectorIdRequired')}</Label>
+            <Label htmlFor="cmd16-avail-connector-id" className="leading-6">
+              {t('commands.connectorIdRequired')}
+            </Label>
             <Input
               id="cmd16-avail-connector-id"
               type="number"
@@ -827,14 +825,15 @@ function QuickActionForm16({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="availability-type-16-select">{t('commands.type')}</Label>
+            <Label htmlFor="availability-type-16-select" className="leading-6">
+              {t('commands.type')}
+            </Label>
             <Select
               id="availability-type-16-select"
               value={form.operationalStatus}
               onChange={(e) => {
                 onChange({ operationalStatus: e.target.value });
               }}
-              className="h-9"
             >
               <option value="Operative">{t('commands.operative')}</option>
               <option value="Inoperative">{t('commands.inoperative')}</option>
@@ -845,7 +844,9 @@ function QuickActionForm16({
     case 'UnlockConnector':
       return (
         <div className="space-y-2">
-          <Label htmlFor="cmd16-unlock-connector-id">{t('commands.connectorIdRequired')}</Label>
+          <Label htmlFor="cmd16-unlock-connector-id" className="leading-6">
+            {t('commands.connectorIdRequired')}
+          </Label>
           <Input
             id="cmd16-unlock-connector-id"
             type="number"
@@ -860,7 +861,9 @@ function QuickActionForm16({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd16-start-id-tag">{t('commands.idTag')}</Label>
+            <Label htmlFor="cmd16-start-id-tag" className="leading-6">
+              {t('commands.idTag')}
+            </Label>
             <Input
               id="cmd16-start-id-tag"
               value={form.idToken}
@@ -870,7 +873,7 @@ function QuickActionForm16({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-start-connector-id">
+            <Label htmlFor="cmd16-start-connector-id" className="leading-6">
               {t('commands.connectorId')} ({t('common.optional')})
             </Label>
             <Input
@@ -887,7 +890,9 @@ function QuickActionForm16({
     case 'RemoteStopTransaction':
       return (
         <div className="space-y-2">
-          <Label htmlFor="cmd16-stop-transaction-id">{t('commands.transactionId')}</Label>
+          <Label htmlFor="cmd16-stop-transaction-id" className="leading-6">
+            {t('commands.transactionId')}
+          </Label>
           <Input
             id="cmd16-stop-transaction-id"
             type="number"
@@ -902,14 +907,15 @@ function QuickActionForm16({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="trigger-message-16-select">{t('commands.requestedMessage')}</Label>
+            <Label htmlFor="trigger-message-16-select" className="leading-6">
+              {t('commands.requestedMessage')}
+            </Label>
             <Select
               id="trigger-message-16-select"
               value={form.triggerMessage}
               onChange={(e) => {
                 onChange({ triggerMessage: e.target.value });
               }}
-              className="h-9"
             >
               {TRIGGER_MESSAGE_TYPES_16.map((tm) => (
                 <option key={tm} value={tm}>
@@ -919,7 +925,7 @@ function QuickActionForm16({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-trigger-connector-id">
+            <Label htmlFor="cmd16-trigger-connector-id" className="leading-6">
               {t('commands.connectorId')} ({t('common.optional')})
             </Label>
             <Input
@@ -938,7 +944,9 @@ function QuickActionForm16({
     case 'GetConfiguration':
       return (
         <div className="space-y-2">
-          <Label htmlFor="cmd16-get-config-key">{t('commands.configKeyOptional')}</Label>
+          <Label htmlFor="cmd16-get-config-key" className="leading-6">
+            {t('commands.configKeyOptional')}
+          </Label>
           <Select
             id="cmd16-get-config-key"
             value={form.getConfigKey}
@@ -975,7 +983,9 @@ function QuickActionForm16({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd16-change-config-key">{t('commands.configKey')}</Label>
+            <Label htmlFor="cmd16-change-config-key" className="leading-6">
+              {t('commands.configKey')}
+            </Label>
             <Select
               id="cmd16-change-config-key"
               value={form.configKey}
@@ -1008,7 +1018,9 @@ function QuickActionForm16({
             </Alert>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-change-config-value">{t('commands.configValue')}</Label>
+            <Label htmlFor="cmd16-change-config-value" className="leading-6">
+              {t('commands.configValue')}
+            </Label>
             <Input
               id="cmd16-change-config-value"
               value={form.configValue}
@@ -1023,7 +1035,9 @@ function QuickActionForm16({
       return (
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="cmd16-fw-url">{t('commands.firmwareLocationUrl')}</Label>
+            <Label htmlFor="cmd16-fw-url" className="leading-6">
+              {t('commands.firmwareLocationUrl')}
+            </Label>
             <Input
               id="cmd16-fw-url"
               value={form.firmwareUrl}
@@ -1034,7 +1048,9 @@ function QuickActionForm16({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-fw-retrieve-dt">{t('commands.retrieveDateTime')}</Label>
+            <Label htmlFor="cmd16-fw-retrieve-dt" className="leading-6">
+              {t('commands.retrieveDateTime')}
+            </Label>
             <Input
               id="cmd16-fw-retrieve-dt"
               type="datetime-local"
@@ -1045,7 +1061,9 @@ function QuickActionForm16({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-fw-retries">{t('commands.retries')}</Label>
+            <Label htmlFor="cmd16-fw-retries" className="leading-6">
+              {t('commands.retries')}
+            </Label>
             <Input
               id="cmd16-fw-retries"
               type="number"
@@ -1056,7 +1074,9 @@ function QuickActionForm16({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="cmd16-fw-retry-interval">{t('commands.retryInterval')}</Label>
+            <Label htmlFor="cmd16-fw-retry-interval" className="leading-6">
+              {t('commands.retryInterval')}
+            </Label>
             <Input
               id="cmd16-fw-retry-interval"
               type="number"
@@ -1066,6 +1086,17 @@ function QuickActionForm16({
               }}
             />
           </div>
+          <FirmwareSignatureFields
+            value={firmwareSigning(form)}
+            onChange={(v) => {
+              onChange({
+                firmwareSigningCertificate: v.signingCertificate,
+                firmwareSignature: v.signature,
+              });
+            }}
+            idPrefix="cmd16-fw"
+            errors={getFirmwareSignatureErrors(firmwareSigning(form), t)}
+          />
         </div>
       );
   }
@@ -1103,26 +1134,21 @@ export function StationCommands({
   } = useOcppSchema(advancedAction, schemaVersion);
   const resolvedFields = schemaData != null ? resolveFields(schemaData) : [];
 
+  // Form to JSON: the payload the form would send, or the schema's minimal
+  // payload while the form is empty.
   const syncFormToJson = useCallback(() => {
-    if (resolvedFields.length > 0) {
-      const hasValues = Object.keys(schemaFormValues).length > 0;
-      if (hasValues) {
-        const payload = formValuesToPayload(schemaFormValues, resolvedFields);
-        setAdvancedPayload(JSON.stringify(payload, null, 2));
-      } else if (schemaData != null) {
-        setAdvancedPayload(generateJsonStub(schemaData));
-      }
+    if (schemaData != null) {
+      setAdvancedPayload(formToPayloadJson(schemaFormValues, schemaData));
     }
-  }, [schemaFormValues, resolvedFields, schemaData]);
+  }, [schemaFormValues, schemaData]);
 
   const syncJsonToForm = useCallback(() => {
-    try {
-      const parsed = JSON.parse(advancedPayload) as Record<string, unknown>;
-      setSchemaFormValues(parsed);
-    } catch {
-      // Keep current form values if JSON is invalid
+    // Keep the current form values when the JSON is invalid.
+    const parsed = tryParseJson(advancedPayload);
+    if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      setSchemaFormValues(payloadToFormValues(parsed as Record<string, unknown>, resolvedFields));
     }
-  }, [advancedPayload]);
+  }, [advancedPayload, resolvedFields]);
 
   const mutation = useMutation({
     mutationFn: (params: { action: string; payload: Record<string, unknown> }) => {
@@ -1193,10 +1219,14 @@ export function StationCommands({
     if (activeAction == null) return;
     setResult(null);
     if (is16) {
-      mutation.mutate({
-        action: activeAction,
-        payload: buildPayload16(activeAction as QuickAction16, form),
-      });
+      const signed =
+        activeAction === 'UpdateFirmware' &&
+        Object.keys(firmwareSignaturePayload(firmwareSigning(form))).length > 0;
+      mutation.mutate(
+        signed
+          ? { action: 'SignedUpdateFirmware', payload: buildSignedUpdateFirmware16(form) }
+          : { action: activeAction, payload: buildPayload16(activeAction as QuickAction16, form) },
+      );
     } else {
       mutation.mutate({
         action: activeAction,
@@ -1207,6 +1237,12 @@ export function StationCommands({
 
   function handleQuickSubmit(): void {
     if (activeAction == null) return;
+    if (
+      activeAction === 'UpdateFirmware' &&
+      Object.keys(getFirmwareSignatureErrors(firmwareSigning(form), t)).length > 0
+    ) {
+      return;
+    }
     if (DESTRUCTIVE_QUICK_ACTIONS.has(activeAction)) {
       setConfirmPending(true);
       return;
@@ -1227,9 +1263,8 @@ export function StationCommands({
     let parsed: Record<string, unknown>;
     const usingRawInput = rawMode || schemaError;
     if (usingRawInput) {
-      try {
-        parsed = JSON.parse(advancedPayload) as Record<string, unknown>;
-      } catch {
+      const value = tryParseJson(advancedPayload);
+      if (value == null || typeof value !== 'object' || Array.isArray(value)) {
         setAdvancedOpen(true);
         setAdvancedResult({
           status: 'error',
@@ -1239,6 +1274,7 @@ export function StationCommands({
         });
         return;
       }
+      parsed = value as Record<string, unknown>;
     } else {
       parsed = formValuesToPayload(schemaFormValues, resolvedFields);
     }
@@ -1298,7 +1334,9 @@ export function StationCommands({
         <div className="space-y-3">
           <h3 className="text-sm font-medium">{t('commands.advancedCommand')}</h3>
           <div className="space-y-2">
-            <Label htmlFor="advanced-action-select">{t('commands.action')}</Label>
+            <Label htmlFor="advanced-action-select" className="leading-6">
+              {t('commands.action')}
+            </Label>
             <Select
               id="advanced-action-select"
               value={advancedAction}
@@ -1310,7 +1348,6 @@ export function StationCommands({
                 setRawMode(false);
                 setAdvancedResult(null);
               }}
-              className="h-9"
             >
               <option value="">{t('common.select')}</option>
               {csmsActions.map((a) => (
@@ -1439,10 +1476,13 @@ export function StationCommands({
               <Button variant="outline" onClick={closeQuickAction}>
                 {t('common.close')}
               </Button>
-              <Button onClick={handleQuickSubmit} disabled={mutation.isPending}>
-                {mutation.isPending && <Spinner className="h-4 w-4" />}
-                {t('common.send')}
-              </Button>
+              {/* A queued command is sent on reconnect: no second copy from this dialog. */}
+              {result?.status !== 'queued' && (
+                <Button onClick={handleQuickSubmit} disabled={mutation.isPending}>
+                  {mutation.isPending && <Spinner className="h-4 w-4" />}
+                  {t('common.send')}
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>

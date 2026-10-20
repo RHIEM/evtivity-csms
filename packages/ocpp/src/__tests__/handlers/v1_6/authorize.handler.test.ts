@@ -31,6 +31,11 @@ vi.mock('@evtivity/database', () => {
       stationOcppId: 'station_ocpp_id',
     },
     authorizeAttempts: { __table: 'authorize_attempts' },
+    resolveOcpiTokenOwner: async () => {
+      const { ocpiOwnerFromRows } = await import('../../helpers/ocpi-token-owner.js');
+      const rows = (await selectFn().from({}).where({}).limit(1)) as unknown[];
+      return ocpiOwnerFromRows(rows);
+    },
     isRoamingEnabled: vi.fn().mockResolvedValue(false),
     isSiteFreeVendEnabledByStation: vi.fn().mockResolvedValue(false),
   };
@@ -56,7 +61,7 @@ function selectResolving(rows: unknown[]): { from: ReturnType<typeof vi.fn> } {
     then: (resolve: (v: unknown) => unknown): unknown => resolve(rows),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -67,7 +72,7 @@ function selectThrowing(err: unknown): { from: ReturnType<typeof vi.fn> } {
       reject(err),
   };
   const where = vi.fn().mockReturnValue(whereResult);
-  const from = vi.fn().mockReturnValue({ where });
+  const from = vi.fn().mockReturnValue({ where, leftJoin: vi.fn().mockReturnValue({ where }) });
   return { from };
 }
 
@@ -88,13 +93,14 @@ function makeCtx(idTag: string): {
       pendingMessages: new Map(),
       ocppProtocol: 'ocpp1.6',
       bootStatus: null,
+      readyAnnounced: false,
     },
     messageId: 'msg-1',
     action: 'Authorize',
     protocolVersion: 'ocpp1.6',
     payload: { idTag },
     logger,
-    eventBus: { publish: publishMock, subscribe: vi.fn() },
+    eventBus: { publish: publishMock, subscribe: vi.fn(), drain: vi.fn(), track: vi.fn() },
     correlator: {} as HandlerContext['correlator'],
     dispatcher: {} as HandlerContext['dispatcher'],
   };
@@ -142,7 +148,7 @@ describe('OCPP 1.6 Authorize handler', () => {
       expect(lastAttemptRow()).toMatchObject({
         outcome: 'accepted',
         reason: 'free_vend',
-        tokenType: null,
+        tokenType: 'ISO14443',
         matchedTokenId: 'dtk_fv',
         matchedDriverId: 'drv_fv',
       });
@@ -223,7 +229,7 @@ describe('OCPP 1.6 Authorize handler', () => {
         matchedTokenId: 'dtk_ok',
         matchedDriverId: 'drv_ok',
         tokenType: 'ISO14443',
-        reason: null,
+        reason: 'active',
       });
     });
 
@@ -287,7 +293,7 @@ describe('OCPP 1.6 Authorize handler', () => {
       expect(response).toEqual({ idTagInfo: { status: 'Blocked' } });
       expect(lastAttemptRow()).toMatchObject({
         outcome: 'blocked',
-        reason: 'inactive_or_revoked',
+        reason: 'inactive',
         matchedTokenId: 'dtk_inact',
       });
     });
@@ -309,7 +315,7 @@ describe('OCPP 1.6 Authorize handler', () => {
       const response = await handleAuthorize(ctx);
 
       expect(response).toEqual({ idTagInfo: { status: 'Blocked' } });
-      expect(lastAttemptRow()).toMatchObject({ outcome: 'blocked', reason: 'inactive_or_revoked' });
+      expect(lastAttemptRow()).toMatchObject({ outcome: 'blocked', reason: 'revoked' });
     });
 
     it('prefers the usable token when both usable and unusable rows match', async () => {
@@ -345,6 +351,44 @@ describe('OCPP 1.6 Authorize handler', () => {
     });
   });
 
+  describe('prepaid tokens (no NoCredit in 1.6)', () => {
+    const prepaidRow = (prepaidBalanceCents: number) => ({
+      id: 'dtk_pp',
+      driverId: 'drv_pp',
+      isActive: true,
+      expiresAt: null,
+      revokedAt: null,
+      prepaidBalanceCents,
+    });
+
+    it('Accepted with expiryDate now for a prepaid token with credit', async () => {
+      selectFn
+        .mockReturnValueOnce(selectResolving([prepaidRow(5000)]))
+        .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
+      const { ctx } = makeCtx('PREPAID-TAG');
+
+      const response = await handleAuthorize(ctx);
+      const info = response['idTagInfo'] as Record<string, unknown>;
+
+      expect(info['status']).toBe('Accepted');
+      expect(Math.abs(Date.parse(info['expiryDate'] as string) - Date.now())).toBeLessThan(5_000);
+    });
+
+    it('Blocked with outcome no_credit when the balance is not positive', async () => {
+      selectFn
+        .mockReturnValueOnce(selectResolving([prepaidRow(0)]))
+        .mockReturnValueOnce(selectResolving([])); // concurrent-tx lookup: none
+      const { ctx } = makeCtx('NOCREDIT-TAG');
+
+      const response = await handleAuthorize(ctx);
+      const info = response['idTagInfo'] as Record<string, unknown>;
+
+      expect(info['status']).toBe('Blocked');
+      expect(info['expiryDate']).toBeDefined();
+      expect(lastAttemptRow()).toMatchObject({ outcome: 'no_credit', reason: 'no_credit' });
+    });
+  });
+
   describe('driver-id fallback (drv_ prefix)', () => {
     it('Accepted for an active driver, returns early and logs driver_id', async () => {
       // First select (driver_tokens) empty, second select (drivers) returns active driver.
@@ -360,7 +404,7 @@ describe('OCPP 1.6 Authorize handler', () => {
         outcome: 'accepted',
         reason: 'driver_id',
         matchedDriverId: 'drv_123',
-        tokenType: null,
+        tokenType: 'ISO14443',
       });
     });
 
@@ -615,8 +659,8 @@ describe('OCPP 1.6 Authorize handler', () => {
         idTagInfo: { status: 'Accepted', expiryDate: future.toISOString() },
       });
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ idTag: 'WARN-TAG' }),
-        'Concurrent-tx lookup failed (1.6)',
+        expect.objectContaining({ idToken: 'WARN-TAG' }),
+        'Concurrent transaction lookup failed; keeping the decision',
       );
       expect(lastAttemptRow()).toMatchObject({ outcome: 'accepted' });
       warnSpy.mockRestore();

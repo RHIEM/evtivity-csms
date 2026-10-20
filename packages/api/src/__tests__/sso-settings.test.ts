@@ -49,6 +49,10 @@ function makeChain() {
   return chain;
 }
 
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
+
 vi.mock('@evtivity/database', () => ({
   db: {
     select: vi.fn(() => makeChain()),
@@ -67,6 +71,8 @@ vi.mock('@evtivity/database', () => ({
     }),
   },
   settings: {},
+  settingAuditLog: { _name: 'settingAuditLog' },
+  writeAudit: vi.fn(() => Promise.resolve()),
   clearSsoSettingsCache: vi.fn(),
   getSsoConfig: vi.fn(() => Promise.resolve(null)),
   getRecaptchaConfig: vi.fn(() => Promise.resolve(null)),
@@ -133,6 +139,14 @@ async function buildApp(): Promise<FastifyInstance> {
   await app.ready();
   return app;
 }
+
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let libModule: typeof import('@evtivity/lib');
+let databaseModule: typeof import('@evtivity/database');
+beforeAll(async () => {
+  libModule = await import('@evtivity/lib');
+  databaseModule = await import('@evtivity/database');
+}, 30_000);
 
 describe('SSO Settings routes', () => {
   let app: FastifyInstance;
@@ -246,10 +260,10 @@ describe('SSO Settings routes', () => {
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
 
-    const { encryptString } = await import('@evtivity/lib');
+    const { encryptString } = libModule;
     expect(encryptString).toHaveBeenCalledWith('PEM-CERT-DATA', expect.any(String));
 
-    const { clearSsoSettingsCache } = await import('@evtivity/database');
+    const { clearSsoSettingsCache } = databaseModule;
     expect(clearSsoSettingsCache).toHaveBeenCalled();
   });
 
@@ -276,12 +290,75 @@ describe('SSO Settings routes', () => {
     const body = JSON.parse(response.body);
     expect(body.success).toBe(true);
 
-    const { encryptString } = await import('@evtivity/lib');
+    const { encryptString } = libModule;
     // Since cert is omitted, encryptString should not have been called for cert data
     const calls = vi.mocked(encryptString).mock.calls;
     expect(calls.filter((c) => typeof c[0] === 'string' && c[0] !== 'PEM-CERT-DATA').length).toBe(
       0,
     );
+  });
+
+  it('PUT /sso/settings audits each changed key and never records the certificate', async () => {
+    const { writeAudit } = databaseModule;
+    vi.mocked(writeAudit).mockClear();
+    // The before read, then 8 upserts.
+    setupDbResults(
+      [
+        { key: 'sso.enabled', value: false },
+        { key: 'sso.provider', value: 'okta' },
+        { key: 'sso.entryPoint', value: 'https://example.com/sso' },
+        { key: 'sso.issuer', value: 'https://example.com' },
+        { key: 'sso.autoProvision', value: true },
+        { key: 'sso.defaultRoleId', value: 'rol_000000000001' },
+        { key: 'sso.attributeMapping', value: JSON.stringify({ email: 'email' }) },
+        { key: 'sso.certEnc', value: 'encrypted:OLD' },
+      ],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+    );
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/sso/settings',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        enabled: true,
+        provider: 'okta',
+        entryPoint: 'https://example.com/sso',
+        issuer: 'https://example.com',
+        cert: 'PEM-CERT-DATA',
+        autoProvision: true,
+        defaultRoleId: 'rol_000000000001',
+        attributeMapping: { email: 'email' },
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const calls = vi.mocked(writeAudit).mock.calls;
+    expect(calls.map((c) => (c[1] as { entityId: string }).entityId).sort()).toEqual([
+      'sso.certEnc',
+      'sso.enabled',
+    ]);
+    const enabled = calls.find((c) => (c[1] as { entityId: string }).entityId === 'sso.enabled');
+    expect(enabled?.[0]).toEqual({ table: { _name: 'settingAuditLog' }, idColumn: 'setting_key' });
+    expect(enabled?.[1]).toMatchObject({
+      action: 'updated',
+      actor: 'operator',
+      actorUserId: VALID_USER_ID,
+      before: { key: 'sso.enabled', value: false },
+      after: { key: 'sso.enabled', value: true },
+    });
+    const cert = calls.find((c) => (c[1] as { entityId: string }).entityId === 'sso.certEnc');
+    expect(cert?.[1]).toMatchObject({
+      before: { key: 'sso.certEnc', configured: true },
+      after: { key: 'sso.certEnc', configured: true },
+    });
+    expect(JSON.stringify(calls)).not.toContain('PEM-CERT-DATA');
+    expect(JSON.stringify(calls)).not.toContain('encrypted:');
   });
 
   // --- GET /security/public ---

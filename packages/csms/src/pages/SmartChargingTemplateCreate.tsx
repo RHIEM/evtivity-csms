@@ -18,7 +18,12 @@ import { TimeSlotEditor, type SchedulePeriod } from '@/components/smart-charging
 import { api, getApiErrorCode, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { useUserTimezone } from '@/lib/timezone';
-import { midnightInTimezone, toDatetimeLocalInTimezone } from '@/lib/schedule-anchor';
+import {
+  fromDatetimeLocalInTimezone,
+  midnightInTimezone,
+  toDatetimeLocalInTimezone,
+} from '@/lib/schedule-anchor';
+import { useHasAllSiteAccess } from '@/lib/auth';
 
 type OcppVersion = '2.1' | '1.6';
 
@@ -29,7 +34,9 @@ const PURPOSES_21 = [
   'LocalGeneration',
 ];
 
-const PURPOSES_16 = ['ChargePointMaxProfile', 'TxDefaultProfile'];
+// Templates store the 2.1 purpose names; the OCPP server sends
+// ChargingStationMaxProfile to a 1.6 station as ChargePointMaxProfile.
+const PURPOSES_16 = ['ChargingStationMaxProfile', 'TxDefaultProfile'];
 
 interface FilterOptions {
   sites: { id: string; name: string }[];
@@ -43,6 +50,7 @@ interface CreatedTemplate {
 
 export function SmartChargingTemplateCreate(): React.JSX.Element {
   const { t } = useTranslation();
+  const hasAllSiteAccess = useHasAllSiteAccess();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const timezone = useUserTimezone();
@@ -88,7 +96,12 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
   function getValidationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
     if (!name.trim()) errors.name = t('validation.required');
-    if (profileKind === 'Recurring' && !startSchedule) {
+    // A template without a site targets every site.
+    if (!hasAllSiteAccess && filterSiteId === '') {
+      errors.filterSiteId = t('validation.selectRequired');
+    }
+    // Absolute and Recurring profiles both need a start (OCPP 2.1 K01.FR.40).
+    if (!startSchedule) {
       errors.startSchedule = t('validation.required');
     }
     return errors;
@@ -123,10 +136,11 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
     };
     if (description.trim() !== '') body.description = description;
     if (profileKind === 'Recurring') body.recurrencyKind = recurrencyKind;
-    if (startSchedule) body.startSchedule = new Date(startSchedule).toISOString();
+    if (startSchedule)
+      body.startSchedule = fromDatetimeLocalInTimezone(startSchedule, timezone).toISOString();
     if (duration) body.duration = parseInt(duration, 10);
-    if (validFrom) body.validFrom = new Date(validFrom).toISOString();
-    if (validTo) body.validTo = new Date(validTo).toISOString();
+    if (validFrom) body.validFrom = fromDatetimeLocalInTimezone(validFrom, timezone).toISOString();
+    if (validTo) body.validTo = fromDatetimeLocalInTimezone(validTo, timezone).toISOString();
 
     const filter: Record<string, string> = {};
     if (filterSiteId) filter.siteId = filterSiteId;
@@ -148,7 +162,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="sc-name">{t('common.name')}</Label>
+              <Label htmlFor="sc-name" className="leading-6">
+                {t('common.name')}
+              </Label>
               <Input
                 id="sc-name"
                 value={name}
@@ -163,7 +179,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="sc-description">{t('common.description')}</Label>
+              <Label htmlFor="sc-description" className="leading-6">
+                {t('common.description')}
+              </Label>
               <Input
                 id="sc-description"
                 value={description}
@@ -174,7 +192,7 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
             </div>
 
             <div className="space-y-2">
-              <Label>{t('smartCharging.ocppVersion')}</Label>
+              <Label className="leading-6">{t('smartCharging.ocppVersion')}</Label>
               <div className="flex gap-1">
                 <Button
                   type="button"
@@ -309,7 +327,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-rate-unit">{t('smartCharging.chargingRateUnit')}</Label>
+                <Label htmlFor="sc-rate-unit" className="leading-6">
+                  {t('smartCharging.chargingRateUnit')}
+                </Label>
                 <Select
                   id="sc-rate-unit"
                   value={chargingRateUnit}
@@ -325,7 +345,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
 
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="sc-start-schedule">{t('smartCharging.startSchedule')}</Label>
+                <Label htmlFor="sc-start-schedule" className="leading-6">
+                  {t('smartCharging.startSchedule')}
+                </Label>
                 <Input
                   id="sc-start-schedule"
                   type="datetime-local"
@@ -340,7 +362,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-valid-from">{t('smartCharging.validFrom')}</Label>
+                <Label htmlFor="sc-valid-from" className="leading-6">
+                  {t('smartCharging.validFrom')}
+                </Label>
                 <Input
                   id="sc-valid-from"
                   type="datetime-local"
@@ -351,7 +375,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-valid-to">{t('smartCharging.validTo')}</Label>
+                <Label htmlFor="sc-valid-to" className="leading-6">
+                  {t('smartCharging.validTo')}
+                </Label>
                 <Input
                   id="sc-valid-to"
                   type="datetime-local"
@@ -362,7 +388,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-duration">{t('smartCharging.durationSeconds')}</Label>
+                <Label htmlFor="sc-duration" className="leading-6">
+                  {t('smartCharging.durationSeconds')}
+                </Label>
                 <Input
                   id="sc-duration"
                   type="number"
@@ -380,7 +408,11 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
               periods={schedulePeriods}
               onChange={setSchedulePeriods}
               rateUnit={chargingRateUnit}
-              startSchedule={startSchedule ? new Date(startSchedule).toISOString() : null}
+              startSchedule={
+                startSchedule
+                  ? fromDatetimeLocalInTimezone(startSchedule, timezone).toISOString()
+                  : null
+              }
               timezone={timezone}
             />
 
@@ -392,24 +424,34 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="sc-filter-site">{t('configTemplates.site')}</Label>
+                <Label htmlFor="sc-filter-site" className="leading-6">
+                  {t('configTemplates.site')}
+                </Label>
                 <Select
                   id="sc-filter-site"
                   value={filterSiteId}
+                  className={hasSubmitted && errors.filterSiteId ? 'border-destructive' : ''}
                   onChange={(e) => {
                     setFilterSiteId(e.target.value);
                   }}
                 >
-                  <option value="">{t('configTemplates.allSites')}</option>
+                  <option value="">
+                    {hasAllSiteAccess ? t('configTemplates.allSites') : t('common.select')}
+                  </option>
                   {filterOptions?.sites.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
                     </option>
                   ))}
                 </Select>
+                {hasSubmitted && errors.filterSiteId && (
+                  <p className="text-sm text-destructive">{errors.filterSiteId}</p>
+                )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-filter-vendor">{t('configTemplates.vendor')}</Label>
+                <Label htmlFor="sc-filter-vendor" className="leading-6">
+                  {t('configTemplates.vendor')}
+                </Label>
                 <Select
                   id="sc-filter-vendor"
                   value={filterVendorId}
@@ -426,7 +468,9 @@ export function SmartChargingTemplateCreate(): React.JSX.Element {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sc-filter-model">{t('configTemplates.model')}</Label>
+                <Label htmlFor="sc-filter-model" className="leading-6">
+                  {t('configTemplates.model')}
+                </Label>
                 <Select
                   id="sc-filter-model"
                   value={filterModel}

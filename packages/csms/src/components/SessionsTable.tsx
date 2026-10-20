@@ -5,6 +5,7 @@ import { memo } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import {
   Table,
   TableBody,
@@ -13,11 +14,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { formatDuration } from '@/lib/formatting';
+import { formatDuration, formatNumber, formatCents } from '@/lib/formatting';
 import { formatDateTime } from '@/lib/timezone';
 import { sessionStatusVariant } from '@/lib/status-variants';
 import type { ColumnMeta, ColumnVisibility } from '@/lib/column-visibility';
 import { LoadingLogo } from '@/components/loading-logo';
+import { formatVehicleId } from '@evtivity/lib/vehicle-id';
+import { sessionDisplayCostCents } from '@evtivity/lib/session-cost';
 
 export const SESSIONS_COLUMNS: ColumnMeta[] = [
   {
@@ -39,6 +42,12 @@ export const SESSIONS_COLUMNS: ColumnMeta[] = [
     label: 'sessions.driverName',
     defaultVisible: true,
     defaultVisibleMobile: true,
+  },
+  {
+    key: 'vehicle',
+    label: 'vehicles.vehicle',
+    defaultVisible: true,
+    defaultVisibleMobile: false,
   },
   {
     key: 'guestSession',
@@ -89,12 +98,43 @@ export interface Session {
   freeVend: boolean | null;
   isGuestSession?: boolean;
   co2AvoidedKg: number | null;
+  /** Operator re-bill of a session the CSMS could not end; 'manual' waits for billing outside the platform. */
+  rebillStatus?: 'in_progress' | 'billed' | 'manual' | null;
+  vehicleId?: string | null;
+  vehicleName?: string | null;
+  vehicleCapture?: { value: string; type: string; source: string } | null;
+  autocharge?: boolean;
+}
+
+/**
+ * The vehicle of a session row: the linked vehicle (with Autocharge when it
+ * started the session), else the id the charger sent, marked as captured.
+ */
+function SessionVehicleCell({ session }: { session: Session }): React.JSX.Element {
+  const { t } = useTranslation();
+  if (session.vehicleName != null && session.vehicleName !== '') {
+    return (
+      <span className="inline-flex items-center gap-2">
+        {session.vehicleName}
+        {session.autocharge === true && <Badge variant="info">{t('vehicles.autocharge')}</Badge>}
+      </span>
+    );
+  }
+  if (session.vehicleCapture != null) {
+    return (
+      <span title={t('sessions.capturedFromCharger')}>
+        <span className="font-mono">{formatVehicleId(session.vehicleCapture.value)}</span>{' '}
+        <span className="text-xs text-muted-foreground">{t('sessions.captured')}</span>
+      </span>
+    );
+  }
+  return <span className="text-muted-foreground">-</span>;
 }
 
 function formatCost(session: Session): string {
-  const cents = session.status === 'completed' ? session.finalCostCents : session.currentCostCents;
+  const cents = sessionDisplayCostCents(session);
   if (cents == null) return '-';
-  return `${(cents / 100).toFixed(2)} ${session.currency}`;
+  return formatCents(cents, session.currency);
 }
 
 interface SessionsTableProps {
@@ -104,6 +144,9 @@ interface SessionsTableProps {
   onPageChange: (page: number) => void;
   timezone: string;
   isLoading?: boolean;
+  /** The list failed to load: shows the load error with a Retry button. */
+  isError?: boolean;
+  onRetry?: () => void;
   emptyMessage?: string;
   hideStationName?: boolean;
   hideDriverName?: boolean;
@@ -114,6 +157,8 @@ export const SessionsTable = memo(function SessionsTable({
   sessions,
   timezone,
   isLoading,
+  isError = false,
+  onRetry,
   emptyMessage,
   hideStationName = false,
   hideDriverName = false,
@@ -141,6 +186,7 @@ export const SessionsTable = memo(function SessionsTable({
               {!hideDriverName && isVisible('driverName') && (
                 <TableHead>{t('sessions.driverName')}</TableHead>
               )}
+              {isVisible('vehicle') && <TableHead>{t('vehicles.vehicle')}</TableHead>}
               {isVisible('guestSession') && <TableHead>{t('sessions.guestSession')}</TableHead>}
               {isVisible('status') && <TableHead>{t('common.status')}</TableHead>}
               {isVisible('started') && <TableHead>{t('sessions.started')}</TableHead>}
@@ -164,6 +210,18 @@ export const SessionsTable = memo(function SessionsTable({
                 </TableCell>
               </TableRow>
             )}
+            {isError && isLoading !== true && (
+              <TableRow>
+                <TableCell colSpan={colCount} className="text-center">
+                  <span className="text-destructive">{t('common.loadError')}</span>
+                  {onRetry != null && (
+                    <Button variant="outline" size="sm" className="ml-3" onClick={onRetry}>
+                      {t('common.retry')}
+                    </Button>
+                  )}
+                </TableCell>
+              </TableRow>
+            )}
             {sessions?.map((session) => (
               <TableRow
                 key={session.id}
@@ -180,7 +238,7 @@ export const SessionsTable = memo(function SessionsTable({
                   <TableCell className="whitespace-nowrap">
                     <Link
                       to={`/stations/${session.stationId}`}
-                      className="text-primary hover:underline"
+                      className="text-link hover:underline"
                       onClick={(e) => {
                         e.stopPropagation();
                       }}
@@ -198,7 +256,7 @@ export const SessionsTable = memo(function SessionsTable({
                     ) : session.driverName != null ? (
                       <Link
                         to={`/drivers/${session.driverId ?? ''}`}
-                        className="text-primary hover:underline"
+                        className="text-link hover:underline"
                         onClick={(e) => {
                           e.stopPropagation();
                         }}
@@ -206,8 +264,13 @@ export const SessionsTable = memo(function SessionsTable({
                         {session.driverName}
                       </Link>
                     ) : (
-                      'n/a'
+                      t('common.na')
                     )}
+                  </TableCell>
+                )}
+                {isVisible('vehicle') && (
+                  <TableCell className="whitespace-nowrap">
+                    <SessionVehicleCell session={session} />
                   </TableCell>
                 )}
                 {isVisible('guestSession') && (
@@ -229,8 +292,13 @@ export const SessionsTable = memo(function SessionsTable({
                     >
                       {session.status === 'active' && session.idleStartedAt != null
                         ? t('status.idle')
-                        : session.status}
+                        : t(`status.${session.status}`, { defaultValue: session.status })}
                     </Badge>
+                    {session.rebillStatus === 'manual' && (
+                      <Badge variant="warning" className="ml-2">
+                        {t('sessions.manualBilling')}
+                      </Badge>
+                    )}
                   </TableCell>
                 )}
                 {isVisible('started') && (
@@ -245,7 +313,7 @@ export const SessionsTable = memo(function SessionsTable({
                   <TableCell className="text-right">
                     {session.energyDeliveredWh != null
                       ? t('sessions.energyKwh', {
-                          value: (session.energyDeliveredWh / 1000).toFixed(2),
+                          value: formatNumber(session.energyDeliveredWh / 1000, 2),
                         })
                       : '-'}
                   </TableCell>
@@ -254,10 +322,12 @@ export const SessionsTable = memo(function SessionsTable({
                   <TableCell className="text-right">
                     {session.co2AvoidedKg != null ? (
                       <span className="text-success">
-                        {parseFloat(String(session.co2AvoidedKg)).toFixed(2)} kg
+                        {t('sessions.co2Kg', {
+                          value: formatNumber(parseFloat(String(session.co2AvoidedKg)), 2),
+                        })}
                       </span>
                     ) : (
-                      'n/a'
+                      t('common.na')
                     )}
                   </TableCell>
                 )}
@@ -266,7 +336,7 @@ export const SessionsTable = memo(function SessionsTable({
                 )}
               </TableRow>
             ))}
-            {sessions?.length === 0 && (
+            {!isError && sessions?.length === 0 && (
               <TableRow>
                 <TableCell colSpan={colCount} className="text-center text-muted-foreground">
                   {emptyMessage ?? t('sessions.noSessionsFound')}

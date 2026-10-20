@@ -1,503 +1,580 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { AiAlertsBanner } from '@/components/ai/alerts/AiAlertsBanner';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  AI_LIMIT_SETTINGS,
+  AI_PROVIDER_IDS,
+  aiProviderApiKeySettingKey,
+  aiProviderBaseUrlSettingKey,
+  parseAiLimitValue,
+} from '@evtivity/lib/ai-config';
+import type { AiLimitSettingKey } from '@evtivity/lib/ai-config';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
+import { PasswordInput } from '@/components/ui/password-input';
+import { Toggle } from '@/components/ui/toggle';
+import {
+  AiProviderSelect,
+  AiEffortSelect,
+  AiToneSelect,
+  PROVIDER_LABELS,
+} from '@/components/ai/AiConfigFields';
+import { AiDataNotice } from '@/components/ai/AiDataNotice';
+import { AI_STATUS_KEY } from '@/components/ai/use-ai-status';
+import { useLoadedValues, useSaveKeys } from './ai-settings-save';
+import type { Values } from './ai-settings-save';
+import { AiAdvancedOptions, AiPromptSummary } from './AiAdvancedOptions';
+import { AiInsightsSettings, AiMcpSettings } from './AiOpsSettings';
+import { DriverAiSettings } from './ai/DriverAiSettings';
+import { AiUsageTab } from '@/components/ai/usage/AiUsageTab';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useTab } from '@/hooks/use-tab';
+import {
+  AI_SETTINGS_TABS,
+  DEFAULT_AI_SETTINGS_TAB,
+  resolveAiSettingsTab,
+} from './ai-settings-tabs';
+import type { AiSettingsTab } from './ai-settings-tabs';
+import { AiModelField } from '@/components/ai/AiModelField';
+import { AiSystemPromptField } from '@/components/ai/AiSystemPromptField';
+import type { AiDefaults } from '@/components/ai/use-ai-defaults';
+import { isCustomModel, isDefaultPrompt, useAiDefaults } from '@/components/ai/use-ai-defaults';
 import { api } from '@/lib/api';
+import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
+import { getErrorMessage } from '@/lib/error-message';
+import { formatNumber } from '@/lib/formatting';
+
+const LIMIT_KEYS = Object.keys(AI_LIMIT_SETTINGS) as AiLimitSettingKey[];
+
+type LimitLabelKey =
+  | 'settings.aiLimits.userPerMinute'
+  | 'settings.aiLimits.sitePerMinute'
+  | 'settings.aiLimits.userDailyTokens'
+  | 'settings.aiLimits.maxToolCallsPerTurn'
+  | 'settings.aiLimits.conversationRetentionDays'
+  | 'settings.aiLimits.attachmentsMaxBytes'
+  | 'settings.aiLimits.attachmentsMaxPerMessage'
+  | 'settings.aiLimits.companyMonthlyTokens'
+  | 'settings.aiLimits.siteMonthlyTokens'
+  | 'settings.aiLimits.siteDailyTokens'
+  | 'settings.aiLimits.warnPercent';
+
+// Budgets where 0 means no limit (the daily user budget has its own hint).
+const ZERO_NO_LIMIT_KEYS: ReadonlySet<AiLimitSettingKey> = new Set([
+  'ai.budget.companyMonthlyTokens',
+  'ai.budget.siteMonthlyTokens',
+  'ai.budget.siteDailyTokens',
+]);
+
+const LIMIT_LABELS: Record<AiLimitSettingKey, LimitLabelKey> = {
+  'ai.rateLimit.userPerMinute': 'settings.aiLimits.userPerMinute',
+  'ai.rateLimit.sitePerMinute': 'settings.aiLimits.sitePerMinute',
+  'ai.budget.userDailyTokens': 'settings.aiLimits.userDailyTokens',
+  'ai.maxToolCallsPerTurn': 'settings.aiLimits.maxToolCallsPerTurn',
+  'ai.conversationRetentionDays': 'settings.aiLimits.conversationRetentionDays',
+  'ai.attachments.maxBytes': 'settings.aiLimits.attachmentsMaxBytes',
+  'ai.attachments.maxPerMessage': 'settings.aiLimits.attachmentsMaxPerMessage',
+  'ai.budget.companyMonthlyTokens': 'settings.aiLimits.companyMonthlyTokens',
+  'ai.budget.siteMonthlyTokens': 'settings.aiLimits.siteMonthlyTokens',
+  'ai.budget.siteDailyTokens': 'settings.aiLimits.siteDailyTokens',
+  'ai.budget.warnPercent': 'settings.aiLimits.warnPercent',
+};
+
+const PROVIDER_KEYS = AI_PROVIDER_IDS.flatMap((p) => [
+  aiProviderApiKeySettingKey(p),
+  aiProviderBaseUrlSettingKey(p),
+]);
+const CHATBOT_KEYS = [
+  'chatbotAi.provider',
+  'chatbotAi.model',
+  'chatbotAi.effort',
+  'chatbotAi.systemPrompt',
+];
+const SUPPORT_KEYS = [
+  'supportAi.provider',
+  'supportAi.model',
+  'supportAi.effort',
+  'supportAi.tone',
+  'supportAi.systemPrompt',
+];
+
+function asString(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return String(value);
+  return '';
+}
+
+function loadValues(settings: Record<string, unknown> | undefined): Values {
+  const out: Values = {};
+  for (const key of [...PROVIDER_KEYS, ...CHATBOT_KEYS, ...SUPPORT_KEYS]) {
+    out[key] = asString(settings?.[key]);
+  }
+  out['chatbotAi.effort'] =
+    out['chatbotAi.effort'] !== '' ? (out['chatbotAi.effort'] ?? '') : 'medium';
+  out['supportAi.effort'] =
+    out['supportAi.effort'] !== '' ? (out['supportAi.effort'] ?? '') : 'medium';
+  out['supportAi.tone'] =
+    out['supportAi.tone'] !== '' ? (out['supportAi.tone'] ?? '') : 'professional';
+  for (const key of LIMIT_KEYS) {
+    const stored = parseAiLimitValue(key, settings?.[key]);
+    out[key] = String(stored ?? AI_LIMIT_SETTINGS[key].defaultValue);
+  }
+  return out;
+}
 
 interface AiSettingsProps {
   settings: Record<string, unknown> | undefined;
 }
 
+interface CardProps extends AiSettingsProps {
+  canWrite: boolean;
+}
+
+/**
+ * Settings > AI, one tab per function: providers and keys (`ai.<provider>.*`),
+ * the assistant (`chatbotAi.*`), support drafts (`supportAi.*`), driver
+ * support (`driverAi.*`), automatic insights (the `opsAi.*` surface,
+ * `aiInsights.*` and the background workers `aiWorkers.*`), MCP (`ai.mcp.*`), and
+ * usage and limits (the `ai.*` limits, then the usage dashboard for users with
+ * `aiUsage:read` and access to every site). An unknown `sub` opens the default
+ * tab, so old `sub=config` links still work.
+ */
 export function AiSettings({ settings }: AiSettingsProps): React.JSX.Element {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
-
-  // Chatbot AI state
-  const [chatbotAiEnabled, setChatbotAiEnabled] = useState(false);
-  const [chatbotAiProvider, setChatbotAiProvider] = useState('anthropic');
-  const [chatbotAiApiKey, setChatbotAiApiKey] = useState('');
-  const [chatbotAiModel, setChatbotAiModel] = useState('');
-  const [chatbotAiTemperature, setChatbotAiTemperature] = useState('');
-  const [chatbotAiTopP, setChatbotAiTopP] = useState('');
-  const [chatbotAiTopK, setChatbotAiTopK] = useState('');
-  const [chatbotAiSystemPrompt, setChatbotAiSystemPrompt] = useState('');
-
-  // Support AI state
-  const [supportAiEnabled, setSupportAiEnabled] = useState(false);
-  const [supportAiProvider, setSupportAiProvider] = useState('anthropic');
-  const [supportAiApiKey, setSupportAiApiKey] = useState('');
-  const [supportAiModel, setSupportAiModel] = useState('');
-  const [supportAiTemperature, setSupportAiTemperature] = useState('');
-  const [supportAiTopP, setSupportAiTopP] = useState('');
-  const [supportAiTopK, setSupportAiTopK] = useState('');
-  const [supportAiTone, setSupportAiTone] = useState('professional');
-  const [supportAiSystemPrompt, setSupportAiSystemPrompt] = useState('');
-
+  const canWrite = useHasPermission('settings.ai:write');
+  const canReadUsage = useHasPermission('aiUsage:read');
+  const allSites = useHasAllSiteAccess();
+  const showUsage = canReadUsage && allSites;
+  const aiDefaults = useAiDefaults('settings');
+  const [sub, setSub] = useTab(DEFAULT_AI_SETTINGS_TAB, 'sub');
+  const active = resolveAiSettingsTab(sub);
+  // Opened tabs stay mounted (hidden), so unsaved edits survive a tab switch;
+  // unopened tabs load nothing.
+  const [visited, setVisited] = useState<ReadonlySet<AiSettingsTab>>(() => new Set([active]));
   useEffect(() => {
-    if (settings == null) return;
-    setChatbotAiEnabled(settings['chatbotAi.enabled'] === true);
-    const aip = settings['chatbotAi.provider'];
-    setChatbotAiProvider(typeof aip === 'string' && aip !== '' ? aip : 'anthropic');
-    const aik = settings['chatbotAi.apiKeyEnc'];
-    setChatbotAiApiKey(typeof aik === 'string' ? aik : '');
-    const aim = settings['chatbotAi.model'];
-    setChatbotAiModel(typeof aim === 'string' ? aim : '');
-    const ait = settings['chatbotAi.temperature'];
-    setChatbotAiTemperature(
-      typeof ait === 'number' ? String(ait) : typeof ait === 'string' && ait !== '' ? ait : '',
-    );
-    const aitp = settings['chatbotAi.topP'];
-    setChatbotAiTopP(
-      typeof aitp === 'number' ? String(aitp) : typeof aitp === 'string' && aitp !== '' ? aitp : '',
-    );
-    const aitk = settings['chatbotAi.topK'];
-    setChatbotAiTopK(
-      typeof aitk === 'number' ? String(aitk) : typeof aitk === 'string' && aitk !== '' ? aitk : '',
-    );
-    const aisp = settings['chatbotAi.systemPrompt'];
-    setChatbotAiSystemPrompt(typeof aisp === 'string' ? aisp : '');
-    setSupportAiEnabled(settings['supportAi.enabled'] === true);
-    const saip = settings['supportAi.provider'];
-    setSupportAiProvider(typeof saip === 'string' && saip !== '' ? saip : 'anthropic');
-    const saik = settings['supportAi.apiKeyEnc'];
-    setSupportAiApiKey(typeof saik === 'string' ? saik : '');
-    const saim = settings['supportAi.model'];
-    setSupportAiModel(typeof saim === 'string' ? saim : '');
-    const sait = settings['supportAi.temperature'];
-    setSupportAiTemperature(
-      typeof sait === 'number' ? String(sait) : typeof sait === 'string' && sait !== '' ? sait : '',
-    );
-    const saitp = settings['supportAi.topP'];
-    setSupportAiTopP(
-      typeof saitp === 'number'
-        ? String(saitp)
-        : typeof saitp === 'string' && saitp !== ''
-          ? saitp
-          : '',
-    );
-    const saitk = settings['supportAi.topK'];
-    setSupportAiTopK(
-      typeof saitk === 'number'
-        ? String(saitk)
-        : typeof saitk === 'string' && saitk !== ''
-          ? saitk
-          : '',
-    );
-    const saitn = settings['supportAi.tone'];
-    setSupportAiTone(typeof saitn === 'string' && saitn !== '' ? saitn : 'professional');
-    const saisp = settings['supportAi.systemPrompt'];
-    setSupportAiSystemPrompt(typeof saisp === 'string' ? saisp : '');
-  }, [settings]);
-
-  const chatbotAiToggleMutation = useMutation({
-    mutationFn: (enabled: boolean) => api.put('/v1/settings/chatbotAi.enabled', { value: enabled }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['settings'] });
-    },
-  });
-
-  const chatbotAiSaveMutation = useMutation({
-    mutationFn: (vals: {
-      provider: string;
-      apiKey: string;
-      model: string;
-      temperature: string;
-      topP: string;
-      topK: string;
-      systemPrompt: string;
-    }) =>
-      Promise.all([
-        api.put('/v1/settings/chatbotAi.provider', { value: vals.provider }),
-        ...(vals.apiKey !== ''
-          ? [api.put('/v1/settings/chatbotAi.apiKeyEnc', { value: vals.apiKey })]
-          : []),
-        api.put('/v1/settings/chatbotAi.model', { value: vals.model }),
-        api.put('/v1/settings/chatbotAi.temperature', { value: vals.temperature }),
-        api.put('/v1/settings/chatbotAi.topP', { value: vals.topP }),
-        api.put('/v1/settings/chatbotAi.topK', { value: vals.topK }),
-        api.put('/v1/settings/chatbotAi.systemPrompt', { value: vals.systemPrompt }),
-      ]),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['settings'] });
-    },
-  });
-
-  const supportAiToggleMutation = useMutation({
-    mutationFn: (enabled: boolean) => api.put('/v1/settings/supportAi.enabled', { value: enabled }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['settings'] });
-    },
-  });
-
-  const supportAiSaveMutation = useMutation({
-    mutationFn: (vals: {
-      provider: string;
-      apiKey: string;
-      model: string;
-      temperature: string;
-      topP: string;
-      topK: string;
-      tone: string;
-      systemPrompt: string;
-    }) =>
-      Promise.all([
-        api.put('/v1/settings/supportAi.provider', { value: vals.provider }),
-        ...(vals.apiKey !== ''
-          ? [api.put('/v1/settings/supportAi.apiKeyEnc', { value: vals.apiKey })]
-          : []),
-        api.put('/v1/settings/supportAi.model', { value: vals.model }),
-        api.put('/v1/settings/supportAi.temperature', { value: vals.temperature }),
-        api.put('/v1/settings/supportAi.topP', { value: vals.topP }),
-        api.put('/v1/settings/supportAi.topK', { value: vals.topK }),
-        api.put('/v1/settings/supportAi.tone', { value: vals.tone }),
-        api.put('/v1/settings/supportAi.systemPrompt', { value: vals.systemPrompt }),
-      ]),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['settings'] });
-    },
-  });
-
+    setVisited((prev) => (prev.has(active) ? prev : new Set([...prev, active])));
+  }, [active]);
+  const warnPercent =
+    parseAiLimitValue('ai.budget.warnPercent', settings?.['ai.budget.warnPercent']) ??
+    AI_LIMIT_SETTINGS['ai.budget.warnPercent'].defaultValue;
+  const cardProps = { settings, canWrite };
   return (
-    <>
-      <Card>
-        <CardHeader>
-          <CardTitle>{t('settings.chatbotAiSectionTitle')}</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="flex items-center justify-between rounded-lg border p-4">
-            <div className="space-y-0.5">
-              <Label>{t('settings.chatbotAiEnabled')}</Label>
-              <p className="text-xs text-muted-foreground">{t('settings.chatbotAiEnabledDesc')}</p>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={chatbotAiEnabled}
-              onClick={() => {
-                setChatbotAiEnabled(!chatbotAiEnabled);
-                chatbotAiToggleMutation.mutate(!chatbotAiEnabled);
-              }}
-              disabled={chatbotAiToggleMutation.isPending}
-              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${chatbotAiEnabled ? 'bg-primary' : 'bg-muted'}`}
-            >
-              <span
-                className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${chatbotAiEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-              />
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="ai-provider">{t('settings.chatbotAiProvider')}</Label>
-              <select
-                id="ai-provider"
-                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                value={chatbotAiProvider}
-                onChange={(e) => {
-                  setChatbotAiProvider(e.target.value);
-                }}
-              >
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI</option>
-                <option value="gemini">Gemini</option>
-              </select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="ai-api-key">{t('settings.chatbotAiApiKey')}</Label>
-              <PasswordInput
-                id="ai-api-key"
-                value={chatbotAiApiKey}
-                onChange={(e) => {
-                  setChatbotAiApiKey(e.target.value);
-                }}
-                placeholder={
-                  settings?.['chatbotAi.apiKeyEnc'] != null &&
-                  settings['chatbotAi.apiKeyEnc'] !== ''
-                    ? '********'
-                    : ''
-                }
-              />
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="ai-model">{t('settings.chatbotAiModel')}</Label>
-            <Input
-              id="ai-model"
-              value={chatbotAiModel}
-              onChange={(e) => {
-                setChatbotAiModel(e.target.value);
-              }}
-            />
-            <p className="text-xs text-muted-foreground">{t('settings.chatbotAiModelHelp')}</p>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="ai-temperature">{t('settings.chatbotAiTemperature')}</Label>
-              <Input
-                id="ai-temperature"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
-                value={chatbotAiTemperature}
-                onChange={(e) => {
-                  setChatbotAiTemperature(e.target.value);
-                }}
-                placeholder="0.7"
-              />
-              <p className="text-xs text-muted-foreground">
-                {t('settings.chatbotAiTemperatureHint')}
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="ai-top-p">{t('settings.chatbotAiTopP')}</Label>
-              <Input
-                id="ai-top-p"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={chatbotAiTopP}
-                onChange={(e) => {
-                  setChatbotAiTopP(e.target.value);
-                }}
-                placeholder="0.9"
-              />
-              <p className="text-xs text-muted-foreground">{t('settings.chatbotAiTopPHint')}</p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="ai-top-k">{t('settings.chatbotAiTopK')}</Label>
-              <Input
-                id="ai-top-k"
-                type="number"
-                min={1}
-                max={100}
-                step={1}
-                value={chatbotAiTopK}
-                onChange={(e) => {
-                  setChatbotAiTopK(e.target.value);
-                }}
-                placeholder="40"
-              />
-              <p className="text-xs text-muted-foreground">{t('settings.chatbotAiTopKHint')}</p>
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="ai-system-prompt">{t('settings.chatbotAiSystemPrompt')}</Label>
-            <textarea
-              id="ai-system-prompt"
-              rows={4}
-              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              value={chatbotAiSystemPrompt}
-              onChange={(e) => {
-                setChatbotAiSystemPrompt(e.target.value);
-              }}
-              placeholder={t('settings.chatbotAiSystemPromptDefault')}
-            />
-            <p className="text-xs text-muted-foreground">
-              {t('settings.chatbotAiSystemPromptHint')}
-            </p>
-          </div>
-          <div className="flex justify-end items-center gap-4">
-            <SaveButton
-              isPending={chatbotAiSaveMutation.isPending}
-              onClick={() => {
-                chatbotAiSaveMutation.mutate({
-                  provider: chatbotAiProvider,
-                  apiKey: chatbotAiApiKey,
-                  model: chatbotAiModel,
-                  temperature: chatbotAiTemperature,
-                  topP: chatbotAiTopP,
-                  topK: chatbotAiTopK,
-                  systemPrompt: chatbotAiSystemPrompt,
-                });
-              }}
-            />
-            {chatbotAiSaveMutation.isSuccess && (
-              <p className="text-sm text-green-600">{t('settings.chatbotAiSaved')}</p>
-            )}
-            {chatbotAiSaveMutation.isError && (
-              <p className="text-sm text-destructive">{t('settings.chatbotAiSaveFailed')}</p>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+    <Tabs value={active} onValueChange={setSub}>
+      <AiAlertsBanner placement="settings" className="mb-4" />
+      <TabsList>
+        {AI_SETTINGS_TABS.map((id) => (
+          <TabsTrigger key={id} value={id}>
+            {t(`settings.aiTabs.${id}`)}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+      <AiTab id="providers" visited={visited} notice>
+        <AiProvidersCard {...cardProps} />
+      </AiTab>
+      <AiTab id="assistant" visited={visited} notice>
+        <AiSurfaceCard {...cardProps} surface="chatbot" aiDefaults={aiDefaults} />
+      </AiTab>
+      <AiTab id="support" visited={visited} notice>
+        <AiSurfaceCard {...cardProps} surface="support" aiDefaults={aiDefaults} />
+      </AiTab>
+      <AiTab id="driver" visited={visited} notice>
+        <DriverAiSettings settings={settings} />
+      </AiTab>
+      <AiTab id="insights" visited={visited} notice>
+        <AiInsightsSettings {...cardProps} aiDefaults={aiDefaults} />
+      </AiTab>
+      <AiTab id="mcp" visited={visited} notice>
+        <AiMcpSettings {...cardProps} />
+      </AiTab>
+      <AiTab id="usage" visited={visited}>
+        <AiLimitsCard {...cardProps} />
+        {showUsage && <AiUsageTab warnPercent={warnPercent} />}
+      </AiTab>
+    </Tabs>
+  );
+}
 
-      <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>{t('settings.supportAi')}</CardTitle>
-          <p className="text-sm text-muted-foreground">{t('settings.supportAiDescription')}</p>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="flex items-center justify-between rounded-lg border p-4">
-            <div className="space-y-0.5">
-              <Label>{t('settings.supportAiEnabled')}</Label>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={supportAiEnabled}
-              onClick={() => {
-                setSupportAiEnabled(!supportAiEnabled);
-                supportAiToggleMutation.mutate(!supportAiEnabled);
-              }}
-              disabled={supportAiToggleMutation.isPending}
-              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${supportAiEnabled ? 'bg-primary' : 'bg-muted'}`}
-            >
-              <span
-                className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform ${supportAiEnabled ? 'translate-x-5' : 'translate-x-0'}`}
-              />
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="support-ai-provider">{t('settings.supportAiProvider')}</Label>
-              <select
-                id="support-ai-provider"
-                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                value={supportAiProvider}
-                onChange={(e) => {
-                  setSupportAiProvider(e.target.value);
-                }}
+/** One tab: its short description, the AI data note on surface tabs, then its cards. */
+function AiTab({
+  id,
+  visited,
+  notice = false,
+  children,
+}: {
+  id: AiSettingsTab;
+  visited: ReadonlySet<AiSettingsTab>;
+  notice?: boolean;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  const { t } = useTranslation();
+  return (
+    <TabsContent
+      value={id}
+      keepMounted={visited.has(id)}
+      className="mt-4 space-y-6"
+      data-testid={`ai-tab-${id}`}
+    >
+      <p className="text-sm text-muted-foreground">{t(`settings.aiTabs.${id}Description`)}</p>
+      {notice && <AiDataNotice />}
+      {children}
+    </TabsContent>
+  );
+}
+
+function SaveStatus({
+  m,
+}: {
+  m: { isSuccess: boolean; isError: boolean; error: unknown };
+}): React.JSX.Element | null {
+  const { t } = useTranslation();
+  if (m.isError) {
+    return (
+      <p className="text-sm text-destructive">
+        {getErrorMessage(m.error, t, 'settings.aiSaveFailed')}
+      </p>
+    );
+  }
+  if (m.isSuccess) return <p className="text-sm text-success">{t('settings.aiSaved')}</p>;
+  return null;
+}
+
+function useFormValues(settings: Record<string, unknown> | undefined): {
+  loaded: Values;
+  values: Values;
+  set: (key: string) => (value: string) => void;
+} {
+  const loaded = useMemo(() => loadValues(settings), [settings]);
+  // A refetch (a toggle, another card's save, window focus) keeps edits in progress.
+  const [values, setValues] = useLoadedValues<Values>(loaded);
+  const set = (key: string) => (value: string) => {
+    setValues((prev) => ({ ...prev, [key]: value }));
+  };
+  return { loaded, values, set };
+}
+
+/** Providers and keys: one API key per provider, the base URL behind a disclosure. */
+function AiProvidersCard({ settings, canWrite }: CardProps): React.JSX.Element {
+  const { t } = useTranslation();
+  const { loaded, values, set } = useFormValues(settings);
+  const save = useSaveKeys(PROVIDER_KEYS, loaded, (_k, v) => v.trim());
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('settings.aiProvidersTitle')}</CardTitle>
+        <p className="text-sm text-muted-foreground">{t('settings.aiProvidersDescription')}</p>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {AI_PROVIDER_IDS.map((p) => {
+          const keyKey = aiProviderApiKeySettingKey(p);
+          const urlKey = aiProviderBaseUrlSettingKey(p);
+          const baseUrl = values[urlKey] ?? '';
+          return (
+            <fieldset key={p} className="space-y-4 rounded-lg border p-4">
+              <legend className="px-1 text-sm font-medium">{PROVIDER_LABELS[p]}</legend>
+              <div className="space-y-2">
+                <Label htmlFor={`ai-${p}-key`} className="leading-6">
+                  {t('settings.aiApiKey')}
+                </Label>
+                <PasswordInput
+                  id={`ai-${p}-key`}
+                  autoComplete="off"
+                  disabled={!canWrite}
+                  value={values[keyKey] ?? ''}
+                  onChange={(e) => {
+                    set(keyKey)(e.target.value);
+                  }}
+                />
+              </div>
+              <AiAdvancedOptions
+                summary={baseUrl !== '' ? baseUrl : t('settings.aiBaseUrlDefaultSummary')}
+                data-testid={`ai-${p}-advanced`}
               >
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI</option>
-                <option value="gemini">Gemini</option>
-              </select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="support-ai-api-key">{t('settings.supportAiApiKey')}</Label>
-              <PasswordInput
-                id="support-ai-api-key"
-                value={supportAiApiKey}
-                onChange={(e) => {
-                  setSupportAiApiKey(e.target.value);
-                }}
-                placeholder={
-                  settings?.['supportAi.apiKeyEnc'] != null &&
-                  settings['supportAi.apiKeyEnc'] !== ''
-                    ? '********'
-                    : ''
-                }
-              />
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="support-ai-model">{t('settings.supportAiModel')}</Label>
-            <Input
-              id="support-ai-model"
-              value={supportAiModel}
-              onChange={(e) => {
-                setSupportAiModel(e.target.value);
-              }}
-            />
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="support-ai-temperature">{t('settings.supportAiTemperature')}</Label>
-              <Input
-                id="support-ai-temperature"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
-                value={supportAiTemperature}
-                onChange={(e) => {
-                  setSupportAiTemperature(e.target.value);
-                }}
-                placeholder="0.3"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="support-ai-top-p">{t('settings.supportAiTopP')}</Label>
-              <Input
-                id="support-ai-top-p"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={supportAiTopP}
-                onChange={(e) => {
-                  setSupportAiTopP(e.target.value);
-                }}
-                placeholder="0.9"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="support-ai-top-k">{t('settings.supportAiTopK')}</Label>
-              <Input
-                id="support-ai-top-k"
-                type="number"
-                min={1}
-                max={100}
-                step={1}
-                value={supportAiTopK}
-                onChange={(e) => {
-                  setSupportAiTopK(e.target.value);
-                }}
-                placeholder="40"
-              />
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="support-ai-tone">{t('settings.supportAiTone')}</Label>
-            <select
-              id="support-ai-tone"
-              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              value={supportAiTone}
-              onChange={(e) => {
-                setSupportAiTone(e.target.value);
-              }}
-            >
-              <option value="professional">Professional</option>
-              <option value="friendly">Friendly</option>
-              <option value="formal">Formal</option>
-            </select>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="support-ai-system-prompt">{t('settings.supportAiSystemPrompt')}</Label>
-            <textarea
-              id="support-ai-system-prompt"
-              rows={4}
-              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              value={supportAiSystemPrompt}
-              onChange={(e) => {
-                setSupportAiSystemPrompt(e.target.value);
-              }}
-              placeholder={t('settings.supportAiSystemPromptDefault')}
-            />
-          </div>
-          <div className="flex justify-end items-center gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor={`ai-${p}-base-url`} className="leading-6">
+                    {t('settings.aiBaseUrl')}
+                  </Label>
+                  <Input
+                    id={`ai-${p}-base-url`}
+                    type="url"
+                    inputMode="url"
+                    placeholder="https://"
+                    disabled={!canWrite}
+                    value={baseUrl}
+                    onChange={(e) => {
+                      set(urlKey)(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">{t('settings.aiBaseUrlHint')}</p>
+                </div>
+              </AiAdvancedOptions>
+            </fieldset>
+          );
+        })}
+        {canWrite && (
+          <div className="flex items-center justify-end gap-4">
+            <SaveStatus m={save} />
             <SaveButton
-              isPending={supportAiSaveMutation.isPending}
+              isPending={save.isPending}
               onClick={() => {
-                supportAiSaveMutation.mutate({
-                  provider: supportAiProvider,
-                  apiKey: supportAiApiKey,
-                  model: supportAiModel,
-                  temperature: supportAiTemperature,
-                  topP: supportAiTopP,
-                  topK: supportAiTopK,
-                  tone: supportAiTone,
-                  systemPrompt: supportAiSystemPrompt,
-                });
+                save.mutate(values);
               }}
             />
-            {supportAiSaveMutation.isSuccess && (
-              <p className="text-sm text-green-600">{t('settings.supportAiSaved')}</p>
-            )}
-            {supportAiSaveMutation.isError && (
-              <p className="text-sm text-destructive">{t('settings.supportAiSaveFailed')}</p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The assistant or support drafts surface: switch, provider, model, effort, prompt. */
+function AiSurfaceCard({
+  settings,
+  canWrite,
+  surface,
+  aiDefaults,
+}: CardProps & {
+  surface: 'chatbot' | 'support';
+  aiDefaults: AiDefaults | undefined;
+}): React.JSX.Element {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const prefix = surface === 'chatbot' ? 'chatbotAi' : 'supportAi';
+  const { loaded, values, set } = useFormValues(settings);
+  const enabledStored = settings?.[`${prefix}.enabled`] === true;
+  const [enabled, setEnabled] = useState(enabledStored);
+  useEffect(() => {
+    setEnabled(enabledStored);
+  }, [enabledStored]);
+
+  // An unchanged built-in prompt is saved empty, so later defaults still apply.
+  const surfaceValue = (key: string, v: string): unknown =>
+    key === `${prefix}.systemPrompt` && isDefaultPrompt(v, aiDefaults?.[surface]) ? '' : v;
+  const save = useSaveKeys(
+    surface === 'chatbot' ? CHATBOT_KEYS : SUPPORT_KEYS,
+    loaded,
+    surfaceValue,
+  );
+  const resetPrompt = useMutation({
+    mutationFn: () => api.put(`/v1/settings/${prefix}.systemPrompt`, { value: '' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+  const toggle = useMutation({
+    mutationFn: (on: boolean) => api.put(`/v1/settings/${prefix}.enabled`, { value: on }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+      void queryClient.invalidateQueries({ queryKey: ['security-public'] });
+      void queryClient.invalidateQueries({ queryKey: AI_STATUS_KEY });
+    },
+  });
+
+  const providerValue = values[`${prefix}.provider`] ?? '';
+  const keyValue = settings?.[`ai.${providerValue}.apiKeyEnc`];
+  const providerHasKey = providerValue === '' || (typeof keyValue === 'string' && keyValue !== '');
+  const prompt = values[`${prefix}.systemPrompt`] ?? '';
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t(`settings.aiSurface.${surface}.title`)}</CardTitle>
+        <p className="text-sm text-muted-foreground">
+          {t(`settings.aiSurface.${surface}.description`)}
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="flex items-center justify-between gap-4 rounded-lg border p-4">
+          <Label htmlFor={`${prefix}-enabled`} className="leading-6">
+            {t(`settings.aiSurface.${surface}.enabled`)}
+          </Label>
+          <Toggle
+            id={`${prefix}-enabled`}
+            checked={enabled}
+            disabled={!canWrite || toggle.isPending}
+            onCheckedChange={(checked) => {
+              setEnabled(checked);
+              toggle.mutate(checked);
+            }}
+          />
+        </div>
+        {toggle.isError && (
+          <p className="text-sm text-destructive">
+            {getErrorMessage(toggle.error, t, 'settings.aiSaveFailed')}
+          </p>
+        )}
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor={`${prefix}-provider`} className="leading-6">
+              {t('settings.aiProvider')}
+            </Label>
+            <AiProviderSelect
+              id={`${prefix}-provider`}
+              allowNone
+              disabled={!canWrite}
+              value={providerValue}
+              onChange={(next) => {
+                // A listed model belongs to the old provider: back to the default.
+                const model = values[`${prefix}.model`] ?? '';
+                if (!isCustomModel(aiDefaults, providerValue, model)) {
+                  set(`${prefix}.model`)('');
+                }
+                set(`${prefix}.provider`)(next);
+              }}
+            />
+            {!providerHasKey && (
+              <p className="text-xs text-warning">{t('settings.aiProviderNoKey')}</p>
             )}
           </div>
-        </CardContent>
-      </Card>
-    </>
+          <div className="space-y-2">
+            <Label htmlFor={`${prefix}-model`} className="leading-6">
+              {t('settings.aiModel')}
+            </Label>
+            <AiModelField
+              key={providerValue}
+              id={`${prefix}-model`}
+              provider={providerValue}
+              defaults={aiDefaults}
+              disabled={!canWrite}
+              value={values[`${prefix}.model`] ?? ''}
+              onChange={set(`${prefix}.model`)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={`${prefix}-effort`} className="leading-6">
+              {t('settings.aiEffort')}
+            </Label>
+            <AiEffortSelect
+              id={`${prefix}-effort`}
+              disabled={!canWrite}
+              value={values[`${prefix}.effort`] ?? 'medium'}
+              onChange={set(`${prefix}.effort`)}
+            />
+            <p className="text-xs text-muted-foreground">{t('settings.aiEffortHint')}</p>
+          </div>
+          {surface === 'support' && (
+            <div className="space-y-2">
+              <Label htmlFor="supportAi-tone" className="leading-6">
+                {t('settings.aiTone')}
+              </Label>
+              <AiToneSelect
+                id="supportAi-tone"
+                disabled={!canWrite}
+                value={values['supportAi.tone'] ?? 'professional'}
+                onChange={set('supportAi.tone')}
+              />
+            </div>
+          )}
+        </div>
+        <AiAdvancedOptions
+          summary={<AiPromptSummary custom={prompt !== ''} />}
+          data-testid={`${prefix}-advanced`}
+        >
+          <AiSystemPromptField
+            id={`${prefix}-system-prompt`}
+            defaults={aiDefaults?.[surface]}
+            disabled={!canWrite}
+            value={prompt}
+            savedValue={loaded[`${prefix}.systemPrompt`] ?? ''}
+            onChange={set(`${prefix}.systemPrompt`)}
+            resetPending={resetPrompt.isPending}
+            onReset={() => {
+              resetPrompt.mutate();
+            }}
+          />
+        </AiAdvancedOptions>
+        {resetPrompt.isError && (
+          <p className="text-sm text-destructive">
+            {getErrorMessage(resetPrompt.error, t, 'settings.aiSaveFailed')}
+          </p>
+        )}
+        {canWrite && (
+          <div className="flex items-center justify-end gap-4">
+            <SaveStatus m={save} />
+            <SaveButton
+              isPending={save.isPending}
+              onClick={() => {
+                save.mutate(values);
+              }}
+            />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Rate limits and token budgets (`ai.*`). */
+function AiLimitsCard({ settings, canWrite }: CardProps): React.JSX.Element {
+  const { t } = useTranslation();
+  const { loaded, values, set } = useFormValues(settings);
+  const save = useSaveKeys(LIMIT_KEYS, loaded, (k, v) =>
+    parseAiLimitValue(k as AiLimitSettingKey, v),
+  );
+  const invalidLimits = LIMIT_KEYS.filter((k) => parseAiLimitValue(k, values[k]) == null);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('settings.aiLimitsTitle')}</CardTitle>
+        <p className="text-sm text-muted-foreground">{t('settings.aiLimitsDescription')}</p>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          {LIMIT_KEYS.map((key) => {
+            const { min, max } = AI_LIMIT_SETTINGS[key];
+            const invalid = invalidLimits.includes(key);
+            const id = `ai-limit-${key.replace(/\./g, '-')}`;
+            return (
+              <div key={key} className="space-y-2">
+                <Label htmlFor={id} className="leading-6">
+                  {t(LIMIT_LABELS[key])}
+                </Label>
+                <Input
+                  id={id}
+                  type="number"
+                  inputMode="numeric"
+                  min={min}
+                  max={max}
+                  step={1}
+                  disabled={!canWrite}
+                  aria-invalid={invalid}
+                  className={invalid ? 'border-destructive' : undefined}
+                  value={values[key] ?? ''}
+                  onChange={(e) => {
+                    set(key)(e.target.value);
+                  }}
+                />
+                <p
+                  className={invalid ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}
+                >
+                  {t('settings.aiLimitRange', {
+                    min: formatNumber(min, 0),
+                    max: formatNumber(max, 0),
+                  })}
+                  {key === 'ai.budget.userDailyTokens' && ` ${t('settings.aiLimitZeroNoBudget')}`}
+                  {ZERO_NO_LIMIT_KEYS.has(key) && ` ${t('settings.aiLimitZeroNoLimit')}`}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+        {canWrite && (
+          <div className="flex items-center justify-end gap-4">
+            <SaveStatus m={save} />
+            <SaveButton
+              isPending={save.isPending}
+              disabled={invalidLimits.length > 0}
+              onClick={() => {
+                save.mutate(values);
+              }}
+            />
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

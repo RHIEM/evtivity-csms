@@ -3,6 +3,7 @@
 
 import { useState, useMemo, Fragment } from 'react';
 import { useTranslation } from 'react-i18next';
+import { tryParseJson } from '@evtivity/lib/safe-json';
 import { Badge } from '@/components/ui/badge';
 import { Select } from '@/components/ui/select';
 import { FilterPopover } from '@/components/FilterBar';
@@ -24,6 +25,7 @@ import {
 } from '@/lib/template-variables';
 import { type NotificationRecord, statusBadgeClass, formatTimestamp } from './shared';
 import { LoadingLogo } from '@/components/loading-logo';
+import { useUserTimezone } from '@/lib/timezone';
 
 const EVENT_CATEGORIES: Record<string, readonly string[]> = {
   driver: DRIVER_EVENT_TYPES,
@@ -32,18 +34,18 @@ const EVENT_CATEGORIES: Record<string, readonly string[]> = {
 };
 
 function parsePushBody(body: string): { title: string; message: string } | null {
-  try {
-    const parsed = JSON.parse(body) as Record<string, unknown>;
-    if (typeof parsed.title === 'string' && typeof parsed.message === 'string') {
-      return { title: parsed.title, message: parsed.message };
-    }
-  } catch {
-    // Legacy push records stored HTML, not JSON
+  // Legacy push records stored HTML, not JSON
+  const parsed = tryParseJson(body);
+  if (parsed == null || typeof parsed !== 'object') return null;
+  const { title, message } = parsed as Record<string, unknown>;
+  if (typeof title === 'string' && typeof message === 'string') {
+    return { title, message };
   }
   return null;
 }
 
 export function PushLogTab(): React.JSX.Element {
+  const timezone = useUserTimezone();
   const { t } = useTranslation();
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [eventCategory, setEventCategory] = useState('');
@@ -86,7 +88,7 @@ export function PushLogTab(): React.JSX.Element {
             setEventCategory(e.target.value);
             setEventType('');
           }}
-          className="hidden h-9 w-auto md:block"
+          className="hidden w-auto md:block"
         >
           <option value="">{t('notifications.allCategories')}</option>
           <option value="driver">{t('notifications.driverEvents')}</option>
@@ -100,7 +102,7 @@ export function PushLogTab(): React.JSX.Element {
             onChange={(e) => {
               setEventType(e.target.value);
             }}
-            className="hidden h-9 w-auto md:block"
+            className="hidden w-auto md:block"
           >
             <option value="">{t('notifications.allEvents')}</option>
             {eventNames.map((et) => (
@@ -116,7 +118,7 @@ export function PushLogTab(): React.JSX.Element {
           onChange={(e) => {
             setStatusFilter(e.target.value);
           }}
-          className="hidden h-9 w-auto md:block"
+          className="hidden w-auto md:block"
         >
           <option value="">{t('notifications.allStatuses')}</option>
           <option value="sent">Sent</option>
@@ -130,7 +132,7 @@ export function PushLogTab(): React.JSX.Element {
               setEventCategory(e.target.value);
               setEventType('');
             }}
-            className="h-9 w-auto"
+            className="w-auto"
           >
             <option value="">{t('notifications.allCategories')}</option>
             <option value="driver">{t('notifications.driverEvents')}</option>
@@ -144,7 +146,7 @@ export function PushLogTab(): React.JSX.Element {
               onChange={(e) => {
                 setEventType(e.target.value);
               }}
-              className="h-9 w-auto"
+              className="w-auto"
             >
               <option value="">{t('notifications.allEvents')}</option>
               {eventNames.map((et) => (
@@ -160,7 +162,7 @@ export function PushLogTab(): React.JSX.Element {
             onChange={(e) => {
               setStatusFilter(e.target.value);
             }}
-            className="h-9 w-auto"
+            className="w-auto"
           >
             <option value="">{t('notifications.allStatuses')}</option>
             <option value="sent">Sent</option>
@@ -199,7 +201,7 @@ export function PushLogTab(): React.JSX.Element {
                     }}
                   >
                     <TableCell className="whitespace-nowrap" data-testid="row-click-target">
-                      {formatTimestamp(msg.sentAt, msg.createdAt)}
+                      {formatTimestamp(msg.sentAt, msg.createdAt, timezone)}
                     </TableCell>
                     <TableCell>{msg.recipient}</TableCell>
                     <TableCell>{msg.eventType ?? '-'}</TableCell>

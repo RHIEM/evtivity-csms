@@ -51,6 +51,13 @@ export const ID_PREFIXES = {
   panel: 'pnl',
   circuit: 'cir',
   maintenanceEvent: 'mne',
+  aiConversation: 'aic',
+  aiMessage: 'aim',
+  aiToolCall: 'atc',
+  aiPendingAction: 'apa',
+  aiProposal: 'apr',
+  aiMcpCall: 'amc',
+  aiInsight: 'ain',
 } as const;
 
 export type EntityType = keyof typeof ID_PREFIXES;

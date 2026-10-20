@@ -21,6 +21,13 @@ import {
 import { formatDateTime } from '@/lib/timezone';
 import { eventTypeVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
+import { formatNumber } from '@/lib/formatting';
+import { sessionDisplayCostCents } from '@evtivity/lib/session-cost';
+import {
+  SessionVehicle,
+  type SessionVehicleCapture,
+  type SessionVehicleInfo,
+} from '@/components/session/SessionVehicle';
 
 interface TransactionEvent {
   id: number;
@@ -49,13 +56,15 @@ interface SessionOverview {
   freeVend: boolean | null;
   co2AvoidedKg: number | null;
   transactionId: string | null;
-  token: { id: string; idToken: string; tokenType: string } | null;
-  vehicle: {
+  token: {
     id: string;
-    make: string | null;
-    model: string | null;
-    year: string | null;
+    idToken: string;
+    tokenType: string;
+    pncContract?: { id: number; pcid: string; status: 'active' | 'revoked' } | null;
   } | null;
+  vehicle: SessionVehicleInfo | null;
+  vehicleCapture?: SessionVehicleCapture | null;
+  autocharge?: boolean;
   metadata: Record<string, unknown> | null;
 }
 
@@ -95,7 +104,7 @@ export function SessionDetailsTab({
     setPage: setTxEventPage,
     total: txEventTotal,
   } = usePaginatedQuery<TransactionEvent>(
-    'session-transaction-events',
+    ['sessions', sessionId, 'transaction-events'],
     `/v1/sessions/${sessionId}/transaction-events`,
   );
 
@@ -120,10 +129,10 @@ export function SessionDetailsTab({
             {t('sessions.reservationTokenMismatchDescription')}
             <div className="mt-2 text-xs">
               <div>
-                {t('sessions.expectedToken')}: {reservationMismatch.expected ?? 'n/a'}
+                {t('sessions.expectedToken')}: {reservationMismatch.expected ?? t('common.na')}
               </div>
               <div>
-                {t('sessions.actualToken')}: {reservationMismatch.actual ?? 'n/a'}
+                {t('sessions.actualToken')}: {reservationMismatch.actual ?? t('common.na')}
               </div>
             </div>
           </AlertDescription>
@@ -137,43 +146,42 @@ export function SessionDetailsTab({
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Row label={t('sessions.station')}>
-              <Link to={`/stations/${session.stationId}`} className="text-primary hover:underline">
+              <Link to={`/stations/${session.stationId}`} className="text-link hover:underline">
                 {session.siteName != null
                   ? `${session.siteName} / ${String(session.stationName)}`
-                  : (session.stationName ?? 'n/a')}
+                  : (session.stationName ?? t('common.na'))}
               </Link>
             </Row>
             <Row label={t('sessions.driver')}>
               {session.freeVend === true ? (
                 <span className="text-muted-foreground">{t('sessions.freeVend')}</span>
               ) : session.driverName != null ? (
-                <div className="space-y-1">
-                  <Link
-                    to={`/drivers/${session.driverId ?? ''}`}
-                    className="text-primary hover:underline block"
-                  >
-                    {session.driverName}
-                  </Link>
-                  {session.vehicle != null && (
-                    <div className="text-xs text-muted-foreground">
-                      {[session.vehicle.make, session.vehicle.model]
-                        .filter((v) => v != null && v !== '')
-                        .join(' ')}
-                      {session.vehicle.year != null && session.vehicle.year !== ''
-                        ? ` (${session.vehicle.year})`
-                        : ''}
-                    </div>
-                  )}
-                </div>
+                <Link
+                  to={`/drivers/${session.driverId ?? ''}`}
+                  className="text-link hover:underline block"
+                >
+                  {session.driverName}
+                </Link>
               ) : (
-                'n/a'
+                t('common.na')
               )}
             </Row>
+            <Row label={t('vehicles.vehicle')}>
+              <SessionVehicle
+                sessionId={sessionId}
+                driverId={session.driverId}
+                vehicle={session.vehicle}
+                capture={session.vehicleCapture ?? null}
+                autocharge={session.autocharge === true}
+              />
+            </Row>
             <Row label={t('sessions.started')}>
-              {session.startedAt != null ? formatDateTime(session.startedAt, timezone) : 'n/a'}
+              {session.startedAt != null
+                ? formatDateTime(session.startedAt, timezone)
+                : t('common.na')}
             </Row>
             <Row label={t('sessions.ended')}>
-              {session.endedAt != null ? formatDateTime(session.endedAt, timezone) : 'n/a'}
+              {session.endedAt != null ? formatDateTime(session.endedAt, timezone) : t('common.na')}
             </Row>
             {session.idleStartedAt != null && (
               <Row label={t('sessions.idleStartedAt')}>
@@ -185,37 +193,53 @@ export function SessionDetailsTab({
             </Row>
             <Row label={t('sessions.energy')}>
               {session.energyDeliveredWh != null
-                ? `${(session.energyDeliveredWh / 1000).toFixed(2)} kWh`
-                : 'n/a'}
+                ? t('sessions.energyKwh', {
+                    value: formatNumber(session.energyDeliveredWh / 1000, 2),
+                  })
+                : t('common.na')}
             </Row>
             {session.co2AvoidedKg != null && (
               <Row label={t('sessions.co2AvoidedLabel')}>
                 <span className="inline-flex items-center gap-1 text-success">
                   <Leaf className="h-4 w-4" />
-                  {parseFloat(String(session.co2AvoidedKg)).toFixed(2)} kg CO₂ avoided
+                  {t('sessions.co2AvoidedValue', {
+                    value: formatNumber(parseFloat(String(session.co2AvoidedKg)), 2),
+                  })}
                 </span>
               </Row>
             )}
             <Row label={t('payments.cost')}>
-              {formatCents(
-                session.status === 'completed' ? session.finalCostCents : session.currentCostCents,
-                currency,
-              )}
+              {formatCents(sessionDisplayCostCents(session), currency)}
             </Row>
             {session.token != null && (
               <Row label={t('sessions.token')}>
-                <Link to={`/tokens/${session.token.id}`} className="text-primary hover:underline">
+                <Link to={`/tokens/${session.token.id}`} className="text-link hover:underline">
                   {session.token.idToken}
                 </Link>
                 <span className="ml-2 text-muted-foreground">{session.token.tokenType}</span>
               </Row>
             )}
-            <Row label={t('sessions.stoppedReason')}>{session.stoppedReason ?? 'n/a'}</Row>
+            {session.token?.pncContract != null && (
+              <Row label={t('sessions.pncContract')}>
+                <span data-testid="session-pnc-contract">
+                  {t('sessions.pncContractPcid', { pcid: session.token.pncContract.pcid })}
+                </span>
+                <Badge
+                  variant={
+                    session.token.pncContract.status === 'active' ? 'success' : 'destructive'
+                  }
+                  className="ml-2"
+                >
+                  {t(`drivers.pncContractStatus.${session.token.pncContract.status}`)}
+                </Badge>
+              </Row>
+            )}
+            <Row label={t('sessions.stoppedReason')}>{session.stoppedReason ?? t('common.na')}</Row>
             {session.reservationId != null && (
               <Row label={t('sessions.reservation')}>
                 <Link
                   to={`/reservations/${session.reservationId}`}
-                  className="text-primary hover:underline"
+                  className="text-link hover:underline"
                 >
                   {session.reservationId}
                 </Link>
@@ -232,7 +256,7 @@ export function SessionDetailsTab({
             <CardTitle>{t('sessions.transactionEvents')}</CardTitle>
             {txEventTotal > 0 && (
               <span className="text-sm text-muted-foreground">
-                {txEventTotal} {txEventTotal === 1 ? 'event' : 'events'}
+                {t('sessions.eventCount', { count: txEventTotal })}
               </span>
             )}
           </div>

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import type { StepResult, TestCase } from '../../../../types.js';
-import { pushSendAckStep } from '../../../../csms-test-helpers.js';
+import { pushSendAckStep, newTransactionId } from '../../../../csms-test-helpers.js';
+import { defaultReply } from '../../../../default-replies.js';
 
 /**
  * TC_K_58_CSMS: Renegotiating a Charging Schedule ISO 15118-2 - Initiated by CSMS
@@ -31,7 +32,7 @@ export const TC_K_58_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -39,17 +40,17 @@ export const TC_K_58_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     let receivedProfile = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           receivedProfile = true;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -138,7 +139,7 @@ export const TC_K_59_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -146,17 +147,17 @@ export const TC_K_59_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     let profileCount = 0;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           profileCount++;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 
@@ -284,7 +285,7 @@ export const TC_K_113_CSMS: TestCase = {
       connectorId: 1,
     });
 
-    const txId = `OCTT-TX-${String(Date.now())}`;
+    const txId = newTransactionId('OCTT-TX');
     await ctx.client.sendCall('TransactionEvent', {
       eventType: 'Started',
       timestamp: new Date().toISOString(),
@@ -292,17 +293,17 @@ export const TC_K_113_CSMS: TestCase = {
       seqNo: 0,
       transactionInfo: { transactionId: txId, chargingState: 'Charging' },
       evse: { id: 1, connectorId: 1 },
-      idToken: { idToken: 'OCTT-TOKEN-001', type: 'ISO14443' },
+      idToken: { idToken: ctx.tokens.valid, type: 'ISO14443' },
     });
 
     let receivedProfile = false;
     ctx.client.setIncomingCallHandler(
-      async (_messageId: string, action: string, _payload: Record<string, unknown>) => {
+      async (_messageId: string, action: string, payload: Record<string, unknown>) => {
         if (action === 'SetChargingProfile') {
           receivedProfile = true;
           return { status: 'Accepted' };
         }
-        return {};
+        return defaultReply('ocpp2.1', action, payload);
       },
     );
 

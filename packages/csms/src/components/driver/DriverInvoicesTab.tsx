@@ -38,7 +38,13 @@ export interface DriverInvoice {
   id: string;
   invoiceNumber: string;
   driverId: string | null;
-  status: 'draft' | 'issued' | 'paid' | 'void';
+  status: 'draft' | 'issued' | 'paid' | 'void' | 'credited';
+  /** credit_note: a credit note that credits creditedInvoiceId in full (negative amounts). */
+  kind: 'invoice' | 'credit_note';
+  creditedInvoiceId: string | null;
+  /** A member invoice: billed on account by the fleet fleetName, addressed to this driver. */
+  memberBilled?: boolean;
+  fleetName?: string | null;
   issuedAt: string | null;
   dueAt: string | null;
   currency: string;
@@ -56,6 +62,7 @@ export const INVOICE_STATUS_VARIANT: Record<
   issued: 'warning',
   paid: 'success',
   void: 'secondary',
+  credited: 'secondary',
 };
 
 interface Props {
@@ -160,6 +167,7 @@ export function DriverInvoicesTab({ driverId, timezone }: Props): React.JSX.Elem
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('invoices.invoiceNumber')}</TableHead>
+                    <TableHead>{t('invoices.kind')}</TableHead>
                     <TableHead>{t('common.status')}</TableHead>
                     <TableHead>{t('invoices.issuedAt')}</TableHead>
                     <TableHead>{t('invoices.dueAt')}</TableHead>
@@ -176,11 +184,24 @@ export function DriverInvoicesTab({ driverId, timezone }: Props): React.JSX.Elem
                         void navigate(`/invoices/${inv.id}`);
                       }}
                     >
-                      <TableCell
-                        className="font-medium text-primary"
-                        data-testid="row-click-target"
-                      >
+                      <TableCell className="font-medium text-link" data-testid="row-click-target">
                         {inv.invoiceNumber}
+                        {inv.memberBilled === true && (
+                          <Badge
+                            variant="info"
+                            className="ml-2"
+                            data-testid={`invoice-fleet-${inv.id}`}
+                          >
+                            {t('invoices.viaFleetBadge', { fleet: inv.fleetName ?? '' })}
+                          </Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {inv.kind === 'credit_note' ? (
+                          <Badge variant="outline">{t('invoices.kinds.credit_note')}</Badge>
+                        ) : (
+                          t('invoices.kinds.invoice')
+                        )}
                       </TableCell>
                       <TableCell>
                         <Badge variant={INVOICE_STATUS_VARIANT[inv.status]}>
@@ -227,7 +248,9 @@ export function DriverInvoicesTab({ driverId, timezone }: Props): React.JSX.Elem
               {t('invoices.generateInvoiceDescription')}
             </p>
             <div className="space-y-2">
-              <Label htmlFor="invoice-start-date">{t('invoices.startDate')}</Label>
+              <Label htmlFor="invoice-start-date" className="leading-6">
+                {t('invoices.startDate')}
+              </Label>
               <Input
                 id="invoice-start-date"
                 type="date"
@@ -242,7 +265,9 @@ export function DriverInvoicesTab({ driverId, timezone }: Props): React.JSX.Elem
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="invoice-end-date">{t('invoices.endDate')}</Label>
+              <Label htmlFor="invoice-end-date" className="leading-6">
+                {t('invoices.endDate')}
+              </Label>
               <Input
                 id="invoice-end-date"
                 type="date"

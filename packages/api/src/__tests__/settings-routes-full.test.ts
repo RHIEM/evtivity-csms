@@ -51,9 +51,54 @@ function makeChain() {
   return chain;
 }
 
+vi.mock('../lib/site-access.js', async () =>
+  (await import('./helpers/site-access-mock.js')).siteAccessMock(),
+);
+
 vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve('USD')),
+  getCompanyTaxBasis: vi.fn(() => Promise.resolve('net')),
+  getCompanyPriceDisplay: vi.fn(() => Promise.resolve('net')),
   clearSystemSettingsCache: vi.fn(),
+  clearGuestChargingCache: vi.fn(),
+  clearGuestVelocityCache: vi.fn(),
+  GUEST_STARTS_PER_IP_PER_HOUR_KEY: 'guest.startsPerIpPerHour',
+  GUEST_DECLINES_PER_IP_PER_HOUR_KEY: 'guest.declinesPerIpPerHour',
+  MAX_GUEST_VELOCITY_LIMIT: 10_000,
+  parseGuestVelocityLimit: vi.fn((value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10_000
+      ? value
+      : null,
+  ),
+  clearMobileAppConfigCache: vi.fn(),
+  clearStationMessageSettingsCache: vi.fn(),
+  clearWebhookSettingsCache: vi.fn(),
+  clearRoamingCache: vi.fn(),
+  clearSupportCache: vi.fn(),
+  clearFleetCache: vi.fn(),
+  WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY: 'notifications.webhookAllowedPrivateHosts',
+  PREPAID_LOW_CREDIT_THRESHOLD_KEY: 'prepaid.lowCreditThresholdCents',
+  MAX_PREPAID_LOW_CREDIT_THRESHOLD_CENTS: 100_000_000,
+  parsePrepaidLowCreditThresholdCents: (value: unknown) =>
+    typeof value === 'number' ? value : null,
+  clearPrepaidSettingsCache: vi.fn(),
+  INVOICE_PAYMENT_TERMS_DAYS_KEY: 'invoice.paymentTermsDays',
+  MAX_INVOICE_PAYMENT_TERMS_DAYS: 365,
+  parseInvoicePaymentTermsDays: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 365
+      ? value
+      : null,
+  FLEET_INVOICE_RUN_DAY_KEY: 'fleet.invoiceRunDay',
+  MAX_FLEET_INVOICE_RUN_DAY: 28,
+  parseFleetInvoiceRunDay: () => null,
+  clearInvoiceSettingsCache: vi.fn(),
+  FLEET_CREDIT_RESERVATION_KEY: 'fleet.creditReservationCents',
+  MAX_FLEET_CREDIT_RESERVATION_CENTS: 100_000_000,
+  parseFleetCreditReservationCents: (value: unknown) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100_000_000
+      ? value
+      : null,
+  clearFleetCreditSettingsCache: vi.fn(),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -109,8 +154,52 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   return {
     encryptString: vi.fn((_val: string, _key: string) => 'encrypted-value'),
     clearNotificationSettingsCache: vi.fn(),
+    createLogger: actual.createLogger,
     isSupportedCurrency: actual.isSupportedCurrency,
     SUPPORTED_CURRENCIES: actual.SUPPORTED_CURRENCIES,
+    isPriceDisplay: actual.isPriceDisplay,
+    PRICE_DISPLAYS: actual.PRICE_DISPLAYS,
+    isStationMessageLanguage: actual.isStationMessageLanguage,
+    STATION_MESSAGE_LANGUAGES: actual.STATION_MESSAGE_LANGUAGES,
+    isTaxBasis: actual.isTaxBasis,
+    OCPI_TARIFF_SETTING_KEYS: actual.OCPI_TARIFF_SETTING_KEYS,
+    TAX_BASES: actual.TAX_BASES,
+    UI_LANGUAGES: actual.UI_LANGUAGES,
+    isMobileAppSettingKey: actual.isMobileAppSettingKey,
+    parseMobileAppList: actual.parseMobileAppList,
+    MOBILE_APP_URL_SCHEMES_KEY: actual.MOBILE_APP_URL_SCHEMES_KEY,
+    MOBILE_APP_ANDROID_PACKAGES_KEY: actual.MOBILE_APP_ANDROID_PACKAGES_KEY,
+    parseAllowedPrivateHosts: actual.parseAllowedPrivateHosts,
+    MAX_ALLOWED_PRIVATE_HOSTS: actual.MAX_ALLOWED_PRIVATE_HOSTS,
+    validateAiBaseUrl: actual.validateAiBaseUrl,
+    isAiBaseUrlSettingKey: actual.isAiBaseUrlSettingKey,
+    isAiSettingKey: actual.isAiSettingKey,
+    isAiNumberSettingKey: actual.isAiNumberSettingKey,
+    isAiFlagSettingKey: actual.isAiFlagSettingKey,
+    AI_MCP_MAX_ALLOWED_ORIGINS: actual.AI_MCP_MAX_ALLOWED_ORIGINS,
+    normalizeAiSettingValue: actual.normalizeAiSettingValue,
+    AI_NUMBER_SETTINGS: actual.AI_NUMBER_SETTINGS,
+    AI_PROVIDER_IDS: actual.AI_PROVIDER_IDS,
+    AI_EFFORTS: actual.AI_EFFORTS,
+    AI_SUPPORT_TONES: actual.AI_SUPPORT_TONES,
+    REMOVED_AI_SETTING_KEYS: actual.REMOVED_AI_SETTING_KEYS,
+    PDF_LOGO_KEY: actual.PDF_LOGO_KEY,
+    PDF_FOOTER_KEY: actual.PDF_FOOTER_KEY,
+    MAX_PDF_LOGO_BYTES: actual.MAX_PDF_LOGO_BYTES,
+    MAX_PDF_FOOTER_LENGTH: actual.MAX_PDF_FOOTER_LENGTH,
+    MAX_PDF_FOOTER_LINES: actual.MAX_PDF_FOOTER_LINES,
+    normalizePdfLogo: actual.normalizePdfLogo,
+    normalizePdfFooter: actual.normalizePdfFooter,
+    INVOICE_SELLER_MAX_LENGTHS: actual.INVOICE_SELLER_MAX_LENGTHS,
+    COMPANY_INVOICE_EMAIL_KEY: actual.COMPANY_INVOICE_EMAIL_KEY,
+    isInvoiceSellerSettingKey: actual.isInvoiceSellerSettingKey,
+    normalizeInvoiceSellerSetting: actual.normalizeInvoiceSellerSetting,
+    COMPANY_BIC_KEY: actual.COMPANY_BIC_KEY,
+    COMPANY_IBAN_KEY: actual.COMPANY_IBAN_KEY,
+    INVOICE_EPC_QR_ENABLED_KEY: actual.INVOICE_EPC_QR_ENABLED_KEY,
+    INVOICE_PAYMENT_MAX_LENGTHS: actual.INVOICE_PAYMENT_MAX_LENGTHS,
+    isInvoicePaymentSettingKey: actual.isInvoicePaymentSettingKey,
+    normalizeInvoicePaymentSetting: actual.normalizeInvoicePaymentSetting,
   };
 });
 
@@ -152,8 +241,25 @@ vi.mock('../middleware/rbac.js', () => ({
     },
 }));
 
+vi.mock('../lib/payments.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/payments.js')>()),
+  clearPaymentCaches: vi.fn(),
+}));
+
+const { mockAssertWritable } = vi.hoisted(() => ({ mockAssertWritable: vi.fn() }));
+vi.mock('@evtivity/services/station-message.service', () => ({
+  requestStationMessageRepush: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../lib/provider-switch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/provider-switch.js')>()),
+  assertPaymentProviderWritable: mockAssertWritable,
+}));
+
+import { PaymentProviderUpgradePendingError } from '@evtivity/payments';
 import { registerAuth } from '../plugins/auth.js';
 import { settingsRoutes } from '../routes/settings.js';
+import { clearPaymentCaches } from '../lib/payments.js';
 
 const VALID_USER_ID = 'usr_000000000001';
 const VALID_ROLE_ID = 'rol_000000000001';
@@ -165,6 +271,12 @@ async function buildApp(): Promise<FastifyInstance> {
   await app.ready();
   return app;
 }
+
+// Imported once, not in the first test: loading the module graph can exceed the 5 s test timeout under load.
+let libModule: typeof import('@evtivity/lib');
+beforeAll(async () => {
+  libModule = await import('@evtivity/lib');
+}, 30_000);
 
 describe('Settings routes - full coverage', () => {
   let app: FastifyInstance;
@@ -185,6 +297,56 @@ describe('Settings routes - full coverage', () => {
   });
 
   // ----------------------------------------------------------------
+  // GET /v1/portal/content/:type (public legal content)
+  // ----------------------------------------------------------------
+  describe('GET /v1/portal/content/:type', () => {
+    it('returns stored content for a Korean request', async () => {
+      setupDbResults([{ key: 'content.privacyPolicy.ko', value: '<h1>Custom KO</h1>' }]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=ko',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toBe('<h1>Custom KO</h1>');
+    });
+
+    it('falls back to the Korean default when nothing is stored', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/terms-of-service?lang=ko',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>서비스 이용약관</h1>');
+    });
+
+    it('falls back to the Traditional Chinese default for zh-TW', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=zh-TW',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>隱私權政策</h1>');
+    });
+
+    it('defaults to English without a lang parameter', async () => {
+      setupDbResults([]);
+      const res = await app.inject({ method: 'GET', url: '/portal/content/privacy-policy' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().html).toContain('<h1>Privacy Policy</h1>');
+    });
+
+    it('rejects an unsupported language', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/portal/content/privacy-policy?lang=fr',
+      });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  // ----------------------------------------------------------------
   // GET /v1/portal/branding (public, no auth required)
   // ----------------------------------------------------------------
   describe('GET /v1/portal/branding', () => {
@@ -200,11 +362,24 @@ describe('Settings routes - full coverage', () => {
       expect(body.logo).toBe('https://example.com/logo.png');
     });
 
-    it('returns only the default company currency when no company settings exist', async () => {
+    it('returns only the default currency, price display, and tax basis when no company settings exist', async () => {
       setupDbResults([]);
       const res = await app.inject({ method: 'GET', url: '/portal/branding' });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ currency: 'USD' });
+      expect(res.json()).toEqual({ currency: 'USD', priceDisplay: 'net', taxBasis: 'net' });
+    });
+
+    it('returns the QR code icon as qrCodeIcon', async () => {
+      setupDbResults([
+        { key: 'company.name', value: 'Acme Charging' },
+        { key: 'qr_code_icon', value: '<svg/>' },
+      ]);
+      const res = await app.inject({ method: 'GET', url: '/portal/branding' });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.qrCodeIcon).toBe('<svg/>');
+      expect(body.name).toBe('Acme Charging');
+      expect(body).not.toHaveProperty('qr_code_icon');
     });
 
     it('converts non-string values to empty string', async () => {
@@ -384,6 +559,75 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.key).toBe('new.key');
+      expect(clearPaymentCaches).not.toHaveBeenCalled();
+    });
+
+    it('clears the payment caches after writing a payment setting', async () => {
+      setupDbResults([], [{ key: 'payments.provider', value: 'adyen' }]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/payments.provider',
+        headers: { authorization: `Bearer ${operatorToken}` },
+        payload: { value: 'adyen' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['PUT', 'PATCH'] as const)(
+      '%s answers 409 and writes nothing while the provider-switch guard refuses',
+      async (method) => {
+        const details = {
+          legacyConnections: 1,
+          hosts: ['172.18.0.5'],
+          lastLegacySeenAt: null,
+          watchCheckedAt: null,
+        };
+        mockAssertWritable.mockRejectedValueOnce(
+          new PaymentProviderUpgradePendingError('adyen', details),
+        );
+        setupDbResults([], [{ key: 'payments.provider', value: 'adyen' }]);
+        const res = await app.inject({
+          method,
+          url: '/settings/payments.provider',
+          headers: { authorization: `Bearer ${operatorToken}` },
+          payload: { value: 'adyen' },
+        });
+        expect(res.statusCode).toBe(409);
+        expect(res.json()).toEqual({
+          error:
+            'A process older than v0.1.38 is still connected. Finish the upgrade, then select Adyen.',
+          code: 'PAYMENT_PROVIDER_UPGRADE_PENDING',
+          details,
+        });
+        expect(mockAssertWritable).toHaveBeenCalledWith('payments.provider', 'adyen');
+        expect(dbCallIndex).toBe(0);
+        expect(clearPaymentCaches).not.toHaveBeenCalled();
+      },
+    );
+
+    it('passes a failed guard check on as 500', async () => {
+      mockAssertWritable.mockRejectedValueOnce(new Error('redis down'));
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/payments.provider',
+        headers: { authorization: `Bearer ${operatorToken}` },
+        payload: { value: 'adyen' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(dbCallIndex).toBe(0);
+    });
+
+    it('does not clear the payment caches when the write fails', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/stripe.publishableKey',
+        headers: { authorization: `Bearer ${operatorToken}` },
+        payload: { value: 'pk_test_1' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(clearPaymentCaches).not.toHaveBeenCalled();
     });
 
     it('throws when insert returns no rows', async () => {
@@ -420,6 +664,17 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.key).toBe('old.key');
+    });
+
+    it('clears the payment caches after deleting a payment setting', async () => {
+      setupDbResults([{ key: 'simulated.resultMode', value: 'approve' }]);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: '/settings/simulated.resultMode',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(clearPaymentCaches).toHaveBeenCalledTimes(1);
     });
 
     it('returns 404 when deleting a nonexistent setting', async () => {
@@ -657,7 +912,7 @@ describe('Settings routes - full coverage', () => {
       expect(res.statusCode).toBe(200);
       expect(res.json().success).toBe(true);
 
-      const { encryptString } = await import('@evtivity/lib');
+      const { encryptString } = libModule;
       expect(encryptString).toHaveBeenCalledWith('AKIA123', 'test-encryption-key-32chars!!!!!');
       expect(encryptString).toHaveBeenCalledWith('secret123', 'test-encryption-key-32chars!!!!!');
       expect(mockClearS3ConfigCache).toHaveBeenCalled();

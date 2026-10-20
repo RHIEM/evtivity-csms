@@ -16,6 +16,28 @@ export const TC_B_51_CS: CsTestCase = {
   execute: async (ctx) => {
     const steps: StepResult[] = [];
 
+    // Configuration State: OCPPCommCtrlr.OfflineThreshold is <Configured offlineThreshold>
+    const offlineThresholdSec = 2;
+    const setRes = await ctx.server.sendCommand('SetVariables', {
+      setVariableData: [
+        {
+          component: { name: 'OCPPCommCtrlr' },
+          variable: { name: 'OfflineThreshold' },
+          attributeValue: String(offlineThresholdSec),
+        },
+      ],
+    });
+    const setStatus = (
+      setRes['setVariableResult'] as Array<Record<string, unknown>> | undefined
+    )?.[0]?.['attributeStatus'];
+    steps.push({
+      step: 0,
+      description: 'Configure OCPPCommCtrlr.OfflineThreshold',
+      status: setStatus === 'Accepted' ? 'passed' : 'failed',
+      expected: 'attributeStatus = Accepted',
+      actual: `attributeStatus = ${String(setStatus)}`,
+    });
+
     // Step 1: CSMS closes WebSocket connection and does not accept reconnect
     ctx.server.disconnectStation(true);
 
@@ -34,8 +56,7 @@ export const TC_B_51_CS: CsTestCase = {
     await ctx.station.plugIn(1);
 
     // Step 3: Test System accepts reconnection after threshold exceeded
-    // Allow connections again and wait for station to reconnect
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, offlineThresholdSec * 1000 + 1000));
     ctx.server.acceptConnections();
 
     try {
@@ -47,22 +68,19 @@ export const TC_B_51_CS: CsTestCase = {
         expected: 'Station reconnected',
         actual: `isConnected = ${String(ctx.server.isConnected)}`,
       });
-    } catch {
+    } catch (err) {
       steps.push({
         step: 3,
         description: 'Station reconnected after offline threshold exceeded',
         status: 'failed',
         expected: 'Station reconnected',
-        actual: 'Timed out waiting for reconnection',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
-    // Step 4: Station notifies CSMS about current state of all connectors
-    // Expect StatusNotification with Occupied for the plugged connector
+    // Step 4: Station notifies CSMS about current state of all connectors.
+    // A restored connection is not a reboot: no BootNotification (B04).
     try {
-      // Drain BootNotification from reconnect boot sequence
-      await ctx.server.waitForMessage('BootNotification', 10000);
-
       const statusPayload = await ctx.server.waitForMessage('StatusNotification', 10000);
       const connectorStatus = statusPayload['connectorStatus'] as string;
       steps.push({
@@ -72,13 +90,13 @@ export const TC_B_51_CS: CsTestCase = {
         expected: 'connectorStatus = Occupied',
         actual: `connectorStatus = ${connectorStatus}`,
       });
-    } catch {
+    } catch (err) {
       steps.push({
         step: 4,
         description: 'StatusNotification received for connectors',
         status: 'failed',
         expected: 'StatusNotification received',
-        actual: 'Timed out waiting for StatusNotification',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
@@ -129,21 +147,19 @@ export const TC_B_52_CS: CsTestCase = {
         expected: 'Station reconnected',
         actual: `isConnected = ${String(ctx.server.isConnected)}`,
       });
-    } catch {
+    } catch (err) {
       steps.push({
         step: 3,
         description: 'Station reconnected before offline threshold exceeded',
         status: 'failed',
         expected: 'Station reconnected',
-        actual: 'Timed out waiting for reconnection',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 
-    // Step 4: Station notifies CSMS about the configured connector status change
+    // Step 4: Station notifies CSMS about the configured connector status change.
+    // A restored connection is not a reboot: no BootNotification (B04).
     try {
-      // Drain BootNotification from reconnect boot sequence
-      await ctx.server.waitForMessage('BootNotification', 10000);
-
       const statusPayload = await ctx.server.waitForMessage('StatusNotification', 10000);
       const connectorStatus = statusPayload['connectorStatus'] as string;
       steps.push({
@@ -153,13 +169,13 @@ export const TC_B_52_CS: CsTestCase = {
         expected: 'connectorStatus = Occupied',
         actual: `connectorStatus = ${connectorStatus}`,
       });
-    } catch {
+    } catch (err) {
       steps.push({
         step: 4,
         description: 'StatusNotification received for configured connector',
         status: 'failed',
         expected: 'StatusNotification received',
-        actual: 'Timed out waiting for StatusNotification',
+        actual: err instanceof Error ? err.message : String(err),
       });
     }
 

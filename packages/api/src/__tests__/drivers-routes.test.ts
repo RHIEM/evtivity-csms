@@ -49,7 +49,15 @@ function makeChain() {
   return chain;
 }
 
+const { mockResolveAccountBilling, mockResolveDriverPricingSource } = vi.hoisted(() => ({
+  mockResolveAccountBilling: vi.fn(() => Promise.resolve(null)),
+  mockResolveDriverPricingSource: vi.fn(() => Promise.resolve(null)),
+}));
+
 vi.mock('@evtivity/database', () => ({
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
+  resolveAccountBilling: mockResolveAccountBilling,
+  resolveDriverPricingSource: mockResolveDriverPricingSource,
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
   db: {
     select: vi.fn(() => makeChain()),
@@ -95,6 +103,24 @@ vi.mock('@evtivity/database', () => ({
   localAuthListAuditLog: {},
 }));
 
+// Vehicle writes go through the vehicle service (vehicle-service-mapping is
+// checked here; the service itself runs against the database in
+// __integration__/118-autocharge-vehicles).
+const vehicleServiceMock = vi.hoisted(() => ({
+  createVehicle: vi.fn(),
+  updateVehicle: vi.fn(),
+  deleteVehicle: vi.fn(),
+  setVehicleBlocked: vi.fn(),
+}));
+vi.mock('../services/vehicle.service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/vehicle.service.js')>()),
+  ...vehicleServiceMock,
+}));
+vi.mock('../lib/vehicle-response.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/vehicle-response.js')>()),
+  vehicleLastSeen: vi.fn(() => Promise.resolve(new Map())),
+}));
+
 vi.mock('drizzle-orm', () => ({
   eq: vi.fn(),
   ne: vi.fn(),
@@ -108,7 +134,17 @@ vi.mock('drizzle-orm', () => ({
   inArray: vi.fn(),
 }));
 
-vi.mock('@evtivity/lib', () => ({
+vi.mock('@evtivity/lib', async (importOriginal) => ({
+  UI_LANGUAGES: (await importOriginal<typeof import('@evtivity/lib')>()).UI_LANGUAGES,
+  AppError: class AppError extends Error {
+    constructor(
+      message: string,
+      public readonly statusCode: number,
+      public readonly code: string,
+    ) {
+      super(message);
+    }
+  },
   dispatchDriverNotification: vi.fn().mockResolvedValue(undefined),
   createLogger: vi.fn(() => ({
     info: vi.fn(),
@@ -118,7 +154,7 @@ vi.mock('@evtivity/lib', () => ({
   })),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(() => ({
     publish: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue({ unsubscribe: vi.fn() }),
@@ -143,6 +179,47 @@ vi.mock('../middleware/rbac.js', () => ({
   invalidatePermissionCache: vi.fn(),
 }));
 
+const { getPortalAccessMock, inviteDriverToPortalMock } = vi.hoisted(() => ({
+  getPortalAccessMock: vi.fn(),
+  inviteDriverToPortalMock: vi.fn(),
+}));
+
+vi.mock('../services/driver-portal-access.service.js', () => ({
+  getPortalAccess: getPortalAccessMock,
+  inviteDriverToPortal: inviteDriverToPortalMock,
+}));
+
+const { getDriverBillingAddressMock, updateDriverBillingAddressMock } = vi.hoisted(() => ({
+  getDriverBillingAddressMock: vi.fn(),
+  updateDriverBillingAddressMock: vi.fn(),
+}));
+
+vi.mock('../services/driver-erasure.service.js', () => ({ eraseDriver: vi.fn() }));
+
+vi.mock('../lib/driver-email-verification.js', () => ({
+  sendDriverEmailVerification: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../services/driver-status.service.js', () => ({
+  applyDriverDeactivation: vi.fn().mockResolvedValue({ tokensDeactivated: 0 }),
+  revokeDriverEmailLinks: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../services/driver-billing.service.js', () => ({
+  DRIVER_BILLING_ADDRESS_MAX_LENGTHS: {
+    billingName: 255,
+    billingStreet: 255,
+    billingCity: 100,
+    billingState: 100,
+    billingZip: 20,
+    billingCountry: 100,
+  },
+  getDriverBillingAddress: getDriverBillingAddressMock,
+  updateDriverBillingAddress: updateDriverBillingAddressMock,
+}));
+
+import { AppError } from '@evtivity/lib';
+import { db } from '@evtivity/database';
 import { registerAuth } from '../plugins/auth.js';
 import { driverRoutes } from '../routes/drivers.js';
 
@@ -157,11 +234,21 @@ function makeDriver(overrides: Record<string, unknown> = {}) {
     lastName: 'Doe',
     email: 'john@example.com',
     phone: '+15551234567',
+    language: 'en',
     isActive: true,
     createdAt: now,
     updatedAt: now,
     ...overrides,
   };
+}
+
+/** The `values` or `set` argument of the last db.insert or db.update chain. */
+function lastWrite(kind: 'insert' | 'update'): unknown {
+  const chain = vi.mocked(db[kind]).mock.results.at(-1)?.value as
+    | Record<string, { mock: { calls: unknown[][] } }>
+    | undefined;
+  const method = kind === 'insert' ? 'values' : 'set';
+  return chain?.[method]?.mock.calls.at(-1)?.[0];
 }
 
 function makeToken(overrides: Record<string, unknown> = {}) {
@@ -188,6 +275,9 @@ function makeVehicle(overrides: Record<string, unknown> = {}) {
     year: '2024',
     vin: '5YJ3E1EA1PF000001',
     licensePlate: 'ABC123',
+    evccid: null,
+    autochargeEnabled: false,
+    autochargeBlockedAt: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -196,6 +286,13 @@ function makeVehicle(overrides: Record<string, unknown> = {}) {
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof AppError) {
+      void reply.status(error.statusCode).send({ error: error.message, code: error.code });
+      return;
+    }
+    void reply.send(error);
+  });
   await registerAuth(app);
   driverRoutes(app);
   await app.ready();
@@ -217,6 +314,7 @@ describe('Driver routes (operator)', () => {
 
   beforeEach(() => {
     setupDbResults();
+    getPortalAccessMock.mockResolvedValue({ status: 'none', inviteExpiresAt: null });
   });
 
   // -------------------------------------------------------
@@ -318,6 +416,240 @@ describe('Driver routes (operator)', () => {
       expect(body.id).toBe(VALID_DRIVER_ID);
       expect(body.firstName).toBe('John');
     });
+
+    it('includes the driver portal access state', async () => {
+      const inviteExpiresAt = new Date('2026-10-08T12:00:00.000Z');
+      setupDbResults([makeDriver()]);
+      getPortalAccessMock.mockResolvedValueOnce({ status: 'invited', inviteExpiresAt });
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(getPortalAccessMock).toHaveBeenCalledWith(VALID_DRIVER_ID);
+      expect(res.json().portalAccess).toEqual({
+        status: 'invited',
+        inviteExpiresAt: inviteExpiresAt.toISOString(),
+      });
+    });
+
+    it('includes the billing mode, the billing fleet and the pricing fleet', async () => {
+      setupDbResults([makeDriver()]);
+      mockResolveAccountBilling.mockResolvedValueOnce({
+        fleetId: 'flt_000000000001',
+        fleetName: 'Acme',
+        recipient: 'member',
+      } as never);
+      mockResolveDriverPricingSource.mockResolvedValueOnce({
+        source: 'fleet',
+        fleetId: 'flt_000000000002',
+        fleetName: 'Priced',
+        pricingGroupId: 'pgr_000000000001',
+        pricingGroupName: 'Fleet prices',
+      } as never);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().billing).toEqual({
+        mode: 'account',
+        billingFleet: { id: 'flt_000000000001', name: 'Acme' },
+        invoicedTo: 'member',
+        pricingFleet: { id: 'flt_000000000002', name: 'Priced' },
+        pricingSource: 'fleet',
+        pricingGroup: { id: 'pgr_000000000001', name: 'Fleet prices' },
+      });
+    });
+
+    it('reports a driver pricing group that overrides fleet pricing', async () => {
+      setupDbResults([makeDriver()]);
+      mockResolveDriverPricingSource.mockResolvedValueOnce({
+        source: 'driver',
+        pricingGroupId: 'pgr_000000000003',
+        pricingGroupName: 'VIP',
+      } as never);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.json().billing).toMatchObject({
+        pricingFleet: null,
+        pricingSource: 'driver',
+        pricingGroup: { id: 'pgr_000000000003', name: 'VIP' },
+      });
+    });
+
+    it('reports card billing without a qualifying fleet', async () => {
+      setupDbResults([makeDriver()]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.json().billing).toEqual({
+        mode: 'card',
+        billingFleet: null,
+        invoicedTo: null,
+        pricingFleet: null,
+        pricingSource: null,
+        pricingGroup: null,
+      });
+    });
+  });
+
+  // -------------------------------------------------------
+  // POST /v1/drivers/:id/portal-invite
+  // -------------------------------------------------------
+
+  describe('POST /v1/drivers/:id/portal-invite', () => {
+    it('returns 401 without token', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/portal-invite`,
+      });
+      expect(res.statusCode).toBe(401);
+      expect(inviteDriverToPortalMock).not.toHaveBeenCalled();
+    });
+
+    it('invites the driver as the operator and returns the expiry', async () => {
+      const expiresAt = new Date('2026-10-08T12:00:00.000Z');
+      inviteDriverToPortalMock.mockResolvedValueOnce({ expiresAt });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/portal-invite`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ expiresAt: expiresAt.toISOString() });
+      expect(inviteDriverToPortalMock).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        expect.objectContaining({
+          actor: expect.objectContaining({ actor: 'operator', actorUserId: 'test-id' }),
+        }),
+      );
+    });
+
+    it.each([
+      [404, 'DRIVER_NOT_FOUND'],
+      [409, 'DRIVER_INACTIVE'],
+      [400, 'EMAIL_REQUIRED'],
+      [409, 'PORTAL_ALREADY_ACTIVE'],
+    ])('returns %i %s from the service', async (status, code) => {
+      inviteDriverToPortalMock.mockRejectedValueOnce(new AppError('rejected', status, code));
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/portal-invite`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(status);
+      expect(res.json().code).toBe(code);
+    });
+
+    it('rejects a malformed driver id', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers/not-an-id/portal-invite',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(inviteDriverToPortalMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------
+  // GET/PATCH /v1/drivers/:id/billing-address
+  // -------------------------------------------------------
+
+  describe('/v1/drivers/:id/billing-address', () => {
+    const address = {
+      billingName: null,
+      billingStreet: 'Hauptstrasse 1',
+      billingCity: 'Berlin',
+      billingState: null,
+      billingZip: '10115',
+      billingCountry: 'Germany',
+    };
+
+    it('returns 401 without token', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}/billing-address`,
+      });
+      expect(res.statusCode).toBe(401);
+      expect(getDriverBillingAddressMock).not.toHaveBeenCalled();
+    });
+
+    it('returns the address', async () => {
+      getDriverBillingAddressMock.mockResolvedValueOnce(address);
+      const res = await app.inject({
+        method: 'GET',
+        url: `/drivers/${VALID_DRIVER_ID}/billing-address`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual(address);
+      expect(getDriverBillingAddressMock).toHaveBeenCalledWith(VALID_DRIVER_ID);
+    });
+
+    it('updates the address as the operator', async () => {
+      updateDriverBillingAddressMock.mockResolvedValueOnce({ ...address, billingCity: 'Hamburg' });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}/billing-address`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { billingCity: ' Hamburg ', billingState: null },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().billingCity).toBe('Hamburg');
+      expect(updateDriverBillingAddressMock).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        { billingCity: ' Hamburg ', billingState: null },
+        expect.objectContaining({
+          actor: expect.objectContaining({ actor: 'operator', actorUserId: 'test-id' }),
+        }),
+      );
+    });
+
+    it('rejects a field longer than its column', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}/billing-address`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { billingZip: 'x'.repeat(21) },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(updateDriverBillingAddressMock).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 DRIVER_NOT_FOUND from the service', async () => {
+      updateDriverBillingAddressMock.mockRejectedValueOnce(
+        new AppError('Driver not found', 404, 'DRIVER_NOT_FOUND'),
+      );
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}/billing-address`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { billingCity: 'Berlin' },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().code).toBe('DRIVER_NOT_FOUND');
+    });
   });
 
   // -------------------------------------------------------
@@ -349,6 +681,38 @@ describe('Driver routes (operator)', () => {
       const body = res.json();
       expect(body.id).toBe(VALID_DRIVER_ID);
       expect(body.firstName).toBe('John');
+    });
+
+    it('stores the language and returns it', async () => {
+      const driver = makeDriver({ language: 'zh-TW' });
+      setupDbResults([], [driver]);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          language: 'zh-TW',
+        },
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.json().language).toBe('zh-TW');
+      expect(lastWrite('insert')).toMatchObject({ language: 'zh-TW' });
+    });
+
+    it('returns 400 for an unsupported language', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', language: 'fr' },
+      });
+
+      expect(res.statusCode).toBe(400);
     });
   });
 
@@ -390,8 +754,8 @@ describe('Driver routes (operator)', () => {
         phone: '+15559876543',
         isActive: false,
       });
-      // 1: email-collision pre-check (no collision), 2: before SELECT, 3: UPDATE returning
-      setupDbResults([], [updated], [updated]);
+      // 1: before SELECT, 2: email-collision pre-check (no collision), 3: UPDATE returning
+      setupDbResults([makeDriver()], [], [updated]);
 
       const res = await app.inject({
         method: 'PATCH',
@@ -447,8 +811,8 @@ describe('Driver routes (operator)', () => {
 
     it('returns 200 with only email', async () => {
       const updated = makeDriver({ email: 'new@example.com' });
-      // 1: email-collision pre-check (no collision), 2: before SELECT, 3: UPDATE returning
-      setupDbResults([], [updated], [updated]);
+      // 1: before SELECT, 2: email-collision pre-check (no collision), 3: UPDATE returning
+      setupDbResults([makeDriver()], [], [updated]);
 
       const res = await app.inject({
         method: 'PATCH',
@@ -489,6 +853,33 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().isActive).toBe(false);
+    });
+
+    it('returns 200 with only language', async () => {
+      const updated = makeDriver({ language: 'ko' });
+      setupDbResults([updated], [updated]);
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { language: 'ko' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().language).toBe('ko');
+      expect(lastWrite('update')).toMatchObject({ language: 'ko' });
+    });
+
+    it('returns 400 for an unsupported language', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { language: 'EN' },
+      });
+
+      expect(res.statusCode).toBe(400);
     });
   });
 
@@ -537,8 +928,9 @@ describe('Driver routes (operator)', () => {
 
     it('returns 201 on success', async () => {
       const driverToken = makeToken({ idToken: 'RFID-XYZ' });
-      // tokenService.createToken: dup-check (empty) -> insert returning
-      setupDbResults([], [driverToken]);
+      // tokenService.createToken: dup-check (empty) -> the driver (active)
+      // -> insert returning
+      setupDbResults([], [{ isActive: true }], [driverToken]);
 
       const res = await app.inject({
         method: 'POST',
@@ -623,7 +1015,7 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body).toEqual([vehicle]);
+      expect(body).toEqual([{ ...vehicle, lastSeen: null }]);
     });
 
     it('returns 200 with empty array', async () => {
@@ -656,9 +1048,9 @@ describe('Driver routes (operator)', () => {
 
     it('returns 201 on success', async () => {
       const vehicle = makeVehicle();
-      // New route pre-checks that the driver exists, then inserts the
-      // vehicle. Feed the driver lookup first, then the vehicle returning row.
-      setupDbResults([{ id: VALID_DRIVER_ID }], [vehicle]);
+      // The route pre-checks that the driver exists, then the service inserts.
+      setupDbResults([{ id: VALID_DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockResolvedValueOnce(vehicle);
 
       const res = await app.inject({
         method: 'POST',
@@ -675,7 +1067,8 @@ describe('Driver routes (operator)', () => {
 
     it('returns 201 with all optional fields', async () => {
       const vehicle = makeVehicle();
-      setupDbResults([{ id: VALID_DRIVER_ID }], [vehicle]);
+      setupDbResults([{ id: VALID_DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockResolvedValueOnce(vehicle);
 
       const res = await app.inject({
         method: 'POST',
@@ -691,6 +1084,37 @@ describe('Driver routes (operator)', () => {
       });
 
       expect(res.statusCode).toBe(201);
+    });
+
+    it('answers the service conflict and id errors with their codes', async () => {
+      const { VehicleIdInUseError, VehicleIdRequiredError } =
+        await import('../services/vehicle.service.js');
+      setupDbResults([{ id: VALID_DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockRejectedValueOnce(new VehicleIdInUseError());
+      const conflict = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          make: 'Tesla',
+          model: 'Model 3',
+          evccid: '92D50A693F80',
+          autochargeEnabled: true,
+        },
+      });
+      expect(conflict.statusCode).toBe(409);
+      expect(conflict.json().code).toBe('VEHICLE_ID_IN_USE');
+
+      setupDbResults([{ id: VALID_DRIVER_ID }]);
+      vehicleServiceMock.createVehicle.mockRejectedValueOnce(new VehicleIdRequiredError());
+      const required = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { make: 'Tesla', model: 'Model 3', autochargeEnabled: true },
+      });
+      expect(required.statusCode).toBe(400);
+      expect(required.json().code).toBe('VEHICLE_ID_REQUIRED');
     });
 
     it('returns 400 when make is missing', async () => {
@@ -732,7 +1156,7 @@ describe('Driver routes (operator)', () => {
 
     it('returns 200 on success', async () => {
       const updated = makeVehicle({ make: 'BMW' });
-      setupDbResults([updated], [updated]);
+      vehicleServiceMock.updateVehicle.mockResolvedValueOnce(updated);
 
       const res = await app.inject({
         method: 'PATCH',
@@ -743,10 +1167,18 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().make).toBe('BMW');
+      expect(vehicleServiceMock.updateVehicle).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        VALID_VEHICLE_ID,
+        { make: 'BMW' },
+        expect.objectContaining({ actor: 'operator' }),
+        expect.anything(),
+      );
     });
 
     it('returns 404 when vehicle not found', async () => {
-      setupDbResults([]);
+      const { VehicleNotFoundError } = await import('../services/vehicle.service.js');
+      vehicleServiceMock.updateVehicle.mockRejectedValueOnce(new VehicleNotFoundError());
 
       const res = await app.inject({
         method: 'PATCH',
@@ -818,8 +1250,7 @@ describe('Driver routes (operator)', () => {
     });
 
     it('returns 204 on success', async () => {
-      const vehicle = makeVehicle();
-      setupDbResults([vehicle]);
+      vehicleServiceMock.deleteVehicle.mockResolvedValueOnce(undefined);
 
       const res = await app.inject({
         method: 'DELETE',
@@ -832,7 +1263,8 @@ describe('Driver routes (operator)', () => {
     });
 
     it('returns 404 when vehicle not found', async () => {
-      setupDbResults([]);
+      const { VehicleNotFoundError } = await import('../services/vehicle.service.js');
+      vehicleServiceMock.deleteVehicle.mockRejectedValueOnce(new VehicleNotFoundError());
 
       const res = await app.inject({
         method: 'DELETE',
@@ -840,6 +1272,43 @@ describe('Driver routes (operator)', () => {
         headers: { authorization: `Bearer ${token}` },
       });
 
+      expect(res.statusCode).toBe(404);
+      expect(res.json().code).toBe('VEHICLE_NOT_FOUND');
+    });
+  });
+
+  describe('POST /v1/drivers/:id/vehicles/:vehicleId/block and /unblock', () => {
+    it.each([
+      ['block', true],
+      ['unblock', false],
+    ] as const)('%s calls the service as the operator', async (suffix, blocked) => {
+      vehicleServiceMock.setVehicleBlocked.mockResolvedValueOnce(
+        makeVehicle({ autochargeBlockedAt: blocked ? now : null }),
+      );
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles/${VALID_VEHICLE_ID}/${suffix}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(vehicleServiceMock.setVehicleBlocked).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        VALID_VEHICLE_ID,
+        blocked,
+        expect.objectContaining({ actor: 'operator' }),
+        expect.anything(),
+      );
+      expect(res.json().lastSeen).toBeNull();
+    });
+
+    it('answers 404 for a vehicle of another driver', async () => {
+      const { VehicleNotFoundError } = await import('../services/vehicle.service.js');
+      vehicleServiceMock.setVehicleBlocked.mockRejectedValueOnce(new VehicleNotFoundError());
+      const res = await app.inject({
+        method: 'POST',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles/${VALID_VEHICLE_ID}/block`,
+        headers: { authorization: `Bearer ${token}` },
+      });
       expect(res.statusCode).toBe(404);
       expect(res.json().code).toBe('VEHICLE_NOT_FOUND');
     });

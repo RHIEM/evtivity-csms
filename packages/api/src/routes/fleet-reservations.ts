@@ -1,29 +1,42 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, and, asc, desc, sql, count, inArray } from 'drizzle-orm';
+import { eq, and, asc, desc, count, inArray } from 'drizzle-orm';
 import { db } from '@evtivity/database';
-import {
-  reservations,
-  chargingStations,
-  evses,
-  fleetReservations,
-  fleets,
-  writeReservationAudit,
-} from '@evtivity/database';
+import { reservations, chargingStations, fleetReservations, fleets } from '@evtivity/database';
+import { AppError } from '@evtivity/lib';
 import { zodSchema } from '../lib/zod-schema.js';
+import {
+  isReservedProfileId,
+  maxExternalConstraintsIdByIdentity,
+} from '../lib/charging-profile-id.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import { paginatedResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { sendOcppCommandAndWait } from '../lib/ocpp-command.js';
-import { applyReservationCancellation } from '../lib/reservation-cancel.js';
-import { assertReservationsAllowed } from '../lib/reservation-eligibility.js';
-import { assertNoMaintenanceConflict } from '../lib/maintenance-check.js';
+import { sendOcppCommandAndWait } from '@evtivity/services/ocpp-command';
+import {
+  cancelReservationWithStation,
+  createReservation,
+  dispatchReservation,
+} from '@evtivity/services/reservation.service';
+import type {
+  DispatchOutcome,
+  ReservationRow,
+  ReservationStation,
+} from '@evtivity/services/reservation.service';
+import {
+  FLEET_RESERVATION_STATUSES,
+  initialFleetReservationStatus,
+  refreshFleetReservationStatuses,
+  syncFleetReservationStatus,
+} from '@evtivity/services/fleet-reservation-status';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
+import { siteInScope } from '../lib/site-scope.js';
+import { stationInSitesSql } from '../lib/fleet-operation-scope.js';
 
 // -- Response schemas --
 
@@ -33,8 +46,10 @@ const fleetReservationListItem = z
     fleetId: z.string().describe('Fleet identifier this reservation belongs to'),
     name: z.string().max(255).nullable().describe('Optional display name'),
     status: z
-      .enum(['active', 'partial', 'failed', 'cancelled', 'expired'])
-      .describe('Aggregate status across all slots'),
+      .enum(FLEET_RESERVATION_STATUSES)
+      .describe(
+        'Status derived from the slots: scheduled (every live slot waits for its start), active (a slot is on its station), partial (a slot is live and another was cancelled or expired), completed (every slot ended and one was used), expired (every slot ended, none used, one expired), cancelled (every slot cancelled). completed, expired and cancelled are final.',
+      ),
     startsAt: z.coerce.date().nullable().describe('Scheduled start time'),
     expiresAt: z.coerce.date().describe('Reservation expiry time'),
     createdAt: z.coerce.date().describe('Timestamp when created'),
@@ -64,8 +79,10 @@ const createFleetReservationResponse = z
   .object({
     id: z.string().describe('Fleet reservation identifier'),
     status: z
-      .enum(['active', 'partial', 'failed'])
-      .describe('Aggregate status of the bulk operation'),
+      .enum(['active', 'partial', 'cancelled'])
+      .describe(
+        'Aggregate status of the bulk operation: cancelled when no slot was confirmed, partial when some were',
+      ),
     confirmed: z.number().int().min(0).describe('Number of slots confirmed by their stations'),
     failed: z.number().int().min(0).describe('Number of slots that failed or were rejected'),
     total: z.number().int().min(0).describe('Total number of slots requested'),
@@ -75,14 +92,97 @@ const createFleetReservationResponse = z
 
 const cancelFleetReservationResponse = z
   .object({
-    status: z.literal('cancelled').describe('Resulting status'),
+    status: z
+      .enum(FLEET_RESERVATION_STATUSES)
+      .describe(
+        'Fleet reservation status after the cancel: cancelled, or completed or expired when a slot was used or expired before, or partial while a slot is still in use',
+      ),
     cancelledCount: z
       .number()
       .int()
       .min(0)
-      .describe('Number of individual reservations that were cancelled'),
+      .describe(
+        'Number of reservations this request cancelled (a slot a concurrent change ended first, or whose cancel failed, is not counted)',
+      ),
   })
   .passthrough();
+
+type FleetSlotStation = ReservationStation;
+
+/** Slot error when the create failed on an unexpected error (no row written). */
+const SLOT_CREATE_FAILED = 'Reservation could not be created';
+/** Slot error when sending the created slot to its station failed unexpectedly. */
+const SLOT_DISPATCH_FAILED = 'Reservation could not be sent to the station and was cancelled';
+
+/**
+ * Cancels a slot whose dispatch threw, as system and without a fee, then
+ * sends a best-effort CancelReservation for an active hold. Fail-open: the
+ * route reports the slot as rejected either way; the expiry cron ends a row
+ * this could not cancel.
+ */
+async function cancelUndispatchedSlot(
+  row: ReservationRow,
+  station: FleetSlotStation,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  try {
+    await cancelReservationWithStation({
+      reservationDbId: row.id,
+      siteId: station.siteId,
+      driverId: row.driverId,
+      startsAt: row.startsAt ?? row.createdAt,
+      createdAt: row.createdAt,
+      actor: 'system',
+      reason: 'system_cleanup',
+      auditAction: 'station_rejected',
+      note: 'fleet reservation dispatch failed',
+      chargeFee: false,
+      logger: log,
+      stationOcppId: station.stationId,
+      reservationOcppId: row.reservationId,
+      waitForStation: false,
+    });
+  } catch (err) {
+    log.error(
+      { err, reservationId: row.id },
+      'Cancelling an undispatched fleet reservation slot failed',
+    );
+  }
+}
+
+/**
+ * Sends the booking's charging profile to an accepted slot. A profile id at
+ * or below the station's MaxExternalConstraintsId is not sent (K01.FR.81:
+ * the station would reject it). A failed send is logged; the slot stands.
+ */
+async function sendSlotChargingProfile(
+  stationOcppId: string,
+  evseId: number,
+  chargingProfile: Record<string, unknown>,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const profileId = chargingProfile['id'];
+  if (typeof profileId === 'number') {
+    const maxExternalId = await maxExternalConstraintsIdByIdentity(stationOcppId);
+    if (maxExternalId != null && isReservedProfileId(profileId, maxExternalId)) {
+      log.warn(
+        { stationId: stationOcppId, profileId, maxExternalId },
+        'Charging profile id is not above the station MaxExternalConstraintsId, profile not sent',
+      );
+      return;
+    }
+  }
+  const profile = await sendOcppCommandAndWait(stationOcppId, 'SetChargingProfile', {
+    evseId,
+    chargingProfile,
+  });
+  if (profile.error != null) {
+    log.warn(
+      { err: profile.error, stationId: stationOcppId },
+      'SetChargingProfile for the fleet reservation failed, keeping the reservation',
+    );
+  }
+}
 
 // -- Request schemas --
 
@@ -100,7 +200,15 @@ const createFleetReservationBody = z.object({
     .array(
       z.object({
         stationOcppId: z.string().min(1).max(255).describe('OCPP station identifier'),
-        evseId: z.coerce.number().int().min(1).optional().describe('EVSE ID on the station'),
+        // Bounded to the stored integer range: a larger id failed the EVSE
+        // lookup with a database error instead of a validation answer.
+        evseId: z.coerce
+          .number()
+          .int()
+          .min(1)
+          .max(2147483647)
+          .optional()
+          .describe('EVSE ID on the station'),
         driverId: ID_PARAMS.driverId.optional().describe('Driver ID'),
       }),
     )
@@ -122,7 +230,7 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         tags: ['Fleets'],
         summary: 'Create bulk reservations for a fleet',
         description:
-          'Allocates reservations across the supplied station/EVSE list and creates one reservation per fleet driver. Future-dated reservations are persisted as scheduled and activated by the worker; immediate reservations dispatch ReserveNow synchronously. Returns the per-driver allocation result with success/failure status for each.',
+          "Creates one reservation per slot. Each slot runs the reservation create checks (window, length, online, eligibility, maintenance, EVSE, busy EVSE, overlap, the driver's payment method and fleet membership); a slot that fails one, or a second slot for the same EVSE and window, is rejected with its message. Future-dated slots are persisted as scheduled and activated by the worker; immediate ones dispatch ReserveNow and wait for the station, and only accepted ones get the optional charging profile. Returns the per-slot result; an unexpected error in one slot rejects that slot only (a slot whose station dispatch failed is cancelled as system). A slot at a station that does not exist or is outside the user's sites refuses the whole request with 404 STATION_NOT_FOUND before anything is written.",
         operationId: 'createFleetReservation',
         security: [{ bearerAuth: [] }],
         params: zodSchema(fleetIdParams),
@@ -132,7 +240,7 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
           400: errorWith('Fleet reservation create failed', [
             ERROR_CODES.FLEET_RESERVATION_CREATE_FAILED,
           ]),
-          404: errorWith('Resource not found', [
+          404: errorWith('Fleet or station not found', [
             ERROR_CODES.FLEET_NOT_FOUND,
             ERROR_CODES.STATION_NOT_FOUND,
           ]),
@@ -152,24 +260,34 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Verify all referenced stations belong to sites the user has access to
       const siteIds = await getUserSiteIds(userId);
-      if (siteIds != null) {
-        const stationOcppIds = body.slots.map((s) => s.stationOcppId);
-        const stations = await db
-          .select({ stationId: chargingStations.stationId, siteId: chargingStations.siteId })
-          .from(chargingStations)
-          .where(inArray(chargingStations.stationId, stationOcppIds));
 
-        for (const station of stations) {
-          if (station.siteId != null && !siteIds.includes(station.siteId)) {
-            await reply.status(404).send({
-              error: `Station ${station.stationId} not found`,
-              code: 'STATION_NOT_FOUND',
-            });
-            return;
-          }
-        }
+      // Batch-fetch all referenced stations in one query
+      const slotStationOcppIds = [...new Set(body.slots.map((s) => s.stationOcppId))];
+      const stationRows = await db
+        .select({
+          id: chargingStations.id,
+          stationId: chargingStations.stationId,
+          siteId: chargingStations.siteId,
+          isOnline: chargingStations.isOnline,
+          reservationsEnabled: chargingStations.reservationsEnabled,
+          disabledReason: chargingStations.disabledReason,
+          firmwareState: chargingStations.firmwareState,
+          reportedStatus: chargingStations.reportedStatus,
+        })
+        .from(chargingStations)
+        .where(inArray(chargingStations.stationId, slotStationOcppIds));
+
+      // A station outside the user's sites (or unsited) is left out. A slot
+      // naming it, or a station that does not exist, refuses the whole
+      // request with the same 404 before anything is written (no existence
+      // oracle, P11).
+      const stationMap = new Map(
+        stationRows.filter((s) => siteInScope(siteIds, s.siteId)).map((s) => [s.stationId, s]),
+      );
+      if (slotStationOcppIds.some((id) => !stationMap.has(id))) {
+        await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+        return;
       }
 
       // Create fleet_reservations aggregate row
@@ -178,7 +296,9 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         .values({
           fleetId,
           name: body.name ?? null,
-          status: 'active',
+          status: initialFleetReservationStatus(
+            body.startsAt != null ? new Date(body.startsAt) : null,
+          ),
           startsAt: body.startsAt != null ? new Date(body.startsAt) : null,
           expiresAt: new Date(body.expiresAt),
           chargingProfileData: body.chargingProfile ?? null,
@@ -194,280 +314,136 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Pre-allocate reservation IDs atomically via sequence
-      const idRows = await db.execute<{ next_val: string }>(
-        sql`SELECT nextval('reservation_id_seq')::int AS next_val FROM generate_series(1, ${body.slots.length})`,
-      );
-      const reservationIds = idRows.map((r) => Number(r.next_val));
-
-      // Batch-fetch all referenced stations in one query
-      const slotStationOcppIds = [...new Set(body.slots.map((s) => s.stationOcppId))];
-      const stationRows = await db
-        .select({
-          id: chargingStations.id,
-          stationId: chargingStations.stationId,
-          siteId: chargingStations.siteId,
-          isOnline: chargingStations.isOnline,
-          reservationsEnabled: chargingStations.reservationsEnabled,
-        })
-        .from(chargingStations)
-        .where(inArray(chargingStations.stationId, slotStationOcppIds));
-
-      const stationMap = new Map(stationRows.map((s) => [s.stationId, s]));
-
-      // Batch-fetch all referenced EVSEs in one query
-      const stationUuids = stationRows.map((s) => s.id);
-      const evseRows =
-        stationUuids.length > 0
-          ? await db
-              .select({ id: evses.id, stationId: evses.stationId, evseId: evses.evseId })
-              .from(evses)
-              .where(inArray(evses.stationId, stationUuids))
-          : [];
-
-      const evseMap = new Map(evseRows.map((e) => [`${e.stationId}:${String(e.evseId)}`, e.id]));
-
-      // Phase 1: Validate all slots and prepare reservation values
-      type ValidatedSlot = {
-        slot: (typeof body.slots)[number];
-        reservationId: number;
-        stationId: string;
-        stationOcppId: string;
-        siteId: string | null;
-        resolvedEvseId: string | null;
-        evseId: number | undefined;
-        driverId: string | undefined;
-      };
-
-      const validatedSlots: ValidatedSlot[] = [];
-      const validationErrors: { index: number; error: string }[] = [];
-
-      for (let i = 0; i < body.slots.length; i++) {
-        const slot = body.slots[i];
-        if (slot == null) continue;
-        const reservationId = reservationIds[i] ?? 0;
-        const station = stationMap.get(slot.stationOcppId);
-
-        if (station == null) {
-          validationErrors.push({ index: i, error: `Station ${slot.stationOcppId} not found` });
-          continue;
-        }
-        if (!station.isOnline) {
-          validationErrors.push({ index: i, error: `Station ${slot.stationOcppId} is offline` });
-          continue;
-        }
-        try {
-          await assertReservationsAllowed(station);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : 'Reservations not allowed';
-          validationErrors.push({ index: i, error: msg });
-          continue;
-        }
-
-        try {
-          const fleetStart = body.startsAt != null ? new Date(body.startsAt) : new Date();
-          const fleetEnd = new Date(body.expiresAt);
-          await assertNoMaintenanceConflict(station.id, fleetStart, fleetEnd);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : 'Maintenance window blocks this slot';
-          validationErrors.push({ index: i, error: msg });
-          continue;
-        }
-
-        let resolvedEvseId: string | null = null;
-        if (slot.evseId != null) {
-          const evseUuid = evseMap.get(`${station.id}:${String(slot.evseId)}`);
-          if (evseUuid == null) {
-            validationErrors.push({
-              index: i,
-              error: `EVSE ${String(slot.evseId)} not found on station ${slot.stationOcppId}`,
-            });
-            continue;
-          }
-          resolvedEvseId = evseUuid;
-        }
-
-        validatedSlots.push({
-          slot,
-          reservationId,
-          stationId: station.id,
-          stationOcppId: station.stationId,
-          siteId: station.siteId,
-          resolvedEvseId,
-          evseId: slot.evseId,
-          driverId: slot.driverId,
-        });
-      }
-
-      // Phase 2: Insert all reservation rows in a single transaction
-      const insertedReservations =
-        validatedSlots.length > 0
-          ? await db.transaction(async (tx) => {
-              const inserted = await tx
-                .insert(reservations)
-                .values(
-                  validatedSlots.map((v) => ({
-                    reservationId: v.reservationId,
-                    stationId: v.stationId,
-                    evseId: v.resolvedEvseId,
-                    driverId: v.driverId ?? null,
-                    status: 'active' as const,
-                    startsAt: body.startsAt != null ? new Date(body.startsAt) : null,
-                    expiresAt: new Date(body.expiresAt),
-                    fleetReservationId: fleetReservation.id,
-                  })),
-                )
-                .returning();
-              // Bulk audit: one `created` row per inserted reservation. Inside
-              // the same transaction so a rollback removes audit entries too.
-              for (const r of inserted) {
-                await writeReservationAudit(
-                  {
-                    reservationId: r.id,
-                    action: 'created',
-                    actor: 'operator',
-                    actorUserId: userId,
-                    driverIdAfter: r.driverId,
-                    evseIdAfter: r.evseId,
-                    statusAfter: r.status,
-                    expiresAtAfter: r.expiresAt,
-                    notes: `fleet reservation ${fleetReservation.id}`,
-                  },
-                  tx,
-                  request.log,
-                );
-              }
-              return inserted;
-            })
-          : [];
-
-      // Phase 3: Send OCPP commands in parallel (outside transaction)
-      const slotResults = await Promise.allSettled(
-        validatedSlots.map(async (validated, i) => {
-          const reservation = insertedReservations[i];
-          if (reservation == null) {
-            throw new Error(`Failed to insert reservation for station ${validated.stationOcppId}`);
-          }
-
-          const ocppPayload: Record<string, unknown> = {
-            id: validated.reservationId,
-            expiryDateTime: body.expiresAt,
-            idToken: { idToken: validated.driverId ?? 'operator', type: 'Central' },
-          };
-          if (validated.evseId != null) {
-            ocppPayload['evseId'] = validated.evseId;
-          }
-
-          const result = await sendOcppCommandAndWait(
-            validated.stationOcppId,
-            'ReserveNow',
-            ocppPayload,
-          );
-
-          if (result.error != null) {
-            // System rollback: command did not reach the station or timed out.
-            await applyReservationCancellation({
-              reservationDbId: reservation.id,
-              siteId: validated.siteId,
-              driverId: validated.driverId ?? null,
-              startsAt: reservation.startsAt ?? reservation.createdAt,
-              createdAt: reservation.createdAt,
-              actor: 'system',
-              reason: 'station_rejected_other',
-              chargeFee: false,
-              logger: request.log,
-            });
-            throw new Error(result.error);
-          }
-
-          const responseStatus = result.response?.['status'] as string | undefined;
-          if (responseStatus != null && responseStatus !== 'Accepted') {
-            // Station replied non-Accepted. Map Occupied to its dedicated
-            // enum value so the metadata audit can distinguish it from other
-            // station-rejection reasons.
-            await applyReservationCancellation({
-              reservationDbId: reservation.id,
-              siteId: validated.siteId,
-              driverId: validated.driverId ?? null,
-              startsAt: reservation.startsAt ?? reservation.createdAt,
-              createdAt: reservation.createdAt,
-              actor: 'system',
-              reason:
-                responseStatus === 'Occupied'
-                  ? 'station_rejected_occupied'
-                  : 'station_rejected_other',
-              chargeFee: false,
-              logger: request.log,
-            });
-            throw new Error(`Station rejected reservation: ${responseStatus}`);
-          }
-
-          // If chargingProfile provided, send SetChargingProfile (best effort)
-          if (body.chargingProfile != null) {
-            try {
-              await sendOcppCommandAndWait(validated.stationOcppId, 'SetChargingProfile', {
-                evseId: validated.evseId ?? 0,
-                chargingProfile: body.chargingProfile,
-              });
-            } catch {
-              // Best effort: non-fatal
-            }
-          }
-
-          return {
-            stationOcppId: validated.stationOcppId,
-            evseId: validated.evseId ?? null,
-            reservationId: reservation.id,
-            status: 'confirmed' as const,
-            error: null,
-          };
-        }),
-      );
-
-      // Collect results: merge validation errors and OCPP results
-      const results: Array<{
+      type SlotResult = {
         stationOcppId: string;
         evseId: number | null;
         reservationId: string | null;
         status: 'confirmed' | 'rejected';
         error: string | null;
-      }> = [];
+      };
+      const rejected = (slot: (typeof body.slots)[number], error: string): SlotResult => ({
+        stationOcppId: slot.stationOcppId,
+        evseId: slot.evseId ?? null,
+        reservationId: null,
+        status: 'rejected',
+        error,
+      });
 
-      // Add validation-rejected slots first
-      for (const ve of validationErrors) {
-        const slot = body.slots[ve.index];
-        results.push({
-          stationOcppId: slot?.stationOcppId ?? '',
-          evseId: slot?.evseId ?? null,
-          reservationId: null,
-          status: 'rejected',
-          error: ve.error,
-        });
-      }
-
-      // Add OCPP results
-      for (let i = 0; i < slotResults.length; i++) {
-        const result = slotResults[i];
-        const validated = validatedSlots[i];
-        if (result == null || validated == null) continue;
-        if (result.status === 'fulfilled') {
-          results.push(result.value);
-        } else {
-          results.push({
-            stationOcppId: validated.stationOcppId,
-            evseId: validated.evseId ?? null,
-            reservationId: null,
-            status: 'rejected',
-            error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+      // Phase 1: create each slot through the reservation service, one after
+      // the other (G15): the window, length, online, eligibility, maintenance,
+      // EVSE, busy EVSE, payment method, fleet membership and overlap checks
+      // run per slot, and the station lock makes a second slot for the same
+      // EVSE and window a conflict. A future start is scheduled.
+      const startsAt = body.startsAt != null ? new Date(body.startsAt) : null;
+      const expiresAt = new Date(body.expiresAt);
+      const results: SlotResult[] = new Array<SlotResult>(body.slots.length);
+      const created: Array<{ index: number; row: ReservationRow; station: FleetSlotStation }> = [];
+      for (const [index, slot] of body.slots.entries()) {
+        const station = stationMap.get(slot.stationOcppId);
+        if (station == null) {
+          results[index] = rejected(slot, `Station ${slot.stationOcppId} not found`);
+          continue;
+        }
+        try {
+          const row = await createReservation({
+            station,
+            evseOcppId: slot.evseId,
+            driverId: slot.driverId ?? null,
+            startsAt,
+            expiresAt,
+            actor: { kind: 'operator', userId },
+            fleet: { fleetId, fleetReservationId: fleetReservation.id },
+            auditNotes: `fleet reservation ${fleetReservation.id}`,
+            logger: request.log,
           });
+          created.push({ index, row, station });
+        } catch (err) {
+          if (err instanceof AppError) {
+            results[index] = rejected(slot, err.message);
+            continue;
+          }
+          // An unexpected error (database, network) refuses this slot only:
+          // rethrowing left the slots created before it in the database
+          // without their station dispatch and the booking status stale.
+          // createReservation inserts in one transaction and its later steps
+          // are fail-open, so a throw means no row was written.
+          request.log.error(
+            { err, stationId: slot.stationOcppId, fleetReservationId: fleetReservation.id },
+            'Fleet reservation slot create failed',
+          );
+          results[index] = rejected(slot, SLOT_CREATE_FAILED);
         }
       }
+
+      // Phase 2: send each created slot to its station in parallel. A
+      // scheduled slot is confirmed (the worker sends ReserveNow at its
+      // start); an immediate one waits for the station, and any answer but
+      // Accepted cancels it as system. Only accepted slots get the optional
+      // charging profile. Each slot settles on its own: an unexpected error
+      // in one slot never loses the others' outcomes or the status refresh.
+      await Promise.all(
+        created.map(async ({ index, row, station }) => {
+          const slot = body.slots[index];
+          if (slot == null) return;
+          let outcome: DispatchOutcome;
+          try {
+            outcome = await dispatchReservation(row, {
+              stationOcppId: station.stationId,
+              siteId: station.siteId,
+              notifyCreated: false,
+              logger: request.log,
+            });
+          } catch (err) {
+            // The station side is unknown: cancel the slot as system so it
+            // does not hold the EVSE in the CSMS without a station hold (P4).
+            // An active hold also gets CancelReservation, in case ReserveNow
+            // reached the station.
+            request.log.error(
+              { err, reservationId: row.id, stationId: station.stationId },
+              'Fleet reservation slot dispatch failed, cancelling the slot',
+            );
+            await cancelUndispatchedSlot(row, station, request.log);
+            results[index] = rejected(slot, SLOT_DISPATCH_FAILED);
+            return;
+          }
+          if (outcome.kind === 'rejected') {
+            results[index] = rejected(slot, `Station rejected reservation: ${outcome.status}`);
+            return;
+          }
+          if (outcome.kind === 'no_response' || outcome.kind === 'failed') {
+            results[index] = rejected(slot, outcome.error);
+            return;
+          }
+          if (outcome.kind === 'accepted' && body.chargingProfile != null) {
+            try {
+              await sendSlotChargingProfile(
+                station.stationId,
+                slot.evseId ?? 0,
+                body.chargingProfile,
+                request.log,
+              );
+            } catch (err) {
+              // Best effort: the reservation stands without the profile.
+              request.log.warn(
+                { err, stationId: station.stationId },
+                'SetChargingProfile for the fleet reservation failed, keeping the reservation',
+              );
+            }
+          }
+          results[index] = {
+            stationOcppId: station.stationId,
+            evseId: slot.evseId ?? null,
+            reservationId: row.id,
+            status: 'confirmed',
+            error: null,
+          };
+        }),
+      );
 
       const confirmed = results.filter((r) => r.status === 'confirmed').length;
       const failed = results.filter((r) => r.status === 'rejected').length;
 
-      // Determine fleet reservation status
-      let aggregateStatus: string;
+      let aggregateStatus: z.infer<typeof createFleetReservationResponse>['status'];
       if (confirmed === 0) {
         aggregateStatus = 'cancelled';
       } else if (failed === 0) {
@@ -476,11 +452,9 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         aggregateStatus = 'partial';
       }
 
-      // Update fleet_reservations status
-      await db
-        .update(fleetReservations)
-        .set({ status: aggregateStatus, updatedAt: new Date() })
-        .where(eq(fleetReservations.id, fleetReservation.id));
+      // The stored booking status follows its slots (fail-open: the slots
+      // are created and the response reports each one).
+      await refreshFleetReservationStatuses([fleetReservation.id], request.log);
 
       await reply.status(201).send({
         id: fleetReservation.id,
@@ -551,7 +525,16 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
             reservationCount: count(reservations.id),
           })
           .from(fleetReservations)
-          .leftJoin(reservations, eq(reservations.fleetReservationId, fleetReservations.id))
+          // A site-restricted user counts only the reservations at its sites.
+          .leftJoin(
+            reservations,
+            siteIds == null
+              ? eq(reservations.fleetReservationId, fleetReservations.id)
+              : and(
+                  eq(reservations.fleetReservationId, fleetReservations.id),
+                  stationInSitesSql(reservations.stationId, siteIds),
+                ),
+          )
           .where(where)
           .groupBy(fleetReservations.id)
           // Secondary sort on id keeps pagination stable when two
@@ -575,7 +558,7 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         tags: ['Fleets'],
         summary: 'Cancel all reservations in a fleet reservation',
         description:
-          'Cancels every reservation in the fleet booking. Active reservations get a CancelReservation dispatched to their station; scheduled reservations are cancelled DB-only. Operator-initiated and never charges cancellation fees. Returns counts of cancelled and skipped reservations.',
+          'Cancels every reservation in the fleet booking. Active reservations get a CancelReservation dispatched to their station; scheduled reservations are cancelled DB-only. Operator-initiated and never charges cancellation fees. Returns the fleet reservation status after the cancel and the number of cancelled reservations. A user restricted to some sites gets 404 FLEET_RESERVATION_NOT_FOUND when a reservation is outside its sites or the booking has none.',
         operationId: 'cancelFleetReservation',
         security: [{ bearerAuth: [] }],
         params: zodSchema(fleetReservationIdParams),
@@ -609,7 +592,9 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Verify the fleet reservation's stations belong to allowed sites
+      // Verify the fleet reservation's stations belong to allowed sites. A
+      // fleet reservation with no reservation at all names no site, so only
+      // an all-site user may cancel it (the list hides it from the others).
       const siteIds = await getUserSiteIds(userId);
       if (siteIds != null) {
         const stationSites = await db
@@ -618,14 +603,15 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
           .innerJoin(chargingStations, eq(reservations.stationId, chargingStations.id))
           .where(eq(reservations.fleetReservationId, id));
 
-        for (const row of stationSites) {
-          if (row.siteId != null && !siteIds.includes(row.siteId)) {
-            await reply.status(404).send({
-              error: 'Fleet reservation not found',
-              code: 'FLEET_RESERVATION_NOT_FOUND',
-            });
-            return;
-          }
+        if (
+          stationSites.length === 0 ||
+          stationSites.some((row) => !siteInScope(siteIds, row.siteId))
+        ) {
+          await reply.status(404).send({
+            error: 'Fleet reservation not found',
+            code: 'FLEET_RESERVATION_NOT_FOUND',
+          });
+          return;
         }
       }
 
@@ -637,10 +623,9 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Query all active individual reservations for this fleet reservation.
-      // Pull every field the cancel helper needs so each leg is an
-      // independent unit of work.
-      const activeReservations = await db
+      // Every live reservation of the fleet reservation. Pull every field the
+      // cancel helper needs so each leg is an independent unit of work.
+      const liveReservations = await db
         .select({
           id: reservations.id,
           reservationId: reservations.reservationId,
@@ -653,43 +638,54 @@ export function fleetReservationRoutes(app: FastifyInstance): void {
         .from(reservations)
         .innerJoin(chargingStations, eq(reservations.stationId, chargingStations.id))
         .where(
-          and(eq(reservations.fleetReservationId, id), inArray(reservations.status, ['active'])),
+          and(
+            eq(reservations.fleetReservationId, id),
+            inArray(reservations.status, ['active', 'scheduled']),
+          ),
         );
 
-      // Cancel each reservation in parallel (best effort). Fleet-level cancel
-      // never charges per-driver fees -- the fleet operator owns the policy.
-      await Promise.allSettled(
-        activeReservations.map(async (reservation) => {
-          // Send CancelReservation to station (best effort)
-          try {
-            await sendOcppCommandAndWait(reservation.stationOcppId, 'CancelReservation', {
-              reservationId: reservation.reservationId,
-            });
-          } catch {
-            // Best effort
-          }
-
-          await applyReservationCancellation({
+      // Database first (G7): each row is cancelled, then an active hold gets
+      // CancelReservation (fire-and-forget). Fleet-level cancel never charges
+      // per-driver fees: the fleet operator owns the policy.
+      const outcomes = await Promise.allSettled(
+        liveReservations.map((reservation) =>
+          cancelReservationWithStation({
             reservationDbId: reservation.id,
             siteId: reservation.siteId,
             driverId: reservation.driverId,
             startsAt: reservation.startsAt ?? reservation.createdAt,
             createdAt: reservation.createdAt,
             actor: 'operator',
+            actorUserId: userId,
             reason: 'operator_manual',
             chargeFee: false,
             logger: request.log,
-          });
-        }),
+            stationOcppId: reservation.stationOcppId,
+            reservationOcppId: reservation.reservationId,
+            waitForStation: false,
+          }),
+        ),
       );
+      // Count only the slots this request cancelled: a slot that failed, or
+      // that a concurrent writer moved first (in use, expired, cancelled),
+      // was not cancelled here.
+      let cancelledCount = 0;
+      for (const [i, outcome] of outcomes.entries()) {
+        if (outcome.status === 'fulfilled') {
+          if (outcome.value.cancelled) cancelledCount++;
+        } else {
+          request.log.error(
+            { err: outcome.reason as unknown, reservationId: liveReservations[i]?.id },
+            'Cancelling a fleet reservation slot failed',
+          );
+        }
+      }
 
-      // Update fleet reservation status
-      await db
-        .update(fleetReservations)
-        .set({ status: 'cancelled', updatedAt: new Date() })
-        .where(eq(fleetReservations.id, id));
+      // Each slot cancel already refreshed the booking; this covers a booking
+      // without a live slot and returns the stored status.
+      const status = (await syncFleetReservationStatus(id)) ?? 'cancelled';
 
-      return { status: 'cancelled' as const, cancelledCount: activeReservations.length };
+      return { status, cancelledCount };
     },
   );
 }

@@ -40,7 +40,8 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   db: {
     select: vi.fn(() => makeChain()),
   },
@@ -59,6 +60,7 @@ vi.mock('@evtivity/database', () => ({
   chargingStations: {
     id: 'id',
     stationId: 'stationId',
+    siteId: 'siteId',
   },
   // Referenced by the correlated subquery that resolves the charging_sessions
   // row produced by the authorize attempt (joined on matched token + start
@@ -79,6 +81,9 @@ vi.mock('drizzle-orm', () => {
     desc: vi.fn(),
     gte: vi.fn(),
     lte: vi.fn(),
+    inArray: vi.fn(),
+    or: vi.fn((...conds: unknown[]) => ({ or: conds })),
+    isNull: vi.fn((col: unknown) => ({ isNull: col })),
     sql: sqlTag,
   };
 });
@@ -87,11 +92,17 @@ vi.mock('drizzle-orm', () => {
 // middleware does a permission lookup against the DB which would balloon the
 // mock surface; we test the handler logic here, not RBAC.
 vi.mock('../middleware/rbac.js', () => ({
-  authorize: () => async () => {},
+  authorize: () => async (request: { jwtVerify: () => Promise<void> }) => {
+    await request.jwtVerify();
+  },
 }));
+
+const siteAccess = vi.hoisted(() => ({ getUserSiteIds: vi.fn() }));
+vi.mock('../lib/site-access.js', () => ({ getUserSiteIds: siteAccess.getUserSiteIds }));
 
 import { authorizeAttemptRoutes } from '../routes/authorize-attempts.js';
 import { registerAuth } from '../plugins/auth.js';
+import * as drizzleOrmModule from 'drizzle-orm';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -117,6 +128,7 @@ describe('Authorize attempts route', () => {
   beforeEach(() => {
     setupDbResults();
     vi.clearAllMocks();
+    siteAccess.getUserSiteIds.mockResolvedValue(null);
   });
 
   describe('GET /v1/authorize-attempts', () => {
@@ -133,6 +145,9 @@ describe('Authorize attempts route', () => {
         outcome: 'accepted',
         ocppVersion: 'ocpp2.1',
         reason: 'active',
+        vehicleIdValue: null,
+        vehicleIdType: null,
+        matchedVehicleId: null,
         createdAt: new Date(),
       };
       setupDbResults([row], [{ count: 1 }]);
@@ -163,6 +178,80 @@ describe('Authorize attempts route', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().data).toEqual([]);
       expect(response.json().total).toBe(0);
+    });
+
+    it('filters by from/to as Date values, not the raw query strings', async () => {
+      const { gte, lte } = drizzleOrmModule;
+      setupDbResults([], [{ count: 0 }]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/authorize-attempts?from=2026-01-01T00:00:00Z&to=2026-01-31T23:59:59Z',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The timestamp column serializes its parameter with toISOString(), so a
+      // string here fails at query time.
+      expect(gte).toHaveBeenCalledWith('createdAt', new Date('2026-01-01T00:00:00Z'));
+      expect(lte).toHaveBeenCalledWith('createdAt', new Date('2026-01-31T23:59:59Z'));
+    });
+
+    it('does not filter by site for an all-site user', async () => {
+      const { inArray } = drizzleOrmModule;
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/authorize-attempts',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(inArray).not.toHaveBeenCalled();
+    });
+
+    it('leaves out attempts at conformance test stations, keeping unknown stations', async () => {
+      const { or, isNull } = drizzleOrmModule;
+      const { isOperatorStation } = await import('@evtivity/database');
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/authorize-attempts',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(isOperatorStation).toHaveBeenCalled();
+      expect(isNull).toHaveBeenCalledWith('id');
+      expect(or).toHaveBeenCalledWith(
+        { isNull: 'id' },
+        { conformancePredicate: 'isOperatorStation' },
+      );
+    });
+
+    it('filters a site-restricted user to stations of its sites', async () => {
+      const { inArray } = drizzleOrmModule;
+      siteAccess.getUserSiteIds.mockResolvedValue(['sit_a']);
+      setupDbResults([], [{ count: 0 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/authorize-attempts',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(inArray).toHaveBeenCalledWith('siteId', ['sit_a']);
+    });
+
+    it('returns an empty page without querying for a user with no sites', async () => {
+      const { db } = await import('@evtivity/database');
+      siteAccess.getUserSiteIds.mockResolvedValue([]);
+      setupDbResults([{ id: 1 }], [{ count: 1 }]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/authorize-attempts',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ data: [], total: 0 });
+      expect(db.select).not.toHaveBeenCalled();
     });
 
     it('rejects invalid outcome enum values', async () => {

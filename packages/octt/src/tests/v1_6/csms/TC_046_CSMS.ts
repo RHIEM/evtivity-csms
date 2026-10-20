@@ -3,6 +3,7 @@
 
 import type { StepResult, TestCase } from '../../../types.js';
 import { pushSendAckStep } from '../../../csms-test-helpers.js';
+import { defaultReply } from '../../../default-replies.js';
 
 export const TC_046_CSMS: TestCase = {
   id: 'TC_046_CSMS',
@@ -31,7 +32,7 @@ export const TC_046_CSMS: TestCase = {
         reserveIdTag = (payload['idTag'] as string) || '';
         return { status: 'Accepted' };
       }
-      return {};
+      return defaultReply('ocpp1.6', action, payload);
     });
 
     if (ctx.triggerCommand != null) {
@@ -39,7 +40,7 @@ export const TC_046_CSMS: TestCase = {
         stationId: ctx.stationId,
         connectorId: 1,
         expiryDate: new Date(Date.now() + 300000).toISOString(),
-        idTag: 'OCTT-TOKEN-001',
+        idTag: ctx.tokens.valid,
         reservationId: 1,
       });
     } else {
@@ -64,7 +65,7 @@ export const TC_046_CSMS: TestCase = {
     pushSendAckStep(steps, 2, 'Send StatusNotification (Reserved)', resp2);
 
     // Start charging with the reserved idTag
-    const idTag = reserveIdTag || 'OCTT_TAG_001';
+    const idTag = reserveIdTag || ctx.tokens.valid;
     await ctx.client.sendCall('StatusNotification', {
       connectorId,
       status: 'Preparing',

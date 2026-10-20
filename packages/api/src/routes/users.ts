@@ -1,13 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { JwtPayload } from '../plugins/auth.js';
 import crypto from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { eq, and, or, isNull, ilike, sql, inArray, desc } from 'drizzle-orm';
+import { eq, and, or, isNull, ilike, sql, inArray, desc, ne } from 'drizzle-orm';
 import argon2 from 'argon2';
 import { db, client, getMfaConfig, writeAudit, userAuditLog } from '@evtivity/database';
 import {
@@ -21,6 +21,7 @@ import {
   userPermissions,
 } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { changedFields } from '../lib/audit-diff.js';
 import {
   getNotificationSettings,
   sendEmail,
@@ -31,23 +32,44 @@ import {
   encryptString,
   generateTotpSecret,
   generateTotpUri,
-  verifyTotpCode,
+  matchTotpStep,
   createMfaChallenge,
   verifyMfaChallenge,
   redactSensitiveNotificationContent,
   recordNotificationAttempt,
 } from '@evtivity/lib';
 import QRCode from 'qrcode';
-import { setAuthCookies, clearAuthCookies, isSecureRequest } from '../lib/auth-cookies.js';
+import { clearAuthCookies, isSecureRequest, readRefreshCookie } from '../lib/auth-cookies.js';
 import { checkRecaptcha } from '../lib/recaptcha-check.js';
 import {
-  createRefreshToken,
   validateAndRotateRefreshToken,
   revokeRefreshToken,
   revokeAllUserRefreshTokens,
   revokeAllUserSessions,
 } from '../services/refresh-token.service.js';
-import { zodSchema } from '../lib/zod-schema.js';
+import {
+  announceSessionChange,
+  bumpSessionVersion,
+  endUserSessions,
+  issueOperatorSession,
+  passwordAuthBlocked,
+  ssoManagedUser,
+} from '../lib/operator-session.js';
+import { sendPasswordChangedNotice } from '../lib/password-changed-notice.js';
+import { verifyPassword } from '../lib/password-verify.js';
+import {
+  clearSignInFailures,
+  acceptTotpStep,
+  isLocked,
+  mfaResendRetryAfter,
+  recordSignInFailure,
+  secondsUntil,
+} from '../lib/sign-in-backoff.js';
+import { applyUserDeactivation, revokeUserEmailLinks } from '../services/user-status.service.js';
+import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
+import { emailEquals } from '../lib/email-match.js';
+import { verifyAgainstDummyHash } from '../lib/dummy-password-hash.js';
+import { hasMfaContact, mfaCodeRecipient, removesSmsMfaPhone } from '../lib/mfa-contact.js';
 import { generateUserToken, hashUserToken } from '../lib/user-token.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
@@ -61,23 +83,32 @@ import {
   errorResponse,
 } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { authorize, invalidatePermissionCache } from '../middleware/rbac.js';
-import { invalidateUserActiveCache } from '../plugins/auth.js';
-import { invalidateSiteAccessCache } from '../lib/site-access.js';
+import { beginOperatorMfa } from '../lib/operator-mfa.js';
+import { authorize, invalidatePermissionCache, selfService } from '../middleware/rbac.js';
+import { invalidateUserActiveCache } from '../lib/user-active.js';
+import { invalidateSiteAccessCache, assertSitesWithinScope } from '../lib/site-access.js';
 import {
-  PERMISSIONS,
-  PERMISSION_GROUPS,
-  ADMIN_DEFAULT_PERMISSIONS,
-  OPERATOR_DEFAULT_PERMISSIONS,
-  VIEWER_DEFAULT_PERMISSIONS,
-} from '@evtivity/lib';
+  canAdministerUser,
+  canGrantPermissions,
+  canManageUser,
+  getUserManagementActor,
+  manageableUsersCondition,
+  roleDefaultPermissions,
+} from '../lib/user-management-scope.js';
+import { permissionCatalog, AI_EFFORTS, AI_PROVIDER_IDS, isAiEffort } from '@evtivity/lib';
+import { isValidTimezone } from '@evtivity/lib/timezone';
 import { validatePasswordComplexity } from '../lib/password-validation.js';
+import { PASSWORD_MIN_LENGTH } from '@evtivity/lib/password-policy';
 import { config as apiConfig } from '../lib/config.js';
-import {
-  isMfaChallengeExhausted,
-  recordMfaChallengeAttempt,
-  clearMfaChallengeAttempts,
-} from '../lib/rate-limiters.js';
+import { recordAuthAudit } from '../lib/auth-audit.js';
+import { storedSystemPrompt } from '../services/ai/engine/prompt-defaults.js';
+import type { AiSurface } from '../services/ai/tools/policy.js';
+
+/** Null for no personal prompt, including a saved but unchanged built-in one. */
+function personalSystemPrompt(surface: AiSurface, text: string | undefined): string | null {
+  const stored = text != null ? storedSystemPrompt(surface, text) : '';
+  return stored.trim() === '' ? null : stored;
+}
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = process.env['API_TEMPLATES_DIR'] ?? resolve(currentDir, '..', 'templates');
@@ -86,14 +117,20 @@ const OCPP_TEMPLATES_DIR =
   resolve(currentDir, '..', '..', '..', 'ocpp', 'src', 'templates');
 const ALL_TEMPLATES_DIRS = [OCPP_TEMPLATES_DIR, TEMPLATES_DIR];
 
-// Lazily computed argon2 hash of random data, used to equalize timing on
-// authentication endpoints when the lookup returns no user. Running
-// argon2.verify against this on the no-user branch hides whether the email
-// exists, mitigating email-enumeration timing attacks.
-let dummyPasswordHashPromise: Promise<string> | null = null;
-async function getDummyPasswordHash(): Promise<string> {
-  dummyPasswordHashPromise ??= argon2.hash(crypto.randomBytes(32).toString('hex'));
-  return dummyPasswordHashPromise;
+const SMS_MFA_PHONE_REQUIRED = {
+  error: 'The user signs in with SMS codes: turn them off before you remove the phone number',
+  code: 'VALIDATION_ERROR',
+} as const;
+
+/** Whether the phone update would remove the phone the user's SMS second factor needs. */
+async function smsMfaNeedsPhone(userId: string, nextPhone: string | null): Promise<boolean> {
+  // A new number never locks anyone out: no read needed.
+  if (nextPhone != null && nextPhone.trim() !== '') return false;
+  const [row] = await db
+    .select({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod })
+    .from(users)
+    .where(eq(users.id, userId));
+  return row != null && removesSmsMfaPhone(nextPhone, row);
 }
 
 const loginBody = z.object({
@@ -118,7 +155,9 @@ const createUserBody = z.object({
   siteIds: z
     .array(z.string())
     .optional()
-    .describe('Site IDs to grant access to (ignored when hasAllSiteAccess is true)'),
+    .describe(
+      'Site IDs to grant access to (ignored when hasAllSiteAccess is true). A site-restricted operator must give at least one of its own sites.',
+    ),
 });
 
 const userParams = z.object({
@@ -133,19 +172,34 @@ const userLanguageEnum = z
   .describe('Preferred language code (one of the 6 CSMS-supported locales)');
 
 const updateUserBody = z.object({
+  email: z
+    .string()
+    .email()
+    .max(255)
+    .transform((v) => v.trim().toLowerCase())
+    .optional()
+    .describe('Sign-in email address, where password reset links go'),
   firstName: z.string().max(100).optional(),
   lastName: z.string().max(100).optional(),
   phone: z.string().max(50).nullable().optional().describe('Mobile phone number'),
   roleId: ID_PARAMS.roleId.optional().describe('Role ID to assign to the user'),
   isActive: z.boolean().optional().describe('Whether the user account is active'),
   language: userLanguageEnum.optional(),
-  timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
+  timezone: z
+    .string()
+    .max(50)
+    .optional()
+    .describe(
+      'IANA timezone (e.g. America/New_York). An unknown zone returns 400 VALIDATION_ERROR.',
+    ),
   themePreference: z.enum(['light', 'dark']).optional(),
   hasAllSiteAccess: z.boolean().optional().describe('Whether the user can access all sites'),
   siteIds: z
     .array(z.string())
     .optional()
-    .describe('Site IDs to grant access to (replaces existing assignments)'),
+    .describe(
+      'Site IDs to grant access to (replaces existing assignments). A site-restricted operator cannot send an empty list.',
+    ),
 });
 
 // Self-edit body for /v1/users/me. Restricted to fields a user can change
@@ -158,17 +212,23 @@ const updateMeBody = z.object({
   lastName: z.string().max(100).optional(),
   phone: z.string().max(50).nullable().optional().describe('Mobile phone number'),
   language: userLanguageEnum.optional(),
-  timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
+  timezone: z
+    .string()
+    .max(50)
+    .optional()
+    .describe(
+      'IANA timezone (e.g. America/New_York). An unknown zone returns 400 VALIDATION_ERROR.',
+    ),
   themePreference: z.enum(['light', 'dark']).optional(),
 });
 
 const resetPasswordBody = z.object({
-  password: z.string().min(12),
+  password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const changePasswordBody = z.object({
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(12),
+  newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const forgotPasswordBody = z.object({
@@ -178,13 +238,13 @@ const forgotPasswordBody = z.object({
 
 const resetPasswordWithTokenBody = z.object({
   token: z.string().min(1).describe('Password reset token from email link'),
-  password: z.string().min(12),
+  password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const forceChangePasswordBody = z.object({
   email: z.string().email(),
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(12),
+  newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 
 const userSelect = {
@@ -200,6 +260,9 @@ const userSelect = {
   language: users.language,
   timezone: users.timezone,
   themePreference: users.themePreference,
+  mfaEnabled: users.mfaEnabled,
+  mfaMethod: users.mfaMethod,
+  authSource: users.authSource,
   lastLoginAt: users.lastLoginAt,
   createdAt: users.createdAt,
   updatedAt: users.updatedAt,
@@ -269,6 +332,16 @@ const userItem = z
     language: z.string().describe('Preferred UI language code'),
     timezone: z.string().describe('IANA timezone identifier'),
     themePreference: z.string().describe('Preferred dashboard theme (light, dark, system)'),
+    mfaEnabled: z.boolean().optional().describe('Whether the user signs in with a second factor'),
+    mfaMethod: z
+      .string()
+      .nullable()
+      .optional()
+      .describe('Second factor method (email, sms, totp), null without MFA'),
+    authSource: z
+      .enum(['password', 'sso'])
+      .optional()
+      .describe('How the account was created: password, or sso (provisioned by an SSO sign-in)'),
     lastLoginAt: z.coerce
       .date()
       .nullable()
@@ -290,6 +363,16 @@ const userWithRole = z
       .describe('Whether the user must reset their password on next login'),
     language: z.string().describe('Preferred UI language code'),
     timezone: z.string().describe('IANA timezone identifier'),
+    mfaEnabled: z.boolean().optional().describe('Whether the user signs in with a second factor'),
+    mfaMethod: z
+      .string()
+      .nullable()
+      .optional()
+      .describe('Second factor method (email, sms, totp), null without MFA'),
+    authSource: z
+      .enum(['password', 'sso'])
+      .optional()
+      .describe('How the account was created: password, or sso (provisioned by an SSO sign-in)'),
     lastLoginAt: z.coerce
       .date()
       .nullable()
@@ -322,6 +405,99 @@ const roleItem = z
     name: z.string().describe('Role name (e.g., admin, operator)'),
   })
   .passthrough();
+
+type AiConfigKind = 'chatbot' | 'support';
+
+/** A personal AI configuration as its audit row shows it: no key, only whether one is set. */
+interface AiConfigState {
+  fields: Record<string, unknown>;
+  apiKeyEnc: string;
+}
+
+/** The user's personal chatbot or support AI configuration, null when not configured. */
+async function readAiConfigState(
+  userId: string,
+  kind: AiConfigKind,
+): Promise<AiConfigState | null> {
+  const [row] = await db.select().from(chatbotAiConfigs).where(eq(chatbotAiConfigs.userId, userId));
+  if (row == null) return null;
+  if (kind === 'chatbot') {
+    if (row.apiKeyEnc === '' || row.provider === '') return null;
+    return {
+      fields: {
+        provider: row.provider,
+        model: row.model ?? null,
+        effort: row.effort ?? null,
+        systemPrompt: row.systemPrompt ?? null,
+      },
+      apiKeyEnc: row.apiKeyEnc,
+    };
+  }
+  if (row.supportAiApiKeyEnc == null || row.supportAiApiKeyEnc === '') return null;
+  return {
+    fields: {
+      provider: row.supportAiProvider ?? null,
+      model: row.supportAiModel ?? null,
+      effort: row.supportAiEffort ?? null,
+      systemPrompt: row.supportAiSystemPrompt ?? null,
+      tone: row.supportAiTone ?? null,
+    },
+    apiKeyEnc: row.supportAiApiKeyEnc,
+  };
+}
+
+/** Whether `apiKey` differs from the stored key. */
+function aiKeyReplaced(stored: string, apiKey: string, encKey: string): boolean {
+  try {
+    return decryptString(stored, encKey) !== apiKey;
+  } catch {
+    // fail-open: a stored key this process cannot decrypt counts as replaced.
+    return true;
+  }
+}
+
+/**
+ * `user.updated` audit row of a personal AI configuration change: the changed
+ * fields only, and the API key as `set`, `replaced` or `unset`, never its
+ * value. Nothing changed, no row. Fail-open (writeAudit).
+ */
+async function writeAiConfigAudit(
+  request: FastifyRequest,
+  userId: string,
+  kind: AiConfigKind,
+  before: AiConfigState | null,
+  after: { fields: Record<string, unknown>; keyReplaced: boolean } | null,
+): Promise<void> {
+  const diff = changedFields(
+    { configured: before != null, ...(before?.fields ?? {}) },
+    { configured: after != null, ...(after?.fields ?? {}) },
+  );
+  if (before == null && after != null) {
+    diff.before['apiKey'] = 'unset';
+    diff.after['apiKey'] = 'set';
+  } else if (before != null && after == null) {
+    diff.before = { ...diff.before, ...before.fields, apiKey: 'set' };
+    diff.after['apiKey'] = 'unset';
+  } else if (after?.keyReplaced === true) {
+    diff.before['apiKey'] = 'set';
+    diff.after['apiKey'] = 'replaced';
+  }
+  if (Object.keys(diff.after).length === 0) return;
+  await writeAudit(
+    { table: userAuditLog, idColumn: 'user_id' },
+    {
+      entityId: userId,
+      entityIdSnapshot: userId,
+      action: 'updated',
+      ...getAuditActor(request),
+      before: diff.before,
+      after: diff.after,
+      notes: kind === 'chatbot' ? 'personal AI configuration' : 'personal support AI configuration',
+    },
+    db,
+    request.log,
+  );
+}
 
 export function userRoutes(app: FastifyInstance): void {
   app.post(
@@ -356,23 +532,55 @@ export function userRoutes(app: FastifyInstance): void {
       const recaptchaOk = await checkRecaptcha(recaptchaToken, reply);
       if (!recaptchaOk) return;
 
-      const [user] = await db.select().from(users).where(ilike(users.email, email));
+      const [user] = await db.select().from(users).where(emailEquals(users.email, email));
 
       if (user == null) {
         // Equalize timing with the user-exists branch so email enumeration
         // via response-time analysis fails.
-        await argon2.verify(await getDummyPasswordHash(), password).catch(() => false);
+        await verifyAgainstDummyHash(password);
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
 
-      const valid = await argon2.verify(user.passwordHash, password);
-      if (!valid) {
+      // A locked account (sign-in backoff) and an SSO account while SSO is
+      // enabled answer as for a wrong password, after the same time.
+      const locked = isLocked(user.loginLockedUntil);
+      if (locked || (await passwordAuthBlocked(user))) {
+        await verifyAgainstDummyHash(password);
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'password',
+          reason: locked ? 'locked' : 'sso_account',
+        });
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
+
+      const valid = await verifyPassword(user.passwordHash, password, request.log);
+      if (!valid) {
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'password',
+          reason: 'bad_password',
+        });
+        await recordSignInFailure(request, user.id, 'password');
+        await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
+        return;
+      }
+      await clearSignInFailures(user.id, 'password');
 
       if (!user.isActive) {
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'password',
+          reason: 'inactive',
+        });
         await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
@@ -383,52 +591,23 @@ export function userRoutes(app: FastifyInstance): void {
       }
 
       // MFA check
-      if (user.mfaEnabled && user.mfaMethod != null) {
-        const mfaToken = app.jwt.sign(
-          { userId: user.id, roleId: user.roleId, mfaPending: true },
-          { expiresIn: '3m' },
-        );
-
-        let challengeId: number | undefined;
-        if (user.mfaMethod === 'email' || user.mfaMethod === 'sms') {
-          const challenge = await createMfaChallenge(client, {
-            userId: user.id,
-            method: user.mfaMethod,
-          });
-          challengeId = challenge.challengeId;
-
-          await dispatchSystemNotification(
-            client,
-            'mfa.VerificationCode',
-            {
-              email: user.email,
-              phone: user.phone ?? undefined,
-              firstName: user.firstName ?? undefined,
-              language: user.language,
-            },
-            { code: challenge.code },
-            TEMPLATES_DIR,
-          );
-        }
-
-        return {
-          mfaRequired: true,
-          mfaMethod: user.mfaMethod,
-          mfaToken,
-          challengeId,
-        };
-      }
+      const mfaPending = await beginOperatorMfa(app, user);
+      if (mfaPending != null) return mfaPending;
 
       const [role] = await db
         .select({ id: roles.id, name: roles.name })
         .from(roles)
         .where(eq(roles.id, user.roleId));
 
-      const token = app.jwt.sign({ userId: user.id, roleId: user.roleId }, { expiresIn: '1h' });
-      const refreshResult = await createRefreshToken({ userId: user.id });
-      setAuthCookies('csms', reply, token, refreshResult.rawToken, isSecureRequest(request));
+      const token = await issueOperatorSession(app, request, reply, user);
 
       await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+      await recordAuthAudit(request, {
+        kind: 'user',
+        accountId: user.id,
+        action: 'login_succeeded',
+        method: 'password',
+      });
 
       return {
         token,
@@ -459,14 +638,17 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const rawRefreshToken = request.cookies['csms_refresh'];
-      if (rawRefreshToken) {
-        await revokeRefreshToken(rawRefreshToken);
+      const refreshCookie = readRefreshCookie('csms', request);
+      if (refreshCookie.status === 'valid') {
+        await revokeRefreshToken(refreshCookie.value);
       }
-      // Clear cached permissions for the logged-out user
-      const jwtUser = request.user as unknown as Record<string, unknown>;
-      if ('userId' in jwtUser && typeof jwtUser['userId'] === 'string') {
-        invalidatePermissionCache(jwtUser['userId']);
+      // Clear cached permissions for the logged-out user, and end the access
+      // tokens issued before (session version). An API key signs nothing out.
+      const jwtUser = request.user as JwtPayload;
+      if (jwtUser.isApiKey !== true) {
+        invalidatePermissionCache(jwtUser.userId);
+        await bumpSessionVersion(jwtUser.userId);
+        announceSessionChange(jwtUser.userId);
       }
       clearAuthCookies('csms', reply, isSecureRequest(request));
       return { success: true };
@@ -498,13 +680,16 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const rawToken = request.cookies['csms_refresh'];
-      if (!rawToken) {
+      const refreshCookie = readRefreshCookie('csms', request);
+      if (refreshCookie.status === 'absent') {
         await reply.status(401).send({ error: 'No refresh token', code: 'NO_REFRESH_TOKEN' });
         return;
       }
 
-      const result = await validateAndRotateRefreshToken(rawToken);
+      const result =
+        refreshCookie.status === 'valid'
+          ? await validateAndRotateRefreshToken(refreshCookie.value)
+          : null;
       if (result == null || result.userId == null) {
         clearAuthCookies('csms', reply, isSecureRequest(request));
         await reply
@@ -518,6 +703,7 @@ export function userRoutes(app: FastifyInstance): void {
           id: users.id,
           roleId: users.roleId,
           isActive: users.isActive,
+          sessionVersion: users.sessionVersion,
         })
         .from(users)
         .where(eq(users.id, result.userId));
@@ -528,12 +714,7 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const accessToken = app.jwt.sign(
-        { userId: user.id, roleId: user.roleId },
-        { expiresIn: '1h' },
-      );
-      const newRefresh = await createRefreshToken({ userId: user.id });
-      setAuthCookies('csms', reply, accessToken, newRefresh.rawToken, isSecureRequest(request));
+      await issueOperatorSession(app, request, reply, user);
 
       return { success: true };
     },
@@ -575,11 +756,15 @@ export function userRoutes(app: FastifyInstance): void {
           firstName: users.firstName,
           lastName: users.lastName,
           language: users.language,
+          isActive: users.isActive,
+          authSource: users.authSource,
         })
         .from(users)
-        .where(ilike(users.email, email));
+        .where(emailEquals(users.email, email));
 
-      if (user != null) {
+      // An inactive account and an SSO account while SSO is enabled get no
+      // link, with the same answer as an unknown email.
+      if (user != null && user.isActive && !(await passwordAuthBlocked(user))) {
         // Revoke existing password_reset tokens
         await db
           .update(userTokens)
@@ -606,7 +791,9 @@ export function userRoutes(app: FastifyInstance): void {
         const csmsUrl = apiConfig.CSMS_URL;
         const resetUrl = `${csmsUrl}/reset-password?token=${rawToken}`;
 
-        try {
+        // Not awaited: the answer for a known email must not wait for the
+        // mail provider, or its time would tell the email exists.
+        void (async () => {
           const settings = await getNotificationSettings(client);
           if (settings.smtp != null) {
             const companyRows = await client`
@@ -686,9 +873,11 @@ export function userRoutes(app: FastifyInstance): void {
               metadata,
             });
           }
-        } catch {
-          // Silently fail email sending to not leak user existence
-        }
+        })().catch((err: unknown) => {
+          // fail-open: the answer is the same either way, so it does not
+          // reveal whether the user exists (P9).
+          request.log.warn({ err }, 'Password reset email dispatch failed');
+        });
       }
 
       return { success: true };
@@ -725,80 +914,73 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // Hash before the lookup: the time does not depend on the link.
+      const passwordHash = await argon2.hash(password);
       const tokenHash = hashUserToken(token);
 
-      const [tokenRow] = await db
-        .select({
-          id: userTokens.id,
-          userId: userTokens.userId,
-          expiresAt: userTokens.expiresAt,
-        })
-        .from(userTokens)
-        .where(
-          and(
-            eq(userTokens.tokenHash, tokenHash),
-            eq(userTokens.type, 'password_reset'),
-            isNull(userTokens.revokedAt),
-          ),
-        );
+      // One transaction: the guarded consume (a link works once, the first of
+      // two parallel requests wins) and the password write. A link of an
+      // inactive user, or of an SSO account while SSO is enabled, stays used
+      // and sets nothing.
+      const outcome = await db.transaction(async (tx) => {
+        const [consumed] = await tx
+          .update(userTokens)
+          .set({ revokedAt: new Date() })
+          .where(
+            and(
+              eq(userTokens.tokenHash, tokenHash),
+              eq(userTokens.type, 'password_reset'),
+              isNull(userTokens.revokedAt),
+              sql`${userTokens.expiresAt} > now()`,
+            ),
+          )
+          .returning({ userId: userTokens.userId });
+        if (consumed?.userId == null) return null;
+        const [user] = await tx
+          .select({ isActive: users.isActive, authSource: users.authSource })
+          .from(users)
+          .where(eq(users.id, consumed.userId));
+        if (user == null || !user.isActive || (await passwordAuthBlocked(user))) return null;
+        const [updated] = await tx
+          .update(users)
+          .set({
+            passwordHash,
+            mustResetPassword: false,
+            failedLoginCount: 0,
+            loginLockedUntil: null,
+            sessionVersion: sql`${users.sessionVersion} + 1`,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(users.id, consumed.userId), eq(users.isActive, true)))
+          .returning({ id: users.id });
+        if (updated == null) return null;
+        // Other open links of the user end with this one.
+        await revokeUserEmailLinks(updated.id, tx);
+        return updated.id;
+      });
 
-      if (tokenRow == null || tokenRow.userId == null || tokenRow.expiresAt < new Date()) {
+      if (outcome == null) {
         await reply
           .status(400)
           .send({ error: 'Invalid or expired reset link', code: 'INVALID_TOKEN' });
         return;
       }
 
-      const passwordHash = await argon2.hash(password);
-
-      await db
-        .update(users)
-        .set({ passwordHash, mustResetPassword: false, updatedAt: new Date() })
-        .where(eq(users.id, tokenRow.userId));
-
-      await db
-        .update(userTokens)
-        .set({ revokedAt: new Date() })
-        .where(eq(userTokens.id, tokenRow.id));
-
       // Forgot-password is the recovery path after credential compromise:
-      // revoke every outstanding refresh token so an attacker holding a
-      // stolen csms_refresh cookie cannot keep using the account after the
-      // legitimate user completes the reset. Mirrors the driver path at
-      // packages/api/src/routes/portal/auth.ts and the operator
-      // force-change-password / admin reset-password paths.
-      await revokeAllUserSessions(tokenRow.userId);
+      // revoke every refresh token and API key, so a stolen session cookie or
+      // key stops working after the legitimate user completes the reset.
+      // The session version moved in the transaction.
+      await revokeAllUserRefreshTokens(outcome);
+      announceSessionChange(outcome);
 
-      const [updatedUser] = await db
-        .select({
-          id: users.id,
-          email: users.email,
-          phone: users.phone,
-          firstName: users.firstName,
-          lastName: users.lastName,
-          language: users.language,
-        })
-        .from(users)
-        .where(eq(users.id, tokenRow.userId));
+      await recordAuthAudit(request, {
+        kind: 'user',
+        accountId: outcome,
+        action: 'password_reset',
+        method: 'reset_token',
+      });
 
-      if (updatedUser != null) {
-        void dispatchSystemNotification(
-          client,
-          'operator.PasswordChanged',
-          {
-            email: updatedUser.email,
-            phone: updatedUser.phone ?? undefined,
-            userId: updatedUser.id,
-            language: updatedUser.language,
-          },
-          {
-            firstName: updatedUser.firstName ?? '',
-            lastName: updatedUser.lastName ?? '',
-            email: updatedUser.email,
-          },
-          ALL_TEMPLATES_DIRS,
-        );
-      }
+      sendPasswordChangedNotice(outcome, request.log);
 
       return { success: true };
     },
@@ -817,7 +999,6 @@ export function userRoutes(app: FastifyInstance): void {
           200: zodSchema(loginResponse),
           400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
           401: errorWith('Invalid credentials', [ERROR_CODES.INVALID_CREDENTIALS]),
-          403: errorWith('Account disabled', [ERROR_CODES.ACCOUNT_DISABLED]),
         },
       },
       config: {
@@ -832,32 +1013,46 @@ export function userRoutes(app: FastifyInstance): void {
         typeof forceChangePasswordBody
       >;
 
-      const [user] = await db.select().from(users).where(ilike(users.email, email));
+      const [user] = await db.select().from(users).where(emailEquals(users.email, email));
 
-      if (user == null) {
-        // Equalize timing with the user-exists branch (see login handler).
-        await argon2.verify(await getDummyPasswordHash(), currentPassword).catch(() => false);
+      // The password is checked first (against a dummy hash for an unknown
+      // email), and every refusal answers the same 401, so the route tells
+      // nothing about the account: not whether it exists, is active, needs
+      // a reset, is locked or signs in with SSO.
+      const locked = user != null && isLocked(user.loginLockedUntil);
+      const valid =
+        user != null && !locked
+          ? await verifyPassword(user.passwordHash, currentPassword, request.log)
+          : await verifyAgainstDummyHash(currentPassword);
+      const refusal =
+        user == null
+          ? 'unknown'
+          : locked
+            ? 'locked'
+            : !valid
+              ? 'bad_password'
+              : !user.isActive
+                ? 'inactive'
+                : !user.mustResetPassword
+                  ? 'reset_not_required'
+                  : (await passwordAuthBlocked(user))
+                    ? 'sso_account'
+                    : null;
+      if (user == null || refusal != null) {
+        if (user != null && refusal != null) {
+          await recordAuthAudit(request, {
+            kind: 'user',
+            accountId: user.id,
+            action: 'login_failed',
+            method: 'password',
+            reason: refusal,
+          });
+          if (refusal === 'bad_password') await recordSignInFailure(request, user.id, 'password');
+        }
         await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
         return;
       }
-
-      if (!user.mustResetPassword) {
-        await reply
-          .status(400)
-          .send({ error: 'Password reset is not required', code: 'RESET_NOT_REQUIRED' });
-        return;
-      }
-
-      if (!user.isActive) {
-        await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
-        return;
-      }
-
-      const valid = await argon2.verify(user.passwordHash, currentPassword);
-      if (!valid) {
-        await reply.status(401).send({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
-        return;
-      }
+      await clearSignInFailures(user.id, 'password');
 
       const complexityError = validatePasswordComplexity(newPassword);
       if (complexityError != null) {
@@ -872,10 +1067,11 @@ export function userRoutes(app: FastifyInstance): void {
         .set({ passwordHash, mustResetPassword: false, updatedAt: new Date() })
         .where(eq(users.id, user.id));
 
-      // Revoke any existing sessions before issuing the new one. Mirrors
-      // /users/me/change-password and the admin reset-password handler so
-      // forced-reset password changes terminate other devices' sessions.
-      await revokeAllUserSessions(user.id);
+      // End every existing session before issuing the new one (session
+      // version and refresh tokens). API keys stay: the user changed the
+      // password, nobody reset it.
+      const sessionVersion = (await endUserSessions(user.id, { apiKeys: false })) ?? 0;
+      sendPasswordChangedNotice(user.id, request.log);
 
       await writeAudit(
         { table: userAuditLog, idColumn: 'user_id' },
@@ -883,7 +1079,10 @@ export function userRoutes(app: FastifyInstance): void {
           entityId: user.id,
           entityIdSnapshot: user.id,
           action: 'password_reset',
-          ...getAuditActor(request),
+          // The request is not authenticated: the user proved the account
+          // with the current password, so the user is the actor.
+          actor: 'operator',
+          actorUserId: user.id,
           notes: 'User changed own password (forced reset)',
         },
         db,
@@ -895,51 +1094,23 @@ export function userRoutes(app: FastifyInstance): void {
       // existing /auth/mfa/verify flow before getting a real session. The
       // login handler does the same thing for normal logins; we route the
       // forced-reset path through the same gate.
-      if (user.mfaEnabled && user.mfaMethod != null) {
-        const mfaToken = app.jwt.sign(
-          { userId: user.id, roleId: user.roleId, mfaPending: true },
-          { expiresIn: '3m' },
-        );
-
-        let challengeId: number | undefined;
-        if (user.mfaMethod === 'email' || user.mfaMethod === 'sms') {
-          const challenge = await createMfaChallenge(client, {
-            userId: user.id,
-            method: user.mfaMethod,
-          });
-          challengeId = challenge.challengeId;
-          await dispatchSystemNotification(
-            client,
-            'mfa.VerificationCode',
-            {
-              email: user.email,
-              phone: user.phone ?? undefined,
-              firstName: user.firstName ?? undefined,
-              language: user.language,
-            },
-            { code: challenge.code },
-            TEMPLATES_DIR,
-          );
-        }
-
-        return {
-          mfaRequired: true,
-          mfaMethod: user.mfaMethod,
-          mfaToken,
-          challengeId,
-        };
-      }
+      const mfaPending = await beginOperatorMfa(app, user);
+      if (mfaPending != null) return mfaPending;
 
       const [role] = await db
         .select({ id: roles.id, name: roles.name })
         .from(roles)
         .where(eq(roles.id, user.roleId));
 
-      const token = app.jwt.sign({ userId: user.id, roleId: user.roleId }, { expiresIn: '1h' });
-      const refreshResult = await createRefreshToken({ userId: user.id });
-      setAuthCookies('csms', reply, token, refreshResult.rawToken, isSecureRequest(request));
+      const token = await issueOperatorSession(app, request, reply, { ...user, sessionVersion });
 
       await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+      await recordAuthAudit(request, {
+        kind: 'user',
+        accountId: user.id,
+        action: 'login_succeeded',
+        method: 'password',
+      });
 
       return {
         token,
@@ -960,7 +1131,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.get(
     '/users/me',
     {
-      onRequest: [authorize('users:read')],
+      onRequest: [selfService({ allowApiKey: true })],
       schema: {
         tags: ['Users'],
         summary: 'Get the currently authenticated user',
@@ -1001,7 +1172,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.patch(
     '/users/me',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Update the authenticated user&#39;s own profile fields',
@@ -1012,6 +1183,11 @@ export function userRoutes(app: FastifyInstance): void {
         body: zodSchema(updateMeBody),
         response: {
           200: itemResponse(userWithRole),
+          400: errorWith(
+            'Invalid timezone, or the phone of an SMS second factor cannot be removed',
+            [ERROR_CODES.VALIDATION_ERROR],
+          ),
+          403: errorWith('API keys cannot change the profile', [ERROR_CODES.SESSION_REQUIRED]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
         },
       },
@@ -1019,6 +1195,17 @@ export function userRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { userId } = request.user as JwtPayload;
       const body = request.body as z.infer<typeof updateMeBody>;
+
+      // An unknown zone would make every date in the user's notices throw.
+      if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+        await reply.status(400).send({ error: 'Invalid IANA timezone', code: 'VALIDATION_ERROR' });
+        return;
+      }
+
+      if (body.phone !== undefined && (await smsMfaNeedsPhone(userId, body.phone))) {
+        await reply.status(400).send(SMS_MFA_PHONE_REQUIRED);
+        return;
+      }
 
       const fields: Record<string, unknown> = { updatedAt: new Date() };
       if (body.firstName !== undefined) fields['firstName'] = body.firstName;
@@ -1092,7 +1279,11 @@ export function userRoutes(app: FastifyInstance): void {
       const { page, limit, search, roleId, status } = query;
       const offset = (page - 1) * limit;
 
+      // A site-restricted operator sees only users within its sites.
+      const actor = await getUserManagementActor(request);
       const conditions = [];
+      const scope = manageableUsersCondition(actor.siteIds);
+      if (scope != null) conditions.push(scope);
       if (search) {
         const pattern = `%${search}%`;
         conditions.push(
@@ -1168,20 +1359,39 @@ export function userRoutes(app: FastifyInstance): void {
         response: {
           201: itemResponse(userCreated),
           400: errorResponse,
+          403: errorWith('Grant exceeds own access', [
+            ERROR_CODES.FORBIDDEN,
+            ERROR_CODES.PERMISSIONS_EXCEED_OWN,
+          ]),
           409: errorWith('Email already in use', [ERROR_CODES.DUPLICATE_EMAIL]),
         },
       },
     },
     async (request, reply) => {
-      const body = request.body as z.infer<typeof createUserBody>;
+      const body = parseZodRequest(createUserBody, request.body);
+      const actor = await getUserManagementActor(request);
+
+      // A site-restricted operator never grants access to every site.
+      if (body.hasAllSiteAccess && actor.siteIds != null) {
+        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
+        return;
+      }
+      // A site-restricted operator assigns at least one of its sites: a user
+      // without a site would be invisible to it.
+      if (actor.siteIds != null && (body.siteIds == null || body.siteIds.length === 0)) {
+        await reply
+          .status(400)
+          .send({ error: 'At least one site is required', code: 'INVALID_SITE_IDS' });
+        return;
+      }
 
       // Pre-check the unique email constraint (case-insensitive) so we return
       // a clean 409 instead of letting Postgres raise a 500. Body email is
-      // already lowercased + trimmed by the Zod transform on createUserBody.
+      // lowercased + trimmed by the Zod transform on createUserBody.
       const [existing] = await db
         .select({ id: users.id })
         .from(users)
-        .where(ilike(users.email, body.email))
+        .where(emailEquals(users.email, body.email))
         .limit(1);
       if (existing != null) {
         await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
@@ -1191,12 +1401,21 @@ export function userRoutes(app: FastifyInstance): void {
       // Pre-validate roleId so a bad FK returns a clean 400 instead of a
       // Postgres FK violation surfaced as 500.
       const [role] = await db
-        .select({ id: roles.id })
+        .select({ id: roles.id, name: roles.name })
         .from(roles)
         .where(eq(roles.id, body.roleId))
         .limit(1);
       if (role == null) {
         await reply.status(400).send({ error: 'Role does not exist', code: 'ROLE_NOT_FOUND' });
+        return;
+      }
+      // The new user gets the role's default permissions: an operator may
+      // only pick a role whose defaults it holds itself.
+      if (!(await canGrantPermissions(request, roleDefaultPermissions(role.name)))) {
+        await reply.status(403).send({
+          error: 'Permissions must be a subset of your own permissions',
+          code: 'PERMISSIONS_EXCEED_OWN',
+        });
         return;
       }
 
@@ -1211,7 +1430,12 @@ export function userRoutes(app: FastifyInstance): void {
           .select({ id: sites.id })
           .from(sites)
           .where(inArray(sites.id, createSiteIds));
-        if (found.length !== createSiteIds.length) {
+        // A site outside a restricted operator's sites answers like an
+        // unknown one, so its existence does not leak.
+        if (
+          found.length !== createSiteIds.length ||
+          !(await assertSitesWithinScope(actor.userId, createSiteIds))
+        ) {
           await reply
             .status(400)
             .send({ error: 'One or more siteIds do not exist', code: 'INVALID_SITE_IDS' });
@@ -1264,12 +1488,7 @@ export function userRoutes(app: FastifyInstance): void {
         .from(roles)
         .where(eq(roles.id, body.roleId));
 
-      const roleDefaults =
-        createdRole?.name === 'admin'
-          ? ADMIN_DEFAULT_PERMISSIONS
-          : createdRole?.name === 'viewer'
-            ? VIEWER_DEFAULT_PERMISSIONS
-            : OPERATOR_DEFAULT_PERMISSIONS;
+      const roleDefaults = permissionCatalog.defaultsFor(createdRole?.name);
 
       if (roleDefaults.length > 0) {
         await db
@@ -1304,14 +1523,14 @@ export function userRoutes(app: FastifyInstance): void {
         ALL_TEMPLATES_DIRS,
       );
 
-      const actor = getAuditActor(request);
+      const auditActor = getAuditActor(request);
       await writeAudit(
         { table: userAuditLog, idColumn: 'user_id' },
         {
           entityId: user.id,
           entityIdSnapshot: user.id,
           action: 'created',
-          ...actor,
+          ...auditActor,
           after: {
             ...user,
             hasAllSiteAccess: body.hasAllSiteAccess,
@@ -1351,7 +1570,7 @@ export function userRoutes(app: FastifyInstance): void {
 
       const [user] = await db.select(userSelect).from(users).where(eq(users.id, id));
 
-      if (user == null) {
+      if (user == null || !(await canManageUser(await getUserManagementActor(request), id))) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
       }
@@ -1389,15 +1608,27 @@ export function userRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(userItem),
           400: errorResponse,
-          403: errorWith('Self edit forbidden', [ERROR_CODES.SELF_EDIT_FORBIDDEN]),
+          403: errorWith('Self edit forbidden or grant exceeds own access', [
+            ERROR_CODES.SELF_EDIT_FORBIDDEN,
+            ERROR_CODES.FORBIDDEN,
+            ERROR_CODES.PERMISSIONS_EXCEED_OWN,
+          ]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+          409: errorWith('Email already in use', [ERROR_CODES.DUPLICATE_EMAIL]),
         },
       },
     },
     async (request, reply) => {
       const { userId } = request.user as JwtPayload;
       const { id } = request.params as z.infer<typeof userParams>;
-      const body = request.body as z.infer<typeof updateUserBody>;
+      // Parsed here so the email transform (trim, lowercase) runs.
+      const body = parseZodRequest(updateUserBody, request.body);
+
+      // An unknown zone would make every date in the user's notices throw.
+      if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+        await reply.status(400).send({ error: 'Invalid IANA timezone', code: 'VALIDATION_ERROR' });
+        return;
+      }
 
       // Block self-edit of sensitive fields (role, status, site access)
       // Users can edit their own name, language, timezone, theme via Profile
@@ -1416,11 +1647,74 @@ export function userRoutes(app: FastifyInstance): void {
         }
       }
 
+      // A site-restricted operator manages only users within its sites. Any
+      // other user answers like a missing one.
+      const actor = await getUserManagementActor(request);
+      // Account changes (status, role, site access, the MFA phone, the email
+      // that receives password reset links) also need the target's
+      // permissions within the actor's own; the profile fields (name,
+      // language, timezone, theme) need the site scope only.
+      const changesAccount =
+        body.isActive !== undefined ||
+        body.roleId !== undefined ||
+        body.hasAllSiteAccess !== undefined ||
+        body.siteIds !== undefined ||
+        body.phone !== undefined ||
+        body.email !== undefined;
+      const [before] = await db.select(userSelect).from(users).where(eq(users.id, id));
+      const allowed =
+        before != null &&
+        (changesAccount
+          ? await canAdministerUser(request, actor, id)
+          : await canManageUser(actor, id));
+      if (!allowed) {
+        await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
+        return;
+      }
+
+      // A site-restricted operator never grants access to every site.
+      if (body.hasAllSiteAccess === true && actor.siteIds != null) {
+        await reply.status(403).send({ error: 'Forbidden', code: 'FORBIDDEN' });
+        return;
+      }
+      // A site-restricted operator never removes every site of a user: the
+      // user would become invisible to it.
+      if (actor.siteIds != null && body.siteIds !== undefined && body.siteIds.length === 0) {
+        await reply
+          .status(400)
+          .send({ error: 'At least one site is required', code: 'INVALID_SITE_IDS' });
+        return;
+      }
+
+      // SMS codes need the phone: removing it would lock the user out.
+      if (body.phone !== undefined && (await smsMfaNeedsPhone(id, body.phone))) {
+        await reply.status(400).send(SMS_MFA_PHONE_REQUIRED);
+        return;
+      }
+
+      // The unique email constraint is case-insensitive: answer a clean 409
+      // instead of a Postgres error.
+      const emailChanged = body.email !== undefined && body.email !== before.email.toLowerCase();
+      if (emailChanged && body.email !== undefined) {
+        const [taken] = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(and(emailEquals(users.email, body.email), ne(users.id, id)))
+          .limit(1);
+        if (taken != null) {
+          await reply.status(409).send({ error: 'Email already in use', code: 'DUPLICATE_EMAIL' });
+          return;
+        }
+      }
+
       // Pre-validate roleId FK so a bad role returns a clean 400 instead
-      // of a Postgres FK violation surfaced as 500.
+      // of a Postgres FK violation surfaced as 500. A role change resets the
+      // user's permissions to the role defaults, so a site-restricted
+      // operator may only pick a role whose defaults it holds itself.
+      let newRoleDefaults: string[] = [];
       if (body.roleId !== undefined) {
         const [role] = await db
-          .select({ id: roles.id })
+          .select({ id: roles.id, name: roles.name })
           .from(roles)
           .where(eq(roles.id, body.roleId))
           .limit(1);
@@ -1428,9 +1722,40 @@ export function userRoutes(app: FastifyInstance): void {
           await reply.status(400).send({ error: 'Role does not exist', code: 'ROLE_NOT_FOUND' });
           return;
         }
+        newRoleDefaults = roleDefaultPermissions(role.name);
+        if (!(await canGrantPermissions(request, newRoleDefaults))) {
+          await reply.status(403).send({
+            error: 'Permissions must be a subset of your own permissions',
+            code: 'PERMISSIONS_EXCEED_OWN',
+          });
+          return;
+        }
+      }
+
+      // Pre-validate site assignments before any write, so a bad siteId
+      // returns a clean 400 instead of a Postgres FK violation surfaced as
+      // 500. A site outside a restricted operator's sites answers like an
+      // unknown one. Dedupe the input so duplicates don't trip the
+      // (userId, siteId) UNIQUE constraint on insert.
+      const patchSiteIds = body.siteIds === undefined ? undefined : [...new Set(body.siteIds)];
+      if (patchSiteIds != null && patchSiteIds.length > 0) {
+        const found = await db
+          .select({ id: sites.id })
+          .from(sites)
+          .where(inArray(sites.id, patchSiteIds));
+        if (
+          found.length !== patchSiteIds.length ||
+          !(await assertSitesWithinScope(actor.userId, patchSiteIds))
+        ) {
+          await reply
+            .status(400)
+            .send({ error: 'One or more siteIds do not exist', code: 'INVALID_SITE_IDS' });
+          return;
+        }
       }
 
       const fields: Record<string, unknown> = { updatedAt: new Date() };
+      if (body.email !== undefined) fields['email'] = body.email;
       if (body.firstName !== undefined) fields['firstName'] = body.firstName;
       if (body.lastName !== undefined) fields['lastName'] = body.lastName;
       if (body.phone !== undefined) fields['phone'] = body.phone;
@@ -1441,46 +1766,47 @@ export function userRoutes(app: FastifyInstance): void {
       if (body.themePreference !== undefined) fields['themePreference'] = body.themePreference;
       if (body.hasAllSiteAccess !== undefined) fields['hasAllSiteAccess'] = body.hasAllSiteAccess;
 
-      const [before] = await db.select(userSelect).from(users).where(eq(users.id, id));
-      const [updated] = await db
-        .update(users)
-        .set(fields)
-        .where(eq(users.id, id))
-        .returning(userSelect);
+      // One transaction: the user row, its site assignments and its
+      // permissions change together or not at all.
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(users)
+          .set(fields)
+          .where(eq(users.id, id))
+          .returning(userSelect);
+        if (row == null) return null;
+
+        // Reset and invite links already sent went to the old address.
+        if (emailChanged) await revokeUserEmailLinks(id, tx);
+
+        // A role change ends the access tokens issued under the old role.
+        if (body.roleId !== undefined) await bumpSessionVersion(id, tx);
+
+        if (patchSiteIds !== undefined) {
+          await tx.delete(userSiteAssignments).where(eq(userSiteAssignments.userId, id));
+          if (patchSiteIds.length > 0) {
+            await tx
+              .insert(userSiteAssignments)
+              .values(patchSiteIds.map((siteId) => ({ userId: id, siteId })));
+          }
+        }
+
+        // Reset permissions to the new role defaults when roleId changes
+        if (body.roleId !== undefined) {
+          await tx.delete(userPermissions).where(eq(userPermissions.userId, id));
+          if (newRoleDefaults.length > 0) {
+            await tx
+              .insert(userPermissions)
+              .values(newRoleDefaults.map((p) => ({ userId: id, permission: p })))
+              .onConflictDoNothing();
+          }
+        }
+        return row;
+      });
 
       if (updated == null) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
-      }
-
-      // Update site assignments if provided. Pre-validate so a bad siteId
-      // returns a clean 400 instead of a Postgres FK violation surfaced
-      // as 500. Dedupe the input so duplicates don't trip the
-      // (userId, siteId) UNIQUE constraint on insert.
-      if (body.siteIds !== undefined) {
-        const patchSiteIds = [...new Set(body.siteIds)];
-        if (patchSiteIds.length > 0) {
-          const found = await db
-            .select({ id: sites.id })
-            .from(sites)
-            .where(inArray(sites.id, patchSiteIds));
-          if (found.length !== patchSiteIds.length) {
-            await reply
-              .status(400)
-              .send({ error: 'One or more siteIds do not exist', code: 'INVALID_SITE_IDS' });
-            return;
-          }
-        }
-        await db.delete(userSiteAssignments).where(eq(userSiteAssignments.userId, id));
-
-        if (patchSiteIds.length > 0) {
-          await db.insert(userSiteAssignments).values(
-            patchSiteIds.map((siteId) => ({
-              userId: id,
-              siteId,
-            })),
-          );
-        }
       }
 
       // Invalidate site access cache when site access fields change
@@ -1488,37 +1814,20 @@ export function userRoutes(app: FastifyInstance): void {
         invalidateSiteAccessCache(id);
       }
 
-      // Deactivation: revoke all sessions and clear the isActive cache so
-      // the user is locked out immediately rather than after the 30s cache
-      // window plus the JWT lifetime.
+      // Deactivation: end every session, API key and emailed link at once
+      // (user-status.service.ts), not after the cache window plus the JWT
+      // lifetime. Run for every isActive: false, so a retry completes a
+      // failed step.
       if (body.isActive === false) {
-        await revokeAllUserRefreshTokens(id);
+        await applyUserDeactivation(id, { log: request.log });
+      } else if (body.isActive === true) {
         invalidateUserActiveCache(id);
       }
 
-      // Reset permissions to new role defaults when roleId changes
       if (body.roleId !== undefined) {
-        const [newRole] = await db
-          .select({ name: roles.name })
-          .from(roles)
-          .where(eq(roles.id, body.roleId));
-
-        const defaults =
-          newRole?.name === 'admin'
-            ? ADMIN_DEFAULT_PERMISSIONS
-            : newRole?.name === 'viewer'
-              ? VIEWER_DEFAULT_PERMISSIONS
-              : OPERATOR_DEFAULT_PERMISSIONS;
-
-        await db.delete(userPermissions).where(eq(userPermissions.userId, id));
-        if (defaults.length > 0) {
-          await db
-            .insert(userPermissions)
-            .values(defaults.map((p) => ({ userId: id, permission: p })))
-            .onConflictDoNothing();
-        }
         invalidatePermissionCache(id);
         await revokeAllUserSessions(id);
+        announceSessionChange(id);
       }
 
       // Re-fetch site assignments and permissions for the response
@@ -1533,9 +1842,9 @@ export function userRoutes(app: FastifyInstance): void {
           .where(eq(userPermissions.userId, id)),
       ]);
 
-      const actor = getAuditActor(request);
+      const auditActor = getAuditActor(request);
       let action: string = 'updated';
-      if (body.roleId !== undefined && before != null && body.roleId !== before.roleId) {
+      if (body.roleId !== undefined && body.roleId !== before.roleId) {
         action = 'role_changed';
       } else if (body.hasAllSiteAccess !== undefined || body.siteIds !== undefined) {
         action = 'site_access_changed';
@@ -1546,8 +1855,8 @@ export function userRoutes(app: FastifyInstance): void {
           entityId: updated.id,
           entityIdSnapshot: updated.id,
           action,
-          ...actor,
-          before: before ?? null,
+          ...auditActor,
+          before,
           after: { ...updated, siteIds: assignments.map((a) => a.siteId) },
         },
         db,
@@ -1579,6 +1888,7 @@ export function userRoutes(app: FastifyInstance): void {
           200: successResponse,
           400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+          409: errorWith('The user signs in with SSO', [ERROR_CODES.USER_SSO_MANAGED]),
         },
       },
     },
@@ -1592,11 +1902,29 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      if (!(await canAdministerUser(request, await getUserManagementActor(request), id))) {
+        await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
+        return;
+      }
+
+      if (await ssoManagedUser(id)) {
+        await reply
+          .status(409)
+          .send({ error: 'The user signs in with SSO', code: 'USER_SSO_MANAGED' });
+        return;
+      }
+
       const passwordHash = await argon2.hash(password);
 
       const [updated] = await db
         .update(users)
-        .set({ passwordHash, mustResetPassword: true, updatedAt: new Date() })
+        .set({
+          passwordHash,
+          mustResetPassword: true,
+          failedLoginCount: 0,
+          loginLockedUntil: null,
+          updatedAt: new Date(),
+        })
         .where(eq(users.id, id))
         .returning({ id: users.id });
 
@@ -1605,7 +1933,10 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      await revokeAllUserSessions(updated.id);
+      // A reset by an admin ends every session and API key of the user, and
+      // tells the user.
+      await endUserSessions(updated.id, { apiKeys: true });
+      sendPasswordChangedNotice(updated.id, request.log);
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -1628,7 +1959,9 @@ export function userRoutes(app: FastifyInstance): void {
   app.post(
     '/users/me/change-password',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
+      // A stolen session must not brute-force the current password.
+      config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
       schema: {
         tags: ['Users'],
         summary: 'Change the current user password',
@@ -1637,7 +1970,11 @@ export function userRoutes(app: FastifyInstance): void {
         body: zodSchema(changePasswordBody),
         response: {
           200: successResponse,
-          400: errorWith('Weak password', [ERROR_CODES.WEAK_PASSWORD]),
+          400: errorWith('Weak password', [
+            ERROR_CODES.WEAK_PASSWORD,
+            ERROR_CODES.INVALID_PASSWORD,
+          ]),
+          403: errorWith('API keys cannot change the password', [ERROR_CODES.SESSION_REQUIRED]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
         },
       },
@@ -1647,7 +1984,12 @@ export function userRoutes(app: FastifyInstance): void {
       const { currentPassword, newPassword } = request.body as z.infer<typeof changePasswordBody>;
 
       const [user] = await db
-        .select({ id: users.id, passwordHash: users.passwordHash })
+        .select({
+          id: users.id,
+          roleId: users.roleId,
+          passwordHash: users.passwordHash,
+          authSource: users.authSource,
+        })
         .from(users)
         .where(eq(users.id, userId));
 
@@ -1656,7 +1998,11 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const valid = await argon2.verify(user.passwordHash, currentPassword);
+      // An SSO account while SSO is enabled has no password to change: it
+      // answers as for a wrong current password.
+      const valid =
+        (await verifyPassword(user.passwordHash, currentPassword, request.log)) &&
+        !(await passwordAuthBlocked(user));
       if (!valid) {
         await reply
           .status(400)
@@ -1676,7 +2022,11 @@ export function userRoutes(app: FastifyInstance): void {
         .set({ passwordHash, mustResetPassword: false, updatedAt: new Date() })
         .where(eq(users.id, userId));
 
-      await revokeAllUserSessions(userId);
+      // End every session (other devices included), keep the API keys (a
+      // voluntary change), and give this browser a new session.
+      const sessionVersion = (await endUserSessions(userId, { apiKeys: false })) ?? 0;
+      await issueOperatorSession(app, request, reply, { ...user, sessionVersion });
+      sendPasswordChangedNotice(userId, request.log);
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -1728,7 +2078,10 @@ export function userRoutes(app: FastifyInstance): void {
       }
 
       const [user] = await db.select().from(users).where(eq(users.id, id));
-      if (user == null) {
+      if (
+        user == null ||
+        !(await canAdministerUser(request, await getUserManagementActor(request), id))
+      ) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
       }
@@ -1738,10 +2091,7 @@ export function userRoutes(app: FastifyInstance): void {
         .set({ isActive: false, updatedAt: new Date() })
         .where(eq(users.id, id));
 
-      invalidateUserActiveCache(id);
-      invalidatePermissionCache(id);
-      invalidateSiteAccessCache(id);
-      await revokeAllUserRefreshTokens(id);
+      await applyUserDeactivation(id, { log: request.log });
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -1777,6 +2127,7 @@ export function userRoutes(app: FastifyInstance): void {
           200: successResponse,
           403: errorWith('Account disabled', [ERROR_CODES.ACCOUNT_DISABLED]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+          409: errorWith('The user signs in with SSO', [ERROR_CODES.USER_SSO_MANAGED]),
         },
       },
     },
@@ -1796,7 +2147,10 @@ export function userRoutes(app: FastifyInstance): void {
         .from(users)
         .where(eq(users.id, id));
 
-      if (user == null) {
+      if (
+        user == null ||
+        !(await canAdministerUser(request, await getUserManagementActor(request), id))
+      ) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
       }
@@ -1805,18 +2159,14 @@ export function userRoutes(app: FastifyInstance): void {
         await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
+      if (await ssoManagedUser(id)) {
+        await reply
+          .status(409)
+          .send({ error: 'The user signs in with SSO', code: 'USER_SSO_MANAGED' });
+        return;
+      }
 
-      // Revoke existing password_reset tokens
-      await db
-        .update(userTokens)
-        .set({ revokedAt: new Date() })
-        .where(
-          and(
-            eq(userTokens.userId, user.id),
-            eq(userTokens.type, 'password_reset'),
-            isNull(userTokens.revokedAt),
-          ),
-        );
+      await revokeUserEmailLinks(user.id);
 
       // Generate new 24-hour token
       const { raw: rawToken, hash: tokenHash } = generateUserToken();
@@ -1847,6 +2197,19 @@ export function userRoutes(app: FastifyInstance): void {
           setPasswordUrl,
         },
         ALL_TEMPLATES_DIRS,
+      );
+
+      await writeAudit(
+        { table: userAuditLog, idColumn: 'user_id' },
+        {
+          entityId: user.id,
+          entityIdSnapshot: user.id,
+          action: 'invite_resent',
+          ...getAuditActor(request),
+          after: { email: user.email },
+        },
+        db,
+        request.log,
       );
 
       return { success: true };
@@ -1904,6 +2267,7 @@ export function userRoutes(app: FastifyInstance): void {
           ]),
           401: errorWith('Unauthorized', [ERROR_CODES.UNAUTHORIZED, ERROR_CODES.MFA_TOKEN_EXPIRED]),
           403: errorWith('Account disabled', [ERROR_CODES.ACCOUNT_DISABLED]),
+          429: errorWith('Too many wrong codes', [ERROR_CODES.MFA_LOCKED]),
         },
       },
       config: {
@@ -1919,7 +2283,8 @@ export function userRoutes(app: FastifyInstance): void {
       let payload: { userId: string; roleId: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -1931,70 +2296,106 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Per-challengeId brute-force protection
-      if (challengeId != null && isMfaChallengeExhausted(challengeId)) {
-        await reply.status(400).send({
-          error: 'Too many failed attempts. Request a new code.',
-          code: 'MFA_CHALLENGE_EXHAUSTED',
-        });
-        return;
-      }
-
       const [user] = await db.select().from(users).where(eq(users.id, payload.userId));
       if (user == null || !user.mfaEnabled || user.mfaMethod == null) {
         await reply.status(400).send({ error: 'MFA not configured', code: 'MFA_NOT_CONFIGURED' });
         return;
       }
       if (!user.isActive) {
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'inactive',
+        });
         await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
         return;
       }
 
+      // Per-account backoff after repeated wrong codes (sign-in-backoff.ts).
+      if (user.mfaLockedUntil != null && isLocked(user.mfaLockedUntil)) {
+        const retryAfterSeconds = secondsUntil(user.mfaLockedUntil);
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: 'locked',
+        });
+        void reply.header('Retry-After', String(retryAfterSeconds));
+        await reply.status(429).send({
+          error: 'Too many wrong codes. Try again later.',
+          code: 'MFA_LOCKED',
+          retryAfterSeconds,
+        });
+        return;
+      }
+
       let verified = false;
+      let exhausted = false;
       if (user.mfaMethod === 'totp') {
         if (user.totpSecretEnc == null) {
           await reply.status(400).send({ error: 'TOTP not set up', code: 'TOTP_NOT_CONFIGURED' });
           return;
         }
         const encKey = apiConfig.SETTINGS_ENCRYPTION_KEY;
+        let step: number | null = null;
         try {
           const secret = decryptString(user.totpSecretEnc, encKey);
-          verified = verifyTotpCode(secret, code);
+          step = matchTotpStep(secret, code);
         } catch (err: unknown) {
           // Stored TOTP secret cannot be decrypted (e.g. SETTINGS_ENCRYPTION_KEY
           // rotated, ciphertext corrupted). Surface as a clean MFA failure
           // rather than a 500, but log the underlying error for ops.
           request.log.warn({ err, userId: payload.userId }, 'TOTP secret decrypt failed');
-          verified = false;
         }
+        // A code is accepted once (replay guard, sign-in-backoff.ts).
+        if (step != null) verified = await acceptTotpStep(user.id, step);
       } else if (challengeId != null) {
-        verified = await verifyMfaChallenge(client, challengeId, code, { userId: user.id });
+        // Tries are counted on the challenge row (MFA_CHALLENGE_MAX_ATTEMPTS),
+        // shared by every API process, and the challenge is single use.
+        const result = await verifyMfaChallenge(client, challengeId, code, { userId: user.id });
+        verified = result === 'verified';
+        exhausted = result === 'exhausted';
       }
 
       if (!verified) {
-        if (challengeId != null) {
-          recordMfaChallengeAttempt(challengeId);
+        await recordAuthAudit(request, {
+          kind: 'user',
+          accountId: user.id,
+          action: 'login_failed',
+          method: 'mfa',
+          reason: exhausted ? 'mfa_challenge_exhausted' : 'mfa_code_invalid',
+        });
+        await recordSignInFailure(request, user.id, 'mfa');
+        if (exhausted) {
+          await reply.status(400).send({
+            error: 'Too many failed attempts. Request a new code.',
+            code: 'MFA_CHALLENGE_EXHAUSTED',
+          });
+          return;
         }
         await reply
           .status(400)
           .send({ error: 'Invalid verification code', code: 'MFA_CODE_INVALID' });
         return;
       }
-
-      // Clear attempt counter on success
-      if (challengeId != null) {
-        clearMfaChallengeAttempts(challengeId);
-      }
+      await clearSignInFailures(user.id, 'mfa');
 
       const [role] = await db
         .select({ id: roles.id, name: roles.name })
         .from(roles)
         .where(eq(roles.id, user.roleId));
 
-      const token = app.jwt.sign({ userId: user.id, roleId: user.roleId }, { expiresIn: '1h' });
-      const refreshResult = await createRefreshToken({ userId: user.id });
-      setAuthCookies('csms', reply, token, refreshResult.rawToken, isSecureRequest(request));
+      const token = await issueOperatorSession(app, request, reply, user);
       await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+      await recordAuthAudit(request, {
+        kind: 'user',
+        accountId: user.id,
+        action: 'login_succeeded',
+        method: 'mfa',
+      });
 
       return {
         token,
@@ -2046,6 +2447,8 @@ export function userRoutes(app: FastifyInstance): void {
             ERROR_CODES.MFA_TOTP_NO_RESEND,
           ]),
           401: errorWith('Unauthorized', [ERROR_CODES.UNAUTHORIZED, ERROR_CODES.MFA_TOKEN_EXPIRED]),
+          403: errorWith('Account disabled', [ERROR_CODES.ACCOUNT_DISABLED]),
+          429: errorWith('Too many codes sent', [ERROR_CODES.MFA_RESEND_LIMITED]),
         },
       },
       config: {
@@ -2061,7 +2464,8 @@ export function userRoutes(app: FastifyInstance): void {
       let payload: { userId: string; roleId: string; mfaPending?: boolean };
       try {
         payload = app.jwt.verify(mfaToken);
-      } catch {
+      } catch (err) {
+        request.log.debug({ err }, 'MFA token did not verify, refusing it');
         await reply
           .status(401)
           .send({ error: 'Invalid or expired MFA token', code: 'MFA_TOKEN_EXPIRED' });
@@ -2079,10 +2483,28 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      if (!user.isActive) {
+        await reply.status(403).send({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
+        return;
+      }
+
       if (user.mfaMethod === 'totp') {
         await reply
           .status(400)
           .send({ error: 'Cannot resend TOTP codes', code: 'MFA_TOTP_NO_RESEND' });
+        return;
+      }
+
+      // A cap on the codes sent to one user (sign-in-backoff.ts), counted
+      // from the challenge rows so every process sees the same count.
+      const retryAfterSeconds = await mfaResendRetryAfter(user.id);
+      if (retryAfterSeconds != null) {
+        void reply.header('Retry-After', String(retryAfterSeconds));
+        await reply.status(429).send({
+          error: 'Too many codes sent. Try again later.',
+          code: 'MFA_RESEND_LIMITED',
+          retryAfterSeconds,
+        });
         return;
       }
 
@@ -2094,17 +2516,89 @@ export function userRoutes(app: FastifyInstance): void {
       await dispatchSystemNotification(
         client,
         'mfa.VerificationCode',
-        {
-          email: user.email,
-          phone: user.phone ?? undefined,
-          firstName: user.firstName ?? undefined,
-          language: user.language,
-        },
+        mfaCodeRecipient(user.mfaMethod, user),
         { code: challenge.code },
         TEMPLATES_DIR,
       );
 
       return { challengeId: challenge.challengeId };
+    },
+  );
+
+  // Admin MFA reset: for a user who lost the authenticator or phone. The
+  // user signs in with the password alone and can set MFA up again.
+  app.post(
+    '/users/:id/mfa/reset',
+    {
+      onRequest: [authorize('users:write')],
+      schema: {
+        tags: ['Users'],
+        summary: 'Turn off the MFA of a user',
+        description:
+          'Clears the MFA method and TOTP secret of the user, ends every session of the user (API keys stay) and writes an mfa_reset audit row. For a user who lost the second factor. Requires users:write and every permission of the target user. Never available to the AI assistant or MCP.',
+        operationId: 'resetUserMfa',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(userParams),
+        response: {
+          200: successResponse,
+          403: errorWith('Self edit forbidden', [ERROR_CODES.SELF_EDIT_FORBIDDEN]),
+          404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof userParams>;
+      const { userId: actorUserId } = request.user as JwtPayload;
+
+      // An operator changes its own MFA on its profile, with its password.
+      if (id === actorUserId) {
+        await reply
+          .status(403)
+          .send({ error: 'Use your profile to change your MFA', code: 'SELF_EDIT_FORBIDDEN' });
+        return;
+      }
+
+      const [before] = await db
+        .select({ id: users.id, mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod })
+        .from(users)
+        .where(eq(users.id, id));
+      if (
+        before == null ||
+        !(await canAdministerUser(request, await getUserManagementActor(request), id))
+      ) {
+        await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
+        return;
+      }
+
+      await db
+        .update(users)
+        .set({
+          mfaEnabled: false,
+          mfaMethod: null,
+          totpSecretEnc: null,
+          totpLastStep: null,
+          mfaFailedCount: 0,
+          mfaLockedUntil: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, id));
+      await endUserSessions(id, { apiKeys: false });
+
+      await writeAudit(
+        { table: userAuditLog, idColumn: 'user_id' },
+        {
+          entityId: id,
+          entityIdSnapshot: id,
+          action: 'mfa_reset',
+          ...getAuditActor(request),
+          before: { mfaEnabled: before.mfaEnabled, mfaMethod: before.mfaMethod },
+          after: { mfaEnabled: false, mfaMethod: null },
+        },
+        db,
+        request.log,
+      );
+
+      return { success: true };
     },
   );
 
@@ -2123,7 +2617,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.get(
     '/users/me/mfa',
     {
-      onRequest: [authorize('users:read')],
+      onRequest: [selfService({ allowApiKey: true })],
       schema: {
         tags: ['Users'],
         summary: 'Get current MFA status',
@@ -2135,15 +2629,22 @@ export function userRoutes(app: FastifyInstance): void {
     async (request) => {
       const { userId } = request.user as { userId: string; roleId: string };
       const [user] = await db
-        .select({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod })
+        .select({
+          mfaEnabled: users.mfaEnabled,
+          mfaMethod: users.mfaMethod,
+          email: users.email,
+          phone: users.phone,
+        })
         .from(users)
         .where(eq(users.id, userId));
 
       const mfaConfig = await getMfaConfig();
+      const contact = { email: user?.email ?? null, phone: user?.phone ?? null };
       const availableMethods: string[] = [];
       if (mfaConfig.emailEnabled) availableMethods.push('email');
       if (mfaConfig.totpEnabled) availableMethods.push('totp');
-      if (mfaConfig.smsEnabled) availableMethods.push('sms');
+      // SMS codes need a phone number on the profile.
+      if (mfaConfig.smsEnabled && hasMfaContact('sms', contact)) availableMethods.push('sms');
 
       return {
         mfaEnabled: user?.mfaEnabled ?? false,
@@ -2174,7 +2675,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.post(
     '/users/me/mfa/setup',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Start MFA setup',
@@ -2185,7 +2686,10 @@ export function userRoutes(app: FastifyInstance): void {
         body: zodSchema(mfaSetupBody),
         response: {
           200: itemResponse(mfaSetupResponse),
-          400: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+          400: errorWith('User not found or no phone for SMS codes', [
+            ERROR_CODES.USER_NOT_FOUND,
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
           403: errorWith('MFA method disabled', [ERROR_CODES.MFA_METHOD_DISABLED]),
           409: errorResponse,
         },
@@ -2234,6 +2738,15 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // A code sent to nothing would leave the user unable to confirm.
+      if (!hasMfaContact(method, user)) {
+        await reply.status(400).send({
+          error: 'Add a phone number to your profile before you turn on SMS codes',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+
       if (method === 'totp') {
         const secret = generateTotpSecret();
         const uri = generateTotpUri(secret, user.email, 'EVtivity CSMS');
@@ -2256,12 +2769,7 @@ export function userRoutes(app: FastifyInstance): void {
       await dispatchSystemNotification(
         client,
         'mfa.VerificationCode',
-        {
-          email: user.email,
-          phone: user.phone ?? undefined,
-          firstName: user.firstName ?? undefined,
-          language: user.language,
-        },
+        mfaCodeRecipient(method, user),
         { code: challenge.code },
         TEMPLATES_DIR,
       );
@@ -2279,7 +2787,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.post(
     '/users/me/mfa/confirm',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Confirm MFA setup with verification code',
@@ -2295,6 +2803,7 @@ export function userRoutes(app: FastifyInstance): void {
             ERROR_CODES.TOTP_NOT_CONFIGURED,
           ]),
           403: errorResponse,
+          409: errorWith('MFA is already enabled', [ERROR_CODES.MFA_ALREADY_ENABLED]),
         },
       },
     },
@@ -2314,12 +2823,22 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      const [user] = await db
+        .select({ totpSecretEnc: users.totpSecretEnc, mfaEnabled: users.mfaEnabled })
+        .from(users)
+        .where(eq(users.id, userId));
+      // Switching the method of an active MFA goes through the password-gated
+      // disable and a new setup, like the setup step itself.
+      if (user?.mfaEnabled === true) {
+        await reply
+          .status(409)
+          .send({ error: 'MFA is already enabled', code: 'MFA_ALREADY_ENABLED' });
+        return;
+      }
+
       let verified = false;
+      let totpStep: number | null = null;
       if (method === 'totp') {
-        const [user] = await db
-          .select({ totpSecretEnc: users.totpSecretEnc })
-          .from(users)
-          .where(eq(users.id, userId));
         if (user?.totpSecretEnc == null) {
           await reply.status(400).send({ error: 'TOTP not set up', code: 'TOTP_NOT_CONFIGURED' });
           return;
@@ -2327,7 +2846,8 @@ export function userRoutes(app: FastifyInstance): void {
         const encKey = apiConfig.SETTINGS_ENCRYPTION_KEY;
         try {
           const secret = decryptString(user.totpSecretEnc, encKey);
-          verified = verifyTotpCode(secret, code);
+          totpStep = matchTotpStep(secret, code);
+          verified = totpStep != null;
         } catch (err: unknown) {
           // Stored TOTP secret cannot be decrypted (e.g. SETTINGS_ENCRYPTION_KEY
           // rotated, ciphertext corrupted). Surface as a clean MFA failure
@@ -2336,7 +2856,7 @@ export function userRoutes(app: FastifyInstance): void {
           verified = false;
         }
       } else if (challengeId != null) {
-        verified = await verifyMfaChallenge(client, challengeId, code, { userId });
+        verified = (await verifyMfaChallenge(client, challengeId, code, { userId })) === 'verified';
       }
 
       if (!verified) {
@@ -2346,12 +2866,27 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // The confirming TOTP code cannot be replayed at the next sign-in.
       await db
         .update(users)
-        .set({ mfaEnabled: true, mfaMethod: method, updatedAt: new Date() })
+        .set({
+          mfaEnabled: true,
+          mfaMethod: method,
+          totpLastStep: totpStep,
+          mfaFailedCount: 0,
+          mfaLockedUntil: null,
+          updatedAt: new Date(),
+        })
         .where(eq(users.id, userId));
 
-      await revokeAllUserSessions(userId);
+      // End every other session (session version and refresh tokens) and
+      // give this browser a new one; API keys stay.
+      const sessionVersion = (await endUserSessions(userId, { apiKeys: false })) ?? 0;
+      await issueOperatorSession(app, request, reply, {
+        id: userId,
+        roleId: (request.user as JwtPayload).roleId,
+        sessionVersion,
+      });
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -2378,7 +2913,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.delete(
     '/users/me/mfa',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       // Throttle so a stolen session cookie can't be used to brute-force the
       // password (each request hits argon2.verify with the supplied value).
       config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
@@ -2414,7 +2949,7 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const valid = await argon2.verify(user.passwordHash, password);
+      const valid = await verifyPassword(user.passwordHash, password, request.log);
       if (!valid) {
         await reply.status(400).send({ error: 'Invalid password', code: 'INVALID_PASSWORD' });
         return;
@@ -2426,11 +2961,18 @@ export function userRoutes(app: FastifyInstance): void {
           mfaEnabled: false,
           mfaMethod: null,
           totpSecretEnc: null,
+          totpLastStep: null,
           updatedAt: new Date(),
         })
         .where(eq(users.id, userId));
 
-      await revokeAllUserSessions(userId);
+      // End every other session and give this browser a new one; API keys stay.
+      const sessionVersion = (await endUserSessions(userId, { apiKeys: false })) ?? 0;
+      await issueOperatorSession(app, request, reply, {
+        id: userId,
+        roleId: (request.user as JwtPayload).roleId,
+        sessionVersion,
+      });
 
       const actor = getAuditActor(request);
       await writeAudit(
@@ -2456,15 +2998,19 @@ export function userRoutes(app: FastifyInstance): void {
   const aiConfigResponse = z
     .object({
       configured: z.boolean().describe('Whether the user has saved a personal AI assistant config'),
-      provider: z.string().nullable().describe('Selected AI provider (anthropic, openai, gemini)'),
+      provider: z
+        .string()
+        .nullable()
+        .describe('Selected AI provider (anthropic, openai, gemini, deepseek)'),
       apiKey: z
         .string()
         .nullable()
         .describe('Provider API key (decrypted from storage; null when unset)'),
       model: z.string().nullable().describe('Model override applied for this user'),
-      temperature: z.number().nullable().describe('Generation temperature (0-2)'),
-      topP: z.number().nullable().describe('Nucleus sampling threshold (0-1)'),
-      topK: z.number().nullable().describe('Top-K token selection limit'),
+      effort: z
+        .enum(AI_EFFORTS)
+        .nullable()
+        .describe('Reasoning effort (low, medium, high); null uses the default (medium)'),
       systemPrompt: z
         .string()
         .nullable()
@@ -2477,14 +3023,26 @@ export function userRoutes(app: FastifyInstance): void {
   const operatorNotificationPrefsResponse = z
     .object({
       smsEnabled: z.boolean().describe('Whether the operator opted in to SMS notifications'),
+      aiDigestEmail: z
+        .boolean()
+        .describe(
+          'Whether the operator gets the daily email of AI insight actions waiting for a decision (default off)',
+        ),
     })
     .passthrough();
-  const operatorNotificationPrefsBody = z.object({ smsEnabled: z.boolean() });
+  // Either field alone: the one not sent keeps its stored value.
+  const operatorNotificationPrefsBody = z.object({
+    smsEnabled: z.boolean().optional().describe('Opt in to SMS notifications'),
+    aiDigestEmail: z
+      .boolean()
+      .optional()
+      .describe('Opt in to the daily email of AI insight actions waiting for a decision'),
+  });
 
   app.get(
     '/users/me/notification-preferences',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService({ allowApiKey: true })],
       schema: {
         tags: ['Users'],
         summary: 'Get operator notification preferences',
@@ -2499,41 +3057,92 @@ export function userRoutes(app: FastifyInstance): void {
         .select()
         .from(userNotificationPreferences)
         .where(eq(userNotificationPreferences.userId, userId));
-      return { smsEnabled: prefs?.smsEnabled ?? true };
+      return {
+        smsEnabled: prefs?.smsEnabled ?? true,
+        aiDigestEmail: prefs?.aiDigestEmail ?? false,
+      };
     },
   );
 
   app.put(
     '/users/me/notification-preferences',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Update operator notification preferences',
         operationId: 'updateUserNotificationPreferences',
         security: [{ bearerAuth: [] }],
         body: zodSchema(operatorNotificationPrefsBody),
-        response: { 200: itemResponse(operatorNotificationPrefsResponse) },
+        response: {
+          200: itemResponse(operatorNotificationPrefsResponse),
+          400: errorWith('No preference sent', [ERROR_CODES.VALIDATION_ERROR]),
+        },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { userId } = request.user as JwtPayload;
       const body = request.body as z.infer<typeof operatorNotificationPrefsBody>;
-      await db
+      if (body.smsEnabled === undefined && body.aiDigestEmail === undefined) {
+        return reply.status(400).send({
+          error: 'Send smsEnabled, aiDigestEmail or both',
+          code: ERROR_CODES.VALIDATION_ERROR,
+        });
+      }
+      const changes = {
+        ...(body.smsEnabled !== undefined ? { smsEnabled: body.smsEnabled } : {}),
+        ...(body.aiDigestEmail !== undefined ? { aiDigestEmail: body.aiDigestEmail } : {}),
+      };
+      const [previous] = await db
+        .select({
+          smsEnabled: userNotificationPreferences.smsEnabled,
+          aiDigestEmail: userNotificationPreferences.aiDigestEmail,
+        })
+        .from(userNotificationPreferences)
+        .where(eq(userNotificationPreferences.userId, userId));
+      const [prefs] = await db
         .insert(userNotificationPreferences)
-        .values({ userId, smsEnabled: body.smsEnabled })
+        .values({ userId, ...changes })
         .onConflictDoUpdate({
           target: [userNotificationPreferences.userId],
-          set: { smsEnabled: body.smsEnabled, updatedAt: new Date() },
-        });
-      return { smsEnabled: body.smsEnabled };
+          set: { ...changes, updatedAt: new Date() },
+        })
+        .returning();
+      const result = {
+        smsEnabled: prefs?.smsEnabled ?? true,
+        aiDigestEmail: prefs?.aiDigestEmail ?? false,
+      };
+      const diff = changedFields(
+        {
+          smsEnabled: previous?.smsEnabled ?? true,
+          aiDigestEmail: previous?.aiDigestEmail ?? false,
+        },
+        result,
+      );
+      if (Object.keys(diff.after).length > 0) {
+        await writeAudit(
+          { table: userAuditLog, idColumn: 'user_id' },
+          {
+            entityId: userId,
+            entityIdSnapshot: userId,
+            action: 'updated',
+            ...getAuditActor(request),
+            before: diff.before,
+            after: diff.after,
+            notes: 'notification preferences',
+          },
+          db,
+          request.log,
+        );
+      }
+      return result;
     },
   );
 
   app.get(
     '/users/me/chatbot-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Get personal AI configuration',
@@ -2550,9 +3159,7 @@ export function userRoutes(app: FastifyInstance): void {
           provider: chatbotAiConfigs.provider,
           apiKeyEnc: chatbotAiConfigs.apiKeyEnc,
           model: chatbotAiConfigs.model,
-          temperature: chatbotAiConfigs.temperature,
-          topP: chatbotAiConfigs.topP,
-          topK: chatbotAiConfigs.topK,
+          effort: chatbotAiConfigs.effort,
           systemPrompt: chatbotAiConfigs.systemPrompt,
         })
         .from(chatbotAiConfigs)
@@ -2567,9 +3174,7 @@ export function userRoutes(app: FastifyInstance): void {
           provider: null,
           apiKey: null,
           model: null,
-          temperature: null,
-          topP: null,
-          topK: null,
+          effort: null,
           systemPrompt: null,
         };
       }
@@ -2585,28 +3190,27 @@ export function userRoutes(app: FastifyInstance): void {
         provider: row.provider,
         apiKey,
         model: row.model ?? null,
-        temperature: row.temperature != null ? Number(row.temperature) : null,
-        topP: row.topP != null ? Number(row.topP) : null,
-        topK: row.topK ?? null,
+        effort: isAiEffort(row.effort) ? row.effort : null,
         systemPrompt: row.systemPrompt ?? null,
       };
     },
   );
 
   const aiConfigBody = z.object({
-    provider: z.enum(['anthropic', 'openai', 'gemini']).describe('AI provider'),
+    provider: z.enum(AI_PROVIDER_IDS).describe('AI provider'),
     apiKey: z.string().min(1).describe('Provider API key'),
     model: z.string().optional().describe('Model override (leave empty for provider default)'),
-    temperature: z.number().min(0).max(2).optional().describe('Sampling temperature (0-2)'),
-    topP: z.number().min(0).max(1).optional().describe('Top-p sampling (0-1)'),
-    topK: z.number().int().min(1).optional().describe('Top-k sampling'),
+    effort: z
+      .enum(AI_EFFORTS)
+      .optional()
+      .describe('Reasoning effort (low, medium, high); omit for the default (medium)'),
     systemPrompt: z.string().max(8000).optional().describe('Custom system prompt (max 8000 chars)'),
   });
 
   app.put(
     '/users/me/chatbot-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Create or update personal AI configuration',
@@ -2618,14 +3222,16 @@ export function userRoutes(app: FastifyInstance): void {
     },
     async (request) => {
       const { userId } = request.user as { userId: string; roleId: string };
-      const { provider, apiKey, model, temperature, topP, topK, systemPrompt } =
-        request.body as z.infer<typeof aiConfigBody>;
+      const { provider, apiKey, model, effort, systemPrompt } = request.body as z.infer<
+        typeof aiConfigBody
+      >;
 
       const encKey = apiConfig.SETTINGS_ENCRYPTION_KEY;
       if (encKey === '') {
         throw new Error('SETTINGS_ENCRYPTION_KEY is required to store AI API keys');
       }
       const apiKeyEnc = encryptString(apiKey, encKey);
+      const previous = await readAiConfigState(userId, 'chatbot');
 
       await db
         .insert(chatbotAiConfigs)
@@ -2634,10 +3240,8 @@ export function userRoutes(app: FastifyInstance): void {
           provider,
           apiKeyEnc,
           model: model ?? null,
-          temperature: temperature != null ? String(temperature) : null,
-          topP: topP != null ? String(topP) : null,
-          topK: topK ?? null,
-          systemPrompt: systemPrompt ?? null,
+          effort: effort ?? null,
+          systemPrompt: personalSystemPrompt('chatbot', systemPrompt),
           updatedAt: new Date(),
         })
         .onConflictDoUpdate({
@@ -2646,14 +3250,21 @@ export function userRoutes(app: FastifyInstance): void {
             provider,
             apiKeyEnc,
             model: model ?? null,
-            temperature: temperature != null ? String(temperature) : null,
-            topP: topP != null ? String(topP) : null,
-            topK: topK ?? null,
-            systemPrompt: systemPrompt ?? null,
+            effort: effort ?? null,
+            systemPrompt: personalSystemPrompt('chatbot', systemPrompt),
             updatedAt: new Date(),
           },
         });
 
+      await writeAiConfigAudit(request, userId, 'chatbot', previous, {
+        fields: {
+          provider,
+          model: model ?? null,
+          effort: effort ?? null,
+          systemPrompt: personalSystemPrompt('chatbot', systemPrompt),
+        },
+        keyReplaced: previous != null && aiKeyReplaced(previous.apiKeyEnc, apiKey, encKey),
+      });
       return { success: true };
     },
   );
@@ -2661,7 +3272,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.delete(
     '/users/me/chatbot-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Delete personal AI configuration',
@@ -2685,6 +3296,7 @@ export function userRoutes(app: FastifyInstance): void {
       if (row == null) {
         return { success: true };
       }
+      const previous = await readAiConfigState(userId, 'chatbot');
 
       if (row.supportAiApiKeyEnc == null || row.supportAiApiKeyEnc === '') {
         await db.delete(chatbotAiConfigs).where(eq(chatbotAiConfigs.userId, userId));
@@ -2699,15 +3311,14 @@ export function userRoutes(app: FastifyInstance): void {
             provider: '',
             apiKeyEnc: '',
             model: null,
-            temperature: null,
-            topP: null,
-            topK: null,
+            effort: null,
             systemPrompt: null,
             updatedAt: new Date(),
           })
           .where(eq(chatbotAiConfigs.userId, userId));
       }
 
+      await writeAiConfigAudit(request, userId, 'chatbot', previous, null);
       return { success: true };
     },
   );
@@ -2723,9 +3334,10 @@ export function userRoutes(app: FastifyInstance): void {
         .nullable()
         .describe('Provider API key (decrypted from storage; null when unset)'),
       model: z.string().nullable().describe('Model override applied for this user'),
-      temperature: z.number().nullable().describe('Generation temperature (0-2)'),
-      topP: z.number().nullable().describe('Nucleus sampling threshold (0-1)'),
-      topK: z.number().nullable().describe('Top-K token selection limit'),
+      effort: z
+        .enum(AI_EFFORTS)
+        .nullable()
+        .describe('Reasoning effort (low, medium, high); null uses the default (medium)'),
       systemPrompt: z
         .string()
         .nullable()
@@ -2740,7 +3352,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.get(
     '/users/me/support-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Get personal support AI configuration',
@@ -2757,9 +3369,7 @@ export function userRoutes(app: FastifyInstance): void {
           supportAiProvider: chatbotAiConfigs.supportAiProvider,
           supportAiApiKeyEnc: chatbotAiConfigs.supportAiApiKeyEnc,
           supportAiModel: chatbotAiConfigs.supportAiModel,
-          supportAiTemperature: chatbotAiConfigs.supportAiTemperature,
-          supportAiTopP: chatbotAiConfigs.supportAiTopP,
-          supportAiTopK: chatbotAiConfigs.supportAiTopK,
+          supportAiEffort: chatbotAiConfigs.supportAiEffort,
           supportAiSystemPrompt: chatbotAiConfigs.supportAiSystemPrompt,
           supportAiTone: chatbotAiConfigs.supportAiTone,
         })
@@ -2772,9 +3382,7 @@ export function userRoutes(app: FastifyInstance): void {
           provider: null,
           apiKey: null,
           model: null,
-          temperature: null,
-          topP: null,
-          topK: null,
+          effort: null,
           systemPrompt: null,
           tone: null,
         };
@@ -2791,9 +3399,7 @@ export function userRoutes(app: FastifyInstance): void {
         provider: row.supportAiProvider,
         apiKey,
         model: row.supportAiModel ?? null,
-        temperature: row.supportAiTemperature != null ? Number(row.supportAiTemperature) : null,
-        topP: row.supportAiTopP != null ? Number(row.supportAiTopP) : null,
-        topK: row.supportAiTopK ?? null,
+        effort: isAiEffort(row.supportAiEffort) ? row.supportAiEffort : null,
         systemPrompt: row.supportAiSystemPrompt ?? null,
         tone: row.supportAiTone ?? null,
       };
@@ -2801,14 +3407,13 @@ export function userRoutes(app: FastifyInstance): void {
   );
 
   const supportAiConfigBody = z.object({
-    provider: z
-      .enum(['anthropic', 'openai', 'gemini'])
-      .describe('AI provider for support case assistance'),
+    provider: z.enum(AI_PROVIDER_IDS).describe('AI provider for support case assistance'),
     apiKey: z.string().min(1).describe('Provider API key'),
     model: z.string().optional().describe('Model override (leave empty for provider default)'),
-    temperature: z.number().min(0).max(2).optional().describe('Sampling temperature (0-2)'),
-    topP: z.number().min(0).max(1).optional().describe('Top-p sampling (0-1)'),
-    topK: z.number().int().min(1).optional().describe('Top-k sampling'),
+    effort: z
+      .enum(AI_EFFORTS)
+      .optional()
+      .describe('Reasoning effort (low, medium, high); omit for the default (medium)'),
     systemPrompt: z
       .string()
       .max(8000)
@@ -2823,7 +3428,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.put(
     '/users/me/support-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Create or update personal support AI configuration',
@@ -2835,8 +3440,9 @@ export function userRoutes(app: FastifyInstance): void {
     },
     async (request) => {
       const { userId } = request.user as { userId: string; roleId: string };
-      const { provider, apiKey, model, temperature, topP, topK, systemPrompt, tone } =
-        request.body as z.infer<typeof supportAiConfigBody>;
+      const { provider, apiKey, model, effort, systemPrompt, tone } = request.body as z.infer<
+        typeof supportAiConfigBody
+      >;
 
       const encKey = apiConfig.SETTINGS_ENCRYPTION_KEY;
       if (encKey === '') {
@@ -2848,15 +3454,14 @@ export function userRoutes(app: FastifyInstance): void {
         supportAiProvider: provider,
         supportAiApiKeyEnc,
         supportAiModel: model ?? null,
-        supportAiTemperature: temperature != null ? String(temperature) : null,
-        supportAiTopP: topP != null ? String(topP) : null,
-        supportAiTopK: topK ?? null,
-        supportAiSystemPrompt: systemPrompt ?? null,
+        supportAiEffort: effort ?? null,
+        supportAiSystemPrompt: personalSystemPrompt('support', systemPrompt),
         supportAiTone: tone ?? null,
         updatedAt: new Date(),
       };
 
       // Check if a row exists for this user
+      const previous = await readAiConfigState(userId, 'support');
       const [existing] = await db
         .select({ id: chatbotAiConfigs.id })
         .from(chatbotAiConfigs)
@@ -2878,6 +3483,16 @@ export function userRoutes(app: FastifyInstance): void {
         });
       }
 
+      await writeAiConfigAudit(request, userId, 'support', previous, {
+        fields: {
+          provider,
+          model: model ?? null,
+          effort: effort ?? null,
+          systemPrompt: personalSystemPrompt('support', systemPrompt),
+          tone: tone ?? null,
+        },
+        keyReplaced: previous != null && aiKeyReplaced(previous.apiKeyEnc, apiKey, encKey),
+      });
       return { success: true };
     },
   );
@@ -2885,7 +3500,7 @@ export function userRoutes(app: FastifyInstance): void {
   app.delete(
     '/users/me/support-ai-config',
     {
-      onRequest: [app.authenticate],
+      onRequest: [selfService()],
       schema: {
         tags: ['Users'],
         summary: 'Delete personal support AI configuration',
@@ -2909,6 +3524,7 @@ export function userRoutes(app: FastifyInstance): void {
       if (row == null) {
         return { success: true };
       }
+      const previous = await readAiConfigState(userId, 'support');
 
       // If general AI config is also empty, delete the whole row
       if (row.apiKeyEnc === '') {
@@ -2921,9 +3537,7 @@ export function userRoutes(app: FastifyInstance): void {
             supportAiProvider: null,
             supportAiApiKeyEnc: null,
             supportAiModel: null,
-            supportAiTemperature: null,
-            supportAiTopP: null,
-            supportAiTopK: null,
+            supportAiEffort: null,
             supportAiSystemPrompt: null,
             supportAiTone: null,
             updatedAt: new Date(),
@@ -2931,6 +3545,7 @@ export function userRoutes(app: FastifyInstance): void {
           .where(eq(chatbotAiConfigs.userId, userId));
       }
 
+      await writeAiConfigAudit(request, userId, 'support', previous, null);
       return { success: true };
     },
   );
@@ -2939,8 +3554,16 @@ export function userRoutes(app: FastifyInstance): void {
 
   const permissionGroupItem = z
     .object({
-      label: z.string().describe('Display label for the permission group'),
-      permissions: z.array(z.string()).describe('Permission strings that belong to this group'),
+      resource: z
+        .string()
+        .describe('Resource of the group, the part before the colon, e.g. stations'),
+      kind: z
+        .enum(['page', 'settings'])
+        .describe('page for a CSMS page, settings for a Settings tab'),
+      labelKey: z.string().describe('CSMS locale key of the group label'),
+      permissions: z
+        .array(z.string())
+        .describe('The read and write permission strings of the resource'),
     })
     .passthrough();
 
@@ -2964,14 +3587,14 @@ export function userRoutes(app: FastifyInstance): void {
       },
     },
     () => {
-      return [...PERMISSION_GROUPS];
+      return permissionCatalog.groups();
     },
   );
 
   app.get(
     '/users/me/permissions',
     {
-      onRequest: [authorize('users:read')],
+      onRequest: [selfService({ allowApiKey: true })],
       schema: {
         tags: ['Users'],
         summary: 'Get current user permissions',
@@ -3013,7 +3636,7 @@ export function userRoutes(app: FastifyInstance): void {
 
       const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, id));
 
-      if (user == null) {
+      if (user == null || !(await canManageUser(await getUserManagementActor(request), id))) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
       }
@@ -3041,7 +3664,11 @@ export function userRoutes(app: FastifyInstance): void {
         response: {
           200: arrayResponse(z.string()),
           400: errorWith('Invalid permissions', [ERROR_CODES.INVALID_PERMISSIONS]),
-          403: errorWith('Forbidden', [ERROR_CODES.FORBIDDEN]),
+          403: errorWith('Forbidden', [
+            ERROR_CODES.FORBIDDEN,
+            ERROR_CODES.SELF_EDIT_FORBIDDEN,
+            ERROR_CODES.PERMISSIONS_EXCEED_OWN,
+          ]),
           404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
         },
       },
@@ -3059,16 +3686,18 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
+      const actor = await getUserManagementActor(request);
       const [user] = await db.select({ id: users.id }).from(users).where(eq(users.id, id));
 
-      if (user == null) {
+      // The target's current permissions must be within the actor's own too:
+      // no one rewrites (or strips) the permissions of a more privileged user.
+      if (user == null || !(await canAdministerUser(request, actor, id))) {
         await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
         return;
       }
 
       // Validate all permissions are in the catalog
-      const catalogSet = new Set<string>(PERMISSIONS);
-      const invalid = permissions.filter((p) => !catalogSet.has(p));
+      const invalid = permissions.filter((p) => !permissionCatalog.isKnown(p));
       if (invalid.length > 0) {
         await reply.status(400).send({
           error: `Invalid permissions: ${invalid.join(', ')}`,
@@ -3077,30 +3706,44 @@ export function userRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Capture before-permissions for the audit row
-      const beforePermRows = await db
-        .select({ permission: userPermissions.permission })
-        .from(userPermissions)
-        .where(eq(userPermissions.userId, id));
-
-      // Replace all permissions
-      await db.delete(userPermissions).where(eq(userPermissions.userId, id));
-      if (permissions.length > 0) {
-        await db
-          .insert(userPermissions)
-          .values(permissions.map((p) => ({ userId: id, permission: p })))
-          .onConflictDoNothing();
+      // An operator grants only permissions it holds.
+      if (!(await canGrantPermissions(request, permissions))) {
+        await reply.status(403).send({
+          error: 'Permissions must be a subset of your own permissions',
+          code: 'PERMISSIONS_EXCEED_OWN',
+        });
+        return;
       }
-      invalidatePermissionCache(id);
 
-      const actor = getAuditActor(request);
+      // One transaction: the before snapshot, the replacement and the
+      // session version (access tokens of the old permissions end) commit
+      // together or not at all.
+      const beforePermRows = await db.transaction(async (tx) => {
+        const before = await tx
+          .select({ permission: userPermissions.permission })
+          .from(userPermissions)
+          .where(eq(userPermissions.userId, id));
+        await tx.delete(userPermissions).where(eq(userPermissions.userId, id));
+        if (permissions.length > 0) {
+          await tx
+            .insert(userPermissions)
+            .values(permissions.map((p) => ({ userId: id, permission: p })))
+            .onConflictDoNothing();
+        }
+        await bumpSessionVersion(id, tx);
+        return before;
+      });
+      invalidatePermissionCache(id);
+      announceSessionChange(id);
+
+      const auditActor = getAuditActor(request);
       await writeAudit(
         { table: userAuditLog, idColumn: 'user_id' },
         {
           entityId: id,
           entityIdSnapshot: id,
           action: 'permissions_changed',
-          ...actor,
+          ...auditActor,
           before: { permissions: beforePermRows.map((r) => r.permission) },
           after: { permissions },
         },

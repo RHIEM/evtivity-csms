@@ -15,8 +15,9 @@ async function main(): Promise<void> {
   let logger: pino.Logger;
   try {
     logger = pino({ transport: { target: 'pino-pretty' } });
-  } catch {
+  } catch (err) {
     logger = pino({ level: 'info' });
+    logger.warn({ err }, 'pino-pretty is not available, logging plain JSON');
   }
   logger.info({ version, module, concurrency }, 'Starting CS conformance test runner');
 
@@ -35,12 +36,14 @@ async function main(): Promise<void> {
         failed: 'FAIL',
         skipped: 'SKIP',
         error: 'ERR ',
+        notApplicable: 'N/A ',
       };
       const colors: Record<string, string> = {
         passed: '\x1b[32m',
         failed: '\x1b[31m',
         skipped: '\x1b[33m',
         error: '\x1b[31m',
+        notApplicable: '\x1b[90m',
       };
       const icon = icons[result.result.status] ?? 'FAIL';
       const color = colors[result.result.status] ?? '\x1b[31m';
@@ -50,6 +53,9 @@ async function main(): Promise<void> {
       );
       if (result.result.error != null) {
         console.log(`       Error: ${result.result.error}`);
+      }
+      if (result.result.notApplicable != null) {
+        console.log(`       Reason: ${result.result.notApplicable.reason}`);
       }
       for (const step of result.result.steps) {
         if (step.status === 'failed') {
@@ -67,6 +73,7 @@ async function main(): Promise<void> {
   console.log(`Failed: ${String(summary.failed)}`);
   console.log(`Skipped: ${String(summary.skipped)}`);
   console.log(`Errors: ${String(summary.errors)}`);
+  console.log(`Not applicable (PICS): ${String(summary.notApplicable)}`);
   console.log(`Duration: ${String(summary.durationMs)}ms`);
 
   process.exit(summary.failed + summary.errors > 0 ? 1 : 0);

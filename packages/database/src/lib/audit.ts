@@ -1,7 +1,9 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { PgTable } from 'drizzle-orm/pg-core';
+import type { AiAuditVia } from '@evtivity/lib/ai-proposals';
 import { db as defaultDb } from '../config.js';
 
 export type AuditActor = 'operator' | 'driver' | 'api_key' | 'system' | 'ocpp';
@@ -22,6 +24,31 @@ export interface WriteAuditArgs {
   before?: unknown;
   after?: unknown;
   notes?: string | null;
+  /** Defaults to the AI tool call the code runs in (`runWithAuditViaAi`). */
+  viaAi?: AuditViaAi | null;
+}
+
+/**
+ * Where an AI-run change came from: a chat tool call (`conversationId`,
+ * `toolCallId`), an MCP call, or a confirmed proposal (`proposalId`,
+ * `confirmedBy`). Read stored values with `readAiAuditVia`.
+ */
+export type AuditViaAi = AiAuditVia;
+
+const viaAiStorage = new AsyncLocalStorage<AuditViaAi>();
+
+/**
+ * Runs `fn` as an AI-run request: every audit row written inside it (by the
+ * route the tool injects) records `via_ai`. The API's tool executor is the
+ * only caller.
+ */
+export function runWithAuditViaAi<T>(viaAi: AuditViaAi, fn: () => T): T {
+  return viaAiStorage.run(viaAi, fn);
+}
+
+/** The AI tool call the current code runs in, if any. */
+export function currentAuditViaAi(): AuditViaAi | undefined {
+  return viaAiStorage.getStore();
 }
 
 type AuditDb = Pick<typeof defaultDb, 'insert'>;
@@ -66,6 +93,15 @@ const SENSITIVE_AUDIT_FIELDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * True for a key the audit must never store: a listed field, or any key that
+ * names an encrypted-at-rest value (`*Enc` / `*_enc`, design principle P12),
+ * such as `partnerRegistrationTokenEnc` or `outbound_token_enc`.
+ */
+export function isSensitiveAuditKey(key: string): boolean {
+  return SENSITIVE_AUDIT_FIELDS.has(key) || key.endsWith('Enc') || key.endsWith('_enc');
+}
+
+/**
  * Returns a redacted copy of `obj` with sensitive fields replaced by the
  * literal string '<redacted>'. Recurses into nested plain objects AND arrays
  * so a sensitive field at any depth is caught (e.g. `before.driver.profile.passwordHash`
@@ -77,7 +113,7 @@ export function redactAuditPayload(obj: unknown): unknown {
   if (Array.isArray(obj)) return obj.map((item) => redactAuditPayload(item));
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (SENSITIVE_AUDIT_FIELDS.has(k)) {
+    if (isSensitiveAuditKey(k)) {
       out[k] = '<redacted>';
     } else {
       out[k] = redactAuditPayload(v);
@@ -109,6 +145,7 @@ export async function writeAudit(
       before: args.before == null ? null : redactAuditPayload(args.before),
       after: args.after == null ? null : redactAuditPayload(args.after),
       notes: args.notes ?? null,
+      viaAi: args.viaAi ?? viaAiStorage.getStore() ?? null,
     };
     // Drizzle insert accepts a values object keyed by camelCase JS field names.
     // We type the helper input loosely so callers don't have to import the

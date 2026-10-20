@@ -33,6 +33,18 @@ describe('PingMonitor', () => {
     vi.useRealTimers();
   });
 
+  it('refreshes the connection registry on every cycle', () => {
+    const refresh = vi.spyOn(cm, 'refreshRegistry');
+    monitor.start();
+    expect(refresh).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(30_000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(30_000);
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
   it('returns default snapshot when no pings have been sent', () => {
     const snapshot = monitor.getSnapshot();
     expect(snapshot.connectedStations).toBe(0);
@@ -210,6 +222,20 @@ describe('PingMonitor', () => {
       expect(ws.close).toHaveBeenCalledWith(1000, 'Heartbeat timeout');
     });
 
+    it('scales the timeout with a longer heartbeat interval', () => {
+      const ws = mockWs();
+      const session = createSessionState('CS-001');
+      // 16 minutes is within 3 x 600 s = 30 minutes.
+      session.lastHeartbeat = new Date(Date.now() - 16 * 60 * 1000);
+      cm.add('CS-001', ws, session);
+      monitor.setHeartbeatIntervalSeconds(600);
+      monitor.start();
+
+      vi.advanceTimersByTime(30_000);
+
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
     it('does not close connection when heartbeat is recent', () => {
       const ws = mockWs();
       const session = createSessionState('CS-001');
@@ -268,6 +294,55 @@ describe('PingMonitor', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(sql).toHaveBeenCalled();
+    });
+
+    it('upserts the row keyed by its instance ID, then prunes stale rows', async () => {
+      const sql = mockSql();
+      monitor.start(sql, null, 'ocpp-pod-a');
+      await vi.advanceTimersByTimeAsync(0);
+
+      const calls = (sql as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<
+        [readonly string[], ...unknown[]]
+      >;
+      expect(calls).toHaveLength(2);
+      const [upsertStrings, instanceId] = calls[0] ?? [[]];
+      expect(upsertStrings.join('?')).toContain('INSERT INTO ocpp_server_health');
+      expect(instanceId).toBe('ocpp-pod-a');
+      expect(monitor.getInstanceId()).toBe('ocpp-pod-a');
+      const [pruneStrings, pruneSeconds] = calls[1] ?? [[]];
+      expect(pruneStrings.join('?')).toContain('DELETE FROM ocpp_server_health');
+      expect(pruneStrings.join('?')).toContain('updated_at <');
+      expect(pruneSeconds).toBe(600);
+    });
+
+    it('prunes at most once per cycle when connects and disconnects write', async () => {
+      const sql = mockSql();
+      monitor.start(sql, null, 'ocpp-pod-a');
+      await vi.advanceTimersByTimeAsync(0);
+      monitor.writeNow();
+      monitor.writeNow();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const texts = (sql as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+        (c[0] as readonly string[]).join('?'),
+      );
+      expect(texts.filter((t) => t.includes('INSERT INTO'))).toHaveLength(3);
+      expect(texts.filter((t) => t.includes('updated_at <'))).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(35_000);
+      const after = (sql as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+        (c[0] as readonly string[]).join('?'),
+      );
+      expect(after.filter((t) => t.includes('updated_at <'))).toHaveLength(2);
+    });
+
+    it('generates a unique instance ID when none is given', () => {
+      const other = new PingMonitor(cm, logger);
+      monitor.start();
+      other.start();
+      expect(monitor.getInstanceId()).toMatch(/^ocpp-[0-9a-f-]{36}$/);
+      expect(other.getInstanceId()).not.toBe(monitor.getInstanceId());
+      void other.stop();
     });
 
     it('writes snapshot after pong wait on each cycle', async () => {
@@ -347,16 +422,60 @@ describe('PingMonitor', () => {
       };
     }
 
-    it('writes zeroed snapshot on stop when sql is provided', async () => {
+    it('deletes only its own row on stop', async () => {
       const sql = mockSql();
-      monitor.start(sql);
+      monitor.start(sql, null, 'ocpp-pod-a');
+      await vi.advanceTimersByTimeAsync(0);
 
       // Clear calls from start
       (sql as unknown as ReturnType<typeof vi.fn>).mockClear();
 
       await monitor.stop();
 
-      expect(sql).toHaveBeenCalled();
+      const calls = (sql as unknown as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls).toHaveLength(1);
+      const [strings, ...values] = calls[0] as [readonly string[], ...unknown[]];
+      expect(strings.join('?')).toContain('DELETE FROM ocpp_server_health WHERE id = ?');
+      expect(values).toEqual(['ocpp-pod-a']);
+    });
+
+    it('does not recreate its row after stop (sockets closing call writeNow)', async () => {
+      const sql = mockSql();
+      monitor.start(sql, null, 'ocpp-pod-a');
+      await monitor.stop();
+      (sql as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+      monitor.writeNow();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(sql).not.toHaveBeenCalled();
+    });
+
+    it('lets a write in flight finish before deleting the row', async () => {
+      let release: () => void = () => {};
+      const order: string[] = [];
+      const sql = vi.fn((strings: readonly string[]) => {
+        const text = strings.join('?');
+        if (text.includes('INSERT INTO')) {
+          return new Promise((resolve) => {
+            release = () => {
+              order.push('upsert');
+              resolve([]);
+            };
+          });
+        }
+        if (text.includes('WHERE id =')) order.push('delete');
+        return Promise.resolve({ count: 0 });
+      }) as unknown as import('postgres').Sql;
+      monitor.start(sql, null, 'ocpp-pod-a');
+
+      const stopped = monitor.stop();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual([]);
+      release();
+      await stopped;
+
+      expect(order).toEqual(['upsert', 'delete']);
     });
 
     it('publishes csms_events on shutdown', async () => {

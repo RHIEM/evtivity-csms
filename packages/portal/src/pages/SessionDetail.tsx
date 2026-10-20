@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router';
+import { Link, useParams, useNavigate, useLocation } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -26,12 +26,27 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { ErrorCard } from '@/components/ui/error-card';
 import { useToast } from '@/components/ui/toast';
 import { SessionCharts } from '@/components/SessionCharts';
+import { SessionVehicleCard, type SessionVehicleCapture } from '@/components/SessionVehicleCard';
 import { ReportIssue } from '@/components/ReportIssue';
 import { api } from '@/lib/api';
-import { formatCents, formatEnergy, formatDate, formatDistance } from '@/lib/utils';
+import { getErrorMessage } from '@/lib/error-message';
+import {
+  formatCents,
+  formatEnergy,
+  formatDate,
+  formatDistance,
+  formatNumber,
+  formatTaxPercent,
+} from '@/lib/utils';
+import { usePriceDisplay } from '@/hooks/use-price-display';
 import { useAuth } from '@/lib/auth';
 import { useDriverTimezone } from '@/lib/timezone';
 import { LoadingLogo } from '@/components/loading-logo';
+import type { SessionAccountBilling } from '@/lib/fleet-billing';
+import { isUnchargedSession, sessionDisplayCostCents } from '@evtivity/lib/session-cost';
+
+/** Longer than the API's 35 s wait for the station's stop answer plus the session end. */
+const STOP_SAFETY_TIMEOUT_MS = 50_000;
 
 interface SessionDetailData {
   id: string;
@@ -41,6 +56,12 @@ interface SessionDetailData {
   endedAt: string | null;
   energyDeliveredWh: string | null;
   currentCostCents: number | null;
+  // Net amount and tax contained in the cost, split per tariff as billed.
+  // Null when the cost contains no tax or the split is not known.
+  netCents: number | null;
+  taxCents: number | null;
+  // Null when tariffs with different tax rates applied.
+  taxRate: string | null;
   finalCostCents: number | null;
   currency: string;
   meterStart: number | null;
@@ -53,6 +74,8 @@ interface SessionDetailData {
   siteState: string | null;
   updatedAt: string | null;
   idleStartedAt: string | null;
+  /** Transaction limit the station reported reaching (it then suspends charging). */
+  limitReached?: 'cost' | 'energy' | 'time' | null;
   currentPowerW: number | null;
   batteryPercent: number | null;
   co2AvoidedKg: number | null;
@@ -63,14 +86,25 @@ interface SessionDetailData {
     currency: string;
   } | null;
   reservationId: string | null;
+  /** Set when the session is billed to a fleet (charge on account). */
+  accountBilling?: SessionAccountBilling | null;
   token: { idToken: string; tokenType: string } | null;
   vehicle: {
     id: string;
     make: string | null;
     model: string | null;
     year: string | null;
+    vin?: string | null;
+    evccid?: string | null;
+    autochargeEnabled?: boolean;
     efficiencyMiPerKwh: number;
   } | null;
+  /** The vehicle id the charger sent at the start (Autocharge). */
+  vehicleCapture?: SessionVehicleCapture | null;
+  /** The session was started by an Autocharge vehicle. */
+  autocharge?: boolean;
+  /** Autocharge is on at the session's site. */
+  autochargeAvailable?: boolean;
 }
 
 interface DriverVehicle {
@@ -125,6 +159,7 @@ export function SessionDetail(): React.JSX.Element {
   const fromCharge = (location.state as { fromCharge?: boolean } | null)?.fromCharge === true;
   const timezone = useDriverTimezone();
   const distanceUnit = useAuth((s) => s.driver?.distanceUnit ?? 'miles');
+  const priceDisplay = usePriceDisplay();
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const [showStopConfirm, setShowStopConfirm] = useState(false);
@@ -190,10 +225,15 @@ export function SessionDetail(): React.JSX.Element {
       void queryClient.invalidateQueries({ queryKey: ['portal-session', id] });
       void queryClient.invalidateQueries({ queryKey: ['portal-active-sessions'] });
     },
-    onError: () => {
+    onError: (err: unknown) => {
       setStopping(false);
       setShowStopConfirm(false);
-      toast({ variant: 'destructive', title: t('sessionDetail.stopFailed') });
+      // The station refused the stop (SESSION_STOP_REJECTED), is offline
+      // (STATION_OFFLINE) or did not answer (STATION_TIMEOUT): the API code says which.
+      toast({
+        variant: 'destructive',
+        title: getErrorMessage(err, t, 'sessionDetail.stopFailed'),
+      });
     },
   });
 
@@ -208,15 +248,18 @@ export function SessionDetail(): React.JSX.Element {
     }
   }, [session?.status, stopping]);
 
-  // Safety timeout. If the station never acks (offline, dropped command, etc.)
-  // clear the spinner and surface a toast so the user can retry.
+  // Safety timeout. If the session does not end after the station accepted the
+  // stop, clear the spinner and surface a toast so the user can retry. It runs
+  // longer than the API's 35 s wait for the station's answer
+  // (STOP_SAFETY_TIMEOUT_MS), so a rejection or timeout the API reports shows
+  // its own toast first.
   useEffect(() => {
     if (!stopping) return;
     const timer = setTimeout(() => {
       setStopping(false);
       setShowStopConfirm(false);
       toast({ variant: 'warning', title: t('sessionDetail.stopTimeout') });
-    }, 30000);
+    }, STOP_SAFETY_TIMEOUT_MS);
     return () => {
       clearTimeout(timer);
     };
@@ -232,11 +275,23 @@ export function SessionDetail(): React.JSX.Element {
     return <ErrorCard message={t('sessionDetail.notFound')} />;
   }
 
-  const costCents = session.finalCostCents ?? session.currentCostCents;
-  const cost =
-    costCents != null && costCents === 0
+  // A faulted or failed session that cost nothing was not charged; any other
+  // session at 0 was free (shared rule: @evtivity/lib/session-cost).
+  const costCents = sessionDisplayCostCents(session);
+  const cost = isUnchargedSession(session)
+    ? t('common.notCharged')
+    : costCents === 0
       ? t('sessionDetail.free')
       : formatCents(costCents, session.currency);
+  // Costs include tax. The API splits out the tax they contain per tariff, as
+  // billed: shown below the total (gross display), or as the net amount plus
+  // the tax above it (net display).
+  const { netCents, taxCents } = session;
+  const hasTaxSplit = netCents != null && taxCents != null;
+  const taxPercent = session.taxRate != null ? formatTaxPercent(Number(session.taxRate)) : null;
+  const costLabel = hasTaxSplit
+    ? t(isActive ? 'sessionDetail.costInclTax' : 'sessionDetail.totalCostInclTax')
+    : t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost');
   const energy = formatEnergy(session.energyDeliveredWh);
   const efficiency = session.vehicle?.efficiencyMiPerKwh ?? 3.5;
   const miles = formatDistance(session.energyDeliveredWh, efficiency, distanceUnit);
@@ -266,7 +321,7 @@ export function SessionDetail(): React.JSX.Element {
     ? t('sessionDetail.idle')
     : isActive
       ? t('sessionDetail.charging')
-      : session.status;
+      : t(`sessionStatus.${session.status}`, { defaultValue: session.status });
 
   return (
     <div className="space-y-4">
@@ -300,6 +355,11 @@ export function SessionDetail(): React.JSX.Element {
           <StatusIcon className="h-5 w-5" />
           {statusLabel}
         </div>
+        {session.limitReached != null && (
+          <p role="status" className="text-sm text-muted-foreground">
+            {t(`sessionDetail.limitReached.${session.limitReached}`)}
+          </p>
+        )}
         {session.energyDeliveredWh != null && (
           <button
             type="button"
@@ -307,7 +367,7 @@ export function SessionDetail(): React.JSX.Element {
               setPendingVehicleId(session.vehicle?.id ?? null);
               setShowVehicleDialog(true);
             }}
-            className="block w-full focus:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-md"
+            className="block w-full focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring rounded-md"
             aria-label={t('sessionDetail.changeVehicle')}
           >
             <p className="text-3xl font-bold hover:underline decoration-dotted underline-offset-4">
@@ -344,7 +404,7 @@ export function SessionDetail(): React.JSX.Element {
           <CardContent className="p-3 text-center">
             <DollarSign className="mx-auto h-5 w-5 text-muted-foreground mb-1" />
             <p className="text-xs text-muted-foreground h-8 flex items-center justify-center">
-              {t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost')}
+              {costLabel}
             </p>
             <p className="text-base font-bold">{cost}</p>
           </CardContent>
@@ -366,7 +426,7 @@ export function SessionDetail(): React.JSX.Element {
           <CardContent className="flex items-center gap-3 p-4">
             <Leaf className="h-5 w-5 text-success shrink-0" />
             <p className="text-sm font-medium text-success">
-              {session.co2AvoidedKg.toFixed(2)} kg {t('sessions.co2Avoided')}
+              {formatNumber(session.co2AvoidedKg, 2)} kg {t('sessions.co2Avoided')}
             </p>
           </CardContent>
         </Card>
@@ -397,6 +457,17 @@ export function SessionDetail(): React.JSX.Element {
           <CircleStop className="mr-2 h-5 w-5" />
           {stopping ? t('sessionDetail.stopping') : t('sessionDetail.stopCharging')}
         </Button>
+      )}
+
+      {/* The vehicle id the charger sent (Autocharge) */}
+      {session.vehicleCapture != null && (
+        <SessionVehicleCard
+          sessionId={session.id}
+          capture={session.vehicleCapture}
+          autocharge={session.autocharge === true}
+          autochargeAvailable={session.autochargeAvailable === true}
+          vehicle={session.vehicle}
+        />
       )}
 
       {/* Station info */}
@@ -458,13 +529,36 @@ export function SessionDetail(): React.JSX.Element {
           {session.batteryPercent != null && (
             <Row
               label={t('sessionDetail.battery')}
-              value={`${session.batteryPercent.toFixed(0)}%`}
+              value={`${formatNumber(session.batteryPercent, 0)}%`}
             />
           )}
-          <Row
-            label={t(isActive ? 'sessionDetail.cost' : 'sessionDetail.totalCost')}
-            value={cost}
-          />
+          {hasTaxSplit && priceDisplay === 'net' && (
+            <>
+              <Row
+                label={t('sessionDetail.netCost')}
+                value={formatCents(netCents, session.currency)}
+              />
+              <Row
+                label={
+                  taxPercent != null
+                    ? t('sessionDetail.taxAdded', { rate: taxPercent })
+                    : t('sessionDetail.taxAddedNoRate')
+                }
+                value={formatCents(taxCents, session.currency)}
+              />
+            </>
+          )}
+          <Row label={costLabel} value={cost} />
+          {hasTaxSplit && priceDisplay === 'gross' && (
+            <Row
+              label={
+                taxPercent != null
+                  ? t('sessionDetail.taxContained', { rate: taxPercent })
+                  : t('sessionDetail.taxContainedNoRate')
+              }
+              value={formatCents(taxCents, session.currency)}
+            />
+          )}
           {session.stoppedReason != null && (
             <Row label={t('sessionDetail.stopReason')} value={session.stoppedReason} />
           )}
@@ -495,6 +589,48 @@ export function SessionDetail(): React.JSX.Element {
               label={t('sessionDetail.captured')}
               value={formatCents(session.payment.capturedAmountCents, session.payment.currency)}
             />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Charge on account: billed to the fleet */}
+      {session.accountBilling != null && (
+        <Card data-testid="fleet-billing">
+          <CardHeader>
+            <CardTitle className="text-sm">{t('fleetBilling.title')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {session.accountBilling.invoicedTo === 'member' ? (
+              <>
+                <p className="text-sm font-medium">
+                  {t('fleetBilling.billedToYouVia', { fleet: session.accountBilling.fleetName })}
+                </p>
+                <Row
+                  label={t('fleetBilling.status')}
+                  value={t(`fleetBilling.stateMember.${session.accountBilling.state}`)}
+                />
+                {session.accountBilling.invoiceId != null && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">{t('fleetBilling.invoice')}</span>
+                    <Link
+                      to={`/account/invoices/${session.accountBilling.invoiceId}`}
+                      className="font-medium text-link hover:underline"
+                      data-testid="session-invoice-link"
+                    >
+                      {session.accountBilling.invoiceNumber ?? t('fleetBilling.invoice')}
+                    </Link>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <Row label={t('fleetBilling.fleet')} value={session.accountBilling.fleetName} />
+                <Row
+                  label={t('fleetBilling.status')}
+                  value={t(`fleetBilling.state.${session.accountBilling.state}`)}
+                />
+              </>
+            )}
           </CardContent>
         </Card>
       )}
@@ -559,7 +695,7 @@ export function SessionDetail(): React.JSX.Element {
                     onChange={() => {
                       setPendingVehicleId(v.id);
                     }}
-                    className="h-4 w-4 text-primary"
+                    className="h-4 w-4 text-link"
                   />
                   <span className="text-sm font-medium">{label}</span>
                 </label>

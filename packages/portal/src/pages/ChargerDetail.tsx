@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
   ArrowLeft,
+  Building2,
   CalendarClock,
   Info,
   Mail,
@@ -27,12 +28,15 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { InfoNote } from '@/components/ui/info-note';
 import { ReportIssue } from '@/components/ReportIssue';
 import { useToast } from '@/components/ui/toast';
-import { PricingDisplay, isPricingFree } from '@/components/PricingDisplay';
+import { PricingDisplay } from '@/components/PricingDisplay';
+import { isTariffFree } from '@evtivity/lib/payment-helpers';
+import { usePriceDisplay } from '@/hooks/use-price-display';
 import type { PricingInfo } from '@/components/PricingDisplay';
 import { EvPlugAnimation } from '@/components/EvPlugAnimation';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { useAuth } from '@/lib/auth';
+import { accountBillingAt, useDriverBilling } from '@/lib/fleet-billing';
 import { cn, formatDate } from '@/lib/utils';
 import {
   connectorStatusVariant,
@@ -40,6 +44,7 @@ import {
   isEvseSelectable,
 } from '@/lib/connector-status';
 import { formatConnectorType } from '@/lib/charger-utils';
+import { noShowFeeEstimate, noShowFeeNote } from '@/lib/reservation-fee';
 import { useStationEvents } from '@/hooks/use-station-events';
 import { useCableCheck } from '@/hooks/use-cable-check';
 
@@ -55,7 +60,8 @@ interface EvseItem {
   evseId: number;
   connectors: ConnectorItem[];
   reservationExpiresAt: string | null;
-  reservationDriverId: string | null;
+  reserved: boolean;
+  reservedByMe: boolean;
 }
 
 interface MaintenanceInfo {
@@ -80,6 +86,7 @@ interface StationDetail {
   paymentEnabled: boolean;
   evses: EvseItem[];
   maintenance: MaintenanceInfo | null;
+  stationUnavailable: boolean;
 }
 
 interface PaymentMethod {
@@ -126,7 +133,12 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const isAuthenticated = useAuth((s) => s.isAuthenticated);
-  const currentDriverId = useAuth((s) => s.driver?.id ?? null);
+  const priceDisplay = usePriceDisplay();
+  // Signed-out visitors see times in the browser's time zone.
+  const timezone = useAuth((s) => s.driver?.timezone);
+  // reservedByMe depends on who asks, so the signed-in driver is in the key.
+  const driverId = useAuth((s) => s.driver?.id ?? null);
+  const driverBilling = useDriverBilling(isAuthenticated && mode === 'charge');
   useStationEvents(stationId);
 
   const evseParam = searchParams.get('evse');
@@ -153,7 +165,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
     isLoading,
     error: loadError,
   } = useQuery({
-    queryKey: ['station-detail', stationId],
+    queryKey: ['station-detail', stationId, driverId],
     queryFn: () => api.get<StationDetail>(`/v1/portal/chargers/${stationId ?? ''}`),
     enabled: stationId != null,
     // SSE via useStationEvents is the primary update path -- it invalidates
@@ -280,7 +292,25 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
     }
   }
 
-  const isFree = pricing != null && isPricingFree(pricing);
+  // A free tariff with a paid tariff ahead (split billing) needs a payment
+  // method like a paid one: the start decides from the whole group (B3).
+  const isFree = pricing != null && isTariffFree(pricing) && pricing.paidTariffAhead !== true;
+  // The no-show fee of the chosen window, tax included, as the server charges
+  // it when the reservation expires unused; the generic note without a fee.
+  const noShowFee =
+    pricing != null && reserveExpiresAt !== ''
+      ? noShowFeeEstimate(pricing, {
+          startsAt: reserveStartsAt !== '' ? new Date(reserveStartsAt) : null,
+          expiresAt: new Date(reserveExpiresAt),
+        })
+      : null;
+  const noShowText =
+    noShowFee != null && pricing != null
+      ? noShowFeeNote(t, noShowFee, pricing.currency)
+      : t('reservations.noShowFeeNote');
+  // Charge on account: the fleet pays, so no card is picked or sent.
+  const accountBilling = mode === 'charge' ? accountBillingAt(pricing, driverBilling) : null;
+  const fleetName = accountBilling?.fleetName ?? null;
 
   async function doStart(): Promise<void> {
     if (selectedEvseId == null) return;
@@ -289,7 +319,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
     try {
       const result = await api.post<{ chargingSessionId: string }>(
         `/v1/portal/chargers/${stationId ?? ''}/evse/${String(selectedEvseId)}/start`,
-        selectedPm != null ? { paymentMethodId: selectedPm } : {},
+        selectedPm != null && fleetName == null ? { paymentMethodId: selectedPm } : {},
       );
       void navigate(`/sessions/${result.chargingSessionId}`, {
         replace: true,
@@ -401,7 +431,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
         mode,
         isOnline: station.isOnline,
         maintenanceActive: station.maintenance?.active === true,
-        currentDriverId,
+        stationUnavailable: station.stationUnavailable,
       }),
     );
     if (selectable.length === 1 && selectable[0] != null) {
@@ -416,12 +446,20 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
     selectedEvseId != null &&
     station.paymentEnabled &&
     !isFree &&
+    fleetName == null &&
+    isAuthenticated &&
+    !hasActiveSession;
+  const showFleetBilling =
+    mode === 'charge' &&
+    selectedEvseId != null &&
+    !isFree &&
+    fleetName != null &&
     isAuthenticated &&
     !hasActiveSession;
   const showStartButton =
     mode === 'charge' &&
     selectedEvseId != null &&
-    (isFree || !station.paymentEnabled || selectedPm != null) &&
+    (isFree || !station.paymentEnabled || fleetName != null || selectedPm != null) &&
     !hasActiveSession;
   // Reserve mode shows the time pickers + Reserve button as soon as the
   // user lands on the page so they can pick a connector OR leave it null.
@@ -473,7 +511,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
       {station.siteAddress != null && station.siteId != null ? (
         <Link
           to={`/location/${station.siteId}?from=${encodeURIComponent(`/start/${station.stationId}`)}`}
-          className="flex items-start gap-2 text-sm text-primary hover:underline transition-colors"
+          className="flex items-start gap-2 text-sm text-link hover:underline transition-colors"
         >
           <MapPin className="h-4 w-4 mt-0.5 shrink-0" />
           <span>
@@ -493,13 +531,19 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
         </div>
       ) : null}
 
+      {station.stationUnavailable && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+          <p className="text-sm">{t('errors.STATION_UNAVAILABLE')}</p>
+        </div>
+      )}
+
       {station.maintenance?.active === true && (
         <div className="rounded-md border border-warning/40 bg-warning/10 p-4">
           <p className="font-semibold">{t('charger.maintenanceTitle')}</p>
           {station.maintenance.plannedEndAt != null && (
             <p className="mt-1 text-sm">
               {t('charger.maintenanceUntil', {
-                time: new Date(station.maintenance.plannedEndAt).toLocaleString(),
+                time: formatDate(station.maintenance.plannedEndAt, timezone),
               })}
             </p>
           )}
@@ -529,7 +573,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
                 <Mail className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                 <a
                   href={`mailto:${station.siteContactEmail}`}
-                  className="text-primary hover:underline"
+                  className="text-link hover:underline"
                 >
                   {station.siteContactEmail}
                 </a>
@@ -538,10 +582,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
             {station.siteContactPhone != null && (
               <div className="flex items-center gap-2 text-sm">
                 <Phone className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                <a
-                  href={`tel:${station.siteContactPhone}`}
-                  className="text-primary hover:underline"
-                >
+                <a href={`tel:${station.siteContactPhone}`} className="text-link hover:underline">
                   {station.siteContactPhone}
                 </a>
               </div>
@@ -551,7 +592,9 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
       )}
 
       {/* Pricing */}
-      {pricing != null && <PricingDisplay pricing={pricing} />}
+      {pricing != null && priceDisplay != null && (
+        <PricingDisplay pricing={pricing} priceDisplay={priceDisplay} />
+      )}
 
       {/* EVSE selection instruction */}
       {station.evses.length > 0 && !hasActiveSession && (
@@ -575,7 +618,7 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
               mode,
               isOnline: station.isOnline,
               maintenanceActive: station.maintenance?.active === true,
-              currentDriverId,
+              stationUnavailable: station.stationUnavailable,
             });
             const isSelected = selectedEvseId === evse.evseId;
 
@@ -623,13 +666,13 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
                     >
                       {t(`status.${connectorStatus}`)}
                     </Badge>
-                    {isSelected && <Zap className="h-4 w-4 text-primary" />}
+                    {isSelected && <Zap className="h-4 w-4 text-link" />}
                   </div>
                   {connectorStatus === 'reserved' && (
                     <p className="text-xs text-muted-foreground">
                       {evse.reservationExpiresAt != null
                         ? t('charger.reservedUntil', {
-                            time: formatDate(evse.reservationExpiresAt),
+                            time: formatDate(evse.reservationExpiresAt, timezone),
                           })
                         : t('charger.reserved')}
                     </p>
@@ -707,8 +750,8 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
             </div>
             <InfoNote>
               {reservationMaxHours > 0
-                ? `${t('reservations.maxHoursHint', { hours: reservationMaxHours })} ${t('reservations.noShowFeeNote')}`
-                : t('reservations.noShowFeeNote')}
+                ? `${t('reservations.maxHoursHint', { hours: reservationMaxHours })} ${noShowText}`
+                : noShowText}
             </InfoNote>
             {!hasDefaultPaymentMethod && paymentMethods != null && (
               <Alert variant="warning">
@@ -783,6 +826,27 @@ export function ChargerDetail({ mode = 'charge' }: ChargerDetailProps = {}): Rea
                 </div>
               ))
             )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Charge on account: billed to the fleet instead of a card */}
+      {showFleetBilling && (
+        <Card data-testid="fleet-billing">
+          <CardContent className="flex items-start gap-3 p-4">
+            <Building2 className="mt-0.5 h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-sm font-medium">
+                {accountBilling?.invoicedTo === 'member'
+                  ? t('fleetBilling.billedToYouVia', { fleet: fleetName })
+                  : t('fleetBilling.billedTo', { fleet: fleetName })}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {accountBilling?.invoicedTo === 'member'
+                  ? t('fleetBilling.memberStartHint')
+                  : t('fleetBilling.startHint')}
+              </p>
+            </div>
           </CardContent>
         </Card>
       )}

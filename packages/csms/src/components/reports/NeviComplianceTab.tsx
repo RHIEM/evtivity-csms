@@ -20,6 +20,7 @@ import { CreateButton } from '@/components/create-button';
 import { EditButton } from '@/components/edit-button';
 import { RemoveButton } from '@/components/remove-button';
 import { GenerateButton } from '@/components/generate-button';
+import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
@@ -133,6 +134,7 @@ async function downloadReport(id: string, fileName: string): Promise<void> {
 
 function EvChartExportSection(): React.JSX.Element {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [quarter, setQuarter] = useState('1');
   const [year, setYear] = useState(String(new Date().getFullYear()));
   const [neviReportId, setNeviReportId] = useState<string | null>(null);
@@ -147,6 +149,7 @@ function EvChartExportSection(): React.JSX.Element {
       }),
     onSuccess: (report) => {
       setNeviReportId(report.id);
+      void queryClient.invalidateQueries({ queryKey: ['audit', 'report_schedule'] });
     },
   });
 
@@ -172,16 +175,19 @@ function EvChartExportSection(): React.JSX.Element {
         <CardTitle>{t('nevi.generateChart')}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="flex items-end gap-4">
-          <div className="space-y-2">
-            <Label htmlFor="nevi-quarter-select">{t('nevi.quarter')}</Label>
+        {/* Phones: quarter and year side by side, Generate full width below. */}
+        <div className="grid grid-cols-2 items-end gap-4 sm:flex sm:flex-wrap">
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor="nevi-quarter-select" className="leading-6">
+              {t('nevi.quarter')}
+            </Label>
             <Select
               id="nevi-quarter-select"
               value={quarter}
               onChange={(e) => {
                 setQuarter(e.target.value);
               }}
-              className="h-9"
+              className="sm:w-28"
             >
               <option value="1">Q1</option>
               <option value="2">Q2</option>
@@ -189,22 +195,26 @@ function EvChartExportSection(): React.JSX.Element {
               <option value="4">Q4</option>
             </Select>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="nevi-year">{t('nevi.year')}</Label>
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor="nevi-year" className="leading-6">
+              {t('nevi.year')}
+            </Label>
             <Input
               id="nevi-year"
               type="number"
+              inputMode="numeric"
               value={year}
               onChange={(e) => {
                 setYear(e.target.value);
               }}
-              className="w-28"
+              className="sm:w-28"
             />
           </div>
           <GenerateButton
             label={generateMutation.isPending ? t('nevi.generating') : t('nevi.generateChart')}
             onClick={handleGenerate}
             disabled={generateMutation.isPending}
+            className="col-span-2 w-full sm:w-auto"
           />
         </div>
 
@@ -223,8 +233,11 @@ function EvChartExportSection(): React.JSX.Element {
             {neviReport.status === 'completed' && (
               <Button
                 variant="outline"
+                className="w-full sm:w-auto"
                 onClick={() => {
-                  void downloadReport(neviReport.id, neviReport.name + '.xlsx');
+                  void downloadReport(neviReport.id, neviReport.name + '.xlsx').finally(() => {
+                    void queryClient.invalidateQueries({ queryKey: ['audit', 'report_schedule'] });
+                  });
                 }}
               >
                 {t('common.download')}
@@ -426,7 +439,9 @@ function StationDataSection(): React.JSX.Element {
                 <h3 className="text-sm font-medium">{t('nevi.operatorName')}</h3>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-operator-name">{t('nevi.operatorName')}</Label>
+                    <Label htmlFor="nevi-operator-name" className="leading-6">
+                      {t('nevi.operatorName')}
+                    </Label>
                     <Input
                       id="nevi-operator-name"
                       value={operatorName}
@@ -436,7 +451,9 @@ function StationDataSection(): React.JSX.Element {
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-operator-address">{t('nevi.operatorAddress')}</Label>
+                    <Label htmlFor="nevi-operator-address" className="leading-6">
+                      {t('nevi.operatorAddress')}
+                    </Label>
                     <Input
                       id="nevi-operator-address"
                       value={operatorAddress}
@@ -446,7 +463,9 @@ function StationDataSection(): React.JSX.Element {
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-operator-phone">{t('nevi.operatorPhone')}</Label>
+                    <Label htmlFor="nevi-operator-phone" className="leading-6">
+                      {t('nevi.operatorPhone')}
+                    </Label>
                     <Input
                       id="nevi-operator-phone"
                       value={operatorPhone}
@@ -456,7 +475,9 @@ function StationDataSection(): React.JSX.Element {
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-operator-email">{t('nevi.operatorEmail')}</Label>
+                    <Label htmlFor="nevi-operator-email" className="leading-6">
+                      {t('nevi.operatorEmail')}
+                    </Label>
                     <Input
                       id="nevi-operator-email"
                       type="email"
@@ -473,44 +494,40 @@ function StationDataSection(): React.JSX.Element {
                 <h3 className="text-sm font-medium">{t('nevi.installationCost')}</h3>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-installation-cost">{t('nevi.installationCost')}</Label>
-                    <Input
+                    <Label htmlFor="nevi-installation-cost" className="leading-6">
+                      {t('nevi.installationCost')}
+                    </Label>
+                    <DecimalInput
                       id="nevi-installation-cost"
-                      type="number"
+                      decimalScale={2}
                       value={installationCost}
-                      onChange={(e) => {
-                        setInstallationCost(e.target.value);
-                      }}
+                      onChange={setInstallationCost}
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-grid-connection-cost">
+                    <Label htmlFor="nevi-grid-connection-cost" className="leading-6">
                       {t('nevi.gridConnectionCost')}
                     </Label>
-                    <Input
+                    <DecimalInput
                       id="nevi-grid-connection-cost"
-                      type="number"
+                      decimalScale={2}
                       value={gridConnectionCost}
-                      onChange={(e) => {
-                        setGridConnectionCost(e.target.value);
-                      }}
+                      onChange={setGridConnectionCost}
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-maintenance-cost-annual">
+                    <Label htmlFor="nevi-maintenance-cost-annual" className="leading-6">
                       {t('nevi.maintenanceCostAnnual')}
                     </Label>
-                    <Input
+                    <DecimalInput
                       id="nevi-maintenance-cost-annual"
-                      type="number"
+                      decimalScale={2}
                       value={maintenanceCostAnnual}
-                      onChange={(e) => {
-                        setMaintenanceCostAnnual(e.target.value);
-                      }}
+                      onChange={setMaintenanceCostAnnual}
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-maintenance-cost-year">
+                    <Label htmlFor="nevi-maintenance-cost-year" className="leading-6">
                       {t('nevi.maintenanceCostYear')}
                     </Label>
                     <Input
@@ -529,7 +546,9 @@ function StationDataSection(): React.JSX.Element {
                 <h3 className="text-sm font-medium">{t('nevi.derType')}</h3>
                 <div className="grid gap-3 sm:grid-cols-3">
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-der-type">{t('nevi.derType')}</Label>
+                    <Label htmlFor="nevi-der-type" className="leading-6">
+                      {t('nevi.derType')}
+                    </Label>
                     <Input
                       id="nevi-der-type"
                       value={derType}
@@ -539,25 +558,23 @@ function StationDataSection(): React.JSX.Element {
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-der-capacity-kw">{t('nevi.derCapacityKw')}</Label>
-                    <Input
+                    <Label htmlFor="nevi-der-capacity-kw" className="leading-6">
+                      {t('nevi.derCapacityKw')}
+                    </Label>
+                    <DecimalInput
                       id="nevi-der-capacity-kw"
-                      type="number"
                       value={derCapacityKw}
-                      onChange={(e) => {
-                        setDerCapacityKw(e.target.value);
-                      }}
+                      onChange={setDerCapacityKw}
                     />
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="nevi-der-capacity-kwh">{t('nevi.derCapacityKwh')}</Label>
-                    <Input
+                    <Label htmlFor="nevi-der-capacity-kwh" className="leading-6">
+                      {t('nevi.derCapacityKwh')}
+                    </Label>
+                    <DecimalInput
                       id="nevi-der-capacity-kwh"
-                      type="number"
                       value={derCapacityKwh}
-                      onChange={(e) => {
-                        setDerCapacityKwh(e.target.value);
-                      }}
+                      onChange={setDerCapacityKwh}
                     />
                   </div>
                 </div>
@@ -566,7 +583,7 @@ function StationDataSection(): React.JSX.Element {
               <div className="space-y-3">
                 <h3 className="text-sm font-medium">{t('nevi.programParticipation')}</h3>
                 <div className="space-y-1">
-                  <Label htmlFor="nevi-program-participation">
+                  <Label htmlFor="nevi-program-participation" className="leading-6">
                     {t('nevi.programParticipation')}
                   </Label>
                   <Input
@@ -738,7 +755,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-end gap-4">
           <div className="space-y-1">
-            <Label htmlFor="nevi-station-filter">{t('nevi.station')}</Label>
+            <Label htmlFor="nevi-station-filter" className="leading-6">
+              {t('nevi.station')}
+            </Label>
             <Select
               id="nevi-station-filter"
               value={stationFilter}
@@ -746,7 +765,6 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 setStationFilter(e.target.value);
                 setPage(1);
               }}
-              className="h-9"
             >
               <option value="">{t('common.all')}</option>
               {stations.map((s) => (
@@ -757,11 +775,13 @@ function ExcludedDowntimeSection(): React.JSX.Element {
             </Select>
           </div>
           <div className="space-y-1">
-            <Label htmlFor="nevi-downtime-filter-from">{t('nevi.startedAt')}</Label>
+            <Label htmlFor="nevi-downtime-filter-from" className="leading-6">
+              {t('nevi.startedAt')}
+            </Label>
             <Input
               id="nevi-downtime-filter-from"
               type="date"
-              aria-label="Start date"
+              aria-label={t('common.startDate')}
               value={fromFilter}
               onChange={(e) => {
                 setFromFilter(e.target.value);
@@ -771,11 +791,13 @@ function ExcludedDowntimeSection(): React.JSX.Element {
             />
           </div>
           <div className="space-y-1">
-            <Label htmlFor="nevi-downtime-filter-to">{t('nevi.endedAt')}</Label>
+            <Label htmlFor="nevi-downtime-filter-to" className="leading-6">
+              {t('nevi.endedAt')}
+            </Label>
             <Input
               id="nevi-downtime-filter-to"
               type="date"
-              aria-label="End date"
+              aria-label={t('common.endDate')}
               value={toFilter}
               onChange={(e) => {
                 setToFilter(e.target.value);
@@ -867,7 +889,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
             </DialogHeader>
             <form onSubmit={handleSubmit} noValidate className="space-y-4">
               <div className="space-y-1">
-                <Label htmlFor="nevi-downtime-station">{t('nevi.station')}</Label>
+                <Label htmlFor="nevi-downtime-station" className="leading-6">
+                  {t('nevi.station')}
+                </Label>
                 <Select
                   id="nevi-downtime-station"
                   value={form.stationId}
@@ -875,7 +899,7 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                     updateForm('stationId', e.target.value);
                   }}
                   className={
-                    hasSubmitted && downtimeErrors.stationId ? 'h-9 border-destructive' : 'h-9'
+                    hasSubmitted && downtimeErrors.stationId ? 'border-destructive' : undefined
                   }
                 >
                   <option value="">{t('common.select')}</option>
@@ -890,7 +914,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-1">
-                <Label htmlFor="nevi-downtime-evse-id">{t('nevi.evseId')}</Label>
+                <Label htmlFor="nevi-downtime-evse-id" className="leading-6">
+                  {t('nevi.evseId')}
+                </Label>
                 <Input
                   id="nevi-downtime-evse-id"
                   type="number"
@@ -905,14 +931,15 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-1">
-                <Label htmlFor="nevi-downtime-reason">{t('nevi.reason')}</Label>
+                <Label htmlFor="nevi-downtime-reason" className="leading-6">
+                  {t('nevi.reason')}
+                </Label>
                 <Select
                   id="nevi-downtime-reason"
                   value={form.reason}
                   onChange={(e) => {
                     updateForm('reason', e.target.value);
                   }}
-                  className="h-9"
                 >
                   {DOWNTIME_REASONS.map((reason) => (
                     <option key={reason} value={reason}>
@@ -922,7 +949,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 </Select>
               </div>
               <div className="space-y-1">
-                <Label htmlFor="nevi-downtime-started-at">{t('nevi.startedAt')}</Label>
+                <Label htmlFor="nevi-downtime-started-at" className="leading-6">
+                  {t('nevi.startedAt')}
+                </Label>
                 <Input
                   id="nevi-downtime-started-at"
                   type="datetime-local"
@@ -937,7 +966,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 )}
               </div>
               <div className="space-y-1">
-                <Label htmlFor="nevi-downtime-ended-at">{t('nevi.endedAt')}</Label>
+                <Label htmlFor="nevi-downtime-ended-at" className="leading-6">
+                  {t('nevi.endedAt')}
+                </Label>
                 <Input
                   id="nevi-downtime-ended-at"
                   type="datetime-local"
@@ -948,9 +979,9 @@ function ExcludedDowntimeSection(): React.JSX.Element {
                 />
               </div>
               <div className="space-y-1">
-                <Label>{t('nevi.notes')}</Label>
+                <Label className="leading-6">{t('nevi.notes')}</Label>
                 <textarea
-                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
+                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
                   value={form.notes}
                   onChange={(e) => {
                     updateForm('notes', e.target.value);

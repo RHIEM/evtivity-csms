@@ -2,17 +2,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import crypto from 'node:crypto';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, isNull, sql } from 'drizzle-orm';
 import {
   db,
   chargingSessions,
-  chargingStations,
-  evses,
-  connectors,
-  sites,
+  createCreditCdr,
   ocpiCdrs,
   ocpiRoamingSessions,
-  ocpiTariffMappings,
   ocpiPartnerEndpoints,
   ocpiPartners,
   ocpiSyncLog,
@@ -20,12 +16,20 @@ import {
 import { createLogger } from '@evtivity/lib';
 import { getOutboundToken } from '../lib/outbound-token.js';
 import { OcpiClient } from '../lib/ocpi-client.js';
+import { OcpiStatusCode } from '../lib/ocpi-response.js';
 import { config } from '../lib/config.js';
 import { transformCdr } from '../transformers/cdr.transformer.js';
 import { resolvePartnerVersion } from '../lib/ocpi-version.js';
-import { tariffInCurrency } from '../lib/tariff-currency.js';
 import { notifyRoamingCdrChanged } from '../lib/pubsub.js';
-import type { OcpiCdr, OcpiTariff } from '../types/ocpi.js';
+import { taxTotals } from '@evtivity/lib/price-display';
+import { idleMinutesAt, ocpiCdrCost } from './session-cost-split.js';
+import { cpoSessionLink, partnerToken, sessionPlace } from './cpo-sessions.js';
+import type { CpoSessionLink } from './cpo-sessions.js';
+import { renderSnapshotTariff, sessionTariffMapping } from './published-tariffs.js';
+import { partTimes, sessionCdrParts } from './cdr-parts.js';
+import { cdrChargingPeriods } from '../lib/charging-periods.js';
+import type { PublishedTariff } from './published-tariffs.js';
+import type { OcpiCdr } from '../types/ocpi.js';
 
 const logger = createLogger('ocpi-cdr');
 
@@ -37,137 +41,124 @@ function getPartyId(): string {
   return config.OCPI_PARTY_ID;
 }
 
+type ChargingSessionRow = typeof chargingSessions.$inferSelect;
+
+/** A CDR built for a session, and the `ocpi_cdrs` row that stores it. */
+export interface BuiltCdr {
+  cdr: OcpiCdr;
+  row: typeof ocpiCdrs.$inferInsert;
+}
+
 /**
- * Generate an OCPI CDR for a roaming session.
+ * Builds the OCPI CDR of a completed session for the partner whose token
+ * started it. Null when the session has no start or end, or its place (site,
+ * EVSE) is gone.
  *
  * Pricing model: roaming sessions ALWAYS use OUR tariff (the tariff resolved
  * at the station as if a local driver had charged there) and OUR currency.
  * The session cost is computed by the standard payment-gate / event-projection
- * pipeline -- the only difference for `is_roaming = true` sessions is that
- * `runPaymentGate()` skips Stripe pre-auth (event-projections.ts:2955) because
- * the eMSP partner pays us via this CDR, then bills their own driver however
- * they want.
- *
- * In practical terms: a partner's driver charging at our station pays whatever
- * our tariff says; we never honour the partner's tariff for sessions hosted on
- * our hardware. If two partners want different rates at the same station, that
- * is modelled via OCPI tariff negotiation outside the CDR (tariff_id reference
- * on the CDR points to the partner's view of our published tariff).
+ * pipeline; the only difference for `is_roaming = true` sessions is that the
+ * payment gate skips the pre-auth, because the eMSP partner pays us via this
+ * CDR and then bills its own driver however it wants. The CDR embeds the
+ * tariffs it was billed with (the session's and its segments' price
+ * snapshots, not the tariffs' current prices) under the OCPI ids of the
+ * mappings that publish them to this partner.
  */
-export async function generateCdr(
-  chargingSessionId: string,
-  partnerId: string,
-): Promise<OcpiCdr | null> {
-  logger.info({ chargingSessionId, partnerId }, 'Generating CDR');
+export async function buildSessionCdr(
+  session: ChargingSessionRow,
+  link: CpoSessionLink,
+): Promise<BuiltCdr | null> {
+  if (session.startedAt == null || session.endedAt == null) return null;
+  const { partnerId } = link;
 
-  // Load the charging session
-  const [session] = await db
-    .select()
-    .from(chargingSessions)
-    .where(eq(chargingSessions.id, chargingSessionId))
-    .limit(1);
-
-  if (session == null) {
-    logger.error({ chargingSessionId }, 'Session not found');
-    return null;
-  }
-
-  if (session.startedAt == null || session.endedAt == null) {
-    logger.error({ chargingSessionId }, 'Session not completed');
-    return null;
-  }
-
-  // Load station and site
-  const [station] = await db
-    .select()
-    .from(chargingStations)
-    .where(eq(chargingStations.id, session.stationId))
-    .limit(1);
-
-  if (station == null) return null;
-
-  const siteId = station.siteId;
-  const [site] =
-    siteId != null ? await db.select().from(sites).where(eq(sites.id, siteId)).limit(1) : [null];
-
-  // Load EVSE and connector
-  let evseUid = 'unknown';
-  let evseIdStr = 'unknown';
-  let connectorIdStr = '1';
-  let connectorType: string | null = null;
-
-  if (session.evseId != null) {
-    const [evse] = await db.select().from(evses).where(eq(evses.id, session.evseId)).limit(1);
-    if (evse != null) {
-      evseUid = `${siteId ?? station.id}-${String(evse.evseId)}`;
-      evseIdStr = `${siteId ?? station.id}-EVSE-${String(evse.evseId)}`;
-    }
-  }
-
-  if (session.connectorId != null) {
-    const [connector] = await db
-      .select()
-      .from(connectors)
-      .where(eq(connectors.id, session.connectorId))
-      .limit(1);
-    if (connector != null) {
-      connectorIdStr = String(connector.connectorId);
-      connectorType = connector.connectorType;
-    }
-  }
+  const place = await sessionPlace(session);
+  if (place == null) return null;
+  const site = place.site;
 
   const currency = session.currency.toUpperCase();
+  // The partner's token from the CPO session link written at session start.
+  const token = await partnerToken(link.partnerId, link.tokenUid);
 
-  // Load tariff mapping if available
-  let ocpiTariff: OcpiTariff | undefined;
-  if (session.tariffId != null) {
-    const [mapping] = await db
-      .select()
-      .from(ocpiTariffMappings)
-      .where(eq(ocpiTariffMappings.tariffId, session.tariffId))
-      .limit(1);
-    if (mapping != null) {
-      ocpiTariff = tariffInCurrency(mapping.ocpiTariffData, currency);
-    }
-  }
-
-  // Get token info from roaming session
-  const [roamingSession] = await db
-    .select()
-    .from(ocpiRoamingSessions)
-    .where(eq(ocpiRoamingSessions.chargingSessionId, chargingSessionId))
-    .limit(1);
-
-  const tokenUid = roamingSession?.tokenUid ?? 'unknown';
-
-  // Get partner info for token country/party plus negotiated version so the
-  // CDR is shaped to match what the partner agreed to consume.
+  // The negotiated version shapes the CDR the partner consumes.
   const [partner] = await db
-    .select({
-      countryCode: ocpiPartners.countryCode,
-      partyId: ocpiPartners.partyId,
-      version: ocpiPartners.version,
-    })
+    .select({ version: ocpiPartners.version })
     .from(ocpiPartners)
     .where(eq(ocpiPartners.id, partnerId))
     .limit(1);
-
   const partnerVersion = resolvePartnerVersion(partner?.version);
 
+  // The priced parts (the session, or each tariff segment) with the prices
+  // they were billed at, and the tariffs the CDR embeds for them: the price
+  // snapshot of each part, published under the OCPI id of the mapping that
+  // covers its tariff for this partner (directly or through its pricing
+  // group). Distinct snapshots under one mapping get "<id>-2", "<id>-3".
+  const parts = await sessionCdrParts(session);
+  const tariffs: PublishedTariff[] = [];
+  const partTariffIds: Array<string | undefined> = [];
+  const byContent = new Map<string, string>();
+  const perMapping = new Map<string, number>();
+  for (const part of parts) {
+    const mapping =
+      part.tariffId != null ? await sessionTariffMapping(partnerId, part.tariffId) : null;
+    if (mapping == null) {
+      partTariffIds.push(undefined);
+      continue;
+    }
+    const key = `${mapping.ocpiTariffId}|${JSON.stringify({ ...part.prices, id: '' })}`;
+    let ocpiTariffId = byContent.get(key);
+    if (ocpiTariffId == null) {
+      const n = (perMapping.get(mapping.ocpiTariffId) ?? 0) + 1;
+      perMapping.set(mapping.ocpiTariffId, n);
+      ocpiTariffId =
+        n === 1 ? mapping.ocpiTariffId : `${mapping.ocpiTariffId.slice(0, 32)}-${String(n)}`;
+      byContent.set(key, ocpiTariffId);
+      tariffs.push(
+        await renderSnapshotTariff(
+          {
+            prices: part.prices,
+            ocpiTariffId,
+            currency,
+            taxBasis:
+              session.taxBasis === 'gross' || session.taxBasis === 'net' ? session.taxBasis : null,
+            lastUpdated: session.startedAt,
+          },
+          partnerVersion,
+        ),
+      );
+    }
+    partTariffIds.push(ocpiTariffId);
+  }
+
   const cdrId = crypto.randomUUID();
+  // The CDR's last_updated and its row's created_at are one instant: the
+  // CPO CDRs sender filters and orders on created_at.
+  const issuedAt = new Date();
+
+  // final_cost_cents includes tax: the CDR carries it as the gross and its
+  // net and tax split per tax rate and dimension, from the pricing engine
+  // (see session-cost-split.ts).
+  const cost = ocpiCdrCost(session, partTimes(parts));
+  const periods = cdrChargingPeriods(
+    parts.map((part, i) => {
+      const tariffId = partTariffIds[i];
+      return tariffId != null ? { ...part.period, tariffId } : part.period;
+    }),
+  );
 
   const cdrInput: Parameters<typeof transformCdr>[0] = {
     session: {
       sessionId: session.id,
-      transactionId: session.transactionId,
+      // The Session id the partner knows, stored on the link.
+      ocpiSessionId: link.ocpiSessionId,
       startedAt: session.startedAt,
       endedAt: session.endedAt,
       energyDeliveredWh: session.energyDeliveredWh,
-      finalCostCents: session.finalCostCents,
       currency,
+      idleMinutes: idleMinutesAt(session, session.endedAt),
     },
+    cost,
     location: {
-      siteId: siteId ?? station.id,
+      locationId: place.locationId,
       siteName: site?.name ?? 'Unknown',
       address: site?.address ?? null,
       city: site?.city ?? null,
@@ -176,48 +167,161 @@ export async function generateCdr(
       country: site?.country ?? null,
       latitude: site?.latitude ?? null,
       longitude: site?.longitude ?? null,
-      evseUid,
-      evseId: evseIdStr,
-      connectorId: connectorIdStr,
-      connectorType,
+      evseUid: place.evseUid,
+      evseId: place.evseId,
+      connectorId: place.connectorId,
+      connectorType: place.connectorType,
     },
     countryCode: getCountryCode(),
     partyId: getPartyId(),
     cdrId,
-    tokenUid,
-    tokenCountryCode: partner?.countryCode ?? '',
-    tokenPartyId: partner?.partyId ?? '',
+    issuedAt,
+    token,
+    authMethod: link.authMethod,
+    authorizationReference: link.authorizationReference,
   };
-  if (ocpiTariff != null) {
-    cdrInput.tariff = ocpiTariff;
-  }
+  if (periods.length > 0) cdrInput.chargingPeriods = periods;
+  if (tariffs.length > 0) cdrInput.tariffs = tariffs;
 
   const cdr = transformCdr(cdrInput, partnerVersion);
-
-  // Store the CDR
-  await db.insert(ocpiCdrs).values({
-    partnerId,
-    ocpiCdrId: cdrId,
-    chargingSessionId,
-    totalEnergy: String(cdr.total_energy),
-    totalCost: String(cdr.total_cost.excl_vat),
-    currency: cdr.currency,
-    cdrData: cdr,
-    isCredit: false,
-    pushStatus: 'pending',
-  });
-
-  // Tell the CSMS so the Roaming CDRs page reloads itself.
-  notifyRoamingCdrChanged();
-
-  logger.info({ cdrId, chargingSessionId }, 'CDR generated');
-  return cdr;
+  return {
+    cdr,
+    row: {
+      partnerId,
+      ocpiCdrId: cdrId,
+      chargingSessionId: session.id,
+      totalEnergy: String(cdr.total_energy),
+      // ocpi_cdrs.total_cost holds the amount excluding tax, like the CDRs
+      // received from partners (excl_vat in 2.2.1, before_taxes in 2.3.0).
+      totalCost: String(taxTotals(cost.total).netCents / 100),
+      currency: cdr.currency,
+      cdrData: cdr,
+      isCredit: false,
+      pushStatus: 'pending',
+      createdAt: issuedAt,
+      updatedAt: issuedAt,
+    },
+  };
 }
 
-export async function pushCdr(cdrId: string): Promise<boolean> {
+export type IssueCdrResult =
+  | { status: 'created' | 'existing'; cdrId: string }
+  | { status: 'not_found' | 'not_billable' | 'not_roaming' | 'not_renderable' };
+
+async function existingSessionCdrId(
+  executor: Pick<typeof db, 'select'>,
+  chargingSessionId: string,
+): Promise<string | null> {
+  const [row] = await executor
+    .select({ ocpiCdrId: ocpiCdrs.ocpiCdrId })
+    .from(ocpiCdrs)
+    .where(
+      and(
+        eq(ocpiCdrs.chargingSessionId, chargingSessionId),
+        eq(ocpiCdrs.isCredit, false),
+        isNull(ocpiCdrs.supersededAt),
+      ),
+    )
+    .limit(1);
+  return row?.ocpiCdrId ?? null;
+}
+
+/**
+ * Issues the CDR of one of our CPO sessions: the only writer of our session
+ * CDRs. One live CDR per session (OCPI 10.1: a sent CDR is never replaced,
+ * only credited): a second call returns the CDR already stored. After an
+ * operator credited every CDR of the session and reissued it (the API marks
+ * them superseded), the next call issues a new CDR with a new id. The session's
+ * `ocpi_roaming_sessions` row is locked while the CDR is stored, so two runs
+ * (a retried job, two replicas) cannot both insert.
+ *
+ * Only `completed` sessions are billed. `faulted`, `failed`, and `invalid`
+ * sessions are OCPI INVALID ("declared invalid and will not be billed") and
+ * get no CDR; the status is read here, not trusted from the trigger.
+ */
+export async function issueSessionCdr(chargingSessionId: string): Promise<IssueCdrResult> {
+  const [session] = await db
+    .select()
+    .from(chargingSessions)
+    .where(eq(chargingSessions.id, chargingSessionId))
+    .limit(1);
+  if (session == null) return { status: 'not_found' };
+  if (session.status !== 'completed' || session.startedAt == null || session.endedAt == null) {
+    return { status: 'not_billable' };
+  }
+
+  const link = await cpoSessionLink(chargingSessionId);
+  if (link == null) return { status: 'not_roaming' };
+
+  const existing = await existingSessionCdrId(db, chargingSessionId);
+  if (existing != null) return { status: 'existing', cdrId: existing };
+
+  const built = await buildSessionCdr(session, link);
+  if (built == null) {
+    logger.warn({ chargingSessionId }, 'CDR not generated: session place not found');
+    return { status: 'not_renderable' };
+  }
+
+  const result = await db.transaction(async (tx): Promise<IssueCdrResult> => {
+    await tx
+      .select({ id: ocpiRoamingSessions.id })
+      .from(ocpiRoamingSessions)
+      .where(eq(ocpiRoamingSessions.id, link.id))
+      .for('update');
+    const stored = await existingSessionCdrId(tx, chargingSessionId);
+    if (stored != null) return { status: 'existing', cdrId: stored };
+    await tx.insert(ocpiCdrs).values(built.row);
+    return { status: 'created', cdrId: built.cdr.id };
+  });
+
+  if (result.status === 'created') {
+    // Tell the CSMS so the Roaming CDRs page reloads itself.
+    notifyRoamingCdrChanged();
+    logger.info({ cdrId: result.cdrId, chargingSessionId }, 'CDR generated');
+  }
+  return result;
+}
+
+export type PushCdrResult =
+  | 'sent'
+  | 'already_sent'
+  | 'no_receiver'
+  | 'waiting_for_original'
+  | 'failed'
+  | 'not_found';
+
+/**
+ * Whether the CDR a credit CDR credits was sent: a credit goes to the partner
+ * only after its original (a partner cannot credit a CDR it never got).
+ */
+async function creditedOriginalSent(cdr: typeof ocpiCdrs.$inferSelect): Promise<boolean> {
+  const [original] = await db
+    .select({ pushStatus: ocpiCdrs.pushStatus })
+    .from(ocpiCdrs)
+    .where(
+      and(
+        eq(ocpiCdrs.partnerId, cdr.partnerId),
+        eq(ocpiCdrs.isCredit, false),
+        sql`${ocpiCdrs.ocpiCdrId} = ${cdr.cdrData}->>'credit_reference_id'`,
+      ),
+    )
+    .limit(1);
+  return original?.pushStatus === 'sent';
+}
+
+/**
+ * sent: POSTed now; already_sent: sent before, not repeated; no_receiver: the
+ * partner has no CDRs receiver or no token, so it stays pending for the
+ * partner's pull; waiting_for_original: a credit CDR whose original was not
+ * sent yet stays pending (the sweep tries again); failed: the POST failed or
+ * the partner answered another code than 1000 (retry); not_found.
+ */
+export async function pushCdr(cdrId: string): Promise<PushCdrResult> {
   const [cdr] = await db.select().from(ocpiCdrs).where(eq(ocpiCdrs.ocpiCdrId, cdrId)).limit(1);
 
-  if (cdr == null) return false;
+  if (cdr == null) return 'not_found';
+  if (cdr.pushStatus === 'sent') return 'already_sent';
+  if (cdr.isCredit && !(await creditedOriginalSent(cdr))) return 'waiting_for_original';
 
   const partnerId = cdr.partnerId;
 
@@ -236,22 +340,27 @@ export async function pushCdr(cdrId: string): Promise<boolean> {
 
     if (endpoint == null) {
       logger.debug({ partnerId }, 'No CDR receiver endpoint for partner');
-      return false;
+      return 'no_receiver';
     }
 
     const token = await getOutboundToken(partnerId);
     if (token == null) {
       logger.warn({ partnerId, cdrId }, 'No outbound token for partner, cannot push CDR');
-      return false;
+      return 'no_receiver';
     }
 
     const [partner] = await db
-      .select({ countryCode: ocpiPartners.countryCode, partyId: ocpiPartners.partyId })
+      .select({
+        countryCode: ocpiPartners.countryCode,
+        partyId: ocpiPartners.partyId,
+        allowPrivateNetwork: ocpiPartners.allowPrivateNetwork,
+        allowRawToken: ocpiPartners.allowRawToken,
+      })
       .from(ocpiPartners)
       .where(eq(ocpiPartners.id, partnerId))
       .limit(1);
 
-    if (partner == null) return false;
+    if (partner == null) return 'not_found';
 
     const client = new OcpiClient({
       token,
@@ -259,11 +368,19 @@ export async function pushCdr(cdrId: string): Promise<boolean> {
       fromPartyId: getPartyId(),
       toCountryCode: partner.countryCode,
       toPartyId: partner.partyId,
+      allowPrivateNetwork: partner.allowPrivateNetwork,
+      rawToken: partner.allowRawToken,
     });
 
+    // The same stored CDR (same id) on every attempt, so a retry after a
+    // lost response cannot create a second CDR at the partner.
     const cdrData = cdr.cdrData as OcpiCdr;
-    await client.post(endpoint.url, cdrData);
-
+    const response = await client.post(endpoint.url, cdrData);
+    if (response.status_code !== OcpiStatusCode.SUCCESS) {
+      throw new Error(
+        `Partner rejected CDR: ${String(response.status_code)} ${response.status_message}`,
+      );
+    }
     await db
       .update(ocpiCdrs)
       .set({ pushStatus: 'sent', updatedAt: new Date() })
@@ -281,7 +398,7 @@ export async function pushCdr(cdrId: string): Promise<boolean> {
       objectsCount: '1',
     });
 
-    return true;
+    return 'sent';
   } catch (err) {
     const message = err instanceof Error ? err.message : 'CDR push failed';
     logger.error({ cdrId, partnerId, err }, 'Failed to push CDR');
@@ -301,91 +418,28 @@ export async function pushCdr(cdrId: string): Promise<boolean> {
       errorMessage: message,
     });
 
-    return false;
+    return 'failed';
   }
 }
 
+/**
+ * A credit CDR for one of our CDRs (OCPI 10.1.1): only total_cost is negated.
+ * Stored pending push through the shared `createCreditCdr`, which the API's
+ * operator credit uses too. An existing credit of the CDR is returned as is.
+ */
 export async function generateCreditCdr(
   originalCdrId: string,
   reason: string,
 ): Promise<OcpiCdr | null> {
-  const [originalCdr] = await db
-    .select()
-    .from(ocpiCdrs)
-    .where(eq(ocpiCdrs.ocpiCdrId, originalCdrId))
-    .limit(1);
-
-  if (originalCdr == null) return null;
-
-  const originalData = originalCdr.cdrData as OcpiCdr;
-  const creditCdrId = crypto.randomUUID();
-
-  // Negate every OcpiPrice on the CDR. Preserve `incl_vat` when present so
-  // the credit reflects both pre- and post-tax amounts. Per OCPI 2.2.1
-  // §11.4.2 a credit CDR represents a refund, so all cost components must
-  // flip sign. The earlier implementation only negated `total_cost.excl_vat`
-  // and dropped `incl_vat` and the per-component costs (total_energy_cost,
-  // total_time_cost, etc.), leaving partners with an inconsistent credit.
-  const negatePrice = (p: {
-    excl_vat: number;
-    incl_vat?: number;
-  }): { excl_vat: number; incl_vat?: number } => {
-    const result: { excl_vat: number; incl_vat?: number } = { excl_vat: -p.excl_vat };
-    if (p.incl_vat != null) result.incl_vat = -p.incl_vat;
-    return result;
-  };
-
-  // Defensive: cdrData is JSONB, so the typed-shape promise is only as good
-  // as whatever was stored. A legacy row missing total_cost would otherwise
-  // crash inside negatePrice; treat that as "cannot synthesize credit".
-  const totalCostMaybe = (originalData as { total_cost?: { excl_vat: number; incl_vat?: number } })
-    .total_cost;
-  if (totalCostMaybe == null) {
-    logger.warn({ originalCdrId }, 'Original CDR has no total_cost; cannot generate credit');
+  const result = await createCreditCdr(originalCdrId, reason);
+  if (result.status !== 'created' && result.status !== 'existing') {
+    logger.warn({ originalCdrId, status: result.status }, 'Credit CDR not generated');
     return null;
   }
-  const negatedTotalCost = negatePrice(totalCostMaybe);
-
-  const creditCdr: OcpiCdr = {
-    ...originalData,
-    id: creditCdrId,
-    credit: true,
-    credit_reference_id: originalCdrId,
-    remark: reason,
-    total_cost: negatedTotalCost,
-    ...(originalData.total_fixed_cost != null
-      ? { total_fixed_cost: negatePrice(originalData.total_fixed_cost) }
-      : {}),
-    ...(originalData.total_energy_cost != null
-      ? { total_energy_cost: negatePrice(originalData.total_energy_cost) }
-      : {}),
-    ...(originalData.total_time_cost != null
-      ? { total_time_cost: negatePrice(originalData.total_time_cost) }
-      : {}),
-    ...(originalData.total_parking_cost != null
-      ? { total_parking_cost: negatePrice(originalData.total_parking_cost) }
-      : {}),
-    ...(originalData.total_reservation_cost != null
-      ? { total_reservation_cost: negatePrice(originalData.total_reservation_cost) }
-      : {}),
-    last_updated: new Date().toISOString(),
-  };
-
-  await db.insert(ocpiCdrs).values({
-    partnerId: originalCdr.partnerId,
-    ocpiCdrId: creditCdrId,
-    chargingSessionId: originalCdr.chargingSessionId,
-    totalEnergy: originalCdr.totalEnergy,
-    totalCost: String(-parseFloat(originalCdr.totalCost)),
-    currency: originalCdr.currency,
-    cdrData: creditCdr,
-    isCredit: true,
-    pushStatus: 'pending',
-  });
-
-  // Tell the CSMS so the Roaming CDRs page reloads itself.
-  notifyRoamingCdrChanged();
-
-  logger.info({ creditCdrId, originalCdrId, reason }, 'Credit CDR generated');
-  return creditCdr;
+  if (result.status === 'created') {
+    // Tell the CSMS so the Roaming CDRs page reloads itself.
+    notifyRoamingCdrChanged();
+    logger.info({ creditCdrId: result.cdrId, originalCdrId, reason }, 'Credit CDR generated');
+  }
+  return result.cdrData as unknown as OcpiCdr;
 }

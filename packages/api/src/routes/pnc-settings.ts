@@ -3,7 +3,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { inArray } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import {
   db,
   settings,
@@ -11,7 +11,12 @@ import {
   settingAuditLog,
   clearPncSettingsCache,
 } from '@evtivity/database';
-import { encryptString, isPrivateUrl } from '@evtivity/lib';
+import {
+  encryptString,
+  isPrivateUrl,
+  parseAllowedPrivateHosts,
+  MAX_ALLOWED_PRIVATE_HOSTS,
+} from '@evtivity/lib';
 import { decryptForRead } from '../lib/settings-crypto.js';
 import { zodSchema } from '../lib/zod-schema.js';
 import { successResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
@@ -19,6 +24,15 @@ import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { config as apiConfig } from '../lib/config.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
+
+// Plug and Charge settings and the contract CA serve every site: company-wide,
+// so a site-restricted user gets this 404 before any read or write
+// (requireAllSiteAccess, features/site-access-control.md).
+const ALL_SITES_SETTING_NOT_FOUND = {
+  error: 'Setting not found',
+  code: 'SETTING_NOT_FOUND',
+} as const;
 
 const testProviderResponse = z
   .object({ success: z.boolean().describe('Whether the provider connectivity test succeeded') })
@@ -33,11 +47,22 @@ const PNC_KEYS = [
   'pnc.hubject.tokenUrl',
   'pnc.expirationWarningDays',
   'pnc.expirationCriticalDays',
+  'pnc.ocsp.allowedPrivateHosts',
+  'pnc.local.emaidCountry',
+  'pnc.local.emaidProviderId',
 ];
+
+// Checked in the handler (parseAllowedPrivateHosts): zod-to-json-schema strips
+// .refine(), .trim(), and .toLowerCase(), and Fastify validates the body with
+// the JSON Schema only.
+const ocspAllowedHost = z.string().max(253);
 
 const updatePncSettingsBody = z.object({
   enabled: z.boolean().optional().describe('Enable or disable Plug and Charge'),
-  provider: z.enum(['manual', 'hubject']).optional().describe('PKI provider type'),
+  provider: z
+    .enum(['manual', 'hubject', 'local'])
+    .optional()
+    .describe('PKI provider type (local: the CSMS issues contract certificates from its own CA)'),
   hubjectBaseUrl: z.string().optional().describe('Hubject OPCP API base URL'),
   hubjectClientId: z.string().optional().describe('Hubject OAuth2 client ID'),
   hubjectClientSecret: z
@@ -59,6 +84,23 @@ const updatePncSettingsBody = z.object({
     .max(90)
     .optional()
     .describe('Days before certificate expiry to trigger auto-renewal'),
+  localEmaidCountry: z
+    .string()
+    .regex(/^([A-Z]{2})?$/)
+    .optional()
+    .describe('ISO 3166-1 alpha-2 country code of the eMAIDs the local contract CA issues'),
+  localEmaidProviderId: z
+    .string()
+    .regex(/^([A-Z0-9]{3})?$/)
+    .optional()
+    .describe('Three character eMobility provider ID of the eMAIDs the local contract CA issues'),
+  ocspAllowedPrivateHosts: z
+    .array(ocspAllowedHost)
+    .max(MAX_ALLOWED_PRIVATE_HOSTS)
+    .optional()
+    .describe(
+      'Private or internal hosts the CSMS may send OCSP requests to (hostname or IP, no scheme or port)',
+    ),
 });
 
 function getEncryptionKey(): string {
@@ -79,10 +121,14 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
         summary: 'Get Plug and Charge settings',
         operationId: 'getPncSettings',
         security: [{ bearerAuth: [] }],
-        response: { 200: itemResponse(z.record(z.unknown())) },
+        response: {
+          200: itemResponse(z.record(z.unknown())),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
+        },
       },
     },
-    async () => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       // Push the PNC_KEYS filter to Postgres instead of selecting every
       // settings row and discarding the rest in JS.
       const rows = await db
@@ -109,11 +155,16 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
         body: zodSchema(updatePncSettingsBody),
         response: {
           200: successResponse,
-          400: errorWith('Private url', [ERROR_CODES.PRIVATE_URL]),
+          400: errorWith('Private url or invalid OCSP host', [
+            ERROR_CODES.PRIVATE_URL,
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
         },
       },
     },
     async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof updatePncSettingsBody>;
 
       if (
@@ -124,6 +175,18 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
         await reply.status(400).send({
           error: 'Hubject base URL must not point to a private or internal address',
           code: 'PRIVATE_URL',
+        });
+        return;
+      }
+
+      const ocspHosts =
+        body.ocspAllowedPrivateHosts !== undefined
+          ? parseAllowedPrivateHosts(body.ocspAllowedPrivateHosts)
+          : undefined;
+      if (ocspHosts === null) {
+        await reply.status(400).send({
+          error: 'OCSP allowed hosts must be hostnames or IP addresses without scheme or port',
+          code: 'VALIDATION_ERROR',
         });
         return;
       }
@@ -155,6 +218,15 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
       if (body.expirationCriticalDays !== undefined) {
         updates.push({ key: 'pnc.expirationCriticalDays', value: body.expirationCriticalDays });
       }
+      if (ocspHosts !== undefined) {
+        updates.push({ key: 'pnc.ocsp.allowedPrivateHosts', value: ocspHosts });
+      }
+      if (body.localEmaidCountry !== undefined) {
+        updates.push({ key: 'pnc.local.emaidCountry', value: body.localEmaidCountry });
+      }
+      if (body.localEmaidProviderId !== undefined) {
+        updates.push({ key: 'pnc.local.emaidProviderId', value: body.localEmaidProviderId });
+      }
 
       // Snapshot prior values so the audit entries can carry an honest
       // before/after. Settings page changes for PnC are operator-visible
@@ -185,7 +257,9 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
       const actor = getAuditActor(request);
       await Promise.allSettled(
         updates
-          .filter((update) => beforeMap.get(update.key) !== update.value)
+          .filter(
+            (update) => JSON.stringify(beforeMap.get(update.key)) !== JSON.stringify(update.value),
+          )
           .map((update) =>
             writeAudit(
               { table: settingAuditLog, idColumn: 'setting_key' },
@@ -220,10 +294,12 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
           200: itemResponse(testProviderResponse),
           400: itemResponse(testProviderResponse),
           502: itemResponse(testProviderResponse),
+          404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
         },
       },
     },
-    async (_request, reply) => {
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ALL_SITES_SETTING_NOT_FOUND))) return;
       try {
         const rows = await db
           .select()
@@ -241,6 +317,32 @@ export function pncSettingsRoutes(app: FastifyInstance): void {
 
         if (providerType === 'manual') {
           return { success: true, provider: 'manual' };
+        }
+
+        if (providerType === 'local') {
+          // The local provider needs its CA and an eMAID prefix for contracts.
+          const [caRow] = await db
+            .select({ value: settings.value })
+            .from(settings)
+            .where(eq(settings.key, 'pnc.local.caEnc'));
+          const country = settingsMap.get('pnc.local.emaidCountry');
+          const providerId = settingsMap.get('pnc.local.emaidProviderId');
+          if (
+            typeof caRow?.value !== 'string' ||
+            caRow.value === '' ||
+            typeof country !== 'string' ||
+            country === '' ||
+            typeof providerId !== 'string' ||
+            providerId === ''
+          ) {
+            await reply.status(400).send({
+              success: false,
+              error:
+                'The local provider requires a contract CA and an eMAID country and provider ID',
+            });
+            return;
+          }
+          return { success: true, provider: 'local' };
         }
 
         // For Hubject, verify required fields are configured

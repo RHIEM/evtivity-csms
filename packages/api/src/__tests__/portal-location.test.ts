@@ -53,7 +53,18 @@ function makeChain() {
   return chain;
 }
 
-vi.mock('@evtivity/database', () => ({
+const { mockEvseAvailableSql, mockEvseOpenToDriversSql, mockSqlRaw } = vi.hoisted(() => ({
+  mockEvseAvailableSql: vi.fn((e: string, s: string) => `EVSE_AVAILABLE(${e},${s})`),
+  mockEvseOpenToDriversSql: vi.fn((e: string, s: string) => `EVSE_OPEN(${e},${s})`),
+  mockSqlRaw: vi.fn((text: string) => ({ raw: text })),
+}));
+
+vi.mock('@evtivity/database', async () => ({
+  ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
+  evseAvailableSql: mockEvseAvailableSql,
+  evseOpenToDriversSql: mockEvseOpenToDriversSql,
+  STARTABLE_CONNECTOR_STATUSES: ['available', 'occupied', 'preparing', 'ev_connected', 'finishing'],
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -78,7 +89,7 @@ vi.mock('drizzle-orm', () => ({
   and: vi.fn(),
   or: vi.fn(),
   ilike: vi.fn(),
-  sql: vi.fn(),
+  sql: Object.assign(vi.fn(), { raw: mockSqlRaw }),
   desc: vi.fn(),
   asc: vi.fn(),
   count: vi.fn(),
@@ -106,16 +117,16 @@ vi.mock('../services/s3.service.js', () => ({
 
 // -- Other mocks --
 
-vi.mock('../../lib/pubsub.js', () => ({
+vi.mock('@evtivity/lib/pubsub-instance', () => ({
   getPubSub: vi.fn(),
 }));
 
-vi.mock('../lib/pubsub.js', () => ({
-  getPubSub: vi.fn(),
-}));
-
-vi.mock('../lib/ocpp-command.js', () => ({
+vi.mock('@evtivity/services/ocpp-command', () => ({
   sendOcppCommandAndWait: vi.fn(),
+}));
+
+vi.mock('../lib/station-status-check.js', () => ({
+  sendStatusCheckError: vi.fn(),
   triggerAndWaitForStatus: vi.fn(),
 }));
 
@@ -123,13 +134,13 @@ vi.mock('../lib/rate-limiters.js', () => ({
   isStationCheckRateLimited: vi.fn(() => false),
 }));
 
-vi.mock('../services/stripe.service.js', () => ({
-  getStripeConfig: vi.fn(() => Promise.resolve(null)),
+vi.mock('@evtivity/payments', () => ({
+  authorizeSessionHold: vi.fn(),
 }));
 
-vi.mock('../services/tariff.service.js', () => ({
-  resolveTariff: vi.fn(() => Promise.resolve(null)),
-  isTariffFree: vi.fn(() => false),
+vi.mock('../lib/payments.js', () => ({
+  activePaymentProvider: vi.fn().mockResolvedValue(null),
+  paymentContext: vi.fn(() => ({})),
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => {
@@ -148,11 +159,11 @@ vi.mock('@evtivity/lib', async (importOriginal) => {
   };
 });
 
-vi.mock('../services/maintenance.service.js', () => ({
+vi.mock('@evtivity/services/maintenance.service', () => ({
   getActiveMaintenanceForStation: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('../lib/template-dirs.js', () => ({
+vi.mock('@evtivity/services/template-dirs', () => ({
   ALL_TEMPLATES_DIRS: [],
 }));
 
@@ -269,6 +280,50 @@ describe('Portal location routes', () => {
       expect(body.contactName).toBeNull();
       expect(body.contactEmail).toBeNull();
       expect(body.contactPhone).toBeNull();
+    });
+
+    // An operator-disabled station whose connectors still report Available was
+    // counted as available and listed as startable. Both must use the shared rule.
+    it('counts available EVSEs and flags each charger with the shared driver availability rule', async () => {
+      const site = {
+        id: 'site-003',
+        name: 'Disabled Site',
+        address: null,
+        city: null,
+        state: null,
+        postalCode: null,
+        latitude: null,
+        longitude: null,
+        hoursOfOperation: null,
+        contactName: null,
+        contactEmail: null,
+        contactPhone: null,
+        contactIsPublic: false,
+      };
+      const charger = {
+        stationId: 'CS-0250',
+        stationName: 'CS-0250',
+        evseId: 1,
+        connectorType: 'CCS2',
+        maxPowerKw: '50',
+        status: 'available',
+        available: false,
+      };
+      setupDbResults([site], [{ stationCount: 1, evseCount: 3, availableCount: 0 }], [charger]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/location/site-003',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.availableCount).toBe(0);
+      expect(body.chargers[0].available).toBe(false);
+      expect(mockEvseAvailableSql).toHaveBeenCalledWith('evses', 'charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('EVSE_AVAILABLE(evses,charging_stations)');
+      expect(mockEvseOpenToDriversSql).toHaveBeenCalledWith('evses', 'charging_stations');
+      expect(mockSqlRaw).toHaveBeenCalledWith('EVSE_OPEN(evses,charging_stations)');
     });
 
     it('returns 404 for nonexistent site', async () => {
@@ -487,7 +542,7 @@ describe('Portal location routes', () => {
       expect(body.defaultZoom).toBe(14);
     });
 
-    it('returns defaults when no settings exist', async () => {
+    it('returns the seeded default view (US center, zoom 4) when no settings exist', async () => {
       // 1. select settings (empty)
       setupDbResults([]);
 
@@ -499,9 +554,28 @@ describe('Portal location routes', () => {
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
       expect(body.apiKey).toBe('');
-      expect(body.defaultLat).toBe(37.7749);
-      expect(body.defaultLng).toBe(-122.4194);
-      expect(body.defaultZoom).toBe(12);
+      expect(body.defaultLat).toBe(39.8283);
+      expect(body.defaultLng).toBe(-98.5795);
+      expect(body.defaultZoom).toBe(4);
+    });
+
+    it('falls back per value when a stored view value is empty or not a number', async () => {
+      setupDbResults([
+        { key: 'googleMaps.defaultLat', value: '' },
+        { key: 'googleMaps.defaultLng', value: 'west' },
+        { key: 'googleMaps.defaultZoom', value: '6' },
+      ]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/chargers/map-config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.defaultLat).toBe(39.8283);
+      expect(body.defaultLng).toBe(-98.5795);
+      expect(body.defaultZoom).toBe(6);
     });
   });
 });

@@ -6,7 +6,10 @@ import { eq } from 'drizzle-orm';
 import { db, octtRuns, octtTestResults } from '@evtivity/database';
 import { runTests } from '@evtivity/octt';
 import type { OcppVersion, SutType } from '@evtivity/octt';
+import type { Redis } from 'ioredis';
+import { withLock } from '@evtivity/lib';
 import type { RedisPubSubClient } from '@evtivity/lib';
+import { config } from '../lib/config.js';
 
 export interface OcttJobData {
   runId: number;
@@ -27,8 +30,8 @@ export async function octtRunnerHandler(
     .set({ status: 'running', startedAt: new Date() })
     .where(eq(octtRuns.id, runId));
 
-  const serverUrl = process.env['OCPP_SERVER_URL'] ?? 'ws://localhost:7103';
-  const apiUrl = process.env['API_BASE_URL'] ?? 'http://localhost:7102';
+  const serverUrl = config.OCPP_SERVER_URL;
+  const apiUrl = config.API_BASE_URL;
 
   try {
     const summary = await runTests(
@@ -38,6 +41,7 @@ export async function octtRunnerHandler(
         version: ocppVersion === 'all' ? undefined : (ocppVersion as OcppVersion),
         sut: sutType as SutType,
         concurrency: 3,
+        ocspResponderUrl: config.OCTT_OCSP_RESPONDER_URL,
       },
       (result) => {
         // Insert each test result as it completes. Wrapped to surface errors;
@@ -54,6 +58,8 @@ export async function octtRunnerHandler(
             durationMs: result.result.durationMs,
             steps: result.result.steps,
             error: result.result.error ?? null,
+            notApplicableItem: result.result.notApplicable?.item ?? null,
+            notApplicableReason: result.result.notApplicable?.reason ?? null,
           })
           .then(() =>
             pubsub.publish(
@@ -85,6 +91,7 @@ export async function octtRunnerHandler(
         failed: summary.failed,
         skipped: summary.skipped,
         errors: summary.errors,
+        notApplicable: summary.notApplicable,
         durationMs: summary.durationMs,
         completedAt: new Date(),
       })
@@ -100,4 +107,26 @@ export async function octtRunnerHandler(
       .set({ status: 'failed', completedAt: new Date() })
       .where(eq(octtRuns.id, runId));
   }
+}
+
+/** Redis key held while a conformance run is in progress (ACL prefix `wkl:`). */
+export const OCTT_RUN_LOCK_KEY = 'wkl:octt-run';
+
+/** How long a queued run waits for the run in progress to finish. */
+export const OCTT_RUN_LOCK_WAIT_MS = 24 * 60 * 60_000;
+
+/**
+ * Runs one conformance run at a time across worker replicas. The OCTT worker's
+ * `concurrency: 1` holds per worker instance only, and two runs at once would
+ * drive the same test stations. A queued run waits for the lock.
+ */
+export async function octtRunnerJob(
+  lockRedis: Redis,
+  data: OcttJobData,
+  log: Logger,
+  pubsub: RedisPubSubClient,
+): Promise<void> {
+  await withLock(lockRedis, OCTT_RUN_LOCK_KEY, () => octtRunnerHandler(data, log, pubsub), {
+    acquireTimeoutMs: OCTT_RUN_LOCK_WAIT_MS,
+  });
 }

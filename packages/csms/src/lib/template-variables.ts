@@ -1,66 +1,33 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import {
+  OCPP_NOTIFICATION_EVENT_TYPES,
+  ocppNotificationEventsFor,
+} from '@evtivity/lib/notification-events';
+
 export interface TemplateVariable {
   name: string;
   description: string;
 }
 
-// Common OCPP events (both 1.6 and 2.1)
-export const OCPP_COMMON_EVENTS = [
-  'station.Connected',
-  'station.Disconnected',
-  'ocpp.Authorize',
-  'ocpp.BootNotification',
-  'ocpp.DataTransfer',
-  'ocpp.FirmwareStatusNotification',
-  'ocpp.Heartbeat',
-  'ocpp.MeterValues',
-  'ocpp.StatusNotification',
-  'ocpp.TransactionEvent',
-] as const;
+// OCPP events, from the shared list the OCPP server subscribes and the API lists.
+// Common to OCPP 1.6 and 2.1:
+export const OCPP_COMMON_EVENTS = ocppNotificationEventsFor('common');
 
-// OCPP 2.1 only events
-export const OCPP_21_EVENTS = [
-  'ocpp.BatterySwap',
-  'ocpp.ClearedChargingLimit',
-  'ocpp.Get15118EVCertificate',
-  'ocpp.GetCertificateChainStatus',
-  'ocpp.GetCertificateStatus',
-  'ocpp.LogStatusNotification',
-  'ocpp.MessageLog',
-  'ocpp.NotifyAllowedEnergyTransfer',
-  'ocpp.NotifyChargingLimit',
-  'ocpp.NotifyCustomerInformation',
-  'ocpp.NotifyDERAlarm',
-  'ocpp.NotifyDERStartStop',
-  'ocpp.NotifyDisplayMessages',
-  'ocpp.NotifyEVChargingNeeds',
-  'ocpp.NotifyEVChargingSchedule',
-  'ocpp.NotifyEvent',
-  'ocpp.NotifyMonitoringReport',
-  'ocpp.NotifyPeriodicEventStream',
-  'ocpp.NotifyPriorityCharging',
-  'ocpp.NotifyQRCodeScanned',
-  'ocpp.NotifyReport',
-  'ocpp.NotifySettlement',
-  'ocpp.NotifyWebPaymentStarted',
-  'ocpp.PublishFirmwareStatusNotification',
-  'ocpp.PullDynamicScheduleUpdate',
-  'ocpp.ReportChargingProfiles',
-  'ocpp.ReportDERControl',
-  'ocpp.ReservationStatusUpdate',
-  'ocpp.SecurityEventNotification',
-  'ocpp.SignCertificate',
-  'ocpp.VatNumberValidation',
-] as const;
+// OCPP 1.6 only:
+export const OCPP_16_EVENTS = ocppNotificationEventsFor('1.6');
+
+// OCPP 2.1 only:
+export const OCPP_21_EVENTS = ocppNotificationEventsFor('2.1');
 
 // All OCPP event types
-export const OCPP_EVENT_TYPES = [...OCPP_COMMON_EVENTS, ...OCPP_21_EVENTS] as const;
+export const OCPP_EVENT_TYPES = OCPP_NOTIFICATION_EVENT_TYPES;
 
 // Driver-facing events: notifications sent to drivers
 export const DRIVER_SESSION_EVENTS = [
   'session.Started',
+  'session.AutochargeStarted',
   'session.Updated',
   'session.Completed',
   'session.Faulted',
@@ -77,14 +44,25 @@ export const DRIVER_ACCOUNT_EVENTS = [
   'driver.PasswordChanged',
   'driver.AccountVerification',
   'driver.MfaDisabled',
+  'driver.PortalInvite',
+  'driver.RegistrationAttempt',
 ] as const;
+
+/** Driver events sent by email only. Their links act on the email address (verification, password reset), so they never go to an unverified phone. */
+export const EMAIL_ONLY_DRIVER_EVENTS: readonly string[] = [
+  'driver.AccountVerification',
+  'driver.ForgotPassword',
+  'driver.RegistrationAttempt',
+];
 
 export const DRIVER_PAYMENT_EVENTS = [
   'payment.Complete',
   'payment.Refunded',
+  'payment.FeeRefunded',
   'payment.PreAuthFailed',
   'payment.CaptureFailed',
   'payment.MissingPaymentMethod',
+  'payment.AccountCreditLimit',
 ] as const;
 
 export const DRIVER_RESERVATION_EVENTS = [
@@ -94,21 +72,38 @@ export const DRIVER_RESERVATION_EVENTS = [
   'reservation.Expiring',
   'reservation.Expired',
   'reservation.StationFaulted',
+  'reservation.TakenByOther',
 ] as const;
 
 export const DRIVER_SUPPORT_EVENTS = [
   'supportCase.Created',
   'supportCase.OperatorReply',
   'supportCase.Resolved',
+  'supportCase.AiAnswered',
 ] as const;
 
-export const DRIVER_TOKEN_EVENTS = ['token.Added', 'token.Removed', 'token.Deactivated'] as const;
+export const DRIVER_TOKEN_EVENTS = [
+  'token.Added',
+  'token.Removed',
+  'token.Deactivated',
+  'token.Reactivated',
+] as const;
 
 export const DRIVER_MFA_EVENTS = ['mfa.VerificationCode'] as const;
 
-export const DRIVER_INVOICE_EVENTS = ['invoice.Sent'] as const;
+export const DRIVER_INVOICE_EVENTS = [
+  'invoice.Sent',
+  'invoice.CreditNote',
+  'invoice.MemberInvoice',
+  'invoice.MemberCreditNote',
+  'invoice.MemberOverdue',
+] as const;
 
 export const DRIVER_WATCH_EVENTS = ['watch.StationAvailable'] as const;
+
+export const DRIVER_PREPAID_EVENTS = ['prepaid.LowCredit', 'prepaid.CreditExhausted'] as const;
+
+export const DRIVER_FLEET_EVENTS = ['fleet.AccountBillingChanged'] as const;
 
 // All driver-facing event types (for backward compat)
 export const DRIVER_EVENT_TYPES = [
@@ -122,6 +117,8 @@ export const DRIVER_EVENT_TYPES = [
   ...DRIVER_MAINTENANCE_EVENTS,
   ...DRIVER_INVOICE_EVENTS,
   ...DRIVER_WATCH_EVENTS,
+  ...DRIVER_PREPAID_EVENTS,
+  ...DRIVER_FLEET_EVENTS,
 ] as const;
 
 // Keep old names for imports that haven't been updated
@@ -140,9 +137,42 @@ export const OPERATOR_SUPPORT_EVENTS = [
   'supportCase.DriverReply',
 ] as const;
 
+// Session alerts: sent to operators who manage the session's site
+export const OPERATOR_SESSION_EVENTS = ['session.EndRequestFailed'] as const;
+
+// Site host events: notifications sent to a site's contact
+export const SITE_HOST_EVENTS = ['site.PayoutOnboarding'] as const;
+
+// Fleet billing alerts: sent to a fleet's billing contacts and the operators who manage fleets
+export const FLEET_BILLING_SYSTEM_EVENTS = [
+  'fleet.CreditLimitWarning',
+  'fleet.CreditLimitReached',
+  'fleet.InvoiceRunFailed',
+] as const;
+
+// Fleet invoices: emailed with the PDF to a fleet's billing contacts
+export const FLEET_INVOICE_EVENTS = [
+  'invoice.FleetInvoice',
+  'invoice.FleetCreditNote',
+  'invoice.FleetOverdue',
+] as const;
+
+// AI: the daily digest of AI insight actions, sent to opted-in operators who can confirm them
+export const OPERATOR_AI_EVENTS = [
+  'ai.ProposalDigest',
+  'ai.ProviderQuotaExceeded',
+  'ai.BudgetWarning',
+  'ai.BudgetExhausted',
+] as const;
+
 export const OPERATOR_EVENT_TYPES = [
   ...OPERATOR_ACCOUNT_EVENTS,
   ...OPERATOR_SUPPORT_EVENTS,
+  ...OPERATOR_SESSION_EVENTS,
+  ...SITE_HOST_EVENTS,
+  ...FLEET_BILLING_SYSTEM_EVENTS,
+  ...FLEET_INVOICE_EVENTS,
+  ...OPERATOR_AI_EVENTS,
 ] as const;
 
 export const COMMON_VARIABLES: TemplateVariable[] = [
@@ -194,6 +224,11 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'stationId', description: 'Station identifier' },
     { name: 'occurredAt', description: 'Timestamp' },
     { name: 'status', description: 'Firmware update status' },
+  ],
+  'ocpp.DiagnosticsStatus': [
+    { name: 'stationId', description: 'Station identifier' },
+    { name: 'occurredAt', description: 'Timestamp' },
+    { name: 'status', description: 'Diagnostics upload status' },
   ],
   'ocpp.Get15118EVCertificate': [
     { name: 'stationId', description: 'Station identifier' },
@@ -272,19 +307,11 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'stationId', description: 'Station identifier' },
     { name: 'occurredAt', description: 'Timestamp' },
   ],
-  'ocpp.NotifyQRCodeScanned': [
-    { name: 'stationId', description: 'Station identifier' },
-    { name: 'occurredAt', description: 'Timestamp' },
-  ],
   'ocpp.NotifyReport': [
     { name: 'stationId', description: 'Station identifier' },
     { name: 'occurredAt', description: 'Timestamp' },
   ],
   'ocpp.NotifySettlement': [
-    { name: 'stationId', description: 'Station identifier' },
-    { name: 'occurredAt', description: 'Timestamp' },
-  ],
-  'ocpp.NotifyWebPaymentStarted': [
     { name: 'stationId', description: 'Station identifier' },
     { name: 'occurredAt', description: 'Timestamp' },
   ],
@@ -345,6 +372,20 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'startedAt', description: 'Start timestamp' },
   ],
+  'session.AutochargeStarted': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'siteName', description: 'Site name' },
+    { name: 'stationId', description: 'Station identifier' },
+    { name: 'transactionId', description: 'Transaction ID' },
+    { name: 'startedAt', description: 'Start timestamp' },
+    { name: 'vehicleName', description: 'Vehicle that started the session (year, make, model)' },
+    {
+      name: 'vehiclesUrl',
+      description: 'Portal page where the driver turns Autocharge off (empty without a portal URL)',
+    },
+  ],
   'session.Updated': [
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
@@ -354,6 +395,11 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'energyDeliveredWh', description: 'Energy in Wh' },
     { name: 'currentCostCents', description: 'Current cost in cents' },
+    { name: 'costFormatted', description: 'Cost with currency, including tax' },
+    {
+      name: 'costIncludesTax',
+      description: 'Whether the cost contains tax (the tax stored with the cost); use with #if',
+    },
     { name: 'currency', description: 'Currency code' },
     { name: 'durationMinutes', description: 'Duration in minutes' },
   ],
@@ -366,10 +412,70 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'energyDeliveredWh', description: 'Energy in Wh' },
     { name: 'finalCostCents', description: 'Final cost in cents' },
+    { name: 'costFormatted', description: 'Cost with currency, including tax' },
+    {
+      name: 'costIncludesTax',
+      description: 'Whether the cost contains tax (the tax stored with the cost); use with #if',
+    },
+    {
+      name: 'taxFormatted',
+      description: 'Tax contained in the cost, with currency; empty without tax',
+    },
+    { name: 'taxCents', description: 'Tax contained in the cost in cents' },
+    { name: 'netFormatted', description: 'Cost without tax, with currency; empty without tax' },
+    {
+      name: 'taxRatePercent',
+      description: 'Tax rate in percent when all tax was charged at one rate; empty otherwise',
+    },
+    {
+      name: 'taxLinesFormatted',
+      description:
+        'Tax per rate (7%: 0.11; 19%: 0.29) when tax was charged at several rates; empty otherwise',
+    },
+    { name: 'energyCostFormatted', description: 'Energy cost incl. tax; empty when not billed' },
+    { name: 'timeCostFormatted', description: 'Time cost incl. tax; empty when not billed' },
+    { name: 'sessionFeeFormatted', description: 'Session fee incl. tax; empty when not billed' },
+    { name: 'idleCostFormatted', description: 'Idle fee charged incl. tax; empty when not billed' },
+    {
+      name: 'reservationFeeFormatted',
+      description: 'Reservation holding fee incl. tax; empty when not billed',
+    },
+    {
+      name: 'partiallyPaid',
+      description:
+        'The payment collected less than the cost (the top-up above the hold was declined); use with #if',
+    },
+    { name: 'chargedFormatted', description: 'Amount charged when partially paid, with currency' },
+    { name: 'chargedCents', description: 'Amount charged in cents' },
+    {
+      name: 'unpaidFormatted',
+      description: 'Amount still open when partially paid, with currency',
+    },
+    { name: 'unpaidCents', description: 'Amount still open in cents; 0 when fully paid' },
     { name: 'currency', description: 'Currency code' },
     { name: 'durationMinutes', description: 'Duration in minutes' },
     { name: 'startedAt', description: 'Start timestamp' },
     { name: 'endedAt', description: 'End timestamp' },
+    {
+      name: 'notCharged',
+      description:
+        'Nothing was charged: the cost is below the payment provider minimum and the hold was released; use with #if',
+    },
+    {
+      name: 'billingMode',
+      description:
+        'How the session is paid: account (billed to a fleet), card, or empty (prepaid, roaming, free vend)',
+    },
+    {
+      name: 'billedTo',
+      description:
+        'Fleet the session is billed to, no card charged (charge on account); empty otherwise, use with #if',
+    },
+    {
+      name: 'billedToMember',
+      description:
+        'The account session is invoiced to the driver each month, not to the fleet; use with #if',
+    },
   ],
   'session.Faulted': [
     { name: 'firstName', description: 'Driver first name' },
@@ -385,6 +491,10 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'siteName', description: 'Site name' },
     { name: 'stationId', description: 'Station identifier' },
     { name: 'transactionId', description: 'Transaction ID' },
+    {
+      name: 'amountFormatted',
+      description: 'Amount with currency, in the driver language (e.g. $12.50)',
+    },
     { name: 'amountCents', description: 'Payment amount in cents' },
     { name: 'currency', description: 'Currency code' },
   ],
@@ -397,7 +507,14 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'idleStartedAt', description: 'When idling started' },
     { name: 'gracePeriodMinutes', description: 'Grace period in minutes' },
-    { name: 'idleFeePricePerMinute', description: 'Idle fee rate per minute' },
+    { name: 'idleFeePricePerMinute', description: 'Idle fee rate per minute, excluding tax' },
+    {
+      name: 'idleFeeFormatted',
+      description:
+        'Idle fee per minute with currency, including or excluding tax as the driver chose; empty without an idle fee',
+    },
+    { name: 'idleFeeIncludesTax', description: 'Whether idleFeeFormatted includes tax' },
+    { name: 'taxRatePercent', description: 'Tariff tax rate in percent; empty without tax' },
     { name: 'currency', description: 'Currency code' },
   ],
   'driver.Welcome': [
@@ -410,6 +527,20 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
     { name: 'resetUrl', description: 'Password reset URL' },
+  ],
+  'driver.PortalInvite': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'activateUrl', description: 'Link to set the portal password' },
+    { name: 'expiresInDays', description: 'Days until the link expires' },
+  ],
+  'driver.RegistrationAttempt': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'signInUrl', description: 'Driver portal sign-in URL' },
+    { name: 'resetUrl', description: 'Driver portal password reset URL' },
   ],
   'driver.PasswordChanged': [
     { name: 'firstName', description: 'Driver first name' },
@@ -429,6 +560,10 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
+    {
+      name: 'amountFormatted',
+      description: 'Amount with currency, in the driver language (e.g. $12.50)',
+    },
     { name: 'amountCents', description: 'Payment amount in cents' },
     { name: 'currency', description: 'Currency code' },
     { name: 'transactionId', description: 'Transaction ID' },
@@ -437,9 +572,31 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
+    {
+      name: 'amountFormatted',
+      description: 'Refund amount with currency, in the driver language (e.g. $12.50)',
+    },
     { name: 'amountCents', description: 'Refund amount in cents' },
     { name: 'currency', description: 'Currency code' },
     { name: 'transactionId', description: 'Session ID' },
+  ],
+  'payment.FeeRefunded': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    {
+      name: 'amountFormatted',
+      description: 'Refund amount with currency, in the driver language (e.g. $5.95)',
+    },
+    { name: 'amountCents', description: 'Refund amount in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'feeType', description: 'Refunded fee: cancellation or no_show' },
+    { name: 'isNoShowFee', description: 'True for a no-show fee, false for a cancellation fee' },
+    {
+      name: 'reservationId',
+      description: 'Reservation ID (empty when the reservation was deleted)',
+    },
+    { name: 'refundedAt', description: 'Refund date and time' },
   ],
   'payment.PreAuthFailed': [
     { name: 'firstName', description: 'Driver first name' },
@@ -453,7 +610,10 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'lastName', description: 'Driver last name' },
     { name: 'stationId', description: 'Station OCPP identifier' },
     { name: 'transactionId', description: 'Transaction ID' },
-    { name: 'amountFormatted', description: 'Formatted amount (e.g. $12.50)' },
+    {
+      name: 'amountFormatted',
+      description: 'Amount with currency, in the driver language (e.g. $12.50)',
+    },
     { name: 'reason', description: 'Failure reason' },
   ],
   'payment.MissingPaymentMethod': [
@@ -462,11 +622,20 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'stationId', description: 'Station OCPP identifier' },
     { name: 'transactionId', description: 'Transaction ID' },
   ],
+  'payment.AccountCreditLimit': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'fleetName', description: 'Fleet the session is billed to' },
+    { name: 'siteName', description: 'Site name (empty when the station has no site)' },
+    { name: 'stationId', description: 'Station OCPP identifier' },
+    { name: 'transactionId', description: 'Transaction ID' },
+  ],
   'reservation.Created': [
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
-    { name: 'reservationId', description: 'Reservation ID' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
     { name: 'stationId', description: 'Station OCPP identifier' },
     { name: 'expiresAt', description: 'Expiration timestamp' },
   ],
@@ -474,9 +643,27 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
-    { name: 'reservationId', description: 'Reservation ID' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
     { name: 'stationId', description: 'Station OCPP identifier' },
-    { name: 'cancellationFeeFormatted', description: 'Formatted cancellation fee (e.g. $5.00)' },
+    { name: 'expiresAt', description: 'Expiration timestamp' },
+    {
+      name: 'cancellationFeeFormatted',
+      description:
+        'Cancellation fee charged, tax included, with currency in the driver language (e.g. $5.95); empty without a fee',
+    },
+    {
+      name: 'cancellationFeeCents',
+      description: 'Cancellation fee charged in cents, tax included',
+    },
+    { name: 'currency', description: 'Currency code' },
+    {
+      name: 'stationUnavailable',
+      description: 'True when the station went offline or faulted during the hold (no fee)',
+    },
+    {
+      name: 'stationNoResponse',
+      description: 'True when the station did not confirm the reservation (no fee)',
+    },
   ],
   'reservation.CancelledForMaintenance': [
     { name: 'firstName', description: 'Driver first name' },
@@ -498,21 +685,33 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
-    { name: 'reservationId', description: 'Reservation ID' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
+    { name: 'stationId', description: 'Station OCPP identifier' },
     { name: 'expiresAt', description: 'Expiration timestamp' },
   ],
   'reservation.Expired': [
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
-    { name: 'reservationId', description: 'Reservation ID' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
+    { name: 'stationId', description: 'Station OCPP identifier' },
+    { name: 'expiresAt', description: 'Expiration timestamp' },
   ],
   'reservation.StationFaulted': [
     { name: 'firstName', description: 'Driver first name' },
     { name: 'lastName', description: 'Driver last name' },
     { name: 'email', description: 'Driver email address' },
-    { name: 'reservationId', description: 'Reservation ID' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
     { name: 'stationId', description: 'Station OCPP identifier' },
+    { name: 'expiresAt', description: 'Expiration timestamp' },
+  ],
+  'reservation.TakenByOther': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'reservationId', description: 'Reservation ID shown on the station (OCPP id)' },
+    { name: 'stationId', description: 'Station OCPP identifier' },
+    { name: 'expiresAt', description: 'Expiration timestamp' },
   ],
   'session.Receipt': [
     { name: 'firstName', description: 'Driver first name' },
@@ -522,10 +721,70 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'transactionId', description: 'Transaction ID' },
     { name: 'energyDeliveredWh', description: 'Energy in Wh' },
     { name: 'finalCostCents', description: 'Final cost in cents' },
+    { name: 'costFormatted', description: 'Cost with currency, including tax' },
+    {
+      name: 'costIncludesTax',
+      description: 'Whether the cost contains tax (the tax stored with the cost); use with #if',
+    },
+    {
+      name: 'taxFormatted',
+      description: 'Tax contained in the cost, with currency; empty without tax',
+    },
+    { name: 'taxCents', description: 'Tax contained in the cost in cents' },
+    { name: 'netFormatted', description: 'Cost without tax, with currency; empty without tax' },
+    {
+      name: 'taxRatePercent',
+      description: 'Tax rate in percent when all tax was charged at one rate; empty otherwise',
+    },
+    {
+      name: 'taxLinesFormatted',
+      description:
+        'Tax per rate (7%: 0.11; 19%: 0.29) when tax was charged at several rates; empty otherwise',
+    },
+    { name: 'energyCostFormatted', description: 'Energy cost incl. tax; empty when not billed' },
+    { name: 'timeCostFormatted', description: 'Time cost incl. tax; empty when not billed' },
+    { name: 'sessionFeeFormatted', description: 'Session fee incl. tax; empty when not billed' },
+    { name: 'idleCostFormatted', description: 'Idle fee charged incl. tax; empty when not billed' },
+    {
+      name: 'reservationFeeFormatted',
+      description: 'Reservation holding fee incl. tax; empty when not billed',
+    },
+    {
+      name: 'partiallyPaid',
+      description:
+        'The payment collected less than the cost (the top-up above the hold was declined); use with #if',
+    },
+    { name: 'chargedFormatted', description: 'Amount charged when partially paid, with currency' },
+    { name: 'chargedCents', description: 'Amount charged in cents' },
+    {
+      name: 'unpaidFormatted',
+      description: 'Amount still open when partially paid, with currency',
+    },
+    { name: 'unpaidCents', description: 'Amount still open in cents; 0 when fully paid' },
     { name: 'currency', description: 'Currency code' },
     { name: 'durationMinutes', description: 'Duration in minutes' },
     { name: 'startedAt', description: 'Start timestamp' },
     { name: 'endedAt', description: 'End timestamp' },
+    {
+      name: 'notCharged',
+      description:
+        'Nothing was charged: the cost is below the payment provider minimum and the hold was released; use with #if',
+    },
+    {
+      name: 'billingMode',
+      description:
+        'How the session is paid: account (billed to a fleet), card, or empty (prepaid, roaming, free vend)',
+    },
+    {
+      name: 'billedTo',
+      description:
+        'Fleet the session is billed to, no card charged (charge on account); empty otherwise, use with #if',
+    },
+    {
+      name: 'billedToMember',
+      description:
+        'The account session is invoiced to the driver each month, not to the fleet; use with #if',
+    },
   ],
   'invoice.Sent': [
     { name: 'firstName', description: 'Driver first name' },
@@ -534,7 +793,97 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'status', description: 'Invoice status' },
     { name: 'issuedAt', description: 'Issued timestamp' },
     { name: 'dueAt', description: 'Due timestamp' },
-    { name: 'total', description: 'Invoice total amount' },
+    {
+      name: 'total',
+      description: 'Invoice total with currency, in the driver language (e.g. $12.50)',
+    },
+    { name: 'totalCents', description: 'Invoice total in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.CreditNote': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'creditNoteNumber', description: 'Credit note number (CN-YYYYMM-NNNN)' },
+    { name: 'invoiceNumber', description: 'Number of the invoice the credit note cancels' },
+    { name: 'creditReason', description: 'Reason the operator gave for the credit note' },
+    { name: 'issuedAt', description: 'Issued timestamp of the credit note' },
+    {
+      name: 'total',
+      description: 'Amount credited with currency, in the driver language (e.g. $12.50)',
+    },
+    { name: 'totalCents', description: 'Amount credited in cents' },
+    { name: 'currency', description: 'Currency code' },
+    {
+      name: 'wasPaid',
+      description:
+        'The cancelled invoice was already paid; the refund is made separately. Use with #if',
+    },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.MemberInvoice': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'fleetName', description: 'Fleet the sessions are charged on account of' },
+    { name: 'invoiceNumber', description: 'Invoice number (INV-YYYYMM-NNNN)' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the invoice language (e.g. September 2026)',
+    },
+    { name: 'sessionCount', description: 'Number of charging sessions on the invoice' },
+    { name: 'issuedAt', description: 'Issued timestamp' },
+    { name: 'dueAt', description: 'Due timestamp' },
+    {
+      name: 'total',
+      description: 'Invoice total with currency, in the driver language (e.g. $12.50)',
+    },
+    { name: 'totalCents', description: 'Invoice total in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.MemberCreditNote': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'fleetName', description: 'Fleet the sessions are charged on account of' },
+    { name: 'creditNoteNumber', description: 'Credit note number (CN-YYYYMM-NNNN)' },
+    { name: 'invoiceNumber', description: 'Number of the invoice the credit note cancels' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the invoice language (e.g. September 2026)',
+    },
+    { name: 'creditReason', description: 'Reason the operator gave for the credit note' },
+    { name: 'issuedAt', description: 'Issued timestamp of the credit note' },
+    {
+      name: 'total',
+      description: 'Amount credited with currency, in the driver language (e.g. $12.50)',
+    },
+    { name: 'totalCents', description: 'Amount credited in cents' },
+    { name: 'currency', description: 'Currency code' },
+    {
+      name: 'wasPaid',
+      description:
+        'The cancelled invoice was already paid; the refund is made separately. Use with #if',
+    },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.MemberOverdue': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'fleetName', description: 'Fleet the sessions are charged on account of' },
+    { name: 'invoiceNumber', description: 'Number of the overdue invoice (INV-YYYYMM-NNNN)' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the invoice language (e.g. September 2026)',
+    },
+    { name: 'sessionCount', description: 'Number of charging sessions on the invoice' },
+    { name: 'issuedAt', description: 'Issued timestamp' },
+    { name: 'dueAt', description: 'Due timestamp (passed)' },
+    {
+      name: 'total',
+      description: 'Amount due with currency, in the driver language (e.g. $12.50)',
+    },
+    { name: 'totalCents', description: 'Amount due in cents' },
+    { name: 'currency', description: 'Currency code' },
     { name: 'companyName', description: 'Company name' },
   ],
   'watch.StationAvailable': [
@@ -568,10 +917,73 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'subject', description: 'Case subject' },
     { name: 'category', description: 'Case category' },
   ],
+  'supportCase.AiAnswered': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'caseNumber', description: 'Support case number' },
+    { name: 'subject', description: 'Case subject' },
+    { name: 'category', description: 'Case category' },
+  ],
   'mfa.VerificationCode': [
     { name: 'code', description: 'Six-digit verification code' },
     { name: 'firstName', description: 'Recipient first name' },
     { name: 'email', description: 'Recipient email address' },
+  ],
+  'prepaid.LowCredit': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'idToken', description: 'Prepaid card identifier (e.g. RFID UID)' },
+    {
+      name: 'balanceFormatted',
+      description: 'Balance after the debit, with currency, in the driver language (e.g. $3.50)',
+    },
+    { name: 'balanceCents', description: 'Balance after the debit in cents' },
+    {
+      name: 'thresholdFormatted',
+      description: 'Low credit threshold with currency, in the driver language (e.g. $5.00)',
+    },
+    { name: 'currency', description: 'Currency code' },
+  ],
+  'fleet.AccountBillingChanged': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'fleetName', description: 'Fleet whose account billing or membership changed' },
+    {
+      name: 'billedTo',
+      description:
+        'Fleet the driver sessions are now billed to; empty when they pay by card, use with #if',
+    },
+    {
+      name: 'accountBilling',
+      description: 'Whether the driver sessions are now billed to a fleet; use with #if',
+    },
+    {
+      name: 'invoicedTo',
+      description:
+        'Who now gets the monthly invoice for the driver sessions: fleet, member (the driver), or empty for card',
+    },
+    {
+      name: 'invoicedToMember',
+      description: 'The driver now gets the monthly invoice for their sessions; use with #if',
+    },
+  ],
+  'prepaid.CreditExhausted': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'email', description: 'Driver email address' },
+    { name: 'idToken', description: 'Prepaid card identifier (e.g. RFID UID)' },
+    { name: 'siteName', description: 'Site name (empty when the station has no site)' },
+    { name: 'stationId', description: 'Station identifier' },
+    { name: 'transactionId', description: 'Transaction ID' },
+    {
+      name: 'creditFormatted',
+      description:
+        'Prepaid credit the session used up, with currency, in the driver language (e.g. $25.00)',
+    },
+    { name: 'currency', description: 'Currency code' },
   ],
   'token.Added': [
     { name: 'firstName', description: 'Driver first name' },
@@ -604,6 +1016,174 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'idToken', description: 'Token identifier (e.g. RFID UID)' },
     { name: 'tokenType', description: 'OCPP token type (e.g. ISO14443)' },
     { name: 'reactivatedBy', description: 'Who reactivated (driver, operator, system)' },
+  ],
+  'session.EndRequestFailed': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'email', description: 'Operator email address' },
+    { name: 'sessionId', description: 'Session ID (search for it on the Sessions page)' },
+    { name: 'stationId', description: 'Station identifier' },
+    { name: 'siteName', description: 'Site name (empty when the station has no site)' },
+    { name: 'transactionId', description: 'Transaction ID' },
+    {
+      name: 'endRequestReason',
+      description: 'Why the CSMS ended the session (Superseded, GhostRecovered, OperatorEnded)',
+    },
+    { name: 'attempts', description: 'Number of failed end attempts' },
+    { name: 'startedAt', description: 'Session start time' },
+    { name: 'endedAt', description: 'Time the session was faulted' },
+  ],
+  'fleet.CreditLimitWarning': [
+    { name: 'firstName', description: 'Operator first name (empty for a billing contact)' },
+    { name: 'lastName', description: 'Operator last name (empty for a billing contact)' },
+    { name: 'fleetName', description: 'Fleet name' },
+    {
+      name: 'exposureFormatted',
+      description:
+        'Open amount on account (unbilled, invoiced unpaid and running sessions) with currency',
+    },
+    { name: 'limitFormatted', description: 'Credit limit with currency' },
+    { name: 'exposureCents', description: 'Open amount on account in cents' },
+    { name: 'limitCents', description: 'Credit limit in cents' },
+    { name: 'warningPercent', description: 'Warning percent of the credit limit (e.g. 80)' },
+    { name: 'currency', description: 'Currency code' },
+  ],
+  'fleet.CreditLimitReached': [
+    { name: 'firstName', description: 'Operator first name (empty for a billing contact)' },
+    { name: 'lastName', description: 'Operator last name (empty for a billing contact)' },
+    { name: 'fleetName', description: 'Fleet name' },
+    {
+      name: 'exposureFormatted',
+      description:
+        'Open amount on account (unbilled, invoiced unpaid and running sessions) with currency',
+    },
+    { name: 'limitFormatted', description: 'Credit limit with currency' },
+    { name: 'exposureCents', description: 'Open amount on account in cents' },
+    { name: 'limitCents', description: 'Credit limit in cents' },
+    { name: 'warningPercent', description: 'Warning percent of the credit limit (e.g. 80)' },
+    { name: 'currency', description: 'Currency code' },
+  ],
+  'invoice.FleetInvoice': [
+    { name: 'fleetName', description: 'Fleet name' },
+    { name: 'invoiceNumber', description: 'Invoice number (INV-YYYYMM-NNNN)' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the fleet invoice language (e.g. September 2026)',
+    },
+    { name: 'sessionCount', description: 'Number of charging sessions on the invoice' },
+    { name: 'issuedAt', description: 'Issued timestamp' },
+    { name: 'dueAt', description: 'Due timestamp' },
+    { name: 'total', description: 'Invoice total with currency (e.g. $412.50)' },
+    { name: 'totalCents', description: 'Invoice total in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.FleetCreditNote': [
+    { name: 'fleetName', description: 'Fleet name' },
+    { name: 'creditNoteNumber', description: 'Credit note number (CN-YYYYMM-NNNN)' },
+    { name: 'invoiceNumber', description: 'Number of the fleet invoice the credit note cancels' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the fleet invoice language (e.g. September 2026)',
+    },
+    { name: 'creditReason', description: 'Reason the operator gave for the credit note' },
+    { name: 'issuedAt', description: 'Issued timestamp of the credit note' },
+    { name: 'total', description: 'Amount credited with currency (e.g. $412.50)' },
+    { name: 'totalCents', description: 'Amount credited in cents' },
+    { name: 'currency', description: 'Currency code' },
+    {
+      name: 'wasPaid',
+      description:
+        'The cancelled invoice was already paid; the refund is made separately. Use with #if',
+    },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.FleetOverdue': [
+    { name: 'fleetName', description: 'Fleet name' },
+    { name: 'invoiceNumber', description: 'Number of the overdue invoice (INV-YYYYMM-NNNN)' },
+    {
+      name: 'periodLabel',
+      description: 'Billed month in the fleet invoice language (e.g. September 2026)',
+    },
+    { name: 'sessionCount', description: 'Number of charging sessions on the invoice' },
+    { name: 'issuedAt', description: 'Issued timestamp' },
+    { name: 'dueAt', description: 'Due timestamp (passed)' },
+    { name: 'total', description: 'Amount due with currency (e.g. $412.50)' },
+    { name: 'totalCents', description: 'Amount due in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'fleet.InvoiceRunFailed': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'period', description: 'Month the run could not invoice (YYYY-MM)' },
+    { name: 'fleetCount', description: 'Number of fleets in this notice' },
+    { name: 'fleetNames', description: 'Names of the fleets in this notice, comma-separated' },
+    {
+      name: 'memberCount',
+      description: 'Number of member invoices (invoices to a driver of a fleet) in this notice',
+    },
+    {
+      name: 'issuedNotEmailed',
+      description:
+        'Invoices issued but not emailed: "Fleet (invoice number): last error", or "Fleet, Driver (invoice number): last error" for a member invoice, separated by "; " (empty when none)',
+    },
+    { name: 'issuedNotEmailedCount', description: 'Number of invoices issued but not emailed' },
+    {
+      name: 'notInvoiced',
+      description:
+        'Not invoiced: "Fleet: last error", or "Fleet, Driver: last error" for a member invoice, separated by "; " (empty when none)',
+    },
+    { name: 'notInvoicedCount', description: 'Number of invoices not issued' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'ai.ProposalDigest': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'digestDate', description: 'Day of the digest (YYYY-MM-DD)' },
+    {
+      name: 'pendingCount',
+      description: 'AI insight actions waiting for a decision at your sites',
+    },
+    { name: 'stuckSessionsCount', description: 'Pending actions from the stuck sessions job' },
+    { name: 'networkSummaryCount', description: 'Pending actions from the network health job' },
+    { name: 'siteCount', description: 'Number of sites with pending actions' },
+    { name: 'siteNames', description: 'Sites with pending actions, comma-separated' },
+    { name: 'insightsUrl', description: 'Link to the AI insights with a pending action' },
+  ],
+  'ai.ProviderQuotaExceeded': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'provider', description: 'AI provider id (anthropic, openai, gemini, deepseek)' },
+    { name: 'providerName', description: 'AI provider name' },
+    { name: 'since', description: 'When the provider first answered out of credit or quota' },
+  ],
+  'ai.BudgetWarning': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'scope', description: 'Budget scope: company or site' },
+    { name: 'siteName', description: 'Site name of a site budget (empty for the company budget)' },
+    { name: 'period', description: 'Month of the budget (YYYY-MM)' },
+    { name: 'percent', description: 'Share of the budget used, in percent' },
+    { name: 'usedTokens', description: 'Budget tokens used this month' },
+    { name: 'limitTokens', description: 'Monthly token budget' },
+  ],
+  'ai.BudgetExhausted': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'scope', description: 'Budget scope: company or site' },
+    { name: 'siteName', description: 'Site name of a site budget (empty for the company budget)' },
+    { name: 'period', description: 'Month of the budget (YYYY-MM)' },
+    { name: 'percent', description: 'Share of the budget used, in percent' },
+    { name: 'usedTokens', description: 'Budget tokens used this month' },
+    { name: 'limitTokens', description: 'Monthly token budget' },
+  ],
+  'site.PayoutOnboarding': [
+    { name: 'siteName', description: 'Site name' },
+    { name: 'contactName', description: 'Site contact name' },
+    { name: 'email', description: 'Site contact email address' },
+    { name: 'onboardingUrl', description: 'Link to set up the Stripe payout account' },
+    { name: 'expiresInDays', description: 'Days until the link expires' },
   ],
   'operator.UserCreated': [
     { name: 'firstName', description: 'User first name' },

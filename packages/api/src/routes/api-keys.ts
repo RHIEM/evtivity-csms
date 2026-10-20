@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { zodSchema } from '../lib/zod-schema.js';
 import {
@@ -14,11 +14,17 @@ import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
 import type { JwtPayload } from '../plugins/auth.js';
 import { createApiKey, listApiKeys, revokeApiKey } from '../services/api-key.service.js';
-import { PERMISSIONS, isSubsetOf } from '@evtivity/lib';
+import { permissionCatalog } from '@evtivity/lib';
+import {
+  canAdministerUser,
+  canGrantPermissions,
+  getUserManagementActor,
+} from '../lib/user-management-scope.js';
+import { ID_PARAMS } from '../lib/id-validation.js';
 import {
   db,
-  userPermissions,
   refreshTokens,
+  userPermissions,
   writeAudit,
   apiKeyAuditLog,
   OCTT_API_KEY_NAME,
@@ -89,6 +95,58 @@ const apiKeyCreatedItem = z
 
 const idParams = z.object({ id: z.coerce.number().int().min(1) });
 
+const userIdParams = z.object({ id: ID_PARAMS.userId.describe('User ID') });
+
+const userApiKeyParams = z.object({
+  id: ID_PARAMS.userId.describe('User ID'),
+  keyId: z.coerce.number().int().min(1).describe('API key ID'),
+});
+
+/**
+ * Whether a request may change or revoke a key with this scope. A request
+ * through an API key acts only on keys whose scope is within its own
+ * effective permissions (a narrow key never revokes or rewrites a wider
+ * one); a key without an explicit scope carries all of the user's
+ * permissions. A session (JWT) request manages every key of its user.
+ */
+async function keyScopeWithinRequest(
+  request: FastifyRequest,
+  keyPermissions: unknown,
+  userId: string,
+): Promise<boolean> {
+  if ((request.user as JwtPayload).isApiKey !== true) return true;
+  const scope = Array.isArray(keyPermissions)
+    ? (keyPermissions as string[])
+    : (
+        await db
+          .select({ permission: userPermissions.permission })
+          .from(userPermissions)
+          .where(eq(userPermissions.userId, userId))
+      ).map((r) => r.permission);
+  return canGrantPermissions(request, scope);
+}
+
+/** `keyScopeWithinRequest` for a key of the user loaded by id; false when missing. */
+async function apiKeyWithinRequestScope(
+  request: FastifyRequest,
+  id: number,
+  userId: string,
+): Promise<boolean> {
+  if ((request.user as JwtPayload).isApiKey !== true) return true;
+  const [key] = await db
+    .select({ permissions: refreshTokens.permissions })
+    .from(refreshTokens)
+    .where(
+      and(
+        eq(refreshTokens.id, id),
+        eq(refreshTokens.userId, userId),
+        eq(refreshTokens.type, 'api_key'),
+        isNull(refreshTokens.revokedAt),
+      ),
+    );
+  return key != null && (await keyScopeWithinRequest(request, key.permissions, userId));
+}
+
 export function apiKeyRoutes(app: FastifyInstance): void {
   app.get(
     '/api-keys',
@@ -116,13 +174,16 @@ export function apiKeyRoutes(app: FastifyInstance): void {
         tags: ['API Keys'],
         summary: 'Create a new API key',
         description:
-          'Generates a 64-character hex API token. The raw token is shown ONLY in this response and cannot be retrieved later (only its SHA-256 hash is stored). Copy it immediately on the client. Optional `permissions` scopes the key to a subset of the creator current permissions; `expiresInDays` sets a hard expiry. Returns 403 if requested permissions exceed the creator permissions.',
+          'Generates a 64-character hex API token. The raw token is shown ONLY in this response and cannot be retrieved later (only its SHA-256 hash is stored). Copy it immediately on the client. Optional `permissions` scopes the key to a subset of the creator current permissions; `expiresInDays` sets a hard expiry. Returns 403 if requested permissions exceed the creator permissions. Through an API key with an expiry, the new key expires no later than the calling key, and a request without `expiresInDays` answers 400 VALIDATION_ERROR.',
         operationId: 'createApiKey',
         security: [{ bearerAuth: [] }],
         body: zodSchema(createApiKeyBody),
         response: {
           201: itemResponse(apiKeyCreatedItem),
-          400: errorWith('Invalid permissions', [ERROR_CODES.INVALID_PERMISSIONS]),
+          400: errorWith('Invalid request', [
+            ERROR_CODES.INVALID_PERMISSIONS,
+            ERROR_CODES.VALIDATION_ERROR,
+          ]),
           403: errorWith('Permissions exceed own', [ERROR_CODES.PERMISSIONS_EXCEED_OWN]),
           409: errorWith('Duplicate api key name', [ERROR_CODES.DUPLICATE_API_KEY_NAME]),
         },
@@ -141,32 +202,37 @@ export function apiKeyRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const expiresAt =
+      const requested =
         body.expiresInDays != null
           ? new Date(Date.now() + body.expiresInDays * 24 * 60 * 60 * 1000)
           : null;
+      // A key created through an expiring API key never outlives it: the
+      // expiry is capped at the calling key's, and no expiry is refused.
+      const callerExpiresAt = (request.user as JwtPayload).apiKeyExpiresAt;
+      if (callerExpiresAt != null && requested == null) {
+        await reply.status(400).send({
+          error: 'A key created with an expiring API key must expire',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      const expiresAt =
+        callerExpiresAt != null && requested != null && requested > new Date(callerExpiresAt)
+          ? new Date(callerExpiresAt)
+          : requested;
 
-      // Duplicate-name check and creator-permissions lookup are independent;
-      // run them in parallel so POST /v1/api-keys pays one DB round-trip
-      // instead of two.
-      const [existingRows, creatorPermRows] = await Promise.all([
-        db
-          .select({ id: refreshTokens.id })
-          .from(refreshTokens)
-          .where(
-            and(
-              eq(refreshTokens.userId, userId),
-              eq(refreshTokens.type, 'api_key'),
-              eq(refreshTokens.name, body.name.trim()),
-              isNull(refreshTokens.revokedAt),
-            ),
-          )
-          .limit(1),
-        db
-          .select({ permission: userPermissions.permission })
-          .from(userPermissions)
-          .where(eq(userPermissions.userId, userId)),
-      ]);
+      const existingRows = await db
+        .select({ id: refreshTokens.id })
+        .from(refreshTokens)
+        .where(
+          and(
+            eq(refreshTokens.userId, userId),
+            eq(refreshTokens.type, 'api_key'),
+            eq(refreshTokens.name, body.name.trim()),
+            isNull(refreshTokens.revokedAt),
+          ),
+        )
+        .limit(1);
 
       if (existingRows[0] != null) {
         await reply.status(409).send({
@@ -177,8 +243,7 @@ export function apiKeyRoutes(app: FastifyInstance): void {
       }
 
       // Validate all permissions are in the catalog
-      const catalogSet = new Set<string>(PERMISSIONS);
-      const invalid = body.permissions.filter((p) => !catalogSet.has(p));
+      const invalid = body.permissions.filter((p) => !permissionCatalog.isKnown(p));
       if (invalid.length > 0) {
         await reply.status(400).send({
           error: `Invalid permissions: ${invalid.join(', ')}`,
@@ -187,9 +252,9 @@ export function apiKeyRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const creatorPerms = creatorPermRows.map((r) => r.permission);
-
-      if (!isSubsetOf(body.permissions, creatorPerms)) {
+      // The request's effective permissions, API key scope included: a key
+      // never mints a key beyond its own scope.
+      if (!(await canGrantPermissions(request, body.permissions))) {
         await reply.status(403).send({
           error: 'API key permissions must be a subset of your own permissions',
           code: 'PERMISSIONS_EXCEED_OWN',
@@ -255,6 +320,11 @@ export function apiKeyRoutes(app: FastifyInstance): void {
       const { userId } = request.user as JwtPayload;
       const { id } = request.params as z.infer<typeof idParams>;
 
+      // Through an API key, only a key within the request's scope.
+      if (!(await apiKeyWithinRequestScope(request, id, userId))) {
+        await reply.status(404).send({ error: 'API key not found', code: 'API_KEY_NOT_FOUND' });
+        return;
+      }
       const revoked = await revokeApiKey(id, userId);
       if (!revoked) {
         await reply.status(404).send({ error: 'API key not found', code: 'API_KEY_NOT_FOUND' });
@@ -313,14 +383,15 @@ export function apiKeyRoutes(app: FastifyInstance): void {
             isNull(refreshTokens.revokedAt),
           ),
         );
-      if (key == null) {
+      // Through an API key, only a key within the request's scope, with the
+      // same answer as a missing key.
+      if (key == null || !(await keyScopeWithinRequest(request, key.permissions, userId))) {
         await reply.status(404).send({ error: 'API key not found', code: 'API_KEY_NOT_FOUND' });
         return;
       }
 
       // Validate permissions
-      const catalogSet = new Set<string>(PERMISSIONS);
-      const invalid = body.permissions.filter((p) => !catalogSet.has(p));
+      const invalid = body.permissions.filter((p) => !permissionCatalog.isKnown(p));
       if (invalid.length > 0) {
         await reply.status(400).send({
           error: `Invalid permissions: ${invalid.join(', ')}`,
@@ -329,13 +400,9 @@ export function apiKeyRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const creatorPermRows = await db
-        .select({ permission: userPermissions.permission })
-        .from(userPermissions)
-        .where(eq(userPermissions.userId, userId));
-      const creatorPerms = creatorPermRows.map((r) => r.permission);
-
-      if (!isSubsetOf(body.permissions, creatorPerms)) {
+      // The request's effective permissions, API key scope included: a key
+      // never widens a key beyond its own scope.
+      if (!(await canGrantPermissions(request, body.permissions))) {
         await reply.status(403).send({
           error: 'API key permissions must be a subset of your own permissions',
           code: 'PERMISSIONS_EXCEED_OWN',
@@ -363,6 +430,87 @@ export function apiKeyRoutes(app: FastifyInstance): void {
         request.log,
       );
 
+      return { success: true as const };
+    },
+  );
+
+  // Another user's keys, for an admin who holds every permission of that
+  // user (canAdministerUser): list them and revoke one, for example after
+  // the user left or a key leaked. A user outside the actor's reach answers
+  // 404 like a missing one.
+  app.get(
+    '/users/:id/api-keys',
+    {
+      onRequest: [authorize('users:read')],
+      schema: {
+        tags: ['API Keys'],
+        summary: 'List the active API keys of a user',
+        description:
+          'Active API keys of another user (no token, only the last characters). Requires users:read and every permission of the target user.',
+        operationId: 'listUserApiKeys',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(userIdParams),
+        response: {
+          200: arrayResponse(apiKeyItem),
+          404: errorWith('User not found', [ERROR_CODES.USER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof userIdParams>;
+      if (!(await canAdministerUser(request, await getUserManagementActor(request), id))) {
+        await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
+        return;
+      }
+      return listApiKeys(id);
+    },
+  );
+
+  app.delete(
+    '/users/:id/api-keys/:keyId',
+    {
+      onRequest: [authorize('users:write')],
+      schema: {
+        tags: ['API Keys'],
+        summary: 'Revoke an API key of a user',
+        description:
+          'Revokes one API key of another user and writes a revoked audit row. Requires users:write and every permission of the target user.',
+        operationId: 'revokeUserApiKey',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(userApiKeyParams),
+        response: {
+          200: successResponse,
+          404: errorWith('User or API key not found', [
+            ERROR_CODES.USER_NOT_FOUND,
+            ERROR_CODES.API_KEY_NOT_FOUND,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id, keyId } = request.params as z.infer<typeof userApiKeyParams>;
+      if (!(await canAdministerUser(request, await getUserManagementActor(request), id))) {
+        await reply.status(404).send({ error: 'User not found', code: 'USER_NOT_FOUND' });
+        return;
+      }
+      const revoked = await revokeApiKey(keyId, id);
+      if (!revoked) {
+        await reply.status(404).send({ error: 'API key not found', code: 'API_KEY_NOT_FOUND' });
+        return;
+      }
+      await writeAudit(
+        { table: apiKeyAuditLog, idColumn: 'api_key_id' },
+        {
+          entityId: String(keyId),
+          entityIdSnapshot: String(keyId),
+          action: 'revoked',
+          ...getAuditActor(request),
+          after: { userId: id },
+          notes: 'Revoked by an administrator',
+        },
+        db,
+        request.log,
+      );
       return { success: true as const };
     },
   );
