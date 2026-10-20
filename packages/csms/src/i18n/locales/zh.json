@@ -2573,6 +2573,8 @@
     "content": "内容",
     "privacyPolicy": "隐私政策",
     "termsOfService": "服务条款",
+    "signedMeterData": "签名计量数据",
+    "signedMeterDataDescription": "在司机门户下载会话的签名计量数据（计量法）时显示：如何使用透明度软件进行验证。",
     "language": "语言",
     "contentSaved": "内容已保存。",
     "contentSaveFailed": "内容保存失败。",

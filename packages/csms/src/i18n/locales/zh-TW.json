@@ -2573,6 +2573,8 @@
     "content": "內容",
     "privacyPolicy": "隱私政策",
     "termsOfService": "服務條款",
+    "signedMeterData": "簽章計量資料",
+    "signedMeterDataDescription": "在駕駛入口網站下載會話的簽章計量資料（計量法）時顯示：如何使用透明度軟體進行驗證。",
     "language": "語言",
     "contentSaved": "內容已儲存。",
     "contentSaveFailed": "內容儲存失敗。",
