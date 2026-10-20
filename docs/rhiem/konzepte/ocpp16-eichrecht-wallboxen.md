@@ -1,7 +1,7 @@
 # Konzept: Eichrechtskonforme OCPP-1.6-Wallboxen (KEBA KC-P30)
 
 - **Status:** Freigegeben (30.09.2026)
-- **Stand:** 30.09.2026, geändert 30.09.2026 (3 und 4 zusammengelegt, Signatur-Feature vorerst nicht an EVtivity)
+- **Stand:** 30.09.2026, geändert 30.09.2026 (3 und 4 zusammengelegt, Signatur-Feature vorerst nicht an EVtivity), ergänzt 20.10.2026 (9: Messnachweis im Portal und auf der Rechnung)
 - **Anlass:** Erste echte Wallbox im Pilot (KEBA KC-P30, Firmware 2.1.0, OCPP 1.6J, RFID). Befunde aus der ersten Testladung am 30.09.2026 mit `v0.1.27` + RHIEM-Änderungen.
 
 ## Ziel
@@ -91,6 +91,16 @@ Zusammengelegt mit 3 (30.09.2026): Nachweis und Schlüssel gehören fachlich zus
 - Diese sieben Aufrufe geben keine Version mehr mit; die vorhandene Übersetzung (`RemoteStopTransaction` mit ganzzahliger `transactionId` usw.) greift. `triggerAndWaitForStatus()` baut versionsgerechte Nutzdaten und übergibt die Version weiterhin. Der Parameter ist dokumentiert.
 - Tests: Portal-Stopp einer 1.6-Sitzung ohne Versionsangabe; der bisherige Stationstest, der den Aufruf mit Version festschrieb, ist angepasst.
 
+### 9. Messnachweis im Portal und auf der Rechnung (im Zweig von 3, freigegeben am 20.10.2026)
+
+Abgestimmt am 20.10.2026: Die signierten Rohdaten gehören nicht auf die gedruckte Rechnung (auf Papier nicht prüfbar, bei Flottenrechnungen seitenlang, OCMF enthält die RFID-Kennung). Die Rechnung bekommt einen kurzen Prüfblock, der Nachweis selbst wird im Portal heruntergeladen.
+
+- **Rechnungs-PDF:** Unter der letzten Position jeder Sitzung eine kleine graue Zeile mit der Sitzungs-ID, wie das Portal sie zeigt (`invoice_line_items.session_id` war schon gespeichert, wurde aber nicht gedruckt). Mit signierten Daten folgen Datensatz (`PG`), Zähler (`MS`, sonst Seriennummer aus `meter_public_keys`) und in einer zweiten Zeile die signierten Zählerstände bei Beginn und Ende, mit der Zeit im Offset des Zählers und allen signierten Nachkommastellen. Unter der Tabelle steht ein Hinweis auf den Download im Portal. Texte in allen sechs Rechnungssprachen (`packages/services/src/invoice-evidence.ts`).
+- **Portal:** `GET /portal/sessions/:id/signed-meter-data` (Datensätze mit den OCMF-Messwerten) und `GET /portal/sessions/:id/signed-meter-data/xml` (Download), nur für eigene Sitzungen. Die Sitzungsseite zeigt bei abgeschlossenen Sitzungen die Karte „Messnachweis (Eichrecht)“.
+- **XML-Format:** `values.xsd` der S.A.F.E.-Transparenzsoftware (github.com/SAFE-eV/transparenzsoftware): je Datensatz ein `value` mit `transactionId` (nur ganzzahlig) und `context`, darin zuerst `publicKey` (`hex` für den DER-Schlüssel der KC-P30, sonst `base64`), dann `signedData format="OCMF"` (`plain`, bei OCPP 2.x `base64`) mit dem Datensatz unverändert.
+- **Hinweistext:** Neuer Inhaltstyp `signed-meter-data` neben Datenschutz und Nutzungsbedingungen (`content.signedMeterData.<lang>`, Einstellungen → Inhalt → Messnachweis). Standardtexte in sechs Sprachen mit Link auf die Transparenzsoftware des S.A.F.E. e.V.; eine eigene Software von KEBA ist nicht bekannt.
+- Keine Migration. Commits `a7b565c`, `efa35ae`, `50e93d5`; in `rhiem/main` mit `f5a5499`.
+
 ### Migrationen
 
 Die Tabellen aus 3 und 4 kommen als eine Migration im Namenskreis `rhiem_` ([ADR 0002](../adr/0002-eigene-datenbankmigrationen.md)), von Hand geschrieben wie bei Upstream. 1, 2 und 5 brauchen keine Migration.
@@ -107,7 +117,7 @@ Je Zweig: `npm run typecheck && npm run lint && npm test` grün, neue Tests wie 
 
 ## Bewusst nicht in diesem Schnitt
 
-- Anzeige und Export der Messnachweise, Prüfung der Signaturen, Anbindung an Transparenzsoftware.
+- Anzeige und Export der Messnachweise, Prüfung der Signaturen, Anbindung an Transparenzsoftware. Seit 9 gibt es Anzeige und Export im Portal; ein Download in der Betreiberoberfläche und eine Signaturprüfung im CSMS fehlen weiterhin.
 - Füllen von `signed_data` im OCPI-CDR.
 - Wahlweise Eingabe von Bruttopreisen.
 - Kennzeichnung von EVSE 0 (Connector 0 unter 1.6 ist die gesamte Station) und die angezeigte OCPP-URL einer Station.
