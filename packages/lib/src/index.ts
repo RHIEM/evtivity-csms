@@ -650,3 +650,10 @@ export type {
   ChargingProfileClearCriteria,
   ChargingProfileClearFilter,
 } from './charging-profile-clear.js';
+export { ocmfSessionReadings, ocmfText, parseOcmf, signedMeterDataXml } from './ocmf.js';
+export type {
+  OcmfReading,
+  OcmfRecord,
+  OcmfSessionReadings,
+  SignedMeterDataExport,
+} from './ocmf.js';
