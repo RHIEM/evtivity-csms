@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/css",
-  "version": "0.1.47-beta.1",
+  "version": "0.1.48-beta.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,12 @@
         "types": "./src/lib/iso15118-test-ev.ts",
         "default": "./dist/lib/iso15118-test-ev.js"
       }
+    },
+    "./signed-meter-values": {
+      "import": {
+        "types": "./src/signed-meter-values.ts",
+        "default": "./dist/signed-meter-values.js"
+      }
     }
   },
   "scripts": {
@@ -49,6 +55,8 @@
   "devDependencies": {
     "@types/node": "^25.2.3",
     "@types/ws": "^8.18.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "typescript": "^6.0.3",
     "vitest": "^5.0.2"
   }

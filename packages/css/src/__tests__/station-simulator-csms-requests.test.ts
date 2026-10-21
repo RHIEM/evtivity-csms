@@ -117,7 +117,11 @@ describe('RequestStartTransaction (F01/F02)', () => {
     });
     expect(res).toEqual({
       status: 'Rejected',
-      statusInfo: { reasonCode: 'Authorization rejected: Blocked' },
+      // reasonCode is a CiString20; the error text goes in additionalInfo.
+      statusInfo: {
+        reasonCode: 'InternalError',
+        additionalInfo: 'Authorization rejected: Blocked',
+      },
     });
     expect(h.sent('TransactionEvent').filter((e) => e['eventType'] === 'Started')).toHaveLength(0);
   });
@@ -310,7 +314,7 @@ describe('SetVariables (B05)', () => {
     const h = await makeHarness();
     setVar(h, 'SecurityCtrlr.SecurityProfile', '2');
     setVar(h, 'NetworkConfiguration.SecurityProfile', '2');
-    setVar(h, 'SecurityCtrlr.AllowSecurityDowngrade', 'false');
+    setVar(h, 'SecurityCtrlr.AllowSecurityProfileDowngrade', 'false');
     const down = await h.invoke('SetVariables', {
       setVariableData: [sv({ name: 'NetworkConfiguration' }, { name: 'SecurityProfile' }, '1')],
     });
@@ -319,7 +323,7 @@ describe('SetVariables (B05)', () => {
     ).toBe('Rejected');
     expect(config(h).get('NetworkConfiguration.SecurityProfile')?.value).toBe('2');
 
-    setVar(h, 'SecurityCtrlr.AllowSecurityDowngrade', 'true');
+    setVar(h, 'SecurityCtrlr.AllowSecurityProfileDowngrade', 'true');
     const allowed = await h.invoke('SetVariables', {
       setVariableData: [sv({ name: 'NetworkConfiguration' }, { name: 'SecurityProfile' }, '1')],
     });
@@ -611,7 +615,7 @@ describe('SetNetworkProfile (B09)', () => {
   it('rejects a lower security profile unless downgrades are allowed', async () => {
     const h = await makeHarness();
     setVar(h, 'SecurityCtrlr.SecurityProfile', '2');
-    setVar(h, 'SecurityCtrlr.AllowSecurityDowngrade', 'false');
+    setVar(h, 'SecurityCtrlr.AllowSecurityProfileDowngrade', 'false');
     expect(
       await h.invoke('SetNetworkProfile', {
         configurationSlot: 2,

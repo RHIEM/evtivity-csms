@@ -207,8 +207,6 @@
     "setDefaultFailed": "Standard-Zahlungsmethode konnte nicht festgelegt werden. Bitte erneut versuchen."
   },
   "profile": {
-    "title": "Profil",
-    "personalInfo": "Persönliche Daten",
     "email": "E-Mail",
     "firstName": "Vorname",
     "lastName": "Nachname",
@@ -223,7 +221,6 @@
     "passwordChangeFailed": "Passwort konnte nicht geändert werden.",
     "signOut": "Abmelden",
     "language": "Sprache",
-    "notificationPreferences": "Benachrichtigungseinstellungen",
     "emailNotifications": "E-Mail-Benachrichtigungen",
     "smsNotifications": "SMS-Benachrichtigungen",
     "preferencesSaved": "Benachrichtigungseinstellungen gespeichert.",
@@ -878,6 +875,7 @@
     "STATUS_CHECK_TIMEOUT": "Zeitüberschreitung bei der Statusabfrage. Stecker neu einstecken und erneut versuchen.",
     "SECURITY_PROFILE_DOWNGRADE": "Eine verbundene Station kann nicht auf ein niedrigeres Sicherheitsprofil gesetzt werden",
     "STATION_TLS_URL_NOT_CONFIGURED": "Die öffentliche TLS-Adresse für Stationen (OCPP_STATION_TLS_URL) ist nicht konfiguriert",
+    "STATION_ENDPOINT_URL_UNKNOWN": "Die Adresse, über die sich diese Station verbindet, ist noch nicht bekannt. Sie wird bei der nächsten Verbindung der Station gespeichert.",
     "STATION_SECURITY_CHANGE_REJECTED": "Die Station hat die Sicherheitsänderung nicht angenommen; die aktuellen Einstellungen bleiben unverändert",
     "STATION_CREDENTIALS_ROUTE_REQUIRED": "Passwoerter von Ladestationen werden mit POST /v1/stations/:id/credentials geaendert, nicht mit einem allgemeinen OCPP-Befehl",
     "WEB_PAYMENTS_NOT_SUPPORTED": "Die Ladestation unterstützt keine dynamischen QR-Codes",
@@ -934,7 +932,9 @@
       "minLength": "mindestens {{min}} Zeichen",
       "uppercase": "einen Großbuchstaben",
       "lowercase": "einen Kleinbuchstaben",
-      "number": "eine Ziffer"
+      "number": "eine Ziffer",
+      "symbol": "ein Sonderzeichen",
+      "maxLength": "höchstens {{max}} Zeichen"
     }
   },
   "activity": {

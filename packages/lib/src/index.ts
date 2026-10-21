@@ -72,6 +72,7 @@ export {
   publishOcppCommand,
   OCPP_COMMANDS_CHANNEL,
   OCPP_COMMAND_RESULTS_CHANNEL,
+  OCPP_VERSION_MISMATCH,
 } from './ocpp-command-publish.js';
 export type { OcppCommand } from './ocpp-command-publish.js';
 export { buildOcppTariff, ocppTariffConditions } from './ocpp-tariff.js';
@@ -203,12 +204,23 @@ export {
   type Pnc16MessageId,
 } from './iso15118-pnc16.js';
 export {
-  PASSWORD_MIN_LENGTH,
-  PASSWORD_RULES,
+  DEFAULT_PASSWORD_POLICY,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH_CEILING,
+  PASSWORD_MIN_LENGTH_FLOOR,
+  PASSWORD_RULE_IDS,
+  activePasswordRules,
   passwordRuleResults,
   missingPasswordRules,
+  normalizePasswordPolicy,
 } from './password-policy.js';
-export type { PasswordRule } from './password-policy.js';
+export type { PasswordPolicy, PasswordRule, PolicyRule } from './password-policy.js';
+export {
+  DEFAULT_SESSION_LIFETIMES,
+  SESSION_LIFETIME_LIMITS,
+  normalizeSessionLifetimes,
+} from './session-lifetimes.js';
+export type { SessionLifetimes } from './session-lifetimes.js';
 export { UI_LANGUAGES, isUiLanguage, toUiLanguage } from './languages.js';
 export type { UiLanguage } from './languages.js';
 export {
@@ -554,9 +566,15 @@ export type { MobileAppConfig } from './mobile-app.js';
 
 export {
   findTemplateTargetConfiguration,
+  hasConfigDrift,
   configTemplateTarget,
   configTemplateMatchesStation,
 } from './config-drift.js';
+export {
+  OCPP21_ONLY_COMPONENTS,
+  OCPP21_ONLY_VARIABLES,
+  isOcpp21OnlyVariable,
+} from './ocpp21-only-variables.js';
 export type { ReportedConfiguration, ConfigTemplateTarget } from './config-drift.js';
 
 export { storedCostBreakdown, storedSessionCostTax } from './session-tax.js';
@@ -566,7 +584,7 @@ export {
   SIMULATOR_CONNECTION_HEADER_VALUE,
 } from './simulator-connection.js';
 
-export { OCTT_TEST_DRIVER_EMAIL } from './octt-test-driver.js';
+export { OCTT_TEST_DRIVER_EMAIL, OCTT_PENDING_RESTORE_SETTING_KEY } from './octt-test-driver.js';
 
 export { tryParseJson } from './safe-json.js';
 
@@ -657,3 +675,29 @@ export type {
   OcmfSessionReadings,
   SignedMeterDataExport,
 } from './ocmf.js';
+export {
+  OCPP_PROTOCOLS,
+  OCPP21_ONLY_ACTIONS,
+  OCPP21_ONLY_MESSAGE_FORMATS,
+  OCPP21_ONLY_MESSAGE_STATES,
+  OCPP21_ONLY_MONITOR_TYPES,
+  OCPP21_ONLY_PROFILE_PURPOSES,
+  OCPP201_MESSAGE_CONTENT_MAX_LENGTH,
+  OCPP201_NETWORK_INTERFACES,
+  stationMessageContentFor,
+  isOcpp2x,
+  isOcpp21,
+  isOcpp21OnlyAction,
+  isOcpp21OnlyMessage,
+  OCPP21_ONLY_SEND_MESSAGES,
+  ocpp2xActionFitsProtocol,
+} from './ocpp-version.js';
+export {
+  OCPP21_ONLY_PERIOD_FIELDS,
+  OCPP21_ONLY_PROFILE_FIELDS,
+  OCPP21_ONLY_SCHEDULE_FIELDS,
+  chargingProfileForOcpp201,
+  ocpp201ChargingProfileRefusal,
+} from './ocpp201-charging-profile.js';
+export type { Ocpp201Refuse } from './ocpp201-charging-profile.js';
+export type { Ocpp201NetworkInterface, OcppProtocol } from './ocpp-version.js';
