@@ -76,7 +76,7 @@ export const embedWasmPlugin = {
   },
 };
 
-// The API reads the OCPP request schemas (schemas/ocpp-2.1/<Action>Request.json,
+// The API reads the OCPP request schemas (schemas/ocpp-2.1/ and ocpp-2.0.1/<Action>Request.json,
 // schemas/ocpp-1.6/<Action>.json) through packages/api/src/lib/ocpp-schema-files.ts.
 // In the bundles that module is replaced by one that embeds them, so the
 // service images need no schemas folder next to the bundle.
@@ -86,6 +86,7 @@ export function embeddedOcppSchemas() {
   const files = {};
   for (const [dir, isRequest] of [
     ['ocpp-2.1', (name) => name.endsWith('Request.json')],
+    ['ocpp-2.0.1', (name) => name.endsWith('Request.json')],
     ['ocpp-1.6', (name) => name.endsWith('.json') && !name.endsWith('Response.json')],
   ]) {
     const names = readdirSync(resolve(root, 'schemas', dir))
@@ -111,6 +112,47 @@ export const embedOcppSchemasPlugin = {
           `const FILES: Record<string, string> = ${JSON.stringify(embeddedOcppSchemas())};\n` +
           'export function readOcppSchemaFile(relativePath: string): Promise<string | null> {\n' +
           '  return Promise.resolve(Object.hasOwn(FILES, relativePath) ? FILES[relativePath] : null);\n' +
+          '}\n',
+        loader: 'ts',
+        resolveDir: dirname(args.path),
+      };
+    });
+  },
+};
+
+// The conformance runner (worker) checks every Test System and station message
+// against the OCPP schemas (packages/octt/src/ocpp-schema-check.ts), reading
+// them through packages/octt/src/ocpp-schema-files.ts. In the bundles that
+// module is replaced by one that embeds every request, response and SEND
+// schema of the three versions, so the worker image needs no schemas folder.
+const OCTT_SCHEMA_FILES_MODULE = resolve(root, 'packages/octt/src/ocpp-schema-files.ts');
+
+export function embeddedOcttSchemas() {
+  const files = {};
+  for (const dir of ['ocpp-2.1', 'ocpp-2.0.1', 'ocpp-1.6']) {
+    const names = readdirSync(resolve(root, 'schemas', dir))
+      .filter((name) => name.endsWith('.json'))
+      .sort();
+    // Fail the build when the schemas are missing (a Docker build stage without them).
+    if (names.length === 0) throw new Error(`No OCPP schemas in schemas/${dir}`);
+    for (const name of names) {
+      const content = readFileSync(resolve(root, 'schemas', dir, name), 'utf8');
+      files[`${dir}/${name}`] = JSON.stringify(JSON.parse(content));
+    }
+  }
+  return files;
+}
+
+export const embedOcttSchemasPlugin = {
+  name: 'embed-octt-schemas',
+  setup(build) {
+    build.onLoad({ filter: /ocpp-schema-files\.ts$/ }, (args) => {
+      if (args.path !== OCTT_SCHEMA_FILES_MODULE) return undefined;
+      return {
+        contents:
+          `const FILES: Record<string, string> = ${JSON.stringify(embeddedOcttSchemas())};\n` +
+          'export function readOcppSchemaText(relativePath: string): string | null {\n' +
+          '  return Object.hasOwn(FILES, relativePath) ? FILES[relativePath] : null;\n' +
           '}\n',
         loader: 'ts',
         resolveDir: dirname(args.path),
@@ -192,7 +234,7 @@ async function main() {
       minify: true,
       treeShaking: true,
       external: EXTERNAL,
-      plugins: [workspacePlugin, embedWasmPlugin, embedOcppSchemasPlugin],
+      plugins: [workspacePlugin, embedWasmPlugin, embedOcppSchemasPlugin, embedOcttSchemasPlugin],
       loader: { '.wasm': 'binary' },
       banner: { js: BANNER },
     });

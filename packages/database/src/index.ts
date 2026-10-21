@@ -413,6 +413,8 @@ export type { InvoicePaymentSettings } from './lib/system-settings.js';
 export {
   getRecaptchaConfig,
   getMfaConfig,
+  getPasswordPolicy,
+  getSessionLifetimes,
   clearSecuritySettingsCache,
 } from './lib/security-settings.js';
 export type { RecaptchaConfig, MfaConfig } from './lib/security-settings.js';
@@ -446,6 +448,7 @@ export {
   getTxEndedMeasurands,
   isIso15118Enabled,
   getDefaultMaxPowerW,
+  OCPP_SETTINGS_CACHE_TTL_MS,
 } from './lib/ocpp-settings.js';
 export {
   getRegistrationPolicy,

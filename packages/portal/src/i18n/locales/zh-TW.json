@@ -207,8 +207,6 @@
     "setDefaultFailed": "設定預設支付方式失敗，請重試。"
   },
   "profile": {
-    "title": "個人資料",
-    "personalInfo": "個人資訊",
     "email": "電子郵件",
     "firstName": "名",
     "lastName": "姓",
@@ -223,7 +221,6 @@
     "passwordChangeFailed": "修改密碼失敗。",
     "signOut": "登出",
     "language": "語言",
-    "notificationPreferences": "通知偏好",
     "emailNotifications": "郵件通知",
     "smsNotifications": "簡訊通知",
     "preferencesSaved": "通知偏好已儲存。",
@@ -878,6 +875,7 @@
     "STATUS_CHECK_TIMEOUT": "狀態檢查逾時。請重新插入連接器後重試。",
     "SECURITY_PROFILE_DOWNGRADE": "已連線的充電站不能降級至較低的安全設定檔",
     "STATION_TLS_URL_NOT_CONFIGURED": "未設定充電站的公開 TLS 位址 (OCPP_STATION_TLS_URL)",
+    "STATION_ENDPOINT_URL_UNKNOWN": "尚不知道此充電站的連線位址。充電站下次連線時會記錄該位址。",
     "STATION_SECURITY_CHANGE_REJECTED": "充電站未接受安全變更，目前設定維持不變",
     "STATION_CREDENTIALS_ROUTE_REQUIRED": "充電站密碼須透過 POST /v1/stations/:id/credentials 變更，不能使用通用 OCPP 命令",
     "WEB_PAYMENTS_NOT_SUPPORTED": "充電站不支援動態 QR 碼",
@@ -934,7 +932,9 @@
       "minLength": "至少 {{min}} 個字元",
       "uppercase": "至少一個大寫字母",
       "lowercase": "至少一個小寫字母",
-      "number": "至少一個數字"
+      "number": "至少一個數字",
+      "symbol": "至少一個特殊字元",
+      "maxLength": "最多 {{max}} 個字元"
     }
   },
   "activity": {
