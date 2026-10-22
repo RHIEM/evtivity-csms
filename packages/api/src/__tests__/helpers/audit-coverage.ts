@@ -90,6 +90,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'DELETE /stations/:id/evses/:evseId/connectors/:connectorId': { audited: 'station' },
   'DELETE /stations/:id/images/:imageId': { audited: 'station_image' },
   'DELETE /stations/:id/monitoring-rules/:ruleId': { audited: 'station' },
+  'DELETE /stations/:id/sim/match': {
+    audited: 'station',
+    service: 'database/src/lib/station-sim-match.ts',
+  },
   'DELETE /stations/:id/pricing-groups/:pricingGroupId': { audited: 'pricing_assignment' },
   'DELETE /stations/:id/web-payments': {
     audited: 'station',
@@ -105,6 +109,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'DELETE /users/:id/api-keys/:keyId': { audited: 'api_key' },
   'DELETE /users/me/chatbot-ai-config': { audited: 'user' },
   'DELETE /users/me/mfa': { audited: 'user' },
+  'DELETE /users/me/webauthn/:id': {
+    audited: 'user',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
   'DELETE /users/me/support-ai-config': { audited: 'user' },
   'PATCH /api-keys/:id': { audited: 'api_key' },
   'PATCH /assistant/conversations/:id': {
@@ -179,6 +187,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'PATCH /tokens/:id': { audited: 'token', service: 'api/src/services/token.service.ts' },
   'PATCH /users/:id': { audited: 'user' },
   'PATCH /users/me': { audited: 'user' },
+  'PATCH /users/me/webauthn/:id': {
+    audited: 'user',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
   'POST /access-logs': { allow: 'is the access log itself' },
   'POST /ad-hoc-payments': {
     audited: 'station',
@@ -221,6 +233,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'POST /auth/logout': { allow: 'auth session' },
   'POST /auth/mfa/resend': { allow: 'auth session' },
   'POST /auth/mfa/verify': { audited: 'user' },
+  'POST /auth/passkey/options': { allow: 'auth challenge, no account named yet' },
+  'POST /auth/passkey/verify': { audited: 'user' },
+  'POST /auth/webauthn/options': { allow: 'auth challenge; verifyWebauthnMfa is audited' },
+  'POST /auth/webauthn/verify': { audited: 'user' },
   'POST /auth/refresh': { allow: 'auth session' },
   'POST /auth/reset-password': { audited: 'user' },
   'POST /auth/sso/callback': { audited: 'user' },
@@ -375,6 +391,7 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     service: 'api/src/services/vehicle.service.ts',
   },
   'POST /settings/adyen/test': { allow: 'connection test, no stored state' },
+  'POST /settings/sim-providers/:provider/test': { allow: 'connection test, no stored state' },
   'POST /settings/adyen/webhook': {
     audited: 'setting',
     service: 'api/src/lib/payment-settings-writes.ts',
@@ -500,6 +517,15 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'station',
     service: 'api/src/services/station-onboarding.service.ts',
   },
+  'POST /stations/:id/sim/match/confirm': {
+    audited: 'station',
+    service: 'database/src/lib/station-sim-match.ts',
+  },
+  'POST /stations/:id/sim/network-reset': { audited: 'station' },
+  'POST /stations/:id/sim/refresh': {
+    audited: 'station',
+    service: 'database/src/lib/station-sim-match.ts',
+  },
   'POST /stations/:id/rotate-credentials': {
     audited: 'station',
     service: 'api/src/services/station-security.service.ts',
@@ -546,7 +572,24 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'POST /users/:id/reset-password': { audited: 'user' },
   'POST /users/me/change-password': { audited: 'user' },
   'POST /users/me/mfa/confirm': { audited: 'user' },
+  'POST /users/me/mfa/recovery-codes': {
+    audited: 'user',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
+  'POST /users/me/mfa/recovery-codes/webauthn-options': {
+    allow: 'challenge only; the regenerate it proves is audited',
+  },
+  'POST /users/me/mfa/factor-proof': {
+    allow: 'challenge or code only; the factor it proves for is audited when added',
+  },
+  'POST /users/me/phone-verification': {
+    allow: 'code only; the phone change it confirms is audited by PATCH /users/me',
+  },
   'POST /users/me/mfa/setup': { allow: 'unconfirmed secret; confirmMfa is audited' },
+  'POST /users/me/webauthn/registration': { audited: 'user' },
+  'POST /users/me/webauthn/registration-options': {
+    allow: 'challenge only; registerWebauthnCredential is audited',
+  },
   'POST /webhooks/payments/*': { allow: 'provider-signed webhook, no operator (see section 3)' },
   'PUT /driver-event-settings': { audited: 'notification_template' },
   'PUT /nevi/station-data/:stationId': { audited: 'station' },
@@ -560,6 +603,7 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'PUT /security/sessions': { audited: 'setting' },
   'PUT /settings/:key': { audited: 'setting' },
   'PUT /settings/adyen': { audited: 'setting', service: 'api/src/lib/payment-settings-writes.ts' },
+  'PUT /settings/sim-providers': { audited: 'setting' },
   'PUT /settings/payments': {
     audited: 'setting',
     service: 'api/src/lib/payment-settings-writes.ts',
@@ -581,6 +625,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'PUT /users/me/notification-preferences': { audited: 'user' },
   'PUT /users/me/support-ai-config': { audited: 'user' },
   'DELETE /portal/driver/mfa': { audited: 'driver' },
+  'DELETE /portal/driver/webauthn/:id': {
+    audited: 'driver',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
   'DELETE /portal/favorites/:id': { allow: 'personal favorite' },
   'DELETE /portal/notifications/push-token': { allow: 'device push token' },
   'DELETE /portal/payment-methods/:pmId': { audited: 'driver', service: 'payments/src/methods.ts' },
@@ -599,6 +647,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     service: 'api/src/services/driver-billing.service.ts',
   },
   'PATCH /portal/driver/password': { audited: 'driver' },
+  'PATCH /portal/driver/webauthn/:id': {
+    audited: 'driver',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
   'PATCH /portal/driver/profile': { audited: 'driver' },
   'PATCH /portal/payment-methods/:pmId/default': {
     audited: 'driver',
@@ -621,11 +673,17 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'POST /portal/auth/logout': { allow: 'auth session' },
   'POST /portal/auth/mfa/resend': { allow: 'auth session' },
   'POST /portal/auth/mfa/verify': { audited: 'driver' },
+  'POST /portal/auth/passkey/options': { allow: 'auth challenge, no account named yet' },
+  'POST /portal/auth/passkey/verify': { audited: 'driver' },
   'POST /portal/auth/refresh': { allow: 'auth session' },
   'POST /portal/auth/register': { audited: 'driver' },
   'POST /portal/auth/resend-verification': { allow: 'issues a verification token only' },
   'POST /portal/auth/reset-password': { audited: 'driver' },
   'POST /portal/auth/verify-email': { audited: 'driver' },
+  'POST /portal/auth/webauthn/options': {
+    allow: 'auth challenge; portalVerifyWebauthnMfa is audited',
+  },
+  'POST /portal/auth/webauthn/verify': { audited: 'driver' },
   'POST /portal/chargers/:stationId/evse/:evseId/check-status': { allow: 'OCPP read' },
   'POST /portal/chargers/:stationId/evse/:evseId/start': { audited: 'station' },
   'POST /portal/chargers/roaming/start': {
@@ -633,7 +691,24 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   },
   'POST /portal/chargers/sessions/:sessionId/stop': { audited: 'station' },
   'POST /portal/driver/mfa/confirm': { audited: 'driver' },
+  'POST /portal/driver/mfa/recovery-codes': {
+    audited: 'driver',
+    service: 'api/src/services/mfa-factor.service.ts',
+  },
+  'POST /portal/driver/mfa/factor-proof': {
+    allow: 'challenge or code only; the factor it proves for is audited when added',
+  },
+  'POST /portal/driver/phone-verification': {
+    allow: 'code only; the phone change it confirms is audited by PATCH /portal/driver/profile',
+  },
+  'POST /portal/driver/mfa/recovery-codes/webauthn-options': {
+    allow: 'challenge only; the regenerate it proves is audited',
+  },
   'POST /portal/driver/mfa/setup': { allow: 'unconfirmed secret' },
+  'POST /portal/driver/webauthn/registration': { audited: 'driver' },
+  'POST /portal/driver/webauthn/registration-options': {
+    allow: 'challenge only; portalRegisterWebauthnCredential is audited',
+  },
   'POST /portal/favorites': { allow: 'personal favorite' },
   'POST /portal/guest/check-status/:stationId/:evseId': { allow: 'OCPP read' },
   'POST /portal/guest/payment-details/:sessionToken': {
