@@ -64,8 +64,22 @@ export type { RecaptchaResult } from './recaptcha.js';
 
 export { generateTotpSecret, generateTotpUri, verifyTotpCode, matchTotpStep } from './totp.js';
 
-export { createMfaChallenge, verifyMfaChallenge, MFA_CHALLENGE_MAX_ATTEMPTS } from './mfa.js';
-export type { CreateChallengeResult, MfaChallengeResult } from './mfa.js';
+export {
+  createCappedMfaChallenge,
+  createMfaChallenge,
+  isMfaChallengeLimited,
+  verifyMfaChallenge,
+  MFA_CHALLENGE_MAX_ATTEMPTS,
+  MFA_CHALLENGE_PURPOSES,
+} from './mfa.js';
+export type {
+  CreateChallengeResult,
+  MfaChallengeLimited,
+  MfaChallengeOptions,
+  MfaChallengePurpose,
+  MfaChallengeResult,
+  MfaSendCap,
+} from './mfa.js';
 
 export type { PubSubClient, Subscription } from './pubsub.js';
 export {
@@ -221,6 +235,15 @@ export {
   normalizeSessionLifetimes,
 } from './session-lifetimes.js';
 export type { SessionLifetimes } from './session-lifetimes.js';
+export {
+  DEFAULT_MFA_CONFIG,
+  MFA_REQUIRED_MODES,
+  isMfaRequiredForRole,
+  isMfaRequiredMode,
+  normalizeMfaConfig,
+  normalizeMfaRequiredRoles,
+} from './mfa-config.js';
+export type { MfaConfig, MfaRequiredMode } from './mfa-config.js';
 export { UI_LANGUAGES, isUiLanguage, toUiLanguage } from './languages.js';
 export type { UiLanguage } from './languages.js';
 export {
@@ -342,7 +365,6 @@ export {
   sendEmail,
   sendSms,
   sendWebhook,
-  normalizeE164,
   logNotification,
   dispatchDriverNotification,
   dispatchSystemNotification,
@@ -532,6 +554,8 @@ export {
   CSS_STATUS_REPORTING_KEY,
   CSS_STATUS_REPORTING_VALUES,
   CSS_STATUS_REPORTING_DEFAULT,
+  CSS_SIGNAL_STRENGTH_KEY,
+  CSS_SIGNAL_STRENGTH_DEFAULT_DBM,
   cssSecurityCtrlrDefaults,
 } from './css-config-defaults.js';
 export type {
@@ -587,6 +611,30 @@ export {
 export { OCTT_TEST_DRIVER_EMAIL, OCTT_PENDING_RESTORE_SETTING_KEY } from './octt-test-driver.js';
 
 export { tryParseJson } from './safe-json.js';
+
+export { normalizeIccid, isValidIccid, iccidsMatch, iccidChanged } from './iccid.js';
+
+export {
+  SIM_SETTING_KEYS,
+  SIM_SETTING_KEY_LIST,
+  SIM_RETENTION_DAYS,
+  SIM_FETCH_DAYS,
+  SIM_REFRESH_DAY_OPTIONS,
+  SIM_RANGE_MAX_DAYS,
+  SIM_SIGNAL_DBM,
+  SIM_SIGNAL_DEFAULTS,
+  SIM_OCPP16_SIGNAL_KEYS_LIMITS,
+  SIM_HOLOGRAM_ORG_ID_MAX_DIGITS,
+  isHologramOrgId,
+  isSimRetentionDays,
+  isSimFetchDays,
+  isSimSignalDbm,
+  parseOcpp16SignalKeys,
+  normalizeSimGeneralSettings,
+} from './sim-settings.js';
+export type { SimGeneralSettings } from './sim-settings.js';
+export { SIGNAL_ASU_UNKNOWN, asuToDbm, gradeSignal, readSignalStrength } from './signal-grade.js';
+export type { SignalGrade, SignalReading, SignalThresholds, SignalUnit } from './signal-grade.js';
 
 export { reservationHoldingMinutes } from './reservation-holding.js';
 
@@ -701,3 +749,5 @@ export {
 } from './ocpp201-charging-profile.js';
 export type { Ocpp201Refuse } from './ocpp201-charging-profile.js';
 export type { Ocpp201NetworkInterface, OcppProtocol } from './ocpp-version.js';
+export { hasAmbiguousPathEncoding } from './request-path.js';
+export { canonicalPhone, normalizeE164 } from './phone.js';

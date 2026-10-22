@@ -2926,6 +2926,38 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     },
   ),
 
+  // SIM provider settings (company-wide)
+  c(
+    'GET',
+    '/settings/sim-providers',
+    'settings.integrations:read',
+    () => '/settings/sim-providers',
+    'SETTING_NOT_FOUND',
+  ),
+  c(
+    'PUT',
+    '/settings/sim-providers',
+    'settings.integrations:write',
+    () => '/settings/sim-providers',
+    'SETTING_NOT_FOUND',
+    { body: () => ({}) },
+  ),
+  c(
+    'POST',
+    '/settings/sim-providers/:provider/test',
+    'settings.integrations:write',
+    () => '/settings/sim-providers/hologram/test',
+    'SETTING_NOT_FOUND',
+    {
+      body: () => ({}),
+      control: ctl(
+        400,
+        'SIM_PROVIDER_NOT_CONFIGURED',
+        'no SIM provider is on in the test database',
+      ),
+    },
+  ),
+
   // stations
   l('/stations', 'stations:read', undefined, { unsited: true }),
   s('GET', '/stations/:id', 'stations:read', st, 'STATION_NOT_FOUND', { unsited: true }),
@@ -3411,6 +3443,83 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'STATION_NOT_FOUND',
     {
       unsited: true,
+    },
+  ),
+  // station SIM (feature off in the test database: the control gets its 400)
+  s('GET', '/stations/:id/sim', 'stations:read', (f) => `${st(f)}/sim`, 'STATION_NOT_FOUND', {
+    unsited: true,
+    adminStatus: 400,
+  }),
+  s(
+    'GET',
+    '/stations/:id/sim/timeline',
+    'stations:read',
+    (f) => `${st(f)}/sim/timeline`,
+    'STATION_NOT_FOUND',
+    { unsited: true, adminStatus: 400 },
+  ),
+  s(
+    'POST',
+    '/stations/:id/sim/refresh',
+    'stations:read',
+    (f) => `${st(f)}/sim/refresh`,
+    'STATION_NOT_FOUND',
+    {
+      unsited: true,
+      body: () => ({}),
+      control: ctl(
+        400,
+        'SIM_FEATURE_DISABLED',
+        'no SIM provider is on in the test database, checked after the site check',
+      ),
+    },
+  ),
+  s(
+    'POST',
+    '/stations/:id/sim/network-reset',
+    'stations:write',
+    (f) => `${st(f)}/sim/network-reset`,
+    'STATION_NOT_FOUND',
+    {
+      unsited: true,
+      body: () => ({}),
+      control: ctl(
+        400,
+        'SIM_PROVIDER_NOT_CONFIGURED',
+        'no SIM provider is on in the test database, checked after the site check',
+      ),
+    },
+  ),
+  s(
+    'DELETE',
+    '/stations/:id/sim/match',
+    'stations:write',
+    (f) => `${st(f)}/sim/match`,
+    'STATION_NOT_FOUND',
+    {
+      unsited: true,
+      control: ctl(
+        400,
+        'SIM_PROVIDER_NOT_CONFIGURED',
+        'no SIM provider is on in the test database, checked after the site check',
+      ),
+    },
+  ),
+  // Confirm SIM needs access to every site: a site-restricted admin gets 404
+  // even for a station of its own site.
+  c(
+    'POST',
+    '/stations/:id/sim/match/confirm',
+    'stations:write',
+    (f) => `${st(f)}/sim/match/confirm`,
+    'STATION_NOT_FOUND',
+    {
+      body: () => ({ matchedAt: '2026-10-21T00:00:00.000Z' }),
+      control: ctl(
+        400,
+        'SIM_PROVIDER_NOT_CONFIGURED',
+        'no SIM provider is on in the test database, checked after the site check',
+      ),
     },
   ),
   s(
@@ -4356,6 +4465,10 @@ export const SITE_ISOLATION_ALLOWLIST: AllowlistEntry[] = [
       ['POST', '/auth/force-change-password'],
       ['POST', '/auth/mfa/verify'],
       ['POST', '/auth/mfa/resend'],
+      ['POST', '/auth/webauthn/options'],
+      ['POST', '/auth/webauthn/verify'],
+      ['POST', '/auth/passkey/options'],
+      ['POST', '/auth/passkey/verify'],
     ] as const
   ).map(([method, path]) => ({ method, path, reason: 'authentication' })),
   ...(
@@ -4366,7 +4479,16 @@ export const SITE_ISOLATION_ALLOWLIST: AllowlistEntry[] = [
       ['GET', '/users/me/mfa'],
       ['POST', '/users/me/mfa/setup'],
       ['POST', '/users/me/mfa/confirm'],
+      ['POST', '/users/me/mfa/recovery-codes'],
+      ['POST', '/users/me/mfa/recovery-codes/webauthn-options'],
+      ['POST', '/users/me/mfa/factor-proof'],
+      ['POST', '/users/me/phone-verification'],
       ['DELETE', '/users/me/mfa'],
+      ['POST', '/users/me/webauthn/registration-options'],
+      ['POST', '/users/me/webauthn/registration'],
+      ['GET', '/users/me/webauthn'],
+      ['PATCH', '/users/me/webauthn/:id'],
+      ['DELETE', '/users/me/webauthn/:id'],
       ['GET', '/users/me/notification-preferences'],
       ['PUT', '/users/me/notification-preferences'],
       ['GET', '/users/me/chatbot-ai-config'],

@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/portal",
-  "version": "0.1.48-beta.1",
+  "version": "0.1.48-beta.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@evtivity/lib": "*",
     "@googlemaps/js-api-loader": "^2.0.2",
+    "@simplewebauthn/browser": "^14.0.0",
     "@stripe/react-stripe-js": "^7.0.0",
     "@stripe/stripe-js": "^10.0.0",
     "@tailwindcss/typography": "^0.5.19",
@@ -45,7 +46,7 @@
     "jsdom": "^30.1.2",
     "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
-    "vite": "^8.0.0",
+    "vite": "^8.3.5",
     "vitest": "^5.0.2"
   }
 }
