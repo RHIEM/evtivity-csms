@@ -1,8 +1,15 @@
 # Bezeichnung für Tokens
 
-- **Status:** Freigegeben (03.11.2026)
-- **Zweig:** `feature/driver-token-label` (Basis `v0.1.49-beta.8`)
-- **Upstream:** Feature Request geplant (Entwurf liegt vor), PR folgt
+- **Status:** Freigegeben (03.11.2026), umgesetzt (`50543942`), noch nicht in `rhiem/main`
+- **Zweig:** `feature/driver-token-label` (Basis `v0.1.49-beta.8`), Migration `rhiem_0004_driver_token_label`
+- **Upstream:** Feature Request [#48](https://github.com/EVtivity/evtivity-csms/issues/48) (03.11.2026), PR folgt nach Rückmeldung
+- **Geprüft:** typecheck, lint, format:check, check:migrations, alle Tests (29.383; ein Timeout in `FleetReservationsTab` lief einzeln grün)
+
+## Abweichung von der Planung
+
+- Die Fahrer-Token-Route `POST /drivers/:id/tokens` (Formular „Token für Fahrer anlegen“) nimmt die Bezeichnung ebenfalls an.
+- Im Portal-PATCH wird „mindestens eines von `isActive` und `label`“ im Handler geprüft. Ein `.refine` landet nicht im JSON-Schema, mit dem Fastify validiert.
+- Die Token-Detailseite zeigt die Bezeichnung zusätzlich unter der Überschrift.
 
 ## Ausgangslage
 
