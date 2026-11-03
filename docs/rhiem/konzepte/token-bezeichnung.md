@@ -1,9 +1,9 @@
 # Bezeichnung für Tokens
 
-- **Status:** Freigegeben (03.11.2026), umgesetzt (`50543942`), noch nicht in `rhiem/main`
+- **Status:** Freigegeben (03.11.2026), umgesetzt (`50543942`), in `rhiem/main` mit `b9eee7fd`
 - **Zweig:** `feature/driver-token-label` (Basis `v0.1.49-beta.8`), Migration `rhiem_0004_driver_token_label`
-- **Upstream:** Feature Request [#48](https://github.com/EVtivity/evtivity-csms/issues/48) (03.11.2026), PR folgt nach Rückmeldung
-- **Geprüft:** typecheck, lint, format:check, check:migrations, alle Tests (29.383; ein Timeout in `FleetReservationsTab` lief einzeln grün)
+- **Upstream:** Vorschlag als Discussion [#49](https://github.com/EVtivity/evtivity-csms/discussions/49) („Ideas“, 03.11.2026; zuerst irrtümlich als Issue #48 angelegt und geschlossen), PR folgt nach Rückmeldung
+- **Geprüft:** auf dem Zweig typecheck, lint, format:check, check:migrations, alle Tests (29.383; ein Timeout in `FleetReservationsTab` lief einzeln grün); nach dem Merge auf `rhiem/main` erneut alles grün (29.421 Tests, Journal: `rhiem_0004` mit `idx` 240 hinter `0482`)
 
 ## Abweichung von der Planung
 
