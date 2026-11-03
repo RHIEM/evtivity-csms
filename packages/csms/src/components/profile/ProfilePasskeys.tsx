@@ -11,6 +11,7 @@ import {
 } from '@simplewebauthn/browser';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -24,6 +25,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { CancelButton } from '@/components/cancel-button';
+import { SaveButton } from '@/components/save-button';
 import { EditIconButton } from '@/components/edit-icon-button';
 import { RemoveIconButton } from '@/components/remove-icon-button';
 import { LoadingLogo } from '@/components/loading-logo';
@@ -38,7 +40,7 @@ import { usePrefetchedOptions } from '@/hooks/use-prefetched-options';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
-import { passkeyDefaultNameKey, passkeyErrorText, webauthnSupported } from '@/lib/webauthn';
+import { passkeyDefaultNameKey, passkeyErrorText, webauthnUnavailableReason } from '@/lib/webauthn';
 import { RecoveryCodesDisplay } from './RecoveryCodesDisplay';
 import { MFA_STATUS_KEY, PASSKEYS_KEY, useMfaStatus } from './mfa-status';
 
@@ -257,9 +259,7 @@ function NamePasskeyForm({
         </p>
       )}
       <div className="flex flex-wrap gap-2">
-        <Button type="submit" disabled={mutation.isPending}>
-          {mutation.isPending ? t('common.saving') : t('common.save')}
-        </Button>
+        <SaveButton isPending={mutation.isPending} />
         <Button type="button" variant="outline" onClick={onDone}>
           {t('passkeys.keepName')}
         </Button>
@@ -277,7 +277,8 @@ export function ProfilePasskeys(): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const timezone = useUserTimezone();
-  const supported = webauthnSupported();
+  const unavailable = webauthnUnavailableReason();
+  const supported = unavailable == null;
   const { data: status } = useMfaStatus();
   const {
     data: credentials,
@@ -356,10 +357,16 @@ export function ProfilePasskeys(): React.JSX.Element {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {!supported && (
-          <Alert variant="info">
+        {unavailable != null && (
+          <Alert variant="info" data-testid="passkey-unavailable">
             <Info className="h-4 w-4" />
-            <AlertDescription>{t('passkeys.needsSecurePage')}</AlertDescription>
+            <AlertDescription>
+              {t(
+                unavailable === 'insecure'
+                  ? 'passkeys.needsSecurePage'
+                  : 'passkeys.browserUnsupported',
+              )}
+            </AlertDescription>
           </Alert>
         )}
         {supported && !enabled && (
@@ -371,10 +378,11 @@ export function ProfilePasskeys(): React.JSX.Element {
         {isLoading ? (
           <LoadingLogo size="inline" />
         ) : isError ? (
-          <div className="space-y-2">
-            <p className="text-sm text-destructive">{t('common.loadError')}</p>
+          <div className="flex flex-col items-center gap-3">
+            <p className="text-center text-sm text-destructive">{t('common.loadError')}</p>
             <Button
               variant="outline"
+              size="sm"
               onClick={() => {
                 void refetch();
               }}
@@ -478,14 +486,12 @@ export function ProfilePasskeys(): React.JSX.Element {
         ) : (
           supported &&
           enabled && (
-            <Button
-              variant="outline"
+            <CreateButton
+              label={t('passkeys.add')}
               onClick={() => {
                 setAdding(true);
               }}
-            >
-              {t('passkeys.add')}
-            </Button>
+            />
           )
         )}
       </CardContent>

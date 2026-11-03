@@ -1,13 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 
 interface MarketingSettingsProps {
@@ -18,18 +19,22 @@ export function MarketingSettings({ settings }: MarketingSettingsProps): React.J
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [gtagPortal, setGtagPortal] = useState('');
-  const [gtagCsms, setGtagCsms] = useState('');
-
-  useEffect(() => {
-    if (settings == null) return;
+  const loaded = useMemo(() => {
     const s = (key: string): string => {
-      const v = settings[key];
+      const v = settings?.[key];
       return typeof v === 'string' || typeof v === 'number' ? String(v) : '';
     };
-    setGtagPortal(s('marketing.gtagPortal'));
-    setGtagCsms(s('marketing.gtagCsms'));
+    return { gtagPortal: s('marketing.gtagPortal'), gtagCsms: s('marketing.gtagCsms') };
   }, [settings]);
+  // A settings reload replaces the values only while they are unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded);
+  const { gtagPortal, gtagCsms } = values;
+  const setGtagPortal = (gtagPortal: string): void => {
+    setValues((v) => ({ ...v, gtagPortal }));
+  };
+  const setGtagCsms = (gtagCsms: string): void => {
+    setValues((v) => ({ ...v, gtagCsms }));
+  };
 
   const marketingMutation = useMutation({
     mutationFn: (vals: { gtagPortal: string; gtagCsms: string }) =>
@@ -86,7 +91,12 @@ export function MarketingSettings({ settings }: MarketingSettingsProps): React.J
           isPending={marketingMutation.isPending}
           type="button"
           onClick={() => {
-            marketingMutation.mutate({ gtagPortal, gtagCsms });
+            const sent = { gtagPortal, gtagCsms };
+            marketingMutation.mutate(sent, {
+              onSuccess: () => {
+                takeNextLoad(sent);
+              },
+            });
           }}
         />
         {marketingMutation.isSuccess && (

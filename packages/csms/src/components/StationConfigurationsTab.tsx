@@ -6,7 +6,7 @@ import { Link } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Pencil, RefreshCw, RotateCcw, Upload } from 'lucide-react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Table,
@@ -23,15 +23,18 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
+import { Tooltip } from '@/components/ui/tooltip';
+import { isBootOwnedStationSetting } from '@evtivity/lib/station-data-plan';
 import { Select } from '@/components/ui/select';
 import { SearchInput } from '@/components/search-input';
 import { Pagination } from '@/components/ui/pagination';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { useToast } from '@/components/ui/toast';
-import { LoadingLogo } from '@/components/loading-logo';
+import { useCanSendOcppCommand } from '@/lib/ocpp-command-access';
 
 interface StationVariable {
   id: number;
@@ -65,6 +68,9 @@ interface Props {
   ocppProtocol: string | null;
 }
 
+/** A toolbar button label shown on phones and from 85rem, icon only (screen reader text) between. */
+const COMPACT_LABEL = 'sm:max-[85rem]:sr-only';
+
 export function StationConfigurationsTab({
   stationId,
   stationOcppId,
@@ -77,6 +83,11 @@ export function StationConfigurationsTab({
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
   const limit = 25;
+
+  // Pushing a configuration template needs settings.stationConfig:write;
+  // the button is hidden without it.
+  const canSend = useCanSendOcppCommand();
+  const canPush = canSend('SetVariables');
 
   const [spinning, setSpinning] = useState(false);
   const refreshMutation = useMutation({
@@ -179,7 +190,7 @@ export function StationConfigurationsTab({
     setPushResult(null);
   }
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['stations', stationId, 'configurations', page, search],
     queryFn: () => {
       const params = new URLSearchParams({ page: String(page), limit: String(limit) });
@@ -191,92 +202,122 @@ export function StationConfigurationsTab({
   });
 
   const totalPages = data != null ? Math.ceil(data.total / limit) : 1;
+  const refreshLabel = isRefreshing
+    ? t('stations.refreshing')
+    : t('stations.refreshConfigurations');
 
   return (
-    <Card>
-      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle>{t('stations.configurations')}</CardTitle>
-        <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-          <SearchInput
-            value={search}
-            onDebouncedChange={(v) => {
-              setSearch(v);
-              setPage(1);
-            }}
-            placeholder={t('common.search')}
-          />
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!isOnline || isRefreshing}
-            onClick={() => {
-              refreshMutation.mutate();
-            }}
+    <>
+      <TabPanel
+        title={t('stations.configurations')}
+        isLoading={isLoading}
+        isError={isError}
+        onRetry={() => {
+          void refetch();
+        }}
+        isEmpty={data == null || data.data.length === 0}
+        emptyMessage={t('stations.noConfigurations')}
+        actionsPosition="fill"
+        actions={
+          // One row from sm: the search field takes the room the buttons leave (at least
+          // 10rem). Below 85rem the three labels do not fit next to it with the sidebar
+          // open, so the buttons show their icon only there (label kept for screen
+          // readers and as the tooltip). On phones each control takes its own row.
+          <div
+            className="flex w-full flex-wrap items-center gap-2 sm:justify-end"
+            data-testid="station-configurations-toolbar"
           >
-            <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-            {isRefreshing ? t('stations.refreshing') : t('stations.refreshConfigurations')}
-          </Button>
-          {defaultTemplate != null && (
-            <Link to={`/station-configurations/${defaultTemplate.id}`}>
-              <Button variant="outline" size="sm">
+            <SearchInput
+              value={search}
+              onDebouncedChange={(v) => {
+                setSearch(v);
+                setPage(1);
+              }}
+              placeholder={t('common.search')}
+              className="w-full sm:w-auto sm:min-w-40 sm:flex-1"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              className="grow sm:grow-0"
+              title={refreshLabel}
+              disabled={!isOnline || isRefreshing}
+              onClick={() => {
+                refreshMutation.mutate();
+              }}
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span className={COMPACT_LABEL}>{refreshLabel}</span>
+            </Button>
+            {defaultTemplate != null && (
+              <Link
+                to={`/station-configurations/${defaultTemplate.id}`}
+                className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'grow sm:grow-0')}
+                title={t('stations.editStationConfiguration')}
+              >
                 <Pencil className="h-4 w-4" />
-                {t('stations.editStationConfiguration')}
+                <span className={COMPACT_LABEL}>{t('stations.editStationConfiguration')}</span>
+              </Link>
+            )}
+            {canPush && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="grow sm:grow-0"
+                title={t('stations.pushConfiguration')}
+                disabled={!isOnline}
+                onClick={handleOpenPush}
+              >
+                <Upload className="h-4 w-4" />
+                <span className={COMPACT_LABEL}>{t('stations.pushConfiguration')}</span>
               </Button>
-            </Link>
-          )}
-          <Button variant="outline" size="sm" disabled={!isOnline} onClick={handleOpenPush}>
-            <Upload className="h-4 w-4" />
-            {t('stations.pushConfiguration')}
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <LoadingLogo size="inline" />
-        ) : data == null || data.data.length === 0 ? (
-          <p className="text-center text-sm text-muted-foreground">
-            {t('stations.noConfigurations')}
-          </p>
-        ) : (
-          <>
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>{t('stations.component')}</TableHead>
-                    <TableHead>{t('stations.variable')}</TableHead>
-                    <TableHead>{t('common.value')}</TableHead>
-                    <TableHead>{t('common.type')}</TableHead>
-                    <TableHead>{t('common.source')}</TableHead>
+            )}
+          </div>
+        }
+      >
+        <>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('stations.component')}</TableHead>
+                  <TableHead>{t('stations.variable')}</TableHead>
+                  <TableHead>{t('common.value')}</TableHead>
+                  <TableHead>{t('common.type')}</TableHead>
+                  <TableHead>{t('common.source')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(data?.data ?? []).map((v) => (
+                  <TableRow key={v.id}>
+                    <TableCell className="text-xs">
+                      {v.component}
+                      {v.instance != null ? ` (${v.instance})` : ''}
+                      {v.evseId != null ? ` EVSE ${String(v.evseId)}` : ''}
+                      {v.connectorId != null ? ` Con ${String(v.connectorId)}` : ''}
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      {v.variable}
+                      {v.variableInstance != null ? ` (${v.variableInstance})` : ''}
+                      {isBootOwnedStationSetting(ocppProtocol, v.component, v.variable) && (
+                        <Tooltip content={t('dataPlan.fromDataPlanHint')}>
+                          <Badge variant="outline" className="ml-2">
+                            {t('dataPlan.fromDataPlan')}
+                          </Badge>
+                        </Tooltip>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs max-w-xs truncate">{v.value ?? 'n/a'}</TableCell>
+                    <TableCell className="text-xs">{v.attributeType}</TableCell>
+                    <TableCell className="text-xs">{v.source}</TableCell>
                   </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data.data.map((v) => (
-                    <TableRow key={v.id}>
-                      <TableCell className="text-xs">
-                        {v.component}
-                        {v.instance != null ? ` (${v.instance})` : ''}
-                        {v.evseId != null ? ` EVSE ${String(v.evseId)}` : ''}
-                        {v.connectorId != null ? ` Con ${String(v.connectorId)}` : ''}
-                      </TableCell>
-                      <TableCell className="text-xs">
-                        {v.variable}
-                        {v.variableInstance != null ? ` (${v.variableInstance})` : ''}
-                      </TableCell>
-                      <TableCell className="text-xs max-w-xs truncate">
-                        {v.value ?? 'n/a'}
-                      </TableCell>
-                      <TableCell className="text-xs">{v.attributeType}</TableCell>
-                      <TableCell className="text-xs">{v.source}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
-          </>
-        )}
-      </CardContent>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+        </>
+      </TabPanel>
 
       {/* Push Configuration dialog */}
       <Dialog open={pushDialogOpen} onOpenChange={setPushDialogOpen}>
@@ -387,6 +428,6 @@ export function StationConfigurationsTab({
           rebootMutation.mutate();
         }}
       />
-    </Card>
+    </>
   );
 }

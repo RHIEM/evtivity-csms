@@ -16,7 +16,8 @@ import {
 } from '@/components/ui/table';
 import { formatDate } from '@/lib/timezone';
 import type { ColumnMeta, ColumnVisibility } from '@/lib/column-visibility';
-import { LoadingLogo } from '@/components/loading-logo';
+import { EmptyState, ErrorState, LoadingState, TableStateRow } from '@/components/ui/content-state';
+import { AccountAvatar, type AvatarData } from '@/components/AccountAvatar';
 
 export const DRIVERS_COLUMNS: ColumnMeta[] = [
   {
@@ -49,6 +50,8 @@ export interface Driver {
   /** Set when the personal data was erased: the name is blank. */
   erasedAt?: string | null;
   createdAt: string;
+  /** The avatar the driver set in the portal or app. */
+  avatar?: AvatarData | null;
 }
 
 /** An extra column a caller adds before the remove button (the fleet member billing switch). */
@@ -64,6 +67,8 @@ interface DriversTableProps {
   onPageChange: (page: number) => void;
   timezone: string;
   isLoading?: boolean;
+  isError?: boolean;
+  onRetry?: (() => void) | undefined;
   emptyMessage?: string;
   onRemove?: (driverId: string) => void;
   removeDisabled?: boolean;
@@ -75,6 +80,8 @@ export function DriversTable({
   drivers,
   timezone,
   isLoading,
+  isError = false,
+  onRetry,
   emptyMessage,
   onRemove,
   removeDisabled,
@@ -106,11 +113,14 @@ export function DriversTable({
           </TableHeader>
           <TableBody>
             {isLoading === true && (
-              <TableRow>
-                <TableCell colSpan={colSpan} className="text-center text-muted-foreground">
-                  <LoadingLogo size="inline" />
-                </TableCell>
-              </TableRow>
+              <TableStateRow colSpan={colSpan}>
+                <LoadingState />
+              </TableStateRow>
+            )}
+            {isError && isLoading !== true && (
+              <TableStateRow colSpan={colSpan}>
+                <ErrorState onRetry={onRetry} />
+              </TableStateRow>
             )}
             {drivers?.map((driver) => (
               <TableRow
@@ -126,9 +136,18 @@ export function DriversTable({
                 )}
                 {isVisible('driverName') && (
                   <TableCell className="font-medium text-link" data-testid="row-click-target">
-                    {driver.erasedAt != null
-                      ? t('drivers.erasedName')
-                      : `${driver.firstName} ${driver.lastName}`}
+                    <span className="inline-flex items-center gap-2">
+                      {driver.erasedAt == null && (
+                        <AccountAvatar
+                          avatar={driver.avatar}
+                          firstName={driver.firstName}
+                          lastName={driver.lastName}
+                        />
+                      )}
+                      {driver.erasedAt != null
+                        ? t('drivers.erasedName')
+                        : `${driver.firstName} ${driver.lastName}`}
+                    </span>
                   </TableCell>
                 )}
                 {isVisible('email') && <TableCell>{driver.email ?? '-'}</TableCell>}
@@ -169,12 +188,10 @@ export function DriversTable({
                 )}
               </TableRow>
             ))}
-            {drivers?.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={colSpan} className="text-center text-muted-foreground">
-                  {emptyMessage ?? t('drivers.noDriversFound')}
-                </TableCell>
-              </TableRow>
+            {!isLoading && !isError && drivers?.length === 0 && (
+              <TableStateRow colSpan={colSpan}>
+                <EmptyState>{emptyMessage ?? t('drivers.noDriversFound')}</EmptyState>
+              </TableStateRow>
             )}
           </TableBody>
         </Table>

@@ -12,9 +12,11 @@ import {
   isOperatorStation,
 } from '@evtivity/database';
 import { VEHICLE_ID_SOURCES, VEHICLE_ID_TYPES } from '@evtivity/lib/vehicle-id';
+import { VEHICLE_BODY_TYPES, VEHICLE_COLORS } from '@evtivity/lib/vehicle-appearance';
 import { ID_PARAMS } from './id-validation.js';
 import { sessionsAtSites } from './session-site-scope.js';
 import {
+  AutochargeClaimRequiredError,
   SessionNoVehicleIdError,
   SessionNotFoundError,
   VehicleBlockedError,
@@ -32,11 +34,41 @@ export const vehicleLastSeenItem = z
     siteName: z.string().nullable().describe('Site of the station'),
     at: z.coerce.date().describe('Start of the session in which the charger sent the id'),
   })
-  .passthrough()
+  .loose()
   .nullable()
   .describe(
     'The last session in which a charger sent one of the vehicle ids, null when none (operators see sessions at their sites only)',
   );
+
+/** Color and body type in a vehicle item (operator and portal). */
+export const vehicleAppearanceItemFields = {
+  color: z
+    .enum(VEHICLE_COLORS)
+    .nullable()
+    .describe(
+      'Vehicle color group (white, black, silver, grey, blue, red, green, brown_beige, yellow_orange, other)',
+    ),
+  bodyType: z
+    .enum(VEHICLE_BODY_TYPES)
+    .nullable()
+    .describe(
+      'Vehicle body type (sedan, hatchback, suv, pickup_truck, van, box_truck, bus, semi_truck)',
+    ),
+};
+
+/** Color and body type in a create or update body. Null removes a value. */
+export const vehicleAppearanceBodyFields = {
+  color: z
+    .enum(VEHICLE_COLORS)
+    .nullable()
+    .optional()
+    .describe('Vehicle color group. Null removes it.'),
+  bodyType: z
+    .enum(VEHICLE_BODY_TYPES)
+    .nullable()
+    .optional()
+    .describe('Vehicle body type. Null removes it.'),
+};
 
 /** The vehicle fields of Autocharge, shared by the operator and portal vehicle items. */
 export const vehicleAutochargeFields = {
@@ -73,7 +105,7 @@ export const sessionVehicleCaptureItem = z
         'id_token: the 2.1 idToken itself; additional_info: an additionalInfo entry of the 2.1 idToken; id_tag: a 1.6 idTag',
       ),
   })
-  .passthrough()
+  .loose()
   .nullable()
   .describe('The vehicle id the charger sent at the start, null when none');
 
@@ -164,6 +196,8 @@ export async function replyVehicleServiceError(
     await reply.status(404).send({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
   } else if (err instanceof VehicleIdInUseError) {
     await reply.status(409).send({ error: err.message, code: 'VEHICLE_ID_IN_USE' });
+  } else if (err instanceof AutochargeClaimRequiredError) {
+    await reply.status(409).send({ error: err.message, code: 'AUTOCHARGE_CLAIM_REQUIRED' });
   } else if (err instanceof SessionNoVehicleIdError) {
     await reply.status(409).send({ error: err.message, code: 'SESSION_NO_VEHICLE_ID' });
   } else if (err instanceof VehicleIdRequiredError) {

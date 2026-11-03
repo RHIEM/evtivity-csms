@@ -1,0 +1,109 @@
+// Copyright (c) 2024-2026 EVtivity. All rights reserved.
+// SPDX-License-Identifier: BUSL-1.1
+
+// Model paint of the 3D site layout (the ground, the lot, the building and the models, not
+// status colors). `haze` is the grass as it reads in the distance: the fog and
+// the background, so the ground fills the stage to its edges. The legend reads
+// the AC and DC accents without loading three.js.
+export const SCENE_COLORS = {
+  light: {
+    asphalt: '#4a515c',
+    grass: '#5d8a3a',
+    grassDark: '#4f7a30',
+    grassLight: '#6f9c48',
+    haze: '#7d9a6a',
+    concrete: '#b9bec6',
+    curb: '#c9ccd1',
+    paint: '#f4f4f2',
+    shell: '#e8ebef',
+    signPlate: '#f8fafc',
+    signText: '#1f2937',
+    transformer: '#5f7a63',
+    transformerFin: '#536b57',
+    switchboard: '#9aa3ad',
+    switchboardDoor: '#a9b1ba',
+    building: '#d9d3c7',
+    buildingBase: '#8f8a82',
+    buildingTrim: '#5b6470',
+    window: '#3a5873',
+    sidewalk: '#c4c7cc',
+    battery: '#e5e7eb',
+    batteryVent: '#9ca3af',
+    solarCell: '#1e3a5f',
+    solarFrame: '#cbd5e1',
+  },
+  dark: {
+    asphalt: '#2b313b',
+    grass: '#2f4a25',
+    grassDark: '#273f1f',
+    grassLight: '#3a5730',
+    haze: '#34432f',
+    concrete: '#6f7783',
+    curb: '#7d848f',
+    paint: '#d9dbd8',
+    shell: '#c9ced6',
+    signPlate: '#d9dde3',
+    signText: '#111827',
+    transformer: '#4a6250',
+    transformerFin: '#3f5545',
+    switchboard: '#6b737d',
+    switchboardDoor: '#78808a',
+    building: '#6e6a63',
+    buildingBase: '#55524d',
+    buildingTrim: '#3b424b',
+    window: '#1d2c3a',
+    sidewalk: '#737a84',
+    battery: '#b8bec7',
+    batteryVent: '#6b7280',
+    solarCell: '#16304f',
+    solarFrame: '#94a3b8',
+  },
+  ac: '#2563eb',
+  dc: '#ea7a1a',
+  bollard: '#d4a017',
+  dark1: '#20252d',
+  rubber: '#15181d',
+  glass: '#0b1220',
+  carGlass: '#22364a',
+  screenGlow: '#1d3a6e',
+  rim: '#b8bec7',
+  headlight: '#f1f5f9',
+  taillight: '#b91c1c',
+  chargePort: '#16a34a',
+  /** Reserved sign border and traffic cone (the reserved and maintenance hues). */
+  signBorder: '#f97316',
+  cone: '#f26a1b',
+  coneBand: '#f4f4f2',
+  signPost: '#6b7280',
+  /**
+   * Hot-dip galvanized steel of the solar carport frame (matte zinc gray; a
+   * screen approximation, no source gives a color).
+   */
+  galvanizedSteel: '#a4abb2',
+  /** The back of a sign blank (bare aluminum). */
+  signBack: '#9ca3af',
+  /**
+   * The red of a regulatory parking sign legend (R7-113). The MUTCD fixes the
+   * color by the FHWA Color Specifications for Retroreflective Sign and
+   * Pavement Marking Materials (23 CFR 655 Appendix to Subpart F); this is a
+   * screen approximation, not the specification.
+   */
+  signRegulatoryRed: '#c8102e',
+  /** The black legend of the California tow-away sign (the statute sets no color). */
+  signInk: '#111111',
+  warning: '#facc15',
+  /** Lit interiors behind the building windows in the dark theme. */
+  windowLight: '#f3d9a4',
+  warningInk: '#111827',
+  /** Load management links: panel and circuit feeders, and the station drops. */
+  linkFeeder: '#22d3ee',
+  /** The beacon of a faulted station. */
+  beacon: '#ef4444',
+  linkStation: '#38bdf8',
+  terminalBody: '#374151',
+  terminalScreen: '#3b82f6',
+  terminalOnline: '#22c55e',
+  terminalOffline: '#6b7280',
+  /** Unpainted white panels of large vehicles: a semi trailer's van body, bus roof pods. */
+  vehiclePanel: '#eceff2',
+} as const;

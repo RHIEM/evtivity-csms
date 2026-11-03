@@ -275,6 +275,8 @@ function makeVehicle(overrides: Record<string, unknown> = {}) {
     year: '2024',
     vin: '5YJ3E1EA1PF000001',
     licensePlate: 'ABC123',
+    color: null,
+    bodyType: null,
     evccid: null,
     autochargeEnabled: false,
     autochargeBlockedAt: null,
@@ -327,6 +329,33 @@ describe('Driver routes (operator)', () => {
       expect(res.statusCode).toBe(401);
     });
 
+    it('returns the generated avatar of a driver without its raw columns', async () => {
+      const options = { style: 'avataaars', seed: 'abc', options: { topVariant: 'bob' } };
+      setupDbResults(
+        [
+          {
+            ...makeDriver(),
+            avatarKind: 'generated',
+            avatarOptions: options,
+            avatarS3Key: null,
+            avatarS3Bucket: null,
+            avatarUpdatedAt: null,
+          },
+        ],
+        [{ count: 1 }],
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      const [row] = res.json().data as Array<Record<string, unknown>>;
+      expect(row?.['avatar']).toEqual({ kind: 'generated', updatedAt: null, ...options });
+      expect(row).not.toHaveProperty('avatarKind');
+      expect(row).not.toHaveProperty('avatarS3Key');
+    });
+
     it('returns 200 with no search param', async () => {
       const driver = makeDriver();
       // First result: data rows, second result: count rows
@@ -340,7 +369,7 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.data).toEqual([driver]);
+      expect(body.data).toEqual([{ ...driver, avatar: null }]);
       expect(body.total).toBe(1);
     });
 
@@ -356,7 +385,7 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.data).toEqual([driver]);
+      expect(body.data).toEqual([{ ...driver, avatar: null }]);
       expect(body.total).toBe(1);
     });
 
@@ -930,7 +959,7 @@ describe('Driver routes (operator)', () => {
       const driverToken = makeToken({ idToken: 'RFID-XYZ' });
       // tokenService.createToken: dup-check (empty) -> the driver (active)
       // -> insert returning
-      setupDbResults([], [{ isActive: true }], [driverToken]);
+      setupDbResults([], [{ isActive: true }], [], [driverToken]);
 
       const res = await app.inject({
         method: 'POST',
@@ -1174,6 +1203,59 @@ describe('Driver routes (operator)', () => {
         expect.objectContaining({ actor: 'operator' }),
         expect.anything(),
       );
+    });
+
+    it('passes a color and body type to the service and returns them', async () => {
+      const updated = makeVehicle({ color: 'red', bodyType: 'suv' });
+      vehicleServiceMock.updateVehicle.mockResolvedValueOnce(updated);
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles/${VALID_VEHICLE_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { color: 'red', bodyType: 'suv' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ color: 'red', bodyType: 'suv' });
+      expect(vehicleServiceMock.updateVehicle).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        VALID_VEHICLE_ID,
+        { color: 'red', bodyType: 'suv' },
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('passes null to remove the color and body type', async () => {
+      vehicleServiceMock.updateVehicle.mockResolvedValueOnce(makeVehicle());
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}/vehicles/${VALID_VEHICLE_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { color: null, bodyType: null },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(vehicleServiceMock.updateVehicle).toHaveBeenCalledWith(
+        VALID_DRIVER_ID,
+        VALID_VEHICLE_ID,
+        { color: null, bodyType: null },
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('refuses a color or body type off the list', async () => {
+      for (const payload of [{ color: 'Blue' }, { bodyType: 'coupe' }]) {
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/drivers/${VALID_DRIVER_ID}/vehicles/${VALID_VEHICLE_ID}`,
+          headers: { authorization: `Bearer ${token}` },
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+      }
+      expect(vehicleServiceMock.updateVehicle).not.toHaveBeenCalled();
     });
 
     it('returns 404 when vehicle not found', async () => {

@@ -11,7 +11,7 @@ const { getMock, postMock, putMock, toastMock, permission } = vi.hoisted(() => (
   postMock: vi.fn(),
   putMock: vi.fn(),
   toastMock: vi.fn(),
-  permission: { canWrite: true, hasAllSiteAccess: true },
+  permission: { canWrite: true, canWriteProvider: true, hasAllSiteAccess: true },
 }));
 
 vi.mock('react-i18next', () => ({
@@ -46,7 +46,10 @@ vi.mock('@/lib/api', () => {
 
 vi.mock('@/lib/config', () => ({ API_BASE_URL: 'https://api.example.com' }));
 vi.mock('@/lib/auth', () => ({
-  useHasPermission: () => permission.canWrite,
+  // canWrite: payments:write (site configs) and settings.system:*. canWriteProvider:
+  // settings.payment:write (Stripe, Adyen and the provider selection).
+  useHasPermission: (perm: string) =>
+    perm === 'settings.payment:write' ? permission.canWriteProvider : permission.canWrite,
   useHasAllSiteAccess: () => permission.hasAllSiteAccess,
 }));
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast: toastMock }) }));
@@ -54,6 +57,9 @@ vi.mock('@/hooks/use-company-currency', () => ({
   useCompanyCurrency: () => ({ currency: 'USD', isError: false, refetch: vi.fn() }),
 }));
 vi.mock('../settings/AdyenSettings', () => ({ AdyenSettings: () => <div>adyen-tab</div> }));
+vi.mock('../settings/PaymentTerminalSettings', () => ({
+  PaymentTerminalSettings: () => <div>terminals-tab</div>,
+}));
 vi.mock('../settings/PaymentProviderSettings', () => ({
   PaymentProviderSettings: () => <div>general-tab</div>,
 }));
@@ -122,6 +128,17 @@ const STRIPE_SETTINGS_HIDDEN = {
 
 let stripeSettings: Record<string, unknown> = STRIPE_SETTINGS_WITH_SECRETS;
 
+const SITE_CONFIG = {
+  id: 1,
+  siteId: 'sit_1',
+  payoutAccountId: 'acct_site_1',
+  preAuthAmountCents: 5000,
+  platformFeePercent: null,
+  isEnabled: true,
+};
+
+let siteConfig: Record<string, unknown> = SITE_CONFIG;
+
 function mockGets(
   webhook: (url: string) => Promise<unknown> = () => Promise.resolve(webhookSetup()),
 ): void {
@@ -134,16 +151,7 @@ function mockGets(
       return Promise.resolve({ data: [{ id: 'sit_1', name: 'Main Street' }], total: 1 });
     }
     if (url === '/v1/sites/payment-configs') return Promise.resolve([]);
-    if (url === '/v1/sites/sit_1/payment-config') {
-      return Promise.resolve({
-        id: 1,
-        siteId: 'sit_1',
-        payoutAccountId: 'acct_site_1',
-        preAuthAmountCents: 5000,
-        platformFeePercent: null,
-        isEnabled: true,
-      });
-    }
+    if (url === '/v1/sites/sit_1/payment-config') return Promise.resolve(siteConfig);
     return Promise.reject(new Error(`unexpected GET ${url}`));
   });
 }
@@ -161,7 +169,7 @@ function webhookSetup(endpoints = ENDPOINTS): Record<string, unknown> {
   };
 }
 
-function renderSettings(path = '/settings?sub=stripe'): void {
+function renderSettings(path = '/settings?sub=stripe'): QueryClient {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
@@ -170,6 +178,7 @@ function renderSettings(path = '/settings?sub=stripe'): void {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return queryClient;
 }
 
 async function stripeForm(): Promise<HTMLFormElement> {
@@ -186,8 +195,10 @@ afterEach(() => {
   putMock.mockReset();
   toastMock.mockReset();
   permission.canWrite = true;
+  permission.canWriteProvider = true;
   permission.hasAllSiteAccess = true;
   stripeSettings = STRIPE_SETTINGS_WITH_SECRETS;
+  siteConfig = SITE_CONFIG;
 });
 
 describe('PaymentSettings sub-tabs', () => {
@@ -200,8 +211,15 @@ describe('PaymentSettings sub-tabs', () => {
       'paymentProviders.general.tab',
       'settings.paymentSubTabStripe',
       'settings.paymentSubTabAdyen',
+      'settings.paymentSubTabTerminals',
       'settings.paymentSubTabSiteConfigs',
     ]);
+  });
+
+  it('opens the Payment Terminals tab from its link', async () => {
+    mockGets();
+    renderSettings('/settings?sub=terminals');
+    expect(await screen.findByText('terminals-tab')).toBeTruthy();
   });
 
   it('hides the provider, Stripe and Adyen settings from a site-restricted user', async () => {
@@ -214,6 +232,7 @@ describe('PaymentSettings sub-tabs', () => {
     expect(tabs).toEqual(['paymentProviders.general.tab', 'settings.paymentSubTabSiteConfigs']);
     expect(screen.queryByText('general-tab')).toBeNull();
     expect(screen.queryByText('adyen-tab')).toBeNull();
+    expect(screen.queryByText('terminals-tab')).toBeNull();
     expect(getMock).not.toHaveBeenCalledWith('/v1/settings/stripe');
   });
 
@@ -600,9 +619,9 @@ describe('PaymentSettings Stripe tab', () => {
       expect(body).not.toHaveProperty('webhookSecret');
     });
 
-    it('has no Remove without payments:write', async () => {
+    it('has no Remove without settings.payment:write', async () => {
       stripeSettings = STRIPE_SETTINGS_HIDDEN;
-      permission.canWrite = false;
+      permission.canWriteProvider = false;
       mockGets();
       renderSettings();
       await hiddenSecretKey();
@@ -610,8 +629,8 @@ describe('PaymentSettings Stripe tab', () => {
     });
   });
 
-  it('hides the write controls without payments:write', async () => {
-    permission.canWrite = false;
+  it('hides the Stripe write controls with payments:write but without settings.payment:write', async () => {
+    permission.canWriteProvider = false;
     mockGets();
     renderSettings();
     await stripeForm();
@@ -656,5 +675,97 @@ describe('PaymentSettings Stripe tab', () => {
     });
     const body = putMock.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(body).not.toHaveProperty('stripeConnectedAccountId');
+  });
+});
+
+describe('PaymentSettings settings reload', () => {
+  async function reload(client: QueryClient, url: string, queryKey: unknown[]): Promise<void> {
+    const calls = getMock.mock.calls.filter(([u]) => u === url).length;
+    await client.invalidateQueries({ queryKey });
+    await waitFor(() => {
+      expect(getMock.mock.calls.filter(([u]) => u === url).length).toBe(calls + 1);
+    });
+  }
+
+  async function publishableKey(): Promise<HTMLInputElement> {
+    const input = asInput(await screen.findByLabelText('settings.stripePublishableKey'));
+    await waitFor(() => {
+      expect(input.value).not.toBe('');
+    });
+    return input;
+  }
+
+  async function connectedAccount(): Promise<HTMLInputElement> {
+    fireEvent.click(await screen.findByText('Main Street'));
+    const input = asInput(await screen.findByLabelText('payments.connectedAccountId'));
+    await waitFor(() => {
+      expect(input.value).toBe('acct_site_1');
+    });
+    return input;
+  }
+
+  it('keeps unsaved Stripe edits when the settings reload, takes them while clean', async () => {
+    mockGets();
+    const client = renderSettings();
+    const input = await publishableKey();
+    stripeSettings = { ...STRIPE_SETTINGS_WITH_SECRETS, publishableKey: 'pk_test_reloaded' };
+    await reload(client, '/v1/settings/stripe', ['stripe-settings']);
+    expect(input.value).toBe('pk_test_reloaded');
+    fireEvent.change(input, { target: { value: 'pk_test_edit' } });
+    stripeSettings = { ...STRIPE_SETTINGS_WITH_SECRETS, publishableKey: 'pk_test_other' };
+    await reload(client, '/v1/settings/stripe', ['stripe-settings']);
+    expect(input.value).toBe('pk_test_edit');
+    expect(screen.getByText('settings.unsavedChanges')).toBeTruthy();
+  });
+
+  it('takes the stored Stripe values after its own save', async () => {
+    mockGets();
+    putMock.mockImplementation(() => {
+      stripeSettings = { ...STRIPE_SETTINGS_WITH_SECRETS, publishableKey: 'pk_test_saved' };
+      return Promise.resolve({ success: true });
+    });
+    const client = renderSettings();
+    const input = await publishableKey();
+    fireEvent.change(input, { target: { value: '  pk_test_saved  ' } });
+    fireEvent.submit(await stripeForm());
+    await waitFor(() => {
+      expect(input.value).toBe('pk_test_saved');
+    });
+    expect(screen.queryByText('settings.unsavedChanges')).toBeNull();
+    stripeSettings = { ...STRIPE_SETTINGS_WITH_SECRETS, publishableKey: 'pk_test_later' };
+    await reload(client, '/v1/settings/stripe', ['stripe-settings']);
+    expect(input.value).toBe('pk_test_later');
+  });
+
+  it('keeps unsaved site config edits when the config reloads, takes them while clean', async () => {
+    mockGets();
+    const client = renderSettings('/settings?sub=siteConfigs');
+    const input = await connectedAccount();
+    const url = '/v1/sites/sit_1/payment-config';
+    siteConfig = { ...SITE_CONFIG, payoutAccountId: 'acct_reloaded' };
+    await reload(client, url, ['sites', 'sit_1', 'payment-config']);
+    expect(input.value).toBe('acct_reloaded');
+    fireEvent.change(input, { target: { value: 'acct_edit' } });
+    siteConfig = { ...SITE_CONFIG, payoutAccountId: 'acct_other' };
+    await reload(client, url, ['sites', 'sit_1', 'payment-config']);
+    expect(input.value).toBe('acct_edit');
+  });
+
+  it('takes the stored site config after its own save', async () => {
+    mockGets();
+    putMock.mockImplementation(() => {
+      siteConfig = { ...SITE_CONFIG, preAuthAmountCents: 6000 };
+      return Promise.resolve({});
+    });
+    renderSettings('/settings?sub=siteConfigs');
+    const input = await connectedAccount();
+    const preAuth = asInput(screen.getByLabelText('settings.stripePreAuthAmount'));
+    fireEvent.change(preAuth, { target: { value: '60' } });
+    const form = input.closest('form');
+    if (form == null) throw new Error('form not found');
+    fireEvent.submit(form);
+    await waitFor(() => {
+      expect(preAuth.value).toBe('60.00');
+    });
   });
 });

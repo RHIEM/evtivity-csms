@@ -4,13 +4,14 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Plus, Pencil, Trash2 } from 'lucide-react';
+import { Pencil, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
 import {
   Table,
   TableBody,
@@ -36,6 +37,7 @@ import { useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { useToast } from '@/components/ui/toast';
 import { RecalculateElectricityCostAction } from '@/components/ElectricityCostNotices';
+import { TimeInput } from '@/components/ui/time-input';
 
 interface RateRestrictions {
   timeRange?: { startTime: string; endTime: string };
@@ -123,7 +125,12 @@ export function SiteElectricityRatesTab({
   const queryKey = ['site-electricity-rates', siteId];
   const { currency } = useCompanyCurrency();
 
-  const { data: rates = [], isLoading } = useQuery({
+  const {
+    data: rates = [],
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey,
     queryFn: () => api.get<ElectricityRate[]>(`/v1/sites/${siteId}/electricity-rates`),
   });
@@ -227,77 +234,84 @@ export function SiteElectricityRatesTab({
   }
 
   return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle>{t('sites.electricityRates')}</CardTitle>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {rates.length > 0 && (
-            <RecalculateElectricityCostAction siteId={siteId} siteName={siteName} size="default" />
-          )}
-          {canWrite && (
-            <Button onClick={openCreate}>
-              <Plus className="h-4 w-4" />
-              {t('sites.addElectricityRate')}
-            </Button>
-          )}
-        </div>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? null : rates.length === 0 ? (
-          <div className="py-8">
-            <p className="text-center text-sm font-medium">{t('sites.noElectricityRates')}</p>
-            <p className="text-center text-sm text-muted-foreground">
-              {t('sites.noElectricityRatesDescription')}
-            </p>
+    <>
+      <TabPanel
+        title={t('sites.electricityRates')}
+        isLoading={isLoading}
+        isError={isError}
+        onRetry={() => {
+          void refetch();
+        }}
+        isEmpty={rates.length === 0}
+        emptyMessage={
+          <>
+            <span className="block font-medium text-foreground">
+              {t('sites.noElectricityRates')}
+            </span>
+            <span className="block">{t('sites.noElectricityRatesDescription')}</span>
+          </>
+        }
+        actions={
+          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+            {rates.length > 0 && (
+              <RecalculateElectricityCostAction
+                siteId={siteId}
+                siteName={siteName}
+                size="default"
+              />
+            )}
+            {canWrite && (
+              <CreateButton label={t('sites.addElectricityRate')} onClick={openCreate} />
+            )}
           </div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{t('sites.electricityRateName')}</TableHead>
-                <TableHead className="text-right">{t('sites.ratePerKwh')}</TableHead>
-                <TableHead>{t('sites.electricityRateRestrictions')}</TableHead>
-                {canWrite && <TableHead className="text-right">{t('common.actions')}</TableHead>}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rates.map((rate) => (
-                <TableRow key={rate.id}>
-                  <TableCell>{rate.name}</TableCell>
+        }
+      >
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t('sites.electricityRateName')}</TableHead>
+              <TableHead className="text-right">{t('sites.ratePerKwh')}</TableHead>
+              <TableHead>{t('sites.electricityRateRestrictions')}</TableHead>
+              {canWrite && <TableHead className="text-right">{t('common.actions')}</TableHead>}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rates.map((rate) => (
+              <TableRow key={rate.id}>
+                <TableCell>{rate.name}</TableCell>
+                <TableCell className="text-right">
+                  {currency != null ? formatRatePerKwh(rate.ratePerKwh, currency) : '-'}
+                </TableCell>
+                <TableCell>{describeRestrictions(rate.restrictions)}</TableCell>
+                {canWrite && (
                   <TableCell className="text-right">
-                    {currency != null ? formatRatePerKwh(rate.ratePerKwh, currency) : '-'}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={t('common.edit')}
+                      onClick={() => {
+                        openEdit(rate);
+                      }}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={t('sites.deleteElectricityRate')}
+                      onClick={() => {
+                        setDeleteTarget(rate);
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
                   </TableCell>
-                  <TableCell>{describeRestrictions(rate.restrictions)}</TableCell>
-                  {canWrite && (
-                    <TableCell className="text-right">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label={t('common.edit')}
-                        onClick={() => {
-                          openEdit(rate);
-                        }}
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label={t('sites.deleteElectricityRate')}
-                        onClick={() => {
-                          setDeleteTarget(rate);
-                        }}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </TableCell>
-                  )}
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
+                )}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TabPanel>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent>
@@ -349,23 +363,21 @@ export function SiteElectricityRatesTab({
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-2">
                   <Label htmlFor="rate-start-time">{t('pricing.startTime')}</Label>
-                  <Input
+                  <TimeInput
                     id="rate-start-time"
-                    type="time"
                     value={form.startTime}
-                    onChange={(e) => {
-                      setForm((f) => ({ ...f, startTime: e.target.value }));
+                    onChange={(next) => {
+                      setForm((f) => ({ ...f, startTime: next }));
                     }}
                   />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="rate-end-time">{t('pricing.endTime')}</Label>
-                  <Input
+                  <TimeInput
                     id="rate-end-time"
-                    type="time"
                     value={form.endTime}
-                    onChange={(e) => {
-                      setForm((f) => ({ ...f, endTime: e.target.value }));
+                    onChange={(next) => {
+                      setForm((f) => ({ ...f, endTime: next }));
                     }}
                   />
                 </div>
@@ -446,6 +458,6 @@ export function SiteElectricityRatesTab({
           if (deleteTarget != null) deleteMutation.mutate(deleteTarget.id);
         }}
       />
-    </Card>
+    </>
   );
 }

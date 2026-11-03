@@ -144,6 +144,9 @@ export const OPERATOR_SUPPORT_EVENTS = [
 // Session alerts: sent to operators who manage the session's site
 export const OPERATOR_SESSION_EVENTS = ['session.EndRequestFailed'] as const;
 
+// Payment terminal alerts: sent to operators who manage the terminal's site
+export const OPERATOR_PAYMENT_TERMINAL_EVENTS = ['paymentTerminal.Offline'] as const;
+
 // Site host events: notifications sent to a site's contact
 export const SITE_HOST_EVENTS = ['site.PayoutOnboarding'] as const;
 
@@ -176,6 +179,7 @@ export const OPERATOR_EVENT_TYPES = [
   ...OPERATOR_ACCOUNT_EVENTS,
   ...OPERATOR_SUPPORT_EVENTS,
   ...OPERATOR_SESSION_EVENTS,
+  ...OPERATOR_PAYMENT_TERMINAL_EVENTS,
   ...SITE_HOST_EVENTS,
   ...FLEET_BILLING_SYSTEM_EVENTS,
   ...FLEET_INVOICE_EVENTS,
@@ -1041,6 +1045,20 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'startedAt', description: 'Session start time' },
     { name: 'endedAt', description: 'Time the session was faulted' },
   ],
+  'paymentTerminal.Offline': [
+    { name: 'firstName', description: 'Operator first name' },
+    { name: 'lastName', description: 'Operator last name' },
+    { name: 'email', description: 'Operator email address' },
+    { name: 'terminalLabel', description: 'Terminal label (else its serial number)' },
+    { name: 'terminalModel', description: 'Terminal model (empty when unknown)' },
+    {
+      name: 'stationId',
+      description: 'OCPP ID of the paired station (empty when the terminal has no station)',
+    },
+    { name: 'siteName', description: 'Site name (empty when unknown)' },
+    { name: 'offlineSince', description: 'When the terminal went offline' },
+    { name: 'minutes', description: 'Minutes offline before the alert is sent (15)' },
+  ],
   'fleet.CreditLimitWarning': [
     { name: 'firstName', description: 'Operator first name (empty for a billing contact)' },
     { name: 'lastName', description: 'Operator last name (empty for a billing contact)' },
@@ -1265,5 +1283,63 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
     { name: 'email', description: 'User email address' },
     { name: 'keyName', description: 'Name of the new API key' },
     { name: 'expiresAt', description: 'When the key expires (empty when it never expires)' },
+  ],
+  'security.SsoSettingsChanged': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+    { name: 'idpChanged', description: 'True when the identity provider changed' },
+    { name: 'ssoEnabled', description: 'True when SSO is on after the change' },
+    { name: 'autoProvision', description: 'True when SSO creates accounts after the change' },
+  ],
+  'security.PaymentTerminalSettingsChanged': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+    { name: 'provider', description: 'Payment terminal provider (ID TECH)' },
+    {
+      name: 'accountChanged',
+      description: 'True when the environment, the merchant or a credential changed',
+    },
+    { name: 'enabled', description: 'True when payment terminals are on after the change' },
+  ],
+  'security.RetentionLowered': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+    {
+      name: 'changes',
+      description: 'Each shortened setting with its days before and after (0 keeps forever)',
+    },
+  ],
+  'security.UserCreatedPrivileged': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+    { name: 'newUserEmail', description: 'Email address of the new administrator account' },
+  ],
+  'security.PermissionsGranted': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+    { name: 'targetEmail', description: 'Email address of the user who got the permissions' },
+    { name: 'granted', description: 'The permissions granted, comma separated' },
+  ],
+  'security.PasswordResetByAdmin': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
+  ],
+  'security.SsoUnlinked': [
+    { name: 'firstName', description: 'Account first name' },
+    { name: 'lastName', description: 'Account last name' },
+    { name: 'email', description: 'Account email address' },
+    { name: 'isDriver', description: 'True for a driver, false for an operator' },
   ],
 };

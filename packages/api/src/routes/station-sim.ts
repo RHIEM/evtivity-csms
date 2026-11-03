@@ -1,28 +1,18 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import {
-  and,
-  desc,
-  eq,
-  gte,
-  inArray,
-  lt,
-  lte,
-  or,
-  sql,
-  type AnyColumn,
-  type SQL,
-} from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
 import {
   chargingStations,
   connectionLogs,
   db,
-  getStationSimMatch,
+  getSim,
+  getSimByIccid,
   getSystemTimezone,
+  openSimAttachment,
+  openStationAttachment,
   settings,
   simAlerts,
   simSessions,
@@ -30,66 +20,96 @@ import {
   stationEvents,
   users,
   variableMonitoringRules,
-  type StationSimMatch,
+  type Sim,
+  type SimAttachment,
 } from '@evtivity/database';
 import { normalizeIccid, SIM_RANGE_MAX_DAYS, SIM_REFRESH_DAY_OPTIONS } from '@evtivity/lib';
 import {
-  clearStationSim,
-  confirmStationSim,
+  atInWindows,
+  fetchedAfterFloor,
   refreshStationSimProvider,
+  resetSimNetwork,
   SIM_KEYS,
+  simCoveredDays,
   simHistoryDays,
   simRefOf,
   simRefreshPeriod,
-  SimProviderError,
   SimRefreshValidationError,
   readStationDataLink,
-  stationCoveredDays,
+  spanInWindows,
   stationDisconnectCauses,
-  confirmedSimRef,
   stationSignalSnapshot,
+  stationSimView,
   type SimProvider,
   type SimProviderId,
 } from '@evtivity/services/station-sim.service';
+import {
+  confirmStationAttachment,
+  detachStationSim,
+  type SimActor,
+} from '@evtivity/services/sim-inventory.service';
 import { authorize } from '../middleware/rbac.js';
 import { zodSchema } from '../lib/zod-schema.js';
 import { errorWith, itemResponse, successResponse } from '../lib/response-schemas.js';
-import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { ERROR_CODES, ERROR_MESSAGES } from '../lib/error-codes.generated.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { getAuditActor } from '../lib/audit-actor.js';
-import { checkStationSiteAccess, requireAllSiteAccess } from '../lib/site-access.js';
+import {
+  checkStationSiteAccess,
+  getUserSiteIds,
+  requireAllSiteAccess,
+} from '../lib/site-access.js';
 import { recordStationCommandAudit } from '../lib/station-command-audit.js';
-import { isSimFeatureOn, readSimSettings, simProviderRegistry } from '../lib/sim.js';
+import {
+  anySimProviderEnabled,
+  isSimFeatureOn,
+  readSimSettings,
+  simProviderRegistry,
+} from '../lib/sim.js';
 import { simKeyStore } from '../lib/sim-keys.js';
+import {
+  simAlertItem,
+  simSessionItem,
+  timelineEntries,
+  timelineIdsOf,
+  timelinePageKeys,
+  timelinePageOut,
+  timelinePaging,
+  timelinePagingQueryFields,
+  timelinePagingResponseFields,
+  type TimelineItem,
+  type TimelineRank,
+  type TimelineSourceSpec,
+} from '../lib/sim-timeline.js';
+import { visibleUserIds } from '../lib/user-management-scope.js';
 import { sendSimProviderError } from './sim-provider-settings.js';
 import type { JwtPayload } from '../plugins/auth.js';
 
 const DAY_MS = 86_400_000;
 /** Refreshes per station a minute, across API pods. */
 export const SIM_REFRESH_LIMIT_PER_MINUTE = 6;
-/** One network reset per station a minute, across API pods. */
-export const SIM_RESET_COOLDOWN_SECONDS = 60;
-const TIMELINE_DEFAULT_LIMIT = 200;
 /** SIM alerts the status shows; the timeline lists them all. */
 const RECENT_ALERTS = 5;
 const CONNECTION_LOG_RETENTION_KEY = 'logs.connection.retentionDays';
 const CONNECTION_LOG_RETENTION_DEFAULT = 90;
 
 const STATION_NOT_FOUND = { error: 'Station not found', code: 'STATION_NOT_FOUND' } as const;
+const SIM_NOT_FOUND = { error: ERROR_MESSAGES.SIM_NOT_FOUND, code: 'SIM_NOT_FOUND' } as const;
+const SIM_INACTIVE = { error: ERROR_MESSAGES.SIM_INACTIVE, code: 'SIM_INACTIVE' } as const;
 
 const stationParams = z.object({ id: ID_PARAMS.stationId.describe('Station ID') });
 
 const capabilitiesSchema = z
   .object({
-    networkName: z.boolean(),
-    radioAccessTechnology: z.boolean(),
-    cellId: z.boolean(),
-    usage: z.boolean(),
-    sessions: z.boolean(),
-    alerts: z.boolean(),
-    networkReset: z.boolean(),
+    networkName: z.boolean().describe('Reports the network name of a session'),
+    radioAccessTechnology: z.boolean().describe('Reports the radio access technology'),
+    cellId: z.boolean().describe('Reports the cell ID'),
+    usage: z.boolean().describe('Reports the data usage of the billing period'),
+    sessions: z.boolean().describe('Lists data sessions'),
+    alerts: z.boolean().describe('Lists SIM alerts'),
+    networkReset: z.boolean().describe('Can reset the SIM network connection'),
   })
-  .passthrough()
+  .loose()
   .describe('What the provider reports');
 
 const storedStatusSchema = z
@@ -109,11 +129,11 @@ const storedStatusSchema = z
         periodEnd: z.string().nullable(),
         limitBytes: z.number().nullable(),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('Data used this billing period'),
   })
-  .passthrough();
+  .loose();
 
 const signalReadingSchema = z
   .object({
@@ -125,7 +145,7 @@ const signalReadingSchema = z
       .enum(['good', 'fair', 'poor', 'unknown'])
       .describe('From sim.signal.goodDbm and sim.signal.fairDbm (RSSI thresholds)'),
   })
-  .passthrough();
+  .loose();
 
 const stationSignalSchema = z
   .object({
@@ -138,24 +158,24 @@ const stationSignalSchema = z
       ),
     readAt: z.string().nullable().describe('When the station last reported these values'),
     values: z
-      .record(z.string().nullable())
+      .record(z.string(), z.string().nullable())
       .describe('Every stored value by name: DataLink[instance].Variable, or the 1.6 key'),
     dataLinks: z
       .array(
         z
           .object({
             instance: z.string().nullable().describe('The DataLink component instance'),
-            values: z.record(z.string().nullable()),
+            values: z.record(z.string(), z.string().nullable()),
             signalUnit: z.string().nullable(),
             signal: signalReadingSchema.nullable(),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('One entry per DataLink instance (OCPP 2.x)'),
     activeNetworkProfile: z.string().nullable(),
-    thresholds: z.object({ goodDbm: z.number(), fairDbm: z.number() }).passthrough(),
+    thresholds: z.object({ goodDbm: z.number(), fairDbm: z.number() }).loose(),
   })
-  .passthrough();
+  .loose();
 
 const simStatusResponse = z
   .object({
@@ -166,10 +186,13 @@ const simStatusResponse = z
         'no_provider_configured',
         'not_looked_up',
         'not_found',
-        'sim_matched_elsewhere',
+        'attached_elsewhere',
+        'sim_inactive',
       ])
       .nullable()
-      .describe('Why there is no provider, null when there is one'),
+      .describe(
+        'Why there is no provider, null when there is one. attached_elsewhere: the SIM of the ICCID the station holds is attached to another target; sim_inactive: that SIM is inactive',
+      ),
     capabilities: capabilitiesSchema.nullable(),
     status: storedStatusSchema.nullable().describe('The status stored by the last Refresh'),
     statusFetchedAt: z.string().nullable().describe('When the status was fetched'),
@@ -180,35 +203,39 @@ const simStatusResponse = z
         cellId: z.string().nullable(),
         observedAt: z.string().describe('End of the newest stored session'),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('Network of the newest stored session'),
-    match: z
+    attachment: z
       .object({
-        confirmed: z
-          .boolean()
+        id: z.number().int().describe('The attachment id; Confirm SIM sends it back'),
+        simId: z.string().describe('The SIM of the attachment'),
+        source: z
+          .enum(['reported', 'entered', 'attached', 'imported'])
           .describe(
-            'A person with access to every site confirmed the SIM. Until then nothing is fetched from the provider and no reset is possible',
+            'Where the attachment came from: the ICCID the station reported, an ICCID entered on the station, an attach on the SIM page, or a CSV import',
           ),
-        confirmedAt: z.string().nullable(),
-        matchedAt: z
-          .string()
-          .nullable()
-          .describe('When the SIM was matched; Confirm SIM sends it back'),
-        iccidSource: z
-          .enum(['station', 'entered'])
-          .describe('Where the ICCID of the match came from: reported by the station, or entered'),
-        enteredBy: z
+        attachedAt: z.string(),
+        attachedBy: z
           .object({
             id: z.string(),
             name: z.string().nullable().describe('First and last name, null when not set'),
           })
-          .passthrough()
+          .loose()
           .nullable()
-          .describe('The person who entered the ICCID, for an entered one'),
+          .describe(
+            'The person who attached the SIM; null for a station report or a person a site-restricted reader may not see (an all-site user or a user of another site)',
+          ),
+        confirmedAt: z
+          .string()
+          .nullable()
+          .describe(
+            'When a person with access to every site confirmed the SIM. Until then nothing is fetched from the provider and no reset is possible',
+          ),
       })
-      .passthrough()
-      .nullable(),
+      .loose()
+      .nullable()
+      .describe("The station's open SIM attachment, null without one"),
     lastFetchedAt: z.string().nullable().describe('When the sessions were last fetched'),
     recentAlerts: z
       .array(
@@ -221,7 +248,7 @@ const simStatusResponse = z
               ),
             receivedAt: z.string().describe('When the provider logged the alert'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('The five newest stored SIM alerts; alerts arrive only with a Refresh'),
     station: stationSignalSchema
@@ -235,13 +262,12 @@ const simStatusResponse = z
       .string()
       .describe('The time zone of the coverage days: the site, else the system time zone'),
   })
-  .passthrough();
+  .loose();
 
 const timelineQuery = z.object({
-  from: z.string().datetime({ offset: true }).optional().describe('Start, default 24 hours ago'),
-  to: z.string().datetime({ offset: true }).optional().describe('End, default and at most now'),
-  limit: z.coerce.number().int().min(1).max(500).optional().describe('Items per page, default 200'),
-  cursor: z.string().max(200).optional().describe('nextCursor of the previous page'),
+  from: z.iso.datetime({ offset: true }).optional().describe('Start, default 24 hours ago'),
+  to: z.iso.datetime({ offset: true }).optional().describe('End, default and at most now'),
+  ...timelinePagingQueryFields,
 });
 
 const timelineItem = z
@@ -254,17 +280,17 @@ const timelineItem = z
         'connected, disconnected, signal_low, signal_restored (the low signal monitor), session, or an alert kind',
       ),
     details: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .describe(
         'Fields of the item. A disconnect carries offlineCause: server, sim_account, station, network, pending or unknown, computed from stored data',
       ),
   })
-  .passthrough();
+  .loose();
 
 const timelineResponse = z
   .object({
     items: z.array(timelineItem),
-    nextCursor: z.string().nullable(),
+    ...timelinePagingResponseFields,
     from: z.string().describe('Start of the range read'),
     to: z.string().describe('End of the range read'),
     capped: z.boolean().describe('The range was shortened to 31 days or the retention'),
@@ -283,11 +309,11 @@ const timelineResponse = z
               'unavailable',
             ]),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('What the stored SIM data of each day can show, in the station time zone'),
   })
-  .passthrough();
+  .loose();
 
 const refreshBody = z.object({
   days: z
@@ -297,8 +323,8 @@ const refreshBody = z.object({
     .max(SIM_RANGE_MAX_DAYS)
     .optional()
     .describe('Days to fetch back from now: 1, 3, 7, 14 or 31; default sim.sessions.fetchDays'),
-  from: z.string().datetime({ offset: true }).optional().describe('Start of a date range'),
-  to: z.string().datetime({ offset: true }).optional().describe('End of a date range'),
+  from: z.iso.datetime({ offset: true }).optional().describe('Start of a date range'),
+  to: z.iso.datetime({ offset: true }).optional().describe('End of a date range'),
   retryLookup: z
     .boolean()
     .optional()
@@ -312,9 +338,8 @@ const providerPartSchema = z
       .string()
       .optional()
       .describe(
-        'provider_off, not_matched (see matchReason), not_confirmed (nothing is fetched until Confirm SIM), backoff or in_progress for a skipped part',
+        'provider_off, backoff, in_progress, no_iccid, not_found, attached_elsewhere (the SIM is attached to another target; no attachment is made), attach_conflict (other changes to the SIM attachments ran at the same time; nothing was attached, a later Refresh tries again) or not_confirmed (nothing is fetched until Confirm SIM) for a skipped part',
       ),
-    matchReason: z.string().optional(),
     kind: z.string().optional().describe('The error kind of a failed part'),
     provider: z.string().optional(),
     fetchedAt: z.string().optional(),
@@ -322,7 +347,7 @@ const providerPartSchema = z
     alertsStored: z.number().optional(),
     retryAfter: z.number().optional(),
   })
-  .passthrough();
+  .loose();
 
 const refreshResponse = z
   .object({
@@ -342,25 +367,32 @@ const refreshResponse = z
           .describe('timeout, command_failed, unsupported or unavailable for a failed part'),
         readAt: z.string().optional(),
       })
-      .passthrough()
+      .loose()
       .describe('The station signal part'),
   })
-  .passthrough();
+  .loose();
 
 const resetResponse = z
-  .object({ status: z.literal('accepted').describe('The provider accepted the network reset') })
-  .passthrough();
+  .object({
+    status: z
+      .enum(['accepted', 'submitted'])
+      .describe(
+        'accepted: the provider reset the network (Hologram). submitted: the provider queued the reset, which runs within a few minutes (1NCE).',
+      ),
+  })
+  .loose();
 
 const confirmResponse = z
   .object({ confirmed: z.literal(true), confirmedAt: z.string().nullable() })
-  .passthrough();
+  .loose();
 
 const confirmBody = z.object({
-  matchedAt: z
-    .string()
-    .datetime({ offset: true })
+  attachmentId: z
+    .number()
+    .int()
+    .min(1)
     .describe(
-      'The matchedAt of the match the confirmation showed (GET /v1/stations/{id}/sim). A match that changed since answers 409 SIM_MATCH_CHANGED.',
+      'The attachment id the confirmation showed (GET /v1/stations/{id}/sim). An attachment that changed since answers 409 SIM_ATTACHMENT_CHANGED.',
     ),
 });
 
@@ -376,6 +408,12 @@ async function sendNotConfigured(reply: FastifyReply): Promise<void> {
     error: 'No SIM provider is configured',
     code: 'SIM_PROVIDER_NOT_CONFIGURED',
   });
+}
+
+/** The person who acts, for the SIM and station audit rows (an API key counts as its user). */
+function simActorOf(request: FastifyRequest): SimActor {
+  const audit = getAuditActor(request);
+  return { audit, userId: audit.actorUserId };
 }
 
 async function stationAccessible(request: FastifyRequest, stationId: string): Promise<boolean> {
@@ -399,36 +437,63 @@ async function coverageTimeZone(station: { timezone: string | null }): Promise<s
   return station.timezone ?? (await getSystemTimezone());
 }
 
-/** The match as the status shows it, with where its ICCID came from. */
-async function matchView(
-  match: StationSimMatch,
-  stationIccid: string | null,
-): Promise<{
-  confirmed: boolean;
+interface AttachmentView {
+  id: number;
+  simId: string;
+  source: SimAttachment['source'];
+  attachedAt: string;
+  attachedBy: { id: string; name: string | null } | null;
   confirmedAt: string | null;
-  matchedAt: string | null;
-  iccidSource: 'station' | 'entered';
-  enteredBy: { id: string; name: string | null } | null;
-}> {
-  const entered = match.enteredIccid != null && match.enteredIccid === normalizeIccid(stationIccid);
-  let enteredBy: { id: string; name: string | null } | null = null;
-  if (entered && match.enteredBy != null) {
+}
+
+/**
+ * The attachment as the status shows it, with the person who attached the
+ * SIM. A site-restricted viewer never sees an all-site user or a user of
+ * another site named (`visibleUserIds`): that person is null for them.
+ */
+async function attachmentView(
+  attachment: SimAttachment,
+  request: FastifyRequest,
+): Promise<AttachmentView> {
+  let attachedBy: AttachmentView['attachedBy'] = null;
+  const { userId } = request.user as JwtPayload;
+  const visible =
+    attachment.attachedBy == null
+      ? null
+      : await visibleUserIds([attachment.attachedBy], userId, await getUserSiteIds(userId));
+  if (attachment.attachedBy != null && (visible == null || visible.has(attachment.attachedBy))) {
     const [user] = await db
       .select({ firstName: users.firstName, lastName: users.lastName })
       .from(users)
-      .where(eq(users.id, match.enteredBy));
+      .where(eq(users.id, attachment.attachedBy));
     const name = [user?.firstName, user?.lastName]
       .filter((part): part is string => part != null && part.trim() !== '')
       .join(' ');
-    enteredBy = { id: match.enteredBy, name: name === '' ? null : name };
+    attachedBy = { id: attachment.attachedBy, name: name === '' ? null : name };
   }
   return {
-    confirmed: match.confirmedAt != null,
-    confirmedAt: match.confirmedAt?.toISOString() ?? null,
-    matchedAt: match.matchedAt?.toISOString() ?? null,
-    iccidSource: entered ? 'entered' : 'station',
-    enteredBy,
+    id: attachment.id,
+    simId: attachment.simId,
+    source: attachment.source,
+    attachedAt: attachment.attachedAt.toISOString(),
+    attachedBy,
+    confirmedAt: attachment.confirmedAt?.toISOString() ?? null,
   };
+}
+
+/**
+ * The SIM a station tab action is about: the SIM of the station's open
+ * attachment, else the SIM of the ICCID the station holds (null when none is
+ * stored yet). Database only.
+ */
+async function stationSimOf(
+  stationId: string,
+  stationIccid: string | null,
+): Promise<{ sim: Sim | null; attachment: SimAttachment | null }> {
+  const attachment = await openStationAttachment(stationId);
+  if (attachment != null) return { sim: await getSim(attachment.simId), attachment };
+  const iccid = normalizeIccid(stationIccid);
+  return { sim: iccid == null ? null : await getSimByIccid(iccid), attachment: null };
 }
 
 /** Seconds a Redis key still lives, else the fallback; a Redis failure is logged. */
@@ -456,7 +521,9 @@ async function connectionLogRetentionDays(): Promise<number> {
     .from(settings)
     .where(eq(settings.key, CONNECTION_LOG_RETENTION_KEY));
   const days = row?.value;
-  return typeof days === 'number' && days > 0 ? days : CONNECTION_LOG_RETENTION_DEFAULT;
+  if (typeof days !== 'number' || !Number.isFinite(days)) return CONNECTION_LOG_RETENTION_DEFAULT;
+  // 0 or less keeps the connection log forever (log-retention-prune skips it): no bound.
+  return days > 0 ? days : Number.POSITIVE_INFINITY;
 }
 
 /** The enabled provider with this id, or null. */
@@ -467,7 +534,7 @@ async function providerOf(id: string | null): Promise<SimProvider | null> {
 
 /** The timeline sources; at one time their items sort by source, then by row id, newest first. */
 type TimelineSource = 'sim:session' | 'sim:alert' | 'ocpp:event' | 'ocpp';
-const SOURCE_RANK: Record<TimelineSource, number> = {
+const SOURCE_RANK: TimelineRank<TimelineSource> = {
   'sim:session': 3,
   'sim:alert': 2,
   'ocpp:event': 1,
@@ -499,78 +566,26 @@ function signalEventItems(
   });
 }
 
-interface TimelineEntry {
-  at: Date;
-  from: TimelineSource;
-  id: number;
-  source: 'ocpp' | 'sim';
-  kind: string;
-  details: Record<string, unknown>;
-}
-
-interface TimelineCursor {
-  at: Date;
-  from: TimelineSource;
-  id: number;
-}
-
-/** The last row a source returned when it returned more than `limit`, else null. */
-function horizonOf<Row extends { id: number }>(
-  from: TimelineSource,
-  rows: readonly Row[],
-  limit: number,
-  atOf: (row: Row) => Date,
-): TimelineCursor | null {
-  if (rows.length <= limit) return null;
-  const last = rows[rows.length - 1];
-  return last == null ? null : { at: atOf(last), from, id: last.id };
-}
-
-function cursorOf(entry: TimelineCursor): string {
-  return Buffer.from(`${entry.at.toISOString()}|${entry.from}|${String(entry.id)}`).toString(
-    'base64url',
-  );
-}
-
-function parseCursor(cursor: string | undefined): TimelineCursor | null {
-  if (cursor == null) return null;
-  const [iso, from, id] = Buffer.from(cursor, 'base64url').toString('utf8').split('|');
-  if (iso == null || from == null || id == null || !Object.hasOwn(SOURCE_RANK, from)) return null;
-  const at = new Date(iso);
-  const rowId = Number(id);
-  if (Number.isNaN(at.getTime()) || !Number.isSafeInteger(rowId)) return null;
-  return { at, from: from as TimelineSource, id: rowId };
-}
-
-/** Newest first: time, then source, then row id. */
-function compareEntries(a: TimelineCursor, b: TimelineCursor): number {
-  return (
-    b.at.getTime() - a.at.getTime() || SOURCE_RANK[b.from] - SOURCE_RANK[a.from] || b.id - a.id
-  );
-}
-
-/** Times compared at the millisecond the cursor carries, so a tie is a tie. */
-function msOf(column: AnyColumn): SQL {
-  return sql`date_trunc('milliseconds', ${column})`;
-}
-
-/** The rows of one source that come after the cursor in the timeline order. */
-function afterCursor(
-  from: TimelineSource,
-  atColumn: AnyColumn,
-  idColumn: AnyColumn,
-  cursor: TimelineCursor | null,
-): SQL | undefined {
-  if (cursor == null) return undefined;
-  const at = msOf(atColumn);
-  const rank = SOURCE_RANK[from] - SOURCE_RANK[cursor.from];
-  const sameTime =
-    rank < 0
-      ? sql`${at} = ${cursor.at}`
-      : rank === 0
-        ? and(sql`${at} = ${cursor.at}`, lt(idColumn, cursor.id))
-        : undefined;
-  return sameTime == null ? sql`${at} < ${cursor.at}` : or(sql`${at} < ${cursor.at}`, sameTime);
+/**
+ * The SQL twin of `signalEventItems`: the NotifyEvent row holds at least one
+ * low signal item, so every timeline entry of a row gives an item and the
+ * page count matches what the pages show.
+ */
+function hasLowSignalItem(stationId: string): SQL {
+  return sql`CASE WHEN jsonb_typeof(${stationEvents.eventData}) = 'array' THEN EXISTS (
+    SELECT 1 FROM jsonb_array_elements(${stationEvents.eventData}) AS item
+    WHERE item->'component'->>'name' = 'DataLink'
+      AND item->'variable'->>'name' = 'SignalStrength'
+      AND item->>'trigger' = 'Alerting'
+      AND (
+        coalesce(jsonb_typeof(item->'variableMonitoringId'), '') <> 'number'
+        OR (item->>'variableMonitoringId')::numeric IN (
+          SELECT ${variableMonitoringRules.monitoringId} FROM ${variableMonitoringRules}
+          WHERE ${variableMonitoringRules.stationId} = ${stationId}
+            AND ${variableMonitoringRules.source} = 'low_signal'
+        )
+      )
+  ) ELSE false END`;
 }
 
 export function stationSimRoutes(app: FastifyInstance): void {
@@ -582,7 +597,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: "Get a station's SIM",
         description:
-          'The SIM status, match and network stored by the last Refresh. Reads the database only: no provider call and no OCPP command.',
+          "The SIM status, the station's SIM attachment and the network stored by the last Refresh. Reads the database only: no provider call and no OCPP command.",
         operationId: 'getStationSim',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -604,14 +619,15 @@ export function stationSimRoutes(app: FastifyInstance): void {
         await sendFeatureDisabled(reply);
         return;
       }
-      const [station, match] = await Promise.all([stationRow(id), getStationSimMatch(id)]);
+      const station = await stationRow(id);
       if (station == null) {
         await reply.status(404).send(STATION_NOT_FOUND);
         return;
       }
+      const { sim, attachment } = await stationSimOf(id, station.iccid);
       const registry = simProviderRegistry();
       const enabled = await registry.enabledProviders();
-      const provider = match?.provider != null ? await providerOf(match.provider) : null;
+      const provider = attachment != null ? await providerOf(sim?.provider ?? null) : null;
       const common = {
         historyDays: provider?.historyDays ?? (await simHistoryDays(registry)),
         reportingDelayHours: provider?.reportingDelayHours ?? null,
@@ -621,50 +637,49 @@ export function stationSimRoutes(app: FastifyInstance): void {
         station: simSettings.stationSignalEnabled
           ? await stationSignalSnapshot(id, simSettings)
           : null,
+        attachment: attachment != null ? await attachmentView(attachment, request) : null,
       };
-      if (provider == null || match == null || simRefOf(match) == null) {
+      const empty = {
+        status: null,
+        statusFetchedAt: null,
+        network: null,
+        lastFetchedAt: null,
+        recentAlerts: [],
+      };
+      if (attachment == null || sim == null || provider == null || simRefOf(sim) == null) {
         let reason:
           | 'no_iccid'
           | 'no_provider_configured'
           | 'not_looked_up'
           | 'not_found'
-          | 'sim_matched_elsewhere';
-        if (enabled.length === 0 || match?.provider != null) reason = 'no_provider_configured';
-        else if (normalizeIccid(station.iccid) == null) reason = 'no_iccid';
-        else if (match?.lookupMissReason === 'sim_matched_elsewhere')
-          reason = 'sim_matched_elsewhere';
-        else if (match?.lookupMissReason === 'not_found') reason = 'not_found';
+          | 'attached_elsewhere'
+          | 'sim_inactive';
+        if (enabled.length === 0 || (attachment != null && sim?.provider != null)) {
+          reason = 'no_provider_configured';
+        } else if (attachment == null && normalizeIccid(station.iccid) == null) reason = 'no_iccid';
+        else if (sim?.status === 'inactive') reason = 'sim_inactive';
+        else if (attachment == null && sim != null && (await openSimAttachment(sim.id)) != null) {
+          reason = 'attached_elsewhere';
+        } else if (attachment != null && sim?.lookupMissReason === 'not_found')
+          reason = 'not_found';
         else reason = 'not_looked_up';
-        return {
-          provider: null,
-          reason,
-          capabilities: null,
-          status: null,
-          statusFetchedAt: null,
-          network: null,
-          match: null,
-          lastFetchedAt: null,
-          recentAlerts: [],
-          ...common,
-        };
+        return { provider: null, reason, capabilities: null, ...empty, ...common };
       }
-      const view = await matchView(match, station.iccid);
-      // An unconfirmed match fetched nothing and shows nothing of the SIM.
-      const sim = confirmedSimRef(match);
-      if (sim == null) {
+      // An unconfirmed attachment fetched nothing and shows nothing of the SIM.
+      if (attachment.confirmedAt == null) {
         return {
           provider: provider.id,
           reason: null,
           capabilities: provider.capabilities,
-          status: null,
-          statusFetchedAt: null,
-          network: null,
-          match: view,
-          lastFetchedAt: null,
-          recentAlerts: [],
+          ...empty,
           ...common,
         };
       }
+      // Only rows and fetch state after the SIM's history floor: its time
+      // at another station (another site, or a deleted one) never shows here.
+      const windows = (await stationSimView(id))?.windows ?? [];
+      const statusHere = fetchedAfterFloor(sim.statusFetchedAt, sim);
+      const syncedHere = fetchedAfterFloor(sim.sessionsSyncedAt, sim);
       const [[newest], recentAlerts] = await Promise.all([
         db
           .select({
@@ -676,9 +691,8 @@ export function stationSimRoutes(app: FastifyInstance): void {
           .from(simSessions)
           .where(
             and(
-              eq(simSessions.stationId, id),
-              eq(simSessions.provider, provider.id),
-              eq(simSessions.providerSimId, sim.providerRef),
+              eq(simSessions.simId, sim.id),
+              spanInWindows(simSessions.startedAt, simSessions.endedAt, windows),
             ),
           )
           .orderBy(desc(simSessions.endedAt), desc(simSessions.id))
@@ -686,13 +700,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
         db
           .select({ kind: simAlerts.kind, receivedAt: simAlerts.receivedAt })
           .from(simAlerts)
-          .where(
-            and(
-              eq(simAlerts.stationId, id),
-              eq(simAlerts.provider, provider.id),
-              eq(simAlerts.providerRef, sim.providerRef),
-            ),
-          )
+          .where(and(eq(simAlerts.simId, sim.id), atInWindows(simAlerts.receivedAt, windows)))
           .orderBy(desc(simAlerts.receivedAt), desc(simAlerts.id))
           .limit(RECENT_ALERTS),
       ]);
@@ -700,8 +708,8 @@ export function stationSimRoutes(app: FastifyInstance): void {
         provider: provider.id,
         reason: null,
         capabilities: provider.capabilities,
-        status: match.lastStatus ?? null,
-        statusFetchedAt: match.statusFetchedAt?.toISOString() ?? null,
+        status: statusHere ? (sim.lastStatus ?? null) : null,
+        statusFetchedAt: statusHere ? (sim.statusFetchedAt?.toISOString() ?? null) : null,
         network:
           newest == null
             ? null
@@ -711,8 +719,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
                 cellId: newest.cellId,
                 observedAt: newest.endedAt.toISOString(),
               },
-        match: view,
-        lastFetchedAt: match.sessionsSyncedAt?.toISOString() ?? null,
+        lastFetchedAt: syncedHere ? (sim.sessionsSyncedAt?.toISOString() ?? null) : null,
         recentAlerts: recentAlerts.map((a) => ({
           kind: a.kind,
           receivedAt: a.receivedAt.toISOString(),
@@ -730,7 +737,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: "Get a station's connectivity timeline",
         description:
-          'The stored SIM sessions and alerts and the OCPP connects and disconnects of the station in one list, newest first, plus what each day of the range has stored. Reads the database only. The range is at most 31 days and within the SIM and connection log retentions; a longer one is shortened (capped).',
+          'The stored SIM sessions and alerts and the OCPP connects and disconnects of the station in one list, newest first, plus what each day of the range has stored. Paged by page number (page, limit, total) or by cursor. Reads the database only. The range is at most 31 days and within the SIM and connection log retentions; a longer one is shortened (capped).',
         operationId: 'getStationSimTimeline',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -774,11 +781,9 @@ export function stationSimRoutes(app: FastifyInstance): void {
         });
         return;
       }
-      const cursor = parseCursor(query.cursor);
-      if (query.cursor != null && cursor == null) {
-        await reply
-          .status(400)
-          .send({ error: 'The cursor is not valid', code: 'VALIDATION_ERROR' });
+      const paging = timelinePaging(query, SOURCE_RANK);
+      if ('error' in paging) {
+        await reply.status(400).send({ error: paging.error, code: 'VALIDATION_ERROR' });
         return;
       }
       const keptDays = Math.min(simSettings.retentionDays, await connectionLogRetentionDays());
@@ -795,185 +800,151 @@ export function stationSimRoutes(app: FastifyInstance): void {
         });
         return;
       }
-      const limit = query.limit ?? TIMELINE_DEFAULT_LIMIT;
-      // Only the rows of the confirmed SIM: data of an earlier SIM of the station never shows.
-      const match = await getStationSimMatch(id);
-      const sim = confirmedSimRef(match);
+      // Only the rows of the SIM of the confirmed attachment, and only after the
+      // SIM's history floor: data of an earlier SIM of the station never
+      // shows, nor of an unconfirmed one, nor the SIM's data from another station.
+      const view = await stationSimView(id);
+      const sim = view?.sim ?? null;
+      const windows = view?.windows ?? [];
 
-      const [sessionRows, alertRows, connectionRows, signalRows, monitorRows] = await Promise.all([
-        // A session that began before the range but ended in it belongs to the range.
-        sim == null
-          ? []
-          : db
-              .select()
-              .from(simSessions)
-              .where(
-                and(
-                  eq(simSessions.stationId, id),
-                  eq(simSessions.provider, sim.provider),
-                  eq(simSessions.providerSimId, sim.providerRef),
-                  gte(simSessions.endedAt, rangeFrom),
-                  lte(simSessions.startedAt, to),
-                  afterCursor('sim:session', simSessions.startedAt, simSessions.id, cursor),
-                ),
-              )
-              .orderBy(desc(msOf(simSessions.startedAt)), desc(simSessions.id))
-              .limit(limit + 1),
-        sim == null
-          ? []
-          : db
-              .select()
-              .from(simAlerts)
-              .where(
-                and(
-                  eq(simAlerts.stationId, id),
-                  eq(simAlerts.provider, sim.provider),
-                  eq(simAlerts.providerRef, sim.providerRef),
-                  gte(simAlerts.receivedAt, rangeFrom),
-                  lte(simAlerts.receivedAt, to),
-                  afterCursor('sim:alert', simAlerts.receivedAt, simAlerts.id, cursor),
-                ),
-              )
-              .orderBy(desc(msOf(simAlerts.receivedAt)), desc(simAlerts.id))
-              .limit(limit + 1),
-        db
-          .select({
-            id: connectionLogs.id,
-            event: connectionLogs.event,
-            metadata: connectionLogs.metadata,
-            createdAt: connectionLogs.createdAt,
-          })
-          .from(connectionLogs)
-          .where(
-            and(
-              eq(connectionLogs.stationId, id),
-              inArray(connectionLogs.event, ['connected', 'disconnected']),
-              gte(connectionLogs.createdAt, rangeFrom),
-              lte(connectionLogs.createdAt, to),
-              afterCursor('ocpp', connectionLogs.createdAt, connectionLogs.id, cursor),
-            ),
-          )
-          .orderBy(desc(msOf(connectionLogs.createdAt)), desc(connectionLogs.id))
-          .limit(limit + 1),
-        db
-          .select({
-            id: stationEvents.id,
-            generatedAt: stationEvents.generatedAt,
-            eventData: stationEvents.eventData,
-          })
-          .from(stationEvents)
-          .where(
-            and(
-              eq(stationEvents.stationId, id),
-              gte(stationEvents.generatedAt, rangeFrom),
-              lte(stationEvents.generatedAt, to),
-              sql`${stationEvents.eventData} @> ${SIGNAL_EVENT_MATCH}::jsonb`,
-              afterCursor('ocpp:event', stationEvents.generatedAt, stationEvents.id, cursor),
-            ),
-          )
-          .orderBy(desc(msOf(stationEvents.generatedAt)), desc(stationEvents.id))
-          .limit(limit + 1),
-        db
-          .select({ monitoringId: variableMonitoringRules.monitoringId })
-          .from(variableMonitoringRules)
-          .where(
-            and(
-              eq(variableMonitoringRules.stationId, id),
-              eq(variableMonitoringRules.source, 'low_signal'),
-            ),
+      const sources: Array<TimelineSourceSpec<TimelineSource>> = [
+        {
+          from: 'ocpp',
+          table: connectionLogs,
+          id: connectionLogs.id,
+          at: connectionLogs.createdAt,
+          where: and(
+            eq(connectionLogs.stationId, id),
+            inArray(connectionLogs.event, ['connected', 'disconnected']),
+            gte(connectionLogs.createdAt, rangeFrom),
+            lte(connectionLogs.createdAt, to),
           ),
+        },
+        {
+          from: 'ocpp:event',
+          table: stationEvents,
+          id: stationEvents.id,
+          at: stationEvents.generatedAt,
+          where: and(
+            eq(stationEvents.stationId, id),
+            gte(stationEvents.generatedAt, rangeFrom),
+            lte(stationEvents.generatedAt, to),
+            sql`${stationEvents.eventData} @> ${SIGNAL_EVENT_MATCH}::jsonb`,
+            hasLowSignalItem(id),
+          ),
+        },
+      ];
+      if (sim != null) {
+        sources.push(
+          // A session that began before the range but ended in it belongs to the range.
+          {
+            from: 'sim:session',
+            table: simSessions,
+            id: simSessions.id,
+            at: simSessions.startedAt,
+            where: and(
+              eq(simSessions.simId, sim.id),
+              gte(simSessions.endedAt, rangeFrom),
+              lte(simSessions.startedAt, to),
+              spanInWindows(simSessions.startedAt, simSessions.endedAt, windows),
+            ),
+          },
+          {
+            from: 'sim:alert',
+            table: simAlerts,
+            id: simAlerts.id,
+            at: simAlerts.receivedAt,
+            where: and(
+              eq(simAlerts.simId, sim.id),
+              gte(simAlerts.receivedAt, rangeFrom),
+              lte(simAlerts.receivedAt, to),
+              atInWindows(simAlerts.receivedAt, windows),
+            ),
+          },
+        );
+      }
+      const pageKeys = await timelinePageKeys(SOURCE_RANK, sources, paging);
+      // The rows of the page's entries, by id; every one passed the conditions above.
+      const sessionIds = timelineIdsOf(pageKeys.keys, 'sim:session');
+      const alertIds = timelineIdsOf(pageKeys.keys, 'sim:alert');
+      const signalIds = timelineIdsOf(pageKeys.keys, 'ocpp:event');
+      const connectionIds = timelineIdsOf(pageKeys.keys, 'ocpp');
+      const [sessionRows, alertRows, connectionRows, signalRows, monitorRows] = await Promise.all([
+        sessionIds.length === 0
+          ? []
+          : db.select().from(simSessions).where(inArray(simSessions.id, sessionIds)),
+        alertIds.length === 0
+          ? []
+          : db.select().from(simAlerts).where(inArray(simAlerts.id, alertIds)),
+        connectionIds.length === 0
+          ? []
+          : db
+              .select({
+                id: connectionLogs.id,
+                event: connectionLogs.event,
+                metadata: connectionLogs.metadata,
+              })
+              .from(connectionLogs)
+              .where(inArray(connectionLogs.id, connectionIds)),
+        signalIds.length === 0
+          ? []
+          : db
+              .select({ id: stationEvents.id, eventData: stationEvents.eventData })
+              .from(stationEvents)
+              .where(inArray(stationEvents.id, signalIds)),
+        signalIds.length === 0
+          ? []
+          : db
+              .select({ monitoringId: variableMonitoringRules.monitoringId })
+              .from(variableMonitoringRules)
+              .where(
+                and(
+                  eq(variableMonitoringRules.stationId, id),
+                  eq(variableMonitoringRules.source, 'low_signal'),
+                ),
+              ),
       ]);
       const lowSignalMonitorIds = new Set(
         monitorRows.flatMap((row) => (row.monitoringId != null ? [row.monitoringId] : [])),
       );
-
-      const entries: TimelineEntry[] = [
-        ...sessionRows.map((s) => ({
-          at: s.startedAt,
-          from: 'sim:session' as const,
-          id: s.id,
-          source: 'sim' as const,
-          kind: 'session',
-          details: {
-            provider: s.provider,
-            endedAt: s.endedAt.toISOString(),
-            bytes: s.bytes,
-            networkName: s.networkName,
-            radioAccessTechnology: s.radioAccessTechnology,
-            cellId: s.cellId,
-            apn: s.apn,
-          },
-        })),
-        ...alertRows.map((a) => ({
-          at: a.receivedAt,
-          from: 'sim:alert' as const,
-          id: a.id,
-          source: 'sim' as const,
-          kind: a.kind,
-          details: { provider: a.provider },
-        })),
-        ...signalRows.flatMap((e) =>
-          signalEventItems(e.eventData, lowSignalMonitorIds).map((item) => {
-            const component = item.component as { instance?: unknown };
-            return {
-              at: e.generatedAt,
-              from: 'ocpp:event' as const,
-              id: e.id,
-              source: 'ocpp' as const,
-              kind: item.cleared === true ? 'signal_restored' : 'signal_low',
-              details: {
-                instance: typeof component.instance === 'string' ? component.instance : null,
-                actualValue: typeof item.actualValue === 'string' ? item.actualValue : null,
-              },
-            };
+      const itemsBySource: Record<TimelineSource, Map<number, TimelineItem[]>> = {
+        'sim:session': new Map(sessionRows.map((s) => [s.id, [simSessionItem(s)]])),
+        'sim:alert': new Map(alertRows.map((a) => [a.id, [simAlertItem(a)]])),
+        // A NotifyEvent row can hold several low signal items; they share its entry.
+        'ocpp:event': new Map(
+          signalRows.map((e) => [
+            e.id,
+            signalEventItems(e.eventData, lowSignalMonitorIds).map((item): TimelineItem => {
+              const component = item.component as { instance?: unknown };
+              return {
+                source: 'ocpp',
+                kind: item.cleared === true ? 'signal_restored' : 'signal_low',
+                details: {
+                  instance: typeof component.instance === 'string' ? component.instance : null,
+                  actualValue: typeof item.actualValue === 'string' ? item.actualValue : null,
+                },
+              };
+            }),
+          ]),
+        ),
+        ocpp: new Map(
+          connectionRows.map((c) => {
+            const reason = (c.metadata as { reason?: unknown } | null)?.reason;
+            return [
+              c.id,
+              [
+                {
+                  source: 'ocpp' as const,
+                  kind: c.event,
+                  details: typeof reason === 'string' ? { reason } : {},
+                },
+              ],
+            ];
           }),
         ),
-        ...connectionRows.map((c) => {
-          const reason = (c.metadata as { reason?: unknown } | null)?.reason;
-          return {
-            at: c.createdAt,
-            from: 'ocpp' as const,
-            id: c.id,
-            source: 'ocpp' as const,
-            kind: c.event,
-            details: typeof reason === 'string' ? { reason } : {},
-          };
-        }),
-      ].sort(compareEntries);
-
-      // A source that returned more than `limit` rows may hold more rows after its
-      // last one; items past the first such row could hide those, so the page
-      // stops there. A NotifyEvent row can give no item, so this uses row counts.
-      const horizons: TimelineCursor[] = [
-        horizonOf('sim:session', sessionRows, limit, (r) => r.startedAt),
-        horizonOf('sim:alert', alertRows, limit, (r) => r.receivedAt),
-        horizonOf('ocpp:event', signalRows, limit, (r) => r.generatedAt),
-        horizonOf('ocpp', connectionRows, limit, (r) => r.createdAt),
-      ].flatMap((h) => (h != null ? [h] : []));
-      const horizon = horizons.sort(compareEntries)[0] ?? null;
-      const known =
-        horizon == null ? entries : entries.filter((entry) => compareEntries(entry, horizon) <= 0);
-
-      // The cursor names a row, so the items of the page's last row all stay on it.
-      let pageSize = Math.min(limit, known.length);
-      const lastKept = known[pageSize - 1];
-      while (
-        lastKept != null &&
-        pageSize < known.length &&
-        known[pageSize]?.from === lastKept.from &&
-        known[pageSize]?.id === lastKept.id
-      ) {
-        pageSize += 1;
-      }
-      const page = known.slice(0, pageSize);
-      const last = page[page.length - 1];
-      const nextCursor =
-        known.length > page.length && last != null
-          ? cursorOf(last)
-          : horizon != null
-            ? cursorOf(horizon)
-            : null;
-      const provider = await providerOf(match?.provider ?? null);
+      };
+      const page = timelineEntries(pageKeys.keys, (from, rowId) => itemsBySource[from].get(rowId));
+      const provider = await providerOf(sim?.provider ?? null);
       // The likely cause of each disconnect, from stored data only (no provider call).
       const disconnects = page.filter((entry) => entry.kind === 'disconnected');
       const causes = await stationDisconnectCauses(
@@ -987,9 +958,8 @@ export function stationSimRoutes(app: FastifyInstance): void {
       disconnects.forEach((entry, index) => {
         entry.details.offlineCause = causes[index] ?? 'unknown';
       });
-      const days = await stationCoveredDays(
-        id,
-        sim,
+      const days = await simCoveredDays(
+        sim?.id ?? null,
         rangeFrom,
         to,
         await coverageTimeZone(station),
@@ -997,21 +967,19 @@ export function stationSimRoutes(app: FastifyInstance): void {
           historyDays: provider?.historyDays ?? (await simHistoryDays(simProviderRegistry())),
           retentionDays: simSettings.retentionDays,
           reportingDelayHours: provider?.reportingDelayHours ?? 0,
+          windows,
         },
         now,
       );
       return {
-        items: page.map((entry) => ({
-          at: entry.at.toISOString(),
-          source: entry.source,
-          kind: entry.kind,
-          details: entry.details,
-        })),
-        nextCursor,
+        ...timelinePageOut(paging, pageKeys, page),
         from: rangeFrom.toISOString(),
         to: to.toISOString(),
         capped,
-        lastFetchedAt: match?.sessionsSyncedAt?.toISOString() ?? null,
+        lastFetchedAt:
+          view != null && fetchedAfterFloor(view.sim.sessionsSyncedAt, view.sim)
+            ? (view.sim.sessionsSyncedAt?.toISOString() ?? null)
+            : null,
         days,
       };
     },
@@ -1025,7 +993,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: "Refresh a station's SIM data",
         description:
-          'Fetches the SIM status, sessions and alerts from the provider for the last days (1, 3, 7, 14 or 31, default sim.sessions.fetchDays) or a date range of at most 31 days, and stores them. While station signal reads are on it also sends the station one GetVariables (OCPP 2.x, the DataLink values) or GetConfiguration (OCPP 1.6, sim.ocpp16.signalKeys), at most once a minute per station. Each part reports its own result; the reply is 200 whenever the request was valid. At most 6 a minute per station.',
+          'Fetches the SIM status, sessions and alerts from the provider for the last days (1, 3, 7, 14 or 31, default sim.sessions.fetchDays) or a date range of at most 31 days, and stores them. Without a SIM attachment the ICCID the station reported is attached unconfirmed, unless that SIM is attached elsewhere; nothing is fetched until Confirm SIM. An inactive SIM answers 409 SIM_INACTIVE. While station signal reads are on it also sends the station one GetVariables (OCPP 2.x, the DataLink values) or GetConfiguration (OCPP 1.6, sim.ocpp16.signalKeys), at most once a minute per station. Each part reports its own result; the reply is 200 whenever the request was valid. At most 6 a minute per station.',
         operationId: 'refreshStationSim',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -1037,6 +1005,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
             ERROR_CODES.VALIDATION_ERROR,
           ]),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
+          409: errorWith('The SIM is inactive', [ERROR_CODES.SIM_INACTIVE]),
           429: errorWith('Too many Refreshes', [ERROR_CODES.SIM_PROVIDER_RATE_LIMITED]),
         },
       },
@@ -1044,7 +1013,8 @@ export function stationSimRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof stationParams>;
       const body = (request.body ?? {}) as z.infer<typeof refreshBody>;
-      if (!(await stationAccessible(request, id)) || (await stationRow(id)) == null) {
+      const station = (await stationAccessible(request, id)) ? await stationRow(id) : null;
+      if (station == null) {
         await reply.status(404).send(STATION_NOT_FOUND);
         return;
       }
@@ -1086,6 +1056,15 @@ export function stationSimRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // An inactive SIM is never refreshed: refused before either part starts.
+      if (anySimProviderEnabled(simSettings)) {
+        const { sim } = await stationSimOf(id, station.iccid);
+        if (sim?.status === 'inactive') {
+          await reply.status(409).send(SIM_INACTIVE);
+          return;
+        }
+      }
+
       const keys = simKeyStore();
       let count: number | null = null;
       try {
@@ -1104,8 +1083,8 @@ export function stationSimRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const [provider, station] = await Promise.all([
-        simSettings.hologram.enabled
+      const [provider, stationPart] = await Promise.all([
+        anySimProviderEnabled(simSettings)
           ? refreshStationSimProvider(
               { registry, keys, actor: getAuditActor(request), log: request.log },
               id,
@@ -1115,7 +1094,12 @@ export function stationSimRoutes(app: FastifyInstance): void {
           : Promise.resolve({ result: 'skipped', reason: 'provider_off' } as const),
         readStationDataLink({ keys, log: request.log }, id, simSettings),
       ]);
-      return { provider, station };
+      // Deactivated between the check and the provider part: no provider was called.
+      if (provider.result === 'skipped' && provider.reason === 'sim_inactive') {
+        await reply.status(409).send(SIM_INACTIVE);
+        return;
+      }
+      return { provider, station: stationPart };
     },
   );
 
@@ -1127,7 +1111,7 @@ export function stationSimRoutes(app: FastifyInstance): void {
         tags: ['Stations'],
         summary: "Reset a station's SIM network",
         description:
-          'Asks the SIM provider to detach the SIM from the network, so the station loses its data session and reconnects. Needs a confirmed SIM match. One reset per station a minute.',
+          'Asks the SIM provider to detach the SIM from the network, so the station loses its data session and reconnects. Needs a confirmed SIM attachment. One reset per SIM a minute, shared with the SIM page.',
         operationId: 'resetStationSimNetwork',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -1136,11 +1120,13 @@ export function stationSimRoutes(app: FastifyInstance): void {
           400: errorWith('No SIM provider', [ERROR_CODES.SIM_PROVIDER_NOT_CONFIGURED]),
           404: errorWith('Not found', [ERROR_CODES.STATION_NOT_FOUND, ERROR_CODES.SIM_NOT_FOUND]),
           409: errorWith('Reset not possible', [
-            ERROR_CODES.SIM_MATCH_NOT_CONFIRMED,
-            ERROR_CODES.SIM_MATCHED_ELSEWHERE,
+            ERROR_CODES.SIM_ATTACHMENT_NOT_CONFIRMED,
+            ERROR_CODES.SIM_INACTIVE,
             ERROR_CODES.SIM_ACTION_UNSUPPORTED,
           ]),
-          429: errorWith('Reset cooldown', [ERROR_CODES.SIM_PROVIDER_RATE_LIMITED]),
+          429: errorWith('Reset cooldown or provider limit', [
+            ERROR_CODES.SIM_PROVIDER_RATE_LIMITED,
+          ]),
           502: errorWith('Provider request failed', [ERROR_CODES.SIM_PROVIDER_ERROR]),
           503: errorWith('Cooldown not checked', [ERROR_CODES.SIM_RESET_UNAVAILABLE]),
         },
@@ -1148,164 +1134,131 @@ export function stationSimRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof stationParams>;
-      if (!(await stationAccessible(request, id)) || (await stationRow(id)) == null) {
+      const station = (await stationAccessible(request, id)) ? await stationRow(id) : null;
+      if (station == null) {
         await reply.status(404).send(STATION_NOT_FOUND);
         return;
       }
-      if ((await simProviderRegistry().enabledProviders()).length === 0) {
+      const registry = simProviderRegistry();
+      if ((await registry.enabledProviders()).length === 0) {
         await sendNotConfigured(reply);
         return;
       }
-      const match = await getStationSimMatch(id);
-      if (match?.provider == null) {
-        if (match?.lookupMissReason === 'sim_matched_elsewhere') {
-          await reply.status(409).send({
-            error: 'This SIM is matched to another station',
-            code: 'SIM_MATCHED_ELSEWHERE',
-          });
-          return;
-        }
-        await reply.status(404).send({
-          error: 'No SIM is matched to this station',
-          code: 'SIM_NOT_FOUND',
-        });
+      const { sim, attachment } = await stationSimOf(id, station.iccid);
+      if (attachment == null) {
+        // An inactive SIM is never attached: say so rather than "not found".
+        await reply
+          .status(sim?.status === 'inactive' ? 409 : 404)
+          .send(sim?.status === 'inactive' ? SIM_INACTIVE : SIM_NOT_FOUND);
         return;
       }
-      const provider = await providerOf(match.provider);
-      const ref = simRefOf(match);
-      if (provider == null || ref == null) {
-        await sendNotConfigured(reply);
-        return;
-      }
-      if (match.confirmedAt == null) {
+      if (attachment.confirmedAt == null) {
         await reply.status(409).send({
-          error: 'Confirm the SIM before resetting its network',
-          code: 'SIM_MATCH_NOT_CONFIRMED',
+          error: ERROR_MESSAGES.SIM_ATTACHMENT_NOT_CONFIRMED,
+          code: 'SIM_ATTACHMENT_NOT_CONFIRMED',
         });
         return;
       }
-      if (!provider.capabilities.networkReset) {
-        await reply.status(409).send({
-          error: 'The SIM provider does not support a network reset',
-          code: 'SIM_ACTION_UNSUPPORTED',
-        });
-        return;
-      }
-      const keys = simKeyStore();
-      const cooldownKey = SIM_KEYS.reset(id);
-      const cooldownToken = randomUUID();
-      let taken: boolean;
-      try {
-        taken = await keys.acquire(cooldownKey, cooldownToken, SIM_RESET_COOLDOWN_SECONDS * 1000);
-      } catch (err: unknown) {
-        // Without the cooldown two resets could reach the provider at once: refuse.
-        request.log.warn({ err, stationId: id }, 'SIM reset cooldown not taken in Redis');
-        await reply.status(503).send({
-          error: 'The network reset cannot be started right now, try again in a minute',
-          code: 'SIM_RESET_UNAVAILABLE',
-        });
-        return;
-      }
-      if (!taken) {
-        const retryAfter = await secondsLeft(
-          keys,
-          cooldownKey,
-          SIM_RESET_COOLDOWN_SECONDS,
-          request,
-          id,
-        );
-        await reply.status(429).header('Retry-After', String(retryAfter)).send({
-          error: 'The network of this SIM was reset less than a minute ago',
-          code: 'SIM_PROVIDER_RATE_LIMITED',
-          retryAfter,
-        });
-        return;
-      }
-
-      const audit = async (outcome: 'accepted' | 'failed'): Promise<void> => {
-        await recordStationCommandAudit(
-          {
-            stationId: id,
-            actor: getAuditActor(request),
-            command: 'SimNetworkReset',
-            sessionId: null,
-            outcome,
+      const actor = getAuditActor(request);
+      const outcome = await resetSimNetwork(
+        { registry, keys: simKeyStore(), actor, log: request.log },
+        attachment.simId,
+        {
+          // The SIM must still be confirmed at this station once the cooldown is
+          // taken: a detach and an attach elsewhere meanwhile would move the
+          // reset to another site's station.
+          stillAllowed: async () => {
+            const current = await openStationAttachment(id);
+            return current?.id === attachment.id && current.confirmedAt != null;
           },
-          request.log,
-        );
-      };
-      try {
-        const result = await provider.resetNetwork(ref);
-        await audit('accepted');
-        return { status: result.status };
-      } catch (err: unknown) {
-        await audit('failed');
-        if (!(err instanceof SimProviderError)) {
-          // Nothing says the provider got the request, so the cooldown is given back.
-          try {
-            await keys.release(cooldownKey, cooldownToken);
-          } catch (releaseErr: unknown) {
-            request.log.warn(
-              { err: releaseErr, stationId: id },
-              'SIM reset cooldown not released in Redis; it expires by itself',
+          // The station command audit stays on the station the person reset from.
+          onOutcome: async (result) => {
+            await recordStationCommandAudit(
+              {
+                stationId: id,
+                actor,
+                command: 'SimNetworkReset',
+                sessionId: null,
+                outcome: result,
+              },
+              request.log,
             );
-          }
-          throw err;
-        }
-        request.log.warn({ err, stationId: id, kind: err.kind }, 'SIM network reset failed');
-        if (err.kind === 'unsupported') {
+          },
+        },
+      );
+      switch (outcome.kind) {
+        case 'reset':
+          return { status: outcome.status };
+        case 'sim_not_found':
+        case 'not_looked_up':
+          await reply.status(404).send(SIM_NOT_FOUND);
+          return;
+        case 'sim_inactive':
+          await reply.status(409).send(SIM_INACTIVE);
+          return;
+        case 'provider_off':
+          await sendNotConfigured(reply);
+          return;
+        case 'unsupported':
           await reply.status(409).send({
-            error: 'The SIM provider refused a network reset for this SIM',
+            error: 'The SIM provider does not support a network reset',
             code: 'SIM_ACTION_UNSUPPORTED',
           });
           return;
-        }
-        if (err.kind === 'not_found') {
-          await reply.status(404).send({
-            error: 'The SIM provider no longer has this SIM; clear the match and Refresh',
-            code: 'SIM_NOT_FOUND',
+        case 'cooldown':
+          await reply.status(429).header('Retry-After', String(outcome.retryAfter)).send({
+            error: 'The network of this SIM was reset less than a minute ago',
+            code: 'SIM_PROVIDER_RATE_LIMITED',
+            retryAfter: outcome.retryAfter,
           });
           return;
-        }
-        if (err.kind === 'rate_limited') {
-          try {
-            await keys.setFor(
-              SIM_KEYS.backoff(provider.id),
-              err.retryAfterSeconds ?? SIM_RESET_COOLDOWN_SECONDS,
-            );
-          } catch (setErr: unknown) {
-            request.log.warn(
-              { err: setErr, stationId: id },
-              'SIM provider backoff not stored in Redis; the next Refresh may call the provider',
-            );
+        case 'unavailable':
+          await reply.status(503).send({
+            error: ERROR_MESSAGES.SIM_RESET_UNAVAILABLE,
+            code: 'SIM_RESET_UNAVAILABLE',
+          });
+          return;
+        case 'provider_error':
+          if (outcome.error.kind === 'unsupported') {
+            await reply.status(409).send({
+              error: 'The SIM provider refused a network reset for this SIM',
+              code: 'SIM_ACTION_UNSUPPORTED',
+            });
+            return;
           }
-        }
-        await sendSimProviderError(err, reply);
-        return;
+          if (outcome.error.kind === 'not_found') {
+            await reply.status(404).send({
+              error: 'The SIM provider no longer has this SIM; detach it and Refresh',
+              code: 'SIM_NOT_FOUND',
+            });
+            return;
+          }
+          await sendSimProviderError(outcome.error, reply);
+          return;
       }
     },
   );
 
   app.post(
-    '/stations/:id/sim/match/confirm',
+    '/stations/:id/sim/attachment/confirm',
     {
       onRequest: [authorize('stations:write')],
       schema: {
         tags: ['Stations'],
-        summary: "Confirm a station's SIM match",
+        summary: "Confirm a station's SIM attachment",
         description:
-          'Confirms that the matched SIM is the SIM in the station. Until then a Refresh fetches nothing from the provider and no reset is possible. Needs access to every site. Makes no provider call. The body names the match the person saw (its matchedAt): a match that changed since answers 409 SIM_MATCH_CHANGED and nothing is confirmed. A match already confirmed stays as it is; a SIM another station holds confirmed answers 409.',
-        operationId: 'confirmStationSimMatch',
+          'Confirms that the attached SIM is the SIM in the station. Until then a Refresh fetches nothing from the provider and no reset is possible. Needs access to every site. Makes no provider call. The body names the attachment the person saw (its id): an attachment that changed since answers 409 SIM_ATTACHMENT_CHANGED and nothing is confirmed. An attachment already confirmed stays as it is.',
+        operationId: 'confirmStationSimAttachment',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
         body: zodSchema(confirmBody),
         response: {
           200: itemResponse(confirmResponse),
-          400: errorWith('No SIM provider', [ERROR_CODES.SIM_PROVIDER_NOT_CONFIGURED]),
+          400: errorWith('SIM features off', [ERROR_CODES.SIM_FEATURE_DISABLED]),
           404: errorWith('Not found', [ERROR_CODES.STATION_NOT_FOUND, ERROR_CODES.SIM_NOT_FOUND]),
-          409: errorWith('Match changed or confirmed at another station', [
-            ERROR_CODES.SIM_MATCH_CHANGED,
-            ERROR_CODES.SIM_CONFIRMED_ELSEWHERE,
+          409: errorWith('Attachment changed or SIM inactive', [
+            ERROR_CODES.SIM_ATTACHMENT_CHANGED,
+            ERROR_CODES.SIM_INACTIVE,
           ]),
         },
       },
@@ -1317,58 +1270,53 @@ export function stationSimRoutes(app: FastifyInstance): void {
         await reply.status(404).send(STATION_NOT_FOUND);
         return;
       }
-      if ((await simProviderRegistry().enabledProviders()).length === 0) {
-        await sendNotConfigured(reply);
+      if (!isSimFeatureOn(await readSimSettings())) {
+        await sendFeatureDisabled(reply);
         return;
       }
-      const { matchedAt } = request.body as z.infer<typeof confirmBody>;
-      const confirmed = await confirmStationSim(
-        id,
-        getAuditActor(request),
-        new Date(matchedAt),
-        request.log,
-      );
-      if (confirmed === 'not_matched') {
-        await reply.status(404).send({
-          error: 'No SIM is matched to this station',
-          code: 'SIM_NOT_FOUND',
-        });
+      const { attachmentId } = request.body as z.infer<typeof confirmBody>;
+      const confirmed = await confirmStationAttachment(id, attachmentId, {
+        actor: simActorOf(request),
+        log: request.log,
+      });
+      if (confirmed === 'not_attached') {
+        await reply.status(404).send(SIM_NOT_FOUND);
         return;
       }
-      if (confirmed === 'match_changed') {
+      if (confirmed === 'attachment_changed') {
         await reply.status(409).send({
-          error: 'The SIM match changed since it was shown, check it and confirm again',
-          code: 'SIM_MATCH_CHANGED',
+          error: ERROR_MESSAGES.SIM_ATTACHMENT_CHANGED,
+          code: 'SIM_ATTACHMENT_CHANGED',
         });
         return;
       }
-      if (confirmed === 'confirmed_elsewhere') {
-        await reply.status(409).send({
-          error: 'Another station already has a confirmed match for this SIM',
-          code: 'SIM_CONFIRMED_ELSEWHERE',
-        });
+      if (confirmed === 'sim_inactive') {
+        await reply.status(409).send(SIM_INACTIVE);
         return;
       }
-      const match = await getStationSimMatch(id);
-      return { confirmed: true as const, confirmedAt: match?.confirmedAt?.toISOString() ?? null };
+      const attachment = await openStationAttachment(id);
+      return {
+        confirmed: true as const,
+        confirmedAt: attachment?.confirmedAt?.toISOString() ?? null,
+      };
     },
   );
 
   app.delete(
-    '/stations/:id/sim/match',
+    '/stations/:id/sim/attachment',
     {
       onRequest: [authorize('stations:write')],
       schema: {
         tags: ['Stations'],
-        summary: "Clear a station's SIM match",
+        summary: "Detach a station's SIM",
         description:
-          'Forgets the SIM match and what was fetched for it; the next Refresh looks the SIM up again. Stored sessions and alerts are kept.',
-        operationId: 'clearStationSimMatch',
+          "Closes the station's SIM attachment. The SIM, its history and its stored sessions and alerts are kept; the next Refresh attaches the SIM of the ICCID the station reported, unconfirmed.",
+        operationId: 'detachStationSim',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
         response: {
           200: successResponse,
-          400: errorWith('No SIM provider', [ERROR_CODES.SIM_PROVIDER_NOT_CONFIGURED]),
+          400: errorWith('SIM features off', [ERROR_CODES.SIM_FEATURE_DISABLED]),
           404: errorWith('Not found', [ERROR_CODES.STATION_NOT_FOUND, ERROR_CODES.SIM_NOT_FOUND]),
         },
       },
@@ -1379,15 +1327,13 @@ export function stationSimRoutes(app: FastifyInstance): void {
         await reply.status(404).send(STATION_NOT_FOUND);
         return;
       }
-      if ((await simProviderRegistry().enabledProviders()).length === 0) {
-        await sendNotConfigured(reply);
+      if (!isSimFeatureOn(await readSimSettings())) {
+        await sendFeatureDisabled(reply);
         return;
       }
-      if (!(await clearStationSim(id, getAuditActor(request), request.log))) {
-        await reply.status(404).send({
-          error: 'No SIM is matched to this station',
-          code: 'SIM_NOT_FOUND',
-        });
+      const detached = await detachStationSim(id, { actor: simActorOf(request), log: request.log });
+      if (detached == null) {
+        await reply.status(404).send(SIM_NOT_FOUND);
         return;
       }
       return { success: true as const };

@@ -29,19 +29,21 @@ import type { AiDefaults } from '@/components/ai/use-ai-defaults';
 import { isCustomModel, isDefaultPrompt } from '@/components/ai/use-ai-defaults';
 import { AiSystemPromptField } from '@/components/ai/AiSystemPromptField';
 import { InsightQualityCard } from '@/components/ai/insights/InsightQualityCard';
+import { AiInsightsScopeCard } from './AiInsightsScopeCard';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LanguageSelect } from '@/components/ui/language-select';
 import { Textarea } from '@/components/ui/textarea';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { useFeatureFlags } from '@/hooks/use-feature-flags';
 import { api } from '@/lib/api';
 import { API_BASE_URL } from '@/lib/config';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatNumber } from '@/lib/formatting';
 import { AiAdvancedOptions, AiPromptSummary } from './AiAdvancedOptions';
+import { DataRetentionLink } from './DataRetentionSettings';
 import { useLoadedValues } from '@/hooks/use-loaded-values';
 
 /**
@@ -55,8 +57,21 @@ type FieldValue = string | boolean;
 type FieldValues = Record<string, FieldValue>;
 
 type FieldSpec =
-  | { kind: 'flag'; key: AiFlagSettingKey; label: ParseKeys; help?: ParseKeys }
-  | { kind: 'number'; key: AiThresholdSettingKey; label: ParseKeys }
+  | {
+      kind: 'flag';
+      key: AiFlagSettingKey;
+      label: ParseKeys;
+      help?: ParseKeys;
+      /** What stops when the switch is turned off, shown in the confirmation. */
+      offDescription?: ParseKeys;
+    }
+  | {
+      kind: 'number';
+      key: AiThresholdSettingKey;
+      label: ParseKeys;
+      /** Takes effect while system-initiated AI is off too (not disabled then). */
+      worksWhileOpsOff?: true;
+    }
   | { kind: 'language'; key: string; label: ParseKeys }
   | { kind: 'origins'; key: string; label: ParseKeys; help: ParseKeys; advanced: true };
 
@@ -106,6 +121,11 @@ interface KeysCardProps {
   testId: string;
   /** Shown above the fields. */
   intro?: React.ReactNode;
+  /**
+   * System-initiated AI is off: the fields that take effect only while it is
+   * on are disabled (their values kept, nothing saved) with a note why.
+   */
+  opsOff?: boolean;
 }
 
 /** A card of AI settings saved together; only the changed keys are written. */
@@ -117,6 +137,7 @@ function AiKeysCard({
   fields,
   testId,
   intro,
+  opsOff = false,
 }: KeysCardProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -159,6 +180,8 @@ function AiKeysCard({
     setValues((prev) => ({ ...prev, [key]: v }));
     save.reset();
   };
+  const fieldDisabled = (f: FieldSpec): boolean =>
+    !canWrite || (opsOff && !(f.kind === 'number' && f.worksWhileOpsOff === true));
 
   return (
     <Card data-testid={testId}>
@@ -167,6 +190,11 @@ function AiKeysCard({
         {description != null && <p className="text-sm text-muted-foreground">{t(description)}</p>}
       </CardHeader>
       <CardContent className="space-y-6">
+        {opsOff && (
+          <p className="text-sm text-muted-foreground" data-testid={`${testId}-ops-off`}>
+            {t('settings.aiSurface.ops.offNote')}
+          </p>
+        )}
         {intro}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {basicFields.map((f) => {
@@ -184,10 +212,12 @@ function AiKeysCard({
                     </Label>
                     {f.help != null && <p className="text-xs text-muted-foreground">{t(f.help)}</p>}
                   </div>
-                  <Toggle
+                  <ConfirmToggle
                     id={id}
+                    label={t(f.label)}
+                    {...(f.offDescription != null ? { offDescription: t(f.offDescription) } : {})}
                     checked={values[f.key] === true}
-                    disabled={!canWrite}
+                    disabled={fieldDisabled(f)}
                     onCheckedChange={(checked) => {
                       set(f.key, checked);
                     }}
@@ -203,7 +233,7 @@ function AiKeysCard({
                   </Label>
                   <LanguageSelect
                     id={id}
-                    disabled={!canWrite}
+                    disabled={fieldDisabled(f)}
                     value={String(values[f.key] ?? 'en')}
                     onChange={(v) => {
                       set(f.key, v);
@@ -225,7 +255,7 @@ function AiKeysCard({
                   min={min}
                   max={max}
                   step={1}
-                  disabled={!canWrite}
+                  disabled={fieldDisabled(f)}
                   aria-invalid={showError}
                   className={showError ? 'border-destructive' : undefined}
                   value={String(values[f.key] ?? '')}
@@ -326,21 +356,25 @@ const INSIGHT_FIELDS: readonly FieldSpec[] = [
     kind: 'flag',
     key: AI_INSIGHT_SETTING_KEYS.stationEnabled,
     label: 'settings.aiInsightsSettings.station',
+    offDescription: 'settings.aiInsightsSettings.kindOff',
   },
   {
     kind: 'flag',
     key: AI_INSIGHT_SETTING_KEYS.sessionEnabled,
     label: 'settings.aiInsightsSettings.session',
+    offDescription: 'settings.aiInsightsSettings.kindOff',
   },
   {
     kind: 'flag',
     key: AI_INSIGHT_SETTING_KEYS.authorizationEnabled,
     label: 'settings.aiInsightsSettings.authorization',
+    offDescription: 'settings.aiInsightsSettings.kindOff',
   },
   {
     kind: 'flag',
     key: AI_INSIGHT_SETTING_KEYS.reservationEnabled,
     label: 'settings.aiInsightsSettings.reservation',
+    offDescription: 'settings.aiInsightsSettings.kindOff',
   },
   {
     kind: 'language',
@@ -369,13 +403,10 @@ const INSIGHT_FIELDS: readonly FieldSpec[] = [
   },
   {
     kind: 'number',
-    key: AI_INSIGHT_SETTING_KEYS.retentionDays,
-    label: 'settings.aiInsightsSettings.retentionDays',
-  },
-  {
-    kind: 'number',
     key: AI_INSIGHT_SETTING_KEYS.expireAfterDays,
     label: 'settings.aiInsightsSettings.expireAfterDays',
+    // The scan closes old open insights while system-initiated AI is off too.
+    worksWhileOpsOff: true,
   },
 ];
 
@@ -427,6 +458,7 @@ const MCP_FIELDS: readonly FieldSpec[] = [
     key: AI_MCP_SETTING_KEYS.allowWrites,
     label: 'settings.aiMcp.allowWrites',
     help: 'settings.aiMcp.allowWritesHint',
+    offDescription: 'settings.aiMcp.allowWritesOff',
   },
   {
     kind: 'number',
@@ -473,20 +505,21 @@ function AiOpsSurfaceCard({
   settings,
   canWrite,
   aiDefaults,
+  enabled,
+  setEnabled,
 }: {
   settings: Record<string, unknown> | undefined;
   canWrite: boolean;
   aiDefaults: AiDefaults | undefined;
+  /** The switch, shared with the cards below so they follow it before a reload. */
+  enabled: boolean;
+  setEnabled: (on: boolean) => void;
 }): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const loaded = useMemo(() => loadOps(settings), [settings]);
   const [values, setValues] = useLoadedValues<Record<string, string>>(loaded);
   const enabledStored = storedValue(settings, OPS_AI_SETTING_KEYS.enabled) === true;
-  const [enabled, setEnabled] = useState(enabledStored);
-  useEffect(() => {
-    setEnabled(enabledStored);
-  }, [enabledStored]);
 
   const toggle = useMutation({
     mutationFn: (on: boolean) =>
@@ -541,8 +574,10 @@ function AiOpsSurfaceCard({
           <Label htmlFor="opsAi-enabled" className="leading-6">
             {t('settings.aiSurface.ops.enabled')}
           </Label>
-          <Toggle
+          <ConfirmToggle
             id="opsAi-enabled"
+            label={t('settings.aiSurface.ops.enabled')}
+            offDescription={t('settings.aiSurface.ops.offConfirm')}
             checked={enabled}
             disabled={!canWrite || toggle.isPending}
             onCheckedChange={(checked) => {
@@ -713,30 +748,52 @@ export function AiInsightsSettings({
         : INSIGHT_FIELDS.filter((f) => f.key !== AI_INSIGHT_SETTING_KEYS.reservationEnabled),
     [showReservationSwitch],
   );
+  // The system-initiated AI switch: the cards below follow it at once (it
+  // saves on change), and a settings reload puts the stored value back.
+  const opsEnabledStored = storedValue(settings, OPS_AI_SETTING_KEYS.enabled) === true;
+  const [opsEnabled, setOpsEnabled] = useState(opsEnabledStored);
+  useEffect(() => {
+    setOpsEnabled(opsEnabledStored);
+  }, [opsEnabledStored]);
+  const opsOff = !opsEnabled;
   return (
     <>
-      <AiOpsSurfaceCard settings={settings} canWrite={canWrite} aiDefaults={aiDefaults} />
+      <AiOpsSurfaceCard
+        settings={settings}
+        canWrite={canWrite}
+        aiDefaults={aiDefaults}
+        enabled={opsEnabled}
+        setEnabled={setOpsEnabled}
+      />
       <AiKeysCard
         settings={settings}
         canWrite={canWrite}
+        opsOff={opsOff}
         title="settings.aiInsightsSettings.title"
         fields={fields}
         testId="ai-insights-settings"
         intro={
-          reservationsOff ? (
-            <p className="text-sm text-muted-foreground" data-testid="ai-reservation-insights-off">
-              {t('settings.aiInsightsSettings.reservationOff')}{' '}
-              <Link
-                to="/settings?tab=integrations&sub=reservation"
-                className="text-link hover:underline"
+          <>
+            {reservationsOff && (
+              <p
+                className="text-sm text-muted-foreground"
+                data-testid="ai-reservation-insights-off"
               >
-                {t('settings.aiInsightsSettings.reservationOffLink')}
-              </Link>
-            </p>
-          ) : undefined
+                {t('settings.aiInsightsSettings.reservationOff')}{' '}
+                <Link
+                  to="/settings?tab=integrations&sub=reservation"
+                  className="text-link hover:underline"
+                >
+                  {t('settings.aiInsightsSettings.reservationOffLink')}
+                </Link>
+              </p>
+            )}
+            <DataRetentionLink />
+          </>
         }
       />
-      <AiWorkersSettings settings={settings} canWrite={canWrite} />
+      <AiInsightsScopeCard canWrite={canWrite} opsOff={opsOff} />
+      <AiWorkersSettings settings={settings} canWrite={canWrite} opsOff={opsOff} />
       <InsightQualityCard />
     </>
   );
@@ -746,11 +803,16 @@ export function AiInsightsSettings({
  * The background workers card of Settings > AI > Automatic insights. They run
  * on the same surface; their suggestions appear as insights with an action.
  */
-export function AiWorkersSettings({ settings, canWrite }: OpsTabProps): React.JSX.Element {
+export function AiWorkersSettings({
+  settings,
+  canWrite,
+  opsOff = false,
+}: OpsTabProps & { opsOff?: boolean }): React.JSX.Element {
   return (
     <AiKeysCard
       settings={settings}
       canWrite={canWrite}
+      opsOff={opsOff}
       title="aiWorkers.title"
       description="aiWorkers.description"
       fields={WORKER_FIELDS}

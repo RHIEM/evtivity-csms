@@ -8,6 +8,8 @@ import { useTranslation } from 'react-i18next';
 import { BackButton } from '@/components/back-button';
 import { GoogleMapPicker } from '@/components/GoogleMapPicker';
 import { HoursOfOperationField } from '@/components/site/HoursOfOperationField';
+import { SiteTypeField } from '@/components/site/SiteTypeField';
+import type { ChargerPlacement, SiteType } from '@evtivity/lib/site-layout';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
 import { DecimalInput } from '@/components/ui/decimal-input';
@@ -50,6 +52,8 @@ export function SiteCreate(): React.JSX.Element {
   const [contactPhone, setContactPhone] = useState('');
   const [contactIsPublic, setContactIsPublic] = useState(false);
   const [hoursOfOperation, setHoursOfOperation] = useState('');
+  const [siteType, setSiteType] = useState<SiteType>('parking_lot');
+  const [placement, setPlacement] = useState<ChargerPlacement>('islands');
   const [hasSubmitted, setHasSubmitted] = useState(false);
 
   const createMutation = useMutation({
@@ -84,6 +88,8 @@ export function SiteCreate(): React.JSX.Element {
     if (latitude.trim() !== '') body['latitude'] = latitude;
     if (longitude.trim() !== '') body['longitude'] = longitude;
     body['timezone'] = timezone;
+    body['siteType'] = siteType;
+    if (siteType === 'parking_lot') body['chargerPlacement'] = placement;
     if (contactName.trim() !== '') body['contactName'] = contactName;
     if (contactEmail.trim() !== '') body['contactEmail'] = contactEmail;
     if (contactPhone.trim() !== '') body['contactPhone'] = contactPhone;
@@ -238,6 +244,13 @@ export function SiteCreate(): React.JSX.Element {
               id="site-hours"
               value={hoursOfOperation}
               onChange={setHoursOfOperation}
+            />
+            <SiteTypeField
+              id="site-type"
+              value={siteType}
+              onChange={setSiteType}
+              placement={placement}
+              onPlacementChange={setPlacement}
             />
             <div className="border-t pt-4 space-y-4">
               <div>

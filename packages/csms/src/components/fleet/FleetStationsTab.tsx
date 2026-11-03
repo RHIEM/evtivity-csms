@@ -6,8 +6,8 @@ import { useNavigate } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Trash2 } from 'lucide-react';
-import { AddButton } from '@/components/add-button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { CreateButton } from '@/components/create-button';
+import { TabPanel } from '@/components/ui/tab-panel';
 import { StationsTable } from '@/components/StationsTable';
 import type { Station } from '@/components/StationsTable';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -26,7 +26,12 @@ export function FleetStationsTab({ fleetId }: FleetStationsTabProps): React.JSX.
 
   const [removeStationId, setRemoveStationId] = useState<string | null>(null);
 
-  const { data: stations } = useQuery({
+  const {
+    data: stations,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['fleets', fleetId, 'stations'],
     queryFn: () => api.get<Station[]>(`/v1/fleets/${fleetId}/stations`),
   });
@@ -40,27 +45,31 @@ export function FleetStationsTab({ fleetId }: FleetStationsTabProps): React.JSX.
 
   return (
     <>
-      <Card>
-        <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <CardTitle>{t('fleets.stations')}</CardTitle>
-          <AddButton
+      <TabPanel
+        title={t('fleets.stations')}
+        actions={
+          <CreateButton
             label={t('fleets.addStation')}
             onClick={() => {
               void navigate(`/fleets/${fleetId}/stations/add`);
             }}
           />
-        </CardHeader>
-        <CardContent>
-          <StationsTable
-            stations={stations}
-            timezone={timezone}
-            emptyMessage={t('fleets.noStations')}
-            onRemove={(station) => {
-              setRemoveStationId(station.id);
-            }}
-          />
-        </CardContent>
-      </Card>
+        }
+      >
+        <StationsTable
+          stations={stations}
+          timezone={timezone}
+          emptyMessage={t('fleets.noStations')}
+          isLoading={isLoading}
+          isError={isError}
+          onRetry={() => {
+            void refetch();
+          }}
+          onRemove={(station) => {
+            setRemoveStationId(station.id);
+          }}
+        />
+      </TabPanel>
 
       <ConfirmDialog
         open={removeStationId != null}

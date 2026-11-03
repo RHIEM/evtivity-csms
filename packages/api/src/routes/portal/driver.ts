@@ -44,6 +44,9 @@ import {
   issueDriverTokens,
 } from '../../lib/driver-session.js';
 import { driverSessionColumns } from '../../lib/driver-session-columns.js';
+import { avatarItem } from '../../lib/avatar-item.js';
+import { driverAvatarColumns } from '../../services/driver-avatar.service.js';
+import { withAvatars } from '../../services/account-avatar.js';
 import {
   authenticateDriverOrMfaEnrollment,
   driverMfaPolicy,
@@ -135,7 +138,7 @@ const portalDriverProfile = z
     id: z.string().describe('Driver ID (nanoid prefixed with drv_)'),
     firstName: z.string().max(100).nullable().describe('Driver first name'),
     lastName: z.string().max(100).nullable().describe('Driver last name'),
-    email: z.string().email().max(255).nullable().describe('Driver email address'),
+    email: z.email().max(255).nullable().describe('Driver email address'),
     phone: z.string().max(50).nullable().describe('Driver phone number in E.164 format'),
     language: z
       .string()
@@ -157,8 +160,9 @@ const portalDriverProfile = z
       ),
     isActive: z.boolean().describe('Whether the driver account is active'),
     createdAt: z.coerce.date().describe('Timestamp the driver account was created'),
+    avatar: avatarItem,
   })
-  .passthrough();
+  .loose();
 
 const notificationPrefsItem = z
   .object({
@@ -169,7 +173,7 @@ const notificationPrefsItem = z
       .optional()
       .describe('Whether native push notifications are enabled (omit to keep current value)'),
   })
-  .passthrough();
+  .loose();
 
 const updateProfileBody = z.object({
   firstName: z.string().min(1).max(100).optional(),
@@ -333,6 +337,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           priceDisplay: drivers.priceDisplay,
           isActive: drivers.isActive,
           createdAt: drivers.createdAt,
+          ...driverAvatarColumns,
         });
 
       if (updated == null) {
@@ -379,7 +384,8 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         );
       }
 
-      return updated;
+      const [profile] = await withAvatars([updated]);
+      return profile;
     },
   );
 
@@ -409,7 +415,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           200: itemResponse(
             z
               .object({ challengeId: z.number().int().describe('Send it back with the code') })
-              .passthrough(),
+              .loose(),
           ),
           400: errorWith(
             'No number, or the proof is missing or wrong',
@@ -768,7 +774,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           'Proofs that removing a factor (DELETE /v1/portal/driver/webauthn/:id) or turning MFA off (DELETE /v1/portal/driver/mfa) accepts: the factor kinds of factorProofKinds plus recovery_code while recovery codes remain; never password while the account holds a factor',
         ),
     })
-    .passthrough();
+    .loose();
 
   app.get(
     '/portal/driver/mfa',
@@ -846,7 +852,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         .optional()
         .describe('Email/SMS challenge ID used by the confirm step (email/sms setup only)'),
     })
-    .passthrough();
+    .loose();
 
   app.post(
     '/portal/driver/mfa/setup',
@@ -998,7 +1004,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
           firstName: z.string().nullable().describe('First name'),
           lastName: z.string().nullable().describe('Last name'),
         })
-        .passthrough()
+        .loose()
         .optional()
         .describe(
           'With an enrollmentToken: the driver now signed in (session cookies, or tokens for a mobile client)',
@@ -1009,7 +1015,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         expiresIn: z.number().int().optional().describe('Access token lifetime in seconds'),
       },
     })
-    .passthrough();
+    .loose();
 
   const proofKindsField = z
     .array(z.enum(FACTOR_PROOF_KINDS))
@@ -1427,7 +1433,7 @@ export function portalDriverRoutes(app: FastifyInstance): void {
         .optional()
         .describe('Set when an email or SMS code was sent: send it back with the code'),
     })
-    .passthrough();
+    .loose();
 
   app.post(
     '/portal/driver/mfa/recovery-codes',

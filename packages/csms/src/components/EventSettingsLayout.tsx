@@ -14,6 +14,7 @@ import { LanguageSelect } from '@/components/ui/language-select';
 import { TemplateEditPanel, type TemplateEditPanelHandle } from '@/components/TemplateEditPanel';
 import { api } from '@/lib/api';
 import { useHasCompanyWidePermission } from '@/lib/auth';
+import { isSecurityTemplateEventType } from '@evtivity/lib/notification-events';
 import { getErrorMessage } from '@/lib/error-message';
 import { TEMPLATE_VARIABLES, COMMON_VARIABLES } from '@/lib/template-variables';
 
@@ -88,6 +89,9 @@ export function EventSettingsLayout({
   // Template and event setting writes are company-wide: the API answers 404 to a
   // site-restricted user. Templates stay readable.
   const canWrite = useHasCompanyWidePermission('notifications:write');
+  // Security templates (password reset, invitations, codes, security notices) also
+  // need settings.system:write, as the API requires.
+  const canWriteSecurityTemplates = useHasCompanyWidePermission('settings.system:write');
 
   const [selectedEvent, setSelectedEvent] = useState('');
   const [channelChoice, setChannel] = useState<string>(channels[0] ?? 'email');
@@ -169,8 +173,8 @@ export function EventSettingsLayout({
   }, []);
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[300px_1fr]">
-      <div className="space-y-4">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[300px_1fr]">
+      <div className="min-w-0 space-y-4">
         <Card>
           <CardHeader>
             <CardTitle className="text-base">{sidebarTitle}</CardTitle>
@@ -226,7 +230,7 @@ export function EventSettingsLayout({
         </Card>
       </div>
 
-      <div className="space-y-4">
+      <div className="min-w-0 space-y-4">
         {!selectionComplete && (
           <Card>
             <CardContent className="p-6 text-center text-sm text-muted-foreground">
@@ -238,6 +242,9 @@ export function EventSettingsLayout({
         {selectionComplete &&
           (() => {
             const toggleKey = `${selectedEvent}:${channel}`;
+            const templateLocked =
+              canWrite && isSecurityTemplateEventType(selectedEvent) && !canWriteSecurityTemplates;
+            const canWriteTemplate = canWrite && !templateLocked;
             const isActive = hasToggle
               ? (localToggle.get(toggleKey) ?? enabledMap.get(toggleKey) ?? defaultEnabled ?? false)
               : true;
@@ -261,7 +268,7 @@ export function EventSettingsLayout({
                     >
                       {t('notifications.preview')}
                     </Button>
-                    {canWrite && (
+                    {canWriteTemplate && (
                       <Button
                         variant="outline"
                         onClick={() => {
@@ -272,7 +279,7 @@ export function EventSettingsLayout({
                         {t('notifications.resetToDefault')}
                       </Button>
                     )}
-                    {canWrite && (
+                    {canWriteTemplate && (
                       <Button
                         onClick={() => {
                           templatePanelRef.current?.save();
@@ -390,9 +397,17 @@ export function EventSettingsLayout({
                   </CardContent>
                 </Card>
 
+                {templateLocked && (
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="security-template-locked"
+                  >
+                    {t('notifications.securityTemplateLocked')}
+                  </p>
+                )}
                 <TemplateEditPanel
                   ref={templatePanelRef}
-                  disabled={!isActive}
+                  disabled={!isActive || templateLocked}
                   key={`${selectedEvent}:${channel}:${language}`}
                   eventType={selectedEvent}
                   channel={channel as 'email' | 'sms' | 'webhook'}

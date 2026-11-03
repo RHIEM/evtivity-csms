@@ -62,10 +62,10 @@ export function FirmwareCampaignDetail(): React.JSX.Element {
 
   return (
     <div className="px-4 py-4 md:px-6 md:py-6 space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/settings?tab=firmware" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{campaign.name}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{campaign.name}</h1>
           <CopyableId id={campaign.id} />
         </div>
         <Badge variant={STATUS_VARIANT[campaign.status] ?? 'outline'}>
@@ -90,13 +90,13 @@ export function FirmwareCampaignDetail(): React.JSX.Element {
           </TabsTrigger>
           <TabsTrigger value="audit-history">{t('audit.history')}</TabsTrigger>
         </TabsList>
-        <TabsContent value="details" className="space-y-6">
+        <TabsContent value="details">
           <FirmwareCampaignDetailsTab campaign={campaign} />
         </TabsContent>
-        <TabsContent value="history" className="space-y-6">
+        <TabsContent value="history">
           <FirmwareCampaignsTab campaignId={campaignId} />
         </TabsContent>
-        <TabsContent value="matching" className="space-y-6">
+        <TabsContent value="matching">
           <FirmwareCampaignMatchingStationsTab campaignId={campaignId} />
         </TabsContent>
         <TabsContent value="audit-history">

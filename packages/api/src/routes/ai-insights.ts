@@ -38,6 +38,7 @@ import {
   isReservationEnabled,
   isOpsAiEnabled,
   reservations,
+  insightSubjectInScope,
   sites,
   supportCases,
   supportCaseSessions,
@@ -119,6 +120,7 @@ import { supportCaseSiteCondition } from '../lib/support-case-scope.js';
 import { sessionIdsInSites } from '../lib/support-case-redaction.js';
 import { getAuditActor } from '../lib/audit-actor.js';
 import type { JwtPayload } from '../plugins/auth.js';
+import { isApiKeyRequest } from '../lib/session-proof.js';
 import { callerAuthorization } from '../services/ai/engine/route-support.js';
 import { executeConfirmedToolCall } from '../services/ai/tools/execute.js';
 import type { ConfirmedToolCallResult } from '../services/ai/tools/execute.js';
@@ -150,7 +152,7 @@ const countsSchema = z
       .describe('Sessions that failed with the same stop reason in 24 hours'),
     tokenRefusals: z.number().int().optional().describe('Refused authorizations in 24 hours'),
   })
-  .passthrough();
+  .loose();
 
 const actionSchema = z
   .object({
@@ -163,15 +165,17 @@ const actionSchema = z
     operationId: z.string().describe('The API operation the action runs'),
     method: z.string().describe('HTTP method of the operation'),
     path: z.string().describe('Path of the operation'),
-    args: z.record(z.unknown()).describe('The arguments the operation runs with'),
+    args: z.record(z.string(), z.unknown()).describe('The arguments the operation runs with'),
     argsHash: z.string().describe('Hash of the arguments; send it back to confirm'),
-    summary: z.record(z.unknown()).describe('Structured fields for the confirmation card'),
+    summary: z
+      .record(z.string(), z.unknown())
+      .describe('Structured fields for the confirmation card'),
     precondition: z
       .object({
         kind: z.enum(AI_PROPOSAL_PRECONDITION_KINDS).describe('What must still hold at confirm'),
-        params: z.record(z.unknown()).describe('Parameters of the check'),
+        params: z.record(z.string(), z.unknown()).describe('Parameters of the check'),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('Checked again at confirm; an action whose precondition fails ends stale'),
     expiresAt: z.string().describe('ISO datetime after which it can no longer be confirmed'),
@@ -187,12 +191,12 @@ const actionSchema = z
         httpStatus: z.number().int().describe('HTTP status the operation answered; 0 when refused'),
         body: z.unknown().optional().describe('Redacted excerpt of the answer, or the refusal'),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('The operation result, once it ran'),
     createdAt: z.string().describe('ISO datetime'),
   })
-  .passthrough();
+  .loose();
 
 const insightSchema = z
   .object({
@@ -226,7 +230,7 @@ const insightSchema = z
             code: z.enum(FIX_CODES).describe('Suggested fix (localize aiInsights.fix.<code>)'),
             note: z.string().optional().describe('Short model note on the fix'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Suggested fixes, at most three'),
     scope: z
@@ -240,7 +244,7 @@ const insightSchema = z
                 'Since when the station is offline (last disconnect, else last heartbeat or the session activity), ISO',
               ),
           })
-          .passthrough()
+          .loose()
           .optional()
           .describe('A stuck session at an offline station'),
         concurrentSession: z
@@ -255,11 +259,11 @@ const insightSchema = z
                 'wait (the session is live), stop (stuck at an online station), restore (its station is offline), end (offline past the setting: end it in the CSMS)',
               ),
           })
-          .passthrough()
+          .loose()
           .optional()
           .describe('A token refused because it already runs a session (concurrent_tx)'),
       })
-      .passthrough()
+      .loose()
       .describe(
         'Counts at detection, stored with the insight; computed by the server, never by the model',
       ),
@@ -341,7 +345,7 @@ const insightSchema = z
       .boolean()
       .describe('feedbackUsed, and you asked for the regeneration: the note was yours'),
   })
-  .passthrough();
+  .loose();
 
 const languageField = z
   .enum(UI_LANGUAGES)
@@ -408,7 +412,7 @@ const wrongVoteSchema = z
       .describe('The note on the wrong vote (operator text, plain), or null when none was given'),
     votedAt: z.string().describe('When the vote or its note was last given'),
   })
-  .passthrough();
+  .loose();
 const detailQuery = z.object({
   language: languageField,
   feedback: z
@@ -676,14 +680,9 @@ async function supportCaseFilter(
   return { stationId: caseRow.stationId, sessionIds };
 }
 
-async function siteSwitchOn(row: AiInsightRow): Promise<boolean> {
-  if (row.siteId == null) return true;
-  const [site] = await db
-    .select({ enabled: sites.aiInsightsEnabled })
-    .from(sites)
-    .where(eq(sites.id, row.siteId))
-    .limit(1);
-  return site?.enabled ?? true;
+/** The insight's station, else its site, is in the AI insights scope. */
+async function subjectInScope(row: AiInsightRow): Promise<boolean> {
+  return insightSubjectInScope({ siteId: row.siteId, stationId: row.stationId });
 }
 
 export interface AiInsightRouteOptions {
@@ -777,11 +776,11 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
                         helpful: z.number().int().describe('Helpful votes'),
                         wrong: z.number().int().describe('Wrong votes'),
                       })
-                      .passthrough(),
+                      .loose(),
                   )
                   .describe('Kinds with at least one vote, insights in your sites only'),
               })
-              .passthrough(),
+              .loose(),
           ),
         },
       },
@@ -868,7 +867,7 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
               .object({
                 id: z.string().describe('Id of the new insight, analyzing until generated'),
               })
-              .passthrough(),
+              .loose(),
           ),
           400: errorWith('Insights are off for this insight, or it cannot be regenerated', [
             ERROR_CODES.AI_INSIGHTS_DISABLED,
@@ -895,7 +894,7 @@ export function aiInsightRoutes(app: FastifyInstance, options: AiInsightRouteOpt
         !opsEnabled ||
         !REGENERATABLE.has(kind) ||
         !kindSwitch(kind, settings) ||
-        !(await siteSwitchOn(row))
+        !(await subjectInScope(row))
       ) {
         return reply.status(400).send({
           error: ERROR_MESSAGES.AI_INSIGHTS_DISABLED,
@@ -1140,10 +1139,6 @@ async function decidedError(reply: FastifyReply, row: AiProposalRow): Promise<Fa
   if (row.status === 'expired') return sendActionError(reply, 409, 'AI_PROPOSAL_EXPIRED');
   if (row.status === 'stale') return sendActionError(reply, 409, 'AI_PROPOSAL_STALE');
   return sendActionError(reply, 409, 'AI_PROPOSAL_ALREADY_DECIDED');
-}
-
-function isApiKeyRequest(request: FastifyRequest): boolean {
-  return (request.user as JwtPayload).isApiKey === true;
 }
 
 /** Worker actions run only the closed action set, also after the OCPP version mapping. */

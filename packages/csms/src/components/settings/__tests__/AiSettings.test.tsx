@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { MemoryRouter, useLocation } from 'react-router';
+import { BrowserRouter, useLocation } from 'react-router';
 
 const { putMock, getMock, permissions } = vi.hoisted(() => ({
   putMock: vi.fn(),
@@ -93,12 +93,14 @@ function renderSettings(
 ): QueryClient {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const search = sub == null ? '?tab=ai' : `?tab=ai&sub=${sub}`;
+  // The app's BrowserRouter: the tabs read the URL as the browser holds it.
+  window.history.replaceState(null, '', `/settings${search}`);
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[`/settings${search}`]}>
+      <BrowserRouter>
         <AiSettings settings={{ ...SETTINGS, ...overrides }} />
         <LocationProbe />
-      </MemoryRouter>
+      </BrowserRouter>
     </QueryClientProvider>,
   );
   return client;
@@ -216,11 +218,12 @@ describe('Settings > AI tabs (plan v0.1.45, section 6)', () => {
 
   it('keeps unsaved edits across a tab switch and a settings reload', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    window.history.replaceState(null, '', '/settings?tab=ai&sub=assistant');
     const view = (settings: Record<string, unknown>) => (
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={['/settings?tab=ai&sub=assistant']}>
+        <BrowserRouter>
           <AiSettings settings={settings} />
-        </MemoryRouter>
+        </BrowserRouter>
       </QueryClientProvider>
     );
     const { rerender } = render(view(SETTINGS));
@@ -506,6 +509,8 @@ describe('AiSettings cards save from their tab (TC-UI-LY-10)', () => {
     const client = renderSettings({}, 'assistant');
     const invalidate = vi.spyOn(client, 'invalidateQueries');
     fireEvent.click(document.getElementById('chatbotAi-enabled') as HTMLElement);
+    expect(putMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'common.toggleOff.confirm' }));
     await waitFor(() => {
       expect(putMock).toHaveBeenCalledWith('/v1/settings/chatbotAi.enabled', { value: false });
     });

@@ -1,4 +1,4 @@
-FROM node:24-slim AS deps
+FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS deps
 # A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
 ENV npm_config_fetch_retries=5 \
     npm_config_fetch_retry_mintimeout=20000 \
@@ -10,6 +10,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
@@ -34,7 +35,7 @@ COPY packages/ocpi-simulator/ packages/ocpi-simulator/
 
 RUN node scripts/build.mjs ocpi-simulator
 
-FROM node:24-slim
+FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 # A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
 ENV npm_config_fetch_retries=5 \
     npm_config_fetch_retry_mintimeout=20000 \
@@ -46,6 +47,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
@@ -65,7 +67,7 @@ RUN npm ci --omit=dev --ignore-scripts
 COPY --from=build /app/dist/ocpi-simulator.mjs dist/ocpi-simulator.mjs
 COPY --from=build /app/dist/ocpi-simulator.mjs.map dist/ocpi-simulator.mjs.map
 
-LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
+LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms"
 LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 

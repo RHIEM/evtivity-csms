@@ -8,7 +8,7 @@ import { useTranslation } from 'react-i18next';
 import { BackButton } from '@/components/back-button';
 import { CancelButton } from '@/components/cancel-button';
 import { CreateButton } from '@/components/create-button';
-import { Input } from '@/components/ui/input';
+import { DateTimeInput } from '@/components/ui/date-time-input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent } from '@/components/ui/card';
 import { Select } from '@/components/ui/select';
@@ -17,6 +17,7 @@ import { DriverCombobox } from '@/components/driver-combobox';
 import { StationCombobox, type StationSelection } from '@/components/station-combobox';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { formatConnectorPowerKw } from '@/lib/connector-rating';
 import {
   getDefaultStartsAt,
   getDefaultExpiresAt,
@@ -89,7 +90,8 @@ export function ReservationCreate(): React.JSX.Element {
     for (const evse of connectorsQuery.data) {
       for (const conn of evse.connectors) {
         const type = conn.connectorType ?? 'Unknown';
-        const power = conn.maxPowerKw != null ? `${String(conn.maxPowerKw)} kW` : '';
+        const power =
+          conn.maxPowerKw != null ? `${formatConnectorPowerKw(conn.maxPowerKw)} kW` : '';
         const label = `Port ${String(evse.evseId)}-${String(conn.connectorId)}: ${type}${power ? ` (${power})` : ''}`;
         options.push({
           key: `${String(evse.evseId)}-${String(conn.connectorId)}`,
@@ -269,12 +271,11 @@ export function ReservationCreate(): React.JSX.Element {
                 <Label htmlFor="startsAt" className="leading-6">
                   {t('reservations.startsAt')}
                 </Label>
-                <Input
+                <DateTimeInput
                   id="startsAt"
-                  type="datetime-local"
                   value={startsAt}
-                  onChange={(e) => {
-                    setStartsAt(e.target.value);
+                  onChange={(value) => {
+                    setStartsAt(value);
                   }}
                 />
               </div>
@@ -282,14 +283,13 @@ export function ReservationCreate(): React.JSX.Element {
                 <Label htmlFor="expiresAt" className="leading-6">
                   {t('reservations.expiresAt')}
                 </Label>
-                <Input
+                <DateTimeInput
                   id="expiresAt"
-                  type="datetime-local"
                   value={expiresAt}
-                  onChange={(e) => {
-                    setExpiresAt(e.target.value);
+                  onChange={(value) => {
+                    setExpiresAt(value);
                   }}
-                  className={hasSubmitted && errors.expiresAt ? 'border-destructive' : ''}
+                  invalid={hasSubmitted && errors.expiresAt != null}
                 />
                 {hasSubmitted && errors.expiresAt && (
                   <p className="text-sm text-destructive">{errors.expiresAt}</p>

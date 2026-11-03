@@ -118,6 +118,9 @@ const STATION_MESSAGE_STATES = [
   'unauthorized',
   'prepaid_exhausted',
   'account_credit_limit',
+  'terminal_card',
+  'terminal_result',
+  'terminal_receipt',
 ] as const satisfies readonly StationMessageState[];
 
 const stateEnum = z.enum(STATION_MESSAGE_STATES);
@@ -142,7 +145,10 @@ const previewBody = z.object({
     'Display language: sample prices, numbers, and the tax rate are formatted in it',
   ),
   body: z.string().min(1).max(5000).describe('Handlebars template body to render'),
-  sampleContext: z.record(z.string().max(1000)).optional().describe('Variable overrides'),
+  sampleContext: z
+    .record(z.string(), z.string().max(1000))
+    .optional()
+    .describe('Variable overrides'),
 });
 
 const templateItem = z
@@ -153,13 +159,13 @@ const templateItem = z
     updatedAt: z.coerce.date().nullable().describe('Timestamp of the most recent edit'),
     updatedBy: z.string().nullable().describe('Operator user ID who last edited the template'),
   })
-  .passthrough();
+  .loose();
 
 const previewItem = z
   .object({
     rendered: z.string().describe('Compiled template output using sample context values'),
   })
-  .passthrough();
+  .loose();
 
 // Sample tariff and session for the preview: prices are stored net, so the
 // preview shows them the way stations do (company.priceDisplay, company
@@ -221,7 +227,7 @@ export function stationMessageTemplateRoutes(app: FastifyInstance): void {
         summary: 'List all station message templates',
         operationId: 'listStationMessageTemplates',
         security: [{ bearerAuth: [] }],
-        response: { 200: itemResponse(z.object({ data: z.array(templateItem) }).passthrough()) },
+        response: { 200: itemResponse(z.object({ data: z.array(templateItem) }).loose()) },
       },
     },
     async () => {

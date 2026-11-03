@@ -31,6 +31,7 @@ import { Pagination } from '@/components/ui/pagination';
 import { useState } from 'react';
 import { roamingPartnerStatusVariant } from '@/lib/status-variants';
 import { LoadingLogo } from '@/components/loading-logo';
+import { PartnerRolesCard } from '@/components/roaming/PartnerRolesCard';
 
 interface PartnerEndpoint {
   id: number;
@@ -51,6 +52,8 @@ interface PartnerDetail {
   allowRawToken: boolean;
   roles: unknown[];
   ourRoles: unknown[];
+  approvedRoles: string[];
+  rolesApprovedAt: string | null;
   createdAt: string;
   updatedAt: string;
   endpoints: PartnerEndpoint[];
@@ -168,7 +171,7 @@ export function RoamingPartnerDetail(): React.JSX.Element {
             {partner.countryCode}-{partner.partyId}
           </p>
         </div>
-        <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
+        <div className="flex flex-wrap gap-2 *:grow sm:*:grow-0">
           {canWrite && partner.status !== 'connected' && (
             <Button
               variant="outline"
@@ -283,6 +286,14 @@ export function RoamingPartnerDetail(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">{t('roaming.partners.allowRawTokenHint')}</p>
         </CardContent>
       </Card>
+
+      <PartnerRolesCard
+        partnerId={partner.id}
+        declaredRoles={partner.roles}
+        approvedRoles={partner.approvedRoles}
+        rolesApprovedAt={partner.rolesApprovedAt}
+        canWrite={canWrite}
+      />
 
       <Card>
         <CardHeader>

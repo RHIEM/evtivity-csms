@@ -8,8 +8,10 @@ import { itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { authorize } from '../middleware/rbac.js';
 import type { JwtPayload } from '../plugins/auth.js';
-import { startAdHocPayment } from '../services/ad-hoc-payment.service.js';
+import { startAdHocPayment } from '@evtivity/services/ad-hoc-payment.service';
 import { getAuditActor } from '../lib/audit-actor.js';
+import { getUserSiteIds } from '../lib/site-access.js';
+import { siteInScope } from '../lib/site-scope.js';
 
 const adHocPaymentBody = z.object({
   stationId: z.string().min(1).max(255).describe('OCPP identity of the charging station'),
@@ -52,7 +54,7 @@ const adHocPaymentBody = z.object({
     .min(1)
     .optional()
     .describe('Duration limit in seconds. Returned as transactionLimit.maxTime'),
-  email: z.string().email().max(255).optional().describe('EV driver email for the receipt'),
+  email: z.email().max(255).optional().describe('EV driver email for the receipt'),
 });
 
 const adHocPaymentResponse = z
@@ -66,7 +68,7 @@ const adHocPaymentResponse = z
         'True when this pspRef already started a transaction on this EVSE and nothing was sent again',
       ),
   })
-  .passthrough();
+  .loose();
 
 export function adHocPaymentRoutes(app: FastifyInstance): void {
   app.post(
@@ -104,7 +106,12 @@ export function adHocPaymentRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { userId } = request.user as JwtPayload;
       const body = request.body as z.infer<typeof adHocPaymentBody>;
-      const result = await startAdHocPayment(body, userId, getAuditActor(request), request.log);
+      const siteIds = await getUserSiteIds(userId);
+      const result = await startAdHocPayment(body, {
+        siteAllowed: (siteId) => siteInScope(siteIds, siteId),
+        actor: getAuditActor(request),
+        logger: request.log,
+      });
       if (!result.ok) {
         await reply.status(result.status).send({ error: result.error, code: result.code });
         return;

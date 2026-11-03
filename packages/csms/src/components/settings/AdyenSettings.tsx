@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Info } from 'lucide-react';
@@ -11,12 +11,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { useToast } from '@/components/ui/toast';
 import { SaveButton } from '@/components/save-button';
 import { LoadingLogo } from '@/components/loading-logo';
 import { api, getApiErrorCode } from '@/lib/api';
 import { useHasPermission } from '@/lib/auth';
+import { useLoadedValues, useSavedBaseline } from '@/hooks/use-loaded-values';
 import {
   OtherWebhookEndpoints,
   PaymentWebhookSetup,
@@ -112,6 +113,11 @@ const NO_REMOVALS: Record<SecretField, boolean> = {
 
 function storedSecret(data: AdyenSettingsResponse, field: SecretField): StoredSecret {
   return { value: data[field], configured: data[`${field}Configured`] };
+}
+
+interface AdyenFormState {
+  form: AdyenForm | null;
+  removing: Record<SecretField, boolean>;
 }
 
 function formFrom(data: AdyenSettingsResponse): AdyenForm {
@@ -247,7 +253,7 @@ function AdyenWebhookCard({
 export function AdyenSettings(): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const canWrite = useHasPermission('payments:write');
+  const canWrite = useHasPermission('settings.payment:write');
 
   const { data, isLoading } = useQuery({
     queryKey: ['adyen-settings'],
@@ -255,18 +261,18 @@ export function AdyenSettings(): React.JSX.Element {
     staleTime: 30_000,
   });
 
-  const [form, setForm] = useState<AdyenForm | null>(null);
-  const [removing, setRemoving] = useState(NO_REMOVALS);
+  // A reload replaces the form only while it has no unsaved edits.
+  const loaded = useMemo<AdyenFormState>(
+    () => ({ form: data == null ? null : formFrom(data), removing: NO_REMOVALS }),
+    [data],
+  );
   const [hasSubmitted, setHasSubmitted] = useState(false);
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
-
-  useEffect(() => {
-    if (data == null) return;
-    setForm(formFrom(data));
-    setRemoving(NO_REMOVALS);
+  const [state, setState, takeNextLoad, taken] = useLoadedValues<AdyenFormState>(loaded, () => {
     setHasSubmitted(false);
-    setHasUnsavedChanges(false);
-  }, [data]);
+  });
+  const [baseline, markSaved] = useSavedBaseline(loaded);
+  const { form, removing } = state;
+  const hasUnsavedChanges = JSON.stringify(state) !== JSON.stringify(baseline);
 
   const saveMutation = useMutation({
     mutationFn: (body: Record<string, unknown>) => api.put('/v1/settings/adyen', body),
@@ -282,14 +288,19 @@ export function AdyenSettings(): React.JSX.Element {
   });
 
   function markChanged(): void {
-    setHasUnsavedChanges(true);
     saveMutation.reset();
     testMutation.reset();
   }
 
   function update(patch: Partial<AdyenForm>): void {
-    setForm((current) => (current == null ? current : { ...current, ...patch }));
+    setState((s) => (s.form == null ? s : { ...s, form: { ...s.form, ...patch } }));
     markChanged();
+  }
+
+  function setRemoving(
+    change: (r: Record<SecretField, boolean>) => Record<SecretField, boolean>,
+  ): void {
+    setState((s) => ({ ...s, removing: change(s.removing) }));
   }
 
   if (isLoading || form == null || data == null) return <LoadingLogo size="inline" />;
@@ -335,11 +346,22 @@ export function AdyenSettings(): React.JSX.Element {
     // hidden one clears only through its explicit remove (see secretChange).
     if (data != null) {
       for (const key of SECRET_FIELDS) {
-        const change = secretChange(current[key], storedSecret(data, key), removing[key]);
+        const change = secretChange(
+          current[key],
+          storedSecret(data, key),
+          removing[key],
+          taken.form?.[key] ?? '',
+        );
         if (change !== undefined) body[key] = change;
       }
     }
-    saveMutation.mutate(body);
+    const sent = state;
+    saveMutation.mutate(body, {
+      onSuccess: () => {
+        markSaved(sent);
+        takeNextLoad(sent);
+      },
+    });
   }
 
   const dirty = hasUnsavedChanges;
@@ -536,11 +558,12 @@ export function AdyenSettings(): React.JSX.Element {
 
               <div className="space-y-2 sm:col-span-2">
                 <div className="flex items-center gap-3">
-                  <Toggle
+                  <ConfirmToggle
                     id="adyen-authorisation-adjustment"
                     checked={current.authorisationAdjustment}
                     disabled={!canWrite}
                     aria-label={t('settings.adyenAuthorisationAdjustment')}
+                    label={t('settings.adyenAuthorisationAdjustment')}
                     onCheckedChange={(checked) => {
                       update({ authorisationAdjustment: checked });
                     }}

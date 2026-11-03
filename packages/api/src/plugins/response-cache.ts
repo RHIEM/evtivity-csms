@@ -142,6 +142,11 @@ interface CacheCtx {
 declare module 'fastify' {
   interface FastifyRequest {
     responseCacheCtx: CacheCtx | null;
+    /**
+     * A write handler sets it when the request changed nothing (for example
+     * the same avatar again), so no cache tag is bumped.
+     */
+    responseCacheUnchanged: boolean;
   }
   interface FastifyContextConfig {
     /**
@@ -280,6 +285,7 @@ async function versionedKey(
 
 export function registerResponseCache(app: FastifyInstance): void {
   app.decorateRequest('responseCacheCtx', null);
+  app.decorateRequest('responseCacheUnchanged', false);
 
   // Tie the connection to the app lifecycle: a dangling auto-reconnecting
   // client keeps the event loop alive after app.close() and hangs one-shot
@@ -326,7 +332,10 @@ export function registerResponseCache(app: FastifyInstance): void {
       }
       request.responseCacheCtx = { key, ttlSeconds: rule.ttlSeconds };
     } catch (err) {
-      logger.debug({ err, url: request.url }, 'Response cache read failed, serving uncached');
+      logger.debug(
+        { err, route: request.routeOptions.url },
+        'Response cache read failed, serving uncached',
+      );
     }
     return;
   });
@@ -342,7 +351,10 @@ export function registerResponseCache(app: FastifyInstance): void {
     try {
       await getCacheRedis().setex(ctx.key, ctx.ttlSeconds, payload);
     } catch (err) {
-      logger.debug({ err, url: request.url }, 'Response cache write failed, response not cached');
+      logger.debug(
+        { err, route: request.routeOptions.url },
+        'Response cache write failed, response not cached',
+      );
     }
     return payload;
   });
@@ -350,6 +362,7 @@ export function registerResponseCache(app: FastifyInstance): void {
   app.addHook('onResponse', async (request, reply) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) return;
     if (reply.statusCode >= 400) return;
+    if (request.responseCacheUnchanged) return;
     const pathname = routePath(request);
     const resource = extractWriteResource(pathname);
     if (resource == null) return;

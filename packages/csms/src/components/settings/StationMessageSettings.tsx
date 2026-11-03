@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { Textarea } from '@/components/ui/textarea';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
@@ -12,11 +13,12 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 import { useHasCompanyWidePermission } from '@/lib/auth';
 
@@ -34,7 +36,10 @@ type StationMessageState =
   | 'guest_unauthorized'
   | 'unauthorized'
   | 'prepaid_exhausted'
-  | 'account_credit_limit';
+  | 'account_credit_limit'
+  | 'terminal_card'
+  | 'terminal_result'
+  | 'terminal_receipt';
 
 type StationMessageLanguage = (typeof LANGUAGES)[number]['code'];
 
@@ -79,6 +84,9 @@ const ALL: ReadonlySet<StationMessageState> = new Set([
   'unauthorized',
   'prepaid_exhausted',
   'account_credit_limit',
+  'terminal_card',
+  'terminal_result',
+  'terminal_receipt',
 ]);
 
 const VARIABLES: VariableDef[] = [
@@ -144,6 +152,26 @@ const VARIABLES: VariableDef[] = [
     descriptionKey: 'messages.varReservationExpiresAt',
     states: new Set(['reserved']),
   },
+  {
+    name: 'terminalAmount',
+    descriptionKey: 'messages.varTerminalAmount',
+    states: new Set(['terminal_card', 'terminal_receipt']),
+  },
+  {
+    name: 'paymentApproved',
+    descriptionKey: 'messages.varPaymentApproved',
+    states: new Set(['terminal_result']),
+  },
+  {
+    name: 'plugInAnyConnector',
+    descriptionKey: 'messages.varPlugInAnyConnector',
+    states: new Set(['terminal_result']),
+  },
+  {
+    name: 'receiptUrl',
+    descriptionKey: 'messages.varReceiptUrl',
+    states: new Set(['terminal_receipt']),
+  },
 ];
 
 const STATES: StationMessageState[] = [
@@ -163,6 +191,11 @@ const STATES: StationMessageState[] = [
   'unauthorized',
   'prepaid_exhausted',
   'account_credit_limit',
+  // Payment terminal prompts, shown on the station display for a terminal
+  // without a screen (VP7200): present card, result, receipt link.
+  'terminal_card',
+  'terminal_result',
+  'terminal_receipt',
 ];
 
 const STATE_LABEL_KEY: Record<StationMessageState, string> = {
@@ -180,12 +213,47 @@ const STATE_LABEL_KEY: Record<StationMessageState, string> = {
   unauthorized: 'messages.stateUnauthorized',
   prepaid_exhausted: 'messages.statePrepaidExhausted',
   account_credit_limit: 'messages.stateAccountCreditLimit',
+  terminal_card: 'messages.stateTerminalCard',
+  terminal_result: 'messages.stateTerminalResult',
+  terminal_receipt: 'messages.stateTerminalReceipt',
 };
 
 /** Translated name of a station message state, or the raw code for an unknown one. */
 export function stationMessageStateLabel(t: TFunction, state: string): string {
   const key = (STATE_LABEL_KEY as Record<string, string | undefined>)[state];
   return key != null ? t(key as never) : state;
+}
+
+interface StationMessageValues {
+  enabled: boolean;
+  pricingFormat: string;
+  refreshSeconds: string;
+  eventMessageTtlSeconds: string;
+  brandLine: string;
+  language: StationMessageLanguage;
+}
+
+function secondsText(value: unknown): string {
+  if (typeof value === 'number') return value.toString();
+  if (typeof value === 'string' && value !== '') return value;
+  return '30';
+}
+
+/** The station message form values as stored (defaults while the settings load). */
+function stationMessageValuesFrom(
+  settings: Record<string, unknown> | undefined,
+): StationMessageValues {
+  const fmt = settings?.['stationMessage.pricingFormat'];
+  const brand = settings?.['stationMessage.brandLine'];
+  const language = settings?.['stationMessage.language'];
+  return {
+    enabled: settings?.['stationMessage.enabled'] === true,
+    pricingFormat: typeof fmt === 'string' ? fmt : 'compact',
+    refreshSeconds: secondsText(settings?.['stationMessage.charging.refreshSeconds']),
+    eventMessageTtlSeconds: secondsText(settings?.['stationMessage.eventMessageTtlSeconds']),
+    brandLine: typeof brand === 'string' ? brand : '',
+    language: isStationMessageLanguage(language) ? language : 'en',
+  };
 }
 
 interface StationMessageSettingsProps {
@@ -202,42 +270,24 @@ export function StationMessageSettings({
   const canWriteTemplates = useHasCompanyWidePermission('settings.integrations:write');
 
   // Settings keys
-  const [enabled, setEnabled] = useState(false);
-  const [pricingFormat, setPricingFormat] = useState('compact');
-  const [refreshSeconds, setRefreshSeconds] = useState('30');
-  const [eventMessageTtlSeconds, setEventMessageTtlSeconds] = useState('30');
-  const [brandLine, setBrandLine] = useState('');
-  const [displayLanguage, setDisplayLanguage] = useState<StationMessageLanguage>('en');
+  const loaded = useMemo(() => stationMessageValuesFrom(settings), [settings]);
+  const [form, setForm, takeNextLoad] = useLoadedValues<StationMessageValues>(loaded);
+  const { enabled, pricingFormat, refreshSeconds, eventMessageTtlSeconds, brandLine } = form;
+  const displayLanguage = form.language;
+  const setField =
+    <K extends keyof StationMessageValues>(key: K) =>
+    (value: StationMessageValues[K]): void => {
+      setForm((prev) => ({ ...prev, [key]: value }));
+    };
+  const setEnabled = setField('enabled');
+  const setPricingFormat = setField('pricingFormat');
+  const setRefreshSeconds = setField('refreshSeconds');
+  const setEventMessageTtlSeconds = setField('eventMessageTtlSeconds');
+  const setBrandLine = setField('brandLine');
+  const setDisplayLanguage = setField('language');
   // Language of the template being edited. Follows the display language until
   // the operator picks another one.
   const [editLanguage, setEditLanguage] = useState<StationMessageLanguage | null>(null);
-
-  useEffect(() => {
-    if (settings == null) return;
-    setEnabled(settings['stationMessage.enabled'] === true);
-    const fmt = settings['stationMessage.pricingFormat'];
-    setPricingFormat(typeof fmt === 'string' ? fmt : 'compact');
-    const refresh = settings['stationMessage.charging.refreshSeconds'];
-    if (typeof refresh === 'number') {
-      setRefreshSeconds(refresh.toString());
-    } else if (typeof refresh === 'string' && refresh !== '') {
-      setRefreshSeconds(refresh);
-    } else {
-      setRefreshSeconds('30');
-    }
-    const ttl = settings['stationMessage.eventMessageTtlSeconds'];
-    if (typeof ttl === 'number') {
-      setEventMessageTtlSeconds(ttl.toString());
-    } else if (typeof ttl === 'string' && ttl !== '') {
-      setEventMessageTtlSeconds(ttl);
-    } else {
-      setEventMessageTtlSeconds('30');
-    }
-    const brand = settings['stationMessage.brandLine'];
-    setBrandLine(typeof brand === 'string' ? brand : '');
-    const language = settings['stationMessage.language'];
-    setDisplayLanguage(isStationMessageLanguage(language) ? language : 'en');
-  }, [settings]);
 
   const templateLanguage = editLanguage ?? displayLanguage;
 
@@ -263,12 +313,30 @@ export function StationMessageSettings({
     return map;
   }, [templates, templateLanguage]);
 
+  // The draft follows the stored template when the state or language changes,
+  // and on a templates reload only while it holds no unsaved edit (or still
+  // holds what this card just saved or reset).
+  const draftSource = useRef<{ key: string | null; original: string; taken: string | null }>({
+    key: null,
+    original: '',
+    taken: null,
+  });
   useEffect(() => {
     const row = templatesByState.get(selectedState);
     const body = row?.body ?? '';
-    setBodyDraft(body);
+    const key = `${selectedState}:${templateLanguage}`;
+    const previous = draftSource.current;
+    draftSource.current = { key, original: body, taken: null };
     setOriginalBody(body);
-  }, [selectedState, templatesByState]);
+    setBodyDraft((draft) =>
+      previous.key !== key || draft === previous.original || draft === previous.taken
+        ? body
+        : draft,
+    );
+  }, [selectedState, templateLanguage, templatesByState]);
+  const takeNextTemplateLoad = (draft: string): void => {
+    draftSource.current = { ...draftSource.current, taken: draft };
+  };
 
   // Settings mutation
   const settingsMutation = useMutation({
@@ -410,14 +478,22 @@ export function StationMessageSettings({
             onSubmit={(e) => {
               e.preventDefault();
               if (!refreshSecondsValid || !eventMessageTtlValid) return;
-              settingsMutation.mutate({
-                enabled,
-                pricingFormat,
-                refreshSeconds: refreshSecondsNumber,
-                eventMessageTtlSeconds: eventMessageTtlNumber,
-                brandLine,
-                language: displayLanguage,
-              });
+              const sent = form;
+              settingsMutation.mutate(
+                {
+                  enabled,
+                  pricingFormat,
+                  refreshSeconds: refreshSecondsNumber,
+                  eventMessageTtlSeconds: eventMessageTtlNumber,
+                  brandLine,
+                  language: displayLanguage,
+                },
+                {
+                  onSuccess: () => {
+                    takeNextLoad(sent);
+                  },
+                },
+              );
             }}
             noValidate
           >
@@ -428,8 +504,9 @@ export function StationMessageSettings({
                 </Label>
                 <p className="text-xs text-muted-foreground">{t('messages.enabledDesc')}</p>
               </div>
-              <Toggle
+              <ConfirmToggle
                 id="station-message-enabled"
+                label={t('messages.enabled')}
                 size="lg"
                 checked={enabled}
                 onCheckedChange={(v) => {
@@ -572,7 +649,7 @@ export function StationMessageSettings({
                 <Label htmlFor="station-message-body" className="leading-6">
                   {t('messages.bodyLabel')}
                 </Label>
-                <textarea
+                <Textarea
                   id="station-message-body"
                   ref={textareaRef}
                   value={bodyDraft}
@@ -580,7 +657,7 @@ export function StationMessageSettings({
                     setBodyDraft(e.target.value);
                   }}
                   placeholder={t('messages.bodyPlaceholder')}
-                  className="flex min-h-[160px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  className="min-h-[160px] font-mono"
                 />
               </div>
 
@@ -627,11 +704,15 @@ export function StationMessageSettings({
                     type="button"
                     disabled={bodyDraft === originalBody}
                     onClick={() => {
-                      saveMutation.mutate({
-                        state: selectedState,
-                        language: templateLanguage,
-                        body: bodyDraft,
-                      });
+                      const sent = bodyDraft;
+                      saveMutation.mutate(
+                        { state: selectedState, language: templateLanguage, body: sent },
+                        {
+                          onSuccess: () => {
+                            takeNextTemplateLoad(sent);
+                          },
+                        },
+                      );
                     }}
                   />
                   <Button
@@ -661,7 +742,15 @@ export function StationMessageSettings({
         variant="destructive"
         isPending={resetMutation.isPending}
         onConfirm={() => {
-          resetMutation.mutate({ state: selectedState, language: templateLanguage });
+          const draft = bodyDraft;
+          resetMutation.mutate(
+            { state: selectedState, language: templateLanguage },
+            {
+              onSuccess: () => {
+                takeNextTemplateLoad(draft);
+              },
+            },
+          );
         }}
       />
     </div>

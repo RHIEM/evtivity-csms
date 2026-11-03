@@ -13,6 +13,7 @@ import {
   boolean,
   timestamp,
   date,
+  jsonb,
   smallint,
   check,
   index,
@@ -21,6 +22,7 @@ import {
   primaryKey,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
+import type { VehicleBodyType, VehicleColor } from '@evtivity/lib/vehicle-appearance';
 import { createId } from '../lib/id.js';
 import { chargingStations } from './assets.js';
 import { chargingSessions } from './charging.js';
@@ -87,11 +89,25 @@ export const drivers = pgTable(
     // When the driver's personal data was erased (POST /v1/drivers/:id/erase).
     // The row stays as an anonymized stub for the sessions and invoices.
     erasedAt: timestamp('erased_at', { withTimezone: true }),
+    // The driver's avatar, written only by the driver avatar service:
+    // 'generated' with the DiceBear options (@evtivity/lib/account-avatar), or
+    // 'image' with the clean S3 object of an uploaded picture. Null: initials.
+    avatarKind: varchar('avatar_kind', { length: 16 }),
+    avatarOptions: jsonb('avatar_options'),
+    avatarS3Key: text('avatar_s3_key'),
+    avatarS3Bucket: text('avatar_s3_bucket'),
+    avatarUpdatedAt: timestamp('avatar_updated_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     index('idx_drivers_email').on(table.email),
+    check(
+      'drivers_avatar_check',
+      sql`(${table.avatarKind} IS NULL AND ${table.avatarOptions} IS NULL AND ${table.avatarS3Key} IS NULL AND ${table.avatarS3Bucket} IS NULL)
+        OR (${table.avatarKind} = 'generated' AND ${table.avatarOptions} IS NOT NULL AND ${table.avatarS3Key} IS NULL AND ${table.avatarS3Bucket} IS NULL)
+        OR (${table.avatarKind} = 'image' AND ${table.avatarOptions} IS NULL AND ${table.avatarS3Key} IS NOT NULL AND ${table.avatarS3Bucket} IS NOT NULL)`,
+    ),
     // Partial unique index on LOWER(email) is defined in migration
     // 0052_drivers_email_partial_unique.sql (Drizzle's uniqueIndex does not
     // support expression columns or partial WHERE clauses, so the index is
@@ -134,6 +150,12 @@ export const guestSessions = pgTable(
     // notices use it. Null: the company language.
     language: varchar('language', { length: 10 }),
     preAuthAmountCents: integer('pre_auth_amount_cents'),
+    // An ad hoc payment (POST /v1/ad-hoc-payments, OCPP 2.1 C24, C25): a
+    // stand-alone payment terminal or a payment provider authorized the card
+    // and settles the session, so the row has no CSMS hold. The payment gate
+    // counts it as the hold; the end completes it without a shortfall. Only
+    // the ad hoc payment service sets it.
+    paymentTerminal: boolean('payment_terminal').notNull().default(false),
     // Transaction limit returned in the OCPP 2.1 TransactionEventResponse when
     // the transaction starts (C24.FR.02, C25.FR.24). Null means no limit.
     maxCostCents: integer('max_cost_cents'),
@@ -270,6 +292,10 @@ export const vehicles = pgTable(
     // Stored normalized (uppercase, @evtivity/lib/vehicle-id).
     vin: varchar('vin', { length: 17 }),
     licensePlate: varchar('license_plate', { length: 20 }),
+    // How the vehicle looks (@evtivity/lib/vehicle-appearance): the 3D site
+    // layout draws a car of this body type in this color. Both optional.
+    color: varchar('color', { length: 20 }).$type<VehicleColor>(),
+    bodyType: varchar('body_type', { length: 20 }).$type<VehicleBodyType>(),
     // The EV charging controller id (ISO 15118 EVCCID, the MAC address for
     // ISO 15118-2 and DIN 70121) as normalized by @evtivity/lib/vehicle-id:
     // a MAC address as 12 uppercase hex digits.
@@ -297,6 +323,14 @@ export const vehicles = pgTable(
     check(
       'vehicles_autocharge_id_check',
       sql`NOT ${table.autochargeEnabled} OR ${table.evccid} IS NOT NULL OR ${table.vin} IS NOT NULL`,
+    ),
+    check(
+      'vehicles_color_check',
+      sql`${table.color} IS NULL OR ${table.color} IN ('white', 'black', 'silver', 'grey', 'blue', 'red', 'green', 'brown_beige', 'yellow_orange', 'other')`,
+    ),
+    check(
+      'vehicles_body_type_check',
+      sql`${table.bodyType} IS NULL OR ${table.bodyType} IN ('sedan', 'hatchback', 'suv', 'pickup_truck', 'van', 'box_truck', 'bus', 'semi_truck')`,
     ),
   ],
 );

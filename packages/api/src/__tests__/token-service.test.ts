@@ -108,6 +108,7 @@ vi.mock('@evtivity/database', async () => ({
     stationId: 'stationId',
     driverTokenId: 'driverTokenId',
   },
+  vehicles: { id: 'id', driverId: 'driverId', vin: 'vin', evccid: 'evccid' },
   stationLocalAuthVersions: {
     stationId: 'stationId',
     lastModifiedAt: 'lastModifiedAt',
@@ -163,7 +164,12 @@ import {
   bulkSetActive,
   exportTokensCsv,
   importTokensCsv,
+  hasEmailShape,
   DuplicateTokenError,
+  VehicleIdTokenInUseError,
+  VehicleShapedCardError,
+  PrepaidBalanceConflictError,
+  PrepaidBalanceExpectedError,
   TokenDriverNotFoundError,
   TokenDriverInactiveError,
   TokenReactivationBlockedError,
@@ -245,16 +251,47 @@ describe('getToken', () => {
   });
 });
 
+describe('prepaid balance compare-and-set is required (PP2 Info 3)', () => {
+  it('refuses a balance change without the expected value, before any read', async () => {
+    setupDbResults();
+    await expect(updateToken('t1', { prepaidBalanceCents: 6000 })).rejects.toBeInstanceOf(
+      PrepaidBalanceExpectedError,
+    );
+    await expect(updateToken('t1', { prepaidBalanceCents: null })).rejects.toBeInstanceOf(
+      PrepaidBalanceExpectedError,
+    );
+  });
+});
+
 describe('createToken', () => {
   it('returns created token', async () => {
     const token = { id: 't1', idToken: 'NEW_TOKEN', tokenType: 'ISO14443', driverId: null };
-    // dup check (empty), insert returning, writeAudit insert (no result needed),
-    // publishTokenChanged is async pubsub call (no DB)
-    setupDbResults([], [token]);
+    // dup check (empty), another driver's vehicle with the value (none), insert
+    // returning, writeAudit insert (no result needed), publishTokenChanged is
+    // async pubsub call (no DB)
+    setupDbResults([], [], [token]);
 
     const result = await createToken({ idToken: 'NEW_TOKEN', tokenType: 'ISO14443' });
 
     expect(result).toEqual(token);
+  });
+
+  it('refuses a vehicle-shaped card value from a driver before any lookup', async () => {
+    for (const idToken of ['92D50A693F80', '92-d5-0a-69-3f-80', '5YJ3E1EA7KF317000']) {
+      setupDbResults();
+      await expect(
+        createToken(
+          { driverId: 'd1', idToken, tokenType: 'ISO14443' },
+          { type: 'driver', driverId: 'd1' },
+        ),
+      ).rejects.toBeInstanceOf(VehicleShapedCardError);
+    }
+    // Operators keep every value.
+    const token = { id: 't1', idToken: '92D50A693F80', tokenType: 'ISO14443', driverId: null };
+    setupDbResults([], [], [token]);
+    await expect(
+      createToken({ idToken: '92D50A693F80', tokenType: 'ISO14443' }, { type: 'system' }),
+    ).resolves.toEqual(token);
   });
 
   it('throws DuplicateTokenError when (idToken, tokenType) already exists', async () => {
@@ -267,8 +304,9 @@ describe('createToken', () => {
 
   it('allows the same idToken under a different tokenType', async () => {
     const token = { id: 't2', idToken: 'SAME_UID', tokenType: 'ISO15693', driverId: null };
-    // dup check on (SAME_UID, ISO15693) returns empty, then insert returning
-    setupDbResults([], [token]);
+    // dup check on (SAME_UID, ISO15693) returns empty, no vehicle with the
+    // value, then insert returning
+    setupDbResults([], [], [token]);
 
     const result = await createToken({ idToken: 'SAME_UID', tokenType: 'ISO15693' });
 
@@ -282,8 +320,8 @@ describe('createToken', () => {
       tokenType: 'ISO14443',
       driverId: 'drv_1',
     };
-    // existing check (none), the driver (active), insert returning
-    setupDbResults([], [{ isActive: true }], [token]);
+    // existing check (none), the driver (active), no vehicle, insert returning
+    setupDbResults([], [{ isActive: true }], [], [token]);
 
     const result = await createToken(
       { idToken: 'DRIVER_TOKEN', tokenType: 'ISO14443', driverId: 'drv_1' },
@@ -404,11 +442,51 @@ describe('createToken', () => {
   });
 });
 
+describe('vehicle ids of other drivers', () => {
+  it("refuses an operator's card holding another driver's vehicle id", async () => {
+    // dup check (none), the driver (active), a vehicle of another driver
+    setupDbResults([], [{ isActive: true }], [{ id: 'veh_1' }]);
+    await expect(
+      createToken(
+        { idToken: 'VID:92D50A693F80', tokenType: 'ISO14443', driverId: 'drv_1' },
+        { type: 'operator', userId: 'usr_1' },
+      ),
+    ).rejects.toBeInstanceOf(VehicleIdTokenInUseError);
+  });
+
+  it('refuses a rename to another driver vehicle id', async () => {
+    // current-row SELECT, dup check (empty), a vehicle of another driver
+    setupDbResults([{ idToken: 'OLD', tokenType: 'ISO14443' }], [], [{ id: 'veh_1' }]);
+    await expect(updateToken('t1', { idToken: '92-D5-0A-69-3F-80' })).rejects.toBeInstanceOf(
+      VehicleIdTokenInUseError,
+    );
+  });
+});
+
+describe('prepaid balance compare-and-set', () => {
+  it('refuses a balance change based on a stale balance', async () => {
+    setupDbResults([{ idToken: 'P', tokenType: 'ISO14443', prepaidBalanceCents: 2000 }]);
+    await expect(
+      updateToken('t1', { prepaidBalanceCents: 6000, expectedPrepaidBalanceCents: 5000 }),
+    ).rejects.toBeInstanceOf(PrepaidBalanceConflictError);
+  });
+
+  it('applies a balance change based on the stored balance', async () => {
+    const token = { id: 't1', idToken: 'P', tokenType: 'ISO14443', prepaidBalanceCents: 6000 };
+    setupDbResults([{ idToken: 'P', tokenType: 'ISO14443', prepaidBalanceCents: 2000 }], [token]);
+    const result = await updateToken('t1', {
+      prepaidBalanceCents: 6000,
+      expectedPrepaidBalanceCents: 2000,
+    });
+    expect(result).toEqual(token);
+  });
+});
+
 describe('updateToken', () => {
   it('returns updated token when found', async () => {
     const token = { id: 't1', idToken: 'UPDATED', tokenType: 'ISO15693' };
-    // current-row SELECT, dup check (empty), update returning
-    setupDbResults([{ idToken: 'OLD', tokenType: 'ISO14443' }], [], [token]);
+    // current-row SELECT, dup check (empty), vehicle check (none), update returning
+    setupDbResults([{ idToken: 'OLD', tokenType: 'ISO14443' }], [], [], [token]);
 
     const result = await updateToken('t1', { idToken: 'UPDATED', tokenType: 'ISO15693' });
 
@@ -841,7 +919,7 @@ describe('importTokensCsv', () => {
       { id: 't1', idToken: 'T1', tokenType: 'ISO14443', driverId: 'driver-1' },
       { id: 't2', idToken: 'T2', tokenType: 'ISO15693', driverId: null },
     ];
-    setupDbResults([driverRow], [], insertedRows, []);
+    setupDbResults([driverRow], [], [], insertedRows, []);
 
     const result = await importTokensCsv([
       { idToken: 'T1', tokenType: 'ISO14443', driverEmail: 'a@b.com' },
@@ -899,7 +977,7 @@ describe('importTokensCsv', () => {
   it('imports a row with a valid expiresAt date', async () => {
     const insertedRows = [{ id: 't1', idToken: 'EXP', tokenType: 'ISO14443', driverId: null }];
     // no driverEmail -> no driver lookup; existing (empty); insert returning; audit insert
-    setupDbResults([], insertedRows, []);
+    setupDbResults([], [], insertedRows, []);
 
     const result = await importTokensCsv([
       { idToken: 'EXP', tokenType: 'ISO14443', expiresAt: '2027-06-01T00:00:00Z' },
@@ -943,9 +1021,44 @@ describe('importTokensCsv', () => {
     expect(result.errors).toEqual(['Row 2: unknown tokenType Bogus', 'Row 3: invalid driverEmail']);
   });
 
+  it('checks the driver email shape as the reference pattern, in linear time', () => {
+    const reference = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    for (const value of [
+      'a@b.c',
+      'a@.b.c',
+      'a@b.',
+      'a@.b',
+      'a@b..c',
+      '@b.c',
+      'a@@b.c',
+      'a@b.c@d',
+      'a b@c.d',
+      'a@b\t.c',
+      'x.y@z',
+    ]) {
+      expect(hasEmailShape(value), value).toBe(reference.test(value));
+    }
+    const alphabet = ['a', '.', '@', ' ', '!'];
+    let seed = 5;
+    const next = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed;
+    };
+    for (let n = 0; n < 20_000; n++) {
+      let value = '';
+      const length = next() % 10;
+      for (let k = 0; k < length; k++) value += alphabet[next() % alphabet.length] ?? '';
+      expect(hasEmailShape(value), JSON.stringify(value)).toBe(reference.test(value));
+    }
+    const started = performance.now();
+    expect(hasEmailShape(`!@!.${'!.'.repeat(100_000)}@`)).toBe(false);
+    expect(hasEmailShape(`a@${'b.'.repeat(100_000)}`)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
   it('treats a blank expiresAt string as no expiry', async () => {
     const insertedRows = [{ id: 't1', idToken: 'BLANK', tokenType: 'ISO14443', driverId: null }];
-    setupDbResults([], insertedRows, []);
+    setupDbResults([], [], insertedRows, []);
 
     const result = await importTokensCsv([
       { idToken: 'BLANK', tokenType: 'ISO14443', expiresAt: '   ' },
@@ -962,7 +1075,7 @@ describe('importTokensCsv', () => {
     //  2. tx.insert returning -> 1 inserted row
     //  3. tx.insert audit
     const insertedRows = [{ id: 't1', idToken: 'DUPE', tokenType: 'ISO14443', driverId: null }];
-    setupDbResults([], insertedRows, []);
+    setupDbResults([], [], insertedRows, []);
 
     const result = await importTokensCsv([
       { idToken: 'DUPE', tokenType: 'ISO14443' },

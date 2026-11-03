@@ -130,6 +130,9 @@ function makeCtx(
       ocppProtocol: 'ocpp2.1',
       bootStatus: null,
       readyAnnounced: false,
+      dataPlan: 'wifi_or_wired',
+      lastInboundAt: new Date(),
+      answeredPing: false,
     },
     messageId: 'msg-1',
     action,
@@ -281,6 +284,24 @@ describe('LogStatusNotification handler', () => {
     expect(response).toEqual({});
     expect(publishMock).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'ocpp.LogStatusNotification' }),
+    );
+  });
+
+  it('passes the statusInfo of a failed upload to the projection', async () => {
+    const { ctx, publishMock } = makeCtx('LogStatusNotification', {
+      status: 'UploadFailure',
+      requestId: 2,
+      statusInfo: { reasonCode: 'RedirectNotAllowed' },
+    });
+    await handleLogStatusNotification(ctx);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          status: 'UploadFailure',
+          requestId: 2,
+          statusInfo: { reasonCode: 'RedirectNotAllowed' },
+        }) as unknown,
+      }),
     );
   });
 });

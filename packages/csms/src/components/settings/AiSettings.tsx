@@ -18,7 +18,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { PasswordInput } from '@/components/ui/password-input';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import {
   AiProviderSelect,
   AiEffortSelect,
@@ -47,18 +47,23 @@ import { AiSystemPromptField } from '@/components/ai/AiSystemPromptField';
 import type { AiDefaults } from '@/components/ai/use-ai-defaults';
 import { isCustomModel, isDefaultPrompt, useAiDefaults } from '@/components/ai/use-ai-defaults';
 import { api } from '@/lib/api';
+import { isDataRetentionSettingKey } from '@evtivity/lib/data-retention';
+import { DataRetentionLink } from './DataRetentionSettings';
 import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatNumber } from '@/lib/formatting';
 
-const LIMIT_KEYS = Object.keys(AI_LIMIT_SETTINGS) as AiLimitSettingKey[];
+// The conversation retention is edited in Settings > Data Retention.
+type LimitKey = Exclude<AiLimitSettingKey, 'ai.conversationRetentionDays'>;
+const LIMIT_KEYS = (Object.keys(AI_LIMIT_SETTINGS) as AiLimitSettingKey[]).filter(
+  (key): key is LimitKey => !isDataRetentionSettingKey(key),
+);
 
 type LimitLabelKey =
   | 'settings.aiLimits.userPerMinute'
   | 'settings.aiLimits.sitePerMinute'
   | 'settings.aiLimits.userDailyTokens'
   | 'settings.aiLimits.maxToolCallsPerTurn'
-  | 'settings.aiLimits.conversationRetentionDays'
   | 'settings.aiLimits.attachmentsMaxBytes'
   | 'settings.aiLimits.attachmentsMaxPerMessage'
   | 'settings.aiLimits.companyMonthlyTokens'
@@ -67,18 +72,17 @@ type LimitLabelKey =
   | 'settings.aiLimits.warnPercent';
 
 // Budgets where 0 means no limit (the daily user budget has its own hint).
-const ZERO_NO_LIMIT_KEYS: ReadonlySet<AiLimitSettingKey> = new Set([
+const ZERO_NO_LIMIT_KEYS: ReadonlySet<LimitKey> = new Set([
   'ai.budget.companyMonthlyTokens',
   'ai.budget.siteMonthlyTokens',
   'ai.budget.siteDailyTokens',
 ]);
 
-const LIMIT_LABELS: Record<AiLimitSettingKey, LimitLabelKey> = {
+const LIMIT_LABELS: Record<LimitKey, LimitLabelKey> = {
   'ai.rateLimit.userPerMinute': 'settings.aiLimits.userPerMinute',
   'ai.rateLimit.sitePerMinute': 'settings.aiLimits.sitePerMinute',
   'ai.budget.userDailyTokens': 'settings.aiLimits.userDailyTokens',
   'ai.maxToolCallsPerTurn': 'settings.aiLimits.maxToolCallsPerTurn',
-  'ai.conversationRetentionDays': 'settings.aiLimits.conversationRetentionDays',
   'ai.attachments.maxBytes': 'settings.aiLimits.attachmentsMaxBytes',
   'ai.attachments.maxPerMessage': 'settings.aiLimits.attachmentsMaxPerMessage',
   'ai.budget.companyMonthlyTokens': 'settings.aiLimits.companyMonthlyTokens',
@@ -247,23 +251,26 @@ function SaveStatus({
 
 function useFormValues(settings: Record<string, unknown> | undefined): {
   loaded: Values;
+  taken: Values;
   values: Values;
   set: (key: string) => (value: string) => void;
 } {
   const loaded = useMemo(() => loadValues(settings), [settings]);
   // A refetch (a toggle, another card's save, window focus) keeps edits in progress.
-  const [values, setValues] = useLoadedValues<Values>(loaded);
+  const [values, setValues, , taken] = useLoadedValues<Values>(loaded);
   const set = (key: string) => (value: string) => {
     setValues((prev) => ({ ...prev, [key]: value }));
   };
-  return { loaded, values, set };
+  return { loaded, taken, values, set };
 }
 
 /** Providers and keys: one API key per provider, the base URL behind a disclosure. */
 function AiProvidersCard({ settings, canWrite }: CardProps): React.JSX.Element {
   const { t } = useTranslation();
-  const { loaded, values, set } = useFormValues(settings);
-  const save = useSaveKeys(PROVIDER_KEYS, loaded, (_k, v) => v.trim());
+  const { taken, values, set } = useFormValues(settings);
+  // Compared with the values this form loaded, so an API key the user did not
+  // edit is not sent and a key another user rotated since stays.
+  const save = useSaveKeys(PROVIDER_KEYS, taken, (_k, v) => v.trim());
   return (
     <Card>
       <CardHeader>
@@ -393,8 +400,9 @@ function AiSurfaceCard({
           <Label htmlFor={`${prefix}-enabled`} className="leading-6">
             {t(`settings.aiSurface.${surface}.enabled`)}
           </Label>
-          <Toggle
+          <ConfirmToggle
             id={`${prefix}-enabled`}
+            label={t(`settings.aiSurface.${surface}.enabled`)}
             checked={enabled}
             disabled={!canWrite || toggle.isPending}
             onCheckedChange={(checked) => {
@@ -563,6 +571,7 @@ function AiLimitsCard({ settings, canWrite }: CardProps): React.JSX.Element {
             );
           })}
         </div>
+        <DataRetentionLink />
         {canWrite && (
           <div className="flex items-center justify-end gap-4">
             <SaveStatus m={save} />

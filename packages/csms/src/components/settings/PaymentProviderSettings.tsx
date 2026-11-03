@@ -1,7 +1,9 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { PRE_AUTH_AMOUNT_MAX_CENTS, PRE_AUTH_AMOUNT_MIN_CENTS } from '@evtivity/lib/currency';
+import { useMemo, useState } from 'react';
+import { useLoadedValues, useSavedBaseline } from '@/hooks/use-loaded-values';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -74,7 +76,10 @@ export interface PaymentSettingsBody {
 
 const NO_PROVIDER = 'none';
 const SIMULATED = 'simulated';
-const PRE_AUTH_LIMITS = { minCents: 1, maxCents: 1_000_000 };
+const PRE_AUTH_LIMITS = {
+  minCents: PRE_AUTH_AMOUNT_MIN_CENTS,
+  maxCents: PRE_AUTH_AMOUNT_MAX_CENTS,
+};
 const DELAY_RANGE = { min: 0, max: 3600, integer: true };
 const RATE_RANGE = { min: 0, max: 1, integer: false };
 
@@ -219,18 +224,22 @@ function changedFields(
 function PaymentProviderForm({ data }: { data: PaymentSettingsResponse }): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const canWrite = useHasPermission('payments:write');
+  const canWrite = useHasPermission('settings.payment:write');
   const { currency } = useCompanyCurrency();
-  const [form, setForm] = useState<FormState>(() => formFrom(data));
+  // A reload replaces the form only while it has no unsaved edits.
+  const loaded = useMemo(() => formFrom(data), [data]);
   const [hasSubmitted, setHasSubmitted] = useState(false);
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [form, setForm, takeNextLoad] = useLoadedValues<FormState>(loaded, () => {
+    setHasSubmitted(false);
+  });
+  const [baseline, markSaved] = useSavedBaseline(loaded);
+  const hasUnsavedChanges = JSON.stringify(form) !== JSON.stringify(baseline);
 
   const simulatedEntry = data.providers.find((p) => p.id === SIMULATED);
 
   const saveMutation = useMutation({
     mutationFn: (body: PaymentSettingsBody) => api.put('/v1/settings/payments', body),
     onSuccess: () => {
-      setHasUnsavedChanges(false);
       for (const queryKey of [
         ['payment-settings'],
         ['payment-provider'],
@@ -243,15 +252,8 @@ function PaymentProviderForm({ data }: { data: PaymentSettingsResponse }): React
     },
   });
 
-  useEffect(() => {
-    setForm(formFrom(data));
-    setHasSubmitted(false);
-    setHasUnsavedChanges(false);
-  }, [data]);
-
   function update(patch: Partial<FormState>): void {
     setForm((prev) => ({ ...prev, ...patch }));
-    setHasUnsavedChanges(true);
     saveMutation.reset();
   }
 
@@ -271,7 +273,13 @@ function PaymentProviderForm({ data }: { data: PaymentSettingsResponse }): React
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(errors).length > 0) return;
-    saveMutation.mutate(changedFields(form, data, simulatedEntry != null));
+    const sent = form;
+    saveMutation.mutate(changedFields(form, data, simulatedEntry != null), {
+      onSuccess: () => {
+        markSaved(sent);
+        takeNextLoad(sent);
+      },
+    });
   }
 
   const upgradeError = upgradePendingFromError(saveMutation.error);

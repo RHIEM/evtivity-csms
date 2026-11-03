@@ -81,6 +81,13 @@ export const chargingSessions = pgTable(
     meterRegisterOffsetWh: numeric('meter_register_offset_wh').notNull().default('0'),
     meterLastRegisterWh: numeric('meter_last_register_wh'),
     meterLastRegisterAt: timestamp('meter_last_register_at', { withTimezone: true }),
+    // Meter summary (v0.1.48, session-meter-summary.ts): the peak overall
+    // Outlet Power.Active.Import in W and the newest state of charge, kept here
+    // because meter_values is pruned after logs.meterValues.retentionDays.
+    // Null until a reading reports them.
+    peakPowerW: numeric('peak_power_w'),
+    lastSocPercent: numeric('last_soc_percent'),
+    lastSocAt: timestamp('last_soc_at', { withTimezone: true }),
     stoppedReason: varchar('stopped_reason', { length: 50 }),
     isRoaming: boolean('is_roaming').notNull().default(false),
     remoteStartId: integer('remote_start_id'),
@@ -279,6 +286,9 @@ export const transactionEvents = pgTable(
   (table) => [
     index('idx_transaction_events_session_id').on(table.sessionId),
     index('idx_transaction_events_timestamp').on(table.timestamp),
+    // The metrics collector's 24-hour count by trigger reason (migration
+    // 0482, built CONCURRENTLY).
+    index('idx_transaction_events_created_at').on(table.createdAt),
     // One row per event identity, the TransactionEvent resend check's key.
     // Built CONCURRENTLY by 0476_release_0_1_46_indexes.sql; inserts use
     // ON CONFLICT DO NOTHING, so a resend projected on a second pod adds no row.

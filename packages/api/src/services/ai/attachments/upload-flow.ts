@@ -4,8 +4,7 @@
 import { AppError } from '@evtivity/lib';
 import { getAiSettings } from '@evtivity/database';
 import type { FastifyBaseLogger } from 'fastify';
-import { deleteObject, putObject, readObject } from '../../s3.service.js';
-import type { S3Config } from '../../s3.service.js';
+import type { ObjectStorage } from '../../storage.service.js';
 import {
   isAllowedAttachmentMime,
   maxPdfPagesAcrossModels,
@@ -13,7 +12,7 @@ import {
 } from './allowlist.js';
 import type { AttachmentMime } from './allowlist.js';
 import { processAttachment } from './process.js';
-import type { ProcessedAttachment } from './process.js';
+import type { ImageShape, ProcessedAttachment } from './process.js';
 
 /**
  * The upload pipeline shared by AI chat and support case attachments
@@ -69,9 +68,10 @@ export function checkUploadRequest(
 }
 
 export interface FinalizeInput {
-  s3: S3Config;
+  storage: ObjectStorage;
   quarantineKey: string;
-  cleanKey: string;
+  /** Where the clean file goes, or a function of its type (an image is re-encoded as JPEG or PNG). */
+  cleanKey: string | ((contentType: AttachmentMime) => string);
   /**
    * The type the upload URL was issued for. Omitted for support uploads,
    * whose request is not stored: the type the POST policy pinned on the
@@ -79,6 +79,13 @@ export interface FinalizeInput {
    */
   declaredType?: AttachmentMime;
   maxBytes: number;
+  /**
+   * The only stored types accepted (driver avatars: raster images). Checked
+   * before the bytes are processed, on top of the type the POST policy pinned.
+   */
+  acceptTypes?: readonly AttachmentMime[];
+  /** How an image is re-encoded; the default keeps its aspect within the attachment edge limit. */
+  image?: ImageShape;
 }
 
 /**
@@ -92,11 +99,11 @@ export async function finalizeUpload(
   input: FinalizeInput,
   log: FastifyBaseLogger,
 ): Promise<ProcessedAttachment> {
-  const { s3, quarantineKey, cleanKey, maxBytes } = input;
+  const { storage, quarantineKey, cleanKey, maxBytes } = input;
 
   const removeQuarantine = async (): Promise<void> => {
     try {
-      await deleteObject(s3, s3.bucket, quarantineKey);
+      await storage.deleteObject(storage.bucket, quarantineKey);
     } catch (err) {
       log.warn(
         { err, quarantineKey },
@@ -105,7 +112,7 @@ export async function finalizeUpload(
     }
   };
 
-  const read = await readObject(s3, s3.bucket, quarantineKey, maxBytes);
+  const read = await storage.readObject(storage.bucket, quarantineKey, maxBytes);
   if (read.status === 'missing') throw attachmentRejected('no uploaded file was found');
   if (read.status === 'too_large') {
     await removeQuarantine();
@@ -116,13 +123,18 @@ export async function finalizeUpload(
   const storedType = read.contentType ?? '';
   const declaredType =
     input.declaredType ?? (isAllowedAttachmentMime(storedType) ? storedType : null);
-  if (declaredType == null || storedType !== declaredType) {
+  if (
+    declaredType == null ||
+    storedType !== declaredType ||
+    (input.acceptTypes != null && !input.acceptTypes.includes(declaredType))
+  ) {
     await removeQuarantine();
     throw attachmentRejected('the stored type does not match the upload request');
   }
 
   const result = await processAttachment(read.bytes, declaredType, {
     maxPdfPages: maxPdfPagesAcrossModels(),
+    ...(input.image != null ? { image: input.image } : {}),
   });
   if (!result.ok) {
     await removeQuarantine();
@@ -131,7 +143,8 @@ export async function finalizeUpload(
     throw attachmentRejected(result.reason);
   }
 
-  await putObject(s3, s3.bucket, cleanKey, result.bytes, result.contentType);
+  const key = typeof cleanKey === 'string' ? cleanKey : cleanKey(result.contentType);
+  await storage.putObject(storage.bucket, key, result.bytes, result.contentType);
   await removeQuarantine();
   return result;
 }

@@ -1,4 +1,4 @@
-FROM node:24-slim AS deps
+FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS deps
 # A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
 ENV npm_config_fetch_retries=5 \
     npm_config_fetch_retry_mintimeout=20000 \
@@ -10,6 +10,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/api/package.json packages/api/
@@ -27,18 +28,23 @@ RUN npm ci --ignore-scripts && npm rebuild argon2
 COPY tsconfig.base.json tsconfig.json ./
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
+# verify-migrations-applied.mjs and check-migrations.mjs are referenced by
+# `npm run migrate` from packages/database; without scripts/ in the image the
+# migrate-job container fails on a missing script. The lib build below needs it
+# too: a lib test imports scripts/lib/dev-live.mjs.
+COPY scripts/ scripts/
 # sync-admin-permissions (the last step of `npm run migrate`) imports @evtivity/lib,
 # whose package entry is the compiled dist/.
 RUN npm run build --workspace=packages/lib
-# verify-migrations-applied.mjs and check-migrations.mjs are referenced by
-# `npm run migrate` from packages/database; without scripts/ in the image the
-# migrate-job container fails on a missing script.
-COPY scripts/ scripts/
-LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
+LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms"
 LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/evtivity-entrypoint
+# Migrations and seeds run as the unprivileged node user (UID 1000), as the
+# Helm jobs and the CDK database job expect. The image files stay root-owned
+# and read-only to it.
+USER node
 # Declare /tmp so ECS on Fargate copies it (root-owned, mode 1777) into the
 # scratch volume the task mounts there. Without VOLUME, Fargate creates the
 # volume as root 0755 and the node user cannot write to it under a read-only

@@ -10,6 +10,8 @@ import { getAuditActor } from '../../lib/audit-actor.js';
 import * as vehicleService from '../../services/vehicle.service.js';
 import {
   replyVehicleServiceError,
+  vehicleAppearanceBodyFields,
+  vehicleAppearanceItemFields,
   vehicleAutochargeFields,
   vehicleLastSeen,
 } from '../../lib/vehicle-response.js';
@@ -30,13 +32,14 @@ const vehicleItem = z
       .regex(/^\d{4}$/)
       .nullable()
       .describe('Vehicle year (4-digit)'),
+    ...vehicleAppearanceItemFields,
     ...vehicleAutochargeFields,
     autochargeBlocked: z
       .boolean()
       .describe('The operator blocked Autocharge for this vehicle; the driver cannot turn it on'),
     createdAt: z.coerce.date().describe('Timestamp when the vehicle was added'),
   })
-  .passthrough();
+  .loose();
 
 const vehicleIdFields = {
   vin: z
@@ -62,6 +65,7 @@ const updateVehicleBody = z.object({
     .nullable()
     .optional()
     .describe('Model year (4-digit). Null removes it.'),
+  ...vehicleAppearanceBodyFields,
   ...vehicleIdFields,
   autochargeEnabled: z
     .boolean()
@@ -82,6 +86,8 @@ function portalVehicle(
     make: v.make,
     model: v.model,
     year: v.year,
+    color: v.color,
+    bodyType: v.bodyType,
     vin: v.vin,
     evccid: v.evccid,
     autochargeEnabled: v.autochargeEnabled,
@@ -99,6 +105,7 @@ const createVehicleBody = z.object({
     .regex(/^\d{4}$/)
     .optional()
     .describe('Model year (4-digit)'),
+  ...vehicleAppearanceBodyFields,
   ...vehicleIdFields,
 });
 
@@ -110,7 +117,7 @@ const efficiencyResponse = z
   .object({
     efficiencyMiPerKwh: z.number().min(0).max(20).describe('Energy efficiency in miles per kWh'),
   })
-  .passthrough();
+  .loose();
 
 const lookupQuery = z.object({
   make: z.string().optional().describe('Filter models by make (case-insensitive)'),
@@ -126,11 +133,11 @@ const lookupResponse = z
             make: z.string().describe('Vehicle make'),
             model: z.string().describe('Vehicle model'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Make/model pairs, optionally filtered by ?make='),
   })
-  .passthrough();
+  .loose();
 
 export function portalVehicleRoutes(app: FastifyInstance): void {
   app.get(
@@ -172,8 +179,15 @@ export function portalVehicleRoutes(app: FastifyInstance): void {
         body: zodSchema(createVehicleBody),
         response: {
           201: itemResponse(vehicleItem),
-          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          400: errorWith('Validation error', [
+            ERROR_CODES.VALIDATION_ERROR,
+            ERROR_CODES.VEHICLE_ID_REQUIRED,
+          ]),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
+          409: errorWith(
+            "Vehicle id in use, or Autocharge on with an id no charger sent in the driver's sessions",
+            [ERROR_CODES.VEHICLE_ID_IN_USE, ERROR_CODES.AUTOCHARGE_CLAIM_REQUIRED],
+          ),
         },
       },
     },
@@ -215,7 +229,10 @@ export function portalVehicleRoutes(app: FastifyInstance): void {
           ]),
           403: errorWith('Blocked by the operator', [ERROR_CODES.VEHICLE_BLOCKED_BY_OPERATOR]),
           404: errorWith('Vehicle not found', [ERROR_CODES.VEHICLE_NOT_FOUND]),
-          409: errorWith('Vehicle id in use', [ERROR_CODES.VEHICLE_ID_IN_USE]),
+          409: errorWith(
+            "Vehicle id in use, or Autocharge on with an id no charger sent in the driver's sessions",
+            [ERROR_CODES.VEHICLE_ID_IN_USE, ERROR_CODES.AUTOCHARGE_CLAIM_REQUIRED],
+          ),
         },
       },
     },

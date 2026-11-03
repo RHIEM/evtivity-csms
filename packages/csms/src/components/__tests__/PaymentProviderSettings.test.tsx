@@ -46,7 +46,9 @@ vi.mock('@/lib/api', () => {
 });
 
 vi.mock('@/lib/auth', () => ({
-  useHasPermission: () => permission.canWrite,
+  // canWrite stands for settings.payment:write, the permission of the
+  // provider routes. payments:write alone never opens the form.
+  useHasPermission: (perm: string) => perm === 'settings.payment:write' && permission.canWrite,
   useAuth: () => null,
 }));
 vi.mock('@/lib/timezone', () => ({
@@ -361,6 +363,78 @@ describe('PaymentProviderSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'common.retry' }));
     await waitFor(() => {
       expect(getMock).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('PaymentProviderSettings settings reload', () => {
+  let stored = settings();
+
+  function renderReloadable(): QueryClient {
+    stored = settings();
+    getMock.mockImplementation((url: string) =>
+      url === '/v1/settings/payments'
+        ? Promise.resolve(stored)
+        : Promise.reject(new Error(`unexpected ${url}`)),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PaymentProviderSettings />
+      </QueryClientProvider>,
+    );
+    return queryClient;
+  }
+
+  async function reload(client: QueryClient, next: PaymentSettingsResponse): Promise<void> {
+    stored = next;
+    const calls = getMock.mock.calls.length;
+    await client.invalidateQueries({ queryKey: ['payment-settings'] });
+    await waitFor(() => {
+      expect(getMock.mock.calls.length).toBeGreaterThan(calls);
+    });
+  }
+
+  it('keeps unsaved edits when the settings reload', async () => {
+    const client = renderReloadable();
+    await providerSelect();
+    fireEvent.change(screen.getByLabelText('paymentProviders.general.platformFee'), {
+      target: { value: '4' },
+    });
+    await reload(client, settings({ platformFeePercent: 7 }));
+    expect(inputValue('paymentProviders.general.platformFee')).toBe('4');
+    expect(screen.getByText('settings.unsavedChanges')).toBeTruthy();
+  });
+
+  it('takes the reloaded values while the form is clean', async () => {
+    const client = renderReloadable();
+    await providerSelect();
+    await reload(client, settings({ platformFeePercent: 7 }));
+    await waitFor(() => {
+      expect(inputValue('paymentProviders.general.platformFee')).toBe('7');
+    });
+    expect(screen.queryByText('settings.unsavedChanges')).toBeNull();
+  });
+
+  it('takes the stored values after its own save', async () => {
+    putMock.mockImplementation(() => {
+      // The server stores 4.0 as 4.
+      stored = settings({ platformFeePercent: 4 });
+      return Promise.resolve({ success: true });
+    });
+    const client = renderReloadable();
+    await providerSelect();
+    fireEvent.change(screen.getByLabelText('paymentProviders.general.platformFee'), {
+      target: { value: '4.0' },
+    });
+    save();
+    await waitFor(() => {
+      expect(inputValue('paymentProviders.general.platformFee')).toBe('4');
+    });
+    expect(screen.queryByText('settings.unsavedChanges')).toBeNull();
+    await reload(client, settings({ platformFeePercent: 6 }));
+    await waitFor(() => {
+      expect(inputValue('paymentProviders.general.platformFee')).toBe('6');
     });
   });
 });

@@ -5,11 +5,13 @@ export { createBullMQConnection, logBullMQErrors } from './bullmq.js';
 
 export {
   connectionName,
+  processVersion,
   CONNECTION_NAME_PREFIX,
   LEGACY_CONNECTION_NAME,
 } from './connection-name.js';
 
 export { withLock } from './redis-lock.js';
+export { isAllowedSimulatorTarget } from './simulator-target.js';
 export { aiArgsHash, canonicalJson } from './canonical-json.js';
 export type { WithLockOptions, WithLockResult } from './redis-lock.js';
 
@@ -52,12 +54,15 @@ export { keyedSubjectHash, authorizationSubjectId } from './insight-subject.js';
 export {
   assertTemplateAllowed,
   compileAllowedTemplate,
+  EMAIL_BODY_TEMPLATE,
+  EMAIL_LAYOUT_TEMPLATE,
   TemplateNotAllowedError,
   type AllowedTemplateOptions,
   type TemplateRenderer,
 } from './template-safety.js';
 
-export { csvEscape, buildCsv, neutraliseSpreadsheetFormula } from './csv-escape.js';
+export { csvEscape, buildCsv } from './csv-escape.js';
+export { escapeLikePattern } from './like-pattern.js';
 
 export { verifyRecaptcha } from './recaptcha.js';
 export type { RecaptchaResult } from './recaptcha.js';
@@ -252,8 +257,19 @@ export {
   OCPP_NOTIFICATION_EVENTS,
   OCPP_NOTIFICATION_EVENT_TYPES,
   ocppNotificationEventsFor,
+  SECURITY_TEMPLATE_EVENTS,
+  isSecurityTemplateEventType,
 } from './notification-events.js';
-export type { OcppNotificationVersion, OcppNotificationEventType } from './notification-events.js';
+export type {
+  OcppNotificationVersion,
+  OcppNotificationEventType,
+  SecurityTemplateSecrets,
+} from './notification-events.js';
+export {
+  securityTemplateSaveProblems,
+  securityTemplateRenderProblem,
+} from './security-template.js';
+export type { SecurityTemplateDraft, SecurityTemplateRendered } from './security-template.js';
 export {
   LOAD_ALLOCATION_STRATEGIES,
   PANEL_VOLTAGES,
@@ -373,6 +389,8 @@ export {
   DATE_VARIABLE_NAMES,
   formatDateVariables,
   redactSensitiveNotificationContent,
+  webhookSignature,
+  WEBHOOK_SIGNING_SECRET_KEY,
 } from './notification-dispatch.js';
 export type {
   SmtpConfig,
@@ -456,6 +474,7 @@ export {
   createGuardedAgent,
 } from './safe-fetch.js';
 export type { GuardOptions, SafeFetchInit, SafeFetchResponse } from './safe-fetch.js';
+export { readCappedBody, readBodyPrefix, ResponseTooLargeError } from './read-capped-body.js';
 
 export { sendExpoPush, isExpoPushToken } from './push-send.js';
 export type { ExpoPushMessage, ExpoPushResult, PushSendContext } from './push-send.js';
@@ -554,6 +573,8 @@ export {
   CSS_STATUS_REPORTING_KEY,
   CSS_STATUS_REPORTING_VALUES,
   CSS_STATUS_REPORTING_DEFAULT,
+  CSS_FILE_TRANSFER_PROTOCOLS_2X,
+  CSS_FILE_TRANSFER_PROTOCOLS_16,
   CSS_SIGNAL_STRENGTH_KEY,
   CSS_SIGNAL_STRENGTH_DEFAULT_DBM,
   cssSecurityCtrlrDefaults,
@@ -626,6 +647,8 @@ export {
   SIM_OCPP16_SIGNAL_KEYS_LIMITS,
   SIM_HOLOGRAM_ORG_ID_MAX_DIGITS,
   isHologramOrgId,
+  ONENCE_CLIENT_ID_MAX_LENGTH,
+  isOneNceClientId,
   isSimRetentionDays,
   isSimFetchDays,
   isSimSignalDbm,
@@ -633,8 +656,59 @@ export {
   normalizeSimGeneralSettings,
 } from './sim-settings.js';
 export type { SimGeneralSettings } from './sim-settings.js';
-export { SIGNAL_ASU_UNKNOWN, asuToDbm, gradeSignal, readSignalStrength } from './signal-grade.js';
-export type { SignalGrade, SignalReading, SignalThresholds, SignalUnit } from './signal-grade.js';
+export {
+  IDTECH_ENVIRONMENTS,
+  isIdtechEnvironment,
+  isIdtechMerchantId,
+  PAYMENT_TERMINAL_CARD_TIMEOUT_SECONDS,
+  PAYMENT_TERMINAL_DEFAULT_HOLD_CENTS,
+  PAYMENT_TERMINAL_MODELS,
+  PAYMENT_TERMINAL_OFFLINE_ALERT_MINUTES,
+  PAYMENT_TERMINAL_PROVIDERS,
+  PAYMENT_TERMINAL_SETTING_KEY_LIST,
+  PAYMENT_TERMINAL_SETTING_KEYS,
+  PAYMENT_TERMINAL_START_TTL_MINUTES,
+  terminalModelHasDisplay,
+} from './payment-terminal-settings.js';
+export type {
+  IdtechEnvironmentSetting,
+  PaymentTerminalProviderSetting,
+} from './payment-terminal-settings.js';
+export {
+  allowsUnverifiedTerminalAdapters,
+  resolvePaymentTerminalTestBaseUrl,
+} from './payment-terminal-env.js';
+export {
+  DATA_RETENTION_GROUPS,
+  DATA_RETENTION_KEYS,
+  DATA_RETENTION_MAX_DAYS,
+  DATA_RETENTION_SETTINGS,
+  effectiveRetentionDays,
+  isAllowedRetentionDays,
+  isDataRetentionSettingKey,
+  SECURITY_HISTORY_MIN_DAYS,
+  shortensSecurityHistory,
+} from './data-retention.js';
+export type {
+  DataRetentionDefinition,
+  DataRetentionGroup,
+  DataRetentionSettingKey,
+} from './data-retention.js';
+export {
+  SIGNAL_ASU_UNKNOWN,
+  SIGNAL_BAR_MIN_DBM,
+  asuToDbm,
+  gradeSignal,
+  readSignalStrength,
+  signalBars,
+} from './signal-grade.js';
+export type {
+  SignalBars,
+  SignalGrade,
+  SignalReading,
+  SignalThresholds,
+  SignalUnit,
+} from './signal-grade.js';
 
 export { reservationHoldingMinutes } from './reservation-holding.js';
 
@@ -751,3 +825,50 @@ export type { Ocpp201Refuse } from './ocpp201-charging-profile.js';
 export type { Ocpp201NetworkInterface, OcppProtocol } from './ocpp-version.js';
 export { hasAmbiguousPathEncoding } from './request-path.js';
 export { canonicalPhone, normalizeE164 } from './phone.js';
+export {
+  BOOT_OWNED_STATION_SETTINGS,
+  CHARGING_KINDS,
+  DATA_PLANS,
+  DATA_PLAN_DEFAULTS,
+  DATA_PLAN_SETTING_KEYS,
+  DATA_PLAN_SOURCES,
+  DEFAULT_DATA_PLAN,
+  OCPP16_MEASURANDS,
+  OCPP201_MEASURANDS,
+  OCPP21_MEASURANDS,
+  STATION_DATA_PLAN_INVALIDATION_KIND,
+  buildDataPlanCommands,
+  dataPlanIntervalRange,
+  dataPlanSettingKeys,
+  dataPlanValuesFromSettings,
+  isBootOwnedStationSetting,
+  isDataPlan,
+  isDataPlanSettingKey,
+  measurandsForProtocol,
+  normalizeMeasurandList,
+  parseStationDataPlanInvalidation,
+  resolveDataPlan,
+  stationDataPlanInvalidationPayload,
+  validateDataPlanSetting,
+} from './station-data-plan.js';
+export type {
+  BuildDataPlanCommandsOptions,
+  ChargingKind,
+  ChargingReadings,
+  DataPlan,
+  DataPlanCommand,
+  DataPlanSettingKeys,
+  DataPlanSource,
+  DataPlanValues,
+} from './station-data-plan.js';
+export {
+  AC_MAX_POWER_KW,
+  CONNECTOR_CURRENT_AMPS_DECIMALS,
+  CONNECTOR_POWER_KW_DECIMALS,
+  CONNECTOR_RATING_MIN,
+  CONNECTOR_TYPES,
+  hasAtMostDecimals,
+  isDcConnector,
+  stationChargingKind,
+} from './connector-power.js';
+export type { ConnectorPowerInput, ConnectorType } from './connector-power.js';

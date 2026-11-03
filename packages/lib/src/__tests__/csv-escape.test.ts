@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { csvEscape, buildCsv, neutraliseSpreadsheetFormula } from '../csv-escape.js';
+import { expectLinearTime } from './helpers/linear-time.js';
 
 describe('csvEscape', () => {
   it('returns plain ASCII unchanged', () => {
@@ -37,6 +38,23 @@ describe('csvEscape', () => {
   });
 
   describe('formula injection protection', () => {
+    it('neutralizes a formula inside an object, an array and a date too', () => {
+      // A formula after a line break or a separator inside a serialized object.
+      const obj = csvEscape({ a: '\n=HYPERLINK("https://attacker.example")', b: 'x;=1+1' });
+      expect(obj).toContain(";'=1+1");
+      expect(obj.startsWith('"{')).toBe(true);
+      const arr = csvEscape(['ok', ';=HYPERLINK("https://attacker.example")']);
+      expect(arr).toContain(";'=HYPERLINK");
+      expect(arr.startsWith('"[')).toBe(true);
+      const date = csvEscape(new Date('2026-10-23T10:00:00Z'));
+      expect(date).toBe('"""2026-10-23T10:00:00.000Z"""');
+      expect(csvEscape(null)).toBe('');
+      expect(csvEscape(undefined)).toBe('');
+      // Numbers and booleans stay as they are.
+      expect(csvEscape(-5)).toBe('-5');
+      expect(csvEscape(false)).toBe('false');
+    });
+
     it('prefixes leading = with a single quote', () => {
       expect(csvEscape('=SUM(A1:A10)')).toBe("'=SUM(A1:A10)");
     });
@@ -54,7 +72,8 @@ describe('csvEscape', () => {
     });
 
     it('prefixes leading TAB with a single quote', () => {
-      expect(csvEscape('\tevil')).toBe("'\tevil");
+      // A TAB also splits a field in a tab-separated import, so the field is quoted.
+      expect(csvEscape('\tevil')).toBe('"\'\tevil"');
     });
 
     it('prefixes leading CR with a single quote and wraps in CSV quotes', () => {
@@ -69,6 +88,56 @@ describe('csvEscape', () => {
 
     it('only applies formula prefix to strings, not numbers', () => {
       expect(csvEscape(-5)).toBe('-5');
+    });
+
+    it('quotes a field with a semicolon or TAB and breaks a formula after it (review 2, AI L2)', () => {
+      // Excel in de and es splits a .csv on ';', so the part after it is its own cell.
+      expect(csvEscape('x;=HYPERLINK("https://attacker.example","Open")')).toBe(
+        '"x;\'=HYPERLINK(""https://attacker.example"",""Open"")"',
+      );
+      expect(csvEscape('a; +1+1')).toBe('"a; \'+1+1"');
+      expect(csvEscape('a\t@SUM(1)')).toBe('"a\t\'@SUM(1)"');
+      expect(csvEscape('a;b')).toBe('"a;b"');
+      // A comma inside a quoted field never splits it, in any locale.
+      expect(csvEscape('Smith, -5')).toBe('"Smith, -5"');
+      // No cell of a semicolon or TAB split of the field starts with a formula character.
+      for (const value of ['x;=1+1', 'a;;-2+3', 'b;\t=1', 'c; @x']) {
+        for (const cell of csvEscape(value).split(/[;\t]/).slice(1)) {
+          expect(/^\s*[=+\-@]/.test(cell), `${value}: ${cell}`).toBe(false);
+        }
+      }
+    });
+
+    it('scans a long run of TABs or semicolons in linear time', () => {
+      const crafted: [string, (scale: number) => string][] = [
+        ['TABs', (scale) => '\t'.repeat(12_500 * scale)],
+        ['semicolons and TABs', (scale) => `x${';\t '.repeat(6_250 * scale)}y`],
+      ];
+      for (const [label, build] of crafted) {
+        expectLinearTime(label, build, (value) => {
+          csvEscape(value);
+        });
+      }
+      expect(csvEscape(`a${'\t'.repeat(1000)}=1`)).toBe(`"a${'\t'.repeat(1000)}'=1"`);
+    });
+
+    it('breaks split formulas exactly as the reference pattern does', () => {
+      const reference = (value: string) => value.replace(/([;\t]\s*)([=+\-@])/g, "$1'$2");
+      const alphabet = [';', '\t', ' ', '\n', '=', '+', '-', '@', 'a', ' '];
+      let seed = 7;
+      const next = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed;
+      };
+      for (let n = 0; n < 5000; n++) {
+        let value = 'x';
+        const length = next() % 12;
+        for (let k = 0; k < length; k++) value += alphabet[next() % alphabet.length] ?? '';
+        const expected = reference(value);
+        expect(csvEscape(value)).toBe(
+          /[,"\n\r;\t]/.test(expected) ? `"${expected.replace(/"/g, '""')}"` : expected,
+        );
+      }
     });
 
     it('formula prefix combines with quoting when needed', () => {

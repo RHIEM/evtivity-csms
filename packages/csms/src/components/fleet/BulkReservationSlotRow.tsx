@@ -11,6 +11,7 @@ import { Select } from '@/components/ui/select';
 import { StationCombobox, type StationSelection } from '@/components/station-combobox';
 import { DriverCombobox } from '@/components/driver-combobox';
 import { api } from '@/lib/api';
+import { formatConnectorPowerKw } from '@/lib/connector-rating';
 
 interface Connector {
   id: string;
@@ -39,14 +40,15 @@ interface BulkReservationSlotRowProps {
   slot: BulkReservationSlotState;
   onChange: (next: BulkReservationSlotState) => void;
   onRemove: (() => void) | null;
-  excludeStationIds?: ReadonlySet<string> | undefined;
+  /** Connector keys ("evseId-connectorId") other slots already picked at this slot's station. */
+  excludeConnectorKeys?: ReadonlySet<string> | undefined;
 }
 
 export function BulkReservationSlotRow({
   slot,
   onChange,
   onRemove,
-  excludeStationIds,
+  excludeConnectorKeys,
 }: BulkReservationSlotRowProps): React.JSX.Element {
   const { t } = useTranslation();
 
@@ -62,7 +64,8 @@ export function BulkReservationSlotRow({
     for (const evse of connectorsQuery.data) {
       for (const conn of evse.connectors) {
         const type = conn.connectorType ?? 'Unknown';
-        const power = conn.maxPowerKw != null ? `${conn.maxPowerKw} kW` : '';
+        const power =
+          conn.maxPowerKw != null ? `${formatConnectorPowerKw(Number(conn.maxPowerKw))} kW` : '';
         const label = `Port ${String(evse.evseId)}-${String(conn.connectorId)}: ${type}${power !== '' ? ` (${power})` : ''}`;
         options.push({
           key: `${String(evse.evseId)}-${String(conn.connectorId)}`,
@@ -72,8 +75,10 @@ export function BulkReservationSlotRow({
         });
       }
     }
-    return options;
-  }, [connectorsQuery.data]);
+    return options.filter(
+      (o) => excludeConnectorKeys?.has(o.key) !== true || o.key === slot.connectorKey,
+    );
+  }, [connectorsQuery.data, excludeConnectorKeys, slot.connectorKey]);
 
   // Reset connector when station changes (or clears)
   useEffect(() => {
@@ -100,15 +105,41 @@ export function BulkReservationSlotRow({
               onSelect={(station) => {
                 onChange({ ...slot, station, connectorKey: '' });
               }}
-              excludeIds={excludeStationIds}
             />
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground leading-6">
               {t('reservations.connector')}
             </Label>
-            {slot.station != null && connectorOptions.length > 0 ? (
+            {slot.station == null ? (
+              <Select disabled aria-label={t('reservations.connector')}>
+                <option value="">{t('reservations.selectStationFirst')}</option>
+              </Select>
+            ) : connectorsQuery.isError ? (
+              <div className="flex items-center gap-2" role="alert">
+                <p className="text-sm text-destructive">{t('common.loadError')}</p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    void connectorsQuery.refetch();
+                  }}
+                >
+                  {t('common.retry')}
+                </Button>
+              </div>
+            ) : !connectorsQuery.isSuccess ? (
+              <Select disabled aria-label={t('reservations.connector')}>
+                <option value="">{t('common.loading')}</option>
+              </Select>
+            ) : connectorOptions.length === 0 ? (
+              <Select disabled aria-label={t('reservations.connector')}>
+                <option value="">{t('reservations.noConnectors')}</option>
+              </Select>
+            ) : (
               <Select
+                aria-label={t('reservations.connector')}
                 value={slot.connectorKey}
                 onChange={(e) => {
                   onChange({ ...slot, connectorKey: e.target.value });
@@ -120,14 +151,6 @@ export function BulkReservationSlotRow({
                     {opt.label}
                   </option>
                 ))}
-              </Select>
-            ) : (
-              <Select disabled>
-                <option value="">
-                  {slot.station == null
-                    ? t('reservations.selectStationFirst')
-                    : t('common.loading')}
-                </option>
               </Select>
             )}
           </div>

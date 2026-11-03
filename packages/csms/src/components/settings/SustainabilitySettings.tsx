@@ -1,13 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 
 interface SustainabilitySettingsProps {
@@ -20,22 +21,33 @@ export function SustainabilitySettings({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [gridEmissionFactor, setGridEmissionFactor] = useState('0.386');
-  const [evEfficiency, setEvEfficiency] = useState('3.3');
-  const [gasolineEmissionFactor, setGasolineEmissionFactor] = useState('8.887');
-  const [avgMpg, setAvgMpg] = useState('25.4');
-
-  useEffect(() => {
-    if (settings == null) return;
+  const loaded = useMemo(() => {
     const s = (key: string): string => {
-      const v = settings[key];
+      const v = settings?.[key];
       return typeof v === 'string' || typeof v === 'number' ? String(v) : '';
     };
-    setGridEmissionFactor(s('sustainability.gridEmissionFactor') || '0.386');
-    setEvEfficiency(s('sustainability.evEfficiency') || '3.3');
-    setGasolineEmissionFactor(s('sustainability.gasolineEmissionFactor') || '8.887');
-    setAvgMpg(s('sustainability.avgMpg') || '25.4');
+    return {
+      gridEmissionFactor: s('sustainability.gridEmissionFactor') || '0.386',
+      evEfficiency: s('sustainability.evEfficiency') || '3.3',
+      gasolineEmissionFactor: s('sustainability.gasolineEmissionFactor') || '8.887',
+      avgMpg: s('sustainability.avgMpg') || '25.4',
+    };
   }, [settings]);
+  // A settings reload replaces the values only while they are unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded);
+  const { gridEmissionFactor, evEfficiency, gasolineEmissionFactor, avgMpg } = values;
+  const setGridEmissionFactor = (gridEmissionFactor: string): void => {
+    setValues((v) => ({ ...v, gridEmissionFactor }));
+  };
+  const setEvEfficiency = (evEfficiency: string): void => {
+    setValues((v) => ({ ...v, evEfficiency }));
+  };
+  const setGasolineEmissionFactor = (gasolineEmissionFactor: string): void => {
+    setValues((v) => ({ ...v, gasolineEmissionFactor }));
+  };
+  const setAvgMpg = (avgMpg: string): void => {
+    setValues((v) => ({ ...v, avgMpg }));
+  };
 
   const sustainabilityMutation = useMutation({
     mutationFn: (vals: {
@@ -110,11 +122,11 @@ export function SustainabilitySettings({
           isPending={sustainabilityMutation.isPending}
           type="button"
           onClick={() => {
-            sustainabilityMutation.mutate({
-              gridEmissionFactor,
-              evEfficiency,
-              gasolineEmissionFactor,
-              avgMpg,
+            const sent = { gridEmissionFactor, evEfficiency, gasolineEmissionFactor, avgMpg };
+            sustainabilityMutation.mutate(sent, {
+              onSuccess: () => {
+                takeNextLoad(sent);
+              },
             });
           }}
         />

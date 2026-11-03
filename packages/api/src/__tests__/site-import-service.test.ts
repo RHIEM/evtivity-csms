@@ -55,6 +55,13 @@ const { mockRecompute, mockSetDisabled, mockSendAvailability, mockPublishStatus 
   }),
 );
 
+// The AI insights scope reads the database; these tests cover the routes only.
+vi.mock('../services/ai-insight-scope.service.js', () => ({
+  initialSiteAiInsightsSelected: vi.fn().mockResolvedValue(true),
+  isOutsideAiInsightScope: () => false,
+  siteAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+  stationAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+}));
 vi.mock('@evtivity/services/availability-command', () => ({
   sendAvailabilityCommand: mockSendAvailability,
 }));
@@ -71,6 +78,11 @@ vi.mock('@evtivity/services/station-message.service', () => ({
 // New stations get their bound config template (the helper is covered by
 // the import integration test).
 const mockCreateTemplate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('@evtivity/services/station-data-plan.service', () => ({
+  snapshotStationDataPlansByOcppIds: vi.fn().mockResolvedValue(new Map()),
+  pushStationDataPlanChanges: vi.fn().mockResolvedValue([]),
+}));
+
 vi.mock('../lib/station-config-template.js', () => ({
   createStationConfigTemplate: mockCreateTemplate,
 }));
@@ -80,8 +92,13 @@ vi.mock('../lib/ocpi-location-push.js', () => ({
   publishOcpiStationSiteMove: mockSiteMove,
 }));
 
+const mockPlaceStationOnLayout = vi.hoisted(() => vi.fn(() => Promise.resolve({ x: 20, y: 20 })));
+const mockMoveStationLayout = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+
 vi.mock('@evtivity/database', async () => ({
   ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
+  placeStationOnLayout: mockPlaceStationOnLayout,
+  moveStationLayout: mockMoveStationLayout,
   client: {},
   recomputeStationAvailability: mockRecompute,
   setStationDisabled: mockSetDisabled,
@@ -613,6 +630,7 @@ describe('importSitesCsv', () => {
     await importSitesCsv([{ siteName: 'Moved', stationId: 'CS-001' }], true);
 
     expect(mockSiteMove).toHaveBeenCalledWith('station-1', 'site-0', 'site-1', undefined);
+    expect(mockMoveStationLayout).toHaveBeenCalledWith(expect.anything(), 'station-1', 'site-1');
   });
 
   it('audits a moved station and re-renders its screens for the new site', async () => {
@@ -666,6 +684,7 @@ describe('importSitesCsv', () => {
       actorUserId: 'usr_1',
     });
 
+    expect(mockPlaceStationOnLayout).toHaveBeenCalled();
     expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
       expect.objectContaining({ idColumn: 'station_id' }),
       expect.objectContaining({

@@ -4,13 +4,15 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Plus, Trash2, Search, AlertTriangle } from 'lucide-react';
+import { Trash2, Search, AlertTriangle } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { PushButton } from '@/components/push-button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
 import {
   Table,
   TableBody,
@@ -32,6 +34,7 @@ import { CancelButton } from '@/components/cancel-button';
 import { api, ApiError } from '@/lib/api';
 import { useToast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/timezone';
+import { Checkbox } from '@/components/ui/checkbox';
 
 interface LocalAuthEntry {
   id: number;
@@ -85,7 +88,12 @@ export function StationLocalAuthList({
 
   const limit = 10;
 
-  const { data: listData } = useQuery({
+  const {
+    data: listData,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['local-auth-list', stationId, page],
     queryFn: () =>
       api.get<VersionInfo>(
@@ -175,30 +183,30 @@ export function StationLocalAuthList({
   }
 
   return (
-    <Card>
-      <CardHeader className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <CardTitle>{t('stations.localAuthList')}</CardTitle>
-        <div className="flex flex-wrap gap-2">
-          <PushButton
-            label={pushMutation.isPending ? t('stations.pushing') : t('stations.pushToStation')}
-            disabled={!isOnline || pushMutation.isPending}
-            onClick={() => {
-              setPushConfirmOpen(true);
-            }}
-          />
-          <Button
-            onClick={() => {
-              setSelectedTokenIds(new Set());
-              setTokenSearch('');
-              setAddOpen(true);
-            }}
-          >
-            <Plus className="h-4 w-4" />
-            {t('stations.addTokens')}
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent>
+    <>
+      <TabPanel
+        title={t('stations.localAuthList')}
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <PushButton
+              label={pushMutation.isPending ? t('stations.pushing') : t('stations.pushToStation')}
+              disabled={!isOnline || pushMutation.isPending}
+              onClick={() => {
+                setPushConfirmOpen(true);
+              }}
+            />
+            <CreateButton
+              label={t('stations.addTokens')}
+              variant="outline"
+              onClick={() => {
+                setSelectedTokenIds(new Set());
+                setTokenSearch('');
+                setAddOpen(true);
+              }}
+            />
+          </div>
+        }
+      >
         {/* Version info bar */}
         <div className="flex flex-wrap items-center gap-4 mb-4 text-sm">
           <div>
@@ -222,10 +230,16 @@ export function StationLocalAuthList({
         )}
 
         {/* Entries table */}
-        {entries.length === 0 ? (
-          <p className="text-center text-sm text-muted-foreground">
-            {t('stations.noLocalAuthEntries')}
-          </p>
+        {isLoading ? (
+          <LoadingState />
+        ) : isError ? (
+          <ErrorState
+            onRetry={() => {
+              void refetch();
+            }}
+          />
+        ) : entries.length === 0 ? (
+          <EmptyState>{t('stations.noLocalAuthEntries')}</EmptyState>
         ) : (
           <>
             <div className="overflow-x-auto">
@@ -287,7 +301,7 @@ export function StationLocalAuthList({
             </div>
           </>
         )}
-      </CardContent>
+      </TabPanel>
 
       {/* Push Confirm Dialog */}
       <ConfirmDialog
@@ -355,13 +369,11 @@ export function StationLocalAuthList({
                     key={token.id}
                     className="flex items-center gap-3 px-4 py-2 hover:bg-accent cursor-pointer border-b last:border-b-0"
                   >
-                    <input
-                      type="checkbox"
+                    <Checkbox
                       checked={selectedTokenIds.has(token.id)}
                       onChange={() => {
                         toggleToken(token.id);
                       }}
-                      className="h-4 w-4 rounded border-input"
                     />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm truncate">{token.idToken}</div>
@@ -386,17 +398,16 @@ export function StationLocalAuthList({
                 setAddOpen(false);
               }}
             />
-            <Button
+            <CreateButton
+              label={addMutation.isPending ? t('stations.adding') : t('stations.addTokens')}
               disabled={selectedTokenIds.size === 0 || addMutation.isPending}
               onClick={() => {
                 addMutation.mutate(Array.from(selectedTokenIds));
               }}
-            >
-              {addMutation.isPending ? t('stations.adding') : t('stations.addTokens')}
-            </Button>
+            />
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </Card>
+    </>
   );
 }

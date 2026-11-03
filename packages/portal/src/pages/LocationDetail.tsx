@@ -14,7 +14,9 @@ import { LocationMap } from '@/components/LocationMap';
 import { PopularTimesChart } from '@/components/PopularTimesChart';
 import type { PopularTimesData } from '@/components/PopularTimesChart';
 import { api } from '@/lib/api';
+import { formatConnectorPowerKw } from '@/lib/utils';
 import { connectorStatusVariant, connectorStatusClassName } from '@/lib/connector-status';
+import { EmptyState } from '@/components/ui/content-state';
 
 interface ChargerInfo {
   stationId: string;
@@ -167,18 +169,20 @@ export function LocationDetail(): React.JSX.Element {
                       <span className="text-xs text-muted-foreground">
                         {c.connectorType != null ? c.connectorType : ''}
                         {c.connectorType != null && c.maxPowerKw != null ? ' - ' : ''}
-                        {c.maxPowerKw != null ? `${c.maxPowerKw} kW` : ''}
+                        {c.maxPowerKw != null
+                          ? `${formatConnectorPowerKw(Number(c.maxPowerKw))} kW`
+                          : ''}
                       </span>
                     );
                     const inner = (
                       <>
-                        <span className="flex items-center gap-2">
+                        <span className="flex min-w-0 items-center gap-2">
                           <Plug
                             className={`h-4 w-4 shrink-0 ${isStartable ? 'text-success' : 'text-muted-foreground'}`}
                           />
-                          <span className="font-medium">{c.stationId}</span>
+                          <span className="truncate font-medium">{c.stationId}</span>
                         </span>
-                        <span className="flex items-center gap-2">
+                        <span className="flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
                           {meta}
                           <Badge
                             variant={connectorStatusVariant()}
@@ -212,7 +216,7 @@ export function LocationDetail(): React.JSX.Element {
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">{t('location.noStations')}</p>
+              <EmptyState>{t('location.noStations')}</EmptyState>
             )}
           </CardContent>
         </Card>

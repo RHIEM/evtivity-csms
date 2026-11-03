@@ -3,7 +3,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, and, or, ilike, sql, desc } from 'drizzle-orm';
+import { eq, and, or, ilike, sql, desc, gte, lte } from 'drizzle-orm';
 import { db } from '@evtivity/database';
 import { accessLogs, users, drivers } from '@evtivity/database';
 import { zodSchema } from '../lib/zod-schema.js';
@@ -12,6 +12,7 @@ import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
 import { isAllSiteUser } from '../lib/site-access.js';
+import { logTimeRangeQuery, parseLogTimeRange } from '../lib/date-range.js';
 
 // The route stays hidden from site-restricted users: operator-wide logs need
 // access to every site, so they get the same 404 as a route that does not
@@ -52,17 +53,23 @@ const accessLogItem = z
     durationMs: z.number().nullable().describe('Request duration in milliseconds'),
     remoteAddress: z.string().nullable().describe('IP address of the client'),
     userAgent: z.string().nullable().describe('User-Agent header from the request'),
-    metadata: z.record(z.unknown()).nullable().describe('Additional structured metadata'),
+    metadata: z
+      .record(z.string(), z.unknown())
+      .nullable()
+      .describe('Additional structured metadata'),
     createdAt: z.coerce.date().describe('Timestamp when the entry was recorded'),
     userEmail: z.string().nullable().describe('Email of the actor (operator or driver)'),
     userFirstName: z.string().nullable().describe('First name of the actor'),
     userLastName: z.string().nullable().describe('Last name of the actor'),
   })
-  .passthrough();
+  .loose();
 
 const createLogBody = z.object({
   action: z.string().min(1).max(100).describe('Action name to log'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata for the log entry'),
+  metadata: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe('Additional metadata for the log entry'),
 });
 
 const listLogsQuery = paginationQuery.extend({
@@ -74,9 +81,18 @@ const listLogsQuery = paginationQuery.extend({
     .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
     .optional()
     .describe('Filter by HTTP method'),
+  ...logTimeRangeQuery,
 });
 
-const AUTH_ACTIONS = new Set(['login', 'logout']);
+/**
+ * Entries a browser posts are what the client says it did: they are stored as
+ * actions marked `clientReported: true`, never in the `auth` category, so a
+ * user cannot forge an authoritative sign-in entry under its id. The server's own record of sign-ins is the API
+ * access log (`api` category).
+ */
+function clientReported(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  return { ...(metadata ?? {}), clientReported: true };
+}
 
 export function accessLogRoutes(app: FastifyInstance): void {
   app.post(
@@ -86,6 +102,8 @@ export function accessLogRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Access Logs'],
         summary: 'Create an operator access log entry',
+        description:
+          'Records what the CSMS reports the user did, as an action entry marked clientReported (metadata). A client cannot write an auth entry.',
         operationId: 'createAccessLog',
         security: [{ bearerAuth: [] }],
         body: zodSchema(createLogBody),
@@ -95,15 +113,14 @@ export function accessLogRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { action, metadata } = request.body as z.infer<typeof createLogBody>;
       const { userId } = request.user as { userId: string };
-      const category = AUTH_ACTIONS.has(action) ? 'auth' : 'action';
 
       await db.insert(accessLogs).values({
         userId,
         action,
-        category,
+        category: 'action',
         remoteAddress: request.ip,
         userAgent: request.headers['user-agent'] ?? null,
-        metadata: metadata ?? null,
+        metadata: clientReported(metadata),
       });
       notifyAccessLog('csms');
 
@@ -135,7 +152,7 @@ export function accessLogRoutes(app: FastifyInstance): void {
         category: 'portal',
         remoteAddress: request.ip,
         userAgent: request.headers['user-agent'] ?? null,
-        metadata: metadata ?? null,
+        metadata: clientReported(metadata),
       });
       notifyAccessLog('portal');
 
@@ -157,13 +174,17 @@ export function accessLogRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const { page, limit, search, category, method } = request.query as z.infer<
+      const { page, limit, search, category, method, from, to } = request.query as z.infer<
         typeof listLogsQuery
       >;
       if (!(await allowAllSiteUsersOnly(request, reply))) return;
       const offset = (page - 1) * limit;
+      const range = parseLogTimeRange({ from, to });
 
       const conditions = [];
+
+      if (range.from != null) conditions.push(gte(accessLogs.createdAt, range.from));
+      if (range.to != null) conditions.push(lte(accessLogs.createdAt, range.to));
 
       if (category === 'browser' || category === 'csms') {
         conditions.push(or(eq(accessLogs.category, 'auth'), eq(accessLogs.category, 'action')));

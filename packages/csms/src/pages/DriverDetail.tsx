@@ -10,7 +10,7 @@ import { EntityNavButtons } from '@/components/entity-nav-buttons';
 import { CopyableId } from '@/components/copyable-id';
 import { CreateButton } from '@/components/create-button';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
 import { Pagination } from '@/components/ui/pagination';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
@@ -31,6 +31,7 @@ import { DriverPricingTab } from '@/components/driver/DriverPricingTab';
 import { DriverReservationsTab } from '@/components/driver/DriverReservationsTab';
 import { AuthorizeLogView } from '@/components/AuthorizeLogView';
 import { LoadingLogo } from '@/components/loading-logo';
+import { AccountAvatar, type AvatarData } from '@/components/AccountAvatar';
 
 interface Driver {
   id: string;
@@ -45,6 +46,7 @@ interface Driver {
   updatedAt: string;
   portalAccess?: PortalAccess;
   billing?: DriverBilling;
+  avatar?: AvatarData | null;
 }
 
 interface DriverToken {
@@ -80,7 +82,12 @@ export function DriverDetail(): React.JSX.Element {
     enabled: id != null,
   });
 
-  const { data: tokens } = useQuery({
+  const {
+    data: tokens,
+    isLoading: tokensLoading,
+    isError: tokensError,
+    refetch: refetchTokens,
+  } = useQuery({
     queryKey: ['drivers', id, 'tokens'],
     queryFn: () => api.get<DriverToken[]>(`/v1/drivers/${id ?? ''}/tokens`),
     enabled: id != null,
@@ -88,12 +95,20 @@ export function DriverDetail(): React.JSX.Element {
 
   const {
     data: sessions,
+    isLoading: sessionsLoading,
+    isError: sessionsError,
+    refetch: refetchSessions,
     page: sessionsPage,
     totalPages: sessionsTotalPages,
     setPage: setSessionsPage,
   } = usePaginatedQuery<Session>(`driver-sessions-${id ?? ''}`, `/v1/drivers/${id ?? ''}/sessions`);
 
-  const { data: driverVehicles } = useQuery({
+  const {
+    data: driverVehicles,
+    isLoading: vehiclesLoading,
+    isError: vehiclesError,
+    refetch: refetchVehicles,
+  } = useQuery({
     queryKey: ['drivers', id, 'vehicles'],
     queryFn: () => api.get<Vehicle[]>(`/v1/drivers/${id ?? ''}/vehicles`),
     enabled: id != null,
@@ -109,24 +124,37 @@ export function DriverDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <BackButton to="/drivers" />
-        <div className="min-w-0">
-          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">
+      <div className="flex flex-col gap-4 *:w-full sm:flex-row sm:items-start sm:justify-between sm:*:w-auto">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+          <BackButton to="/drivers" />
+          {driver.erasedAt == null && (
+            <AccountAvatar
+              avatar={driver.avatar}
+              firstName={driver.firstName}
+              lastName={driver.lastName}
+              size="lg"
+            />
+          )}
+          <div className="min-w-0">
+            <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">
+              {driver.erasedAt != null
+                ? t('drivers.erasedName')
+                : `${driver.firstName} ${driver.lastName}`}
+            </h1>
+            <CopyableId id={driver.id} />
+          </div>
+          <Badge variant={driver.isActive ? 'default' : 'outline'}>
             {driver.erasedAt != null
-              ? t('drivers.erasedName')
-              : `${driver.firstName} ${driver.lastName}`}
-          </h1>
-          <CopyableId id={driver.id} />
+              ? t('drivers.erased')
+              : driver.isActive
+                ? t('common.active')
+                : t('common.inactive')}
+          </Badge>
         </div>
-        <Badge variant={driver.isActive ? 'default' : 'outline'}>
-          {driver.erasedAt != null
-            ? t('drivers.erased')
-            : driver.isActive
-              ? t('common.active')
-              : t('common.inactive')}
-        </Badge>
-        <EntityNavButtons resource="drivers" basePath="/drivers" currentId={id} />
+        {/* items-start: Prev and Next line up with the top of the title row. The avatar is read-only here: drivers:write edits it in the Details tab edit form. */}
+        <div className="flex flex-wrap items-start gap-2" data-testid="driver-header-actions">
+          <EntityNavButtons resource="drivers" basePath="/drivers" currentId={id} />
+        </div>
       </div>
 
       <Tabs value={tab} onValueChange={setTab}>
@@ -148,79 +176,85 @@ export function DriverDetail(): React.JSX.Element {
         <DriverDetailsTab driver={driver} timezone={timezone} />
 
         <TabsContent value="tokens">
-          <Card>
-            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <CardTitle>{t('tokens.title')}</CardTitle>
+          <TabPanel
+            title={t('tokens.title')}
+            actions={
               <CreateButton
                 label={t('tokens.createToken')}
                 onClick={() => {
                   void navigate(`/drivers/${id ?? ''}/tokens/new`);
                 }}
               />
-            </CardHeader>
-            <CardContent>
-              <TokensTable
-                tokens={tokens}
-                page={1}
-                totalPages={1}
-                onPageChange={() => {}}
-                timezone={timezone}
-                showDriver={false}
-                emptyMessage={t('tokens.noTokens')}
-              />
-            </CardContent>
-          </Card>
+            }
+          >
+            <TokensTable
+              tokens={tokens}
+              page={1}
+              totalPages={1}
+              onPageChange={() => {}}
+              timezone={timezone}
+              showDriver={false}
+              emptyMessage={t('tokens.noTokens')}
+              isLoading={tokensLoading}
+              isError={tokensError}
+              onRetry={() => {
+                void refetchTokens();
+              }}
+            />
+          </TabPanel>
         </TabsContent>
 
         <DriverPaymentMethodsTab driverId={id ?? ''} timezone={timezone} />
 
         <TabsContent value="vehicles">
-          <Card>
-            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <CardTitle>{t('vehicles.title')}</CardTitle>
+          <TabPanel
+            title={t('vehicles.title')}
+            actions={
               <CreateButton
                 label={t('vehicles.createVehicle')}
                 onClick={() => {
                   void navigate(`/drivers/${id ?? ''}/vehicles/new`);
                 }}
               />
-            </CardHeader>
-            <CardContent>
-              <VehiclesTable
-                vehicles={driverVehicles}
-                page={1}
-                totalPages={1}
-                showAutocharge
-                onPageChange={() => {}}
-                onRowClick={(vehicle) => {
-                  void navigate(`/drivers/${id ?? ''}/vehicles/${vehicle.id}`);
-                }}
-              />
-            </CardContent>
-          </Card>
+            }
+          >
+            <VehiclesTable
+              vehicles={driverVehicles}
+              page={1}
+              totalPages={1}
+              showAutocharge
+              isLoading={vehiclesLoading}
+              isError={vehiclesError}
+              onRetry={() => {
+                void refetchVehicles();
+              }}
+              onPageChange={() => {}}
+              onRowClick={(vehicle) => {
+                void navigate(`/drivers/${id ?? ''}/vehicles/${vehicle.id}`);
+              }}
+            />
+          </TabPanel>
         </TabsContent>
 
         <TabsContent value="sessions">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t('sessions.title')}</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <SessionsTable
-                sessions={sessions}
-                page={sessionsPage}
-                totalPages={sessionsTotalPages}
-                onPageChange={setSessionsPage}
-                timezone={timezone}
-                hideDriverName
-              />
-              <Pagination
-                page={sessionsPage}
-                totalPages={sessionsTotalPages}
-                onPageChange={setSessionsPage}
-              />
-            </CardContent>
-          </Card>
+          <TabPanel title={t('sessions.title')}>
+            <SessionsTable
+              sessions={sessions}
+              page={sessionsPage}
+              totalPages={sessionsTotalPages}
+              onPageChange={setSessionsPage}
+              timezone={timezone}
+              hideDriverName
+              isLoading={sessionsLoading}
+              isError={sessionsError}
+              onRetry={refetchSessions}
+            />
+            <Pagination
+              page={sessionsPage}
+              totalPages={sessionsTotalPages}
+              onPageChange={setSessionsPage}
+            />
+          </TabPanel>
         </TabsContent>
 
         {canReadInvoices && (
@@ -237,6 +271,7 @@ export function DriverDetail(): React.JSX.Element {
 
         <TabsContent value="authorize-log">
           <AuthorizeLogView
+            title={t('tokens.authorizeLog')}
             fixedFilters={{ matchedDriverId: id ?? '' }}
             queryKey={`authorize-attempts-driver-${id ?? ''}`}
           />

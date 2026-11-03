@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { Checkbox } from '@/components/ui/checkbox';
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -17,6 +18,17 @@ import { PermissionEditor } from '@/components/PermissionEditor';
 import { useHasAllSiteAccess } from '@/lib/auth';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { isAdminEquivalent } from '@evtivity/lib/admin-equivalent';
+import {
+  FactorProofField,
+  proofRejection,
+  type FactorProof,
+  type ProofRejection,
+} from '@/components/FactorProofField';
+import { useMfaStatus } from '@/components/profile/mfa-status';
+import { PendingAvatarField } from '@/components/avatar/PendingAvatarField';
+import { useToast } from '@/components/ui/toast';
+import { applyAvatarChoice, userAvatarPath, type AvatarChoice } from '@/lib/avatar';
 
 interface User {
   id: string;
@@ -51,6 +63,14 @@ export function UserCreate(): React.JSX.Element {
   const [selectedSiteIds, setSelectedSiteIds] = useState<string[]>([]);
   const [selectedPermissions, setSelectedPermissions] = useState<string[]>([]);
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [avatar, setAvatar] = useState<AvatarChoice | null>(null);
+  const { toast } = useToast();
+  // A signed-in session proves the account again to create an admin-equivalent user.
+  const { data: mfaStatus } = useMfaStatus();
+  const proofKinds = mfaStatus?.factorProofKinds ?? [];
+  const [proof, setProof] = useState<FactorProof | null>(null);
+  const [proofFailure, setProofFailure] = useState<ProofRejection | null>(null);
+  const needsProof = proofKinds.length > 0 && isAdminEquivalent(selectedPermissions);
 
   const { data: roles } = useQuery({
     queryKey: ['roles'],
@@ -79,17 +99,33 @@ export function UserCreate(): React.JSX.Element {
       roleId: string;
       hasAllSiteAccess: boolean;
       siteIds?: string[];
+      permissions: string[];
+      proof?: FactorProof;
     }) => {
       const created = await api.post<User>('/v1/users', body);
-      // After user creation, set permissions
-      if (selectedPermissions.length > 0) {
-        await api.put(`/v1/users/${created.id}/permissions`, {
-          permissions: selectedPermissions,
+      // The avatar is stored right after the user exists; a failure there
+      // keeps the new user and says so (the Details tab can set it again).
+      let avatarError: unknown = null;
+      if (avatar != null) {
+        try {
+          await applyAvatarChoice(userAvatarPath(created.id, null), avatar);
+        } catch (err) {
+          avatarError = err;
+        }
+      }
+      return { created, avatarError };
+    },
+    onError: (err: unknown) => {
+      setProofFailure(proofRejection(err));
+    },
+    onSuccess: ({ created, avatarError }) => {
+      if (avatarError != null) {
+        toast({
+          title: t('avatar.applyFailed'),
+          description: getErrorMessage(avatarError, t, 'avatar.saveFailed'),
+          variant: 'destructive',
         });
       }
-      return created;
-    },
-    onSuccess: (created) => {
       void queryClient.invalidateQueries({ queryKey: ['users'] });
       void navigate(`/users/${created.id}`);
     },
@@ -113,10 +149,14 @@ export function UserCreate(): React.JSX.Element {
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(errors).length > 0) return;
+    if (needsProof && proof == null) return;
+    // One request: the user with its final permissions, and one proof (a TOTP code works once).
     createMutation.mutate({
       email,
       roleId,
       hasAllSiteAccess,
+      permissions: selectedPermissions,
+      ...(needsProof && proof != null ? { proof } : {}),
       ...(firstName.trim() !== '' ? { firstName } : {}),
       ...(lastName.trim() !== '' ? { lastName } : {}),
       ...(phone.trim() !== '' ? { phone } : {}),
@@ -134,6 +174,14 @@ export function UserCreate(): React.JSX.Element {
       <Card>
         <CardContent className="pt-6">
           <form onSubmit={handleSubmit} noValidate className="grid gap-6">
+            <PendingAvatarField
+              choice={avatar}
+              onChange={setAvatar}
+              firstName={firstName}
+              lastName={lastName}
+              description={t('avatar.editDescriptionUser')}
+              hint={t('avatar.savedWithNewAccount')}
+            />
             <div className="space-y-2">
               <Label htmlFor="user-email" className="leading-6">
                 {t('common.email')}
@@ -241,15 +289,13 @@ export function UserCreate(): React.JSX.Element {
               {canGrantAllSites && (
                 <>
                   <div className="flex items-center gap-2">
-                    <input
+                    <Checkbox
                       id="create-all-sites"
-                      type="checkbox"
                       checked={hasAllSiteAccess}
                       onChange={(e) => {
                         setHasAllSiteAccess(e.target.checked);
                         if (e.target.checked) setSelectedSiteIds([]);
                       }}
-                      className="h-4 w-4 rounded border-input"
                     />
                     <Label htmlFor="create-all-sites">{t('users.allSites')}</Label>
                   </div>
@@ -265,9 +311,8 @@ export function UserCreate(): React.JSX.Element {
                   {sitesList.length === 0 && <p className="text-xs text-muted-foreground">n/a</p>}
                   {sitesList.map((site) => (
                     <div key={site.id} className="flex items-center gap-2">
-                      <input
+                      <Checkbox
                         id={`site-${site.id}`}
-                        type="checkbox"
                         checked={selectedSiteIds.includes(site.id)}
                         onChange={(e) => {
                           if (e.target.checked) {
@@ -276,7 +321,6 @@ export function UserCreate(): React.JSX.Element {
                             setSelectedSiteIds((prev) => prev.filter((id) => id !== site.id));
                           }
                         }}
-                        className="h-4 w-4 rounded border-input"
                       />
                       <Label htmlFor={`site-${site.id}`}>{site.name}</Label>
                     </div>
@@ -287,8 +331,21 @@ export function UserCreate(): React.JSX.Element {
                 <p className="text-xs text-destructive">{errors.siteIds}</p>
               )}
             </div>
+            {needsProof && (
+              <FactorProofField
+                idPrefix="user-create-proof"
+                kinds={proofKinds}
+                codeMethod={mfaStatus?.mfaMethod ?? null}
+                description={t('users.adminProofHint')}
+                onChange={setProof}
+                rejection={proofFailure}
+                showMissing={hasSubmitted}
+              />
+            )}
             {createMutation.isError && (
-              <p className="text-sm text-destructive">{getErrorMessage(createMutation.error, t)}</p>
+              <p className="text-sm text-destructive" role="alert">
+                {getErrorMessage(createMutation.error, t)}
+              </p>
             )}
             <div className="flex justify-end gap-2">
               <CancelButton

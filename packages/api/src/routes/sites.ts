@@ -4,7 +4,21 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { invalidateAutochargeCaches } from '../lib/autocharge-invalidation.js';
-import { eq, or, ilike, sql, gte, lte, and, desc, count, inArray, isNotNull } from 'drizzle-orm';
+import {
+  eq,
+  or,
+  ilike,
+  sql,
+  gt,
+  gte,
+  lte,
+  and,
+  desc,
+  count,
+  inArray,
+  isNotNull,
+  isNull,
+} from 'drizzle-orm';
 import {
   db,
   writeAudit,
@@ -23,7 +37,18 @@ import {
   siteInsightsOperatorSuppressedSql,
   siteInsightsSuppressedSql,
   siteInsightSuppressionSourcesSql,
+  getPlatformFeePercent,
+  readStationDataPlans,
+  saveSiteLayout,
+  readSiteLayoutSettings,
+  readStationLayoutKinds,
+  readSiteLayoutPositions,
+  setSiteLayoutType,
+  ChargerPlacementSiteTypeError,
+  LayoutGridTooSmallError,
+  LayoutSpotsOverlapError,
 } from '@evtivity/database';
+import type { SiteTypeChange } from '@evtivity/database';
 import type { SiteInsightSuppressionSource } from '@evtivity/database';
 import {
   resumeSiteAiInsights,
@@ -39,6 +64,11 @@ import {
   revenueItem,
 } from '@evtivity/services/session-revenue';
 import { siteNameEq } from '../lib/site-lookup.js';
+import {
+  readLayoutMaintenanceWindows,
+  readLayoutReservations,
+  type LayoutTimeWindow,
+} from '../lib/site-layout-status-windows.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import {
@@ -66,9 +96,46 @@ import {
   deriveElectricityRatePriority,
   STATION_MESSAGE_LANGUAGES,
   isKnownCountry,
+  DATA_PLANS,
 } from '@evtivity/lib';
+import {
+  changeSiteDataPlan,
+  siteDataPlanImpact,
+} from '@evtivity/services/station-data-plan.service';
 import type { ElectricityRatePeriodRestrictions } from '@evtivity/lib';
+import { ValidationError } from '@evtivity/lib';
+import {
+  firstFreePlacement,
+  freeSlotsFor,
+  sharesSpotPair,
+  splitDispenserCount,
+  layoutStationCountsOfKinds,
+  CHARGER_PLACEMENTS,
+  freeSpotCount,
+  SITE_TYPES,
+  usesFreePositions,
+  type FreePlacement,
+} from '@evtivity/lib/site-layout';
+import { VEHICLE_BODY_TYPES, VEHICLE_COLORS } from '@evtivity/lib/vehicle-appearance';
+import { avatarItem } from '../lib/avatar-item.js';
+import { readLayoutStationSessions } from '../lib/site-layout-sessions.js';
+import type { LayoutStationSession } from '../lib/site-layout-sessions.js';
+import {
+  layoutOcppVersion,
+  readLayoutStationLinks,
+  readLayoutWiredLinks,
+} from '../lib/site-layout-connectivity.js';
+import type { LayoutStationLink, LayoutWiredLink } from '../lib/site-layout-connectivity.js';
+import {
+  REPLAY_MAX_CHANGES,
+  REPLAY_MAX_DAYS_BACK,
+  REPLAY_MAX_STATIONS,
+  readSiteLayoutReplay,
+  replayDayBounds,
+} from '../lib/site-layout-replay.js';
+import { freePlacementSchema, siteLayoutSettingsSchema } from '@evtivity/lib/site-layout-schema';
 import { parseZodRequest, rejectUnknownBodyKeys, zodSchema } from '../lib/zod-schema.js';
+import { connectorCurrentAmpsSchema } from '../lib/connector-rating-schema.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
@@ -84,7 +151,13 @@ import {
   buildDerivedStatusSubquery,
   buildStatusReasonSubquery,
 } from '@evtivity/services/station-derived-status';
-import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { ERROR_CODES, ERROR_MESSAGES } from '../lib/error-codes.generated.js';
+import { AI_INSIGHT_SCOPE_REASONS } from '@evtivity/lib/ai-insights';
+import {
+  initialSiteAiInsightsSelected,
+  isOutsideAiInsightScope,
+  siteAiInsightsScopeStatus,
+} from '../services/ai-insight-scope.service.js';
 import {
   exportSitesCsv,
   exportSitesTemplateCsv,
@@ -95,6 +168,12 @@ import { dateRangeQuery, parseDateRange } from '../lib/date-range.js';
 import { enumerateLocalDays, zeroFillDays } from '../lib/daily-series.js';
 import { buildUnderMaintenanceSubquery } from '../lib/station-maintenance-flag.js';
 import type { JwtPayload } from '../plugins/auth.js';
+import {
+  canReadMoney,
+  maskMoneyFields,
+  METRICS_MONEY_FIELDS,
+  REVENUE_HISTORY_MONEY_FIELDS,
+} from '../lib/money-visibility.js';
 import { authorize, requestHasPermission } from '../middleware/rbac.js';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
 import { recalculateSiteElectricityCost } from '@evtivity/services/electricity-cost.service';
@@ -121,7 +200,8 @@ const importSiteRow = z.object({
   connectorId: z.number().int().min(1).optional(),
   connectorType: z.string().max(50).optional(),
   maxPowerKw: z.number().min(0).max(10000).optional(),
-  maxCurrentAmps: z.number().int().min(0).max(1000).optional(),
+  // Decimal amps with at most 1 decimal (31.5), as on the station EVSE routes.
+  maxCurrentAmps: connectorCurrentAmpsSchema(0).max(1000).optional(),
   stationVendor: z.string().max(100).optional(),
 });
 
@@ -144,14 +224,14 @@ const sitePricingGroupItem = z
     isDefault: z.boolean().describe('Whether this is the system default pricing group'),
     tariffCount: z.number().int().min(0).describe('Number of tariffs in this pricing group'),
   })
-  .passthrough();
+  .loose();
 
 const sitePricingGroupRecordItem = z
   .object({
     siteId: z.string().describe('Site identifier'),
     pricingGroupId: z.string().describe('Pricing group identifier assigned to the site'),
   })
-  .passthrough();
+  .loose();
 
 const addSitePricingGroupBody = z.object({
   pricingGroupId: ID_PARAMS.pricingGroupId.describe('Pricing group ID to assign to the site'),
@@ -205,6 +285,22 @@ const hoursOfOperationField = z
 const COUNTRY_MESSAGE = 'Unknown country: use an ISO 3166-1 code or the English country name';
 const emptyOrCountry = (value: string): boolean => value.trim() === '' || isKnownCountry(value);
 
+// The site type of the layout (layoutSettings.siteType), set on the site form.
+const siteTypeField = z
+  .enum(SITE_TYPES)
+  .optional()
+  .describe(
+    'Site type of the layout: parking_lot, office_retail, curbside, depot or custom. Stored in layoutSettings.siteType; every other layout setting is kept, so switching back restores it. A station outside the new layout moves to the nearest free spot; one with no free spot keeps its position (off the layout). Switching to depot puts the stations with an MCS connector into truck lanes and the others into bus bays. Switching to custom gives every station a free position where it stands now (stations whose spots would overlap slide along their row); switching from custom returns the stations to their grid spots. Omitted keeps the type',
+  );
+
+// The parking lot's charger placement (layoutSettings.chargerPlacement), set on the site form.
+const chargerPlacementField = z
+  .enum(CHARGER_PLACEMENTS)
+  .optional()
+  .describe(
+    'Parking lot only: islands (chargers on the islands of rows back to back and at the lot edge rows) or lot_edge (chargers only along the lot edge: the first and the last row, the inner rows ordinary parking). A change moves the stations onto the new charging spots, AC and DC still grouped, DC nearest the transformer. 400 VALIDATION_ERROR for another site type. Omitted keeps it',
+  );
+
 const createSiteBody = z.object({
   name: z
     .string()
@@ -230,16 +326,18 @@ const createSiteBody = z.object({
     .refine(isValidTimezone, { message: 'Invalid IANA timezone' })
     .optional(),
   contactName: z.string().max(255).optional(),
-  contactEmail: z.string().email().max(255).optional(),
+  contactEmail: z.email().max(255).optional(),
   contactPhone: z.string().max(50).optional(),
   contactIsPublic: z.boolean().optional(),
   hoursOfOperation: hoursOfOperationField,
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  siteType: siteTypeField,
+  chargerPlacement: chargerPlacementField,
 });
 
 // An optional site field that an update can clear: null or an empty string
 // stores null, omitted keeps the stored value.
-function clearable(field: z.ZodType<string, z.ZodTypeDef, string>, description: string) {
+function clearable(field: z.ZodType<string, string>, description: string) {
   return field
     .nullable()
     .optional()
@@ -249,7 +347,7 @@ function clearable(field: z.ZodType<string, z.ZodTypeDef, string>, description: 
 
 const emptyOr = (check: (value: string) => boolean) => (value: string) =>
   value === '' || check(value);
-const isEmail = (value: string): boolean => z.string().email().safeParse(value).success;
+const isEmail = (value: string): boolean => z.email().safeParse(value).success;
 const isLatitude = (value: string): boolean => {
   const n = Number(value);
   return Number.isFinite(n) && n >= -90 && n <= 90;
@@ -302,7 +400,7 @@ const updateSiteBody = z.object({
   contactPhone: clearable(z.string().max(50), 'Site contact phone number'),
   contactIsPublic: z.boolean().optional(),
   hoursOfOperation: hoursOfOperationField,
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   reservationsEnabled: z
     .boolean()
     .optional()
@@ -321,10 +419,6 @@ const updateSiteBody = z.object({
     .describe(
       'Display language of the station screens at this site. Null follows the stationMessage.language setting',
     ),
-  aiInsightsEnabled: z
-    .boolean()
-    .optional()
-    .describe('Whether automatic insights run for this site. Users with access to every site only'),
   aiMonthlyTokenBudget: z
     .number()
     .int()
@@ -335,10 +429,19 @@ const updateSiteBody = z.object({
     .describe(
       'Monthly AI token budget of this site. Null follows the ai.budget.siteMonthlyTokens setting, 0 means no limit. Users with access to every site only',
     ),
+  dataPlan: z
+    .enum(DATA_PLANS)
+    .nullable()
+    .optional()
+    .describe(
+      "The site's data plan (wifi_or_wired or cellular), null for not set. Stations without their own plan and without a confirmed SIM run it; online ones get the settings at once",
+    ),
+  siteType: siteTypeField,
+  chargerPlacement: chargerPlacementField,
 });
 
 /** Site fields only a user with access to every site may change (a restricted user gets 404). */
-const ALL_SITE_FIELDS = ['aiInsightsEnabled', 'aiMonthlyTokenBudget'] as const;
+const ALL_SITE_FIELDS = ['aiMonthlyTokenBudget'] as const;
 
 /** Site columns the OCPI location carries: a change pushes the location to partners. */
 const OCPI_LOCATION_FIELDS = [
@@ -392,6 +495,8 @@ const siteSelect = {
   stationCount: sql<number>`count(${chargingStations.id})::int`,
   loadManagementEnabled: sql<boolean>`coalesce(${siteLoadManagement.isEnabled}, false)`,
   reservationsEnabled: sites.reservationsEnabled,
+  dataPlan: sites.dataPlan,
+  layoutSettings: sites.layoutSettings,
   autochargeEnabled: sites.autochargeEnabled,
   freeVendEnabled: sites.freeVendEnabled,
   freeVendTemplateId21: sites.freeVendTemplateId21,
@@ -462,7 +567,10 @@ const siteItem = z
       .boolean()
       .describe('Whether contact information is visible to drivers in the portal'),
     hoursOfOperation: z.string().nullable().describe('Free-form description of operating hours'),
-    metadata: z.record(z.unknown()).nullable().describe('Arbitrary site metadata as JSON object'),
+    metadata: z
+      .record(z.string(), z.unknown())
+      .nullable()
+      .describe('Arbitrary site metadata as JSON object'),
     createdAt: z.coerce.date().describe('Timestamp when the site was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the site was last updated'),
     stationCount: z.number().describe('Number of charging stations at this site'),
@@ -478,7 +586,22 @@ const siteItem = z
       .describe(
         'Display language of the station screens at this site (en, de, es, ko, zh, zh-TW). Null follows the stationMessage.language setting',
       ),
-    aiInsightsEnabled: z.boolean().describe('Whether automatic insights run for this site'),
+    aiInsightsEnabled: z
+      .boolean()
+      .describe(
+        'Selected in the AI insights scope (true for every site while every site is analyzed); aiInsightsScope tells whether insights run',
+      ),
+    dataPlan: z
+      .enum(DATA_PLANS)
+      .nullable()
+      .describe(
+        "The site's data plan (wifi_or_wired or cellular), null for not set. Stations without their own plan and without a confirmed SIM run it",
+      ),
+    layoutSettings: siteLayoutSettingsSchema
+      .nullable()
+      .describe(
+        'Layout settings of the site (the site type and the fields of every type), null when never saved: the layout then shows a parking lot of 2 rows of 10 standard spots, facing 0, grown to hold the stations, and one transformer. A missing siteType reads as parking_lot. Changed through PUT /v1/sites/{id}/layout, the site type also through the siteType field of POST /v1/sites and PATCH /v1/sites/{id}',
+      ),
     aiMonthlyTokenBudget: z
       .number()
       .nullable()
@@ -508,8 +631,23 @@ const siteItem = z
     aiInsightsSuppressedBy: z.string().nullable().describe('User who suppressed them'),
     aiInsightsSuppressedByName: z.string().nullable().describe('Name of that user'),
     aiInsightsSuppressedReason: z.string().nullable().describe('Reason given for the suppression'),
+    aiInsightsScope: z
+      .object({
+        enabled: z
+          .boolean()
+          .describe('AI insights are produced for the site now: AI Insights on and in the scope'),
+        reason: z
+          .enum(AI_INSIGHT_SCOPE_REASONS)
+          .describe(
+            'all_sites or selected: in scope; feature_off: AI Insights (system-initiated AI) are off; site_not_selected: only selected sites are analyzed and this one is not',
+          ),
+      })
+      .optional()
+      .describe(
+        'Whether AI insights run for the site and why (Settings > AI > Automatic Insights). Site detail only',
+      ),
   })
-  .passthrough();
+  .loose();
 
 const siteBase = z
   .object({
@@ -527,7 +665,14 @@ const siteBase = z
       .describe('Longitude in decimal degrees as string for precision'),
     timezone: z.string().nullable().describe('IANA timezone name (e.g. America/Los_Angeles)'),
     hoursOfOperation: z.string().nullable().describe('Free-form description of operating hours'),
-    metadata: z.record(z.unknown()).nullable().describe('Arbitrary site metadata as JSON object'),
+    metadata: z
+      .record(z.string(), z.unknown())
+      .nullable()
+      .describe('Arbitrary site metadata as JSON object'),
+    dataPlan: z
+      .enum(DATA_PLANS)
+      .nullable()
+      .describe("The site's data plan (wifi_or_wired or cellular), null for not set"),
     autochargeEnabled: z
       .boolean()
       .nullable()
@@ -540,7 +685,11 @@ const siteBase = z
       .describe(
         'Display language of the station screens at this site (en, de, es, ko, zh, zh-TW). Null follows the stationMessage.language setting',
       ),
-    aiInsightsEnabled: z.boolean().describe('Whether automatic insights run for this site'),
+    aiInsightsEnabled: z
+      .boolean()
+      .describe(
+        'Selected in the AI insights scope (true for every site while every site is analyzed); aiInsightsScope tells whether insights run',
+      ),
     aiMonthlyTokenBudget: z
       .number()
       .nullable()
@@ -550,7 +699,7 @@ const siteBase = z
     createdAt: z.coerce.date().describe('Timestamp when the site was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the site was last updated'),
   })
-  .passthrough();
+  .loose();
 
 const importResultResponse = z
   .object({
@@ -566,7 +715,7 @@ const importResultResponse = z
       .array(z.string())
       .describe('List of error messages encountered during import, one per failing row'),
   })
-  .passthrough();
+  .loose();
 
 const siteMetricsResponse = z
   .object({
@@ -596,11 +745,13 @@ const siteMetricsResponse = z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe(
         'Total revenue in the period in cents, tax included. Revenue is the final cost of ended sessions plus reservation fees charged, minus refunds, in the company currency; active sessions are not counted',
       ),
     avgRevenueCentsPerSession: z
       .number()
+      .nullable()
       .describe('Average revenue per ended session billed in the company currency, in cents'),
     totalTransactions: z
       .number()
@@ -609,11 +760,13 @@ const siteMetricsResponse = z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe('Total wholesale electricity cost in cents over the reporting period'),
     totalNetRevenueCents: z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe(
         'Total revenue excluding tax in cents. Each amount is split at its own tax rate (a session at its tariff tax rate, a reservation fee at the rate it was taxed at).',
       ),
@@ -621,10 +774,12 @@ const siteMetricsResponse = z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe('Tax collected in cents (total revenue minus total net revenue)'),
     totalProfitCents: z
       .number()
       .int()
+      .nullable()
       .describe(
         'Total profit in cents (revenue excluding tax minus electricity cost); may be negative. Sessions without an electricity cost (costMissingSessionCount) are left out.',
       ),
@@ -639,6 +794,7 @@ const siteMetricsResponse = z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe('Revenue of those sessions in cents, tax included. Left out of profit.'),
     periodMonths: z.number().describe('Number of months covered by this metrics report'),
     currency: z
@@ -648,7 +804,7 @@ const siteMetricsResponse = z
         'Company currency (ISO 4217) of the revenue, cost, and profit amounts. Those amounts sum only sessions billed in this currency.',
       ),
   })
-  .passthrough();
+  .loose();
 
 const siteStationItem = z
   .object({
@@ -694,14 +850,14 @@ const siteStationItem = z
       .boolean()
       .describe('Whether an active maintenance event currently covers this station'),
   })
-  .passthrough();
+  .loose();
 
 const energyHistoryItem = z
   .object({
     date: z.string().describe('Calendar date in YYYY-MM-DD format (in site timezone)'),
     energyWh: z.number().describe('Total energy delivered on this date in watt-hours'),
   })
-  .passthrough();
+  .loose();
 
 const revenueHistoryItem = z
   .object({
@@ -710,6 +866,7 @@ const revenueHistoryItem = z
       .number()
       .int()
       .min(0)
+      .nullable()
       .describe(
         'Revenue on this date in cents, tax included: final costs of sessions started that day plus reservation fees charged that day, minus refunds, in the company currency. Active sessions are not counted',
       ),
@@ -719,7 +876,7 @@ const revenueHistoryItem = z
         'Number of ended sessions billed in the company currency that started on this date',
       ),
   })
-  .passthrough();
+  .loose();
 
 const meterValueGroup = z
   .object({
@@ -734,11 +891,11 @@ const meterValueGroup = z
             timestamp: z.coerce.date().describe('Timestamp when this meter sample was taken'),
             value: z.string().describe('Meter reading value as a string for numeric precision'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Chronologically ordered list of meter readings for this measurand'),
   })
-  .passthrough();
+  .loose();
 
 const siteSessionItem = z
   .object({
@@ -775,7 +932,7 @@ const siteSessionItem = z
       .boolean()
       .describe('Whether the session was a free-vend session (no driver authorization or payment)'),
   })
-  .passthrough();
+  .loose();
 
 const layoutConnector = z
   .object({
@@ -794,14 +951,75 @@ const layoutConnector = z
       .nullable()
       .describe('Energy delivered during the active session in watt-hours, or null if idle'),
   })
-  .passthrough();
+  .loose();
 
 const layoutEvse = z
   .object({
     evseId: z.number().describe('OCPP EVSE ID within the station'),
     connectors: z.array(layoutConnector).describe('Connectors belonging to this EVSE'),
   })
-  .passthrough();
+  .loose();
+
+const layoutSessionDriver = z
+  .object({
+    id: z.string().describe('Driver id'),
+    name: z
+      .string()
+      .nullable()
+      .describe('First and last name of the driver, null when both are blank'),
+    avatar: avatarItem,
+  })
+  .loose();
+
+const layoutSessionVehicle = z
+  .object({
+    color: z
+      .enum(VEHICLE_COLORS)
+      .nullable()
+      .describe('Color group of the vehicle, null when not set'),
+    bodyType: z
+      .enum(VEHICLE_BODY_TYPES)
+      .nullable()
+      .describe('Body type of the vehicle, null when not set'),
+  })
+  .loose();
+
+const layoutSession = z
+  .object({
+    id: z.string().describe('Charging session id'),
+    startedAt: z
+      .string()
+      .describe(
+        'When the session started (ISO 8601; the creation time when the station sent none)',
+      ),
+    energyDeliveredWh: z.number().describe('Energy delivered so far in watt-hours'),
+    currentCostCents: z
+      .number()
+      .nullable()
+      .describe('Running cost in cents of the session currency, null when not priced yet'),
+    currency: z.string().describe('ISO 4217 currency of the session cost'),
+    driver: layoutSessionDriver
+      .nullable()
+      .describe(
+        'The driver of the session, null without drivers:read, for a session without a driver, or for an erased driver',
+      ),
+    vehicle: layoutSessionVehicle
+      .nullable()
+      .describe(
+        "The car the layout draws: the session's vehicle, else the driver's only vehicle, else the driver's most recently used vehicle; null when none (the layout draws a grey sedan). Color and body type only, shown without drivers:read",
+      ),
+  })
+  .loose();
+
+const layoutTimeWindow = z
+  .object({
+    startsAt: z
+      .string()
+      .nullable()
+      .describe('When it started, ISO 8601 (null: a reservation that holds from its creation)'),
+    endsAt: z.string().describe('When it ends, ISO 8601'),
+  })
+  .loose();
 
 const layoutStation = z
   .object({
@@ -822,15 +1040,229 @@ const layoutStation = z
       ),
     isOnline: z.boolean().describe('Whether the station is currently connected to the CSMS'),
     securityProfile: z.number().describe('OCPP security profile level (0-3)'),
-    positionX: z.number().describe('X coordinate on the site layout canvas'),
-    positionY: z.number().describe('Y coordinate on the site layout canvas'),
+    positionX: z
+      .number()
+      .describe(
+        'X coordinate on the site layout canvas in px. For a station with no saved position (placed false), the first free grid slot that overlaps no other station',
+      ),
+    positionY: z
+      .number()
+      .describe(
+        'Y coordinate on the site layout canvas in px. For a station with no saved position (placed false), the first free grid slot that overlaps no other station',
+      ),
+    placed: z
+      .boolean()
+      .describe(
+        'True when the position is saved for this site; false when it is a free slot the server picked, saved by the next layout save. On a custom site, false also while the free position is one the server picked',
+      ),
+    freePosition: freePlacementSchema
+      .nullable()
+      .describe(
+        'Custom site: where the station stands (meters and turn), the saved one or, with placed false, one the server picked right of the others (saved by the next layout save). Null on the other site types',
+      ),
+    chargingKind: z
+      .enum(['ac', 'dc'])
+      .describe(
+        'ac or dc from the connectors of in-service EVSEs: dc when any connector is CCS1, CCS2 or CHAdeMO, or GBT, Tesla or NACS above 22 kW',
+      ),
+    cellular: z
+      .boolean()
+      .describe(
+        "True when the station's effective data plan is cellular or it has a confirmed SIM attachment",
+      ),
+    connectionType: z
+      .enum(['cellular', 'wifi', 'wired', 'wifi_or_wired'])
+      .nullable()
+      .describe(
+        "How the station connects, from what the CSMS knows: cellular when the station's effective data plan is cellular or it has a confirmed SIM attachment, else wifi or wired from the active network interface an OCPP 2.0.1 or 2.1 station reported (NetworkConfiguration.OcppInterface of the slot in use: Wireless0 to Wireless3 as wifi, Wired0 to Wired3 as wired; read only with stations:read), else wifi_or_wired (the effective data plan, which does not tell the two apart). Null only when the plan could not be read",
+      ),
+    ocppVersion: z
+      .enum(['1.6', '2.0.1', '2.1'])
+      .nullable()
+      .describe(
+        "The station's OCPP version from its stored protocol (ocpp1.6, ocpp2.0.1, ocpp2.1), null when not known or when the request lacks stations:read",
+      ),
+    networkType: z
+      .string()
+      .nullable()
+      .describe(
+        "The radio access technology of a cellular station as its SIM provider reported it for the newest session of the station's confirmed SIM attachment (for example LTE or LTE-M), shown as reported. Null when not reported, for a station that is not cellular, while the SIM features are off, or when the request lacks stations:read",
+      ),
+    signal: z
+      .object({
+        bars: z
+          .number()
+          .int()
+          .min(0)
+          .max(4)
+          .describe(
+            'Signal bars from the RSSI: 4 above -70 dBm, 3 from -70 to -85, 2 from -86 to -100, 1 from -101 to -109, 0 at -110 dBm or below',
+          ),
+        dbm: z
+          .number()
+          .describe('The signal in dBm as the station reported it (ASU converted to dBm)'),
+      })
+      .loose()
+      .nullable()
+      .describe(
+        'The cellular signal the station last reported (OCPP 2.0.1 and 2.1 DataLink SignalStrength, stored by a station signal read or a device model report). Null when not known, for a station that is not cellular, while station signal reads are off, or when the request lacks stations:read',
+      ),
+    inMaintenance: z
+      .boolean()
+      .describe('Whether an active maintenance event currently covers this station'),
     displayMessage: z
       .string()
       .nullable()
-      .describe('Most recent accepted display message text shown on the station, if any'),
+      .describe(
+        'Text of the newest display message the station accepted that is active now (started, not ended), if any',
+      ),
     evses: z.array(layoutEvse).describe('EVSEs installed on this station'),
+    session: layoutSession
+      .nullable()
+      .describe(
+        'The newest active charging session of the station, null when none is active or the request lacks sessions:read',
+      ),
+    reservation: layoutTimeWindow
+      .nullable()
+      .describe(
+        'The reservation holding the station now (active or in use, or scheduled with its start passed; the earliest ending one). Null when none holds it or the request lacks reservations:read',
+      ),
+    maintenanceWindow: layoutTimeWindow
+      .nullable()
+      .describe(
+        'The active maintenance event covering the station now (the earliest ending one), null when none does',
+      ),
   })
-  .passthrough();
+  .loose();
+
+const replayQuery = z.object({
+  date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .describe(
+      `Calendar day (YYYY-MM-DD) in the site timezone: today or up to ${String(REPLAY_MAX_DAYS_BACK)} days back`,
+    ),
+});
+
+const replayConnector = z
+  .object({
+    evseId: z.number().describe('OCPP EVSE ID within the station'),
+    connectorId: z
+      .number()
+      .nullable()
+      .describe(
+        'OCPP connector ID within the EVSE, null for a status the station sent for the whole EVSE',
+      ),
+    initialStatus: z
+      .string()
+      .nullable()
+      .describe(
+        'Connector status at the start of the day (the last status before it), null when none was ever recorded',
+      ),
+    changes: z
+      .array(
+        z
+          .object({
+            at: z.string().describe('When the status changed (ISO 8601)'),
+            status: z.string().describe('New connector status'),
+          })
+          .loose(),
+      )
+      .describe(
+        `Status changes during the day, in time order (at most ${String(REPLAY_MAX_CHANGES)})`,
+      ),
+  })
+  .loose();
+
+const replayStation = z
+  .object({
+    id: z.string().describe('Internal station identifier, the id of GET /v1/sites/{id}/layout'),
+    initialOnline: z
+      .boolean()
+      .describe(
+        'Whether the station was connected at the start of the day: the last connected or disconnected event before it; none: the opposite of the first change of the day, else the current state',
+      ),
+    onlineChanges: z
+      .array(
+        z
+          .object({
+            at: z.string().describe('When the station connected or disconnected (ISO 8601)'),
+            online: z.boolean().describe('True for a connect, false for a disconnect'),
+          })
+          .loose(),
+      )
+      .describe(
+        `Connection changes during the day from the connection log (events connected and disconnected; repeats dropped; at most ${String(REPLAY_MAX_CHANGES)})`,
+      ),
+    connectors: z
+      .array(replayConnector)
+      .describe('Connector status timeline per EVSE and connector'),
+    sessions: z
+      .array(
+        z
+          .object({
+            startedAt: z.string().describe('When the session started (ISO 8601)'),
+            endedAt: z.string().nullable().describe('When the session ended, null while active'),
+            energyWh: z.number().describe('Energy delivered by the session in watt-hours'),
+            evseId: z
+              .number()
+              .nullable()
+              .describe('OCPP EVSE ID the session ran on, null when not known'),
+            id: z.string().nullable().describe('Charging session id, null without sessions:read'),
+            currency: z
+              .string()
+              .nullable()
+              .describe('ISO 4217 currency of the session, null without sessions:read'),
+            vehicle: layoutSessionVehicle
+              .nullable()
+              .describe(
+                "The car the layout draws, as on GET /v1/sites/{id}/layout: the session's vehicle, else the driver's only vehicle, else the driver's most recently used one; null without sessions:read or when none",
+              ),
+            driver: layoutSessionDriver
+              .nullable()
+              .describe(
+                'The driver of the session (name and avatar, as on GET /v1/sites/{id}/layout), null without sessions:read and drivers:read, for a session without a driver, or for an erased driver',
+              ),
+          })
+          .loose(),
+      )
+      .describe(
+        `Charging sessions of the station at this site (the session's own site) that overlap the day, by start (at most ${String(REPLAY_MAX_CHANGES)})`,
+      ),
+    power: z
+      .array(
+        z
+          .object({
+            at: z.string().describe('Start of the 5-minute bucket (ISO 8601)'),
+            kw: z
+              .number()
+              .describe(
+                'Average Power.Active.Import in kW over the bucket, summed over the EVSEs (a station-level reading counts when no EVSE reported)',
+              ),
+          })
+          .loose(),
+      )
+      .describe('Power draw in 5-minute buckets that have readings, in time order'),
+  })
+  .loose();
+
+const replayResponse = z
+  .object({
+    date: z.string().describe('The day replayed (YYYY-MM-DD)'),
+    timezone: z
+      .string()
+      .describe(
+        'IANA timezone the day is read in: the site timezone (UTC when the stored one is not a valid IANA name)',
+      ),
+    from: z.string().describe('Start of the day (ISO 8601)'),
+    to: z.string().describe('End of the day: the start of the next day, exclusive (ISO 8601)'),
+    stations: z
+      .array(replayStation)
+      .describe(
+        `Operator stations of the site, oldest first (at most ${String(REPLAY_MAX_STATIONS)})`,
+      ),
+  })
+  .loose();
 
 const sitesListQuery = paginationQuery.extend({
   city: z.string().optional().describe('Filter by city'),
@@ -849,14 +1281,14 @@ const locationOption = z
     city: z.string().describe('City name'),
     state: z.string().describe('State, province, or region'),
   })
-  .passthrough();
+  .loose();
 const filterOptionsResponse = z
   .object({
     locations: z
       .array(locationOption)
       .describe('Distinct city and state combinations across the user-accessible sites'),
   })
-  .passthrough();
+  .loose();
 
 export function siteRoutes(app: FastifyInstance): void {
   app.get(
@@ -1059,7 +1491,7 @@ export function siteRoutes(app: FastifyInstance): void {
       },
     },
     async (request, reply) => {
-      const { rows, updateExisting } = request.body as z.infer<typeof importSiteBody>;
+      const { rows, updateExisting } = parseZodRequest(importSiteBody, request.body);
       // Station rows create, move and disable stations: the station permission
       // applies as it does on the station routes.
       if (
@@ -1119,14 +1551,64 @@ export function siteRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
-      return row;
+      return { ...row, aiInsightsScope: await siteAiInsightsScopeStatus(row.id) };
+    },
+  );
+
+  const dataPlanImpactQuery = z.object({
+    dataPlan: z
+      .enum(DATA_PLANS)
+      .optional()
+      .describe('The site data plan to check; omitted means not set'),
+  });
+
+  app.get(
+    '/sites/:id/data-plan-impact',
+    {
+      onRequest: [authorize('sites:read')],
+      schema: {
+        tags: ['Sites'],
+        summary: 'Count the stations a site data plan change moves',
+        description:
+          "How many of the site's stations would run another data plan if the site's plan became dataPlan (omitted: not set). Stations with their own plan or a confirmed SIM keep theirs.",
+        operationId: 'getSiteDataPlanImpact',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(siteParams),
+        querystring: zodSchema(dataPlanImpactQuery),
+        response: {
+          200: itemResponse(
+            z
+              .object({
+                stationsChanging: z
+                  .number()
+                  .int()
+                  .describe('Stations whose effective data plan would change'),
+              })
+              .loose(),
+          ),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof siteParams>;
+      const { dataPlan } = request.query as z.infer<typeof dataPlanImpactQuery>;
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      const [site] = siteInScope(siteIds, id)
+        ? await db.select({ id: sites.id }).from(sites).where(eq(sites.id, id))
+        : [];
+      if (site == null) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+      return { stationsChanging: await siteDataPlanImpact(id, dataPlan ?? null) };
     },
   );
 
   const aiSuppressBody = z.object({
     reason: z.string().trim().min(1).max(500).describe('Why the AI insights are suppressed'),
-    until: z
-      .string()
+    until: z.iso
       .datetime({ offset: true })
       .optional()
       .describe('End of the suppression (ISO 8601, in the future); omitted for until resumed'),
@@ -1154,7 +1636,7 @@ export function siteRoutes(app: FastifyInstance): void {
           'Waiting insight actions of the site and its stations expired by the suppression',
         ),
     })
-    .passthrough();
+    .loose();
 
   // Per-site AI insight suppression (site-ai-insights.service.ts).
   app.post(
@@ -1165,7 +1647,7 @@ export function siteRoutes(app: FastifyInstance): void {
         tags: ['Sites'],
         summary: 'Suppress the AI insights of a site',
         description:
-          'Until `until` (or until resumed), every station of the site counts as suppressed (stations added later included: the insight scan and the AI workers create no station insight or action for them, as for a suppressed station), and the site gets no site-level insight (site incidents, site summaries, tariff findings). The open insights of the site and its stations close dismissed with the reason, and their waiting actions expire. The end date passing resumes the insights with no action. Audited in the site history. 400 VALIDATION_ERROR for an end date that is not in the future.',
+          'Until `until` (or until resumed), every station of the site counts as suppressed (stations added later included: the insight scan and the AI workers create no station insight or action for them, as for a suppressed station), and the site gets no site-level insight (site incidents, site summaries, tariff findings). The open insights of the site and its stations close dismissed with the reason, and their waiting actions expire. The end date passing resumes the insights with no action. Audited in the site history. 400 VALIDATION_ERROR for an end date that is not in the future; 409 AI_INSIGHTS_NOT_IN_SCOPE for a site outside the AI insights scope (not selected), which gets no insight to suppress.',
         operationId: 'suppressSiteAiInsights',
         security: [{ bearerAuth: [] }],
         params: zodSchema(siteParams),
@@ -1174,6 +1656,9 @@ export function siteRoutes(app: FastifyInstance): void {
           200: itemResponse(aiSuppressionResponse),
           400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
+          409: errorWith('Site outside the AI insights scope', [
+            ERROR_CODES.AI_INSIGHTS_NOT_IN_SCOPE,
+          ]),
         },
       },
       config: { invalidatesCacheTags: ['stations'] },
@@ -1191,6 +1676,16 @@ export function siteRoutes(app: FastifyInstance): void {
         await reply
           .status(400)
           .send({ error: 'The end date must be in the future', code: 'VALIDATION_ERROR' });
+        return;
+      }
+      // Suppression is offered only where insights run: a site outside the
+      // scope gets none to suppress.
+      const scope = await siteAiInsightsScopeStatus(id);
+      if (scope != null && isOutsideAiInsightScope(scope)) {
+        await reply.status(409).send({
+          error: ERROR_MESSAGES.AI_INSIGHTS_NOT_IN_SCOPE,
+          code: ERROR_CODES.AI_INSIGHTS_NOT_IN_SCOPE,
+        });
         return;
       }
       const result = await suppressSiteAiInsights(
@@ -1283,7 +1778,11 @@ export function siteRoutes(app: FastifyInstance): void {
       ) {
         return;
       }
-      const body = parseZodRequest(createSiteBody, request.body);
+      const { siteType, chargerPlacement, ...body } = parseZodRequest(createSiteBody, request.body);
+      // A charger placement belongs to a parking lot only (400 VALIDATION_ERROR).
+      if (chargerPlacement !== undefined && (siteType ?? 'parking_lot') !== 'parking_lot') {
+        throw new ValidationError('Charger placement is a parking lot setting');
+      }
 
       // Pre-check the unique name constraint (case-insensitive) so duplicate
       // names return a clean 409 instead of a Postgres unique-violation 500.
@@ -1301,7 +1800,30 @@ export function siteRoutes(app: FastifyInstance): void {
 
       let site: typeof sites.$inferSelect | undefined;
       try {
-        [site] = await db.insert(sites).values(body).returning();
+        // A site created while only selected sites are analyzed starts unselected.
+        const aiInsightsEnabled = await initialSiteAiInsightsSelected();
+        if (siteType === undefined && chargerPlacement === undefined) {
+          [site] = await db
+            .insert(sites)
+            .values({ ...body, aiInsightsEnabled })
+            .returning();
+        } else {
+          // The site type goes through the layout writer, like every layout
+          // setting, in the transaction of the insert.
+          site = await db.transaction(async (tx) => {
+            const [created] = await tx
+              .insert(sites)
+              .values({ ...body, aiInsightsEnabled })
+              .returning();
+            if (created == null) return created;
+            const change = await setSiteLayoutType(tx, created.id, siteType, {
+              chargerPlacement,
+            });
+            if (!change.changed) return created;
+            const [withType] = await tx.select().from(sites).where(eq(sites.id, created.id));
+            return withType ?? created;
+          });
+        }
       } catch (err) {
         // A concurrent create took the name after the check above.
         if (!isSiteNameUniqueViolation(err)) throw err;
@@ -1338,6 +1860,8 @@ export function siteRoutes(app: FastifyInstance): void {
       preValidation: [
         rejectUnknownBodyKeys(updateSiteBody, {
           freeVendEnabled: 'free vend is set with POST /v1/sites/:id/free-vend',
+          aiInsightsEnabled:
+            'the AI insights scope is set with PUT /v1/settings/ai/insights-scope (settings.system:write)',
         }),
       ],
       schema: {
@@ -1364,7 +1888,10 @@ export function siteRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
-      const body = parseZodRequest(updateSiteBody, request.body);
+      const { dataPlan, siteType, chargerPlacement, ...body } = parseZodRequest(
+        updateSiteBody,
+        request.body,
+      );
       // A restricted operator cannot change company-wide AI controls of its own site.
       if (ALL_SITE_FIELDS.some((field) => body[field] !== undefined) && siteIds !== null) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
@@ -1390,13 +1917,35 @@ export function siteRoutes(app: FastifyInstance): void {
       }
 
       let site: typeof sites.$inferSelect | undefined;
+      let typeChange: SiteTypeChange | null = null;
+      // The stored positions before a site type change moves stations.
+      const layoutChange = siteType !== undefined || chargerPlacement !== undefined;
+      const positionsBefore = layoutChange ? await readSiteLayoutPositions(id) : ([] as const);
       try {
-        [site] = await db
-          .update(sites)
-          .set({ ...body, updatedAt: new Date() })
-          .where(eq(sites.id, id))
-          .returning();
+        if (!layoutChange) {
+          [site] = await db
+            .update(sites)
+            .set({ ...body, updatedAt: new Date() })
+            .where(eq(sites.id, id))
+            .returning();
+        } else {
+          // The site type goes through the layout writer, like every layout
+          // setting, in the transaction of the update.
+          site = await db.transaction(async (tx) => {
+            const [updated] = await tx
+              .update(sites)
+              .set({ ...body, updatedAt: new Date() })
+              .where(eq(sites.id, id))
+              .returning();
+            if (updated == null) return updated;
+            typeChange = await setSiteLayoutType(tx, id, siteType, { chargerPlacement });
+            if (!typeChange.changed) return updated;
+            const [withType] = await tx.select().from(sites).where(eq(sites.id, id));
+            return withType ?? updated;
+          });
+        }
       } catch (err) {
+        if (err instanceof ChargerPlacementSiteTypeError) throw new ValidationError(err.message);
         // A concurrent write took the name after the check above.
         if (!isSiteNameUniqueViolation(err)) throw err;
         await reply
@@ -1409,19 +1958,49 @@ export function siteRoutes(app: FastifyInstance): void {
         return;
       }
       const actor = getAuditActor(request);
-      await writeAudit(
-        { table: siteAuditLog, idColumn: 'site_id' },
-        {
-          entityId: site.id,
-          entityIdSnapshot: site.id,
-          action: 'updated',
-          ...actor,
-          before: before ?? null,
-          after: site,
-        },
-        db,
-        request.log,
-      );
+      const change = typeChange as SiteTypeChange | null;
+      const typeChanged = change?.changed === true;
+      // A body with only a data plan is audited by the data plan service alone.
+      if (dataPlan === undefined || Object.keys(body).length > 0 || typeChanged) {
+        // A site type change carries the stations it moved, with their positions before.
+        const movedIds = new Set((change?.moved ?? []).map((m) => m.stationId));
+        const moved =
+          change != null && change.moved.length > 0
+            ? {
+                before: positionsBefore.filter((p) => movedIds.has(p.stationId)),
+                after: change.moved,
+              }
+            : null;
+        await writeAudit(
+          { table: siteAuditLog, idColumn: 'site_id' },
+          {
+            entityId: site.id,
+            entityIdSnapshot: site.id,
+            action: 'updated',
+            ...actor,
+            before:
+              before == null
+                ? null
+                : moved != null
+                  ? { ...before, layoutPositions: moved.before }
+                  : before,
+            after: moved != null ? { ...site, layoutPositions: moved.after } : site,
+            ...(change?.typeChanged === true
+              ? { notes: 'site type changed' }
+              : change?.placementChanged === true
+                ? { notes: 'charger placement changed' }
+                : {}),
+          },
+          db,
+          request.log,
+        );
+      }
+      // The data plan service writes the plan, audits it and pushes the new
+      // settings to the online stations whose plan changes.
+      if (dataPlan !== undefined) {
+        await changeSiteDataPlan(site.id, dataPlan, actor, { log: request.log });
+        site = { ...site, dataPlan };
+      }
       if (
         before != null &&
         body.stationMessageLanguage !== undefined &&
@@ -1762,34 +2341,39 @@ export function siteRoutes(app: FastifyInstance): void {
         | { disconnect_count: string; avg_downtime_minutes: string; max_downtime_minutes: string }
         | undefined;
 
-      return {
-        uptimePercent: Math.round(Number(uptimeRow?.uptime_percent ?? 100) * 100) / 100,
-        portCount: Number(uptimeRow?.port_count ?? 0),
-        utilizationPercent: utilization,
-        totalSessions: total,
-        completedSessions: completed,
-        faultedSessions: sessionStats?.faultedSessions ?? 0,
-        sessionSuccessPercent: total > 0 ? Math.round((completed / total) * 100) : 100,
-        totalEnergyWh: sessionStats?.totalEnergyWh ?? 0,
-        avgSessionDurationMinutes: Math.round(sessionStats?.avgDurationMinutes ?? 0),
-        disconnectCount: Number(disconnectRow?.disconnect_count ?? 0),
-        avgDowntimeMinutes: Math.round(Number(disconnectRow?.avg_downtime_minutes ?? 0)),
-        maxDowntimeMinutes: Math.round(Number(disconnectRow?.max_downtime_minutes ?? 0)),
-        totalRevenueCents: revenue.grossCents,
-        avgRevenueCentsPerSession:
-          revenue.sessionCount > 0
-            ? Math.round(revenue.sessionGrossCents / revenue.sessionCount)
-            : 0,
-        totalTransactions: revenue.itemCount,
-        totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
-        totalNetRevenueCents: revenue.netCents,
-        totalTaxCents: revenue.taxCents,
-        totalProfitCents: profitCents(revenue, financialStats?.totalElectricityCostCents ?? 0),
-        costMissingSessionCount: revenue.costMissingCount,
-        costMissingRevenueCents: revenue.costMissingGrossCents,
-        periodMonths: months,
-        currency,
-      };
+      // Revenue, tax, cost and profit need payments:read (null without it).
+      return maskMoneyFields(
+        {
+          uptimePercent: Math.round(Number(uptimeRow?.uptime_percent ?? 100) * 100) / 100,
+          portCount: Number(uptimeRow?.port_count ?? 0),
+          utilizationPercent: utilization,
+          totalSessions: total,
+          completedSessions: completed,
+          faultedSessions: sessionStats?.faultedSessions ?? 0,
+          sessionSuccessPercent: total > 0 ? Math.round((completed / total) * 100) : 100,
+          totalEnergyWh: sessionStats?.totalEnergyWh ?? 0,
+          avgSessionDurationMinutes: Math.round(sessionStats?.avgDurationMinutes ?? 0),
+          disconnectCount: Number(disconnectRow?.disconnect_count ?? 0),
+          avgDowntimeMinutes: Math.round(Number(disconnectRow?.avg_downtime_minutes ?? 0)),
+          maxDowntimeMinutes: Math.round(Number(disconnectRow?.max_downtime_minutes ?? 0)),
+          totalRevenueCents: revenue.grossCents,
+          avgRevenueCentsPerSession:
+            revenue.sessionCount > 0
+              ? Math.round(revenue.sessionGrossCents / revenue.sessionCount)
+              : 0,
+          totalTransactions: revenue.itemCount,
+          totalElectricityCostCents: financialStats?.totalElectricityCostCents ?? 0,
+          totalNetRevenueCents: revenue.netCents,
+          totalTaxCents: revenue.taxCents,
+          totalProfitCents: profitCents(revenue, financialStats?.totalElectricityCostCents ?? 0),
+          costMissingSessionCount: revenue.costMissingCount,
+          costMissingRevenueCents: revenue.costMissingGrossCents,
+          periodMonths: months,
+          currency,
+        },
+        METRICS_MONEY_FIELDS,
+        await canReadMoney(request),
+      );
     },
   );
 
@@ -1981,6 +2565,8 @@ export function siteRoutes(app: FastifyInstance): void {
         where,
       });
 
+      // Revenue needs payments:read (null without it); the counts stay.
+      const moneyVisible = await canReadMoney(request);
       return zeroFillDays(
         enumerateLocalDays(since, until, tz),
         [...byDay]
@@ -1991,7 +2577,7 @@ export function siteRoutes(app: FastifyInstance): void {
             sessionCount: revenue.sessionCount,
           })),
         (date) => ({ date, revenueCents: 0, sessionCount: 0 }),
-      );
+      ).map((day) => maskMoneyFields(day, REVENUE_HISTORY_MONEY_FIELDS, moneyVisible));
     },
   );
 
@@ -2013,7 +2599,7 @@ export function siteRoutes(app: FastifyInstance): void {
         .number()
         .describe('Average number of sessions started in this day-of-week and hour bucket'),
     })
-    .passthrough();
+    .loose();
 
   app.get(
     '/sites/:id/popular-times',
@@ -2324,16 +2910,100 @@ export function siteRoutes(app: FastifyInstance): void {
           statusReason: buildStatusReasonSubquery(chargingStations.id),
           isOnline: chargingStations.isOnline,
           securityProfile: chargingStations.securityProfile,
+          ocppProtocol: chargingStations.ocppProtocol,
           positionX: stationLayoutPositions.positionX,
           positionY: stationLayoutPositions.positionY,
+          freeXM: stationLayoutPositions.freeXM,
+          freeZM: stationLayoutPositions.freeZM,
+          freeRotationDeg: stationLayoutPositions.freeRotationDeg,
+          inMaintenance: buildUnderMaintenanceSubquery(
+            chargingStations.id,
+            chargingStations.siteId,
+          ),
         })
         .from(chargingStations)
-        .leftJoin(stationLayoutPositions, eq(stationLayoutPositions.stationId, chargingStations.id))
-        .where(and(eq(chargingStations.siteId, id), isOperatorStation()));
+        // A position row counts only for the station's current site.
+        .leftJoin(
+          stationLayoutPositions,
+          and(
+            eq(stationLayoutPositions.stationId, chargingStations.id),
+            eq(stationLayoutPositions.siteId, chargingStations.siteId),
+          ),
+        )
+        .where(and(eq(chargingStations.siteId, id), isOperatorStation()))
+        .orderBy(chargingStations.createdAt, chargingStations.id);
 
       if (stationRows.length === 0) return [];
 
       const stationUuids = stationRows.map((s) => s.id);
+
+      // Stations without a saved position get free grid slots, in order, so
+      // none shows on top of another until the layout is saved.
+      const unplaced = stationRows.filter((s) => s.positionX == null || s.positionY == null);
+      // The station kinds: the counts by depot kind (a depot's default bus bays
+      // and truck lanes), and the group a station without a position joins (AC
+      // or DC; a depot's AC station stands below the layout), never inside the
+      // other kind's range.
+      const layoutKinds = await readStationLayoutKinds(stationUuids);
+      const layoutSettings = await readSiteLayoutSettings(
+        id,
+        db,
+        layoutStationCountsOfKinds(stationUuids.map((s) => layoutKinds.get(s))),
+      );
+      const placedPoints = stationRows
+        .filter((s) => s.positionX != null && s.positionY != null)
+        .map((s) => ({
+          x: Number(s.positionX),
+          y: Number(s.positionY),
+          charging: layoutKinds.get(s.id)?.charging ?? null,
+          pair: sharesSpotPair(layoutKinds.get(s.id), layoutSettings),
+          span: splitDispenserCount(layoutKinds.get(s.id), layoutSettings),
+        }));
+      const freeSlots = freeSlotsFor(
+        unplaced.map((s) => layoutKinds.get(s.id)),
+        placedPoints,
+        layoutSettings,
+      );
+      const slotByStation = new Map<string, { x: number; y: number }>();
+      unplaced.forEach((s, i) => {
+        const slot = freeSlots[i];
+        if (slot != null) slotByStation.set(s.id, slot);
+      });
+      const dataPlans = await readStationDataPlans(stationUuids);
+      // The session needs sessions:read and its driver drivers:read too (API
+      // key scopes count); the response cache keys by user and scope.
+      const canReadSessions = await requestHasPermission(request, 'sessions:read');
+      const canReadDrivers =
+        canReadSessions && (await requestHasPermission(request, 'drivers:read'));
+      const layoutSessions = canReadSessions
+        ? await readLayoutStationSessions(stationUuids, canReadDrivers)
+        : new Map<string, LayoutStationSession>();
+      const isCellular = (stationId: string): boolean => {
+        const plan = dataPlans.get(stationId);
+        return plan != null && (plan.plan === 'cellular' || plan.hasConfirmedSim);
+      };
+      // The reported signal and network type need stations:read, as the
+      // station SIM status; wired stations show none.
+      const canReadStations = await requestHasPermission(request, 'stations:read');
+      const stationLinks = canReadStations
+        ? await readLayoutStationLinks(stationUuids.filter(isCellular), request.log)
+        : new Map<string, LayoutStationLink>();
+      // Wi-Fi or wired from the reported active network interface (stations:read,
+      // as the station configuration); without a report, Wi-Fi or Wired.
+      const wiredLinks = canReadStations
+        ? await readLayoutWiredLinks(
+            stationUuids.filter((sid) => dataPlans.get(sid) != null && !isCellular(sid)),
+            request.log,
+          )
+        : new Map<string, LayoutWiredLink>();
+      // The virtual Reserved and Maintenance signs and their hover times.
+      const canReadReservations = await requestHasPermission(request, 'reservations:read');
+      const [reservationWindows, maintenanceWindows] = await Promise.all([
+        canReadReservations
+          ? readLayoutReservations(stationUuids)
+          : Promise.resolve(new Map<string, LayoutTimeWindow>()),
+        readLayoutMaintenanceWindows(id, stationUuids),
+      ]);
 
       const [evseRows, connectorRows, sessionRows, displayMessageRows] = await Promise.all([
         db
@@ -2380,6 +3050,12 @@ export function siteRoutes(app: FastifyInstance): void {
             and(
               inArray(displayMessages.stationId, stationUuids),
               eq(displayMessages.status, 'accepted'),
+              // Active now: started and not ended.
+              or(
+                isNull(displayMessages.startDateTime),
+                lte(displayMessages.startDateTime, sql`now()`),
+              ),
+              or(isNull(displayMessages.endDateTime), gt(displayMessages.endDateTime, sql`now()`)),
             ),
           )
           .orderBy(desc(displayMessages.createdAt)),
@@ -2408,6 +3084,32 @@ export function siteRoutes(app: FastifyInstance): void {
         }
       }
 
+      // A custom site: every station stands at a free position; one without a
+      // saved position gets one right of the others, in order (spots from its EVSEs).
+      const freeByStation = new Map<string, { placement: FreePlacement; picked: boolean }>();
+      if (usesFreePositions(layoutSettings)) {
+        const spotsOf = (stationId: string): number =>
+          freeSpotCount((evsesByStation.get(stationId) ?? []).length);
+        const known: Array<{ placement: FreePlacement; spots: number }> = [];
+        for (const station of stationRows) {
+          if (station.freeXM == null || station.freeZM == null || station.freeRotationDeg == null)
+            continue;
+          const placement: FreePlacement = {
+            x: Number(station.freeXM),
+            z: Number(station.freeZM),
+            rotationDeg: Number(station.freeRotationDeg),
+          };
+          freeByStation.set(station.id, { placement, picked: false });
+          known.push({ placement, spots: spotsOf(station.id) });
+        }
+        for (const station of stationRows) {
+          if (freeByStation.has(station.id)) continue;
+          const placement = firstFreePlacement(known, spotsOf(station.id));
+          freeByStation.set(station.id, { placement, picked: true });
+          known.push({ placement, spots: spotsOf(station.id) });
+        }
+      }
+
       // First accepted message per station (ordered by createdAt desc)
       const displayMessageByStation = new Map<string, string>();
       for (const msg of displayMessageRows) {
@@ -2418,6 +3120,7 @@ export function siteRoutes(app: FastifyInstance): void {
 
       return stationRows.map((station) => {
         const stationEvses = evsesByStation.get(station.id) ?? [];
+        const dataPlan = dataPlans.get(station.id);
         return {
           id: station.id,
           stationId: station.stationId,
@@ -2426,9 +3129,28 @@ export function siteRoutes(app: FastifyInstance): void {
           statusReason: station.statusReason,
           isOnline: station.isOnline,
           securityProfile: station.securityProfile,
-          positionX: Number(station.positionX ?? '0'),
-          positionY: Number(station.positionY ?? '0'),
+          positionX: slotByStation.get(station.id)?.x ?? Number(station.positionX ?? '0'),
+          positionY: slotByStation.get(station.id)?.y ?? Number(station.positionY ?? '0'),
+          placed: !slotByStation.has(station.id) && freeByStation.get(station.id)?.picked !== true,
+          freePosition: freeByStation.get(station.id)?.placement ?? null,
+          chargingKind: dataPlan?.chargingKind ?? 'ac',
+          cellular: isCellular(station.id),
+          connectionType:
+            dataPlan == null
+              ? null
+              : isCellular(station.id)
+                ? 'cellular'
+                : (wiredLinks.get(station.id) ?? 'wifi_or_wired'),
+          ocppVersion: canReadStations ? layoutOcppVersion(station.ocppProtocol) : null,
+          networkType: stationLinks.get(station.id)?.networkType ?? null,
+          signal: stationLinks.get(station.id)?.signal ?? null,
+          inMaintenance: station.inMaintenance,
           displayMessage: displayMessageByStation.get(station.id) ?? null,
+          session: layoutSessions.get(station.id) ?? null,
+          reservation: reservationWindows.get(station.id) ?? null,
+          maintenanceWindow: station.inMaintenance
+            ? (maintenanceWindows.get(station.id) ?? null)
+            : null,
           evses: stationEvses.map((evse) => {
             const evseConnectors = connectorsByEvse.get(evse.id) ?? [];
             return {
@@ -2452,14 +3174,95 @@ export function siteRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.get(
+    '/sites/:id/layout/replay',
+    {
+      onRequest: [authorize('sites:read')],
+      schema: {
+        tags: ['Sites'],
+        summary: 'Replay one day of the site layout',
+        description: `What each operator station of the site did during one calendar day in the site timezone: connection changes, connector statuses, sessions (with the EVSE they ran on; the car with sessions:read and the driver with drivers:read too, as on GET /v1/sites/{id}/layout) and the power draw in 5-minute buckets. 400 VALIDATION_ERROR for a day in the future or more than ${String(REPLAY_MAX_DAYS_BACK)} days back.`,
+        operationId: 'getSiteLayoutReplay',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(siteParams),
+        querystring: zodSchema(replayQuery),
+        response: {
+          200: itemResponse(replayResponse),
+          400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as z.infer<typeof siteParams>;
+      const { date } = request.query as z.infer<typeof replayQuery>;
+      const { userId } = request.user as JwtPayload;
+      const siteIds = await getUserSiteIds(userId);
+      if (!siteInScope(siteIds, id)) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+      const [site] = await db
+        .select({ id: sites.id, timezone: sites.timezone })
+        .from(sites)
+        .where(eq(sites.id, id));
+      if (site == null) {
+        await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+      const timezone = isValidTimezone(site.timezone) ? site.timezone : 'UTC';
+      const day = replayDayBounds(date, timezone);
+      if (typeof day === 'string') {
+        const message =
+          day === 'future'
+            ? 'The day is in the future'
+            : day === 'too_old'
+              ? `The day is more than ${String(REPLAY_MAX_DAYS_BACK)} days back`
+              : 'Invalid date';
+        await reply.status(400).send({ error: message, code: 'VALIDATION_ERROR' });
+        return;
+      }
+      // The live layout's session rule: the car with sessions:read, the driver
+      // with drivers:read too (API key scopes count); the response cache keys by
+      // user and scope.
+      const canReadSessions = await requestHasPermission(request, 'sessions:read');
+      const canReadDrivers =
+        canReadSessions && (await requestHasPermission(request, 'drivers:read'));
+      return {
+        date,
+        timezone,
+        from: day.from.toISOString(),
+        to: day.to.toISOString(),
+        stations: await readSiteLayoutReplay(id, day, {
+          sessions: canReadSessions,
+          drivers: canReadDrivers,
+        }),
+      };
+    },
+  );
+
   const layoutBody = z.object({
-    positions: z.array(
-      z.object({
-        stationId: ID_PARAMS.stationId.describe('Station ID'),
-        positionX: z.number(),
-        positionY: z.number(),
-      }),
-    ),
+    positions: z
+      .array(
+        z.object({
+          stationId: ID_PARAMS.stationId.describe('Station ID'),
+          positionX: z.number().describe('X coordinate on the layout board in px'),
+          positionY: z.number().describe('Y coordinate on the layout board in px'),
+          freePosition: freePlacementSchema
+            .nullable()
+            .optional()
+            .describe(
+              'Custom site: where the station stands (meters and turn). Omitted keeps the saved one; null clears it (the station then gets one right of the others). Spots that overlap another station answer 400 VALIDATION_ERROR naming the stations (details.stations)',
+            ),
+        }),
+      )
+      .describe('Station positions to save'),
+    settings: siteLayoutSettingsSchema
+      .nullable()
+      .optional()
+      .describe(
+        'New layout settings of the site (the site type and the fields of every type); null resets them to the default, omitted keeps them. A station outside the layout moves to the nearest free spot, a transformer or battery on the lot moves to the grass beside it; when the layout has no free spot left for a station, the save answers 400 VALIDATION_ERROR naming those stations (details.stations) and changes nothing',
+      ),
   });
 
   app.put(
@@ -2478,8 +3281,26 @@ export function siteRoutes(app: FastifyInstance): void {
             z
               .object({
                 ok: z.boolean().describe('True when the layout positions were saved successfully'),
+                moved: z
+                  .array(
+                    z.object({
+                      stationId: z.string().describe('Station ID'),
+                      positionX: z.number().describe('New X coordinate in px'),
+                      positionY: z.number().describe('New Y coordinate in px'),
+                      freePosition: freePlacementSchema
+                        .nullable()
+                        .describe('Custom site: the free position the save gave the station'),
+                    }),
+                  )
+                  .describe(
+                    'Stations the lot moved to a free spot inside it, or (custom site) that got a free position',
+                  ),
               })
-              .passthrough(),
+              .loose(),
+          ),
+          400: errorWith(
+            'Invalid settings, the lot has no free spot for every station, or the parking spots of stations on a custom site overlap',
+            [ERROR_CODES.VALIDATION_ERROR],
           ),
           404: errorWith('Site or station not found', [
             ERROR_CODES.SITE_NOT_FOUND,
@@ -2496,7 +3317,21 @@ export function siteRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
         return;
       }
-      const { positions } = request.body as z.infer<typeof layoutBody>;
+      const { positions: bodyPositions } = request.body as z.infer<typeof layoutBody>;
+      // undefined keeps a saved free position, null clears it.
+      const positions = bodyPositions.map((p) => ({
+        stationId: p.stationId,
+        positionX: p.positionX,
+        positionY: p.positionY,
+        ...(p.freePosition !== undefined ? { free: p.freePosition } : {}),
+      }));
+      // Ajv checks the ranges; the Zod schema also checks the 10 cm steps and
+      // the unique transformer ids.
+      const rawSettings = (request.body as { settings?: unknown }).settings;
+      const settings =
+        rawSettings === undefined
+          ? undefined
+          : parseZodRequest(siteLayoutSettingsSchema.nullable(), rawSettings);
 
       const [site] = await db.select({ id: sites.id }).from(sites).where(eq(sites.id, id));
       if (site == null) {
@@ -2508,7 +3343,6 @@ export function siteRoutes(app: FastifyInstance): void {
       // the station, so a foreign station would otherwise get a layout row
       // pointing at this site.
       const requested = [...new Set(positions.map((p) => p.stationId))];
-      let previousPositions: { stationId: string; positionX: number; positionY: number }[] = [];
       if (requested.length > 0) {
         const own = await db
           .select({ id: chargingStations.id })
@@ -2518,46 +3352,74 @@ export function siteRoutes(app: FastifyInstance): void {
           await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
           return;
         }
-        const previousRows = await db
-          .select({
-            stationId: stationLayoutPositions.stationId,
-            positionX: stationLayoutPositions.positionX,
-            positionY: stationLayoutPositions.positionY,
-          })
-          .from(stationLayoutPositions)
-          .where(inArray(stationLayoutPositions.stationId, requested));
-        previousPositions = previousRows.map((row) => ({
-          stationId: row.stationId,
-          positionX: Number(row.positionX),
-          positionY: Number(row.positionY),
-        }));
       }
+      const previousRows = await db
+        .select({
+          stationId: stationLayoutPositions.stationId,
+          positionX: stationLayoutPositions.positionX,
+          positionY: stationLayoutPositions.positionY,
+          freeXM: stationLayoutPositions.freeXM,
+          freeZM: stationLayoutPositions.freeZM,
+          freeRotationDeg: stationLayoutPositions.freeRotationDeg,
+        })
+        .from(stationLayoutPositions)
+        .where(
+          requested.length > 0
+            ? or(
+                eq(stationLayoutPositions.siteId, id),
+                inArray(stationLayoutPositions.stationId, requested),
+              )
+            : eq(stationLayoutPositions.siteId, id),
+        );
 
       // One position row per station: a station that moved here from another
       // site takes this site with its new position, and the layout saves whole.
-      await db.transaction(async (tx) => {
-        for (const pos of positions) {
-          await tx
-            .insert(stationLayoutPositions)
-            .values({
-              siteId: id,
-              stationId: pos.stationId,
-              positionX: String(pos.positionX),
-              positionY: String(pos.positionY),
-            })
-            .onConflictDoUpdate({
-              target: stationLayoutPositions.stationId,
-              set: {
-                siteId: id,
-                positionX: String(pos.positionX),
-                positionY: String(pos.positionY),
-                updatedAt: new Date(),
-              },
-            });
+      // The lot moves stations outside it to free spots inside.
+      let saved: Awaited<ReturnType<typeof saveSiteLayout>>;
+      try {
+        saved = await db.transaction(async (tx) => saveSiteLayout(tx, id, positions, settings));
+      } catch (err) {
+        if (err instanceof LayoutGridTooSmallError) {
+          await reply.status(400).send({
+            error: `The parking lot has no free spot for these stations: ${err.stations.join(', ')}`,
+            code: 'VALIDATION_ERROR',
+            details: { stations: err.stations },
+          });
+          return;
         }
-      });
+        if (err instanceof LayoutSpotsOverlapError) {
+          await reply.status(400).send({
+            error: `The parking spots of these stations overlap another station: ${err.stations.join(', ')}`,
+            code: 'VALIDATION_ERROR',
+            details: { stations: err.stations },
+          });
+          return;
+        }
+        throw err;
+      }
 
-      if (positions.length > 0) {
+      const after = new Map<string, (typeof saved.moved)[number]>(
+        positions.map((p) => [p.stationId, p]),
+      );
+      for (const m of saved.moved) after.set(m.stationId, { ...after.get(m.stationId), ...m });
+      const settingsChanged = saved.settingsChanged;
+      if (after.size > 0 || settingsChanged) {
+        const previousPositions = previousRows
+          .filter((row) => after.has(row.stationId))
+          .map((row) => ({
+            stationId: row.stationId,
+            positionX: Number(row.positionX),
+            positionY: Number(row.positionY),
+            ...(row.freeXM != null && row.freeZM != null && row.freeRotationDeg != null
+              ? {
+                  free: {
+                    x: Number(row.freeXM),
+                    z: Number(row.freeZM),
+                    rotationDeg: Number(row.freeRotationDeg),
+                  },
+                }
+              : {}),
+          }));
         await writeAudit(
           { table: siteAuditLog, idColumn: 'site_id' },
           {
@@ -2565,16 +3427,32 @@ export function siteRoutes(app: FastifyInstance): void {
             entityIdSnapshot: id,
             action: 'updated',
             ...getAuditActor(request),
-            before: { layoutPositions: previousPositions },
-            after: { layoutPositions: positions },
-            notes: 'station layout updated',
+            before: {
+              layoutPositions: previousPositions,
+              ...(settingsChanged ? { layoutSettings: saved.settingsBefore } : {}),
+            },
+            after: {
+              layoutPositions: [...after.values()],
+              ...(settingsChanged ? { layoutSettings: saved.settingsAfter } : {}),
+            },
+            notes: settingsChanged
+              ? 'station layout and layout settings updated'
+              : 'station layout updated',
           },
           db,
           request.log,
         );
       }
 
-      return { ok: true };
+      return {
+        ok: true,
+        moved: saved.moved.map((m) => ({
+          stationId: m.stationId,
+          positionX: m.positionX,
+          positionY: m.positionY,
+          freePosition: m.free ?? null,
+        })),
+      };
     },
   );
 
@@ -2795,23 +3673,27 @@ export function siteRoutes(app: FastifyInstance): void {
           'Identifier of the OCPP 1.6 config push (free vend on, or the authorization restore when off) for stations at the site, empty when no online station got one',
         ),
     })
-    .passthrough();
+    .loose();
 
   app.post(
     '/sites/:id/free-vend',
     {
-      onRequest: [authorize('sites:write')],
+      // Free vend stops payment at the site: payments:write too.
+      onRequest: [authorize('sites:write', 'payments:write')],
       schema: {
         tags: ['Sites'],
         summary: 'Toggle free vend mode for a site',
         description:
-          'On: creates the free vend config templates when missing and pushes them to the online stations of the site. When the site was off, the values the stations report then (2.1 TxCtrlr.TxStartPoint, 1.6 LocalPreAuthorize and LocalAuthorizeOffline) are kept in the restore templates. Off: pushes the restore templates, which turn authorization back on (2.1 AuthCtrlr.Enabled true, 1.6 AllowOfflineTxForUnknownId false). A value no station reported restores to PowerPathClosed (2.1), LocalPreAuthorize false and LocalAuthorizeOffline true (1.6). pushId21 and pushId16 name the config pushes.',
+          'Needs sites:write and payments:write. A site-restricted user cannot turn it on at a site with a platform fee (403). On: creates the free vend config templates when missing and pushes them to the online stations of the site. When the site was off, the values the stations report then (2.1 TxCtrlr.TxStartPoint, 1.6 LocalPreAuthorize and LocalAuthorizeOffline) are kept in the restore templates. Off: pushes the restore templates, which turn authorization back on (2.1 AuthCtrlr.Enabled true, 1.6 AllowOfflineTxForUnknownId false). A value no station reported restores to PowerPathClosed (2.1), LocalPreAuthorize false and LocalAuthorizeOffline true (1.6). pushId21 and pushId16 name the config pushes.',
         operationId: 'toggleSiteFreeVend',
         security: [{ bearerAuth: [] }],
         params: zodSchema(siteParams),
         body: zodSchema(freeVendBody),
         response: {
           200: itemResponse(freeVendResponse),
+          403: errorWith('Free vend at a site with a platform fee needs access to every site', [
+            ERROR_CODES.INSUFFICIENT_PERMISSIONS,
+          ]),
           404: errorWith('Site not found', [ERROR_CODES.SITE_NOT_FOUND]),
         },
       },
@@ -2830,6 +3712,18 @@ export function siteRoutes(app: FastifyInstance): void {
       const [site] = await db.select().from(sites).where(eq(sites.id, id));
       if (site == null) {
         await reply.status(404).send({ error: 'Site not found', code: 'SITE_NOT_FOUND' });
+        return;
+      }
+
+      // Free vend zeroes the platform fee of the site's charges, which only a
+      // user with access to every site changes: a site-restricted
+      // user cannot turn it on while the site has a platform fee.
+      if (enabled && siteIds != null && (await getPlatformFeePercent(id)) > 0) {
+        await reply.status(403).send({
+          error:
+            'Only a user with access to every site turns on free vend at a site with a platform fee',
+          code: 'INSUFFICIENT_PERMISSIONS',
+        });
         return;
       }
 
@@ -2862,7 +3756,7 @@ export function siteRoutes(app: FastifyInstance): void {
           'Carbon intensity for this region in kilograms of CO2 per kilowatt-hour, as string for precision',
         ),
     })
-    .passthrough();
+    .loose();
 
   const carbonRegionBody = z.object({
     regionCode: z.string().nullable().describe('Carbon intensity region code, or null to clear'),
@@ -2993,7 +3887,7 @@ export function siteRoutes(app: FastifyInstance): void {
       name: z.string().describe('Rate period name'),
       ratePerKwh: z.number().describe('Wholesale electricity rate per kWh in the company currency'),
       restrictions: z
-        .record(z.unknown())
+        .record(z.string(), z.unknown())
         .nullable()
         .describe(
           'When the period applies (timeRange/daysOfWeek/dateRange), or null for the default flat rate',
@@ -3001,7 +3895,7 @@ export function siteRoutes(app: FastifyInstance): void {
       priority: z.number().int().describe('Resolution priority derived from the restriction shape'),
       isDefault: z.boolean().describe('True for the flat-rate fallback period'),
     })
-    .passthrough();
+    .loose();
 
   const electricityRateBody = z.object({
     name: z.string().min(1).max(100).describe('Rate period name'),
@@ -3321,7 +4215,7 @@ export function siteRoutes(app: FastifyInstance): void {
           'Billed sessions at the site still without an electricity cost: send the request again while it is above 0 and updated was above 0 (one request writes at most 5000 costs); sessions whose end time matches no rate period stay',
         ),
     })
-    .passthrough();
+    .loose();
 
   app.post(
     '/sites/:id/electricity-cost/recalculate',

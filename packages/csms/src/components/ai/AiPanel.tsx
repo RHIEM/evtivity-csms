@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { History, Plus, Send, Sparkles, Square, Upload, X } from 'lucide-react';
 import type { AiStreamEvent } from '@evtivity/lib/ai-stream';
+import { useStorageGuard } from '@/components/StorageUnavailableDialog';
 import { Button } from '@/components/ui/button';
 import { useEscapeLayer } from '@/components/ui/escape-layer';
 import { Spinner } from '@/components/ui/spinner';
@@ -36,6 +37,7 @@ import { ExplainContextCard } from './ExplainContextCard';
 import { AiUsageFooter } from './usage/AiUsageFooter';
 import { AiUsageNotices } from './usage/AiUsageNotices';
 import { AI_MY_USAGE_KEY } from './usage/usage-api';
+import { Textarea } from '@/components/ui/textarea';
 
 const conversationPath = (id: string): string =>
   `/v1/assistant/conversations/${encodeURIComponent(id)}`;
@@ -67,6 +69,7 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const canWrite = useHasPermission('aiAssistant:write');
+  const storage = useStorageGuard();
   const { run, stop, streaming } = useAiStream();
 
   const [view, setView] = useState<'chat' | 'history'>('chat');
@@ -198,6 +201,7 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
       );
     } catch (err) {
       console.warn('Upload an AI attachment failed', err);
+      storage.handleUploadError(err);
       setAttachments((prev) =>
         prev.map((a) =>
           a.localId === att.localId
@@ -306,6 +310,10 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
 
   function addFiles(files: File[]): void {
     if (files.length === 0 || !canWrite) return;
+    if (!storage.storageEnabled) {
+      storage.showDialog();
+      return;
+    }
     const next = addPendingFiles(attachments, files);
     setAttachments(next);
     for (const att of next.slice(attachments.length)) {
@@ -507,8 +515,8 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
                 onRemove={removeAttachment}
               />
               <div className="flex items-end gap-1">
-                <AttachmentPickerButton disabled={busy} onFiles={addFiles} />
-                <textarea
+                <AttachmentPickerButton disabled={busy} onFiles={addFiles} guard={storage.guard} />
+                <Textarea
                   ref={textareaRef}
                   value={input}
                   rows={1}
@@ -524,7 +532,7 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
                       addFiles(files);
                     }
                   }}
-                  className="max-h-40 min-h-10 flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                  className="max-h-40 min-h-10 flex-1 resize-none"
                 />
                 {streaming ? (
                   <Button
@@ -573,6 +581,7 @@ export function AiPanel({ onClose }: AiPanelProps): React.JSX.Element {
           )}
         </>
       )}
+      {storage.dialog}
     </div>
   );
 }

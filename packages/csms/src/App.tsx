@@ -29,6 +29,17 @@ const SiteDetail = lazy(() =>
   import('@/pages/SiteDetail').then((m) => ({ default: m.SiteDetail })),
 );
 const Stations = lazy(() => import('@/pages/Stations').then((m) => ({ default: m.Stations })));
+const Sims = lazy(() => import('@/pages/Sims').then((m) => ({ default: m.Sims })));
+const PaymentTerminals = lazy(() =>
+  import('@/pages/PaymentTerminals').then((m) => ({ default: m.PaymentTerminals })),
+);
+const PaymentTerminalNew = lazy(() =>
+  import('@/pages/PaymentTerminalNew').then((m) => ({ default: m.PaymentTerminalNew })),
+);
+const PaymentTerminalDetail = lazy(() =>
+  import('@/pages/PaymentTerminalDetail').then((m) => ({ default: m.PaymentTerminalDetail })),
+);
+const SimDetail = lazy(() => import('@/pages/SimDetail').then((m) => ({ default: m.SimDetail })));
 const StationCreate = lazy(() =>
   import('@/pages/StationCreate').then((m) => ({ default: m.StationCreate })),
 );
@@ -321,6 +332,46 @@ export function App(): React.JSX.Element {
                   <Route path="stations/new" element={<StationCreate />} />
                   <Route path="stations/:id" element={<StationDetail />} />
                   <Route path="stations/:id/pricing/add" element={<StationAssignPricing />} />
+                  <Route
+                    path="sims"
+                    element={
+                      <AdminRoute requiredPermission="sims:read">
+                        <Sims />
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="sims/:id"
+                    element={
+                      <AdminRoute requiredPermission="sims:read">
+                        <SimDetail />
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="payment-terminals"
+                    element={
+                      <AdminRoute requiredPermission="paymentTerminals:read">
+                        <PaymentTerminals />
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="payment-terminals/new"
+                    element={
+                      <AdminRoute requiredPermission="paymentTerminals:write">
+                        <PaymentTerminalNew />
+                      </AdminRoute>
+                    }
+                  />
+                  <Route
+                    path="payment-terminals/:id"
+                    element={
+                      <AdminRoute requiredPermission="paymentTerminals:read">
+                        <PaymentTerminalDetail />
+                      </AdminRoute>
+                    }
+                  />
                   <Route path="sessions" element={<Sessions />} />
                   <Route path="sessions/:id" element={<SessionDetail />} />
                   <Route path="invoices/:id" element={<InvoiceDetail />} />

@@ -88,6 +88,8 @@ const SETTINGS = {
   'ai.mcp.allowedOrigins': [],
   'ai.anthropic.apiKeyEnc': 'k',
 };
+/** System-initiated AI on: the insight and worker fields take effect. */
+const ON_SETTINGS = { ...SETTINGS, 'opsAi.enabled': true };
 
 beforeEach(() => {
   perms.clear();
@@ -109,6 +111,23 @@ describe('Settings > AI roadmap panels', () => {
     fireEvent.click(within(ops).getByRole('switch'));
     await waitFor(() => {
       expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/opsAi.enabled', { value: true });
+    });
+  });
+
+  it('asks before turning system-initiated AI off and says what stops', async () => {
+    wrap(<AiOpsSettings settings={ON_SETTINGS} canWrite aiDefaults={undefined} />);
+    const ops = screen.getByTestId('ai-ops-settings');
+    const toggle = within(ops).getAllByRole('switch')[0] as HTMLElement;
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    fireEvent.click(toggle);
+    expect(screen.getByText('settings.aiSurface.ops.offConfirm')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'common.toggleOff.cancel' }));
+    expect(apiMock.put).not.toHaveBeenCalled();
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'common.toggleOff.confirm' }));
+    await waitFor(() => {
+      expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/opsAi.enabled', { value: false });
     });
   });
 
@@ -138,11 +157,14 @@ describe('Settings > AI roadmap panels', () => {
   });
 
   it('TC-UI-LY-10 the reservation insights switch saves aiInsights.reservation.enabled', async () => {
-    wrap(<AiOpsSettings settings={SETTINGS} canWrite aiDefaults={undefined} />);
+    wrap(<AiOpsSettings settings={ON_SETTINGS} canWrite aiDefaults={undefined} />);
     const panel = screen.getByTestId('ai-insights-settings');
     const toggle = await within(panel).findByLabelText('settings.aiInsightsSettings.reservation');
     expect(toggle.getAttribute('aria-checked')).toBe('true');
     fireEvent.click(toggle);
+    // Turning it off asks first and says what stops.
+    expect(screen.getByText('settings.aiInsightsSettings.kindOff')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'common.toggleOff.confirm' }));
     fireEvent.click(within(panel).getByRole('button', { name: /save/i }));
     await waitFor(() => {
       expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/aiInsights.reservation.enabled', {
@@ -156,7 +178,7 @@ describe('Settings > AI roadmap panels', () => {
     apiMock.get.mockImplementation((url: string) =>
       Promise.resolve(url === '/v1/portal/features' ? { reservationEnabled: false } : {}),
     );
-    wrap(<AiOpsSettings settings={SETTINGS} canWrite aiDefaults={undefined} />);
+    wrap(<AiOpsSettings settings={ON_SETTINGS} canWrite aiDefaults={undefined} />);
     const panel = screen.getByTestId('ai-insights-settings');
     const off = await within(panel).findByTestId('ai-reservation-insights-off');
     expect(off.textContent).toContain('settings.aiInsightsSettings.reservationOff');
@@ -169,6 +191,7 @@ describe('Settings > AI roadmap panels', () => {
     expect(within(panel).getAllByRole('switch')).toHaveLength(3);
     // Saving the card never writes the hidden reservation switch.
     fireEvent.click(within(panel).getAllByRole('switch')[0] as HTMLElement);
+    fireEvent.click(screen.getByRole('button', { name: 'common.toggleOff.confirm' }));
     fireEvent.click(within(panel).getByRole('button', { name: /save/i }));
     await waitFor(() => {
       expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/aiInsights.station.enabled', {
@@ -176,6 +199,66 @@ describe('Settings > AI roadmap panels', () => {
       });
     });
     expect(apiMock.put).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables the insight and worker fields while system-initiated AI is off, values kept', () => {
+    wrap(
+      <AiOpsSettings
+        settings={{ ...SETTINGS, 'aiInsights.debounceSeconds': 300 }}
+        canWrite
+        aiDefaults={undefined}
+      />,
+    );
+    const insights = screen.getByTestId('ai-insights-settings');
+    const workers = screen.getByTestId('ai-workers-settings');
+    expect(within(insights).getByTestId('ai-insights-settings-ops-off').textContent).toBe(
+      'settings.aiSurface.ops.offNote',
+    );
+    expect(within(workers).getByTestId('ai-workers-settings-ops-off')).toBeTruthy();
+    for (const toggle of within(insights).getAllByRole<HTMLButtonElement>('switch')) {
+      expect(toggle.disabled).toBe(true);
+    }
+    for (const toggle of within(workers).getAllByRole<HTMLButtonElement>('switch')) {
+      expect(toggle.disabled).toBe(true);
+    }
+    const debounce = document.getElementById(
+      'ai-setting-aiInsights-debounceSeconds',
+    ) as HTMLInputElement;
+    expect(debounce.disabled).toBe(true);
+    expect(debounce.value).toBe('300');
+    // The scan closes old insights while it is off too: that field stays on.
+    const expire = document.getElementById(
+      'ai-setting-aiInsights-expireAfterDays',
+    ) as HTMLInputElement;
+    expect(expire.disabled).toBe(false);
+    // The MCP server does not depend on it.
+    expect(screen.queryByTestId('ai-mcp-settings-ops-off')).toBeNull();
+  });
+
+  it('enables the fields as soon as system-initiated AI is turned on, before any reload', async () => {
+    wrap(<AiOpsSettings settings={SETTINGS} canWrite aiDefaults={undefined} />);
+    const debounce = document.getElementById(
+      'ai-setting-aiInsights-debounceSeconds',
+    ) as HTMLInputElement;
+    expect(debounce.disabled).toBe(true);
+    fireEvent.click(within(screen.getByTestId('ai-ops-settings')).getByRole('switch'));
+    expect(debounce.disabled).toBe(false);
+    expect(screen.queryByTestId('ai-insights-settings-ops-off')).toBeNull();
+    expect(screen.queryByTestId('ai-workers-settings-ops-off')).toBeNull();
+    await waitFor(() => {
+      expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/opsAi.enabled', { value: true });
+    });
+    // Nothing else was saved: the values are kept, not written.
+    expect(apiMock.put).toHaveBeenCalledTimes(1);
+  });
+
+  it('enables the fields while system-initiated AI is on', () => {
+    wrap(<AiOpsSettings settings={ON_SETTINGS} canWrite aiDefaults={undefined} />);
+    const insights = screen.getByTestId('ai-insights-settings');
+    expect(within(insights).queryByTestId('ai-insights-settings-ops-off')).toBeNull();
+    for (const toggle of within(insights).getAllByRole<HTMLButtonElement>('switch')) {
+      expect(toggle.disabled).toBe(false);
+    }
   });
 
   it('refuses an out-of-range worker threshold before saving', () => {

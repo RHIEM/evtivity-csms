@@ -9,6 +9,8 @@ interface RemoveButtonProps {
   onClick: () => void;
   disabled?: boolean;
   title?: string;
+  /** `header` in a detail page header, next to the Prev and Next buttons. */
+  size?: 'default' | 'header';
 }
 
 export function RemoveButton({
@@ -16,10 +18,14 @@ export function RemoveButton({
   onClick,
   disabled,
   title,
+  size,
 }: RemoveButtonProps): React.JSX.Element {
+  // An action button, never a submit (the avatar editor dialog sits inside edit forms).
   return (
     <Button
+      type="button"
       variant="destructive"
+      size={size}
       className="gap-1.5"
       onClick={onClick}
       disabled={disabled}

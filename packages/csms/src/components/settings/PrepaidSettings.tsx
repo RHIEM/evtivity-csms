@@ -1,13 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 import { useCompanyCurrency } from '@/hooks/use-company-currency';
 import {
@@ -36,13 +37,24 @@ export function PrepaidSettings({ settings, readOnly = false }: Props): React.JS
   const queryClient = useQueryClient();
   const { currency } = useCompanyCurrency();
   // Typed in the currency (major units), stored in cents.
-  const [threshold, setThreshold] = useState(centsToMajorInput(DEFAULT_THRESHOLD_CENTS));
+  const storedThreshold = settings?.[THRESHOLD_KEY];
+  const loaded = useMemo(
+    () => ({
+      threshold: centsToMajorInput(
+        typeof storedThreshold === 'number' ? storedThreshold : DEFAULT_THRESHOLD_CENTS,
+      ),
+    }),
+    [storedThreshold],
+  );
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const stored = settings?.[THRESHOLD_KEY];
-    if (typeof stored === 'number') setThreshold(centsToMajorInput(stored));
-  }, [settings]);
+  // A settings reload replaces the value only while it is unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded, () => {
+    setError(null);
+  });
+  const { threshold } = values;
+  const setThreshold = (value: string): void => {
+    setValues({ threshold: value });
+  };
 
   const mutation = useMutation({
     mutationFn: (value: number) => api.put(`/v1/settings/${THRESHOLD_KEY}`, { value }),
@@ -69,7 +81,12 @@ export function PrepaidSettings({ settings, readOnly = false }: Props): React.JS
       return;
     }
     setError(null);
-    mutation.mutate(cents);
+    const sent = { threshold };
+    mutation.mutate(cents, {
+      onSuccess: () => {
+        takeNextLoad(sent);
+      },
+    });
   }
 
   return (

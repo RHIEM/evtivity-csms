@@ -19,7 +19,6 @@ import {
 import { eq, and, isNull } from 'drizzle-orm';
 import {
   db,
-  chargingStations,
   stationConfigurations,
   stationAuditLog,
   localAuthListAuditLog,
@@ -31,7 +30,10 @@ import { ocppCommandQueued, ocppCommandQueuedBody } from '../lib/ocpp-command-qu
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { assertFirmwareSignature } from '../lib/firmware-signature.js';
-import { assertNoStationCredentialWrite } from '../lib/station-credential-guard.js';
+import {
+  assertMaskableUrlPasswords,
+  assertNoStationCredentialWrite,
+} from '../lib/station-credential-guard.js';
 import {
   isLoadManagedStationIdentity,
   isReservedProfileId,
@@ -90,7 +92,11 @@ import {
 } from '../lib/ocpp-zod-types-v21.js';
 
 // --- v16 type imports ---
-import { authorize } from '../middleware/rbac.js';
+import { authorize, requestHasPermission } from '../middleware/rbac.js';
+import {
+  ocppCommandPayloadPermission,
+  ocppCommandRoutePermissions,
+} from '@evtivity/lib/ocpp-command-permissions';
 import {
   resetTypeEnum as resetTypeEnumV16,
   availabilityTypeEnum,
@@ -116,11 +122,11 @@ const ocppCommandSuccess = z
     stationId: z.string().describe('Target station OCPP ID'),
     action: z.string().describe('OCPP action that was dispatched'),
     response: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .optional()
       .describe('Raw OCPP response payload from the station'),
   })
-  .passthrough();
+  .loose();
 
 const ocppCommandError = z
   .object({
@@ -130,7 +136,7 @@ const ocppCommandError = z
     action: z.string().describe('OCPP action that was dispatched'),
     error: z.string().describe('Human-readable error message'),
   })
-  .passthrough();
+  .loose();
 
 interface CommandResult {
   commandId: string;
@@ -145,6 +151,7 @@ const commandResponses = {
   200: itemResponse(ocppCommandSuccess),
   202: itemResponse(ocppCommandQueued),
   400: errorResponse,
+  403: errorResponse,
   404: errorResponse,
   500: itemResponse(ocppCommandError),
   502: itemResponse(ocppCommandError),
@@ -516,7 +523,8 @@ function commandRoute(
   app.post(
     `/ocpp/commands/${version}/${commandName}`,
     {
-      onRequest: [authorize('stations:write')],
+      // stations:write plus the feature permission of the action.
+      onRequest: [authorize(...ocppCommandRoutePermissions(commandName))],
       schema: {
         tags: [`OCPP ${version === 'v21' ? '2.1' : '1.6'} Commands`],
         summary,
@@ -532,6 +540,15 @@ function commandRoute(
       const { stationId, ...payload } = body;
       // Station passwords change only through the station security service (P3).
       assertNoStationCredentialWrite(commandName, payload);
+      // A file transfer URL password every stored copy can mask.
+      assertMaskableUrlPasswords(payload);
+      // A certificate signing trigger is a certificate action.
+      const payloadPermission = ocppCommandPayloadPermission(commandName, payload);
+      if (payloadPermission != null && !(await requestHasPermission(request, payloadPermission))) {
+        return reply
+          .status(403)
+          .send({ error: 'Insufficient permissions', code: 'INSUFFICIENT_PERMISSIONS' });
+      }
       validatePayload?.(payload);
       return dispatchCommand(
         app,
@@ -643,10 +660,26 @@ const clearCacheV21Body = z.object({
   stationId: stationIdField,
 });
 
+/**
+ * A file transfer URL is at most 2000 characters, as the OCPP 2.1 schemas
+ * bound GetLog `remoteLocation`, UpdateFirmware and PublishFirmware
+ * `location`; the 1.6 GetDiagnostics and UpdateFirmware `location` have no
+ * schema bound and take the same one here. It also keeps every URL well
+ * under the URL password scan bound (`MAX_URL_SCAN_LENGTH`).
+ */
+const FILE_TRANSFER_URL_MAX = 2000;
+
 const updateFirmwareV21Body = z.object({
   stationId: stationIdField,
   requestId: z.number().int().describe('Request ID'),
-  firmware: firmwareType.describe('Firmware details'),
+  firmware: firmwareType
+    .extend({
+      location: z
+        .string()
+        .max(FILE_TRANSFER_URL_MAX)
+        .describe('URI defining the origin of the firmware.'),
+    })
+    .describe('Firmware details'),
   retries: z.number().int().optional().describe('Number of retries'),
   retryInterval: z.number().int().optional().describe('Seconds between retries'),
 });
@@ -687,7 +720,14 @@ const getLogV21Body = z.object({
   stationId: stationIdField,
   logType: logEnum.describe('Log type'),
   requestId: z.number().int().describe('Request ID'),
-  log: logParametersType.describe('Log parameters'),
+  log: logParametersType
+    .extend({
+      remoteLocation: z
+        .string()
+        .max(FILE_TRANSFER_URL_MAX)
+        .describe('The URL of the location at the remote system where the log should be stored.'),
+    })
+    .describe('Log parameters'),
   retries: z.number().int().optional().describe('Number of retries'),
   retryInterval: z.number().int().optional().describe('Seconds between retries'),
 });
@@ -847,7 +887,7 @@ const updateDynamicScheduleV21Body = z.object({
 
 const publishFirmwareV21Body = z.object({
   stationId: stationIdField,
-  location: z.string().describe('URI of firmware image'),
+  location: z.string().max(FILE_TRANSFER_URL_MAX).describe('URI of firmware image'),
   checksum: z.string().describe('MD5 checksum of firmware'),
   requestId: z.number().int().describe('Request ID'),
   retries: z.number().int().optional().describe('Number of retries'),
@@ -1008,7 +1048,7 @@ const clearCacheV16Body = z.object({
 
 const updateFirmwareV16Body = z.object({
   stationId: stationIdField,
-  location: z.string().describe('URI of firmware image'),
+  location: z.string().max(FILE_TRANSFER_URL_MAX).describe('URI of firmware image'),
   retrieveDate: z.string().describe('ISO 8601 retrieve date'),
   retries: z.number().int().optional().describe('Number of retries'),
   retryInterval: z.number().int().optional().describe('Seconds between retries'),
@@ -1048,7 +1088,7 @@ const changeConfigurationV16Body = z.object({
 
 const getDiagnosticsV16Body = z.object({
   stationId: stationIdField,
-  location: z.string().describe('URI for diagnostics upload'),
+  location: z.string().max(FILE_TRANSFER_URL_MAX).describe('URI for diagnostics upload'),
   retries: z.number().int().optional().describe('Number of retries'),
   retryInterval: z.number().int().optional().describe('Seconds between retries'),
   startTime: z.string().optional().describe('ISO 8601 log start time'),
@@ -1350,37 +1390,37 @@ export function ocppCommandRoutes(app: FastifyInstance): void {
       const actor = getAuditActor(request);
       const getVariableData = payload.getVariableData;
 
-      // Look up station DB ID for ItemsPerMessage config query
-      const [station] = await db
-        .select({ id: chargingStations.id })
-        .from(chargingStations)
-        .where(eq(chargingStations.stationId, stationId));
+      // The site check comes first, before any read of the station's
+      // settings (security review AZ-I8): a station outside the caller's
+      // sites answers like an unknown one.
+      const station = await findCommandStation(userId, stationId);
+      if (station == null) {
+        return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
+      }
 
       let itemsPerMessage = getVariableData.length; // default: no splitting
-      if (station != null) {
-        // B06.FR.05: the limit is DeviceDataCtrlr.ItemsPerMessage[GetVariables] (Actual).
-        // Other instances (GetReport) are different variables with their own limits.
-        const [match] = await db
-          .select({ value: stationConfigurations.value })
-          .from(stationConfigurations)
-          .where(
-            and(
-              eq(stationConfigurations.stationId, station.id),
-              eq(stationConfigurations.component, 'DeviceDataCtrlr'),
-              isNull(stationConfigurations.instance),
-              isNull(stationConfigurations.evseId),
-              isNull(stationConfigurations.connectorId),
-              eq(stationConfigurations.variable, 'ItemsPerMessage'),
-              eq(stationConfigurations.variableInstance, 'GetVariables'),
-              eq(stationConfigurations.attributeType, 'Actual'),
-            ),
-          )
-          .limit(1);
-        if (match?.value != null) {
-          const parsed = parseInt(match.value, 10);
-          if (!isNaN(parsed) && parsed > 0) {
-            itemsPerMessage = parsed;
-          }
+      // B06.FR.05: the limit is DeviceDataCtrlr.ItemsPerMessage[GetVariables] (Actual).
+      // Other instances (GetReport) are different variables with their own limits.
+      const [match] = await db
+        .select({ value: stationConfigurations.value })
+        .from(stationConfigurations)
+        .where(
+          and(
+            eq(stationConfigurations.stationId, station.id),
+            eq(stationConfigurations.component, 'DeviceDataCtrlr'),
+            isNull(stationConfigurations.instance),
+            isNull(stationConfigurations.evseId),
+            isNull(stationConfigurations.connectorId),
+            eq(stationConfigurations.variable, 'ItemsPerMessage'),
+            eq(stationConfigurations.variableInstance, 'GetVariables'),
+            eq(stationConfigurations.attributeType, 'Actual'),
+          ),
+        )
+        .limit(1);
+      if (match?.value != null) {
+        const parsed = parseInt(match.value, 10);
+        if (!isNaN(parsed) && parsed > 0) {
+          itemsPerMessage = parsed;
         }
       }
 

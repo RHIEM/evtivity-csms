@@ -5,12 +5,16 @@ import { Queue } from 'bullmq';
 import { createBullMQConnection, logBullMQErrors } from '@evtivity/lib';
 import { DRIVER_AI_QUEUE } from '@evtivity/lib/driver-ai';
 import {
+  DRIVER_AVATAR_CLEANUP_JOB_OPTIONS,
+  DRIVER_AVATAR_CLEANUP_QUEUE,
   FLEET_BILLING_FANOUT_JOB_OPTIONS,
   FLEET_BILLING_FANOUT_QUEUE,
   MAINTENANCE_FANOUT_JOB_OPTIONS,
   MAINTENANCE_FANOUT_QUEUE,
   PAYMENT_STOP_JOB_OPTIONS,
   PAYMENT_STOP_QUEUE,
+  PAYMENT_TERMINAL_EVENTS_JOB_OPTIONS,
+  PAYMENT_TERMINAL_EVENTS_QUEUE,
   PAYMENT_WEBHOOK_JOB_OPTIONS,
   PAYMENT_WEBHOOK_QUEUE,
   STATION_MESSAGE_JOB_OPTIONS,
@@ -42,6 +46,8 @@ export const QUEUE_NAMES = {
   AI_WORKERS: 'ai-workers',
   AI_INSIGHTS: 'ai-insights',
   DRIVER_AI: DRIVER_AI_QUEUE,
+  DRIVER_AVATAR_CLEANUP: DRIVER_AVATAR_CLEANUP_QUEUE,
+  PAYMENT_TERMINAL_EVENTS: PAYMENT_TERMINAL_EVENTS_QUEUE,
 } as const;
 
 /** Attempts of one automatic insight job (exponential from 30 s: 30 s, 60 s). */
@@ -81,6 +87,8 @@ export interface WorkerQueues {
   aiWorkerQueue: Queue;
   aiInsightQueue: Queue;
   driverAiQueue: Queue;
+  driverAvatarCleanupQueue: Queue;
+  paymentTerminalEventsQueue: Queue;
 }
 
 /**
@@ -194,6 +202,18 @@ export function createQueues(redisUrl: string): WorkerQueues {
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
       },
+    }),
+    // Driver avatar objects a delete left (API, conformance cleanup): one job
+    // per object or per erased driver (P7).
+    driverAvatarCleanupQueue: new Queue(QUEUE_NAMES.DRIVER_AVATAR_CLEANUP, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: DRIVER_AVATAR_CLEANUP_JOB_OPTIONS,
+    }),
+    // Signed payment terminal events (the simulated provider's), added by the
+    // API and the worker (features/payment-terminals.md).
+    paymentTerminalEventsQueue: new Queue(QUEUE_NAMES.PAYMENT_TERMINAL_EVENTS, {
+      connection: createBullMQConnection(redisUrl),
+      defaultJobOptions: PAYMENT_TERMINAL_EVENTS_JOB_OPTIONS,
     }),
     // Station screen renders: station events, session events, and debounced
     // repushes after a config change (OCPP, API and worker cron).

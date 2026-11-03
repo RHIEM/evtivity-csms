@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router';
 
 const { getMock, patchMock, putMock, permissions } = vi.hoisted(() => ({
   getMock: vi.fn(),
@@ -18,7 +19,11 @@ vi.mock('@/lib/auth', () => ({
 
 vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => undefined },
-  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }),
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) =>
+      opts == null ? key : `${key}:${JSON.stringify(opts)}`,
+    i18n: { language: 'en' },
+  }),
 }));
 
 vi.mock('@/lib/api', () => ({
@@ -42,6 +47,7 @@ vi.mock('@/lib/timezone', () => ({
 }));
 
 import { Tabs } from '@/components/ui/tabs';
+import type { SiteLayoutSettings } from '@evtivity/lib/site-layout';
 import { SiteDetailsTab } from '../site/SiteDetailsTab';
 
 const SITE = {
@@ -67,6 +73,7 @@ const SITE = {
   carbonRegionCode: null,
   stationMessageLanguage: null as string | null,
   stationCount: 0,
+  layoutSettings: null as SiteLayoutSettings | null,
   createdAt: '2026-01-01T00:00:00Z',
   updatedAt: '2026-01-01T00:00:00Z',
 };
@@ -78,16 +85,18 @@ function renderTab(
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
-      <Tabs value="details" onValueChange={() => undefined}>
-        <SiteDetailsTab
-          site={site}
-          siteId={site.id}
-          googleMapsApiKey=""
-          onDelete={options.onDelete ?? (() => undefined)}
-          deleteIsPending={false}
-          deleteError={options.deleteError}
-        />
-      </Tabs>
+      <MemoryRouter>
+        <Tabs value="details" onValueChange={() => undefined}>
+          <SiteDetailsTab
+            site={site}
+            siteId={site.id}
+            googleMapsApiKey=""
+            onDelete={options.onDelete ?? (() => undefined)}
+            deleteIsPending={false}
+            deleteError={options.deleteError}
+          />
+        </Tabs>
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -199,5 +208,103 @@ describe('SiteDetailsTab writes', () => {
     fireEvent.click(confirm as HTMLButtonElement);
     expect(onDelete).toHaveBeenCalledTimes(1);
     expect(screen.getByText('errors.unknown')).toBeDefined();
+  });
+});
+
+describe('SiteDetailsTab site type and layout summary', () => {
+  const BASE: SiteLayoutSettings = {
+    spotsPerRow: 10,
+    rows: 2,
+    facingDeg: 0,
+    transformers: [
+      { id: 'tx-1', name: null, ratedKva: null, x: 30, z: -3 },
+      { id: 'tx-2', name: null, ratedKva: null, x: 34, z: -3 },
+    ],
+  };
+
+  beforeEach(() => {
+    getMock.mockResolvedValue([]);
+    patchMock.mockResolvedValue({});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('summarizes a parking lot with its transformers and links to the Layout tab', () => {
+    renderTab({ ...SITE, layoutSettings: BASE });
+    expect(screen.getByTestId('site-type-value').textContent).toBe(
+      'sites.layoutSettings.siteTypeParkingLot',
+    );
+    const link = screen.getByTestId('site-layout-summary');
+    expect(link.textContent).toBe(
+      'sites.layoutSummary.parkingLotTransformers:{"rows":2,"spots":10,"count":2}',
+    );
+    expect(link.getAttribute('href')).toBe('/sites/sit_1?tab=layout');
+  });
+
+  it('summarizes an office or retail site by its mounting and a curbside site by its sides', () => {
+    renderTab({
+      ...SITE,
+      layoutSettings: { ...BASE, siteType: 'office_retail', chargers: 12, mounting: 'wall' },
+    });
+    expect(screen.getByTestId('site-layout-summary').textContent).toBe(
+      'sites.layoutSummary.officeWall:{"count":12}',
+    );
+    cleanup();
+    renderTab({
+      ...SITE,
+      layoutSettings: { ...BASE, siteType: 'office_retail', chargers: 6, mounting: 'stall' },
+    });
+    expect(screen.getByTestId('site-layout-summary').textContent).toBe(
+      'sites.layoutSummary.officeStall:{"count":6}',
+    );
+    cleanup();
+    renderTab({
+      ...SITE,
+      layoutSettings: { ...BASE, siteType: 'curbside', chargersLeft: 4, chargersRight: 6 },
+    });
+    expect(screen.getByTestId('site-type-value').textContent).toBe(
+      'sites.layoutSettings.siteTypeCurbside',
+    );
+    expect(screen.getByTestId('site-layout-summary').textContent).toBe(
+      'sites.layoutSummary.curbside:{"left":4,"right":6}',
+    );
+  });
+
+  it('defaults a site that never saved a layout to a parking lot of 2 x 10 spots', () => {
+    renderTab();
+    expect(screen.getByTestId('site-layout-summary').textContent).toContain('"rows":2,"spots":10');
+  });
+
+  it('sends the site type only when it changed', async () => {
+    renderTab({ ...SITE, layoutSettings: BASE });
+    fireEvent.click(screen.getByText('common.edit'));
+    const select = screen.getByLabelText('sites.layoutSettings.siteType');
+    expect((select as HTMLSelectElement).value).toBe('parking_lot');
+    expect([...(select as HTMLSelectElement).options].map((o) => o.value)).toEqual([
+      'parking_lot',
+      'office_retail',
+      'curbside',
+      'depot',
+      'custom',
+    ]);
+    fireEvent.submit(screen.getByLabelText('common.name').closest('form') as HTMLFormElement);
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledTimes(1);
+    });
+    expect(patchMock.mock.calls[0]?.[1]).not.toHaveProperty('siteType');
+    fireEvent.click(screen.getByText('common.edit'));
+    fireEvent.change(screen.getByLabelText('sites.layoutSettings.siteType'), {
+      target: { value: 'curbside' },
+    });
+    fireEvent.submit(screen.getByLabelText('common.name').closest('form') as HTMLFormElement);
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenLastCalledWith(
+        '/v1/sites/sit_1',
+        expect.objectContaining({ siteType: 'curbside' }),
+      );
+    });
   });
 });

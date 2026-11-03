@@ -1,8 +1,16 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { randomBytes } from 'node:crypto';
+import {
+  HUBJECT_URL_SETTING_KEYS,
+  PRIVATE_HUBJECT_URL_ERROR,
+  validateHubjectUrl,
+} from '../lib/hubject-url.js';
 import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { AI_INSIGHT_SCOPE_SETTING_KEY } from '@evtivity/lib/ai-insights';
+import { effectiveStorageRegion } from '@evtivity/lib/object-storage-region';
 import { invalidateAutochargeCaches } from '../lib/autocharge-invalidation.js';
 import { eq, like, or, inArray } from 'drizzle-orm';
 import {
@@ -29,6 +37,7 @@ import {
   MAX_GUEST_VELOCITY_LIMIT,
   clearAiSettingsCache,
   clearPncSettingsCache,
+  clearDataPlanValuesCache,
   writeAudit,
   settingAuditLog,
 } from '@evtivity/database';
@@ -65,7 +74,10 @@ import {
   replyIfProviderUpgradePending,
 } from '../lib/provider-switch.js';
 import {
+  assertTemplateAllowed,
+  EMAIL_LAYOUT_TEMPLATE,
   encryptString,
+  WEBHOOK_SIGNING_SECRET_KEY,
   clearNotificationSettingsCache,
   isSupportedCurrency,
   SUPPORTED_CURRENCIES,
@@ -112,9 +124,25 @@ import {
   INVOICE_PAYMENT_MAX_LENGTHS,
   isInvoicePaymentSettingKey,
   normalizeInvoicePaymentSetting,
+  isDataRetentionSettingKey,
+  isDataPlanSettingKey,
+  validateDataPlanSetting,
+  normalizeMeasurandList,
 } from '@evtivity/lib';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
+import {
+  STORAGE_PROVIDERS,
+  parseStorageAllowedPrivateHosts,
+  validateStorageEndpoint,
+} from '@evtivity/services/storage';
+import { factorProof } from '../lib/mfa-factor-proof.js';
+import {
+  isApiKeyRequest,
+  requireSessionProof,
+  SESSION_PROOF_ERROR_CODES,
+  sessionProofErrorFields,
+} from '../lib/session-proof.js';
 
 /** The SVG drawn in the center of station QR codes. */
 const QR_CODE_ICON_KEY = 'qr_code_icon';
@@ -146,7 +174,7 @@ async function invalidateNotificationSettings(): Promise<void> {
 import { zodSchema } from '../lib/zod-schema.js';
 import { successResponse, itemResponse, errorWith } from '../lib/response-schemas.js';
 import { ERROR_CODES } from '../lib/error-codes.generated.js';
-import { clearS3ConfigCache } from '../services/s3.service.js';
+import { clearObjectStorageCache, getObjectStorage } from '../services/storage.service.js';
 import { DEFAULT_CONTENT } from './default-content.js';
 import { DEFAULT_SIGNED_METER_CONTENT } from './default-signed-meter-content.js';
 import { authorize } from '../middleware/rbac.js';
@@ -158,14 +186,19 @@ import { publishOcpiTariffSettingChange } from '../lib/ocpi-tariff-push.js';
 import { readDriverAiAvailability } from '../lib/driver-ai-availability.js';
 import { isSimFeatureOn, readSimSettings } from '../lib/sim.js';
 import { DRIVER_AI_NOTICE_VERSION } from '@evtivity/lib/driver-ai';
-import { decryptForRead, encryptForWrite, isServerManagedSetting } from '../lib/settings-crypto.js';
+import {
+  decryptForRead,
+  encryptForWrite,
+  isServerManagedSetting,
+  storedSecretDecrypts,
+} from '../lib/settings-crypto.js';
 
 const settingParams = z.object({
   key: z.string().min(1).describe('Setting key'),
 });
 
 const updateSettingBody = z.object({
-  value: z.unknown(),
+  value: z.unknown().optional(),
 });
 
 const COMPANY_CURRENCY_KEY = 'company.currency';
@@ -191,6 +224,18 @@ function isCachedSystemSetting(key: string): boolean {
  */
 function normalizeSettingValue(key: string, value: unknown): { value: unknown } | null {
   if (isServerManagedSetting(key) || isDedicatedRouteSetting(key)) return null;
+  if (STORAGE_ENDPOINT_SETTING_KEYS.has(key)) return null;
+  // Data plan values (Settings > Integrations & Features > OCPP): ranges and
+  // known measurands, the checks the Helm chart applies too.
+  if (isDataPlanSettingKey(key)) {
+    if (validateDataPlanSetting(key, value) != null) return null;
+    // A measurand list is stored with each item trimmed, as the station gets it.
+    return { value: typeof value === 'string' ? normalizeMeasurandList(value) : value };
+  }
+  if (HUBJECT_URL_SETTING_KEYS.has(key)) {
+    const url = validateHubjectUrl(value);
+    return url != null ? { value: url } : null;
+  }
   if (isAiBaseUrlSettingKey(key)) {
     // A mock provider on localhost is allowed in development only.
     const url = validateAiBaseUrl(value, {
@@ -215,6 +260,7 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     return { value: storedSystemPrompt('driver', value) };
   }
   if (key === COMPANY_PRICE_DISPLAY_KEY) return isPriceDisplay(value) ? { value } : null;
+  if (key === EMAIL_WRAPPER_TEMPLATE_KEY) return emailLayoutAllowed(value) ? { value } : null;
   if (key === STATION_MESSAGE_LANGUAGE_KEY) {
     return isStationMessageLanguage(value) ? { value } : null;
   }
@@ -275,6 +321,31 @@ const invalidCurrencyError = {
   code: 'VALIDATION_ERROR',
 };
 
+const EMAIL_WRAPPER_TEMPLATE_KEY = 'email.wrapperTemplate';
+
+/**
+ * The email layout wraps every HTML email. It saves only when it sends: plain
+ * variables and if/unless blocks, and no raw variable but `{{{content}}}`, the
+ * rendered body. Empty restores the built-in layout.
+ */
+function emailLayoutAllowed(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  if (value === '') return true;
+  try {
+    assertTemplateAllowed(value, EMAIL_LAYOUT_TEMPLATE);
+    return true;
+  } catch {
+    // fail-open: an invalid layout is operator input, the caller answers 400.
+    return false;
+  }
+}
+
+const invalidEmailWrapperError = {
+  error:
+    'email.wrapperTemplate must be a valid layout: plain variables, if and unless blocks, and no raw variable except {{{content}}}',
+  code: 'VALIDATION_ERROR',
+};
+
 const invalidPriceDisplayError = {
   error: `company.priceDisplay must be one of: ${PRICE_DISPLAYS.join(', ')}`,
   code: 'VALIDATION_ERROR',
@@ -298,6 +369,27 @@ const invalidMobileAppSchemesError = {
 
 const invalidMobileAppPackagesError = {
   error: 'mobile.app.androidPackageNames must be an array of Android application ids',
+  code: 'VALIDATION_ERROR',
+};
+
+/**
+ * The storage provider and the endpoint it connects to, with the private hosts
+ * it may reach. They decide where the storage credentials go, so only
+ * PUT /v1/settings/s3 writes them, checking the endpoint against the allowlist
+ * sent with it. The generic routes still return them.
+ */
+const STORAGE_ENDPOINT_SETTING_DEFAULTS: Readonly<Record<string, unknown>> = {
+  's3.provider': 's3',
+  's3.endpoint': '',
+  's3.forcePathStyle': false,
+  's3.allowedPrivateHosts': [],
+};
+const STORAGE_ENDPOINT_SETTING_KEYS: ReadonlySet<string> = new Set(
+  Object.keys(STORAGE_ENDPOINT_SETTING_DEFAULTS),
+);
+
+const storageEndpointSettingError = {
+  error: 'The storage provider and endpoint are written through PUT /v1/settings/s3',
   code: 'VALIDATION_ERROR',
 };
 
@@ -386,14 +478,28 @@ const serverManagedSettingError = {
  * SSO and security settings decide who signs in and how. Only their own routes
  * write and return them (`/v1/sso/settings`, `/v1/security/*`: the
  * settings.security permissions and all-site access), never the generic ones.
+ * The SIM and data retention settings have their own routes too, which check
+ * each value's range (`/v1/settings/sim-providers`, `/v1/settings/data-retention`),
+ * and so does the AI insights scope, whose change closes the insights of
+ * what leaves it (`/v1/settings/ai/insights-scope`). The payment terminal
+ * account (`paymentTerminals.*`) is read and written only through
+ * `/v1/settings/payment-terminals`, which takes the fresh proof, refuses an
+ * API key and keeps the unverified ID TECH adapter off.
  */
-function isDedicatedRouteSetting(key: string): boolean {
-  return key.startsWith('sso.') || key.startsWith('security.') || key.startsWith('sim.');
+export function isDedicatedRouteSetting(key: string): boolean {
+  return (
+    key.startsWith('sso.') ||
+    key.startsWith('security.') ||
+    key.startsWith('sim.') ||
+    key.startsWith('paymentTerminals.') ||
+    isDataRetentionSettingKey(key) ||
+    key === AI_INSIGHT_SCOPE_SETTING_KEY
+  );
 }
 
 const dedicatedRouteSettingError = {
   error:
-    'This setting is written through /v1/sso/settings, /v1/security/* or /v1/settings/sim-providers',
+    'This setting is written through /v1/sso/settings, /v1/security/*, /v1/settings/sim-providers, /v1/settings/payment-terminals, /v1/settings/data-retention or /v1/settings/ai/insights-scope',
   code: 'VALIDATION_ERROR',
 };
 
@@ -469,9 +575,17 @@ function invalidAiSettingError(key: string): { error: string; code: string } | n
   return null;
 }
 
-function invalidSettingError(key: string): { error: string; code: string } {
+function invalidSettingError(key: string, value?: unknown): { error: string; code: string } {
   if (isServerManagedSetting(key)) return serverManagedSettingError;
   if (isDedicatedRouteSetting(key)) return dedicatedRouteSettingError;
+  if (isDataPlanSettingKey(key)) {
+    return {
+      error: validateDataPlanSetting(key, value) ?? `${key} has an invalid value`,
+      code: 'VALIDATION_ERROR',
+    };
+  }
+  if (HUBJECT_URL_SETTING_KEYS.has(key)) return PRIVATE_HUBJECT_URL_ERROR;
+  if (STORAGE_ENDPOINT_SETTING_KEYS.has(key)) return storageEndpointSettingError;
   const aiError = invalidAiSettingError(key);
   if (aiError != null) return aiError;
   if (key === WEBHOOK_ALLOWED_PRIVATE_HOSTS_KEY) return invalidWebhookAllowedHostsError;
@@ -492,6 +606,7 @@ function invalidSettingError(key: string): { error: string; code: string } {
   if (key === MOBILE_APP_URL_SCHEMES_KEY) return invalidMobileAppSchemesError;
   if (key === MOBILE_APP_ANDROID_PACKAGES_KEY) return invalidMobileAppPackagesError;
   if (key === COMPANY_PRICE_DISPLAY_KEY) return invalidPriceDisplayError;
+  if (key === EMAIL_WRAPPER_TEMPLATE_KEY) return invalidEmailWrapperError;
   if (key === COMPANY_TAX_BASIS_KEY) return invalidTaxBasisError;
   if (key === STATION_MESSAGE_LANGUAGE_KEY) return invalidStationMessageLanguageError;
   return invalidCurrencyError;
@@ -545,24 +660,161 @@ function clearCachesForKey(key: string): void {
   if (key === 'company.portalUrl') clearCompanyPortalUrlCache();
   if (key.startsWith('pnc.')) clearPncSettingsCache();
   if (isAiSettingKey(key)) clearAiSettingsCache();
+  if (isDataPlanSettingKey(key)) clearDataPlanValuesCache();
 }
 
 const settingItem = z
   .object({
     key: z.string().max(100).describe('Setting key'),
-    value: z.unknown().describe('Setting value (any JSON type)'),
+    value: z.unknown().describe('Setting value (any JSON type)').optional(),
   })
-  .passthrough();
+  .loose();
 
 const s3StatusResponse = z
   .object({
     configured: z
       .boolean()
-      .describe('Whether S3 storage is fully configured (bucket, region, and credentials present)'),
+      .describe(
+        'Whether storage is fully configured (bucket, region and credentials present, and for an S3-compatible provider the endpoint)',
+      ),
   })
-  .passthrough();
+  .loose();
+
+const webhookSigningStatus = z
+  .object({
+    configured: z.boolean().describe('A webhook signing secret is stored'),
+  })
+  .loose();
+
+const webhookSigningSecretResponse = z
+  .object({
+    secret: z
+      .string()
+      .max(64)
+      .describe(
+        'The new signing secret, shown once. Receivers check X-EVtivity-Signature (t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">) with it.',
+      ),
+  })
+  .loose();
+
+/** Writes the webhook signing secret (empty removes it), audited, and refreshes every process. */
+async function writeWebhookSigningSecret(request: FastifyRequest, secret: string): Promise<void> {
+  // encryptForWrite refuses an *Enc write without SETTINGS_ENCRYPTION_KEY (never plaintext).
+  const storedValue = encryptForWrite(WEBHOOK_SIGNING_SECRET_KEY, secret);
+  const [before] = await db
+    .select()
+    .from(settings)
+    .where(eq(settings.key, WEBHOOK_SIGNING_SECRET_KEY));
+  const [row] = await db
+    .insert(settings)
+    .values({ key: WEBHOOK_SIGNING_SECRET_KEY, value: storedValue })
+    .onConflictDoUpdate({
+      target: settings.key,
+      set: { value: storedValue, updatedAt: new Date() },
+    })
+    .returning();
+  await writeAudit(
+    { table: settingAuditLog, idColumn: 'setting_key' },
+    {
+      entityId: WEBHOOK_SIGNING_SECRET_KEY,
+      entityIdSnapshot: WEBHOOK_SIGNING_SECRET_KEY,
+      action: 'updated',
+      ...getAuditActor(request),
+      before,
+      after: row,
+      notes: secret === '' ? 'Webhook signing secret removed' : 'Webhook signing secret generated',
+    },
+    db,
+    request.log,
+  );
+  await invalidateNotificationSettings();
+}
+
+/** Whether file storage (S3) is configured, so uploads work. False when it cannot be read. */
+async function isFileStorageConfigured(log: FastifyBaseLogger): Promise<boolean> {
+  try {
+    return (await getObjectStorage()) != null;
+  } catch (err) {
+    log.warn({ err }, 'S3 settings read failed; file storage reported off');
+    return false;
+  }
+}
 
 export function settingsRoutes(app: FastifyInstance): void {
+  // Webhook signing secret: generated here and shown once; the
+  // generic settings routes never return or write it (server managed).
+  app.get(
+    '/settings/notifications/webhook-signing-secret',
+    {
+      onRequest: [authorize('settings.system:read')],
+      schema: {
+        tags: ['Settings'],
+        summary: 'Whether a webhook signing secret is stored',
+        operationId: 'getWebhookSigningSecretStatus',
+        security: [{ bearerAuth: [] }],
+        response: { 200: zodSchema(webhookSigningStatus) },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, settingNotFound))) return;
+      const [row] = await db
+        .select({ value: settings.value })
+        .from(settings)
+        .where(eq(settings.key, WEBHOOK_SIGNING_SECRET_KEY));
+      // Configured only when the stored value decrypts under the current key.
+      return { configured: storedSecretDecrypts(WEBHOOK_SIGNING_SECRET_KEY, row?.value) };
+    },
+  );
+
+  app.post(
+    '/settings/notifications/webhook-signing-secret',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Settings'],
+        summary: 'Generate a new webhook signing secret, shown once',
+        operationId: 'generateWebhookSigningSecret',
+        security: [{ bearerAuth: [] }],
+        response: {
+          200: zodSchema(webhookSigningSecretResponse),
+          500: errorWith('Encryption key missing', [ERROR_CODES.ENCRYPTION_KEY_MISSING]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, settingNotFound))) return;
+      if (apiConfig.SETTINGS_ENCRYPTION_KEY === '') {
+        await reply.status(500).send({
+          error: 'SETTINGS_ENCRYPTION_KEY not configured on server',
+          code: 'ENCRYPTION_KEY_MISSING',
+        });
+        return;
+      }
+      const secret = `whsec_${randomBytes(32).toString('base64url')}`;
+      await writeWebhookSigningSecret(request, secret);
+      return { secret };
+    },
+  );
+
+  app.delete(
+    '/settings/notifications/webhook-signing-secret',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Settings'],
+        summary: 'Remove the webhook signing secret (webhooks go out unsigned)',
+        operationId: 'removeWebhookSigningSecret',
+        security: [{ bearerAuth: [] }],
+        response: { 200: zodSchema(webhookSigningStatus) },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, settingNotFound))) return;
+      await writeWebhookSigningSecret(request, '');
+      return { configured: false };
+    },
+  );
+
   // Public endpoint for portal branding (no auth required)
   app.get(
     '/portal/branding',
@@ -575,9 +827,9 @@ export function settingsRoutes(app: FastifyInstance): void {
         response: {
           200: itemResponse(
             z
-              .record(z.string())
+              .record(z.string(), z.string())
               .describe(
-                'Public branding values. Every company.* and marketing.* setting under its key without the prefix (for example name, logo, favicon), currency, priceDisplay, taxBasis, and qrCodeIcon (the SVG drawn in the center of station QR codes, absent when none is set). Values that are not strings are returned as an empty string',
+                'Public branding values. Every company.* and marketing.* setting under its key without the prefix (for example name, logo, favicon), currency, priceDisplay, taxBasis, portalUrl (company.portalUrl, else the PORTAL_URL the API runs with), and qrCodeIcon (the SVG drawn in the center of station QR codes, absent when none is set). Values that are not strings are returned as an empty string',
               ),
           ),
         },
@@ -610,6 +862,9 @@ export function settingsRoutes(app: FastifyInstance): void {
       // Whether tariff prices are entered excluding ('net') or including
       // ('gross') tax, so clients show a price in the display the driver chose.
       result['taxBasis'] = await getCompanyTaxBasis();
+      // The driver portal address the mobile app links to: the operator's
+      // company.portalUrl, else the PORTAL_URL this API runs with.
+      if ((result['portalUrl'] ?? '').trim() === '') result['portalUrl'] = apiConfig.PORTAL_URL;
       return result;
     },
   );
@@ -692,6 +947,16 @@ export function settingsRoutes(app: FastifyInstance): void {
                   .describe(
                     'Company currency (ISO 4217) used to format any monetary value in this response, including the reservation cancellation fee',
                   ),
+                avatarUploadEnabled: z
+                  .boolean()
+                  .describe(
+                    'Whether drivers can upload an avatar image (file storage is configured). The avatar generator works either way',
+                  ),
+                fileStorageEnabled: z
+                  .boolean()
+                  .describe(
+                    'Whether file storage is configured, so files can be uploaded (AI chat and support case attachments, station images, avatar images). False when it cannot be read',
+                  ),
                 simEnabled: z
                   .literal(true)
                   .optional()
@@ -705,12 +970,12 @@ export function settingsRoutes(app: FastifyInstance): void {
                     'Present (true) only while station signal reads are on (a Refresh also sends one OCPP request to the station). Absent while they are off',
                   ),
               })
-              .passthrough(),
+              .loose(),
           ),
         },
       },
     },
-    async () => {
+    async (request) => {
       const reservationEnabled = await isReservationEnabled();
       const supportEnabled = await isSupportEnabled();
       const roamingEnabled = await isRoamingEnabled();
@@ -724,6 +989,7 @@ export function settingsRoutes(app: FastifyInstance): void {
       const reservationConfig = await getReservationSettings();
       const currency = await getCompanyCurrency();
       const simSettings = await readSimSettings();
+      const fileStorageEnabled = await isFileStorageConfigured(request.log);
       // Left out while off, so the reply stays as it was before SIM providers existed.
       const simFlags = {
         ...(isSimFeatureOn(simSettings) ? { simEnabled: true as const } : {}),
@@ -745,6 +1011,8 @@ export function settingsRoutes(app: FastifyInstance): void {
         reservationCancellationWindowMinutes: reservationConfig.cancellationWindowMinutes,
         reservationMaxHours: reservationConfig.maxHours,
         currency,
+        avatarUploadEnabled: fileStorageEnabled,
+        fileStorageEnabled,
         ...simFlags,
       };
     },
@@ -760,7 +1028,7 @@ export function settingsRoutes(app: FastifyInstance): void {
   });
   const contentItem = z
     .object({ html: z.string().describe('Rendered HTML content for the requested legal document') })
-    .passthrough();
+    .loose();
 
   app.get(
     '/portal/content/:type',
@@ -803,7 +1071,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         summary: 'Get all settings',
         operationId: 'listSettings',
         security: [{ bearerAuth: [] }],
-        response: { 200: itemResponse(z.record(z.unknown())) },
+        response: { 200: itemResponse(z.record(z.string(), z.unknown())) },
       },
     },
     async (request) => {
@@ -886,7 +1154,11 @@ export function settingsRoutes(app: FastifyInstance): void {
         (request.body as z.infer<typeof updateSettingBody>).value,
       );
       if (normalized == null) {
-        await reply.status(400).send(invalidSettingError(key));
+        await reply
+          .status(400)
+          .send(
+            invalidSettingError(key, (request.body as z.infer<typeof updateSettingBody>).value),
+          );
         return;
       }
       try {
@@ -961,7 +1233,11 @@ export function settingsRoutes(app: FastifyInstance): void {
         (request.body as z.infer<typeof updateSettingBody>).value,
       );
       if (normalized == null) {
-        await reply.status(400).send(invalidSettingError(key));
+        await reply
+          .status(400)
+          .send(
+            invalidSettingError(key, (request.body as z.infer<typeof updateSettingBody>).value),
+          );
         return;
       }
       try {
@@ -1082,14 +1358,15 @@ export function settingsRoutes(app: FastifyInstance): void {
       const map = new Map<string, unknown>();
       for (const row of rows) map.set(row.key, row.value);
       const bucket = map.get('s3.bucket') as string | undefined;
-      const region = map.get('s3.region') as string | undefined;
+      const provider = map.get('s3.provider');
       const accessKeyIdEnc = map.get('s3.accessKeyIdEnc') as string | undefined;
       const secretAccessKeyEnc = map.get('s3.secretAccessKeyEnc') as string | undefined;
+      const endpoint = map.get('s3.endpoint') as string | undefined;
       const configured =
+        (provider !== 's3-compatible' || (endpoint != null && endpoint !== '')) &&
         bucket != null &&
         bucket !== '' &&
-        region != null &&
-        region !== '' &&
+        effectiveStorageRegion(provider, map.get('s3.region')) != null &&
         accessKeyIdEnc != null &&
         accessKeyIdEnc !== '' &&
         secretAccessKeyEnc != null &&
@@ -1099,11 +1376,73 @@ export function settingsRoutes(app: FastifyInstance): void {
   );
 
   const s3SettingsBody = z.object({
+    provider: z
+      .enum(STORAGE_PROVIDERS)
+      .optional()
+      .describe('Storage provider: s3 (AWS S3, the default) or s3-compatible (a custom endpoint)'),
     bucket: z.string().min(1),
-    region: z.string().min(1),
-    accessKeyId: z.string().min(1),
-    secretAccessKey: z.string().min(1),
+    region: z
+      .string()
+      .max(64)
+      .optional()
+      .describe(
+        'Region of the bucket. Required for s3. Optional for s3-compatible: empty or missing signs with us-east-1',
+      ),
+    accessKeyId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Access key id. Omit to keep the stored one; required when none is stored or the provider or endpoint changes',
+      ),
+    secretAccessKey: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Secret access key. Omit to keep the stored one; required when none is stored or the provider or endpoint changes',
+      ),
+    endpoint: z
+      .string()
+      .max(2048)
+      .optional()
+      .describe(
+        'S3-compatible endpoint URL without a path, required for s3-compatible. https on a public host, or a host in allowedPrivateHosts (which may use http)',
+      ),
+    forcePathStyle: z
+      .boolean()
+      .optional()
+      .describe('Address the bucket in the path instead of the host name (s3-compatible only)'),
+    allowedPrivateHosts: z
+      .array(z.string().max(253))
+      .optional()
+      .describe(
+        'Hosts on a private network the endpoint may name, without scheme or port (s3-compatible only). Link-local, cloud metadata and other unroutable addresses are refused even when listed',
+      ),
+    proof: factorProof
+      .optional()
+      .describe(
+        'Fresh proof of the account, required from a signed-in session when the provider or the endpoint changes',
+      ),
   });
+
+  const invalidStorageEndpointError = {
+    error:
+      'The endpoint must be an https URL without credentials or path on a public host, or name a host in allowedPrivateHosts',
+    code: 'PRIVATE_URL',
+  };
+
+  const invalidStorageAllowedHostsError = {
+    error: `allowedPrivateHosts must be at most ${String(MAX_ALLOWED_PRIVATE_HOSTS)} hostnames or IP addresses without scheme or port, and no link-local, cloud metadata or other unroutable address`,
+    code: 'VALIDATION_ERROR',
+    field: 'allowedPrivateHosts',
+  };
+
+  const missingStorageRegionError = {
+    error: 'region is required for AWS S3',
+    code: 'VALIDATION_ERROR',
+    field: 'region',
+  };
 
   // Save S3 storage settings (encrypts credentials)
   app.put(
@@ -1114,10 +1453,28 @@ export function settingsRoutes(app: FastifyInstance): void {
         tags: ['Settings'],
         summary: 'Save S3 storage settings',
         operationId: 'updateS3Settings',
+        description:
+          'Saves the storage provider, bucket, region and credentials. A credential left out keeps the stored one, except with a new provider or endpoint, which takes both credentials. A change of the provider or the endpoint decides where the credentials are sent, so it needs a fresh proof from a signed-in session (an API key gets 403 SESSION_REQUIRED).',
         security: [{ bearerAuth: [] }],
         body: zodSchema(s3SettingsBody),
         response: {
           200: successResponse,
+          400: errorWith(
+            'Invalid storage endpoint or private hosts, a missing region or credential, or a missing or wrong proof',
+            [ERROR_CODES.PRIVATE_URL, ERROR_CODES.VALIDATION_ERROR, ...SESSION_PROOF_ERROR_CODES],
+            {
+              ...sessionProofErrorFields,
+              field: z
+                .enum(['allowedPrivateHosts', 'region', 'accessKeyId', 'secretAccessKey'])
+                .optional()
+                .describe(
+                  'The refused field: the private hosts list, a missing region for AWS S3, or a missing credential',
+                ),
+            },
+          ),
+          403: errorWith('API key changing the provider or endpoint', [
+            ERROR_CODES.SESSION_REQUIRED,
+          ]),
           404: errorWith('Setting not found', [ERROR_CODES.SETTING_NOT_FOUND]),
           500: errorWith('Encryption key missing', [ERROR_CODES.ENCRYPTION_KEY_MISSING]),
         },
@@ -1135,6 +1492,32 @@ export function settingsRoutes(app: FastifyInstance): void {
         return;
       }
 
+      // AWS S3 clears the endpoint settings, so a later switch starts empty.
+      const provider = body.provider ?? 's3';
+      // An S3-compatible provider may leave the region empty (stored empty,
+      // signed with us-east-1 by the storage loader); AWS S3 needs one.
+      const region = (body.region ?? '').trim();
+      if (effectiveStorageRegion(provider, region) == null) {
+        await reply.status(400).send(missingStorageRegionError);
+        return;
+      }
+      let endpoint = '';
+      let allowedPrivateHosts: string[] = [];
+      if (provider === 's3-compatible') {
+        const hosts = parseStorageAllowedPrivateHosts(body.allowedPrivateHosts ?? []);
+        if (hosts == null) {
+          await reply.status(400).send(invalidStorageAllowedHostsError);
+          return;
+        }
+        const validEndpoint = validateStorageEndpoint(body.endpoint, hosts);
+        if (validEndpoint == null) {
+          await reply.status(400).send(invalidStorageEndpointError);
+          return;
+        }
+        endpoint = validEndpoint;
+        allowedPrivateHosts = hosts;
+      }
+
       const upsert = (key: string, value: unknown) =>
         db
           .insert(settings)
@@ -1145,24 +1528,79 @@ export function settingsRoutes(app: FastifyInstance): void {
           });
 
       const written: Array<{ key: string; value: unknown }> = [
+        { key: 's3.provider', value: provider },
+        { key: 's3.endpoint', value: endpoint },
+        {
+          key: 's3.forcePathStyle',
+          value: provider === 's3-compatible' && body.forcePathStyle === true,
+        },
+        { key: 's3.allowedPrivateHosts', value: allowedPrivateHosts },
         { key: 's3.bucket', value: body.bucket },
-        { key: 's3.region', value: body.region },
-        { key: 's3.accessKeyIdEnc', value: encryptString(body.accessKeyId, encryptionKey) },
-        { key: 's3.secretAccessKeyEnc', value: encryptString(body.secretAccessKey, encryptionKey) },
+        { key: 's3.region', value: region },
       ];
+      // A credential left out keeps the stored one (a form sends only the
+      // credentials its user edited, so a rotated key is not put back).
+      const credentials = [
+        { key: 's3.accessKeyIdEnc', field: 'accessKeyId', value: body.accessKeyId },
+        { key: 's3.secretAccessKeyEnc', field: 'secretAccessKey', value: body.secretAccessKey },
+      ] as const;
+      for (const credential of credentials) {
+        if (credential.value !== undefined) {
+          written.push({
+            key: credential.key,
+            value: encryptString(credential.value, encryptionKey),
+          });
+        }
+      }
 
-      const keysToWrite = written.map((w) => w.key);
-      const beforeRows = await db.select().from(settings).where(inArray(settings.key, keysToWrite));
+      const keysToRead = [...written.map((w) => w.key), ...credentials.map((c) => c.key)];
+      const beforeRows = await db
+        .select()
+        .from(settings)
+        .where(inArray(settings.key, [...new Set(keysToRead)]));
       const beforeMap = new Map<string, unknown>();
       for (const row of beforeRows) beforeMap.set(row.key, row.value);
+      const storedValue = (key: string): unknown =>
+        beforeMap.get(key) ?? STORAGE_ENDPOINT_SETTING_DEFAULTS[key];
+
+      // The provider and the endpoint decide where the stored credentials are
+      // sent, so changing them takes a fresh proof from a session (a stolen
+      // session alone must not point storage at another host), and an API key
+      // cannot change them (security review case 280).
+      const destinationChanged =
+        storedValue('s3.provider') !== provider || storedValue('s3.endpoint') !== endpoint;
+      if (destinationChanged && isApiKeyRequest(request)) {
+        await reply.status(403).send({
+          error: 'The storage provider and endpoint change only from a signed-in session',
+          code: 'SESSION_REQUIRED',
+        });
+        return;
+      }
+      // A stored credential never follows a new destination, and a missing
+      // one cannot be kept.
+      for (const credential of credentials) {
+        if (credential.value !== undefined) continue;
+        const stored = beforeMap.get(credential.key);
+        if (destinationChanged || typeof stored !== 'string' || stored === '') {
+          await reply.status(400).send({
+            error: `${credential.field} is required when none is stored or the provider or endpoint changes`,
+            code: 'VALIDATION_ERROR',
+            field: credential.field,
+          });
+          return;
+        }
+      }
+      if (destinationChanged && !(await requireSessionProof(request, reply, body.proof))) return;
 
       await Promise.all(written.map((w) => upsert(w.key, w.value)));
-      clearS3ConfigCache();
+      clearObjectStorageCache();
 
+      // A storage endpoint setting without a row reads as its default, so
+      // writing the default (an AWS S3 install saving again) is no change.
       const actor = getAuditActor(request);
       await Promise.allSettled(
         written
-          .filter(({ key, value }) => beforeMap.get(key) !== value)
+          .filter(({ key, value }) => JSON.stringify(storedValue(key)) !== JSON.stringify(value))
           .map(({ key, value }) =>
             writeAudit(
               { table: settingAuditLog, idColumn: 'setting_key' },
@@ -1184,7 +1622,7 @@ export function settingsRoutes(app: FastifyInstance): void {
     },
   );
 
-  // Test S3 connection by listing objects (max 1)
+  // Test the storage connection (S3 lists at most one object)
   app.post(
     '/settings/s3/test',
     {
@@ -1206,9 +1644,8 @@ export function settingsRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       if (!(await requireAllSiteAccess(request, reply, settingNotFound))) return;
-      const { getS3Config: getConfig } = await import('../services/s3.service.js');
-      const s3 = await getConfig();
-      if (s3 == null) {
+      const storage = await getObjectStorage();
+      if (storage == null) {
         await reply
           .status(400)
           .send({ error: 'S3 not configured', code: 'STORAGE_NOT_CONFIGURED' });
@@ -1216,12 +1653,15 @@ export function settingsRoutes(app: FastifyInstance): void {
       }
 
       try {
-        const { ListObjectsV2Command } = await import('@aws-sdk/client-s3');
-        await s3.client.send(new ListObjectsV2Command({ Bucket: s3.bucket, MaxKeys: 1 }));
+        await storage.testConnection();
         return { success: true };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        await reply.status(400).send({ error: message, code: 'STORAGE_CONNECTION_FAILED' });
+        // The provider's message can name internal hosts or addresses, so it
+        // stays in the server log (security review case 279).
+        request.log.warn({ err }, 'Storage connection test failed');
+        await reply
+          .status(400)
+          .send({ error: 'Storage connection failed', code: 'STORAGE_CONNECTION_FAILED' });
         return;
       }
     },

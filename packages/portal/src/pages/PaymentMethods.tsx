@@ -7,9 +7,9 @@ import { useTranslation } from 'react-i18next';
 import { CreditCard, Trash2, Star } from 'lucide-react';
 import { PageHeader } from '@/components/PageHeader';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Skeleton } from '@/components/ui/skeleton';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { InfoNote } from '@/components/ui/info-note';
@@ -20,6 +20,7 @@ import { ProviderHost } from '@/payments/ProviderHost';
 import { startSetup } from '@/payments/api';
 import { createCardSetupSteps, type CardSetupSteps } from '@/payments/setup-attempt';
 import type { PaymentMethodItem, SetupSession } from '@/payments/types';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
 
 function formatBrand(brand: string | null): string {
   if (brand == null || brand.length === 0) return '';
@@ -37,7 +38,12 @@ export function PaymentMethods(): React.JSX.Element {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const billing = useDriverBilling();
 
-  const { data: methods, isLoading } = useQuery({
+  const {
+    data: methods,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['portal-payment-methods'],
     queryFn: () => api.get<PaymentMethodItem[]>('/v1/portal/payment-methods'),
   });
@@ -121,23 +127,28 @@ export function PaymentMethods(): React.JSX.Element {
           </CardContent>
         </Card>
       ) : (
-        <Button className="w-full" disabled={starting} onClick={() => void handleShowAdd()}>
-          {t('payments.addCard')}
-        </Button>
+        <CreateButton
+          label={t('payments.addCard')}
+          fullWidth
+          disabled={starting}
+          onClick={() => void handleShowAdd()}
+        />
       )}
 
-      {isLoading && (
-        <div className="space-y-2">
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
-        </div>
+      {isLoading && <LoadingState />}
+
+      {isError && (
+        <ErrorState
+          onRetry={() => {
+            void refetch();
+          }}
+        />
       )}
 
       {methods != null && methods.length === 0 && setup == null && (
-        <p className="text-center text-sm text-muted-foreground">
+        <EmptyState>
           {billing?.mode === 'account' ? t('fleetBilling.noMethods') : t('payments.noMethods')}
-        </p>
+        </EmptyState>
       )}
 
       <div className="space-y-2">

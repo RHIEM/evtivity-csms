@@ -21,7 +21,12 @@ import { db, client } from './config.js';
 import { sql, eq, and, inArray, isNotNull, isNull } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { sessionSiteIdSql } from './lib/session-site.js';
-import { getCompanyCurrency, clearSystemSettingsCache } from './lib/system-settings.js';
+import { demoVehicleLook } from './seed-demo-vehicles.js';
+import {
+  getCompanyCurrency,
+  getCompanyTaxBasis,
+  clearSystemSettingsCache,
+} from './lib/system-settings.js';
 import {
   settings,
   sites,
@@ -49,8 +54,6 @@ import {
   reservations,
   sitePowerLimits,
   siteLoadManagement,
-  panels,
-  circuits,
   paymentRecords,
   supportCases,
   supportCaseSessions,
@@ -101,7 +104,7 @@ import {
   seedSessionElectricityCostCents,
 } from './seed-electricity-rates.js';
 import { mapSeedSettings, seedSettingRows } from './seed-settings.js';
-import { demoStationProtocol } from './seed-station-defs.js';
+import { demoStationProtocol, STATION_MODELS, STATION_MODELS_16 } from './seed-station-defs.js';
 import argon2 from 'argon2';
 import {
   calculateCo2AvoidedKg,
@@ -233,29 +236,6 @@ const VENDOR_NAMES = [
   'Blink Charging',
 ];
 
-const STATION_MODELS: Array<{ model: string; power: number; type: string; amps: number }> = [
-  { model: 'Terra 360', power: 360, type: 'CCS1', amps: 500 },
-  { model: 'Terra 184', power: 180, type: 'CCS1', amps: 250 },
-  { model: 'CT4000', power: 7, type: 'Type1', amps: 32 },
-  { model: 'CP6000', power: 19, type: 'Type1', amps: 32 },
-  { model: 'RTM75', power: 75, type: 'CCS1', amps: 200 },
-  { model: 'RT50', power: 50, type: 'CCS1', amps: 125 },
-  { model: 'BusinessLine', power: 22, type: 'Type1', amps: 32 },
-  { model: 'Troniq 50', power: 50, type: 'CCS1', amps: 125 },
-  { model: 'Pulsar Plus', power: 11, type: 'Type1', amps: 16 },
-  { model: 'JuiceBox', power: 40, type: 'Type1', amps: 48 },
-  { model: 'Series 6', power: 150, type: 'CCS1', amps: 350 },
-  { model: 'IQ 200', power: 200, type: 'CCS1', amps: 500 },
-];
-
-// Simpler models typical of OCPP 1.6-era chargers
-const STATION_MODELS_16: Array<{ model: string; power: number; type: string; amps: number }> = [
-  { model: 'CT4000 (1.6)', power: 7, type: 'Type1', amps: 32 },
-  { model: 'AV-30 (1.6)', power: 22, type: 'Type1', amps: 32 },
-  { model: 'QC-50 (1.6)', power: 50, type: 'CCS1', amps: 125 },
-  { model: 'DualPlug (1.6)', power: 43, type: 'Type1', amps: 63 },
-];
-
 const FIRST_NAMES = [
   'James',
   'Mary',
@@ -364,12 +344,12 @@ const LAST_NAMES = [
 
 const EV_MAKES: Array<{ make: string; models: string[] }> = [
   { make: 'Tesla', models: ['Model 3', 'Model Y', 'Model S', 'Model X'] },
-  { make: 'Chevrolet', models: ['Bolt EV', 'Bolt EUV', 'Equinox EV'] },
-  { make: 'Ford', models: ['Mustang Mach-E', 'F-150 Lightning'] },
+  { make: 'Chevrolet', models: ['Bolt EV', 'Bolt EUV', 'Equinox EV', 'Silverado EV'] },
+  { make: 'Ford', models: ['Mustang Mach-E', 'F-150 Lightning', 'E-Transit'] },
   { make: 'Hyundai', models: ['Ioniq 5', 'Ioniq 6', 'Kona Electric'] },
   { make: 'Kia', models: ['EV6', 'EV9', 'Niro EV'] },
   { make: 'BMW', models: ['iX', 'i4', 'i7'] },
-  { make: 'Mercedes-Benz', models: ['EQS', 'EQE', 'EQB'] },
+  { make: 'Mercedes-Benz', models: ['EQS', 'EQE', 'EQB', 'eSprinter'] },
   { make: 'Volkswagen', models: ['ID.4', 'ID.Buzz'] },
   { make: 'Rivian', models: ['R1T', 'R1S'] },
   { make: 'Nissan', models: ['Leaf', 'Ariya'] },
@@ -511,14 +491,28 @@ async function seed(): Promise<void> {
   const defaultSettings: Record<string, unknown> = {
     'system.name': 'EVtivity CSMS',
     'system.timezone': 'America/New_York',
-    'ocpp.heartbeatInterval': 300,
+    // Data plans (features/station-data-plans.md): ocpp.* is Wi-Fi or wired
+    // (AC for the charging keys), ocpp.dc.* its DC charging values, and
+    // ocpp.cellular.* the Cellular plan.
+    'ocpp.heartbeatInterval': 900,
+    'ocpp.csmsPingInterval': 120,
     'ocpp.meterValueInterval': 60,
+    'ocpp.sampledMeasurands': 'Energy.Active.Import.Register,Power.Active.Import,Current.Import',
+    'ocpp.dc.meterValueInterval': 30,
+    'ocpp.dc.sampledMeasurands':
+      'Energy.Active.Import.Register,Power.Active.Import,Current.Import,SoC',
     'ocpp.clockAlignedInterval': 900,
-    'ocpp.sampledMeasurands':
-      'Energy.Active.Import.Register,Power.Active.Import,Voltage,SoC,Current.Import',
-    'ocpp.alignedMeasurands':
-      'Energy.Active.Import.Register,Power.Active.Import,Voltage,SoC,Current.Import',
+    'ocpp.alignedMeasurands': 'Energy.Active.Import.Register',
     'ocpp.txEndedMeasurands': 'Energy.Active.Import.Register',
+    'ocpp.cellular.heartbeatInterval': 3600,
+    'ocpp.cellular.csmsPingInterval': 240,
+    'ocpp.cellular.meterValueInterval': 300,
+    'ocpp.cellular.sampledMeasurands': 'Energy.Active.Import.Register,Power.Active.Import',
+    'ocpp.cellular.dc.meterValueInterval': 60,
+    'ocpp.cellular.dc.sampledMeasurands': 'Energy.Active.Import.Register,Power.Active.Import,SoC',
+    'ocpp.cellular.clockAlignedInterval': 0,
+    'ocpp.cellular.alignedMeasurands': 'Energy.Active.Import.Register',
+    'ocpp.cellular.txEndedMeasurands': 'Energy.Active.Import.Register',
     'ocpp.connectionTimeout': 120,
     'ocpp.resetRetries': 3,
     'ocpp.offlineCommandTtlHours': 24,
@@ -535,6 +529,8 @@ async function seed(): Promise<void> {
       'This site is temporarily unavailable for maintenance. {{reason}}',
     'notifications.emailEnabled': true,
     'notifications.webhookAllowedPrivateHosts': [],
+    // Generated in the CSMS (Settings > Notifications > Webhooks); empty: unsigned.
+    'notifications.webhookSigningSecretEnc': '',
     'ftp.host': 'ftp',
     'ftp.port': 21,
     'ftp.username': 'evtivity',
@@ -552,6 +548,12 @@ async function seed(): Promise<void> {
     's3.region': '',
     's3.accessKeyIdEnc': '',
     's3.secretAccessKeyEnc': '',
+    // Storage provider (v0.1.49, migration 0480): s3 (AWS S3) or s3-compatible
+    // with its endpoint; written only through PUT /v1/settings/s3.
+    's3.provider': 's3',
+    's3.endpoint': '',
+    's3.forcePathStyle': false,
+    's3.allowedPrivateHosts': [],
     // Provider for new payments; 'none' turns payments off (migration 0116).
     'payments.provider': 'none',
     // Default hold amount and platform fee, any provider (migration 0125).
@@ -656,10 +658,20 @@ async function seed(): Promise<void> {
     'security.session.operatorRefreshDays': 30,
     'security.session.driverAccessMinutes': 60,
     'security.session.driverRefreshDays': 30,
+    // Payment terminals: the ID TECH provider (off by default).
+    'paymentTerminals.idtech.enabled': false,
+    'paymentTerminals.idtech.environment': 'sandbox',
+    'paymentTerminals.idtech.merchantId': '',
+    'paymentTerminals.idtech.apiKeyEnc': '',
+    'paymentTerminals.idtech.apiSecretEnc': '',
+    'paymentTerminals.idtech.webhookSecretEnc': '',
     // SIM providers (off by default) and station signal reads.
     'sim.hologram.enabled': false,
     'sim.hologram.orgId': '',
     'sim.hologram.apiKeyEnc': '',
+    'sim.1nce.enabled': false,
+    'sim.1nce.clientId': '',
+    'sim.1nce.clientSecretEnc': '',
     'sim.sessions.retentionDays': 90,
     'sim.sessions.fetchDays': 7,
     'sim.stationSignal.enabled': false,
@@ -792,6 +804,7 @@ async function seed(): Promise<void> {
     'aiInsights.primaryLanguage': 'en',
     'aiInsights.retentionDays': 90,
     'aiInsights.expireAfterDays': 7,
+    'aiInsights.scope': 'all',
     'aiWorkers.networkSummary.enabled': false,
     'aiWorkers.stuckSessions.enabled': false,
     'aiWorkers.stuckSessions.idleMinutes': 90,
@@ -1093,7 +1106,13 @@ async function seed(): Promise<void> {
     saratogaSiteCoords.set(site.id, coords);
   }
 
-  const stationModels: Array<{ model: string; power: number; type: string; amps: number }> = [];
+  const stationModels: Array<{
+    model: string;
+    power: number;
+    type: string;
+    amps: number;
+    outputs?: number;
+  }> = [];
   const stationJitter = () => (Math.random() - 0.5) * 0.004; // ~200m offset
   const stationRows = Array.from({ length: 2000 }, (_, i) => {
     const ocppProtocol = demoStationProtocol(i);
@@ -1237,86 +1256,10 @@ async function seed(): Promise<void> {
   await db.insert(siteLoadManagement).values(loadMgmtRows);
   console.log(`  ${String(loadMgmtRows.length)} site load management configs created.`);
 
-  // ------ Panels and Circuits (for hierarchical load management) ------
-  const panelRows: Array<{
-    siteId: string;
-    name: string;
-    breakerRatingAmps: number;
-    voltageV: number;
-    phases: number;
-    maxContinuousKw: string;
-    safetyMarginKw: string;
-  }> = [];
-  for (let i = 0; i < Math.min(8, createdSites.length); i++) {
-    const site = createdSites[i];
-    if (site == null) continue;
-    const amps = [100, 200, 150, 200, 100, 150, 200, 100][i] ?? 200;
-    const voltage = 240;
-    const phases = i % 3 === 0 ? 3 : 1;
-    const maxKw = (amps * voltage * phases * 0.8) / 1000;
-    panelRows.push({
-      siteId: site.id,
-      name: `Main Panel ${String.fromCharCode(65 + i)}`,
-      breakerRatingAmps: amps,
-      voltageV: voltage,
-      phases,
-      maxContinuousKw: String(maxKw),
-      safetyMarginKw: String(randomInt(2, 8)),
-    });
-  }
-  const createdPanels = await db.insert(panels).values(panelRows).returning();
-  console.log(`  ${String(createdPanels.length)} panels created.`);
-
-  // Create 2 circuits per panel and assign stations
-  const circuitRows: Array<{
-    panelId: string;
-    name: string;
-    breakerRatingAmps: number;
-    maxContinuousKw: string;
-  }> = [];
-  for (const panel of createdPanels) {
-    const parentVoltage = panelRows.find((p) => p.siteId === panel.siteId)?.voltageV ?? 240;
-    const parentPhases = panelRows.find((p) => p.siteId === panel.siteId)?.phases ?? 1;
-    for (let c = 0; c < 2; c++) {
-      const circuitAmps = [40, 50][c] ?? 40;
-      const circuitMaxKw = (circuitAmps * parentVoltage * parentPhases * 0.8) / 1000;
-      circuitRows.push({
-        panelId: panel.id,
-        name: `Circuit ${String(c + 1)}`,
-        breakerRatingAmps: circuitAmps,
-        maxContinuousKw: String(circuitMaxKw),
-      });
-    }
-  }
-  const createdCircuits = await db.insert(circuits).values(circuitRows).returning();
-  console.log(`  ${String(createdCircuits.length)} circuits created.`);
-
-  // Assign stations to circuits (round-robin among circuits for the same site)
-  const circuitsBySite = new Map<string, string[]>();
-  for (const circuit of createdCircuits) {
-    const panelRow = createdPanels.find((p) => p.id === circuit.panelId);
-    if (panelRow == null) continue;
-    const list = circuitsBySite.get(panelRow.siteId) ?? [];
-    list.push(circuit.id);
-    circuitsBySite.set(panelRow.siteId, list);
-  }
-  let assignedCount = 0;
-  // stationRows has siteId, createdStations has id. Zip them together.
-  for (let si = 0; si < stationRows.length; si++) {
-    const stationInput = stationRows[si];
-    const stationCreated = createdStations[si];
-    if (stationInput == null || stationCreated == null) continue;
-    const siteCircuits = circuitsBySite.get(stationInput.siteId);
-    if (siteCircuits == null || siteCircuits.length === 0) continue;
-    const circuitId = siteCircuits[assignedCount % siteCircuits.length];
-    if (circuitId == null) continue;
-    await db
-      .update(chargingStations)
-      .set({ circuitId })
-      .where(eq(chargingStations.id, stationCreated.id));
-    assignedCount++;
-  }
-  console.log(`  ${String(assignedCount)} stations assigned to circuits.`);
+  // ------ Panels and Circuits ------
+  // Every site's transformers, switchboards and panelboards are sized to its
+  // stations' connected load after the connectors exist (seedSitePower, run
+  // by seedDemoFeatures below, seed-site-power.ts).
 
   // ------ EVSEs (400 - 2 per station) and Connectors (400) ------
   // All connectors start unavailable. The CSS simulator sets them available via StatusNotification after connecting.
@@ -1335,9 +1278,10 @@ async function seed(): Promise<void> {
   const autoCreateGapEvses: Array<{ stationIdx: number; evseId: number }> = [];
   for (let i = 0; i < createdStations.length; i++) {
     const is16 = !isOcpp2x(at(stationRows, i).ocppProtocol);
-    // 1.6 stations get 1-2 connectors, each with its own EVSE (EVSE N / connector N)
-    // 2.x stations get 2-3 EVSEs
-    const numEvses = is16 ? randomInt(1, 2) : i % 5 === 0 ? 3 : 2;
+    // 1.6 stations get 1-2 connectors, each with its own EVSE (EVSE N / connector N).
+    // 2.x stations get 2 EVSEs, a DC split system one per satellite
+    // (`STATION_MODELS` outputs): no single dispenser gets three or more.
+    const numEvses = is16 ? randomInt(1, 2) : (at(stationModels, i).outputs ?? 2);
     // For every 10th 2.x station, skip the last EVSE so the simulator triggers auto-creation
     const maxEvse = !is16 && i % 10 === 0 ? numEvses - 1 : numEvses;
     if (!is16 && i % 10 === 0) {
@@ -1692,10 +1636,12 @@ async function seed(): Promise<void> {
   // ------ Vehicles (120) ------
   const vehicleRows = createdDrivers.slice(0, 120).map((driver, i) => {
     const evMake = pick(EV_MAKES);
+    const model = pick(evMake.models);
     return {
       driverId: driver.id,
       make: evMake.make,
-      model: pick(evMake.models),
+      model,
+      ...demoVehicleLook(model, driver.id),
       year: String(randomInt(2020, 2025)),
       vin: `${String(i + 1).padStart(4, '0')}ABCDEF${String(randomInt(10000, 99999))}`.slice(0, 17),
       licensePlate: `${String.fromCharCode(65 + randomInt(0, 25))}${String.fromCharCode(65 + randomInt(0, 25))}${String.fromCharCode(65 + randomInt(0, 25))}-${padNum(randomInt(1000, 9999), 4)}`,
@@ -2400,6 +2346,10 @@ async function seed(): Promise<void> {
       countryCode: 'NL',
       partyId: 'SIM',
       roles: ['EMSP'],
+      // The seed is the operator here: it approves the role the simulator
+      // registers with, which every OCPI module checks (deny by default).
+      approvedRoles: ['EMSP'],
+      rolesApprovedAt: new Date(),
       ourRoles: ['CPO'],
       status: 'pending',
       version: '2.2.1',
@@ -2466,6 +2416,8 @@ async function seed(): Promise<void> {
       countryCode: 'DE',
       partyId: 'CPO',
       roles: ['CPO'],
+      approvedRoles: ['CPO'],
+      rolesApprovedAt: new Date(),
       ourRoles: ['EMSP'],
       status: 'pending',
       version: '2.2.1',
@@ -2810,6 +2762,28 @@ async function seed(): Promise<void> {
       subjectSecret: process.env['SETTINGS_ENCRYPTION_KEY'] ?? '',
     });
     console.log(`  ${String(aiInsights)} AI insights created.`);
+  }
+
+  // ------ Plug and Charge, free vend and SIM providers ------
+  // Contracts and the sessions their eMAID tokens started on two SP3 stations,
+  // a free vend site with two stations and its sessions, and SIMs confirmed on
+  // four SP3 stations with the history a Refresh stores (seed-demo-features.ts).
+  // Turns pnc.enabled and sim.hologram.enabled on (no provider credential).
+  {
+    const [featureActor] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, initialAdminEmail));
+    const { seedDemoFeatures } = await import('./seed-demo-features.js');
+    const features = await seedDemoFeatures(client, {
+      now: seedNow,
+      currency: companyCurrency,
+      taxBasis: await getCompanyTaxBasis(),
+      actorUserId: featureActor?.id ?? null,
+    });
+    console.log(
+      `  Demo features created (${String(features.powerSites)} sites with sized power equipment, ${String(features.pncSessions)} Plug and Charge sessions, ${String(features.freeVendSessions)} free vend sessions, ${String(features.sims)} SIMs, ${String(features.terminalPayments)} terminal payments, ${String(features.layoutStations)} site layout demo stations, ${String(features.driverAvatars)} demo driver avatars, ${String(features.vehicleLooks)} demo vehicle looks, ${String(features.vehicleSessions)} sessions linked to their vehicle).`,
+    );
   }
 
   // Portal driver support cases (the portal Support page should show data)
@@ -3443,6 +3417,8 @@ async function seed(): Promise<void> {
     make: 'Tesla',
     model: 'Model 3',
     year: '2024',
+    color: 'white',
+    bodyType: 'sedan',
   });
 
   // Portal driver RFID tokens
@@ -3589,16 +3565,14 @@ async function seed(): Promise<void> {
           .limit(1)
       : [null];
 
+  // The boot push owns the heartbeat and meter value settings (station data
+  // plans), so the demo templates hold none of them.
   const configTemplateDefs = [
     {
       name: 'Standard OCPP 2.1 Config',
       description: 'Default configuration for all OCPP 2.1 stations',
       ocppVersion: '2.1' as const,
-      variables: [
-        { component: 'OCPPCommCtrlr', variable: 'HeartbeatInterval', value: '300' },
-        { component: 'SampledDataCtrlr', variable: 'TxUpdatedInterval', value: '60' },
-        { component: 'AuthCtrlr', variable: 'LocalPreAuthorize', value: 'true' },
-      ],
+      variables: [{ component: 'AuthCtrlr', variable: 'LocalPreAuthorize', value: 'true' }],
       pushCount: 2,
       stationsPerPush: 40,
     },
@@ -3606,11 +3580,7 @@ async function seed(): Promise<void> {
       name: 'High-Traffic Site Config',
       description: 'Optimized settings for busy locations',
       ocppVersion: '2.1' as const,
-      variables: [
-        { component: 'OCPPCommCtrlr', variable: 'HeartbeatInterval', value: '120' },
-        { component: 'SampledDataCtrlr', variable: 'TxUpdatedInterval', value: '30' },
-        { component: 'TxCtrlr', variable: 'StopTxOnInvalidId', value: 'true' },
-      ],
+      variables: [{ component: 'TxCtrlr', variable: 'StopTxOnInvalidId', value: 'true' }],
       targetFilter: { siteId: at(createdSites, 1).id },
       pushCount: 1,
       stationsPerPush: 25,
@@ -3619,11 +3589,7 @@ async function seed(): Promise<void> {
       name: 'OCPP 1.6 Legacy Config',
       description: 'Configuration for OCPP 1.6 stations',
       ocppVersion: '1.6' as const,
-      variables: [
-        { component: '', variable: 'HeartbeatInterval', value: '300' },
-        { component: '', variable: 'MeterValueSampleInterval', value: '60' },
-        { component: '', variable: 'LocalPreAuthorize', value: 'true' },
-      ],
+      variables: [{ component: '', variable: 'LocalPreAuthorize', value: 'true' }],
       pushCount: 1,
       stationsPerPush: 30,
     },

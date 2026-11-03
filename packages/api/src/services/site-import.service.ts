@@ -10,6 +10,8 @@ import {
   setStationDisabled,
   isOperatorStation,
   siteInsightsSuppressedSql,
+  moveStationLayout,
+  placeStationOnLayout,
 } from '@evtivity/database';
 import { siteNameEq } from '../lib/site-lookup.js';
 import {
@@ -23,15 +25,20 @@ import {
   stationAuditLog,
   siteLoadManagement,
 } from '@evtivity/database';
-import { csvEscape } from '@evtivity/lib';
+import { CONNECTOR_TYPES, csvEscape } from '@evtivity/lib';
 import { sendAvailabilityCommand } from '@evtivity/services/availability-command';
 import { requestStationMessageRepush } from '@evtivity/services/station-message.service';
+import {
+  pushStationDataPlanChanges,
+  snapshotStationDataPlansByOcppIds,
+} from '@evtivity/services/station-data-plan.service';
 import { publishStationStatusChanged } from '../lib/station-status-events.js';
 import { publishOcpiStationSiteMove } from '../lib/ocpi-location-push.js';
 import { siteInScope } from '../lib/site-scope.js';
 import { circuitIdAfterSiteChange } from '../lib/station-circuit.js';
 import { createStationConfigTemplate } from '../lib/station-config-template.js';
 import { applyStationSiteMove } from '@evtivity/services/maintenance.service';
+import { initialSiteAiInsightsSelected } from './ai-insight-scope.service.js';
 
 interface ImportActor {
   actor: 'operator' | 'driver' | 'api_key' | 'system' | 'ocpp';
@@ -41,7 +48,7 @@ interface ImportActor {
   actorLabel?: string | null;
 }
 
-const VALID_CONNECTOR_TYPES = ['CCS2', 'CHAdeMO', 'Type2', 'Type1', 'GBT', 'Tesla', 'NACS'];
+const VALID_CONNECTOR_TYPES: readonly string[] = CONNECTOR_TYPES;
 
 const CSV_HEADER =
   'siteName,stationId,stationModel,stationSerialNumber,stationStatus,onboardingStatus,evseId,connectorId,connectorType,maxPowerKw,maxCurrentAmps,stationVendor';
@@ -250,6 +257,18 @@ export async function importSitesCsv(
   const operatorDisableByUuid = new Map<string, boolean>();
   // Existing stations the import moves to another site (OCPI location push).
   const siteMoves: Array<{ stationUuid: string; fromSiteId: string | null; toSiteId: string }> = [];
+  // The data plan and charging kind of the existing stations the import
+  // names, so a site move or a connector type change pushes the new values
+  // after the commit. New stations get theirs at their first boot.
+  const namedStationIds = [
+    ...new Set(validRows.map((e) => e.row.stationId).filter((id): id is string => !!id)),
+  ];
+  const planBefore = await snapshotStationDataPlansByOcppIds(
+    namedStationIds,
+    logger != null ? { log: logger } : {},
+  );
+  // A site created while only selected sites are analyzed starts unselected.
+  const newSiteAiInsightsSelected = await initialSiteAiInsightsSelected();
   await db.transaction(async (tx) => {
     const siteIdByName = new Map<string, string>();
     const evseUuidByKey = new Map<string, string>();
@@ -301,7 +320,10 @@ export async function importSitesCsv(
           result.errors.push(`Site "${siteName}" already exists, skipped`);
         }
       } else {
-        const [site] = await tx.insert(sites).values({ name: siteName }).returning();
+        const [site] = await tx
+          .insert(sites)
+          .values({ name: siteName, aiInsightsEnabled: newSiteAiInsightsSelected })
+          .returning();
         if (site != null) {
           siteIdByName.set(siteName, site.id);
           result.sitesCreated++;
@@ -423,6 +445,10 @@ export async function importSitesCsv(
             // A new station gets its bound config template, like POST /v1/stations
             // (idempotent for one that already has it).
             if (previous == null) await createStationConfigTemplate(tx, station);
+            // A new station takes the first free slot of its site layout; a
+            // moved one leaves the old site's layout for a free slot here.
+            if (previous == null) await placeStationOnLayout(tx, siteId, station.id);
+            else if (previous.siteId !== siteId) await moveStationLayout(tx, station.id, siteId);
             if (previous != null && previous.siteId !== siteId) {
               siteMoves.push({
                 stationUuid: station.id,
@@ -449,6 +475,7 @@ export async function importSitesCsv(
               stationUuidByStationId.set(stationId, station.id);
               await auditImportedStation(tx, actor, null, station);
               await createStationConfigTemplate(tx, station);
+              await placeStationOnLayout(tx, siteId, station.id);
               if (requestedStatus != null) {
                 operatorDisableByUuid.set(station.id, requestedStatus === 'unavailable');
               }
@@ -599,6 +626,7 @@ export async function importSitesCsv(
     }
   });
 
+  await pushStationDataPlanChanges(planBefore, logger != null ? { log: logger } : {});
   await applyImportedAvailability(
     [...stationUuidByStationId.values()],
     operatorDisableByUuid,

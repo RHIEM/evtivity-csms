@@ -5,6 +5,7 @@ import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
+import { Spinner } from '@/components/ui/spinner';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { LANGUAGES } from '@/components/ui/language-select';
@@ -16,6 +17,8 @@ import { useCompanyPriceDisplay } from '@/hooks/use-price-display';
 import { isPriceDisplay, type PriceDisplay } from '@evtivity/lib/price-display';
 import { proofRejection, type ProofRejection } from '@/components/FactorProofField';
 import { MFA_STATUS_KEY, type PortalMfaStatus } from '@/lib/mfa-status';
+import { useDriverAvatar } from '@/lib/avatar';
+import { AvatarField } from './AvatarEditor';
 import {
   PhoneChangeProof,
   phoneChangeNeedsProof,
@@ -31,6 +34,7 @@ function comparablePhone(phone: string | null | undefined): string | null {
 export function AccountPersonalInfo(): React.JSX.Element {
   const { t } = useTranslation();
   const driver = useAuth((s) => s.driver);
+  const { data: avatar } = useDriverAvatar();
   const hydrate = useAuth((s) => s.hydrate);
   const applyLanguageLocal = useAuth((s) => s.applyLanguageLocal);
   const applyTimezoneLocal = useAuth((s) => s.applyTimezoneLocal);
@@ -122,6 +126,12 @@ export function AccountPersonalInfo(): React.JSX.Element {
   return (
     <form onSubmit={(e) => void handleProfileUpdate(e)} className="space-y-4">
       {profileMsg !== '' && <p className="text-sm text-muted-foreground">{profileMsg}</p>}
+      <AvatarField
+        avatar={avatar}
+        firstName={driver?.firstName}
+        lastName={driver?.lastName}
+        mode="live"
+      />
       <div className="space-y-2">
         <label htmlFor="acctEmail" className="block text-sm font-medium leading-6">
           {t('profile.email')}
@@ -277,8 +287,13 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </p>
       </div>
 
-      <Button type="submit" className="w-full" disabled={profileLoading}>
-        {profileLoading ? t('common.saving') : t('common.save')}
+      <Button type="submit" className="relative w-full" disabled={profileLoading}>
+        {profileLoading && (
+          <span className="absolute inset-0 flex items-center justify-center">
+            <Spinner className="h-4 w-4" />
+          </span>
+        )}
+        <span className={profileLoading ? 'invisible' : ''}>{t('common.save')}</span>
       </Button>
     </form>
   );
