@@ -2506,7 +2506,8 @@
       "recipientMember": "Driver",
       "billedTo": "Billed To",
       "sendMemberTitle": "Send Driver Invoice",
-      "sendMemberConfirm": "Send {{number}} with its PDF to the driver?"
+      "sendMemberConfirm": "Send {{number}} with its PDF to the driver?",
+      "sessionReportCsv": "Session Report CSV"
     },
     "bookingStatus": {
       "scheduled": "Scheduled",
@@ -3851,7 +3852,12 @@
     "uploadReplacesHint": "Uploading a new image replaces the current one.",
     "roamingOffDescription": "The Roaming section is hidden and all OCPI traffic is blocked.",
     "pncOffDescription": "The Certificates section is hidden and certificate operations are blocked.",
-    "paymentSubTabTerminals": "Payment Terminals"
+    "paymentSubTabTerminals": "Payment Terminals",
+    "externalInvoicing": "External Invoicing",
+    "externalInvoicingToggle": "Invoice members outside EVtivity",
+    "externalInvoicingHelp": "For fleets that invoice each driver: the member invoice is issued as paid and stays internal (no invoice email, no reminder, not in the driver portal). The driver gets a charging session report with net and gross amounts instead, by email and in the portal. Download the CSV for your own invoicing on the fleet Billing tab. Fleet invoices are not affected.",
+    "externalInvoicingSaved": "External invoicing saved",
+    "externalInvoicingSaveFailed": "Could not save the external invoicing setting."
   },
   "pnc": {
     "certificates": "Certificates",
@@ -4018,6 +4024,7 @@
       "invoice.MemberInvoice": "Member Invoice Issued",
       "invoice.MemberCreditNote": "Member Credit Note Issued",
       "invoice.MemberOverdue": "Member Invoice Overdue",
+      "invoice.MemberSessionReport": "Member Session Report",
       "payment.AccountCreditLimit": "Fleet Credit Limit Reached",
       "fleet.CreditLimitWarning": "Fleet Credit Limit Warning",
       "fleet.CreditLimitReached": "Fleet Credit Limit Reached",
@@ -6056,7 +6063,8 @@
     "driver": "Driver",
     "viaFleet": "Via Fleet",
     "viaFleetBadge": "Via {{fleet}}",
-    "confirmResendMember": "Send this invoice with its PDF to the driver?"
+    "confirmResendMember": "Send this invoice with its PDF to the driver?",
+    "sessionReport": "Session Report"
   },
   "authFooter": {
     "privacyPolicy": "Privacy Policy",

@@ -101,6 +101,7 @@ export const DRIVER_INVOICE_EVENTS = [
   'invoice.MemberInvoice',
   'invoice.MemberCreditNote',
   'invoice.MemberOverdue',
+  'invoice.MemberSessionReport',
 ] as const;
 
 export const DRIVER_WATCH_EVENTS = ['watch.StationAvailable'] as const;
@@ -850,6 +851,24 @@ export const TEMPLATE_VARIABLES: Record<string, TemplateVariable[]> = {
       description: 'Invoice total with currency, in the driver language (e.g. $12.50)',
     },
     { name: 'totalCents', description: 'Invoice total in cents' },
+    { name: 'currency', description: 'Currency code' },
+    { name: 'companyName', description: 'Company name' },
+  ],
+  'invoice.MemberSessionReport': [
+    { name: 'firstName', description: 'Driver first name' },
+    { name: 'lastName', description: 'Driver last name' },
+    { name: 'fleetName', description: 'Fleet the sessions are charged on account of' },
+    {
+      name: 'periodLabel',
+      description: 'Reported month in the report language (e.g. September 2026)',
+    },
+    { name: 'sessionCount', description: 'Number of charging sessions in the report' },
+    { name: 'issuedAt', description: 'Created timestamp' },
+    {
+      name: 'total',
+      description: 'Gross total of the sessions with currency, in the driver language',
+    },
+    { name: 'totalCents', description: 'Gross total in cents' },
     { name: 'currency', description: 'Currency code' },
     { name: 'companyName', description: 'Company name' },
   ],

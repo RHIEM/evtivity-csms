@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { eq } from 'drizzle-orm';
-import { createLogger } from '@evtivity/lib';
+import { INVOICE_EXTERNAL_INVOICING_KEY, createLogger } from '@evtivity/lib';
 import { db } from '../config.js';
 import { settings } from '../schema/settings.js';
 
@@ -108,4 +108,21 @@ export function clearInvoiceSettingsCache(): void {
   cachedAt = 0;
   cachedRunDay = undefined;
   cachedRunDayAt = 0;
+}
+
+/**
+ * Whether member invoices are invoiced outside EVtivity
+ * (`invoice.externalInvoicing`, default false): a member invoice is issued as
+ * paid and stays internal, and the driver gets a session report instead.
+ * Read on every call (no cache), so a switched setting holds from the next
+ * issue, email or portal read in every process. Only `true` turns it on. A
+ * read error is thrown, not defaulted: falling back to false would email an
+ * invoice the operator invoices elsewhere.
+ */
+export async function getExternalInvoicing(): Promise<boolean> {
+  const [row] = await db
+    .select({ value: settings.value })
+    .from(settings)
+    .where(eq(settings.key, INVOICE_EXTERNAL_INVOICING_KEY));
+  return row?.value === true;
 }

@@ -6,6 +6,7 @@ import {
   db,
   invoiceAuditLog,
   loadFleetBillingContacts,
+  getExternalInvoicing,
   getSystemTimezone,
   writeAudit,
 } from '@evtivity/database';
@@ -919,13 +920,16 @@ export interface MemberOverdueRunSummary {
  * date whose reminder was not sent yet and whose driver has an email, oldest
  * due first, at most FLEET_INVOICE_OVERDUE_BATCH per pass. A driver without
  * an email is left out (not claimed), so the reminder goes once an email is
- * added. Each invoice is fail-open (P9).
+ * added. Each invoice is fail-open (P9). Under external invoicing
+ * (`invoice.externalInvoicing`) no reminder goes: the member invoices are
+ * internal, and those issued before the switch are not claimed either.
  */
 export async function sendMemberInvoiceOverdueNotices(
   deps: FleetInvoiceRunDeps,
   log: ServiceLogger,
   now: Date = new Date(),
 ): Promise<MemberOverdueRunSummary> {
+  if (await getExternalInvoicing()) return { sent: 0, failed: 0 };
   const rows = await client<Array<{ id: string }>>`
     SELECT i.id FROM invoices i
     JOIN drivers d ON d.id = i.driver_id

@@ -60,6 +60,7 @@ vi.mock('@evtivity/database', () => ({
   apiKeyAuditLog: { _table: 'api_key_audit_log' },
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getExternalInvoicing: vi.fn(() => Promise.resolve(false)),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),

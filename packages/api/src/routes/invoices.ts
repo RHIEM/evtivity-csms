@@ -313,6 +313,11 @@ import {
 import type { InvoiceDetail, InvoiceWithLineItems } from '@evtivity/services/invoice.service';
 import { creditInvoice } from '@evtivity/services/credit-note.service';
 import { generateInvoicePdf } from '@evtivity/services/invoice-pdf.service';
+import {
+  generateSessionReportPdf,
+  isSessionReportInvoice,
+  sessionReportFileName,
+} from '@evtivity/services/session-report.service';
 import { loadPdfBranding } from '@evtivity/services/pdf-branding';
 import { wasInvoiceSent, writeInvoiceSentAudit } from '@evtivity/services/invoice-audit';
 import type { InvoiceAuditActor, InvoiceAuditLogger } from '@evtivity/services/invoice-audit';
@@ -506,7 +511,9 @@ async function notifyAccountCreditNote(
       { templatesDirs: ALL_TEMPLATES_DIRS },
       { actor, log },
     );
-    if (result.status !== 'sent' && result.status !== 'already_sent') {
+    if (result.status === 'internal') {
+      log.info({ invoiceId: invoice.id }, 'Member credit note kept internal: external invoicing');
+    } else if (result.status !== 'sent' && result.status !== 'already_sent') {
       log.warn(
         { invoiceId: invoice.id, reason: result.status },
         `${kind} credit note not sent: no recipient address`,
@@ -955,7 +962,7 @@ export function invoiceRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Email an invoice to its driver or fleet',
         description:
-          'Renders the invoice.Sent driver notification (invoice.CreditNote for a credit note) and dispatches it via the configured channels. A fleet invoice (invoice.FleetInvoice) or its credit note (invoice.FleetCreditNote) goes to the fleet billing contacts with the PDF attached and sets sentAt; 400 FLEET_BILLING_CONTACT_REQUIRED when the fleet has none. A member invoice (invoice.MemberInvoice) or its credit note (invoice.MemberCreditNote) goes to its driver only, by email with the PDF attached and by push, and sets sentAt; 400 INVOICE_NO_DRIVER when the driver no longer exists, 400 INVOICE_NO_DRIVER_EMAIL when the driver has no email address. Safe to call repeatedly; each call sends again (deliberate resend semantics). A send a provider accepted is recorded in the invoice audit log (invoice_sent).',
+          'Renders the invoice.Sent driver notification (invoice.CreditNote for a credit note) and dispatches it via the configured channels. A fleet invoice (invoice.FleetInvoice) or its credit note (invoice.FleetCreditNote) goes to the fleet billing contacts with the PDF attached and sets sentAt; 400 FLEET_BILLING_CONTACT_REQUIRED when the fleet has none. A member invoice (invoice.MemberInvoice) or its credit note (invoice.MemberCreditNote) goes to its driver only, by email with the PDF attached and by push, and sets sentAt; 400 INVOICE_NO_DRIVER when the driver no longer exists, 400 INVOICE_NO_DRIVER_EMAIL when the driver has no email address. Under external invoicing (invoice.externalInvoicing) a member invoice goes as its session report (invoice.MemberSessionReport, the report PDF attached) and a member credit note is never sent: 409 INVOICE_IS_CREDIT_NOTE. Safe to call repeatedly; each call sends again (deliberate resend semantics). A send a provider accepted is recorded in the invoice audit log (invoice_sent).',
         operationId: 'sendInvoice',
         security: [{ bearerAuth: [] }],
         params: zodSchema(invoiceIdParams),
@@ -970,6 +977,9 @@ export function invoiceRoutes(app: FastifyInstance): void {
             ],
           ),
           404: invoiceNotFound,
+          409: errorWith('Under external invoicing a member credit note stays internal', [
+            ERROR_CODES.INVOICE_IS_CREDIT_NOTE,
+          ]),
         },
       },
     },
@@ -999,6 +1009,13 @@ export function invoiceRoutes(app: FastifyInstance): void {
           sent.status === 'no_email'
         ) {
           await reply.status(400).send(ACCOUNT_SEND_REFUSALS[sent.status]);
+          return;
+        }
+        if (sent.status === 'internal') {
+          await reply.status(409).send({
+            error: 'Under external invoicing a member credit note stays internal',
+            code: 'INVOICE_IS_CREDIT_NOTE',
+          });
           return;
         }
         return { success: true };
@@ -1088,6 +1105,50 @@ export function invoiceRoutes(app: FastifyInstance): void {
       await reply
         .header('Content-Type', 'application/pdf')
         .header('Content-Disposition', `attachment; filename="${result.invoice.invoiceNumber}.pdf"`)
+        .send(pdf);
+    },
+  );
+
+  // Download the session report of a member invoice as a PDF
+  app.get(
+    '/invoices/:id/session-report',
+    {
+      onRequest: [authorize('payments:read')],
+      schema: {
+        tags: ['Invoices'],
+        summary: 'Download the session report of a member invoice as a PDF',
+        description:
+          "Renders the session report of a member invoice: the document the driver gets instead of the invoice under external invoicing (invoice.externalInvoicing). A portrait A4 PDF in the invoice's language with the PDF logo and footer, the driver and fleet, the operator, the period, the notice that it is not an invoice, one row per session (start, end, location, card, energy, net, gross) with its signed meter readings, and the session count, energy, net and gross totals. No invoice number, due date, payment details or tax line. Available whatever the setting. 404 INVOICE_NOT_FOUND for an unknown invoice and for one that is not a member invoice (a driver or fleet invoice); 409 INVOICE_IS_CREDIT_NOTE for a member credit note. Streams application/pdf as an attachment.",
+        operationId: 'downloadInvoiceSessionReport',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(invoiceIdParams),
+        response: {
+          404: invoiceNotFound,
+          409: errorWith('A credit note has no session report', [
+            ERROR_CODES.INVOICE_IS_CREDIT_NOTE,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, invoiceAccessDenied))) return;
+      const { id } = request.params as z.infer<typeof invoiceIdParams>;
+      const result = await getInvoice(id);
+      if (result?.invoice.fleetId == null || !result.invoice.memberBilled) {
+        await reply.status(404).send({ error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' });
+        return;
+      }
+      if (!isSessionReportInvoice(result.invoice)) {
+        await reply.status(409).send({
+          error: 'A credit note has no session report',
+          code: 'INVOICE_IS_CREDIT_NOTE',
+        });
+        return;
+      }
+      const pdf = await generateSessionReportPdf(result);
+      await reply
+        .header('Content-Type', 'application/pdf')
+        .header('Content-Disposition', `attachment; filename="${sessionReportFileName(result)}"`)
         .send(pdf);
     },
   );

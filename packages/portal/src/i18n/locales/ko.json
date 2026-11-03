@@ -1440,7 +1440,15 @@
       "paid": "결제됨",
       "void": "무효",
       "credited": "크레딧 처리됨"
-    }
+    },
+    "sessionReport": "충전 세션 보고서",
+    "sessionReportsTitle": "충전 세션 보고서",
+    "sessionReportNotice": "이 보고서는 청구서가 아닙니다. 해당 기간의 충전 세션을 기록합니다. 정산은 별도로 진행됩니다.",
+    "sessions": "충전 세션",
+    "totalGross": "합계액",
+    "created": "작성일",
+    "downloadReport": "보고서 다운로드(PDF)",
+    "openReport": "보고서 열기"
   },
   "factorProof": {
     "addFactorHint": "두 번째 인증 수단을 추가하기 전에 본인임을 확인하세요.",

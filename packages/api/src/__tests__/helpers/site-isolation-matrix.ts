@@ -1185,6 +1185,13 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     'FLEET_NOT_FOUND',
   ),
   c(
+    'GET',
+    '/fleets/:id/session-report.csv',
+    'payments:read',
+    (_f, w) => `/fleets/${w.fleet}/session-report.csv?period=2026-01`,
+    'FLEET_NOT_FOUND',
+  ),
+  c(
     'POST',
     '/fleets/:id/invoices',
     'payments:write',
@@ -1468,6 +1475,13 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     '/invoices/:id/pdf',
     'payments:read',
     (f) => `/invoices/${f.invoice}/pdf`,
+    'INVOICE_NOT_FOUND',
+  ),
+  c(
+    'GET',
+    '/invoices/:id/session-report',
+    'payments:read',
+    (f) => `/invoices/${f.invoice}/session-report`,
     'INVOICE_NOT_FOUND',
   ),
   c(

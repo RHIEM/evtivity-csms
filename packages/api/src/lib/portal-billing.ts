@@ -67,7 +67,14 @@ export const sessionAccountBillingSchema = z
     invoiceNumber: z
       .string()
       .nullable()
-      .describe('On a member-billed session: the number of that invoice, null until invoiced'),
+      .describe(
+        'On a member-billed session: the number of that invoice, null until invoiced; under external invoicing the report ID of its session report',
+      ),
+    document: z
+      .enum(['invoice', 'sessionReport'])
+      .describe(
+        "What invoiceId opens for the driver: the invoice, or under external invoicing (invoice.externalInvoicing) a member invoice's session report",
+      ),
   })
   .loose();
 
@@ -118,9 +125,16 @@ export interface SessionAccountBillingRow {
   billingInvoiceNumber: string | null;
 }
 
-/** The driver-facing account billing of a session, or null when it is not billed on account. */
+/**
+ * The driver-facing account billing of a session, or null when it is not
+ * billed on account. Under external invoicing (`external`) a member invoice is
+ * internal: the session names its session report (the report ID, never the
+ * invoice number), and a paid invoice reads as invoiced, since the invoice
+ * the driver pays comes from outside EVtivity.
+ */
 export function toSessionAccountBilling(
   row: SessionAccountBillingRow,
+  external = false,
 ): SessionAccountBilling | null {
   if (
     row.billingMode !== 'account' ||
@@ -143,6 +157,17 @@ export function toSessionAccountBilling(
       invoicedTo: 'fleet',
       invoiceId: null,
       invoiceNumber: null,
+      document: 'invoice',
+    };
+  }
+  if (external) {
+    return {
+      state: state === 'paid' ? 'invoiced' : state,
+      fleetName: row.billingFleetName,
+      invoicedTo: 'member',
+      invoiceId: row.billingInvoiceId,
+      invoiceNumber: row.billingInvoiceId,
+      document: 'sessionReport',
     };
   }
   // A credit note releases the session (invoice_id back to null), so the id
@@ -153,12 +178,14 @@ export function toSessionAccountBilling(
     invoicedTo: 'member',
     invoiceId: row.billingInvoiceId,
     invoiceNumber: row.billingInvoiceId != null ? row.billingInvoiceNumber : null,
+    document: 'invoice',
   };
 }
 
 /** Replaces the billing columns of a session row with its `accountBilling`. */
 export function withAccountBilling<T extends SessionAccountBillingRow>(
   row: T,
+  external = false,
 ): Omit<T, keyof SessionAccountBillingRow> & { accountBilling: SessionAccountBilling | null } {
   const {
     billingMode,
@@ -172,14 +199,17 @@ export function withAccountBilling<T extends SessionAccountBillingRow>(
   } = row;
   return {
     ...rest,
-    accountBilling: toSessionAccountBilling({
-      billingMode,
-      billingFleetName,
-      billingInvoiceStatus,
-      billingHasPaymentRecord,
-      billingMemberBilled,
-      billingInvoiceId,
-      billingInvoiceNumber,
-    }),
+    accountBilling: toSessionAccountBilling(
+      {
+        billingMode,
+        billingFleetName,
+        billingInvoiceStatus,
+        billingHasPaymentRecord,
+        billingMemberBilled,
+        billingInvoiceId,
+        billingInvoiceNumber,
+      },
+      external,
+    ),
   };
 }

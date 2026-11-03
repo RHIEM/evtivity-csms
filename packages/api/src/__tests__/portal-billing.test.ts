@@ -51,6 +51,7 @@ describe('toSessionAccountBilling', () => {
       invoicedTo: 'fleet',
       invoiceId: null,
       invoiceNumber: null,
+      document: 'invoice',
     });
   });
 
@@ -80,6 +81,7 @@ describe('toSessionAccountBilling', () => {
       invoicedTo: 'member',
       invoiceId: 'inv_member1',
       invoiceNumber: 'INV-202610-0007',
+      document: 'invoice',
     });
     expect(
       toSessionAccountBilling({
@@ -89,6 +91,21 @@ describe('toSessionAccountBilling', () => {
         billingInvoiceNumber: null,
       }),
     ).toMatchObject({ state: 'unbilled', invoicedTo: 'member', invoiceId: null });
+  });
+
+  it('names the session report, never the invoice number, under external invoicing', () => {
+    expect(toSessionAccountBilling({ ...member, billingInvoiceStatus: 'paid' }, true)).toEqual({
+      state: 'invoiced',
+      fleetName: 'Acme',
+      invoicedTo: 'member',
+      invoiceId: 'inv_member1',
+      invoiceNumber: 'inv_member1',
+      document: 'sessionReport',
+    });
+    // A fleet-billed session is not affected.
+    expect(
+      toSessionAccountBilling({ ...account, billingInvoiceStatus: 'paid' }, true),
+    ).toMatchObject({ state: 'paid', invoicedTo: 'fleet', document: 'invoice' });
   });
 
   it('is null for a card session or an account session with a payment record', () => {

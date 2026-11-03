@@ -1,0 +1,10 @@
+<h2 style='color:#1a1a1a;margin:0 0 16px 0;'>充电会话报告 {{periodLabel}}</h2>
+{{#if firstName}}<p style='color:#4b5563;line-height:1.6;margin:0 0 16px 0;'>{{firstName}}，您好：</p>{{/if}}
+<p style='color:#4b5563;line-height:1.6;margin:0 0 16px 0;'>{{companyName}} 向您发送 {{periodLabel}} 的充电会话报告，费用记入 <strong>{{fleetName}}</strong> 账户。报告以 PDF 附件形式提供。</p>
+<table style='width:100%;border-collapse:collapse;margin:0 0 16px 0;'>
+  <tr><td style='padding:6px 0;color:#6b7280;'>期间</td><td style='padding:6px 0;color:#1a1a1a;text-align:right;'>{{periodLabel}}</td></tr>
+  <tr><td style='padding:6px 0;color:#6b7280;'>充电会话</td><td style='padding:6px 0;color:#1a1a1a;text-align:right;'>{{sessionCount}}</td></tr>
+  <tr><td style='padding:6px 0;color:#6b7280;'>创建日期</td><td style='padding:6px 0;color:#1a1a1a;text-align:right;'>{{issuedAt}}</td></tr>
+  <tr><td style='padding:6px 0;color:#1a1a1a;'><strong>总额合计</strong></td><td style='padding:6px 0;color:#1a1a1a;text-align:right;'><strong>{{total}}</strong></td></tr>
+</table>
+<p style='color:#4b5563;line-height:1.6;margin:0 0 16px 0;'>本报告不是发票。费用另行结算。</p>
