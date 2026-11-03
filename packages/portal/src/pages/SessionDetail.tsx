@@ -614,18 +614,30 @@ export function SessionDetail(): React.JSX.Element {
                   label={t('fleetBilling.status')}
                   value={t(`fleetBilling.stateMember.${session.accountBilling.state}`)}
                 />
-                {session.accountBilling.invoiceId != null && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-muted-foreground">{t('fleetBilling.invoice')}</span>
-                    <Link
-                      to={`/account/invoices/${session.accountBilling.invoiceId}`}
-                      className="font-medium text-link hover:underline"
-                      data-testid="session-invoice-link"
-                    >
-                      {session.accountBilling.invoiceNumber ?? t('fleetBilling.invoice')}
-                    </Link>
-                  </div>
-                )}
+                {session.accountBilling.invoiceId != null &&
+                  (session.accountBilling.document === 'sessionReport' ? (
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">{t('invoices.sessionReport')}</span>
+                      <Link
+                        to={`/account/invoices/${session.accountBilling.invoiceId}`}
+                        className="font-medium text-link hover:underline"
+                        data-testid="session-invoice-link"
+                      >
+                        {t('invoices.openReport')}
+                      </Link>
+                    </div>
+                  ) : (
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">{t('fleetBilling.invoice')}</span>
+                      <Link
+                        to={`/account/invoices/${session.accountBilling.invoiceId}`}
+                        className="font-medium text-link hover:underline"
+                        data-testid="session-invoice-link"
+                      >
+                        {session.accountBilling.invoiceNumber ?? t('fleetBilling.invoice')}
+                      </Link>
+                    </div>
+                  ))}
               </>
             ) : (
               <>

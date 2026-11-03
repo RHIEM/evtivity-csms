@@ -22,7 +22,10 @@ export interface SessionAccountBilling {
   invoicedTo?: InvoicedTo;
   /** On a member-billed session: the driver's invoice it is on, null until invoiced. */
   invoiceId?: string | null;
+  /** The invoice number; under external invoicing the report ID of its session report. */
   invoiceNumber?: string | null;
+  /** What invoiceId opens: the invoice, or under external invoicing its session report. */
+  document?: 'invoice' | 'sessionReport';
 }
 
 /** The fleet a charge on account goes through, and who it is invoiced to. */

@@ -17,6 +17,8 @@ interface RunState {
   contacts: { emails: string[]; language: string | null };
   details: Map<string, unknown>;
   failOperators: boolean;
+  // invoice.externalInvoicing
+  external: boolean;
 }
 
 const h = vi.hoisted(
@@ -33,6 +35,7 @@ const h = vi.hoisted(
     contacts: { emails: [], language: null },
     details: new Map(),
     failOperators: false,
+    external: false,
   }),
 );
 
@@ -66,6 +69,7 @@ vi.mock('@evtivity/database', () => ({
   db: {},
   invoiceAuditLog: { name: 'invoice_audit_log' },
   getSystemTimezone: vi.fn(() => Promise.resolve('Europe/Berlin')),
+  getExternalInvoicing: vi.fn(() => Promise.resolve(h.external)),
   loadFleetBillingContacts: vi.fn(() => Promise.resolve(h.contacts)),
   writeAudit: vi.fn(() => Promise.resolve()),
 }));
@@ -202,6 +206,7 @@ beforeEach(() => {
   h.contacts = { emails: ['ap@acme.test', 'cfo@acme.test'], language: 'en' };
   h.details = new Map();
   h.failOperators = false;
+  h.external = false;
 });
 
 describe('scheduledRunPeriod', () => {
@@ -974,6 +979,16 @@ describe('recordMemberInvoiceRunFailure', () => {
 });
 
 describe('sendMemberInvoiceOverdueNotices', () => {
+  it('sends no reminder under external invoicing and reads no invoice', async () => {
+    h.external = true;
+    h.overdueRows = [{ id: 'inv_1' }];
+    await expect(sendMemberInvoiceOverdueNotices(deps, log, now)).resolves.toEqual({
+      sent: 0,
+      failed: 0,
+    });
+    expect(h.statements).toHaveLength(0);
+  });
+
   it('selects issued member invoices past due whose driver has an email', async () => {
     h.overdueRows = [];
     await expect(sendMemberInvoiceOverdueNotices(deps, log, now)).resolves.toEqual({

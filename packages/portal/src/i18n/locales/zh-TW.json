@@ -1440,7 +1440,15 @@
       "paid": "已付款",
       "void": "已作廢",
       "credited": "已貸記"
-    }
+    },
+    "sessionReport": "充電會話報告",
+    "sessionReportsTitle": "充電會話報告",
+    "sessionReportNotice": "本報告不是發票。它列出您在本期間的充電會話。費用另行結算。",
+    "sessions": "充電會話",
+    "totalGross": "總額合計",
+    "created": "建立日期",
+    "downloadReport": "下載報告（PDF）",
+    "openReport": "開啟報告"
   },
   "factorProof": {
     "addFactorHint": "新增第二驗證因素前，請先確認身分。",

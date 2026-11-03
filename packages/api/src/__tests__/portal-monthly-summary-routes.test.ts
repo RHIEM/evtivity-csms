@@ -54,6 +54,7 @@ vi.mock('@evtivity/database', async () => ({
   ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getExternalInvoicing: vi.fn(() => Promise.resolve(false)),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),

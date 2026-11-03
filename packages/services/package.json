@@ -88,6 +88,12 @@
     "./load-management.service": {
       "import": "./src/load-management.service.ts"
     },
+    "./session-report.service": {
+      "import": "./src/session-report.service.ts"
+    },
+    "./session-report-labels": {
+      "import": "./src/session-report-labels.ts"
+    },
     "./maintenance-check": {
       "import": "./src/maintenance-check.ts"
     },

@@ -44,6 +44,7 @@ export const DRIVER_EVENT_TYPES = [
   'invoice.MemberInvoice',
   'invoice.MemberCreditNote',
   'invoice.MemberOverdue',
+  'invoice.MemberSessionReport',
   'supportCase.Created',
   'supportCase.OperatorReply',
   'supportCase.Resolved',
@@ -74,7 +75,8 @@ export function isDriverEventType(eventType: string): eventType is DriverEventTy
  * their account (password reset, MFA codes, email verification, the portal invitation,
  * the notice that someone tried to register with their address), the security notices
  * of a changed password or removed MFA, the member invoice documents a fleet bills them
- * with (invoice, credit note, overdue reminder), and the notice of a session an
+ * with (invoice, credit note, overdue reminder, and the session report sent instead of
+ * the invoice under external invoicing), and the notice of a session an
  * Autocharge vehicle started. The API refuses to turn them off, dispatch ignores a
  * stored disabled setting, and a recipient's own notification preferences do not
  * suppress them.
@@ -92,6 +94,7 @@ export const REQUIRED_DRIVER_EVENT_TYPES = [
   'invoice.MemberInvoice',
   'invoice.MemberCreditNote',
   'invoice.MemberOverdue',
+  'invoice.MemberSessionReport',
   // A start the driver may not have made (Autocharge): owner decision 2026-10-14.
   'session.AutochargeStarted',
 ] as const satisfies readonly DriverEventType[];

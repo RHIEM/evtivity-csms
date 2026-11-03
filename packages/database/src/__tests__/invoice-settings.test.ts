@@ -139,3 +139,28 @@ describe('getFleetInvoiceRunDay', () => {
     vi.restoreAllMocks();
   });
 });
+
+describe('getExternalInvoicing', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    mockSelect.mockReset();
+  });
+
+  it('is on only for a stored true, read on every call', async () => {
+    const { getExternalInvoicing } = await import('../lib/invoice-settings.js');
+    mockSelect.mockReturnValue(chainResolving([{ value: true }]));
+    await expect(getExternalInvoicing()).resolves.toBe(true);
+    mockSelect.mockReturnValue(chainResolving([{ value: 'true' }]));
+    await expect(getExternalInvoicing()).resolves.toBe(false);
+    mockSelect.mockReturnValue(chainResolving([]));
+    await expect(getExternalInvoicing()).resolves.toBe(false);
+    expect(mockSelect).toHaveBeenCalledTimes(3);
+  });
+
+  it('throws a read error instead of falling back to off', async () => {
+    const { getExternalInvoicing } = await import('../lib/invoice-settings.js');
+    mockSelect.mockReturnValue(chainResolving(new Error('db down')));
+    await expect(getExternalInvoicing()).rejects.toThrow('db down');
+  });
+});

@@ -2506,7 +2506,8 @@
       "recipientMember": "Fahrer",
       "billedTo": "Rechnung An",
       "sendMemberTitle": "Fahrerrechnung Senden",
-      "sendMemberConfirm": "{{number}} mit PDF an den Fahrer senden?"
+      "sendMemberConfirm": "{{number}} mit PDF an den Fahrer senden?",
+      "sessionReportCsv": "CSV für ERP (Ladesitzungen)"
     },
     "bookingStatus": {
       "scheduled": "Geplant",
@@ -3851,7 +3852,12 @@
     "uploadReplacesHint": "Ein neues Bild ersetzt das aktuelle.",
     "roamingOffDescription": "Der Roaming-Bereich wird ausgeblendet und der gesamte OCPI-Verkehr blockiert.",
     "pncOffDescription": "Der Bereich Zertifikate wird ausgeblendet und Zertifikatsoperationen werden blockiert.",
-    "paymentSubTabTerminals": "Zahlungsterminals"
+    "paymentSubTabTerminals": "Zahlungsterminals",
+    "externalInvoicing": "Externe Fakturierung",
+    "externalInvoicingToggle": "Mitglieder außerhalb von EVtivity abrechnen",
+    "externalInvoicingHelp": "Für Flotten mit Rechnung an jeden Fahrer: Die Mitgliederrechnung wird als bezahlt ausgestellt und bleibt intern (keine Rechnungs-E-Mail, keine Mahnung, nicht im Fahrerportal). Der Fahrer bekommt stattdessen einen Ladesitzungsbericht mit Netto- und Bruttobeträgen per E-Mail und im Portal. Die CSV für die eigene Fakturierung gibt es auf dem Abrechnungs-Tab der Flotte. Flottenrechnungen sind nicht betroffen.",
+    "externalInvoicingSaved": "Externe Fakturierung gespeichert",
+    "externalInvoicingSaveFailed": "Die Einstellung zur externen Fakturierung konnte nicht gespeichert werden."
   },
   "pnc": {
     "certificates": "Zertifikate",
@@ -4018,6 +4024,7 @@
       "invoice.MemberInvoice": "Mitgliedsrechnung ausgestellt",
       "invoice.MemberCreditNote": "Mitglieds-Stornorechnung ausgestellt",
       "invoice.MemberOverdue": "Mitgliedsrechnung überfällig",
+      "invoice.MemberSessionReport": "Ladesitzungsbericht an Mitglied",
       "payment.AccountCreditLimit": "Kreditlimit der Flotte erreicht",
       "fleet.CreditLimitWarning": "Kreditlimit-Warnung der Flotte",
       "fleet.CreditLimitReached": "Kreditlimit der Flotte erreicht",
@@ -6056,7 +6063,8 @@
     "driver": "Fahrer",
     "viaFleet": "Über Flotte",
     "viaFleetBadge": "Über {{fleet}}",
-    "confirmResendMember": "Diese Rechnung mit PDF an den Fahrer senden?"
+    "confirmResendMember": "Diese Rechnung mit PDF an den Fahrer senden?",
+    "sessionReport": "Ladesitzungsbericht"
   },
   "authFooter": {
     "privacyPolicy": "Datenschutzerklärung",

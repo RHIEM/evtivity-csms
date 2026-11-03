@@ -99,6 +99,16 @@ vi.mock('@evtivity/services/invoice.service', () => ({
 }));
 vi.mock('@evtivity/services/credit-note.service', () => ({ creditInvoice: vi.fn() }));
 vi.mock('@evtivity/services/invoice-pdf.service', () => ({ generateInvoicePdf: vi.fn() }));
+vi.mock('@evtivity/services/session-report.service', () => ({
+  buildFleetSessionReportCsv: vi.fn(),
+  generateSessionReportPdf: vi.fn(),
+  isSessionReportInvoice: (invoice: {
+    fleetId: string | null;
+    memberBilled: boolean;
+    kind: string;
+  }) => invoice.fleetId != null && invoice.memberBilled && invoice.kind === 'invoice',
+  sessionReportFileName: () => 'Ladesitzungsbericht-2026-09.pdf',
+}));
 vi.mock('@evtivity/services/template-dirs', () => ({ ALL_TEMPLATES_DIRS: ['/t'] }));
 vi.mock('@evtivity/lib/pubsub-instance', () => ({ getPubSub: vi.fn() }));
 
@@ -114,6 +124,10 @@ import {
 import { enqueueMemberInvoiceBatch } from '@evtivity/services/fleet-invoice-run';
 import { sendAccountInvoiceEmail } from '@evtivity/services/fleet-invoice-notice';
 import { getInvoice } from '@evtivity/services/invoice.service';
+import {
+  buildFleetSessionReportCsv,
+  generateSessionReportPdf,
+} from '@evtivity/services/session-report.service';
 import { registerAuth } from '../plugins/auth.js';
 import { fleetInvoiceRoutes } from '../routes/fleet-invoices.js';
 import { invoiceRoutes } from '../routes/invoices.js';
@@ -735,5 +749,110 @@ describe('POST /fleets/:id/billing-recipient', () => {
       heldPermissions = new Set(['payments:read', 'payments:write']);
     }
     expect(moveSessionsBilling).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /fleets/:id/session-report.csv', () => {
+  function download(query = '?period=2026-09') {
+    return app.inject({
+      method: 'GET',
+      url: `/fleets/${FLEET_ID}/session-report.csv${query}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+
+  it('streams the CSV of the period as an attachment', async () => {
+    vi.mocked(buildFleetSessionReportCsv).mockResolvedValue({
+      csv: '\uFEFFperiod;driver_id',
+      fileName: `session-report-${FLEET_ID}-2026-09.csv`,
+      invoiceCount: 0,
+    });
+    const res = await download();
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('text/csv; charset=utf-8');
+    expect(res.headers['content-disposition']).toBe(
+      `attachment; filename="session-report-${FLEET_ID}-2026-09.csv"`,
+    );
+    expect(res.body).toContain('period;driver_id');
+    expect(buildFleetSessionReportCsv).toHaveBeenCalledWith(FLEET_ID, '2026-09');
+  });
+
+  it('requires a period and payments:read', async () => {
+    expect((await download('')).statusCode).toBe(400);
+    expect((await download('?period=2026-9')).statusCode).toBe(400);
+    heldPermissions = new Set();
+    expect((await download()).statusCode).toBe(403);
+    expect(buildFleetSessionReportCsv).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for an unknown fleet', async () => {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: () => ({ where: () => Promise.resolve([]) }),
+    } as never);
+    const res = await download();
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'FLEET_NOT_FOUND' });
+    expect(buildFleetSessionReportCsv).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 to a site-restricted user', async () => {
+    siteAccess.siteIds = ['sit_000000000001'];
+    expect((await download()).statusCode).toBe(404);
+    expect(buildFleetSessionReportCsv).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /invoices/:id/session-report', () => {
+  function download() {
+    return app.inject({
+      method: 'GET',
+      url: `/invoices/${INVOICE_ID}/session-report`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+
+  function memberInvoice(overrides: Record<string, unknown> = {}) {
+    return {
+      invoice: invoiceRow({ memberBilled: true, driverId: 'drv_000000000001', ...overrides }),
+      lineItems: [],
+      driver: null,
+      fleet: { id: FLEET_ID, name: 'Acme Logistics' },
+      taxBreakdown: [],
+      creditedInvoice: null,
+      creditNote: null,
+    } as never;
+  }
+
+  it('streams the session report of a member invoice', async () => {
+    vi.mocked(getInvoice).mockResolvedValue(memberInvoice());
+    vi.mocked(generateSessionReportPdf).mockResolvedValue(Buffer.from('%PDF-report'));
+    const res = await download();
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/pdf');
+    expect(res.headers['content-disposition']).toBe(
+      'attachment; filename="Ladesitzungsbericht-2026-09.pdf"',
+    );
+  });
+
+  it('answers 404 for a fleet invoice and 409 for a member credit note', async () => {
+    expect((await download()).statusCode).toBe(404);
+    vi.mocked(getInvoice).mockResolvedValue(memberInvoice({ kind: 'credit_note' }));
+    const res = await download();
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'INVOICE_IS_CREDIT_NOTE' });
+    expect(generateSessionReportPdf).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /invoices/:id/send under external invoicing', () => {
+  it('answers 409 for a member credit note that stays internal', async () => {
+    vi.mocked(sendAccountInvoiceEmail).mockResolvedValue({ status: 'internal' });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/invoices/${INVOICE_ID}/send`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'INVOICE_IS_CREDIT_NOTE' });
   });
 });

@@ -398,6 +398,11 @@ export interface InsertInvoiceInput {
   /** What the sessions and fees were charged: the lines must sum to it. */
   chargedCents: number;
   status: 'paid' | 'issued';
+  /**
+   * The payment reference of an invoice issued as paid (`status` paid), such
+   * as the note that it is invoiced outside EVtivity. Default null.
+   */
+  paymentReference?: string | null;
   /** Days from issue to the due date; default the invoice.paymentTermsDays setting. */
   paymentTermsDays?: number | null;
   /**
@@ -471,6 +476,7 @@ export async function insertInvoiceInTransaction(
       issuedAt: now,
       dueAt,
       paidAt: status === 'paid' ? now : null,
+      paymentReference: status === 'paid' ? (input.paymentReference ?? null) : null,
       currency,
       subtotalCents: totals.netCents,
       taxCents: totals.taxCents,

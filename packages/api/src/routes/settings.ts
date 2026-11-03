@@ -121,6 +121,7 @@ import {
   COMPANY_BIC_KEY,
   COMPANY_IBAN_KEY,
   INVOICE_EPC_QR_ENABLED_KEY,
+  INVOICE_EXTERNAL_INVOICING_KEY,
   INVOICE_PAYMENT_MAX_LENGTHS,
   isInvoicePaymentSettingKey,
   normalizeInvoicePaymentSetting,
@@ -310,7 +311,9 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     const bank = normalizeInvoicePaymentSetting(key, value);
     return bank != null ? { value: bank } : null;
   }
-  if (key === INVOICE_EPC_QR_ENABLED_KEY) return typeof value === 'boolean' ? { value } : null;
+  if (key === INVOICE_EPC_QR_ENABLED_KEY || key === INVOICE_EXTERNAL_INVOICING_KEY) {
+    return typeof value === 'boolean' ? { value } : null;
+  }
   if (key !== COMPANY_CURRENCY_KEY) return { value };
   const code = typeof value === 'string' ? value.trim().toUpperCase() : value;
   return isSupportedCurrency(code) ? { value: code } : null;
@@ -600,7 +603,7 @@ function invalidSettingError(key: string, value?: unknown): { error: string; cod
   if (key === PDF_FOOTER_KEY) return invalidPdfFooterError;
   if (isInvoiceSellerSettingKey(key)) return invalidInvoiceSellerError(key);
   if (isInvoicePaymentSettingKey(key)) return invalidInvoicePaymentError(key);
-  if (key === INVOICE_EPC_QR_ENABLED_KEY) {
+  if (key === INVOICE_EPC_QR_ENABLED_KEY || key === INVOICE_EXTERNAL_INVOICING_KEY) {
     return { error: `${key} must be true or false`, code: 'VALIDATION_ERROR' };
   }
   if (key === MOBILE_APP_URL_SCHEMES_KEY) return invalidMobileAppSchemesError;

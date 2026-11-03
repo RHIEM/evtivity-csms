@@ -9,6 +9,8 @@ interface NoticeState {
   markRows: Array<{ id: string }>;
   statements: string[];
   detail: unknown;
+  // invoice.externalInvoicing
+  external: boolean;
 }
 
 const h = vi.hoisted(
@@ -17,6 +19,7 @@ const h = vi.hoisted(
     markRows: [{ id: 'inv_f1' }],
     statements: [],
     detail: null,
+    external: false,
   }),
 );
 
@@ -26,7 +29,13 @@ vi.mock('@evtivity/database', () => ({
     return Promise.resolve(h.markRows);
   }),
   getSystemTimezone: vi.fn(() => Promise.resolve('Europe/Berlin')),
+  getExternalInvoicing: vi.fn(() => Promise.resolve(h.external)),
   loadFleetBillingContacts: vi.fn(() => Promise.resolve(h.contacts)),
+}));
+
+vi.mock('../session-report.service.js', () => ({
+  generateSessionReportPdf: vi.fn(() => Promise.resolve(Buffer.from('%PDF-report'))),
+  sessionReportFileName: vi.fn(() => 'Ladesitzungsbericht-2026-09.pdf'),
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => ({
@@ -55,14 +64,17 @@ vi.mock('../invoice-pdf.service.js', async (importOriginal) => ({
 import { dispatchDriverNotification, dispatchSystemNotification } from '@evtivity/lib';
 import { loadFleetBillingContacts } from '@evtivity/database';
 import { generateInvoicePdf } from '../invoice-pdf.service.js';
+import { generateSessionReportPdf } from '../session-report.service.js';
 import { writeInvoiceSentAudit } from '../invoice-audit.js';
 import {
   FLEET_CREDIT_NOTE_EVENT,
   FLEET_INVOICE_EVENT,
   MEMBER_CREDIT_NOTE_EVENT,
   MEMBER_INVOICE_EVENT,
+  MEMBER_SESSION_REPORT_EVENT,
   fleetInvoiceVariables,
   sendAccountInvoiceEmail,
+  sessionReportVariables,
 } from '../fleet-invoice-notice.js';
 
 const issuedAt = new Date('2026-10-02T09:00:00Z');
@@ -105,6 +117,7 @@ beforeEach(() => {
   h.markRows = [{ id: 'inv_f1' }];
   h.statements = [];
   h.detail = detail();
+  h.external = false;
 });
 
 describe('fleetInvoiceVariables', () => {
@@ -316,5 +329,88 @@ describe('sendAccountInvoiceEmail for a member invoice', () => {
       status: 'already_sent',
     });
     expect(dispatchDriverNotification).not.toHaveBeenCalled();
+  });
+});
+
+describe('sendAccountInvoiceEmail under external invoicing', () => {
+  const memberDriver = { id: 'drv_1', firstName: 'Mia', lastName: 'M', email: 'mia@example.com' };
+
+  beforeEach(() => {
+    h.external = true;
+    h.detail = { ...detail({ memberBilled: true, driverId: 'drv_1' }), driver: memberDriver };
+  });
+
+  it('emails the session report instead of the member invoice', async () => {
+    const result = await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit);
+
+    expect(result).toEqual({ status: 'sent', recipients: 1 });
+    expect(generateInvoicePdf).not.toHaveBeenCalled();
+    expect(generateSessionReportPdf).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(dispatchDriverNotification).mock.calls[0];
+    expect(call?.[1]).toBe(MEMBER_SESSION_REPORT_EVENT);
+    expect(call?.[2]).toBe('drv_1');
+    expect(call?.[3]).not.toHaveProperty('invoiceNumber');
+    expect(call?.[3]).not.toHaveProperty('dueAt');
+    expect(call?.[6]).toEqual({
+      attachments: [
+        {
+          filename: 'Ladesitzungsbericht-2026-09.pdf',
+          content: Buffer.from('%PDF-report'),
+          contentType: 'application/pdf',
+        },
+      ],
+      sms: false,
+    });
+    expect(h.statements[0]).toContain('sent_at IS NULL');
+    expect(vi.mocked(writeInvoiceSentAudit).mock.calls[0]?.[0]).toMatchObject({
+      eventType: MEMBER_SESSION_REPORT_EVENT,
+      resend: false,
+    });
+  });
+
+  it('keeps a member credit note internal: nothing rendered, marked or sent', async () => {
+    h.detail = {
+      ...detail({ memberBilled: true, kind: 'credit_note', totalCents: -4165 }),
+      driver: memberDriver,
+    };
+    expect(await sendAccountInvoiceEmail('inv_f1', 'resend', deps, audit)).toEqual({
+      status: 'internal',
+    });
+    expect(generateInvoicePdf).not.toHaveBeenCalled();
+    expect(h.statements).toHaveLength(0);
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a driver without an email', async () => {
+    h.detail = { ...detail({ memberBilled: true }), driver: { ...memberDriver, email: null } };
+    expect(await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit)).toEqual({
+      status: 'no_email',
+    });
+    expect(generateSessionReportPdf).not.toHaveBeenCalled();
+  });
+
+  it('sends a fleet invoice as before', async () => {
+    h.detail = detail();
+    await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit);
+    expect(generateInvoicePdf).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(dispatchSystemNotification).mock.calls[0]?.[1]).toBe(FLEET_INVOICE_EVENT);
+  });
+});
+
+describe('sessionReportVariables', () => {
+  it('describes the report without invoice number and due date', () => {
+    const variables = sessionReportVariables(
+      detail({ memberBilled: true }) as unknown as Parameters<typeof sessionReportVariables>[0],
+    );
+    expect(variables).toMatchObject({
+      invoiceId: 'inv_f1',
+      fleetName: 'Acme Logistics',
+      periodLabel: 'September 2026',
+      sessionCount: 2,
+      totalCents: 4165,
+      currency: 'EUR',
+    });
+    expect(variables).not.toHaveProperty('invoiceNumber');
+    expect(variables).not.toHaveProperty('dueAt');
   });
 });

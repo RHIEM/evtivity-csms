@@ -177,7 +177,7 @@ export function sellerDetailLines(seller: InvoiceSeller, labels: InvoiceLabels):
 }
 
 /** The seller settings (one query, no cache: PDFs are rendered on demand). */
-async function loadInvoiceSeller(): Promise<InvoiceSeller> {
+export async function loadInvoiceSeller(): Promise<InvoiceSeller> {
   const rows = await client`
     SELECT key, value FROM settings WHERE key = ANY(${SELLER_SETTING_KEYS}::text[])
   `;

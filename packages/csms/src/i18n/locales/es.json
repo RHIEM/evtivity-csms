@@ -2506,7 +2506,8 @@
       "recipientMember": "Conductor",
       "billedTo": "Facturado A",
       "sendMemberTitle": "Enviar Factura del Conductor",
-      "sendMemberConfirm": "¿Enviar {{number}} con su PDF al conductor?"
+      "sendMemberConfirm": "¿Enviar {{number}} con su PDF al conductor?",
+      "sessionReportCsv": "CSV de sesiones"
     },
     "bookingStatus": {
       "scheduled": "Programada",
@@ -3851,7 +3852,12 @@
     "uploadReplacesHint": "Al subir una imagen nueva se reemplaza la actual.",
     "roamingOffDescription": "Se oculta la sección de Roaming y se bloquea todo el tráfico OCPI.",
     "pncOffDescription": "Se oculta la sección de Certificados y se bloquean las operaciones con certificados.",
-    "paymentSubTabTerminals": "Terminales de pago"
+    "paymentSubTabTerminals": "Terminales de pago",
+    "externalInvoicing": "Facturación externa",
+    "externalInvoicingToggle": "Facturar a los miembros fuera de EVtivity",
+    "externalInvoicingHelp": "Para flotas que facturan a cada conductor: la factura de miembro se emite como pagada y queda interna (sin correo de factura, sin recordatorio, no aparece en el portal). El conductor recibe en su lugar un informe de sesiones de carga con importes netos y brutos, por correo y en el portal. Descargue el CSV para su propia facturación en la pestaña Facturación de la flota. Las facturas de flota no se ven afectadas.",
+    "externalInvoicingSaved": "Facturación externa guardada",
+    "externalInvoicingSaveFailed": "No se pudo guardar la configuración de facturación externa."
   },
   "pnc": {
     "certificates": "Certificados",
@@ -4018,6 +4024,7 @@
       "invoice.MemberInvoice": "Factura de miembro emitida",
       "invoice.MemberCreditNote": "Nota de crédito de miembro emitida",
       "invoice.MemberOverdue": "Factura de miembro vencida",
+      "invoice.MemberSessionReport": "Informe de sesiones de miembro",
       "payment.AccountCreditLimit": "Límite de crédito de la flota alcanzado",
       "fleet.CreditLimitWarning": "Aviso de límite de crédito de la flota",
       "fleet.CreditLimitReached": "Límite de crédito de la flota alcanzado",
@@ -6056,7 +6063,8 @@
     "driver": "Conductor",
     "viaFleet": "A Través de la Flota",
     "viaFleetBadge": "Vía {{fleet}}",
-    "confirmResendMember": "¿Enviar esta factura con su PDF al conductor?"
+    "confirmResendMember": "¿Enviar esta factura con su PDF al conductor?",
+    "sessionReport": "Informe de sesiones"
   },
   "authFooter": {
     "privacyPolicy": "Política de privacidad",

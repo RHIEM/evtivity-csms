@@ -3,12 +3,24 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, count, desc, eq, isNull, notInArray, or } from 'drizzle-orm';
+import { and, count, desc, eq, isNull, not, notInArray, or } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
-import { db, invoices, fleets, invoiceStatusEnum, INVOICE_KINDS } from '@evtivity/database';
+import {
+  db,
+  invoices,
+  fleets,
+  invoiceStatusEnum,
+  getExternalInvoicing,
+  INVOICE_KINDS,
+} from '@evtivity/database';
 import { getInvoice } from '@evtivity/services/invoice.service';
 import type { InvoiceDetail } from '@evtivity/services/invoice.service';
 import { generateInvoicePdf } from '@evtivity/services/invoice-pdf.service';
+import {
+  generateSessionReportPdf,
+  isSessionReportInvoice,
+  sessionReportFileName,
+} from '@evtivity/services/session-report.service';
 import { zodSchema } from '../../lib/zod-schema.js';
 import { ID_PARAMS } from '../../lib/id-validation.js';
 import { paginationQuery } from '../../lib/pagination.js';
@@ -24,13 +36,39 @@ import type { DriverJwtPayload } from '../../plugins/auth.js';
  * even when it bills the driver's sessions. Drafts and void drafts were never
  * issued to anyone. Every portal invoice route reads through this scope, so
  * another driver's invoice, a fleet invoice and a draft all answer 404.
+ *
+ * Under external invoicing (`external`) a member invoice is internal: the
+ * driver reads its session report, and only of a live one. Member credit
+ * notes and credited member invoices are left out.
  */
-export function driverInvoiceScope(driverId: string): SQL {
+export function driverInvoiceScope(driverId: string, external = false): SQL {
   return and(
     eq(invoices.driverId, driverId),
     or(isNull(invoices.fleetId), eq(invoices.memberBilled, true)),
     notInArray(invoices.status, ['draft', 'void']),
+    ...(external
+      ? [
+          not(
+            and(
+              eq(invoices.memberBilled, true),
+              or(eq(invoices.kind, 'credit_note'), eq(invoices.status, 'credited')),
+            ) as SQL,
+          ),
+        ]
+      : []),
   ) as SQL;
+}
+
+/** What the driver reads: the invoice, or under external invoicing a member invoice's session report. */
+export const PORTAL_DOCUMENTS = ['invoice', 'sessionReport'] as const;
+export type PortalDocument = (typeof PORTAL_DOCUMENTS)[number];
+
+/** The document of an invoice in the scope: a session report for a member invoice under external invoicing. */
+export function portalDocument(
+  invoice: Parameters<typeof isSessionReportInvoice>[0],
+  external: boolean,
+): PortalDocument {
+  return external && isSessionReportInvoice(invoice) ? 'sessionReport' : 'invoice';
 }
 
 const invoiceNotFound = { error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' } as const;
@@ -47,7 +85,14 @@ const portalInvoiceParams = z.object({ id: ID_PARAMS.invoiceId.describe('Invoice
 const portalInvoiceItem = z
   .object({
     id: z.string().describe('Invoice ID'),
-    invoiceNumber: z.string().describe('Invoice or credit note number'),
+    document: z
+      .enum(PORTAL_DOCUMENTS)
+      .describe(
+        'invoice, or sessionReport for a member invoice under external invoicing (invoice.externalInvoicing): the driver gets the session report, not the invoice. A session report has the report ID (the invoice ID) as its number, no due or paid date, no tax breakdown and no credit note reference',
+      ),
+    invoiceNumber: z
+      .string()
+      .describe('Invoice or credit note number; on a session report its report ID'),
     kind: z
       .enum(INVOICE_KINDS)
       .describe('invoice, or credit_note for a credit note that credits an invoice in full'),
@@ -173,12 +218,18 @@ function metaNumber(meta: Record<string, unknown>, key: string): number | null {
  * fields (payment reference, free-form metadata, line metadata beyond what the
  * PDF prints).
  */
-export function toPortalInvoiceDetail(detail: InvoiceDetail): z.infer<typeof portalInvoiceDetail> {
+export function toPortalInvoiceDetail(
+  detail: InvoiceDetail,
+  external = false,
+): z.infer<typeof portalInvoiceDetail> {
   const { invoice } = detail;
   const memberInvoice = invoice.memberBilled;
+  const document = portalDocument(invoice, external);
+  const report = document === 'sessionReport';
   return {
     id: invoice.id,
-    invoiceNumber: invoice.invoiceNumber,
+    document,
+    invoiceNumber: report ? invoice.id : invoice.invoiceNumber,
     kind: invoice.kind,
     status: invoice.status,
     viaFleetName: memberInvoice ? (detail.fleet?.name ?? null) : null,
@@ -186,8 +237,8 @@ export function toPortalInvoiceDetail(detail: InvoiceDetail): z.infer<typeof por
     periodEnd: invoice.periodEnd,
     creditedInvoiceId: invoice.creditedInvoiceId,
     issuedAt: invoice.issuedAt,
-    dueAt: invoice.dueAt,
-    paidAt: invoice.paidAt,
+    dueAt: report ? null : invoice.dueAt,
+    paidAt: report ? null : invoice.paidAt,
     currency: invoice.currency,
     subtotalCents: invoice.subtotalCents,
     taxCents: invoice.taxCents,
@@ -212,12 +263,14 @@ export function toPortalInvoiceDetail(detail: InvoiceDetail): z.infer<typeof por
         stationName: metaString(meta, 'stationName'),
       };
     }),
-    taxBreakdown: detail.taxBreakdown.map((line) => ({
-      taxRate: line.taxRate,
-      netCents: line.netCents,
-      taxCents: line.taxCents,
-      grossCents: line.grossCents,
-    })),
+    taxBreakdown: report
+      ? []
+      : detail.taxBreakdown.map((line) => ({
+          taxRate: line.taxRate,
+          netCents: line.netCents,
+          taxCents: line.taxCents,
+          grossCents: line.grossCents,
+        })),
     creditedInvoice:
       detail.creditedInvoice != null
         ? {
@@ -226,18 +279,22 @@ export function toPortalInvoiceDetail(detail: InvoiceDetail): z.infer<typeof por
           }
         : null,
     creditNote:
-      detail.creditNote != null
+      !report && detail.creditNote != null
         ? { id: detail.creditNote.id, invoiceNumber: detail.creditNote.invoiceNumber }
         : null,
   };
 }
 
 /** The invoice when the driver may read it (`driverInvoiceScope`), else null. */
-async function loadDriverInvoice(driverId: string, id: string): Promise<InvoiceDetail | null> {
+async function loadDriverInvoice(
+  driverId: string,
+  id: string,
+  external: boolean,
+): Promise<InvoiceDetail | null> {
   const [own] = await db
     .select({ id: invoices.id })
     .from(invoices)
-    .where(and(eq(invoices.id, id), driverInvoiceScope(driverId)));
+    .where(and(eq(invoices.id, id), driverInvoiceScope(driverId, external)));
   if (own == null) return null;
   return getInvoice(own.id);
 }
@@ -251,7 +308,7 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
         tags: ['Portal Invoices'],
         summary: "List the driver's invoices",
         description:
-          "The signed-in driver's invoices and credit notes, newest first: ordinary driver invoices and the member invoices a fleet addressed to the driver. A fleet's own invoices are never listed, also when they bill the driver's sessions.",
+          "The signed-in driver's invoices and credit notes, newest first: ordinary driver invoices and the member invoices a fleet addressed to the driver. A fleet's own invoices are never listed, also when they bill the driver's sessions. Under external invoicing (invoice.externalInvoicing) a live member invoice is listed as its session report (document sessionReport) and member credit notes and credited member invoices are left out.",
         operationId: 'portalListInvoices',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(portalInvoiceListQuery),
@@ -261,7 +318,8 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
     async (request) => {
       const { driverId } = request.user as DriverJwtPayload;
       const { page, limit } = request.query as z.infer<typeof portalInvoiceListQuery>;
-      const where = driverInvoiceScope(driverId);
+      const external = await getExternalInvoicing();
+      const where = driverInvoiceScope(driverId, external);
       const [rows, totals] = await Promise.all([
         db
           .select({
@@ -269,6 +327,7 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
             invoiceNumber: invoices.invoiceNumber,
             kind: invoices.kind,
             status: invoices.status,
+            fleetId: invoices.fleetId,
             memberBilled: invoices.memberBilled,
             fleetName: fleets.name,
             periodStart: invoices.periodStart,
@@ -291,10 +350,18 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
           .offset((page - 1) * limit),
         db.select({ count: count() }).from(invoices).where(where),
       ]);
-      const data = rows.map(({ memberBilled, fleetName, ...row }) => ({
-        ...row,
-        viaFleetName: memberBilled ? fleetName : null,
-      }));
+      const data = rows.map(({ fleetId, memberBilled, fleetName, ...row }) => {
+        const document = portalDocument({ fleetId, memberBilled, kind: row.kind }, external);
+        const report = document === 'sessionReport';
+        return {
+          ...row,
+          document,
+          invoiceNumber: report ? row.id : row.invoiceNumber,
+          dueAt: report ? null : row.dueAt,
+          paidAt: report ? null : row.paidAt,
+          viaFleetName: memberBilled ? fleetName : null,
+        };
+      });
       return { data, total: totals[0]?.count ?? 0 } satisfies PaginatedResponse<
         (typeof data)[number]
       >;
@@ -309,7 +376,7 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
         tags: ['Portal Invoices'],
         summary: 'Get one of the driver invoices',
         description:
-          "An invoice or credit note of the signed-in driver with its lines and tax breakdown. Another driver's invoice, a fleet invoice and an unknown id all answer 404 INVOICE_NOT_FOUND.",
+          "An invoice or credit note of the signed-in driver with its lines and tax breakdown; under external invoicing a member invoice as its session report (document sessionReport). Another driver's invoice, a fleet invoice and an unknown id all answer 404 INVOICE_NOT_FOUND.",
         operationId: 'portalGetInvoice',
         security: [{ bearerAuth: [] }],
         params: zodSchema(portalInvoiceParams),
@@ -319,12 +386,13 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
       const { id } = request.params as z.infer<typeof portalInvoiceParams>;
-      const detail = await loadDriverInvoice(driverId, id);
+      const external = await getExternalInvoicing();
+      const detail = await loadDriverInvoice(driverId, id, external);
       if (detail == null) {
         await reply.status(404).send(invoiceNotFound);
         return;
       }
-      return toPortalInvoiceDetail(detail);
+      return toPortalInvoiceDetail(detail, external);
     },
   );
 
@@ -336,7 +404,7 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
         tags: ['Portal Invoices'],
         summary: 'Download one of the driver invoices as a PDF',
         description:
-          "The same PDF the operator downloads (GET /v1/invoices/:id/pdf), for an invoice or credit note of the signed-in driver. Streams application/pdf as an attachment. Another driver's invoice, a fleet invoice and an unknown id all answer 404 INVOICE_NOT_FOUND.",
+          "The same PDF the operator downloads (GET /v1/invoices/:id/pdf), for an invoice or credit note of the signed-in driver; under external invoicing a member invoice's session report (GET /v1/invoices/:id/session-report). Streams application/pdf as an attachment. Another driver's invoice, a fleet invoice and an unknown id all answer 404 INVOICE_NOT_FOUND.",
         operationId: 'portalDownloadInvoicePdf',
         security: [{ bearerAuth: [] }],
         params: zodSchema(portalInvoiceParams),
@@ -346,15 +414,22 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { driverId } = request.user as DriverJwtPayload;
       const { id } = request.params as z.infer<typeof portalInvoiceParams>;
-      const detail = await loadDriverInvoice(driverId, id);
+      const external = await getExternalInvoicing();
+      const detail = await loadDriverInvoice(driverId, id, external);
       if (detail == null) {
         await reply.status(404).send(invoiceNotFound);
         return;
       }
-      const pdf = await generateInvoicePdf(detail);
+      const report = portalDocument(detail.invoice, external) === 'sessionReport';
+      const pdf = report
+        ? await generateSessionReportPdf(detail)
+        : await generateInvoicePdf(detail);
+      const fileName = report
+        ? sessionReportFileName(detail)
+        : `${detail.invoice.invoiceNumber}.pdf`;
       await reply
         .header('Content-Type', 'application/pdf')
-        .header('Content-Disposition', `attachment; filename="${detail.invoice.invoiceNumber}.pdf"`)
+        .header('Content-Disposition', `attachment; filename="${fileName}"`)
         .send(pdf);
     },
   );

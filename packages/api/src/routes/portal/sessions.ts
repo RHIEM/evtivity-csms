@@ -8,6 +8,7 @@ import type { SQL } from 'drizzle-orm';
 import {
   db,
   getCompanyCurrency,
+  getExternalInvoicing,
   inOperatorStation,
   isAutochargeEnabledForStation,
   writeAudit,
@@ -436,7 +437,8 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           .where(whereClause),
       ]);
 
-      const items = data.map(withAccountBilling);
+      const external = await getExternalInvoicing();
+      const items = data.map((row) => withAccountBilling(row, external));
       return { data: items, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
         (typeof items)[number]
       >;
@@ -541,7 +543,8 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       // session billed to a fleet is listed as billed to it and left out
       // (owner decision 2026-10-14); a session billed in an earlier currency
       // is left out and counted, so the statement can say so (currency.md).
-      const items = sessions.map(withAccountBilling);
+      const external = await getExternalInvoicing();
+      const items = sessions.map((row) => withAccountBilling(row, external));
       let totalCostCents = 0;
       let totalEnergyWh = 0;
       let totalCo2AvoidedKg = 0;
@@ -714,7 +717,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         costBreakdown,
         lastSocPercent,
         ...sessionRest
-      } = withAccountBilling(session);
+      } = withAccountBilling(session, await getExternalInvoicing());
       const vehicleCapture =
         vehicleIdValue != null && vehicleIdType != null && vehicleIdSource != null
           ? { value: vehicleIdValue, type: vehicleIdType, source: vehicleIdSource }

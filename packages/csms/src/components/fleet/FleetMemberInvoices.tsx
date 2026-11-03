@@ -22,6 +22,7 @@ import { useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatCents } from '@/lib/formatting';
 import { BillToButton } from '@/components/bill-to-button';
+import { downloadFleetSessionReportCsv } from '@/lib/session-report';
 import { useBillingRecipientMove } from './use-billing-recipient-move';
 
 /** A member row of GET /v1/fleets/:id/billing/unbilled (`members`). */
@@ -135,6 +136,17 @@ export function FleetMemberInvoices({
           <p className="text-muted-foreground">{t('fleets.invoices.membersDescription')}</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="outline"
+            data-testid="session-report-csv"
+            onClick={() => {
+              void downloadFleetSessionReportCsv(fleetId, period).catch((err: unknown) => {
+                toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+              });
+            }}
+          >
+            {t('fleets.invoices.sessionReportCsv')}
+          </Button>
           {move.canMove && movable.length > 0 && (
             <BillToButton
               recipient="fleet"
