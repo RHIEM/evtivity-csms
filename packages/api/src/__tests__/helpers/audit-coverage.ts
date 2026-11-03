@@ -65,6 +65,14 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'DELETE /ocpi/partners/:id': { audited: 'ocpi_partner' },
   'DELETE /ocpi/tariff-mappings/:id': { audited: ['tariff', 'pricing_group', 'ocpi_partner'] },
   'DELETE /ocpp-event-settings': { audited: 'notification_template' },
+  'DELETE /payment-terminals/:id': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'DELETE /payment-terminals/:id/sim': {
+    audited: ['payment_terminal', 'sim'],
+    service: 'services/src/payment-terminal.service.ts',
+  },
   'DELETE /pnc/ca-certificates/:id': { audited: 'certificate' },
   'DELETE /pricing-groups/:id': { audited: ['tariff', 'pricing_group'] },
   'DELETE /pricing-groups/:id/tariffs/:tariffId': { audited: 'tariff' },
@@ -76,12 +84,22 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     service: 'services/src/reservation.service.ts',
   },
   'DELETE /settings/:key': { audited: 'setting' },
+  'DELETE /sims/:id': {
+    audited: 'sim',
+    service: 'services/src/sim-inventory.service.ts',
+  },
   'DELETE /sites/:id': { audited: 'site' },
   'DELETE /sites/:id/electricity-rates/:periodId': { audited: 'site' },
   'DELETE /sites/:id/payment-config': { audited: 'site' },
   'DELETE /sites/:id/pricing-groups/:pricingGroupId': { audited: 'pricing_assignment' },
-  'DELETE /sites/:siteId/panels/:panelId': { audited: 'site' },
-  'DELETE /sites/:siteId/panels/:panelId/circuits/:circuitId': { audited: 'site' },
+  'DELETE /sites/:siteId/panels/:panelId': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
+  'DELETE /sites/:siteId/panels/:panelId/circuits/:circuitId': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
   'DELETE /sites/:siteId/unmanaged-loads/:id': { audited: 'site' },
   'DELETE /smart-charging/templates/:id': { audited: 'smart_charging_template' },
   'DELETE /station-message-templates/:state': { audited: 'station_message_template' },
@@ -90,11 +108,11 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'DELETE /stations/:id/evses/:evseId/connectors/:connectorId': { audited: 'station' },
   'DELETE /stations/:id/images/:imageId': { audited: 'station_image' },
   'DELETE /stations/:id/monitoring-rules/:ruleId': { audited: 'station' },
-  'DELETE /stations/:id/sim/match': {
-    audited: 'station',
-    service: 'database/src/lib/station-sim-match.ts',
-  },
   'DELETE /stations/:id/pricing-groups/:pricingGroupId': { audited: 'pricing_assignment' },
+  'DELETE /stations/:id/sim/attachment': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
   'DELETE /stations/:id/web-payments': {
     audited: 'station',
     service: 'api/src/services/web-payment.service.ts',
@@ -113,6 +131,7 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'user',
     service: 'api/src/services/mfa-factor.service.ts',
   },
+  'DELETE /users/me/dashboard-layout': { allow: 'personal dashboard layout, no shared state' },
   'DELETE /users/me/support-ai-config': { audited: 'user' },
   'PATCH /api-keys/:id': { audited: 'api_key' },
   'PATCH /assistant/conversations/:id': {
@@ -155,6 +174,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'PATCH /nevi/excluded-downtime/:id': { audited: 'station' },
   'PATCH /ocpi/partners/:id': { audited: 'ocpi_partner' },
   'PATCH /ocpi/tariff-mappings/:id': { audited: ['tariff', 'pricing_group', 'ocpi_partner'] },
+  'PATCH /payment-terminals/:id': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
   'PATCH /pricing-groups/:id': { audited: 'pricing_group' },
   'PATCH /pricing-groups/:id/tariffs/:tariffId': { audited: 'tariff' },
   'PATCH /report-schedules/:id': { audited: 'report_schedule' },
@@ -163,6 +186,10 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     service: 'services/src/reservation.service.ts',
   },
   'PATCH /settings/:key': { audited: 'setting' },
+  'PATCH /sims/:id': {
+    audited: 'sim',
+    service: 'services/src/sim-inventory.service.ts',
+  },
   'PATCH /sites/:id': { audited: 'site' },
   'PATCH /sites/:id/electricity-rates/:periodId': { audited: 'site' },
   'PATCH /sites/:id/stations/:stationId/load-min-power': { audited: 'station' },
@@ -171,8 +198,14 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'maintenance_event',
     service: 'services/src/maintenance.service.ts',
   },
-  'PATCH /sites/:siteId/panels/:panelId': { audited: 'site' },
-  'PATCH /sites/:siteId/panels/:panelId/circuits/:circuitId': { audited: 'site' },
+  'PATCH /sites/:siteId/panels/:panelId': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
+  'PATCH /sites/:siteId/panels/:panelId/circuits/:circuitId': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
   'PATCH /sites/:siteId/stations/:stationId/circuit': { audited: 'station' },
   'PATCH /sites/:siteId/unmanaged-loads/:id': { audited: 'site' },
   'PATCH /smart-charging/templates/:id': { audited: 'smart_charging_template' },
@@ -186,6 +219,72 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   },
   'PATCH /tokens/:id': { audited: 'token', service: 'api/src/services/token.service.ts' },
   'PATCH /users/:id': { audited: 'user' },
+  'POST /payment-terminal-transactions/:id/void': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals/:id/pair': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals/:id/payments': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals/:id/sim': {
+    audited: ['payment_terminal', 'sim'],
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals/:id/status': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /payment-terminals/:id/unpair': {
+    audited: 'payment_terminal',
+    service: 'services/src/payment-terminal.service.ts',
+  },
+  'POST /settings/payment-terminals/:provider/test': { allow: 'connection test, no stored state' },
+  'POST /webhooks/payment-terminals/idtech': {
+    allow: 'provider-signed webhook, no operator (see section 3)',
+  },
+  'PUT /settings/payment-terminals': { audited: 'setting' },
+  'PUT /users/me/avatar': { audited: 'user', service: 'api/src/services/user-avatar.service.ts' },
+  'DELETE /users/me/avatar': {
+    audited: 'user',
+    service: 'api/src/services/user-avatar.service.ts',
+  },
+  'POST /users/me/avatar/image': {
+    audited: 'user',
+    service: 'api/src/services/user-avatar.service.ts',
+  },
+  'POST /users/me/avatar/upload-url': { allow: 'issues an upload URL, nothing stored' },
+  'PUT /users/:id/avatar': { audited: 'user', service: 'api/src/services/user-avatar.service.ts' },
+  'DELETE /users/:id/avatar': {
+    audited: 'user',
+    service: 'api/src/services/user-avatar.service.ts',
+  },
+  'POST /users/:id/avatar/image': {
+    audited: 'user',
+    service: 'api/src/services/user-avatar.service.ts',
+  },
+  'POST /users/:id/avatar/upload-url': { allow: 'issues an upload URL, nothing stored' },
+  'PUT /drivers/:id/avatar': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'DELETE /drivers/:id/avatar': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'POST /drivers/:id/avatar/image': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'POST /drivers/:id/avatar/upload-url': { allow: 'issues an upload URL, nothing stored' },
   'PATCH /users/me': { audited: 'user' },
   'PATCH /users/me/webauthn/:id': {
     audited: 'user',
@@ -194,7 +293,7 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'POST /access-logs': { allow: 'is the access log itself' },
   'POST /ad-hoc-payments': {
     audited: 'station',
-    service: 'api/src/services/ad-hoc-payment.service.ts',
+    service: 'services/src/ad-hoc-payment.service.ts',
   },
   'POST /ai/insights/:id/action/confirm': {
     audited: 'ai_proposal',
@@ -402,6 +501,42 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'setting',
     service: 'api/src/lib/payment-settings-writes.ts',
   },
+  'POST /sims': {
+    audited: 'sim',
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/attachments': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/attachments/:attachmentId/confirm': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/attachments/:attachmentId/detach': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/deactivate': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/network-reset': {
+    audited: ['sim', 'station'],
+    service: 'services/src/station-sim.service.ts',
+  },
+  'POST /sims/:id/reactivate': {
+    audited: 'sim',
+    service: 'services/src/sim-inventory.service.ts',
+  },
+  'POST /sims/:id/refresh': {
+    allow:
+      'records the provider lookup result and the fetched SIM data and fetch state, no operator state',
+  },
+  'POST /sims/import': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
+  },
   'POST /sites': { audited: 'site' },
   'POST /sites/:id/electricity-cost/recalculate': { audited: 'site' },
   'POST /sites/:id/electricity-rates': { audited: 'site' },
@@ -443,8 +578,14 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'maintenance_event',
     service: 'services/src/maintenance.service.ts',
   },
-  'POST /sites/:siteId/panels': { audited: 'site' },
-  'POST /sites/:siteId/panels/:panelId/circuits': { audited: 'site' },
+  'POST /sites/:siteId/panels': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
+  'POST /sites/:siteId/panels/:panelId/circuits': {
+    audited: 'site',
+    service: 'database/src/lib/load-management-tree.ts',
+  },
   'POST /sites/:siteId/unmanaged-loads': { audited: 'site' },
   'POST /sites/import': {
     audited: ['site', 'station'],
@@ -517,14 +658,17 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'station',
     service: 'api/src/services/station-onboarding.service.ts',
   },
-  'POST /stations/:id/sim/match/confirm': {
-    audited: 'station',
-    service: 'database/src/lib/station-sim-match.ts',
+  'POST /stations/:id/sim/attachment/confirm': {
+    audited: ['sim', 'station'],
+    service: 'services/src/sim-inventory.service.ts',
   },
-  'POST /stations/:id/sim/network-reset': { audited: 'station' },
+  'POST /stations/:id/sim/network-reset': {
+    audited: ['sim', 'station'],
+    service: 'services/src/station-sim.service.ts',
+  },
   'POST /stations/:id/sim/refresh': {
-    audited: 'station',
-    service: 'database/src/lib/station-sim-match.ts',
+    audited: ['sim', 'station'],
+    service: 'services/src/station-sim.service.ts',
   },
   'POST /stations/:id/rotate-credentials': {
     audited: 'station',
@@ -586,6 +730,8 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     allow: 'code only; the phone change it confirms is audited by PATCH /users/me',
   },
   'POST /users/me/mfa/setup': { allow: 'unconfirmed secret; confirmMfa is audited' },
+  'POST /users/me/sso-link': { audited: 'user' },
+  'DELETE /users/:id/sso-link': { audited: 'user' },
   'POST /users/me/webauthn/registration': { audited: 'user' },
   'POST /users/me/webauthn/registration-options': {
     allow: 'challenge only; registerWebauthnCredential is audited',
@@ -603,12 +749,27 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   'PUT /security/sessions': { audited: 'setting' },
   'PUT /settings/:key': { audited: 'setting' },
   'PUT /settings/adyen': { audited: 'setting', service: 'api/src/lib/payment-settings-writes.ts' },
+  'PUT /settings/data-retention': { audited: 'setting' },
+  'PUT /settings/ai/insights-scope': {
+    audited: ['setting', 'site', 'station'],
+    service: 'api/src/services/ai-insight-scope.service.ts',
+  },
   'PUT /settings/sim-providers': { audited: 'setting' },
   'PUT /settings/payments': {
     audited: 'setting',
     service: 'api/src/lib/payment-settings-writes.ts',
   },
   'PUT /settings/s3': { audited: 'setting' },
+  // writeWebhookSigningSecret in the same file writes the audit row.
+  'POST /settings/notifications/webhook-signing-secret': {
+    audited: 'setting',
+    service: 'api/src/routes/settings.ts',
+  },
+  // writeWebhookSigningSecret in the same file writes the audit row.
+  'DELETE /settings/notifications/webhook-signing-secret': {
+    audited: 'setting',
+    service: 'api/src/routes/settings.ts',
+  },
   'PUT /settings/stripe': { audited: 'setting', service: 'api/src/lib/payment-settings-writes.ts' },
   'PUT /sites/:id/carbon-region': { audited: 'site' },
   'PUT /sites/:id/layout': { audited: 'site' },
@@ -622,6 +783,7 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
   },
   'PUT /users/:id/permissions': { audited: 'user' },
   'PUT /users/me/chatbot-ai-config': { audited: 'user' },
+  'PUT /users/me/dashboard-layout': { allow: 'personal dashboard layout, no shared state' },
   'PUT /users/me/notification-preferences': { audited: 'user' },
   'PUT /users/me/support-ai-config': { audited: 'user' },
   'DELETE /portal/driver/mfa': { audited: 'driver' },
@@ -652,6 +814,19 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     service: 'api/src/services/mfa-factor.service.ts',
   },
   'PATCH /portal/driver/profile': { audited: 'driver' },
+  'PUT /portal/driver/avatar': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'POST /portal/driver/avatar/image': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'DELETE /portal/driver/avatar': {
+    audited: 'driver',
+    service: 'api/src/services/driver-avatar.service.ts',
+  },
+  'POST /portal/driver/avatar/upload-url': { allow: 'issues an upload URL, nothing stored' },
   'PATCH /portal/payment-methods/:pmId/default': {
     audited: 'driver',
     service: 'payments/src/methods.ts',

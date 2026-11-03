@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, and, or, count, sql, inArray, desc, isNull } from 'drizzle-orm';
-import { db, isOperatorStation } from '@evtivity/database';
+import { db, isOperatorStation, placeStationOnLayout } from '@evtivity/database';
 import {
   cssStations,
   cssEvses,
@@ -55,6 +55,8 @@ import {
 } from '../lib/ocpp-zod-types-v16.js';
 import { OCPP21_CONFIG_DEFAULTS, OCPP16_CONFIG_DEFAULTS } from '../lib/css-config-defaults.js';
 import { authorize } from '../middleware/rbac.js';
+import { refuseSecurityProfileChange } from '../lib/security-profile-permission.js';
+import { refuseSimulatorTarget } from '../lib/simulator-target.js';
 import { getUserSiteIds } from '../lib/site-access.js';
 import { siteInScope } from '../lib/site-scope.js';
 import type { JwtPayload } from '../plugins/auth.js';
@@ -279,7 +281,11 @@ const createStationBody = z.object({
   stationId: z.string().min(1).describe('Station identifier string'),
   ocppProtocol: z.enum(OCPP_PROTOCOLS).optional().describe('OCPP protocol version'),
   securityProfile: z.number().int().min(0).max(3).optional().describe('Security profile (0-3)'),
-  targetUrl: z.string().url().describe('Target OCPP WebSocket URL'),
+  targetUrl: z
+    .url()
+    .describe(
+      'Target OCPP WebSocket URL: ws or wss on the origin of the OCPP server, else 400 VALIDATION_ERROR',
+    ),
   password: z.string().optional().describe('Basic auth password'),
   model: z.string().optional().describe('Station model'),
   serialNumber: z.string().optional().describe('Serial number'),
@@ -306,7 +312,12 @@ const updateStationBody = z.object({
     .describe(
       'Network interface of the new network profile when an online OCPP 2.0.1 station moves to a higher security profile (required there, ignored otherwise)',
     ),
-  targetUrl: z.string().url().optional(),
+  targetUrl: z
+    .url()
+    .optional()
+    .describe(
+      'Target OCPP WebSocket URL: ws or wss on the origin of the OCPP server, else 400 VALIDATION_ERROR',
+    ),
   password: z.string().optional(),
   model: z.string().optional(),
   serialNumber: z.string().nullable().optional(),
@@ -354,17 +365,17 @@ const stationItem = z
     createdAt: z.string().describe('Timestamp when the simulator station was created'),
     updatedAt: z.string().describe('Timestamp when the simulator station was last updated'),
   })
-  .passthrough();
+  .loose();
 
 const actionResponse = z
   .object({
     commandId: z.string().describe('Identifier for the dispatched simulator command'),
     data: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .optional()
       .describe('Optional structured data returned by the simulator action'),
   })
-  .passthrough();
+  .loose();
 
 // ---------------------------------------------------------------------------
 // Action body schemas
@@ -791,7 +802,7 @@ const sendSignCertificateBody = z.object({
 
 const sendGetCertificateStatusBody = z.object({
   ocspRequestData: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .describe(
       'OCSP request data object: { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber, responderURL }',
     ),
@@ -829,11 +840,11 @@ const sendNotifySettlementBody = z
     receiptUrl: z.string().optional().describe('Receipt URL'),
     vatNumber: z.string().optional().describe('VAT number for company receipt'),
     vatCompany: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .optional()
       .describe('VAT company address: { name, address1, city, country, ... }'),
   })
-  .passthrough();
+  .loose();
 
 const sendNotifyPriorityChargingBody = z.object({
   transactionId: z.string().describe('Transaction ID'),
@@ -871,10 +882,10 @@ const sendGetCertificateChainStatusBody = z.object({
               issuerKeyHash: z.string().describe('Issuer key hash'),
               serialNumber: z.string().describe('Certificate serial number'),
             })
-            .passthrough()
+            .loose()
             .describe('Certificate hash data'),
         })
-        .passthrough(),
+        .loose(),
     )
     .min(1)
     .max(4)
@@ -895,7 +906,7 @@ const sendNotifyPeriodicEventStreamBody = z
     basetime: z.string().describe('ISO 8601 base time for the event stream data'),
     data: z.array(streamDataElementType).describe('Event stream data entries'),
   })
-  .passthrough();
+  .loose();
 
 const sendNotifyDERAlarmBody = z
   .object({
@@ -905,7 +916,7 @@ const sendNotifyDERAlarmBody = z
     gridEventFault: gridEventFaultEnum.optional().describe('Grid event fault type'),
     extraInfo: z.string().optional().describe('Extra information'),
   })
-  .passthrough();
+  .loose();
 
 const sendNotifyDERStartStopBody = z
   .object({
@@ -914,24 +925,21 @@ const sendNotifyDERStartStopBody = z
     timestamp: z.string().describe('ISO 8601 timestamp'),
     supersededIds: z.array(z.string()).optional().describe('IDs of superseded controls'),
   })
-  .passthrough();
+  .loose();
 
 const sendReportDERControlBody = z
   .object({
     requestId: z.number().int().describe('Request ID'),
     tbc: z.boolean().optional().describe('To be continued (default: false)'),
   })
-  .passthrough();
+  .loose();
 
 const sendBatterySwapBody = z.object({
   eventType: z
     .enum(['BatteryIn', 'BatteryOut', 'BatteryOutTimeout'])
     .describe('Battery swap event type'),
   requestId: z.number().int().describe('Request ID to correlate BatteryIn/Out events'),
-  idToken: z
-    .object({ idToken: z.string(), type: z.string() })
-    .passthrough()
-    .describe('ID token object'),
+  idToken: z.object({ idToken: z.string(), type: z.string() }).loose().describe('ID token object'),
   batteryData: z
     .array(
       z
@@ -943,7 +951,7 @@ const sendBatterySwapBody = z.object({
           productionDate: z.string().optional().describe('Production date'),
           vendorInfo: z.string().optional().describe('Vendor info'),
         })
-        .passthrough(),
+        .loose(),
     )
     .describe('Battery data array'),
 });
@@ -1292,6 +1300,8 @@ export function cssRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const body = request.body as z.infer<typeof createStationBody>;
       const { userId } = request.user as JwtPayload;
+      // The simulator connects only to the OCPP server (security review AZ-L8).
+      if (await refuseSimulatorTarget(reply, body.targetUrl)) return;
 
       // An existing charging_stations row must be in the caller's sites: a
       // site-restricted user cannot take over an unsited or foreign real
@@ -1398,6 +1408,10 @@ export function cssRoutes(app: FastifyInstance): void {
             })
             .returning({ id: chargingStations.id });
           chargingStationId = created?.id ?? null;
+          // A station with a site takes the first free slot of the site layout.
+          if (created != null && body.siteId != null) {
+            await placeStationOnLayout(tx, body.siteId, created.id);
+          }
         } else if (!existingCs.isSimulator) {
           await tx
             .update(chargingStations)
@@ -1626,6 +1640,9 @@ export function cssRoutes(app: FastifyInstance): void {
         body: zodSchema(updateStationBody),
         response: {
           200: itemResponse(stationItem),
+          403: errorWith('A security profile change needs settings.stationConfig:write', [
+            ERROR_CODES.INSUFFICIENT_PERMISSIONS,
+          ]),
           400: errorWith('Invalid security change', [
             ERROR_CODES.VALIDATION_ERROR,
             ERROR_CODES.PASSWORD_REQUIRED,
@@ -1645,6 +1662,10 @@ export function cssRoutes(app: FastifyInstance): void {
       const { stationId } = request.params as z.infer<typeof stationIdParams>;
       const body = request.body as z.infer<typeof updateStationBody>;
       const { userId } = request.user as JwtPayload;
+      // A security profile change is station configuration.
+      if (await refuseSecurityProfileChange(request, reply, body.securityProfile)) return;
+      // The simulator connects only to the OCPP server (security review AZ-L8).
+      if (await refuseSimulatorTarget(reply, body.targetUrl)) return;
 
       if (!(await isCssStationAccessible(stationId, userId))) {
         return reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });

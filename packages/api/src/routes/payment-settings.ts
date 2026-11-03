@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { PRE_AUTH_AMOUNT_MAX_CENTS, PRE_AUTH_AMOUNT_MIN_CENTS } from '@evtivity/lib/currency';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { getPlatformFeePercent } from '@evtivity/database';
@@ -39,7 +40,7 @@ const upgradePendingSchema = z
       .nullable()
       .describe('When the worker watch last ran (ISO 8601), or null when it has not run'),
   })
-  .passthrough()
+  .loose()
   .describe('Why the provider-switch guard refuses the provider');
 
 const providerEntrySchema = z
@@ -67,10 +68,10 @@ const providerEntrySchema = z
           .string()
           .describe('Site host payout model: none, destination_charge or split_instructions'),
       })
-      .passthrough()
+      .loose()
       .describe('Provider capabilities the settings UI shows'),
   })
-  .passthrough()
+  .loose()
   .describe('A payment provider registered in this API process');
 
 const paymentSettingsResponse = z
@@ -97,7 +98,7 @@ const paymentSettingsResponse = z
           .max(1)
           .describe('Failure rate of test provider methods without a scenario (0 to 1)'),
       })
-      .passthrough()
+      .loose()
       .describe('Test (simulated) provider settings'),
     providers: z
       .array(providerEntrySchema)
@@ -105,7 +106,7 @@ const paymentSettingsResponse = z
         'Providers registered in this API process. The simulated provider is listed only where PAYMENTS_ALLOW_SIMULATED is true.',
       ),
   })
-  .passthrough()
+  .loose()
   .describe('Provider-neutral payment settings');
 
 const updatePaymentSettingsBody = z.object({
@@ -117,8 +118,8 @@ const updatePaymentSettingsBody = z.object({
   preAuthAmountCents: z
     .number()
     .int()
-    .min(1)
-    .max(1_000_000)
+    .min(PRE_AUTH_AMOUNT_MIN_CENTS)
+    .max(PRE_AUTH_AMOUNT_MAX_CENTS)
     .optional()
     .describe('Default pre-authorization amount in cents (1 to 1,000,000)'),
   platformFeePercent: z
@@ -157,7 +158,7 @@ export function paymentSettingsRoutes(app: FastifyInstance): void {
   app.get(
     '/settings/payments',
     {
-      onRequest: [authorize('payments:read')],
+      onRequest: [authorize('settings.payment:read')],
       schema: {
         tags: ['Payments'],
         summary: 'Get payment settings',
@@ -191,7 +192,7 @@ export function paymentSettingsRoutes(app: FastifyInstance): void {
   app.put(
     '/settings/payments',
     {
-      onRequest: [authorize('payments:write')],
+      onRequest: [authorize('settings.payment:write')],
       schema: {
         tags: ['Payments'],
         summary: 'Update payment settings',

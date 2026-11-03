@@ -131,6 +131,8 @@ describe('Portal vehicle routes', () => {
           evccid: '92D50A693F80',
           autochargeEnabled: true,
           autochargeBlockedAt: null,
+          color: null,
+          bodyType: null,
           createdAt: new Date(),
         },
       ]);
@@ -165,6 +167,8 @@ describe('Portal vehicle routes', () => {
         evccid: null,
         autochargeEnabled: false,
         autochargeBlockedAt: null,
+        color: null,
+        bodyType: null,
         createdAt: new Date(),
       };
       setupDbResults([vehicle]);
@@ -176,6 +180,89 @@ describe('Portal vehicle routes', () => {
       });
       expect(response.statusCode).toBe(201);
       expect(response.json().make).toBe('Tesla');
+    });
+
+    it('stores and returns the color and body type', async () => {
+      const vehicle = {
+        id: VEHICLE_ID,
+        driverId: DRIVER_ID,
+        make: 'Ford',
+        model: 'F-150 Lightning',
+        year: null,
+        color: 'blue',
+        bodyType: 'pickup_truck',
+        vin: null,
+        evccid: null,
+        autochargeEnabled: false,
+        autochargeBlockedAt: null,
+        createdAt: new Date(),
+      };
+      setupDbResults([vehicle]);
+      const { db } = await import('@evtivity/database');
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/vehicles',
+        headers: { authorization: `Bearer ${driverToken}` },
+        payload: {
+          make: 'Ford',
+          model: 'F-150 Lightning',
+          color: 'blue',
+          bodyType: 'pickup_truck',
+        },
+      });
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({ color: 'blue', bodyType: 'pickup_truck' });
+      const chain = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: ReturnType<typeof vi.fn>;
+      };
+      expect(chain.values).toHaveBeenCalledWith(
+        expect.objectContaining({ color: 'blue', bodyType: 'pickup_truck' }),
+      );
+    });
+
+    it.each(['box_truck', 'bus', 'semi_truck'])(
+      'stores the large body type %s',
+      async (bodyType) => {
+        setupDbResults([
+          {
+            id: VEHICLE_ID,
+            driverId: DRIVER_ID,
+            make: 'Freightliner',
+            model: 'eCascadia',
+            year: null,
+            color: 'white',
+            bodyType,
+            vin: null,
+            evccid: null,
+            autochargeEnabled: false,
+            autochargeBlockedAt: null,
+            createdAt: new Date(),
+          },
+        ]);
+        const response = await app.inject({
+          method: 'POST',
+          url: '/portal/vehicles',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload: { make: 'Freightliner', model: 'eCascadia', color: 'white', bodyType },
+        });
+        expect(response.statusCode).toBe(201);
+        expect(response.json()).toMatchObject({ bodyType });
+      },
+    );
+
+    it('refuses a color or body type off the list', async () => {
+      for (const payload of [
+        { make: 'Tesla', model: 'Model Y', color: 'magenta' },
+        { make: 'Tesla', model: 'Model Y', bodyType: 'truck' },
+      ]) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/portal/vehicles',
+          headers: { authorization: `Bearer ${driverToken}` },
+          payload,
+        });
+        expect(response.statusCode).toBe(400);
+      }
     });
 
     it('rejects empty make', async () => {

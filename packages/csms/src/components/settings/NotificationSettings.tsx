@@ -1,13 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Send } from 'lucide-react';
 import { useTab } from '@/hooks/use-tab';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { SaveButton } from '@/components/save-button';
+import { WebhookSigningSecret } from '@/components/settings/WebhookSigningSecret';
 import { CopyableId } from '@/components/copyable-id';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,6 +19,8 @@ import { Textarea } from '@/components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { api, getApiErrorFieldDetails } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { emailPreviewDocument } from '@/lib/email-preview';
+import { useLoadedValues, withoutUntouchedSecrets } from '@/hooks/use-loaded-values';
 
 const DEFAULT_EMAIL_WRAPPER = `<!DOCTYPE html>
 <html>
@@ -60,6 +63,43 @@ const DEFAULT_EMAIL_WRAPPER = `<!DOCTYPE html>
 </body>
 </html>`;
 
+interface NotificationValues {
+  smtp: { host: string; port: string; username: string; password: string; from: string };
+  twilio: { accountSid: string; authToken: string; fromNumber: string };
+  webhook: { allowedHosts: string };
+  emailLayout: { wrapperTemplate: string };
+}
+
+/** Each card's form values as stored (defaults while the settings load). */
+function notificationValuesFrom(settings: Record<string, unknown> | undefined): NotificationValues {
+  const s = (key: string): string => {
+    const v = settings?.[key];
+    return typeof v === 'string' || typeof v === 'number' ? String(v) : '';
+  };
+  const hosts = settings?.['notifications.webhookAllowedPrivateHosts'];
+  const wrapper = s('email.wrapperTemplate');
+  return {
+    smtp: {
+      host: s('smtp.host'),
+      port: s('smtp.port') || '587',
+      username: s('smtp.username'),
+      password: s('smtp.passwordEnc'),
+      from: s('smtp.from'),
+    },
+    twilio: {
+      accountSid: s('twilio.accountSid'),
+      authToken: s('twilio.authTokenEnc'),
+      fromNumber: s('twilio.fromNumber'),
+    },
+    webhook: {
+      allowedHosts: Array.isArray(hosts)
+        ? hosts.filter((h) => typeof h === 'string').join('\n')
+        : '',
+    },
+    emailLayout: { wrapperTemplate: wrapper !== '' ? wrapper : DEFAULT_EMAIL_WRAPPER },
+  };
+}
+
 interface NotificationSettingsProps {
   settings: Record<string, unknown> | undefined;
 }
@@ -68,61 +108,78 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [smtpHost, setSmtpHost] = useState('');
-  const [smtpPort, setSmtpPort] = useState('587');
-  const [smtpUsername, setSmtpUsername] = useState('');
-  const [smtpPassword, setSmtpPassword] = useState('');
-  const [smtpFrom, setSmtpFrom] = useState('');
-
-  const [twilioAccountSid, setTwilioAccountSid] = useState('');
-  const [twilioAuthToken, setTwilioAuthToken] = useState('');
-  const [twilioFromNumber, setTwilioFromNumber] = useState('');
-
-  const [webhookAllowedHosts, setWebhookAllowedHosts] = useState('');
+  const loaded = useMemo(() => notificationValuesFrom(settings), [settings]);
+  const [smtp, setSmtp, takeNextSmtpLoad, smtpTaken] = useLoadedValues(loaded.smtp);
+  const [twilio, setTwilio, takeNextTwilioLoad, twilioTaken] = useLoadedValues(loaded.twilio);
+  const [webhook, setWebhook, takeNextWebhookLoad] = useLoadedValues(loaded.webhook);
+  const [emailLayout, setEmailLayout, takeNextEmailLayoutLoad] = useLoadedValues(
+    loaded.emailLayout,
+  );
+  const { host: smtpHost, port: smtpPort, username: smtpUsername } = smtp;
+  const { password: smtpPassword, from: smtpFrom } = smtp;
+  const setSmtpHost = (host: string): void => {
+    setSmtp((prev) => ({ ...prev, host }));
+  };
+  const setSmtpPort = (port: string): void => {
+    setSmtp((prev) => ({ ...prev, port }));
+  };
+  const setSmtpUsername = (username: string): void => {
+    setSmtp((prev) => ({ ...prev, username }));
+  };
+  const setSmtpPassword = (password: string): void => {
+    setSmtp((prev) => ({ ...prev, password }));
+  };
+  const setSmtpFrom = (from: string): void => {
+    setSmtp((prev) => ({ ...prev, from }));
+  };
+  const {
+    accountSid: twilioAccountSid,
+    authToken: twilioAuthToken,
+    fromNumber: twilioFromNumber,
+  } = twilio;
+  const setTwilioAccountSid = (accountSid: string): void => {
+    setTwilio((prev) => ({ ...prev, accountSid }));
+  };
+  const setTwilioAuthToken = (authToken: string): void => {
+    setTwilio((prev) => ({ ...prev, authToken }));
+  };
+  const setTwilioFromNumber = (fromNumber: string): void => {
+    setTwilio((prev) => ({ ...prev, fromNumber }));
+  };
+  const webhookAllowedHosts = webhook.allowedHosts;
+  const setWebhookAllowedHosts = (allowedHosts: string): void => {
+    setWebhook({ allowedHosts });
+  };
+  const emailWrapperTemplate = emailLayout.wrapperTemplate;
+  const setEmailWrapperTemplate = (wrapperTemplate: string): void => {
+    setEmailLayout({ wrapperTemplate });
+  };
 
   const [testEmailRecipient, setTestEmailRecipient] = useState('');
   const [testSmsRecipient, setTestSmsRecipient] = useState('');
-
-  const [emailWrapperTemplate, setEmailWrapperTemplate] = useState(DEFAULT_EMAIL_WRAPPER);
-  const [notificationSubTab, setNotificationSubTab] = useTab('smtp', 'sub');
-
+  // The test email goes to the stored sender address until the user types another.
+  const storedFrom = loaded.smtp.from;
   useEffect(() => {
-    if (settings == null) return;
-    const s = (key: string): string => {
-      const v = settings[key];
-      return typeof v === 'string' || typeof v === 'number' ? String(v) : '';
-    };
-    setSmtpHost(s('smtp.host'));
-    setSmtpPort(s('smtp.port') || '587');
-    setSmtpUsername(s('smtp.username'));
-    setSmtpPassword(s('smtp.passwordEnc'));
-    const fromAddr = s('smtp.from');
-    setSmtpFrom(fromAddr);
-    setTestEmailRecipient((current) => (current === '' ? fromAddr : current));
-    setTwilioAccountSid(s('twilio.accountSid'));
-    setTwilioAuthToken(s('twilio.authTokenEnc'));
-    setTwilioFromNumber(s('twilio.fromNumber'));
-    const hosts = settings['notifications.webhookAllowedPrivateHosts'];
-    setWebhookAllowedHosts(
-      Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string').join('\n') : '',
-    );
-    const wrapper = s('email.wrapperTemplate');
-    setEmailWrapperTemplate(wrapper !== '' ? wrapper : DEFAULT_EMAIL_WRAPPER);
-  }, [settings]);
+    setTestEmailRecipient((current) => (current === '' ? storedFrom : current));
+  }, [storedFrom]);
+
+  const [notificationSubTab, setNotificationSubTab] = useTab('smtp', 'sub');
 
   const smtpMutation = useMutation({
     mutationFn: (vals: {
       host: string;
       port: string;
       username: string;
-      password: string;
+      password?: string;
       from: string;
     }) =>
       Promise.all([
         api.put('/v1/settings/smtp.host', { value: vals.host }),
         api.put('/v1/settings/smtp.port', { value: Number(vals.port) }),
         api.put('/v1/settings/smtp.username', { value: vals.username }),
-        api.put('/v1/settings/smtp.passwordEnc', { value: vals.password }),
+        ...(vals.password !== undefined
+          ? [api.put('/v1/settings/smtp.passwordEnc', { value: vals.password })]
+          : []),
         api.put('/v1/settings/smtp.from', { value: vals.from }),
       ]),
     onSuccess: () => {
@@ -131,10 +188,12 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
   });
 
   const twilioMutation = useMutation({
-    mutationFn: (vals: { accountSid: string; authToken: string; fromNumber: string }) =>
+    mutationFn: (vals: { accountSid: string; authToken?: string; fromNumber: string }) =>
       Promise.all([
         api.put('/v1/settings/twilio.accountSid', { value: vals.accountSid }),
-        api.put('/v1/settings/twilio.authTokenEnc', { value: vals.authToken }),
+        ...(vals.authToken !== undefined
+          ? [api.put('/v1/settings/twilio.authTokenEnc', { value: vals.authToken })]
+          : []),
         api.put('/v1/settings/twilio.fromNumber', { value: vals.fromNumber }),
       ]),
     onSuccess: () => {
@@ -279,12 +338,12 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 isPending={smtpMutation.isPending}
                 type="button"
                 onClick={() => {
-                  smtpMutation.mutate({
-                    host: smtpHost,
-                    port: smtpPort,
-                    username: smtpUsername,
-                    password: smtpPassword,
-                    from: smtpFrom,
+                  const sent = smtp;
+                  // An untouched password is left out (the stored one stays).
+                  smtpMutation.mutate(withoutUntouchedSecrets(sent, smtpTaken, ['password']), {
+                    onSuccess: () => {
+                      takeNextSmtpLoad(sent);
+                    },
                   });
                 }}
               />
@@ -385,10 +444,11 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 isPending={twilioMutation.isPending}
                 type="button"
                 onClick={() => {
-                  twilioMutation.mutate({
-                    accountSid: twilioAccountSid,
-                    authToken: twilioAuthToken,
-                    fromNumber: twilioFromNumber,
+                  const sent = twilio;
+                  twilioMutation.mutate(withoutUntouchedSecrets(sent, twilioTaken, ['authToken']), {
+                    onSuccess: () => {
+                      takeNextTwilioLoad(sent);
+                    },
                   });
                 }}
               />
@@ -463,11 +523,17 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 isPending={webhookMutation.isPending}
                 type="button"
                 onClick={() => {
+                  const sent = webhook;
                   webhookMutation.mutate(
                     webhookAllowedHosts
                       .split(/[\s,]+/)
                       .map((h) => h.trim())
                       .filter((h) => h !== ''),
+                    {
+                      onSuccess: () => {
+                        takeNextWebhookLoad(sent);
+                      },
+                    },
                   );
                 }}
               />
@@ -480,6 +546,7 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 {t('settings.webhooksSaveFailed')} {getErrorMessage(webhookMutation.error, t)}
               </p>
             )}
+            <WebhookSigningSecret />
           </CardContent>
         </Card>
       </TabsContent>
@@ -521,9 +588,9 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 <Label htmlFor="email-wrapper-template" className="leading-6">
                   HTML Template
                 </Label>
-                <textarea
+                <Textarea
                   id="email-wrapper-template"
-                  className="h-[500px] w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"
+                  className="h-[500px] font-mono"
                   value={emailWrapperTemplate}
                   onChange={(e) => {
                     setEmailWrapperTemplate(e.target.value);
@@ -535,7 +602,12 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                     isPending={emailLayoutMutation.isPending}
                     type="button"
                     onClick={() => {
-                      emailLayoutMutation.mutate(emailWrapperTemplate);
+                      const sent = emailLayout;
+                      emailLayoutMutation.mutate(sent.wrapperTemplate, {
+                        onSuccess: () => {
+                          takeNextEmailLayoutLoad(sent);
+                        },
+                      });
                     }}
                   />
                   <Button
@@ -569,7 +641,7 @@ export function NotificationSettings({ settings }: NotificationSettingsProps): R
                 <div className="overflow-hidden rounded-md border">
                   <iframe
                     title={t('settings.emailLayoutPreviewFrame')}
-                    srcDoc={preview.data?.html ?? ''}
+                    srcDoc={emailPreviewDocument(preview.data?.html ?? '')}
                     className="h-[500px] w-full"
                     sandbox=""
                   />

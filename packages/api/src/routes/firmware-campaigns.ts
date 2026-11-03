@@ -7,7 +7,7 @@ import {
   FIRMWARE_RETRIES_MAX,
   FIRMWARE_RETRY_INTERVAL_MAX_SECONDS,
 } from '@evtivity/lib';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { eq, and, desc, count, isNotNull, asc, inArray, type SQL } from 'drizzle-orm';
 import {
@@ -51,7 +51,9 @@ import {
 } from '../lib/fleet-operation-scope.js';
 
 const CAMPAIGN_NOT_FOUND = { error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' };
-import { authorize } from '../middleware/rbac.js';
+import { authorize, requestHasPermission } from '../middleware/rbac.js';
+import { REDACTED, maskUrlPassword } from '@evtivity/lib/secret-config';
+import { assertMaskableUrlPasswords } from '../lib/station-credential-guard.js';
 import {
   assertFirmwareSignature,
   firmwareSignatureField,
@@ -89,12 +91,15 @@ const campaignItem = z
         'Install time sent as firmware.installDateTime, null installs when the station can',
       ),
     status: z.enum(firmwareCampaignStatusEnum.enumValues).describe('Campaign status'),
-    targetFilter: z.record(z.unknown()).nullable().describe('Filter selecting target stations'),
+    targetFilter: z
+      .record(z.string(), z.unknown())
+      .nullable()
+      .describe('Filter selecting target stations'),
     createdById: z.string().nullable().describe('User ID that created the campaign'),
     createdAt: z.string().describe('Row creation timestamp'),
     updatedAt: z.string().describe('Row last update timestamp'),
   })
-  .passthrough();
+  .loose();
 
 const fwMatchingStationItem = z
   .object({
@@ -106,7 +111,7 @@ const fwMatchingStationItem = z
     siteName: z.string().nullable().describe('Site name'),
     vendorName: z.string().nullable().describe('Vendor name'),
   })
-  .passthrough();
+  .loose();
 
 const filterOptionsResponse = z
   .object({
@@ -117,7 +122,7 @@ const filterOptionsResponse = z
             id: z.string().describe('Site identifier'),
             name: z.string().describe('Site display name'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Sites available for targeting'),
     vendors: z
@@ -127,7 +132,7 @@ const filterOptionsResponse = z
             id: z.string().describe('Vendor identifier'),
             name: z.string().describe('Vendor display name'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Vendors available for targeting'),
     models: z.array(z.string()).describe('Distinct station models available for targeting'),
@@ -138,11 +143,11 @@ const filterOptionsResponse = z
             id: z.string().describe('Station UUID'),
             stationId: z.string().describe('Human-readable station identifier'),
           })
-          .passthrough(),
+          .loose(),
       )
       .describe('Stations matching the current filter'),
   })
-  .passthrough();
+  .loose();
 
 const campaignParams = z.object({ id: z.string().describe('Campaign ID') });
 
@@ -160,14 +165,13 @@ const retryIntervalField = z
   .describe(
     `Seconds between download retries (1 to ${String(FIRMWARE_RETRY_INTERVAL_MAX_SECONDS)})`,
   );
-const installDateTimeField = z
-  .string()
+const installDateTimeField = z.iso
   .datetime({ offset: true })
   .describe('Install time (ISO 8601); the station downloads first and installs at this time');
 
 const createCampaignBody = z.object({
   name: z.string().min(1).describe('Campaign name'),
-  firmwareUrl: z.string().url().describe('Firmware download URL'),
+  firmwareUrl: z.url().max(2000).describe('Firmware download URL, at most 2000 characters'),
   version: z.string().optional().describe('Firmware version'),
   retries: retriesField.optional(),
   retryInterval: retryIntervalField.optional(),
@@ -188,7 +192,7 @@ const createCampaignBody = z.object({
 
 const updateCampaignBody = z.object({
   name: z.string().min(1).optional(),
-  firmwareUrl: z.string().url().optional(),
+  firmwareUrl: z.url().max(2000).optional(),
   version: z.string().optional(),
   retries: retriesField.nullable().optional(),
   retryInterval: retryIntervalField.nullable().optional(),
@@ -237,6 +241,37 @@ function targetFilterConditions(filter: CampaignTargetFilter | null): SQL[] {
     conditions.push(eq(chargingStations.firmwareVersion, filter.firmwareVersion));
   }
   return conditions;
+}
+
+/**
+ * A campaign as a reply shows it. The stored firmware URL keeps the password
+ * of its userinfo (`ftp://user:password@host/fw.bin`): stations still to be
+ * sent the campaign need it. A reply shows it only to a caller with
+ * `settings.system:read`, the permission that reads stored secrets (P12);
+ * everyone else gets the password as `[redacted]`.
+ */
+function campaignView<T extends { firmwareUrl: string }>(campaign: T, showSecrets: boolean): T {
+  return showSecrets
+    ? campaign
+    : { ...campaign, firmwareUrl: maskUrlPassword(campaign.firmwareUrl) };
+}
+
+async function showsCampaignSecrets(request: FastifyRequest): Promise<boolean> {
+  return requestHasPermission(request, 'settings.system:read');
+}
+
+/**
+ * Whether a sent firmware URL still holds the masked password a reply showed
+ * (`[redacted]`, or `%5Bredacted%5D` after a URL parser encoded it): stored,
+ * the placeholder would become the password. The raw form fails the `uri`
+ * schema already; the CSMS sends the URL only when the operator changed it.
+ */
+function holdsMaskedPassword(url: string): boolean {
+  const lower = url.toLowerCase();
+  return (
+    lower.includes(`:${REDACTED}@`) ||
+    lower.includes(`:${encodeURIComponent(REDACTED).toLowerCase()}@`)
+  );
 }
 
 function emptyToNull(value: string | null | undefined): string | null {
@@ -350,9 +385,11 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         db.select({ total: count() }).from(firmwareCampaigns).where(scope),
       ]);
 
-      return { data, total: countResult[0]?.total ?? 0 } satisfies PaginatedResponse<
-        (typeof data)[number]
-      >;
+      const showSecrets = await showsCampaignSecrets(request);
+      return {
+        data: data.map((c) => campaignView(c, showSecrets)),
+        total: countResult[0]?.total ?? 0,
+      } satisfies PaginatedResponse<(typeof data)[number]>;
     },
   );
 
@@ -423,7 +460,7 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
       }
 
       return {
-        ...campaign,
+        ...campaignView(campaign, await showsCampaignSecrets(request)),
         stations,
         stationsTotal: countResult?.total ?? 0,
         installedCount: counts['installed'] ?? 0,
@@ -461,6 +498,7 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const body = request.body as z.infer<typeof createCampaignBody>;
       const userId = (request.user as { userId: string }).userId;
+      assertMaskableUrlPasswords(body.firmwareUrl);
       assertFirmwareSignature(body.signingCertificate, body.signature);
       const createSiteIds = await getUserSiteIds(userId);
       // A campaign without a site or station targets every site: creating
@@ -507,7 +545,11 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         );
       }
 
-      return reply.status(201).send(campaign);
+      return reply
+        .status(201)
+        .send(
+          campaign != null ? campaignView(campaign, await showsCampaignSecrets(request)) : campaign,
+        );
     },
   );
 
@@ -568,6 +610,15 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         return;
       }
 
+      if (fields.firmwareUrl !== undefined && holdsMaskedPassword(fields.firmwareUrl)) {
+        await reply.status(400).send({
+          error: 'Enter the firmware URL password again: the sent URL holds the masked password',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      if (fields.firmwareUrl !== undefined) assertMaskableUrlPasswords(fields.firmwareUrl);
+
       // The signing fields are checked as the campaign will hold them.
       const nextSigningCertificate =
         signingCertificate !== undefined
@@ -614,7 +665,7 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
         request.log,
       );
 
-      return updated;
+      return campaignView(updated, await showsCampaignSecrets(request));
     },
   );
 
@@ -906,7 +957,9 @@ export function firmwareCampaignRoutes(app: FastifyInstance): void {
             dispatches.map(({ target, requestId }) => ({
               stationId: target.id,
               requestId,
-              firmwareUrl: campaign.firmwareUrl,
+              // The update history shows the URL; the campaign row keeps the
+              // real one for the stations still to be sent it.
+              firmwareUrl: maskUrlPassword(campaign.firmwareUrl),
               retrieveDateTime,
               campaignId: id,
               initiatedAt,

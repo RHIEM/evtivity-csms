@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { Checkbox } from '@/components/ui/checkbox';
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -11,11 +12,12 @@ import { RemoveButton } from '@/components/remove-button';
 import { CancelButton } from '@/components/cancel-button';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
+import { DateTimeInput } from '@/components/ui/date-time-input';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { TokenStatusBadge } from '@/components/token/TokenStatusBadge';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { DriverCombobox } from '@/components/driver-combobox';
 import { api } from '@/lib/api';
@@ -65,6 +67,10 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
   const [expiresAt, setExpiresAt] = useState('');
   const [isPrepaid, setIsPrepaid] = useState(false);
   const [prepaidBalance, setPrepaidBalance] = useState('');
+  // The balance the form was opened with: a save sends a balance only when
+  // the operator changed it, with this value as the expected one, so a debit
+  // in between is never overwritten (409 PREPAID_BALANCE_CONFLICT).
+  const [loadedBalanceCents, setLoadedBalanceCents] = useState<number | null>(null);
   const [selectedDriver, setSelectedDriver] = useState<{ id: string; name: string } | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
@@ -77,6 +83,7 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
       isActive?: boolean;
       expiresAt?: string | null;
       prepaidBalanceCents?: number | null;
+      expectedPrepaidBalanceCents?: number | null;
     }) => api.patch<TokenData>(`/v1/tokens/${token.id}`, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['tokens', token.id] });
@@ -104,6 +111,7 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
     setIsActive(token.isActive);
     setExpiresAt(token.expiresAt != null ? formatDateTimeLocal(new Date(token.expiresAt)) : '');
     setIsPrepaid(token.prepaidBalanceCents != null);
+    setLoadedBalanceCents(token.prepaidBalanceCents ?? null);
     setPrepaidBalance(
       token.prepaidBalanceCents != null ? centsToMajorInput(token.prepaidBalanceCents) : '',
     );
@@ -142,244 +150,237 @@ export function TokenDetailsTab({ token, timezone }: TokenDetailsTabProps): Reac
     e.preventDefault();
     setHasSubmitted(true);
     if (Object.keys(validationErrors).length > 0) return;
+    const balanceCents = isPrepaid ? parseMajorInputToCents(prepaidBalance) : null;
     updateMutation.mutate({
       idToken,
       tokenType,
       driverId: selectedDriver?.id ?? null,
       isActive,
       expiresAt: expiresAt.trim() !== '' ? new Date(expiresAt).toISOString() : null,
-      prepaidBalanceCents: isPrepaid ? parseMajorInputToCents(prepaidBalance) : null,
+      ...(balanceCents !== loadedBalanceCents
+        ? { prepaidBalanceCents: balanceCents, expectedPrepaidBalanceCents: loadedBalanceCents }
+        : {}),
     });
   }
 
   return (
     <>
-      <Card>
-        <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <CardTitle>{t('tokens.tokenDetails')}</CardTitle>
-          <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
-            {!editing && (
-              <>
-                <EditButton label={t('common.edit')} onClick={startEdit} />
-                <RemoveButton
-                  label={t('common.delete')}
-                  onClick={() => {
-                    setDeleteOpen(true);
+      <TabPanel
+        title={t('common.details')}
+        actions={
+          !editing ? (
+            <div className="flex flex-wrap gap-2 *:grow sm:*:grow-0">
+              <EditButton label={t('common.edit')} onClick={startEdit} />
+              <RemoveButton
+                label={t('common.delete')}
+                onClick={() => {
+                  setDeleteOpen(true);
+                }}
+              />
+            </div>
+          ) : undefined
+        }
+      >
+        {editing ? (
+          <form onSubmit={handleSave} noValidate className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-idToken" className="leading-6">
+                {t('tokens.tokenValue')}
+              </Label>
+              <Input
+                id="edit-idToken"
+                value={idToken}
+                onChange={(e) => {
+                  setIdToken(e.target.value);
+                }}
+                className={hasSubmitted && validationErrors.idToken ? 'border-destructive' : ''}
+              />
+              {hasSubmitted && validationErrors.idToken && (
+                <p className="text-sm text-destructive">{validationErrors.idToken}</p>
+              )}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-tokenType" className="leading-6">
+                {t('tokens.tokenType')}
+              </Label>
+              <Select
+                id="edit-tokenType"
+                value={tokenType}
+                onChange={(e) => {
+                  setTokenType(e.target.value);
+                }}
+              >
+                {OCPP_ID_TOKEN_TYPES.map((type) => (
+                  <option key={type} value={type}>
+                    {type}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label className="leading-6">{t('tokens.driver')}</Label>
+              <DriverCombobox value={selectedDriver} onSelect={setSelectedDriver} />
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="edit-active"
+                checked={isActive}
+                onChange={(e) => {
+                  setIsActive(e.target.checked);
+                }}
+              />
+              <Label htmlFor="edit-active">{t('common.active')}</Label>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-expiresAt" className="leading-6">
+                {t('tokens.expiresAt')}
+              </Label>
+              <DateTimeInput
+                id="edit-expiresAt"
+                value={expiresAt}
+                onChange={(value) => {
+                  setExpiresAt(value);
+                }}
+                invalid={hasSubmitted && validationErrors.expiresAt != null}
+              />
+              <p className="text-sm text-muted-foreground">{t('tokens.expiresAtHint')}</p>
+              {hasSubmitted && validationErrors.expiresAt && (
+                <p className="text-sm text-destructive">{validationErrors.expiresAt}</p>
+              )}
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="edit-prepaid"
+                  checked={isPrepaid}
+                  onChange={(e) => {
+                    setIsPrepaid(e.target.checked);
                   }}
                 />
+                <Label htmlFor="edit-prepaid">{t('tokens.prepaid')}</Label>
+              </div>
+              <p className="text-sm text-muted-foreground">{t('tokens.prepaidHint')}</p>
+            </div>
+            {isPrepaid && (
+              <div className="space-y-2">
+                <Label htmlFor="edit-prepaidBalance" className="leading-6">
+                  {t('tokens.prepaidBalance')}
+                  {currency != null ? ` (${currency})` : ''}
+                </Label>
+                <DecimalInput
+                  id="edit-prepaidBalance"
+                  value={prepaidBalance}
+                  onChange={setPrepaidBalance}
+                  allowNegative
+                  decimalScale={2}
+                  className={
+                    hasSubmitted && validationErrors.prepaidBalance ? 'border-destructive' : ''
+                  }
+                />
+                {hasSubmitted && validationErrors.prepaidBalance && (
+                  <p className="text-sm text-destructive">{validationErrors.prepaidBalance}</p>
+                )}
+              </div>
+            )}
+            {updateMutation.isError && (
+              <p className="text-sm text-destructive">{getErrorMessage(updateMutation.error, t)}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <CancelButton
+                onClick={() => {
+                  setEditing(false);
+                  setHasSubmitted(false);
+                }}
+              />
+              <SaveButton isPending={updateMutation.isPending} />
+            </div>
+          </form>
+        ) : (
+          <dl className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+            <div>
+              <dt className="text-muted-foreground">{t('tokens.tokenValue')}</dt>
+              <dd className="font-medium">{token.idToken}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('tokens.tokenType')}</dt>
+              <dd className="font-medium">{token.tokenType}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('tokens.driver')}</dt>
+              <dd className="font-medium">
+                {token.driverId && token.driverFirstName ? (
+                  <Link to={`/drivers/${token.driverId}`} className="hover:underline">
+                    {token.driverFirstName} {token.driverLastName}
+                  </Link>
+                ) : (
+                  <span className="text-muted-foreground">{t('tokens.unassigned')}</span>
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('common.status')}</dt>
+              <dd className="font-medium">
+                <TokenStatusBadge token={token} />
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('tokens.expiresAt')}</dt>
+              <dd className="font-medium">
+                {token.expiresAt != null ? (
+                  formatDateTime(token.expiresAt, timezone)
+                ) : (
+                  <span className="text-muted-foreground">{t('tokens.noExpiry')}</span>
+                )}
+              </dd>
+            </div>
+            {!token.isActive && (
+              <>
+                <div>
+                  <dt className="text-muted-foreground">{t('tokens.deactivatedAt')}</dt>
+                  <dd className="font-medium">
+                    {token.revokedAt != null ? formatDateTime(token.revokedAt, timezone) : 'n/a'}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">{t('tokens.deactivatedBy')}</dt>
+                  <dd className="font-medium">
+                    {token.deactivatedBy != null
+                      ? t(`tokens.deactivatedByValue.${token.deactivatedBy}`)
+                      : 'n/a'}
+                  </dd>
+                </div>
+                {token.revokedReason != null && token.revokedReason !== '' && (
+                  <div>
+                    <dt className="text-muted-foreground">{t('tokens.deactivationReason')}</dt>
+                    <dd className="font-medium">{token.revokedReason}</dd>
+                  </div>
+                )}
               </>
             )}
-          </div>
-        </CardHeader>
-        <CardContent>
-          {editing ? (
-            <form onSubmit={handleSave} noValidate className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="edit-idToken" className="leading-6">
-                  {t('tokens.tokenValue')}
-                </Label>
-                <Input
-                  id="edit-idToken"
-                  value={idToken}
-                  onChange={(e) => {
-                    setIdToken(e.target.value);
-                  }}
-                  className={hasSubmitted && validationErrors.idToken ? 'border-destructive' : ''}
-                />
-                {hasSubmitted && validationErrors.idToken && (
-                  <p className="text-sm text-destructive">{validationErrors.idToken}</p>
+            <div>
+              <dt className="text-muted-foreground">{t('tokens.prepaidBalance')}</dt>
+              <dd className="font-medium">
+                {token.prepaidBalanceCents == null ? (
+                  <span className="text-muted-foreground">{t('tokens.notPrepaid')}</span>
+                ) : currency != null ? (
+                  formatCents(token.prepaidBalanceCents, currency)
+                ) : (
+                  // Never an amount without its currency.
+                  <span className="text-muted-foreground">{t('common.loading')}</span>
                 )}
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-tokenType" className="leading-6">
-                  {t('tokens.tokenType')}
-                </Label>
-                <Select
-                  id="edit-tokenType"
-                  value={tokenType}
-                  onChange={(e) => {
-                    setTokenType(e.target.value);
-                  }}
-                >
-                  {OCPP_ID_TOKEN_TYPES.map((type) => (
-                    <option key={type} value={type}>
-                      {type}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label className="leading-6">{t('tokens.driver')}</Label>
-                <DriverCombobox value={selectedDriver} onSelect={setSelectedDriver} />
-              </div>
-              <div className="flex items-center gap-2">
-                <input
-                  id="edit-active"
-                  type="checkbox"
-                  checked={isActive}
-                  onChange={(e) => {
-                    setIsActive(e.target.checked);
-                  }}
-                  className="h-4 w-4 rounded border-input"
-                />
-                <Label htmlFor="edit-active">{t('common.active')}</Label>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-expiresAt" className="leading-6">
-                  {t('tokens.expiresAt')}
-                </Label>
-                <Input
-                  id="edit-expiresAt"
-                  type="datetime-local"
-                  value={expiresAt}
-                  onChange={(e) => {
-                    setExpiresAt(e.target.value);
-                  }}
-                  className={hasSubmitted && validationErrors.expiresAt ? 'border-destructive' : ''}
-                />
-                <p className="text-sm text-muted-foreground">{t('tokens.expiresAtHint')}</p>
-                {hasSubmitted && validationErrors.expiresAt && (
-                  <p className="text-sm text-destructive">{validationErrors.expiresAt}</p>
-                )}
-              </div>
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <input
-                    id="edit-prepaid"
-                    type="checkbox"
-                    checked={isPrepaid}
-                    onChange={(e) => {
-                      setIsPrepaid(e.target.checked);
-                    }}
-                    className="h-4 w-4 rounded border-input"
-                  />
-                  <Label htmlFor="edit-prepaid">{t('tokens.prepaid')}</Label>
-                </div>
-                <p className="text-sm text-muted-foreground">{t('tokens.prepaidHint')}</p>
-              </div>
-              {isPrepaid && (
-                <div className="space-y-2">
-                  <Label htmlFor="edit-prepaidBalance" className="leading-6">
-                    {t('tokens.prepaidBalance')}
-                    {currency != null ? ` (${currency})` : ''}
-                  </Label>
-                  <DecimalInput
-                    id="edit-prepaidBalance"
-                    value={prepaidBalance}
-                    onChange={setPrepaidBalance}
-                    allowNegative
-                    decimalScale={2}
-                    className={
-                      hasSubmitted && validationErrors.prepaidBalance ? 'border-destructive' : ''
-                    }
-                  />
-                  {hasSubmitted && validationErrors.prepaidBalance && (
-                    <p className="text-sm text-destructive">{validationErrors.prepaidBalance}</p>
-                  )}
-                </div>
-              )}
-              {updateMutation.isError && (
-                <p className="text-sm text-destructive">
-                  {getErrorMessage(updateMutation.error, t)}
-                </p>
-              )}
-              <div className="flex justify-end gap-2">
-                <CancelButton
-                  onClick={() => {
-                    setEditing(false);
-                    setHasSubmitted(false);
-                  }}
-                />
-                <SaveButton isPending={updateMutation.isPending} />
-              </div>
-            </form>
-          ) : (
-            <dl className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-              <div>
-                <dt className="text-muted-foreground">{t('tokens.tokenValue')}</dt>
-                <dd className="font-medium">{token.idToken}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('tokens.tokenType')}</dt>
-                <dd className="font-medium">{token.tokenType}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('tokens.driver')}</dt>
-                <dd className="font-medium">
-                  {token.driverId && token.driverFirstName ? (
-                    <Link to={`/drivers/${token.driverId}`} className="hover:underline">
-                      {token.driverFirstName} {token.driverLastName}
-                    </Link>
-                  ) : (
-                    <span className="text-muted-foreground">{t('tokens.unassigned')}</span>
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('common.status')}</dt>
-                <dd className="font-medium">
-                  <TokenStatusBadge token={token} />
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('tokens.expiresAt')}</dt>
-                <dd className="font-medium">
-                  {token.expiresAt != null ? (
-                    formatDateTime(token.expiresAt, timezone)
-                  ) : (
-                    <span className="text-muted-foreground">{t('tokens.noExpiry')}</span>
-                  )}
-                </dd>
-              </div>
-              {!token.isActive && (
-                <>
-                  <div>
-                    <dt className="text-muted-foreground">{t('tokens.deactivatedAt')}</dt>
-                    <dd className="font-medium">
-                      {token.revokedAt != null ? formatDateTime(token.revokedAt, timezone) : 'n/a'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">{t('tokens.deactivatedBy')}</dt>
-                    <dd className="font-medium">
-                      {token.deactivatedBy != null
-                        ? t(`tokens.deactivatedByValue.${token.deactivatedBy}`)
-                        : 'n/a'}
-                    </dd>
-                  </div>
-                  {token.revokedReason != null && token.revokedReason !== '' && (
-                    <div>
-                      <dt className="text-muted-foreground">{t('tokens.deactivationReason')}</dt>
-                      <dd className="font-medium">{token.revokedReason}</dd>
-                    </div>
-                  )}
-                </>
-              )}
-              <div>
-                <dt className="text-muted-foreground">{t('tokens.prepaidBalance')}</dt>
-                <dd className="font-medium">
-                  {token.prepaidBalanceCents == null ? (
-                    <span className="text-muted-foreground">{t('tokens.notPrepaid')}</span>
-                  ) : currency != null ? (
-                    formatCents(token.prepaidBalanceCents, currency)
-                  ) : (
-                    // Never an amount without its currency.
-                    <span className="text-muted-foreground">{t('common.loading')}</span>
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('common.created')}</dt>
-                <dd className="font-medium">{formatDateTime(token.createdAt, timezone)}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">{t('common.lastUpdated')}</dt>
-                <dd className="font-medium">{formatDateTime(token.updatedAt, timezone)}</dd>
-              </div>
-            </dl>
-          )}
-        </CardContent>
-      </Card>
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('common.created')}</dt>
+              <dd className="font-medium">{formatDateTime(token.createdAt, timezone)}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('common.lastUpdated')}</dt>
+              <dd className="font-medium">{formatDateTime(token.updatedAt, timezone)}</dd>
+            </div>
+          </dl>
+        )}
+      </TabPanel>
 
       <ConfirmDialog
         open={deleteOpen}

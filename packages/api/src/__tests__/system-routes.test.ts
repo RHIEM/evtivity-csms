@@ -13,7 +13,7 @@ function setupDbResults(...results: unknown[][]) {
 }
 function makeChain() {
   const chain: Record<string, unknown> = {};
-  const methods = ['select', 'from', 'where', 'orderBy', 'limit', 'offset'];
+  const methods = ['select', 'from', 'where', 'orderBy', 'limit', 'offset', 'groupBy'];
   for (const m of methods) {
     chain[m] = vi.fn(() => chain);
   }
@@ -31,15 +31,41 @@ function makeChain() {
   return chain;
 }
 
+const { mockFleetHealth, configState } = vi.hoisted(() => {
+  const state: Record<string, unknown> = {};
+  return { mockFleetHealth: vi.fn(), configState: state };
+});
+
 vi.mock('@evtivity/database', () => ({
   db: {
     select: vi.fn(() => makeChain()),
   },
+  client: {},
   settings: {},
+  sites: { dataPlan: 'sites.data_plan' },
+  chargingStations: { onboardingStatus: 'onboarding_status' },
+  cssStations: {},
+  effectiveDataPlanSql: 'effective_plan',
+  isOperatorStation: vi.fn(),
+  getOcppFleetHealth: mockFleetHealth,
 }));
 
 vi.mock('drizzle-orm', () => ({
   inArray: vi.fn(),
+  and: vi.fn(),
+  eq: vi.fn(),
+  isNotNull: vi.fn(),
+  sql: vi.fn(() => ({})),
+}));
+
+vi.mock('../lib/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/config.js')>();
+  Object.assign(configState, actual.config);
+  return { ...actual, config: configState };
+});
+
+vi.mock('../lib/settings-crypto.js', () => ({
+  storedSecretDecrypts: (_key: string, value: unknown) => value === 'decrypts',
 }));
 
 vi.mock('../middleware/rbac.js', () => ({
@@ -70,6 +96,7 @@ vi.mock('../lib/site-access.js', async () =>
 );
 
 import { registerAuth } from '../plugins/auth.js';
+import { config as realConfig } from '../lib/config.js';
 import { resetSiteAccessMock, setMockUserSiteIds } from './helpers/site-access-mock.js';
 import { systemRoutes } from '../routes/system.js';
 
@@ -97,9 +124,14 @@ describe('System routes', () => {
     await app.close();
   });
 
+  const baseConfig = { ...realConfig };
+
   beforeEach(() => {
     resetSiteAccessMock();
     setupDbResults();
+    Object.assign(configState, baseConfig);
+    mockFleetHealth.mockReset();
+    mockFleetHealth.mockResolvedValue({ instances: [] });
     mockActivePaymentProvider.mockReset();
     mockActivePaymentProvider.mockResolvedValue(null);
     vi.stubEnv('SMTP_HOST', undefined);
@@ -215,6 +247,38 @@ describe('System routes', () => {
     expect(body.secrets.s3Configured).toBe(false);
   });
 
+  it.each([
+    ['dev-jwt-secret-change-in-production!!', 'dev-encryption-key-32chars-long!'],
+    ['dev-secret-change-in-production', 'short-key'],
+  ])('reports the published or short secrets %s and %s as not configured', async (jwt, key) => {
+    configState['JWT_SECRET'] = jwt;
+    configState['SETTINGS_ENCRYPTION_KEY'] = key;
+    setupDbResults([]);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.secrets.jwtConfigured).toBe(false);
+    expect(body.secrets.settingsEncryptionConfigured).toBe(false);
+  });
+
+  it('reports generated secrets as configured', async () => {
+    configState['JWT_SECRET'] = 'a'.repeat(64);
+    configState['SETTINGS_ENCRYPTION_KEY'] = 'b'.repeat(64);
+    setupDbResults([]);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const body = response.json();
+    expect(body.secrets.jwtConfigured).toBe(true);
+    expect(body.secrets.settingsEncryptionConfigured).toBe(true);
+  });
+
   it('honors the SMTP_HOST env override when the setting is absent', async () => {
     vi.stubEnv('SMTP_HOST', 'mailpit');
     setupDbResults([]);
@@ -237,5 +301,187 @@ describe('System routes', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json().payments).toEqual({ provider: 'adyen', configured: false });
+  });
+
+  it('reads the API values from the parsed config, not from the environment', async () => {
+    vi.stubEnv('API_PORT', '9999');
+    vi.stubEnv('CORS_ORIGIN', 'https://env.example');
+    Object.assign(configState, {
+      API_PORT: 7102,
+      CORS_ORIGIN: 'https://csms.example',
+      AUTH_RATE_LIMIT_WINDOW: '5 minutes',
+      TRUST_PROXY: '10.0.0.0/8',
+      WEBAUTHN_RP_ID: 'example.com',
+      OCPP_STATION_TLS_URL: 'wss://ocpp.example',
+    });
+    const body = (
+      await app.inject({
+        method: 'GET',
+        url: '/system/info',
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    expect(body.network.apiPort).toBe('7102');
+    expect(body.network.corsOrigin).toBe('https://csms.example');
+    expect(body.network.ocppStationTlsUrl).toBe('wss://ocpp.example');
+    expect(body.network).not.toHaveProperty('ocppPort');
+    expect(body.rateLimits.authRateLimitWindow).toBe('5 minutes');
+    expect(body.rateLimits).not.toHaveProperty('ocppMaxConnectionsPerIp');
+    expect(body.security).toEqual({
+      trustProxyConfigured: true,
+      webauthnRpId: 'example.com',
+      sharedRateLimit: false,
+    });
+  });
+
+  it('reports the registration policy setting', async () => {
+    setupDbResults([{ key: 'ocpp.registrationPolicy', value: 'open' }]);
+    const body = (
+      await app.inject({
+        method: 'GET',
+        url: '/system/info',
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    expect(body.ocpp).toEqual({ registrationPolicy: 'open' });
+  });
+
+  it('lists each OCPP process with the settings it reports, null from an older one', async () => {
+    const processConfig = {
+      version: '0.1.48',
+      wsCompression: true,
+      tlsEnabled: true,
+      tlsPort: 8443,
+      clientCaConfigured: false,
+      maxConnectionsPerIp: 2500,
+      maxMessagesPerIpPerSecond: 5000,
+      maxPendingAuthPerIp: 50,
+      trustedProxiesConfigured: false,
+    };
+    mockFleetHealth.mockResolvedValue({
+      instances: [
+        {
+          instanceId: 'ocpp-a',
+          connectedStations: 3,
+          serverStartedAt: new Date('2026-10-26T08:00:00Z'),
+          updatedAt: new Date('2026-10-26T09:00:00Z'),
+          config: processConfig,
+        },
+        {
+          instanceId: 'ocpp-old',
+          connectedStations: 1,
+          serverStartedAt: new Date('2026-10-26T07:00:00Z'),
+          updatedAt: new Date('2026-10-26T09:00:00Z'),
+        },
+      ],
+    });
+    const body = (
+      await app.inject({
+        method: 'GET',
+        url: '/system/info',
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    expect(body.ocppProcesses).toEqual([
+      {
+        instanceId: 'ocpp-a',
+        connectedStations: 3,
+        serverStartedAt: '2026-10-26T08:00:00.000Z',
+        updatedAt: '2026-10-26T09:00:00.000Z',
+        config: processConfig,
+      },
+      {
+        instanceId: 'ocpp-old',
+        connectedStations: 1,
+        serverStartedAt: '2026-10-26T07:00:00.000Z',
+        updatedAt: '2026-10-26T09:00:00.000Z',
+        config: null,
+      },
+    ]);
+  });
+
+  it('reports SIM provider settings, data plan counts, simulator stations and secret flags', async () => {
+    setupDbResults(
+      [
+        { key: 'sim.hologram.enabled', value: true },
+        { key: 'sim.hologram.orgId', value: '42' },
+        { key: 'sim.hologram.apiKeyEnc', value: 'decrypts' },
+        { key: 'sim.1nce.enabled', value: true },
+        { key: 'sim.1nce.clientId', value: 'client-1' },
+        { key: 'sim.1nce.clientSecretEnc', value: 'decrypts' },
+        { key: 'sim.sessions.fetchDays', value: 7 },
+        { key: 'sim.stationSignal.enabled', value: false },
+        { key: 'notifications.webhookSigningSecretEnc', value: 'decrypts' },
+      ],
+      [
+        { plan: 'wifi_or_wired', count: 5 },
+        { plan: 'cellular', count: 2 },
+      ],
+      [{ plan: 'cellular', count: 1 }],
+      [{ count: 4 }],
+    );
+    const response = await app.inject({
+      method: 'GET',
+      url: '/system/info',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const body = response.json();
+    expect(body.simProviders).toEqual({
+      hologram: { enabled: true, configured: true },
+      '1nce': { enabled: true, configured: true },
+      sessionsFetchDays: 7,
+      stationSignalEnabled: false,
+    });
+    expect(body.dataPlans).toEqual({
+      stations: { wifiOrWired: 5, cellular: 2 },
+      sites: { wifiOrWired: 0, cellular: 1 },
+    });
+    expect(body.simulator.stationCount).toBe(4);
+    expect(body.secrets.webhookSigningConfigured).toBe(true);
+    expect(body.secrets.simHologramConfigured).toBe(true);
+    expect(body.secrets.simOneNceConfigured).toBe(true);
+    expect(response.body).not.toContain('decrypts');
+    expect(response.body).not.toContain('client-1');
+  });
+
+  it('reports a Hologram key that does not decrypt as not configured', async () => {
+    setupDbResults([
+      { key: 'sim.hologram.orgId', value: '42' },
+      { key: 'sim.hologram.apiKeyEnc', value: 'other-key-ciphertext' },
+      { key: 'sim.1nce.clientId', value: 'client-1' },
+      { key: 'sim.1nce.clientSecretEnc', value: 'other-key-ciphertext' },
+      { key: 'notifications.webhookSigningSecretEnc', value: 'other-key-ciphertext' },
+    ]);
+    const body = (
+      await app.inject({
+        method: 'GET',
+        url: '/system/info',
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    expect(body.simProviders.hologram.configured).toBe(false);
+    expect(body.secrets.simHologramConfigured).toBe(false);
+    expect(body.simProviders['1nce']).toEqual({ enabled: false, configured: false });
+    expect(body.secrets.simOneNceConfigured).toBe(false);
+    expect(body.secrets.webhookSigningConfigured).toBe(false);
+  });
+
+  it('reports shared rate limits when the app counts them in Redis', async () => {
+    const shared = Fastify();
+    await registerAuth(shared);
+    shared.decorate('sharedRateLimit', true);
+    systemRoutes(shared);
+    await shared.ready();
+    const body = (
+      await shared.inject({
+        method: 'GET',
+        url: '/system/info',
+        headers: {
+          authorization: `Bearer ${shared.jwt.sign({ userId: VALID_USER_ID, roleId: VALID_ROLE_ID })}`,
+        },
+      })
+    ).json();
+    await shared.close();
+    expect(body.security.sharedRateLimit).toBe(true);
   });
 });

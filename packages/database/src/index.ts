@@ -75,7 +75,11 @@ export type {
   RetryCdrPushResult,
 } from './lib/ocpi-credit-cdr.js';
 export { ocpiLocationAudience } from './lib/ocpi-location-audience.js';
-export { issueOcpiRegistrationToken } from './lib/ocpi-registration-token.js';
+export {
+  issueOcpiRegistrationToken,
+  isOcpiRegistrationTokenExpired,
+  OCPI_REGISTRATION_TOKEN_TTL_MS,
+} from './lib/ocpi-registration-token.js';
 export type { OcpiLocationAudience } from './lib/ocpi-location-audience.js';
 export { resolveOcpiTokenOwner, publishOcpiSessionPush } from './lib/ocpi-token-owner.js';
 export { OCPI_START_CONTEXT_MINUTES, isStartableOcpiToken } from './lib/ocpi-token-startable.js';
@@ -115,6 +119,8 @@ export {
   applySessionEnergyReading,
   registerStateFromRow,
 } from './lib/session-energy.js';
+export { applySessionMeterSummary } from './lib/session-meter-summary.js';
+export type { SessionMeterSummaryReading } from './lib/session-meter-summary.js';
 export type {
   RegisterReadingKind,
   RegisterReadingResult,
@@ -255,6 +261,7 @@ export type {
   OcppFleetHealth,
   OcppInstanceHealth,
   OcppInstanceHealthSnapshot,
+  OcppProcessConfig,
 } from './lib/ocpp-server-health.js';
 export {
   STATION_WATCH_JOB_NAME,
@@ -298,6 +305,23 @@ export {
   recordLoadManagementProfileReply,
 } from './lib/load-management-state.js';
 export type { LoadManagementRateUnit } from './lib/load-management-state.js';
+export {
+  createCircuit,
+  createPanel,
+  deleteCircuit,
+  deletePanel,
+  updateCircuit,
+  updatePanel,
+} from './lib/load-management-tree.js';
+export type {
+  CircuitChanges,
+  CircuitRow,
+  CircuitValues,
+  LoadTreeWriteContext,
+  PanelChanges,
+  PanelRow,
+  PanelValues,
+} from './lib/load-management-tree.js';
 export { isFleetEnabled, clearFleetCache } from './lib/fleet-setting.js';
 export {
   guardVersion,
@@ -336,6 +360,7 @@ export {
   clearAutochargeCache,
   findAutochargeVehicle,
   findBlockedVehicle,
+  findVehicleIdOwners,
   isAutochargeEnabled,
   isAutochargeEnabledForStation,
   isAutochargeOffered,
@@ -442,13 +467,9 @@ export {
   clearStationMessageSettingsCache,
 } from './lib/station-message-settings.js';
 export {
-  getHeartbeatIntervalSeconds,
+  getDataPlanValues,
+  clearDataPlanValuesCache,
   getOfflineCommandTtlHours,
-  getMeterValueIntervalSeconds,
-  getClockAlignedIntervalSeconds,
-  getSampledMeasurands,
-  getAlignedMeasurands,
-  getTxEndedMeasurands,
   isIso15118Enabled,
   getDefaultMaxPowerW,
   OCPP_SETTINGS_CACHE_TTL_MS,
@@ -523,29 +544,87 @@ export {
   clearSimSettingsCache,
   parseSimSettings,
 } from './lib/sim-settings.js';
-export type { SimSettings, SimHologramSettings } from './lib/sim-settings.js';
+export type { SimSettings, SimHologramSettings, SimOneNceSettings } from './lib/sim-settings.js';
 export {
-  getStationSimMatch,
-  setStationSimMatch,
-  recordSimLookupMiss,
-  confirmStationSimMatch,
-  clearStationSimMatch,
-  recordEnteredIccid,
+  attachmentOutcome,
+  findOrCreateSimRecord,
+  getSim,
+  getSimByIccid,
+  updateSimFields,
+  setSimStatus,
+  deleteSim,
+  openStationAttachment,
+  openSimAttachment,
+  attachSimToStation,
+  closeAttachment,
+  raiseStationSimHistoryFloor,
+  raiseTerminalSimHistoryFloor,
+  openTerminalAttachment,
+  attachSimToPaymentTerminal,
+  confirmAttachment,
+  recordSimLookup,
   recordSimStatus,
   recordSimSessionsSynced,
   recordSimAlertsSynced,
   compareRecordIds,
-} from './lib/station-sim-match.js';
+} from './lib/sim-inventory.js';
 export type {
+  AttachSimResult,
+  AttachSimToTerminalResult,
+  AttachmentDecision,
+  AttachmentOutcomeInput,
+  ConfirmAttachmentOutcome,
+  ConfirmAttachmentResult,
+  DeleteSimResult,
+  OpenAttachmentView,
+  RecordSimLookupResult,
+  SetSimStatusResult,
+  Sim,
+  SimAttachment,
   SimAuditActor,
+  SimDb,
+  SimFields,
   SimLookupMissReason,
-  SimMatchMeta,
-  StationSimMatch,
+  SimProviderMeta,
   StoredSimStatus,
-  SetStationSimMatchResult,
-  ConfirmStationSimMatchResult,
-  SimMatchDb,
-} from './lib/station-sim-match.js';
+} from './lib/sim-inventory.js';
+export {
+  getPaymentTerminalSettings,
+  clearPaymentTerminalSettingsCache,
+  parsePaymentTerminalSettings,
+} from './lib/payment-terminal-settings.js';
+export type { PaymentTerminalSettings } from './lib/payment-terminal-settings.js';
+export {
+  OPEN_TERMINAL_TXN_STATES,
+  createTerminal,
+  getTerminal,
+  updateTerminal,
+  pairTerminal,
+  unpairTerminal,
+  setTerminalStatus,
+  recordTerminalDeviceStatus,
+  deleteTerminal,
+  activeTerminalsOfStations,
+  terminalHasOpenTransaction,
+  claimTerminalOfflineAlerts,
+} from './lib/payment-terminals.js';
+export type {
+  ClosedTerminalSim,
+  CreateTerminalInput,
+  CreateTerminalResult,
+  DeleteTerminalResult,
+  DeviceStatusInput,
+  DeviceStatusResult,
+  PairTerminalResult,
+  PairingCheck,
+  PaymentTerminal,
+  PaymentTerminalDb,
+  SetTerminalStatusResult,
+  TerminalFieldChanges,
+  TerminalPairing,
+  UnpairTerminalResult,
+  UpdateTerminalResult,
+} from './lib/payment-terminals.js';
 export { getAttestationConfig, clearAttestationConfigCache } from './lib/attestation-settings.js';
 export type { AttestationConfig } from './lib/attestation-settings.js';
 export { getMobileAppConfig, clearMobileAppConfigCache } from './lib/mobile-app-settings.js';
@@ -566,6 +645,16 @@ export type {
   ConformanceDriverDeleteResult,
 } from './lib/conformance-stations.js';
 export {
+  insightScopeSelectedSql,
+  insightSubjectInScope,
+  siteInsightScopeReasonSql,
+  siteInsightsInScope,
+  siteInsightsInScopeSql,
+  stationIdsInInsightScope,
+  stationInsightScopeReasonSql,
+  stationInsightsInScopeSql,
+} from './lib/ai-insight-scope.js';
+export {
   SITE_INSIGHT_SUPPRESSION_SOURCES,
   STATION_INSIGHT_SUPPRESSION_SOURCES,
   siteInsightsOperatorSuppressedSql,
@@ -582,3 +671,41 @@ export type {
   SiteInsightSuppressionSource,
   StationInsightSuppressionSource,
 } from './lib/ai-insight-suppression.js';
+export {
+  dataPlanSourceSql,
+  dataPlanSourceSqlText,
+  effectiveDataPlanSql,
+  effectiveDataPlanSqlText,
+  hasConfirmedSimSqlText,
+  listSiteStationIds,
+  readStationDataPlans,
+  setSiteDataPlan,
+  setStationDataPlan,
+} from './lib/station-data-plan.js';
+export type { DataPlanChange, DataPlanDb, StationDataPlanState } from './lib/station-data-plan.js';
+export {
+  ChargerPlacementSiteTypeError,
+  LayoutGridTooSmallError,
+  LayoutSpotsOverlapError,
+  moveStationLayout,
+  placeStationOnLayout,
+  readSiteLayoutPositions,
+  readSiteLayoutSettings,
+  readSiteStationCounts,
+  readStationLayoutKinds,
+  readStoredLayoutSettings,
+  saveSiteLayout,
+  setSiteLayoutType,
+} from './lib/station-layout.js';
+export type {
+  LayoutPosition,
+  SavedSiteLayout,
+  SiteTypeChange,
+  StationLayoutDb,
+} from './lib/station-layout.js';
+export {
+  deleteUserDashboardLayout,
+  existingDashboardSiteIds,
+  getUserDashboardLayout,
+  saveUserDashboardLayout,
+} from './lib/dashboard-layout.js';

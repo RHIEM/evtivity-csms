@@ -94,7 +94,7 @@ const portalSessionListItem = z
         'Set when the session is billed to a fleet (charge on account): the billing state and the fleet. Null for a session paid by card or not billed',
       ),
   })
-  .passthrough();
+  .loose();
 
 const paymentRecordItem = z
   .object({
@@ -128,7 +128,7 @@ const paymentRecordItem = z
     createdAt: z.coerce.date().describe('Timestamp the payment record was created'),
     updatedAt: z.coerce.date().describe('Timestamp the payment record was last updated'),
   })
-  .passthrough();
+  .loose();
 
 const portalSessionDetail = portalSessionListItem
   .extend({
@@ -186,7 +186,7 @@ const portalSessionDetail = portalSessionListItem
         idToken: z.string().describe('RFID UID or token identifier transmitted by the station'),
         tokenType: z.string().describe('OCPP IdToken type (e.g. ISO14443, Central, eMAID)'),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('RFID/token used to authorize this session, null when not from a registered token'),
     vehicle: z
@@ -203,7 +203,7 @@ const portalSessionDetail = portalSessionListItem
           .min(0)
           .describe('Resolved efficiency for this vehicle make/model (mi/kWh)'),
       })
-      .passthrough()
+      .loose()
       .nullable()
       .describe('Vehicle linked to this session for distance estimation'),
     vehicleCapture: sessionVehicleCaptureItem,
@@ -216,14 +216,14 @@ const portalSessionDetail = portalSessionListItem
         "Autocharge is on at the session's site, so the driver can use the captured vehicle id for plug-in charging",
       ),
   })
-  .passthrough();
+  .loose();
 
 const powerHistoryItem = z
   .object({
     timestamp: z.coerce.date().describe('Meter sample timestamp'),
     powerW: z.number().min(0).describe('Active power in Watts'),
   })
-  .passthrough();
+  .loose();
 
 const energyHistoryItem = z
   .object({
@@ -233,7 +233,7 @@ const energyHistoryItem = z
       .min(0)
       .describe('Cumulative energy delivered in Watt-hours since session start'),
   })
-  .passthrough();
+  .loose();
 
 const sessionParams = z.object({
   id: ID_PARAMS.sessionId.describe('Charging session ID'),
@@ -269,7 +269,7 @@ const monthlySummaryResponse = z
     sessionCount: z.number().int().min(0).describe('Number of completed sessions in the month'),
     currency: z.string().length(3).describe('Company currency (ISO 4217) of totalCostCents'),
   })
-  .passthrough();
+  .loose();
 
 const monthlyStatementSessionItem = z
   .object({
@@ -305,7 +305,7 @@ const monthlyStatementSessionItem = z
         'Set when the session is billed to a fleet (charge on account). A session invoiced to the fleet (invoicedTo fleet) is not in totalCostCents',
       ),
   })
-  .passthrough();
+  .loose();
 
 const monthlyStatementTotals = z
   .object({
@@ -333,7 +333,7 @@ const monthlyStatementTotals = z
       .min(0)
       .describe('Sessions invoiced to a fleet, left out of totalCostCents'),
   })
-  .passthrough();
+  .loose();
 
 const monthlyStatementResponse = z
   .object({
@@ -342,7 +342,7 @@ const monthlyStatementResponse = z
     sessions: z.array(monthlyStatementSessionItem).describe('Itemized session list for the month'),
     totals: monthlyStatementTotals.describe('Aggregated totals for the statement'),
   })
-  .passthrough();
+  .loose();
 
 /**
  * The driver's timezone, in which a month starts and ends for the driver
@@ -631,6 +631,8 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           vehicleIdSource: chargingSessions.vehicleIdSource,
           autocharge: chargingSessions.autocharge,
           ocppStationId: chargingStations.stationId,
+          // The newest state of charge, kept on the session past the meter_values retention.
+          lastSocPercent: chargingSessions.lastSocPercent,
           ...sessionAccountBillingColumns(),
         })
         .from(chargingSessions)
@@ -647,7 +649,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const [payment, latestPower, latestSoc, vehicleEfficiency] = await Promise.all([
+      const [payment, latestPower, vehicleEfficiency] = await Promise.all([
         // Only return display-safe fields. The full payment_records row
         // contains the provider ids (provider_payment_id, provider_customer_id,
         // provider_payment_method_id) which the portal does not need;
@@ -670,18 +672,11 @@ export function portalSessionRoutes(app: FastifyInstance): void {
           .where(eq(paymentRecords.sessionId, id))
           .then((r) => r[0]),
         db
-          .select({ value: meterValues.value })
+          .select({ value: meterValues.value, unit: meterValues.unit })
           .from(meterValues)
           .where(
             and(eq(meterValues.sessionId, id), eq(meterValues.measurand, 'Power.Active.Import')),
           )
-          .orderBy(desc(meterValues.timestamp))
-          .limit(1)
-          .then((r) => r[0]),
-        db
-          .select({ value: meterValues.value })
-          .from(meterValues)
-          .where(and(eq(meterValues.sessionId, id), eq(meterValues.measurand, 'SoC')))
           .orderBy(desc(meterValues.timestamp))
           .limit(1)
           .then((r) => r[0]),
@@ -717,6 +712,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
         ocppStationId,
         autocharge,
         costBreakdown,
+        lastSocPercent,
         ...sessionRest
       } = withAccountBilling(session);
       const vehicleCapture =
@@ -734,8 +730,12 @@ export function portalSessionRoutes(app: FastifyInstance): void {
       return {
         ...sessionRest,
         limitReached: await sessionLimitReached(id),
-        currentPowerW: latestPower != null ? parseFloat(latestPower.value) : null,
-        batteryPercent: latestSoc != null ? parseFloat(latestSoc.value) : null,
+        // A kW reading is converted, so the field is always W.
+        currentPowerW:
+          latestPower != null
+            ? parseFloat(latestPower.value) * (latestPower.unit === 'kW' ? 1000 : 1)
+            : null,
+        batteryPercent: lastSocPercent != null ? parseFloat(lastSocPercent) : null,
         payment: payment ?? null,
         netCents: costTax?.netCents ?? null,
         taxCents: costTax?.taxCents ?? null,
@@ -787,7 +787,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
                 created: z.boolean().describe('A new vehicle was created'),
                 autochargeEnabled: z.boolean().describe('Autocharge is on for the vehicle'),
               })
-              .passthrough(),
+              .loose(),
           ),
           400: errorWith('Validation error', [ERROR_CODES.VALIDATION_ERROR]),
           403: errorWith('Blocked by the operator', [ERROR_CODES.VEHICLE_BLOCKED_BY_OPERATOR]),
@@ -796,10 +796,14 @@ export function portalSessionRoutes(app: FastifyInstance): void {
             ERROR_CODES.VEHICLE_NOT_FOUND,
             ERROR_CODES.DRIVER_NOT_FOUND,
           ]),
-          409: errorWith('No vehicle id or the id is in use', [
-            ERROR_CODES.SESSION_NO_VEHICLE_ID,
-            ERROR_CODES.VEHICLE_ID_IN_USE,
-          ]),
+          409: errorWith(
+            "No vehicle id, the id is in use, or another id typed on the vehicle that no charger sent in the driver's sessions",
+            [
+              ERROR_CODES.SESSION_NO_VEHICLE_ID,
+              ERROR_CODES.VEHICLE_ID_IN_USE,
+              ERROR_CODES.AUTOCHARGE_CLAIM_REQUIRED,
+            ],
+          ),
         },
       },
     },
@@ -856,7 +860,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               .object({
                 vehicleId: z.string().nullable().describe('Linked vehicle ID after update'),
               })
-              .passthrough(),
+              .loose(),
           ),
           404: errorWith('Not found', [
             ERROR_CODES.SESSION_NOT_FOUND,
@@ -934,7 +938,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               .object({
                 data: z.array(powerHistoryItem).describe('Time-ordered power samples'),
               })
-              .passthrough(),
+              .loose(),
           ),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },
@@ -997,7 +1001,7 @@ export function portalSessionRoutes(app: FastifyInstance): void {
               .object({
                 data: z.array(energyHistoryItem).describe('Time-ordered cumulative energy samples'),
               })
-              .passthrough(),
+              .loose(),
           ),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },

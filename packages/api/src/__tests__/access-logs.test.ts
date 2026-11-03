@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi, beforeEach, type Mock } from 'vitest';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 
@@ -73,6 +73,8 @@ vi.mock('drizzle-orm', () => {
     desc: vi.fn(),
     count: vi.fn(),
     asc: vi.fn(),
+    gte: vi.fn(),
+    lte: vi.fn(),
   };
 });
 
@@ -98,6 +100,7 @@ vi.mock('../lib/site-access.js', () => ({ isAllSiteUser: siteAccess.isAllSiteUse
 import { registerAuth } from '../plugins/auth.js';
 import { accessLogRoutes } from '../routes/access-logs.js';
 import { db } from '@evtivity/database';
+import { gte, lte } from 'drizzle-orm';
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify();
@@ -148,20 +151,28 @@ describe('Access log routes', () => {
       expect(response.statusCode).toBe(400);
     });
 
-    it('returns 201 with action="login" and sets category to auth', async () => {
+    it('stores a client-posted login as a client-reported action, never an auth entry', async () => {
       setupDbResults([]);
+      vi.mocked(db.insert).mockClear();
       const response = await app.inject({
         method: 'POST',
         url: '/access-logs',
         headers: { authorization: `Bearer ${operatorToken}` },
-        payload: { action: 'login' },
+        payload: { action: 'login', metadata: { category: 'auth', clientReported: false } },
       });
       expect(response.statusCode).toBe(201);
       expect(response.json()).toEqual({ success: true });
-      expect(db.insert).toHaveBeenCalled();
+      const chain = vi.mocked(db.insert).mock.results[0]?.value as { values: Mock };
+      expect(chain.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'login',
+          category: 'action',
+          metadata: { category: 'auth', clientReported: true },
+        }),
+      );
     });
 
-    it('returns 201 with action="logout" and sets category to auth', async () => {
+    it('returns 201 with action="logout"', async () => {
       setupDbResults([]);
       const response = await app.inject({
         method: 'POST',
@@ -218,8 +229,9 @@ describe('Access log routes', () => {
       expect(response.statusCode).toBe(403);
     });
 
-    it('returns 201 with valid driver token', async () => {
+    it('returns 201 with valid driver token and marks the row client-reported', async () => {
       setupDbResults([]);
+      vi.mocked(db.insert).mockClear();
       const response = await app.inject({
         method: 'POST',
         url: '/portal/access-logs',
@@ -228,7 +240,10 @@ describe('Access log routes', () => {
       });
       expect(response.statusCode).toBe(201);
       expect(response.json()).toEqual({ success: true });
-      expect(db.insert).toHaveBeenCalled();
+      const chain = vi.mocked(db.insert).mock.results[0]?.value as { values: Mock };
+      expect(chain.values).toHaveBeenCalledWith(
+        expect.objectContaining({ category: 'portal', metadata: { clientReported: true } }),
+      );
     });
   });
 
@@ -350,6 +365,30 @@ describe('Access log routes', () => {
       const body = response.json();
       expect(body.data).toEqual([]);
       expect(body.total).toBe(0);
+    });
+
+    it('filters by a date range, both bounds included', async () => {
+      setupDbResults([], [{ count: 0 }]);
+      const from = '2026-10-01T00:00:00.000+02:00';
+      const to = '2026-10-02T00:00:00.000+02:00';
+      const response = await app.inject({
+        method: 'GET',
+        url: `/access-logs?category=api&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(vi.mocked(gte)).toHaveBeenCalledWith(undefined, new Date(from));
+      expect(vi.mocked(lte)).toHaveBeenCalledWith(undefined, new Date(to));
+    });
+
+    it('refuses a from after to', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/access-logs?from=2026-10-02T00:00:00Z&to=2026-10-01T00:00:00Z',
+        headers: { authorization: `Bearer ${operatorToken}` },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().code).toBe('VALIDATION_ERROR');
     });
 
     it('returns 200 with search filter', async () => {

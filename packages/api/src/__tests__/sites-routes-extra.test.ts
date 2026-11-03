@@ -63,6 +63,24 @@ function makeChain() {
   return chain;
 }
 
+// The AI insights scope reads the database; these tests cover the routes only.
+vi.mock('../services/ai-insight-scope.service.js', () => ({
+  initialSiteAiInsightsSelected: vi.fn().mockResolvedValue(true),
+  isOutsideAiInsightScope: () => false,
+  siteAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+  stationAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+}));
+const { mockReadLayoutStationSessions } = vi.hoisted(() => ({
+  mockReadLayoutStationSessions: vi.fn(async () => new Map()),
+}));
+vi.mock('../lib/site-layout-sessions.js', () => ({
+  readLayoutStationSessions: mockReadLayoutStationSessions,
+}));
+// The virtual sign windows read the database apart (integration 156-site-layout-live).
+vi.mock('../lib/site-layout-status-windows.js', () => ({
+  readLayoutReservations: () => Promise.resolve(new Map()),
+  readLayoutMaintenanceWindows: () => Promise.resolve(new Map()),
+}));
 vi.mock('../middleware/rbac.js', () => ({
   authorize:
     () =>
@@ -77,6 +95,7 @@ vi.mock('../middleware/rbac.js', () => ({
       }
     },
   invalidatePermissionCache: vi.fn(),
+  requestHasPermission: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('@evtivity/services/station-derived-status', () => ({
@@ -97,6 +116,13 @@ vi.mock('@evtivity/database', async () => {
     ...(await import('@evtivity/database/src/lib/ai-insight-suppression.js')),
     ...rawTimestamp,
     getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+    readStationDataPlans: vi.fn(() => Promise.resolve(new Map())),
+    saveSiteLayout: vi.fn(() => Promise.resolve()),
+    readSiteLayoutSettings: vi.fn(async () =>
+      (await import('@evtivity/lib/site-layout')).effectiveLayoutSettings(null),
+    ),
+    readStationLayoutKinds: vi.fn(() => Promise.resolve(new Map())),
+    ChargerPlacementSiteTypeError: class extends Error {},
     db: {
       select: vi.fn(() => makeChain()),
       selectDistinct: vi.fn(() => makeChain()),
@@ -149,7 +175,9 @@ vi.mock('drizzle-orm', () => {
       identifier: vi.fn(sqlFn),
     }),
     getTableName: vi.fn(() => 'charging_stations'),
+    gt: vi.fn(),
     gte: vi.fn(),
+    isNull: vi.fn(),
     lte: vi.fn(),
     desc: vi.fn(),
     count: vi.fn(),
@@ -560,6 +588,7 @@ describe('Site routes - extra coverage', () => {
         stationMessageLanguage: null,
         autochargeEnabled: null,
         aiInsightsEnabled: true,
+        dataPlan: null,
         aiMonthlyTokenBudget: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
@@ -748,7 +777,8 @@ describe('Site routes - extra coverage', () => {
             isOnline: true,
             securityProfile: 1,
             positionX: null,
-            positionY: '12.5',
+            positionY: null,
+            inMaintenance: false,
           },
         ],
         [{ id: 'evse-1', stationId: 'st-uuid-1', evseId: 1 }],
@@ -786,8 +816,8 @@ describe('Site routes - extra coverage', () => {
       });
       expect(res.statusCode).toBe(200);
       const [station] = res.json();
-      expect(station.positionX).toBe(0);
-      expect(station.positionY).toBe(12.5);
+      // No saved position: the first free slot, marked not placed.
+      expect(station).toMatchObject({ positionX: 20, positionY: 20, placed: false });
       expect(station.displayMessage).toBe('Newest message');
       expect(station.evses[0].connectors).toEqual([
         {

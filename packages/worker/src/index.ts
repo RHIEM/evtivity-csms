@@ -40,6 +40,8 @@ import { createMemberInvoiceWorker, setMemberInvoiceQueue } from './member-invoi
 import { createStationWatchWorker } from './station-watch-worker.js';
 import { createPaymentWebhookWorker } from './payment-webhook-worker.js';
 import { createPaymentStopWorker } from './payment-stop-worker.js';
+import { createDriverAvatarCleanupWorker } from './driver-avatar-cleanup-worker.js';
+import { createPaymentTerminalEventsWorker } from './payment-terminal-events-worker.js';
 import { setSimulatedEventSink } from './lib/payments.js';
 import {
   createRemoteStartTimeoutWorker,
@@ -100,6 +102,8 @@ async function start(): Promise<void> {
     aiWorkerQueue,
     aiInsightQueue,
     driverAiQueue,
+    driverAvatarCleanupQueue,
+    paymentTerminalEventsQueue,
   } = createQueues(REDIS_URL);
   // Jobs this process adds to its own queues through the shared producers
   // (maintenance cron, station-watch alerts, station screens, simulated
@@ -112,6 +116,8 @@ async function start(): Promise<void> {
     [QUEUE_NAMES.PAYMENT_WEBHOOKS, paymentWebhookQueue],
     [QUEUE_NAMES.PAYMENT_STOPS, paymentStopQueue],
     [QUEUE_NAMES.STATION_MESSAGES, stationMessageQueue],
+    [QUEUE_NAMES.DRIVER_AVATAR_CLEANUP, driverAvatarCleanupQueue],
+    [QUEUE_NAMES.PAYMENT_TERMINAL_EVENTS, paymentTerminalEventsQueue],
   ]);
   setJobQueueResolver((name) => queuesByName.get(name));
   setSimulatedEventSink(queueSimulatedSink());
@@ -171,6 +177,12 @@ async function start(): Promise<void> {
   const aiWorker = createAiWorker(createBullMQConnection(REDIS_URL), aiWorkerLockRedis);
   const aiInsightWorker = createAiInsightWorker(createBullMQConnection(REDIS_URL), pubsub);
   const driverAiWorker = createDriverAiWorker(createBullMQConnection(REDIS_URL));
+  const driverAvatarCleanupWorker = createDriverAvatarCleanupWorker(
+    createBullMQConnection(REDIS_URL),
+  );
+  const paymentTerminalEventsWorker = createPaymentTerminalEventsWorker(
+    createBullMQConnection(REDIS_URL),
+  );
 
   // OCTT conformance test worker
   const octtWorker = new Worker<OcttJobData>(
@@ -202,6 +214,8 @@ async function start(): Promise<void> {
     aiWorker,
     aiInsightWorker,
     driverAiWorker,
+    driverAvatarCleanupWorker,
+    paymentTerminalEventsWorker,
     octtWorker,
   })) {
     // BullMQ re-emits Redis errors on every Worker; unheard, it prints each one
@@ -306,6 +320,8 @@ async function start(): Promise<void> {
     await aiWorker.close();
     await aiInsightWorker.close();
     await driverAiWorker.close();
+    await driverAvatarCleanupWorker.close();
+    await paymentTerminalEventsWorker.close();
     await octtWorker.close();
     await cronQueue.close();
     await loadQueue.close();
@@ -332,6 +348,8 @@ async function start(): Promise<void> {
     await aiInsightQueue.close();
     setDriverAiQueue(null);
     await driverAiQueue.close();
+    await driverAvatarCleanupQueue.close();
+    await paymentTerminalEventsQueue.close();
     for (const lockRedis of [
       cronLockRedis,
       maintenanceLockRedis,

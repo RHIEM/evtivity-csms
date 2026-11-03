@@ -9,6 +9,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EVENT_DRAIN_TIMEOUT_MS, OcppServer } from '../server/ocpp-server.js';
 import type { HandlerContext } from '../server/middleware/pipeline.js';
+import { DATA_PLAN_DEFAULTS } from '@evtivity/lib';
+
+// The data plan reads go to the shipped values: without a database (CI) a real
+// read waits on the connection.
+vi.mock('@evtivity/database', async (importOriginal) => {
+  const lib = await import('@evtivity/lib');
+  return {
+    ...(await importOriginal<typeof import('@evtivity/database')>()),
+    getDataPlanValues: (plan: keyof typeof lib.DATA_PLAN_DEFAULTS) =>
+      Promise.resolve(lib.DATA_PLAN_DEFAULTS[plan]),
+    readStationDataPlans: () => Promise.resolve(new Map()),
+  };
+});
 
 let testPort = 19080;
 let server: OcppServer | null = null;
@@ -118,7 +131,7 @@ describe('OcppServer integration', () => {
     expect(response[1]).toBe('msg-1');
     const payload = response[2] as Record<string, unknown>;
     expect(payload['status']).toBe('Accepted');
-    expect(payload['interval']).toBe(300);
+    expect(payload['interval']).toBe(DATA_PLAN_DEFAULTS.wifi_or_wired.heartbeatInterval);
     expect(payload['currentTime']).toBeDefined();
     ws.close();
   });
@@ -180,6 +193,49 @@ describe('OcppServer integration', () => {
     expect(response[0]).toBe(4);
     expect(response[1]).toBe('msg-3');
     expect(response[2]).toBe('NotImplemented');
+    ws.close();
+  });
+
+  it('answers a large unknown CALL with NotImplemented and logs it truncated', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    const logged: Record<string, unknown>[] = [];
+    srv.getEventBus().subscribe('ocpp.MessageLog', (event) => {
+      if (event.payload['direction'] === 'inbound') logged.push(event.payload);
+      return Promise.resolve();
+    });
+    const ws = await connectStation(port, 'TEST-BIGCALL');
+    await bootStation(ws);
+
+    const responsePromise = waitForMessage(ws);
+    sendCall(ws, 'big-1', 'NoSuchAction', { blob: 'y'.repeat(900 * 1024) });
+    const response = await responsePromise;
+    expect(response[2]).toBe('NotImplemented');
+    const entry = logged.find((p) => p['messageId'] === 'big-1');
+    expect(JSON.stringify(entry?.['payload']).length).toBeLessThanOrEqual(64 * 1024);
+    expect(entry?.['payload']).toMatchObject({ truncated: true, keys: ['blob'] });
+    ws.close();
+  });
+
+  it('refuses frames past the per-station byte budget like the rate limit', async () => {
+    const port = getNextPort();
+    const srv = await startServer(port);
+    const ws = await connectStation(port, 'TEST-BYTES');
+    await bootStation(ws);
+    const replies: unknown[][] = [];
+    ws.on('message', (data: Buffer) => {
+      replies.push(JSON.parse(data.toString('utf-8')) as unknown[]);
+    });
+    for (const id of ['b-1', 'b-2', 'b-3']) {
+      sendCall(ws, id, 'NoSuchAction', { blob: 'z'.repeat(900 * 1024) });
+    }
+    await vi.waitFor(() => {
+      expect(replies).toHaveLength(3);
+    });
+    const third = replies.find((r) => r[1] === 'b-3');
+    expect(third?.[2]).toBe('GenericError');
+    expect(third?.[3]).toBe('Rate limit exceeded');
+    expect(srv.getInboundFrameStats()['rate_limited']).toBeGreaterThanOrEqual(1);
     ws.close();
   });
 

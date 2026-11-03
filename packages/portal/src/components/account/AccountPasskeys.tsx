@@ -10,10 +10,10 @@ import {
   type PublicKeyCredentialCreationOptionsJSON,
 } from '@simplewebauthn/browser';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Input } from '@/components/ui/input';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import { LoadingLogo } from '@/components/loading-logo';
 import {
   FactorProofField,
   proofRejection,
@@ -27,8 +27,9 @@ import { getErrorMessage } from '@/lib/error-message';
 import { formatDate } from '@/lib/utils';
 import { useDriverTimezone } from '@/lib/timezone';
 import { MFA_STATUS_KEY, PASSKEYS_KEY, type PortalMfaStatus } from '@/lib/mfa-status';
-import { passkeyDefaultNameKey, passkeyErrorText, webauthnSupported } from '@/lib/webauthn';
+import { passkeyDefaultNameKey, passkeyErrorText, webauthnUnavailableReason } from '@/lib/webauthn';
 import { RecoveryCodesDisplay } from './RecoveryCodesDisplay';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
 
 /** GET /v1/portal/driver/webauthn. */
 export interface PasskeyCredential {
@@ -251,8 +252,13 @@ function NamePasskeyForm({
         </p>
       )}
       <div className="flex flex-wrap gap-2">
-        <Button type="submit" disabled={mutation.isPending}>
-          {mutation.isPending ? t('common.saving') : t('common.save')}
+        <Button type="submit" disabled={mutation.isPending} className="relative">
+          {mutation.isPending && (
+            <span className="absolute inset-0 flex items-center justify-center">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            </span>
+          )}
+          <span className={mutation.isPending ? 'invisible' : ''}>{t('common.save')}</span>
         </Button>
         <Button type="button" variant="outline" onClick={onDone}>
           {t('passkeys.keepName')}
@@ -271,7 +277,8 @@ export function AccountPasskeys({ status }: { status: PortalMfaStatus }): React.
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const timezone = useDriverTimezone();
-  const supported = webauthnSupported();
+  const unavailable = webauthnUnavailableReason();
+  const supported = unavailable == null;
   const {
     data: credentials,
     isLoading,
@@ -347,10 +354,16 @@ export function AccountPasskeys({ status }: { status: PortalMfaStatus }): React.
           )}
         </p>
       </div>
-      {!supported && (
-        <Alert variant="info">
+      {unavailable != null && (
+        <Alert variant="info" data-testid="passkey-unavailable">
           <Info className="h-4 w-4" />
-          <AlertDescription>{t('passkeys.needsSecurePage')}</AlertDescription>
+          <AlertDescription>
+            {t(
+              unavailable === 'insecure'
+                ? 'passkeys.needsSecurePage'
+                : 'passkeys.browserUnsupported',
+            )}
+          </AlertDescription>
         </Alert>
       )}
       {supported && !enabled && (
@@ -360,21 +373,17 @@ export function AccountPasskeys({ status }: { status: PortalMfaStatus }): React.
         </Alert>
       )}
       {isLoading ? (
-        <LoadingLogo size="inline" />
+        <LoadingState />
       ) : isError ? (
-        <div className="space-y-2">
-          <p className="text-sm text-destructive">{t('passkeys.loadError')}</p>
-          <Button
-            variant="outline"
-            onClick={() => {
-              void refetch();
-            }}
-          >
-            {t('passkeys.retry')}
-          </Button>
-        </div>
+        <ErrorState
+          message={t('passkeys.loadError')}
+          retryLabel={t('passkeys.retry')}
+          onRetry={() => {
+            void refetch();
+          }}
+        />
       ) : list.length === 0 ? (
-        <p className="text-center text-sm text-muted-foreground">{t('passkeys.empty')}</p>
+        <EmptyState>{t('passkeys.empty')}</EmptyState>
       ) : (
         <ul className="divide-y rounded-lg border">
           {list.map((c) => (
@@ -457,15 +466,13 @@ export function AccountPasskeys({ status }: { status: PortalMfaStatus }): React.
       ) : (
         supported &&
         enabled && (
-          <Button
-            variant="outline"
-            className="w-full"
+          <CreateButton
+            label={t('passkeys.add')}
+            fullWidth
             onClick={() => {
               setAdding(true);
             }}
-          >
-            {t('passkeys.add')}
-          </Button>
+          />
         )
       )}
       <ConfirmDialog

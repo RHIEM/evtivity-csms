@@ -20,6 +20,7 @@ import { TaxPriceHint } from '@/components/pricing/TaxPriceHint';
 import { DEFAULT_TAX_BASIS } from '@evtivity/lib/price-display';
 import { useCompanyTaxBasis } from '@/hooks/use-company-tax-basis';
 import { Input } from '@/components/ui/input';
+import { TimeInput } from '@/components/ui/time-input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -259,10 +260,10 @@ export function TariffDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to={`/pricing/${id ?? ''}?tab=tariffs`} />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{tariff.name}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{tariff.name}</h1>
           <CopyableId id={tariff.id} />
         </div>
       </div>
@@ -274,7 +275,7 @@ export function TariffDetail(): React.JSX.Element {
       <Card>
         <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle>{t('common.details')}</CardTitle>
-          <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
+          <div className="flex flex-wrap gap-2 *:grow sm:*:grow-0">
             {canWrite && !editing && <EditButton label={t('common.edit')} onClick={startEdit} />}
             {canWrite && (
               <RemoveButton
@@ -483,12 +484,11 @@ export function TariffDetail(): React.JSX.Element {
                       <Label htmlFor="edit-start-time" className="leading-6">
                         {t('pricing.startTime')}
                       </Label>
-                      <Input
+                      <TimeInput
                         id="edit-start-time"
-                        type="time"
                         value={startTime}
-                        onChange={(e) => {
-                          setStartTime(e.target.value);
+                        onChange={(value) => {
+                          setStartTime(value);
                         }}
                       />
                     </div>
@@ -496,12 +496,11 @@ export function TariffDetail(): React.JSX.Element {
                       <Label htmlFor="edit-end-time" className="leading-6">
                         {t('pricing.endTime')}
                       </Label>
-                      <Input
+                      <TimeInput
                         id="edit-end-time"
-                        type="time"
                         value={endTime}
-                        onChange={(e) => {
-                          setEndTime(e.target.value);
+                        onChange={(value) => {
+                          setEndTime(value);
                         }}
                       />
                     </div>

@@ -5,9 +5,9 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Plus } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Badge } from '@/components/ui/badge';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
@@ -17,7 +17,7 @@ import { formatDate } from '@/lib/utils';
 import { cancellationFeeApplies, cancellationFeeWarning } from '@/lib/reservation-fee';
 import type { ReservationFee } from '@/lib/reservation-fee';
 import { useDriverTimezone } from '@/lib/timezone';
-import { LoadingLogo } from '@/components/loading-logo';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
 
 interface Reservation {
   id: string;
@@ -77,7 +77,7 @@ export function Reservations(): React.JSX.Element {
   const [pendingCancel, setPendingCancel] = useState<Reservation | null>(null);
   const [tab, setTab] = useState<'upcoming' | 'past'>('upcoming');
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['portal-reservations'],
     queryFn: () => api.get<ReservationsResponse>('/v1/portal/reservations'),
   });
@@ -123,15 +123,13 @@ export function Reservations(): React.JSX.Element {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold">{t('reservations.title')}</h1>
-        <Button
+        <CreateButton
+          label={t('reservations.newReservation')}
           size="sm"
           onClick={() => {
             void navigate('/reservations/new');
           }}
-        >
-          <Plus className="mr-1.5 h-4 w-4" />
-          {t('reservations.newReservation')}
-        </Button>
+        />
       </div>
 
       {/* Upcoming / Past toggle */}
@@ -153,12 +151,18 @@ export function Reservations(): React.JSX.Element {
         ))}
       </div>
 
-      {isLoading && <LoadingLogo size="inline" />}
+      {isLoading && <LoadingState />}
 
-      {!isLoading && items.length === 0 && (
-        <p className="text-center text-sm text-muted-foreground">
-          {t('reservations.noReservations')}
-        </p>
+      {isError && (
+        <ErrorState
+          onRetry={() => {
+            void refetch();
+          }}
+        />
+      )}
+
+      {!isLoading && !isError && items.length === 0 && (
+        <EmptyState>{t('reservations.noReservations')}</EmptyState>
       )}
 
       <div className="space-y-2">

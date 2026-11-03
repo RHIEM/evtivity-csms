@@ -4,11 +4,14 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Plus, Trash2 } from 'lucide-react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Trash2 } from 'lucide-react';
+import { TabPanel } from '@/components/ui/tab-panel';
+import { EmptyState, ErrorState, LoadingState, TableStateRow } from '@/components/ui/content-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Input } from '@/components/ui/input';
+import { DateTimeInput } from '@/components/ui/date-time-input';
 import { Label } from '@/components/ui/label';
 import { Pagination } from '@/components/ui/pagination';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -44,7 +47,6 @@ import {
   getDefaultExpiresAt,
   validateReservationDateRange,
 } from '@/lib/reservation-datetime';
-import { LoadingLogo } from '@/components/loading-logo';
 import { useHasPermission } from '@/lib/auth';
 
 /** The API accepts at most this many slots per bulk reservation. */
@@ -287,110 +289,94 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
 
   return (
     <>
-      <Card>
-        <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <CardTitle>{t('fleets.bulkReservations')}</CardTitle>
-          {canWrite && (
-            <Button
+      <TabPanel
+        title={t('fleets.bulkReservations')}
+        actions={
+          canWrite ? (
+            <CreateButton
+              label={t('fleets.newBulkReservation')}
               onClick={() => {
                 resetForm();
                 setDialogOpen(true);
               }}
-            >
-              <Plus className="h-4 w-4" />
-              {t('fleets.newBulkReservation')}
-            </Button>
-          )}
-        </CardHeader>
-        <CardContent>
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>{t('fleets.fleetReservationName')}</TableHead>
-                  <TableHead>{t('common.status')}</TableHead>
-                  <TableHead>{t('reservations.reservationCount')}</TableHead>
-                  <TableHead>{t('reservations.startsAt')}</TableHead>
-                  <TableHead>{t('reservations.expiresAt')}</TableHead>
-                  <TableHead>{t('reservations.createdAt')}</TableHead>
-                  <TableHead className="text-right">{t('common.actions')}</TableHead>
+            />
+          ) : undefined
+        }
+      >
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('fleets.fleetReservationName')}</TableHead>
+                <TableHead>{t('common.status')}</TableHead>
+                <TableHead>{t('reservations.reservationCount')}</TableHead>
+                <TableHead>{t('reservations.startsAt')}</TableHead>
+                <TableHead>{t('reservations.expiresAt')}</TableHead>
+                <TableHead>{t('reservations.createdAt')}</TableHead>
+                <TableHead className="text-right">{t('common.actions')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isLoading && (
+                <TableStateRow colSpan={7}>
+                  <LoadingState />
+                </TableStateRow>
+              )}
+              {isError && (
+                <TableStateRow colSpan={7}>
+                  <ErrorState
+                    onRetry={() => {
+                      void refetch();
+                    }}
+                  />
+                </TableStateRow>
+              )}
+              {response?.data.map((fr) => (
+                <TableRow key={fr.id}>
+                  <TableCell className="whitespace-nowrap">
+                    {fr.name != null && fr.name !== '' ? fr.name : fr.id.slice(0, 8)}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={fleetReservationStatusVariant(fr.status)}>
+                      {statusLabel(fr.status)}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>{fr.reservationCount}</TableCell>
+                  <TableCell>
+                    {fr.startsAt != null ? (
+                      formatDateTime(fr.startsAt, timezone)
+                    ) : (
+                      <span className="text-muted-foreground">{t('common.na')}</span>
+                    )}
+                  </TableCell>
+                  <TableCell>{formatDateTime(fr.expiresAt, timezone)}</TableCell>
+                  <TableCell>{formatDateTime(fr.createdAt, timezone)}</TableCell>
+                  <TableCell className="text-right">
+                    {canWrite && canCancel(fr.status) && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t('fleets.cancelFleetReservation')}
+                        onClick={() => {
+                          setCancelId(fr.id);
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading && (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center text-muted-foreground">
-                      <LoadingLogo size="inline" />
-                    </TableCell>
-                  </TableRow>
-                )}
-                {isError && (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center text-destructive">
-                      <div className="flex flex-col items-center gap-2">
-                        <span>{t('common.loadError')}</span>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            void refetch();
-                          }}
-                        >
-                          {t('common.retry')}
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-                {response?.data.map((fr) => (
-                  <TableRow key={fr.id}>
-                    <TableCell className="whitespace-nowrap">
-                      {fr.name != null && fr.name !== '' ? fr.name : fr.id.slice(0, 8)}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={fleetReservationStatusVariant(fr.status)}>
-                        {statusLabel(fr.status)}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>{fr.reservationCount}</TableCell>
-                    <TableCell>
-                      {fr.startsAt != null ? (
-                        formatDateTime(fr.startsAt, timezone)
-                      ) : (
-                        <span className="text-muted-foreground">{t('common.na')}</span>
-                      )}
-                    </TableCell>
-                    <TableCell>{formatDateTime(fr.expiresAt, timezone)}</TableCell>
-                    <TableCell>{formatDateTime(fr.createdAt, timezone)}</TableCell>
-                    <TableCell className="text-right">
-                      {canWrite && canCancel(fr.status) && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={t('fleets.cancelFleetReservation')}
-                          onClick={() => {
-                            setCancelId(fr.id);
-                          }}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {response?.data.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center text-muted-foreground">
-                      {t('reservations.noReservations')}
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-          <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
-        </CardContent>
-      </Card>
+              ))}
+              {response?.data.length === 0 && (
+                <TableStateRow colSpan={7}>
+                  <EmptyState>{t('reservations.noReservations')}</EmptyState>
+                </TableStateRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+        <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+      </TabPanel>
 
       {/* New Bulk Reservation Dialog */}
       <Dialog
@@ -427,16 +413,13 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="grid gap-2">
                 <Label htmlFor="fleet-reservation-starts">{t('reservations.startsAt')}</Label>
-                <Input
+                <DateTimeInput
                   id="fleet-reservation-starts"
-                  type="datetime-local"
                   value={startsAt}
-                  onChange={(e) => {
-                    setStartsAt(e.target.value);
+                  onChange={(value) => {
+                    setStartsAt(value);
                   }}
-                  className={
-                    hasSubmitted && dateValidation.startsAtError != null ? 'border-destructive' : ''
-                  }
+                  invalid={hasSubmitted && dateValidation.startsAtError != null}
                 />
                 {hasSubmitted && dateValidation.startsAtError != null && (
                   <p className="text-sm text-destructive">
@@ -446,18 +429,13 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="fleet-reservation-expires">{t('reservations.expiresAt')} *</Label>
-                <Input
+                <DateTimeInput
                   id="fleet-reservation-expires"
-                  type="datetime-local"
                   value={expiresAt}
-                  onChange={(e) => {
-                    setExpiresAt(e.target.value);
+                  onChange={(value) => {
+                    setExpiresAt(value);
                   }}
-                  className={
-                    hasSubmitted && dateValidation.expiresAtError != null
-                      ? 'border-destructive'
-                      : ''
-                  }
+                  invalid={hasSubmitted && dateValidation.expiresAtError != null}
                 />
                 {hasSubmitted && dateValidation.expiresAtError != null && (
                   <p className="text-sm text-destructive">
@@ -476,13 +454,19 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
               <Label>{t('fleets.stations')}</Label>
               <div className="grid gap-3">
                 {slots.map((slot, index) => {
-                  // Exclude every OTHER slot's picked station so this row's
-                  // combobox can't surface it as a duplicate option.
+                  // A station can appear in several slots, but each connector
+                  // only once: hide the connectors other slots picked here.
                   const others = new Set<string>();
                   for (let j = 0; j < slots.length; j++) {
                     if (j === index) continue;
-                    const id = slots[j]?.station?.id;
-                    if (id != null) others.add(id);
+                    const other = slots[j];
+                    if (
+                      other?.station != null &&
+                      other.station.id === slot.station?.id &&
+                      other.connectorKey !== ''
+                    ) {
+                      others.add(other.connectorKey);
+                    }
                   }
                   return (
                     <BulkReservationSlotRow
@@ -498,22 +482,20 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
                             }
                           : null
                       }
-                      excludeStationIds={others}
+                      excludeConnectorKeys={others}
                     />
                   );
                 })}
               </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={addSlot}
-                className="w-fit"
-                disabled={slots.length >= MAX_BULK_RESERVATION_SLOTS}
-              >
-                <Plus className="h-4 w-4" />
-                {t('fleets.addStation')}
-              </Button>
+              <div>
+                <CreateButton
+                  label={t('fleets.addStation')}
+                  variant="outline"
+                  size="sm"
+                  onClick={addSlot}
+                  disabled={slots.length >= MAX_BULK_RESERVATION_SLOTS}
+                />
+              </div>
               {slots.length >= MAX_BULK_RESERVATION_SLOTS && (
                 <p className="text-sm text-muted-foreground">
                   {t('fleets.maxSlotsReached', { max: MAX_BULK_RESERVATION_SLOTS })}
@@ -531,9 +513,11 @@ export function FleetReservationsTab({ fleetId }: FleetReservationsTabProps): Re
               >
                 {t('common.cancel')}
               </Button>
-              <Button type="submit" disabled={createMutation.isPending}>
-                {createMutation.isPending ? t('common.loading') : t('common.create')}
-              </Button>
+              <CreateButton
+                type="submit"
+                disabled={createMutation.isPending}
+                label={createMutation.isPending ? t('common.loading') : t('common.create')}
+              />
             </DialogFooter>
           </form>
         </DialogContent>

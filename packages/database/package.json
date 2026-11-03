@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/database",
-  "version": "0.1.48-beta.3",
+  "version": "0.1.49-beta.8",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -23,6 +23,7 @@
     "seed:dev": "node --env-file-if-exists=../../.env --import=tsx/esm src/seed-dev-stations.ts",
     "seed:ai-insights": "node --env-file-if-exists=../../.env --import=tsx/esm src/seed-ai-insights-run.ts",
     "seed:member-invoices": "node --env-file-if-exists=../../.env --import=tsx/esm src/seed-member-invoices-run.ts",
+    "seed:demo-features": "node --env-file-if-exists=../../.env --import=tsx/esm src/seed-demo-features-run.ts",
     "studio": "node --import tsx ../../node_modules/drizzle-kit/bin.cjs studio",
     "test": "vitest run"
   },
@@ -32,13 +33,13 @@
     "drizzle-orm": "^0.45.2",
     "nanoid": "^6.0.1",
     "postgres": "^3.4.5",
-    "zod": "^3.24.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^25.2.3",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }

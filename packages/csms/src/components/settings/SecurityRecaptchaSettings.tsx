@@ -1,18 +1,19 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle } from 'lucide-react';
 import { SaveButton } from '@/components/save-button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 
@@ -24,29 +25,32 @@ export function SecurityRecaptchaSettings({ settings }: Props): React.JSX.Elemen
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [enabled, setEnabled] = useState(false);
-  const [siteKey, setSiteKey] = useState('');
-  const [secretKey, setSecretKey] = useState('');
-  const [threshold, setThreshold] = useState('0.5');
-
-  useEffect(() => {
-    if (settings == null) return;
-    setEnabled(settings['security.recaptcha.enabled'] === true);
-    setSiteKey(
-      typeof settings['security.recaptcha.siteKey'] === 'string'
-        ? settings['security.recaptcha.siteKey']
-        : '',
-    );
-    const th = settings['security.recaptcha.threshold'];
-    if (typeof th === 'number') setThreshold(String(th));
+  const loaded = useMemo(() => {
+    const key = settings?.['security.recaptcha.siteKey'];
+    const th = settings?.['security.recaptcha.threshold'];
+    return {
+      enabled: settings?.['security.recaptcha.enabled'] === true,
+      siteKey: typeof key === 'string' ? key : '',
+      threshold: typeof th === 'number' ? String(th) : '0.5',
+    };
   }, [settings]);
+  // A settings reload replaces the values only while they are unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded);
+  const { enabled, siteKey, threshold } = values;
+  const setSiteKey = (siteKey: string): void => {
+    setValues((v) => ({ ...v, siteKey }));
+  };
+  const setThreshold = (threshold: string): void => {
+    setValues((v) => ({ ...v, threshold }));
+  };
+  const [secretKey, setSecretKey] = useState('');
 
   // The stored state, not the unsaved toggle: the warning says what protects sign-up now.
   const savedEnabled = settings?.['security.recaptcha.enabled'] === true;
 
-  const hasSavedSecret =
-    typeof settings?.['security.recaptcha.secretKeyEnc'] === 'string' &&
-    settings['security.recaptcha.secretKeyEnc'] !== '';
+  // The GET returns the secret only with settings.system:read; the flag says
+  // whether one is stored for every reader.
+  const hasSavedSecret = settings?.['security.recaptcha.secretKeyConfigured'] === true;
 
   const mutation = useMutation({
     mutationFn: (vals: {
@@ -62,12 +66,20 @@ export function SecurityRecaptchaSettings({ settings }: Props): React.JSX.Elemen
 
   function handleSave(): void {
     const th = parseFloat(threshold);
-    mutation.mutate({
-      enabled,
-      siteKey,
-      ...(secretKey !== '' ? { secretKey } : {}),
-      threshold: Number.isNaN(th) ? 0.5 : Math.min(1, Math.max(0, th)),
-    });
+    const sent = values;
+    mutation.mutate(
+      {
+        enabled,
+        siteKey,
+        ...(secretKey !== '' ? { secretKey } : {}),
+        threshold: Number.isNaN(th) ? 0.5 : Math.min(1, Math.max(0, th)),
+      },
+      {
+        onSuccess: () => {
+          takeNextLoad(sent);
+        },
+      },
+    );
   }
 
   return (
@@ -96,12 +108,13 @@ export function SecurityRecaptchaSettings({ settings }: Props): React.JSX.Elemen
             <div className="space-y-0.5">
               <Label className="leading-6">{t('settings.recaptchaEnabled')}</Label>
             </div>
-            <Toggle
+            <ConfirmToggle
               aria-label={t('settings.recaptchaEnabled')}
+              label={t('settings.recaptchaEnabled')}
               size="lg"
               checked={enabled}
               onCheckedChange={() => {
-                setEnabled((v) => !v);
+                setValues((v) => ({ ...v, enabled: !v.enabled }));
               }}
             />
           </div>

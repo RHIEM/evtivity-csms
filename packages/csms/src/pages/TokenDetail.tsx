@@ -10,7 +10,7 @@ import { EntityNavButtons } from '@/components/entity-nav-buttons';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
 import { CopyableId } from '@/components/copyable-id';
 import { TokenStatusBadge } from '@/components/token/TokenStatusBadge';
-import { Card, CardContent } from '@/components/ui/card';
+import { TabPanel } from '@/components/ui/tab-panel';
 import { Pagination } from '@/components/ui/pagination';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { SessionsTable, type Session } from '@/components/SessionsTable';
@@ -50,6 +50,9 @@ export function TokenDetail(): React.JSX.Element {
 
   const {
     data: sessions,
+    isLoading: sessionsLoading,
+    isError: sessionsError,
+    refetch: refetchSessions,
     page: sessionsPage,
     totalPages: sessionsTotalPages,
     setPage: setSessionsPage,
@@ -71,10 +74,10 @@ export function TokenDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/tokens" />
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold">{token.idToken}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{token.idToken}</h1>
           <CopyableId id={token.id} />
         </div>
         <TokenStatusBadge token={token} />
@@ -89,35 +92,37 @@ export function TokenDetail(): React.JSX.Element {
           <TabsTrigger value="authorize-log">{t('tokens.authorizeLog')}</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="details" className="mt-4 space-y-4">
+        <TabsContent value="details">
           <TokenDetailsTab token={token} timezone={timezone} />
         </TabsContent>
 
-        <TabsContent value="sessions" className="mt-4">
-          <Card>
-            <CardContent className="pt-6">
-              <SessionsTable
-                sessions={sessions}
-                page={sessionsPage}
-                totalPages={sessionsTotalPages}
-                onPageChange={setSessionsPage}
-                timezone={timezone}
-              />
-              <Pagination
-                page={sessionsPage}
-                totalPages={sessionsTotalPages}
-                onPageChange={setSessionsPage}
-              />
-            </CardContent>
-          </Card>
+        <TabsContent value="sessions">
+          <TabPanel title={t('sessions.title')}>
+            <SessionsTable
+              sessions={sessions}
+              page={sessionsPage}
+              totalPages={sessionsTotalPages}
+              onPageChange={setSessionsPage}
+              timezone={timezone}
+              isLoading={sessionsLoading}
+              isError={sessionsError}
+              onRetry={refetchSessions}
+            />
+            <Pagination
+              page={sessionsPage}
+              totalPages={sessionsTotalPages}
+              onPageChange={setSessionsPage}
+            />
+          </TabPanel>
         </TabsContent>
 
-        <TabsContent value="history" className="mt-4">
+        <TabsContent value="history">
           <EntityHistoryTab entityType="token" entityId={token.id} />
         </TabsContent>
 
-        <TabsContent value="authorize-log" className="mt-4">
+        <TabsContent value="authorize-log">
           <AuthorizeLogView
+            title={t('tokens.authorizeLog')}
             fixedFilters={{ matchedTokenId: token.id }}
             hideIdTokenFilter
             hideMatchedTokenColumn

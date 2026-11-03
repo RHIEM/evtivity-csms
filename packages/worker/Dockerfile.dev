@@ -17,6 +17,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/sim-providers/package.json packages/sim-providers/
@@ -38,6 +39,7 @@ COPY tsconfig.base.json tsconfig.json ./
 COPY packages/lib/ packages/lib/
 COPY packages/database/ packages/database/
 COPY packages/payments/ packages/payments/
+COPY packages/payment-terminals/ packages/payment-terminals/
 COPY packages/services/ packages/services/
 COPY packages/sim-providers/ packages/sim-providers/
 COPY packages/ai/ packages/ai/
@@ -51,6 +53,8 @@ COPY packages/ocpp/ packages/ocpp/
 COPY packages/worker/ packages/worker/
 # The database package tests import scripts/lib (the migration file helpers).
 COPY scripts/lib/ scripts/lib/
+# Live mode (mounted sources): node scripts/dev-live.mjs <entry> <dist packages>.
+COPY scripts/dev-live.mjs scripts/dev-live.mjs
 RUN npx tsc -b --force packages/lib packages/database packages/payments packages/ocpp packages/css packages/octt
 
 CMD ["node", "--import", "tsx", "packages/worker/src/index.ts"]

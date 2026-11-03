@@ -517,6 +517,7 @@ export class ChaosOrchestrator {
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private stationIds: string[] = [];
   private tokens: DriverToken[] = [];
+  private fleetTokens = new Map<string, DriverToken[]>();
   private stationProtocols: Map<string, OcppProtocol> = new Map();
   private offlineStations: Set<string> = new Set();
   private chargingStations: Set<string> = new Set();
@@ -546,6 +547,7 @@ export class ChaosOrchestrator {
   private async loadStations(): Promise<{
     stations: Array<{ station_id: string; ocpp_protocol: string }>;
     tokens: DriverToken[];
+    fleetTokens: Map<string, DriverToken[]>;
   }> {
     const stationRows = await this.sql<Array<{ station_id: string; ocpp_protocol: string }>>`
       SELECT cs.station_id, cs.ocpp_protocol
@@ -559,7 +561,9 @@ export class ChaosOrchestrator {
     }
     // The OCTT runner's tokens belong to its run: a chaos session with one
     // would take a token a conformance test is using and keep the run's driver
-    // and tariff referenced, so the run's cleanup could not delete them.
+    // and tariff referenced, so the run's cleanup could not delete them. A
+    // driver whose every vehicle is a box truck, bus or semi truck charges at
+    // its fleet's depot only (below), never in a public car spot.
     const tokens = (
       await this.sql<Array<{ id_token: string; token_type: string }>>`
         SELECT t.id_token, t.token_type FROM driver_tokens t
@@ -568,14 +572,49 @@ export class ChaosOrchestrator {
             SELECT 1 FROM drivers d
             WHERE d.id = t.driver_id AND d.email = ${OCTT_TEST_DRIVER_EMAIL}
           )
+          AND NOT (
+            EXISTS (SELECT 1 FROM vehicles v WHERE v.driver_id = t.driver_id)
+            AND NOT EXISTS (
+              SELECT 1 FROM vehicles v
+              WHERE v.driver_id = t.driver_id
+                AND (v.body_type IS NULL OR v.body_type NOT IN ('box_truck', 'bus', 'semi_truck'))
+            )
+          )
       `
     ).map((r) => ({ idToken: r.id_token, tokenType: r.token_type }));
-    return { stations, tokens };
+    // A depot station is charged by the drivers of the fleets it is assigned
+    // to. A depot station is a fleet station on a site of type Depot (its
+    // layout settings, bus bays and truck lanes). Any other fleet station
+    // takes the pool above.
+    const fleetRows = await this.sql<
+      Array<{ station_id: string; id_token: string; token_type: string }>
+    >`
+      SELECT DISTINCT cs.station_id, t.id_token, t.token_type
+      FROM fleet_stations fs
+      JOIN charging_stations cs ON cs.id = fs.station_id
+      JOIN fleet_drivers fd ON fd.fleet_id = fs.fleet_id
+      JOIN driver_tokens t ON t.driver_id = fd.driver_id AND t.is_active = true
+      JOIN sites s ON s.id = cs.site_id
+      WHERE s.layout_settings->>'siteType' = 'depot'
+    `;
+    const fleetTokens = new Map<string, DriverToken[]>();
+    for (const r of fleetRows) {
+      const list = fleetTokens.get(r.station_id) ?? [];
+      list.push({ idToken: r.id_token, tokenType: r.token_type });
+      fleetTokens.set(r.station_id, list);
+    }
+    return { stations, tokens, fleetTokens };
+  }
+
+  /** The tokens a station's sessions use: its fleets' drivers for a depot station (a Depot site), else the pool. */
+  private tokensFor(stationId: string): DriverToken[] {
+    return this.fleetTokens.get(stationId) ?? this.tokens;
   }
 
   private applyLoaded(
     stations: Array<{ station_id: string; ocpp_protocol: string }>,
     tokens: DriverToken[],
+    fleetTokens: Map<string, DriverToken[]>,
   ): void {
     const liveIds = new Set(stations.map((s) => s.station_id));
 
@@ -603,6 +642,7 @@ export class ChaosOrchestrator {
     this.journeys.retain(liveIds);
 
     this.tokens = tokens;
+    this.fleetTokens = fleetTokens;
   }
 
   async start(): Promise<void> {
@@ -610,8 +650,8 @@ export class ChaosOrchestrator {
     // and migration 0001 -- plus any added at runtime via the dashboard
     // simulator toggle or POST /v1/css/stations. The orchestrator just reads
     // them to populate its in-memory action targets; no INSERT mirroring.
-    const { stations, tokens } = await this.loadStations();
-    this.applyLoaded(stations, tokens);
+    const { stations, tokens, fleetTokens } = await this.loadStations();
+    this.applyLoaded(stations, tokens, fleetTokens);
 
     console.log(
       `[chaos] Loaded ${String(stations.length)} stations and ${String(this.tokens.length)} tokens`,
@@ -628,7 +668,7 @@ export class ChaosOrchestrator {
       void (async (): Promise<void> => {
         try {
           const loaded = await this.loadStations();
-          this.applyLoaded(loaded.stations, loaded.tokens);
+          this.applyLoaded(loaded.stations, loaded.tokens, loaded.fleetTokens);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.log(`[chaos] Refresh failed: ${msg}`);
@@ -759,7 +799,8 @@ export class ChaosOrchestrator {
     // authorize/startCharging would crash on `pick(this.tokens)` returning
     // undefined. startCharging has its own empty-tokens guard below; this
     // filter keeps authorize from getting selected at all.
-    if (this.tokens.length === 0) {
+    const pool = this.tokensFor(stationId);
+    if (pool.length === 0) {
       actions = actions.filter((a) => a.name !== 'authorize' && a.name !== 'startCharging');
     }
 
@@ -784,7 +825,7 @@ export class ChaosOrchestrator {
     if (action.name === 'startCharging') {
       // Pick a token that does not already have an active session
       const busy = new Set(this.chargingTokenByStation.values());
-      const available = this.tokens.filter((t) => !busy.has(t.idToken));
+      const available = pool.filter((t) => !busy.has(t.idToken));
       if (available.length === 0) {
         return; // All drivers are charging, skip
       }
@@ -793,7 +834,7 @@ export class ChaosOrchestrator {
       this.chargingStations.add(stationId);
       this.chargingTokenByStation.set(stationId, t.idToken);
     } else {
-      params = action.params(this.tokens);
+      params = action.params(pool);
       if (action.name === 'stopCharging' || action.name === 'unplug') {
         this.chargingStations.delete(stationId);
         this.chargingTokenByStation.delete(stationId);

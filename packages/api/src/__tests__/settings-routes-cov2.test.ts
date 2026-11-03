@@ -29,7 +29,8 @@ const { state, rec, mocks } = vi.hoisted(() => ({
     clearPncSettingsCache: vi.fn(),
     clearAiSettingsCache: vi.fn(),
     getReservationSettings: vi.fn(),
-    clearS3ConfigCache: vi.fn(),
+    clearObjectStorageCache: vi.fn(),
+    getObjectStorage: vi.fn(),
     readSimSettings: vi.fn(),
   },
 }));
@@ -67,7 +68,11 @@ vi.mock('../lib/sim.js', async (importOriginal) => ({
 }));
 
 function simSettings(hologram: boolean, stationSignal: boolean): unknown {
-  return { hologram: { enabled: hologram }, stationSignalEnabled: stationSignal };
+  return {
+    hologram: { enabled: hologram },
+    '1nce': { enabled: false },
+    stationSignalEnabled: stationSignal,
+  };
 }
 
 vi.mock('../lib/site-access.js', async () =>
@@ -173,9 +178,33 @@ vi.mock('../lib/config.js', () => ({
   },
 }));
 
-vi.mock('../services/s3.service.js', () => ({
-  clearS3ConfigCache: mocks.clearS3ConfigCache,
-  getS3Config: vi.fn(),
+vi.mock('../services/storage.service.js', () => ({
+  clearObjectStorageCache: mocks.clearObjectStorageCache,
+  getObjectStorage: mocks.getObjectStorage,
+}));
+
+// The fresh proof itself has its own tests (session-proof, mfa-factor-proof).
+const proofState = vi.hoisted(() => ({ calls: 0, apiKey: false }));
+vi.mock('../lib/mfa-factor-proof.js', async () => {
+  const { z } = await import('zod');
+  return { factorProof: z.object({ kind: z.string() }).loose() };
+});
+vi.mock('../lib/session-proof.js', () => ({
+  sessionProofErrorFields: {},
+  SESSION_PROOF_ERROR_CODES: ['VALIDATION_ERROR', 'INVALID_PASSWORD'],
+  isApiKeyRequest: () => proofState.apiKey,
+  requireSessionProof: async (
+    _request: unknown,
+    reply: { status: (code: number) => { send: (body: unknown) => Promise<void> } },
+    proof: unknown,
+  ) => {
+    proofState.calls += 1;
+    if (proof != null) return true;
+    await reply
+      .status(400)
+      .send({ error: 'Proof required', code: 'VALIDATION_ERROR', proofKinds: ['password'] });
+    return false;
+  },
 }));
 
 vi.mock('../middleware/rbac.js', () => ({
@@ -284,7 +313,36 @@ describe('settings routes (cov2)', () => {
       reservationCancellationWindowMinutes: 15,
       reservationMaxHours: 4,
       currency: 'EUR',
+      avatarUploadEnabled: false,
+      fileStorageEnabled: false,
     });
+  });
+
+  it('GET /portal/features reports avatar upload and file storage only while file storage is configured', async () => {
+    for (const flag of [
+      mocks.isReservationEnabled,
+      mocks.isSupportEnabled,
+      mocks.isRoamingEnabled,
+      mocks.isPncEnabled,
+      mocks.isFleetEnabled,
+      mocks.isGuestChargingEnabled,
+      mocks.isChatbotAiEnabled,
+      mocks.isAiInsightsEnabled,
+    ]) {
+      flag.mockResolvedValue(false);
+    }
+    mocks.getReservationSettings.mockResolvedValue({
+      cancellationFeeCents: 0,
+      cancellationWindowMinutes: 0,
+      maxHours: 1,
+    });
+    mocks.getObjectStorage.mockResolvedValueOnce({ bucket: 'b' });
+    let res = await app.inject({ method: 'GET', url: '/portal/features' });
+    expect(res.json()).toMatchObject({ avatarUploadEnabled: true, fileStorageEnabled: true });
+    mocks.getObjectStorage.mockRejectedValueOnce(new Error('settings unreadable'));
+    res = await app.inject({ method: 'GET', url: '/portal/features' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ avatarUploadEnabled: false, fileStorageEnabled: false });
   });
 
   it('GET /portal/features adds the SIM switches only while they are on', async () => {
@@ -638,6 +696,37 @@ describe('settings routes (cov2)', () => {
     });
 
     it.each([
+      ['pnc.hubject.tokenUrl', 'http://169.254.169.254/token'],
+      ['pnc.hubject.baseUrl', 'https://10.0.0.5'],
+      ['pnc.hubject.tokenUrl', 'ftp://hubject.example.com'],
+      ['pnc.hubject.baseUrl', 'https://user:pw@hubject.example.com'],
+    ])('refuses %s %s with PRIVATE_URL', async (key, url) => {
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/settings/${key}`,
+        headers: auth,
+        payload: { value: url },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'PRIVATE_URL' });
+      expect(rec.values).toEqual([]);
+    });
+
+    it('stores a public Hubject token URL', async () => {
+      setupDbResults(
+        [],
+        [{ key: 'pnc.hubject.tokenUrl', value: 'https://auth.hubject.example/token' }],
+      );
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/settings/pnc.hubject.tokenUrl',
+        headers: auth,
+        payload: { value: 'https://auth.hubject.example/token' },
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it.each([
       ['https://10.0.0.5'],
       ['http://api.example.com'],
       ['https://user:pass@api.example.com'],
@@ -791,7 +880,7 @@ describe('settings routes (cov2)', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ success: true });
-    expect(mocks.clearS3ConfigCache).toHaveBeenCalled();
+    expect(mocks.clearObjectStorageCache).toHaveBeenCalled();
     const audited = mocks.writeAudit.mock.calls.map(
       (c) => (c[1] as { entityId: string; before: unknown }).entityId,
     );
@@ -801,5 +890,31 @@ describe('settings routes (cov2)', () => {
     )?.[1] as { before: unknown; after: unknown };
     expect(regionAudit.before).toEqual({ key: 's3.region', value: 'us-east-1' });
     expect(regionAudit.after).toEqual({ key: 's3.region', value: 'eu-west-1' });
+  });
+
+  it('PUT /settings/s3 audits the provider and endpoint when switching to S3-compatible', async () => {
+    setupDbResults([
+      { key: 's3.bucket', value: 'b1' },
+      { key: 's3.region', value: 'us-east-1' },
+      { key: 's3.accessKeyIdEnc', value: 'encrypted-value' },
+      { key: 's3.secretAccessKeyEnc', value: 'encrypted-value' },
+    ]);
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/settings/s3',
+      headers: auth,
+      payload: {
+        proof: { kind: 'password', password: 'current-password' },
+        provider: 's3-compatible',
+        endpoint: 'https://storage.example.com',
+        bucket: 'b1',
+        region: 'us-east-1',
+        accessKeyId: 'AK',
+        secretAccessKey: 'SK',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const audited = mocks.writeAudit.mock.calls.map((c) => (c[1] as { entityId: string }).entityId);
+    expect(audited.sort()).toEqual(['s3.endpoint', 's3.provider']);
   });
 });

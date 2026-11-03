@@ -1,12 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 import { useCompanyCurrency } from '@/hooks/use-company-currency';
 import {
@@ -35,13 +36,24 @@ export function FleetCreditReservationSettings({ settings }: Props): React.JSX.E
   const queryClient = useQueryClient();
   const { currency } = useCompanyCurrency();
   // Typed in the currency (major units), stored in cents.
-  const [amount, setAmount] = useState(centsToMajorInput(DEFAULT_RESERVATION_CENTS));
+  const storedAmount = settings?.[RESERVATION_KEY];
+  const loaded = useMemo(
+    () => ({
+      amount: centsToMajorInput(
+        typeof storedAmount === 'number' ? storedAmount : DEFAULT_RESERVATION_CENTS,
+      ),
+    }),
+    [storedAmount],
+  );
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const stored = settings?.[RESERVATION_KEY];
-    if (typeof stored === 'number') setAmount(centsToMajorInput(stored));
-  }, [settings]);
+  // A settings reload replaces the value only while it is unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded, () => {
+    setError(null);
+  });
+  const { amount } = values;
+  const setAmount = (value: string): void => {
+    setValues({ amount: value });
+  };
 
   const mutation = useMutation({
     mutationFn: (value: number) => api.put(`/v1/settings/${RESERVATION_KEY}`, { value }),
@@ -68,7 +80,12 @@ export function FleetCreditReservationSettings({ settings }: Props): React.JSX.E
       return;
     }
     setError(null);
-    mutation.mutate(cents);
+    const sent = { amount };
+    mutation.mutate(cents, {
+      onSuccess: () => {
+        takeNextLoad(sent);
+      },
+    });
   }
 
   return (

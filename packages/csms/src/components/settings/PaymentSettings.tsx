@@ -1,7 +1,8 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
+import { useLoadedValues, useSavedBaseline } from '@/hooks/use-loaded-values';
 import { useTranslation } from 'react-i18next';
 import { useTab } from '@/hooks/use-tab';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -12,7 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { api } from '@/lib/api';
 import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
@@ -23,7 +24,9 @@ import {
   parseMajorInputToCents,
 } from '@evtivity/lib/currency';
 import { AdyenSettings } from './AdyenSettings';
+import { PaymentTerminalSettings } from './PaymentTerminalSettings';
 import { percentError, preAuthAmountError } from './payment-amount-validation';
+import { PRE_AUTH_AMOUNT_MAX_CENTS, PRE_AUTH_AMOUNT_MIN_CENTS } from '@evtivity/lib/currency';
 import { PrepaidSettings } from './PrepaidSettings';
 import { InvoiceSettings } from './InvoiceSettings';
 import { PaymentProviderSettings } from './PaymentProviderSettings';
@@ -83,6 +86,21 @@ interface SitePaymentConfig {
   isEnabled: boolean;
 }
 
+interface StripeForm {
+  publishableKey: string;
+  secretKey: string;
+  webhookSecret: string;
+  connectWebhookSecret: string;
+  removing: Record<StripeSecretField, boolean>;
+}
+
+interface SiteForm {
+  siteId: string | null;
+  connectedAccountId: string;
+  preAuthAmount: string;
+  platformFee: string;
+}
+
 interface PaymentSettingsProps {
   /** The generic settings (GET /v1/settings), for the prepaid card settings. */
   settings?: Record<string, unknown> | undefined;
@@ -91,7 +109,10 @@ interface PaymentSettingsProps {
 export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // Site payment configs need payments:write. The provider settings (Stripe,
+  // Adyen, provider selection) need settings.payment:write, as their routes do.
   const canWrite = useHasPermission('payments:write');
+  const canWriteProvider = useHasPermission('settings.payment:write');
   // The prepaid and invoice settings are generic settings (settings.system:*).
   const canReadSystemSettings = useHasPermission('settings.system:read');
   const canWriteSystemSettings = useHasPermission('settings.system:write');
@@ -107,20 +128,9 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
     'sub',
   );
 
-  const [stripeSecretKey, setStripeSecretKey] = useState('');
-  const [stripePublishableKey, setStripePublishableKey] = useState('');
-  const [stripeWebhookSecret, setStripeWebhookSecret] = useState('');
-  const [stripeConnectWebhookSecret, setStripeConnectWebhookSecret] = useState('');
-  const [stripeRemoving, setStripeRemoving] = useState(NO_STRIPE_REMOVALS);
   const { currency } = useCompanyCurrency();
-  const [stripeHasUnsavedChanges, setStripeHasUnsavedChanges] = useState(false);
   const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
-
-  const [siteConnectedAccountId, setSiteConnectedAccountId] = useState('');
-  const [sitePreAuthAmount, setSitePreAuthAmount] = useState(centsToMajorInput(5000));
-  const [sitePlatformFee, setSitePlatformFee] = useState('');
   const [siteHasSubmitted, setSiteHasSubmitted] = useState(false);
-  const [siteHasUnsavedChanges, setSiteHasUnsavedChanges] = useState(false);
 
   const { data: stripeSettings } = useQuery({
     queryKey: ['stripe-settings'],
@@ -173,33 +183,89 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
     enabled: selectedSiteId != null,
   });
 
-  useEffect(() => {
-    if (selectedSiteConfig != null) {
-      setSiteConnectedAccountId(selectedSiteConfig.payoutAccountId ?? '');
-      setSitePreAuthAmount(centsToMajorInput(selectedSiteConfig.preAuthAmountCents));
-      setSitePlatformFee(
-        selectedSiteConfig.platformFeePercent != null ? selectedSiteConfig.platformFeePercent : '',
-      );
-    } else if (selectedSiteId != null) {
-      setSiteConnectedAccountId('');
-      setSitePreAuthAmount(centsToMajorInput(5000));
-      setSitePlatformFee('');
-    }
+  // The site form follows the selected site. A reload of the same site
+  // replaces it only while it has no unsaved edits; another site replaces it.
+  const siteLoaded = useMemo<SiteForm>(
+    () => ({
+      siteId: selectedSiteId,
+      connectedAccountId: selectedSiteConfig?.payoutAccountId ?? '',
+      preAuthAmount: centsToMajorInput(selectedSiteConfig?.preAuthAmountCents ?? 5000),
+      platformFee: selectedSiteConfig?.platformFeePercent ?? '',
+    }),
+    [selectedSiteConfig, selectedSiteId],
+  );
+  const [siteForm, setSiteForm, takeNextSiteLoad] = useLoadedValues<SiteForm>(siteLoaded, () => {
     setSiteHasSubmitted(false);
-    setSiteHasUnsavedChanges(false);
-  }, [selectedSiteConfig, selectedSiteId]);
+  });
+  if (siteForm.siteId !== siteLoaded.siteId) {
+    setSiteForm(siteLoaded);
+    setSiteHasSubmitted(false);
+  }
+  const [siteBaseline, markSiteSaved] = useSavedBaseline(siteLoaded);
+  const siteHasUnsavedChanges =
+    siteForm.siteId === siteLoaded.siteId &&
+    JSON.stringify(siteForm) !== JSON.stringify(siteBaseline);
+  const {
+    connectedAccountId: siteConnectedAccountId,
+    preAuthAmount: sitePreAuthAmount,
+    platformFee: sitePlatformFee,
+  } = siteForm;
+  function setSiteConnectedAccountId(value: string): void {
+    setSiteForm((f) => ({ ...f, connectedAccountId: value }));
+  }
+  function setSitePreAuthAmount(value: string): void {
+    setSiteForm((f) => ({ ...f, preAuthAmount: value }));
+  }
+  function setSitePlatformFee(value: string): void {
+    setSiteForm((f) => ({ ...f, platformFee: value }));
+  }
 
-  useEffect(() => {
-    if (stripeSettings == null) return;
-    setStripePublishableKey(
-      typeof stripeSettings.publishableKey === 'string' ? stripeSettings.publishableKey : '',
-    );
-    setStripeSecretKey(stripeSettings.secretKey ?? '');
-    setStripeWebhookSecret(stripeSettings.webhookSecret ?? '');
-    setStripeConnectWebhookSecret(stripeSettings.connectWebhookSecret ?? '');
-    setStripeRemoving(NO_STRIPE_REMOVALS);
-    setStripeHasUnsavedChanges(false);
-  }, [stripeSettings]);
+  // A reload replaces the Stripe form only while it has no unsaved edits.
+  const stripeLoaded = useMemo<StripeForm>(
+    () => ({
+      publishableKey:
+        typeof stripeSettings?.publishableKey === 'string' ? stripeSettings.publishableKey : '',
+      secretKey: stripeSettings?.secretKey ?? '',
+      webhookSecret: stripeSettings?.webhookSecret ?? '',
+      connectWebhookSecret: stripeSettings?.connectWebhookSecret ?? '',
+      removing: NO_STRIPE_REMOVALS,
+    }),
+    [stripeSettings],
+  );
+  const [stripeForm, setStripeForm, takeNextStripeLoad, stripeTaken] =
+    useLoadedValues<StripeForm>(stripeLoaded);
+  const [stripeBaseline, markStripeSaved] = useSavedBaseline(stripeLoaded);
+  const stripeHasUnsavedChanges = JSON.stringify(stripeForm) !== JSON.stringify(stripeBaseline);
+  const {
+    publishableKey: stripePublishableKey,
+    secretKey: stripeSecretKey,
+    webhookSecret: stripeWebhookSecret,
+    connectWebhookSecret: stripeConnectWebhookSecret,
+    removing: stripeRemoving,
+  } = stripeForm;
+  function setStripeField(
+    field: 'publishableKey' | 'secretKey' | 'webhookSecret' | 'connectWebhookSecret',
+    value: string,
+  ): void {
+    setStripeForm((f) => ({ ...f, [field]: value }));
+  }
+  function setStripeSecretKey(value: string): void {
+    setStripeField('secretKey', value);
+  }
+  function setStripePublishableKey(value: string): void {
+    setStripeField('publishableKey', value);
+  }
+  function setStripeWebhookSecret(value: string): void {
+    setStripeField('webhookSecret', value);
+  }
+  function setStripeConnectWebhookSecret(value: string): void {
+    setStripeField('connectWebhookSecret', value);
+  }
+  function setStripeRemoving(
+    change: (current: Record<StripeSecretField, boolean>) => Record<StripeSecretField, boolean>,
+  ): void {
+    setStripeForm((f) => ({ ...f, removing: change(f.removing) }));
+  }
 
   const stripeSaveMutation = useMutation({
     mutationFn: (vals: StripeSettingsBody) => api.put('/v1/settings/stripe', vals),
@@ -239,19 +305,20 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
   });
 
   function markStripeChanged(): void {
-    setStripeHasUnsavedChanges(true);
     stripeSaveMutation.reset();
     stripeTestMutation.reset();
   }
 
   function markSiteChanged(): void {
-    setSiteHasUnsavedChanges(true);
     sitePaymentSaveMutation.reset();
   }
 
   function getSiteValidationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
-    const preAuth = preAuthAmountError(sitePreAuthAmount, t);
+    const preAuth = preAuthAmountError(sitePreAuthAmount, t, {
+      minCents: PRE_AUTH_AMOUNT_MIN_CENTS,
+      maxCents: PRE_AUTH_AMOUNT_MAX_CENTS,
+    });
     if (preAuth != null) errors.preAuthAmountCents = preAuth;
     const fee = percentError(sitePlatformFee, t, false);
     if (fee != null) errors.platformFeePercent = fee;
@@ -263,8 +330,8 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
   function handleStripeSubmit(e: React.SyntheticEvent): void {
     e.preventDefault();
     const vals: StripeSettingsBody = {};
-    // Send only the secrets that changed, so an unchanged secret is not
-    // re-encrypted and audited. A shown secret emptied by the user clears; a
+    // Send only the secrets the user edited, so an unchanged secret is not
+    // re-encrypted and audited, and a rotated one is not put back. A shown secret emptied by the user clears; a
     // hidden one clears only through its explicit remove (see secretChange).
     const secrets: Array<[StripeSecretField, string]> = [
       ['secretKey', stripeSecretKey],
@@ -272,7 +339,12 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
       ['connectWebhookSecret', stripeConnectWebhookSecret],
     ];
     for (const [key, value] of secrets) {
-      const change = secretChange(value, stripeSecret(stripeSettings, key), stripeRemoving[key]);
+      const change = secretChange(
+        value,
+        stripeSecret(stripeSettings, key),
+        stripeRemoving[key],
+        stripeTaken[key],
+      );
       if (change !== undefined) vals[key] = change;
     }
     // Send the publishable key when it changed; emptying a stored key clears it.
@@ -281,7 +353,13 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
     if (stripePublishableKey.trim() !== storedPublishableKey) {
       vals.publishableKey = stripePublishableKey.trim();
     }
-    stripeSaveMutation.mutate(vals);
+    const sent = stripeForm;
+    stripeSaveMutation.mutate(vals, {
+      onSuccess: () => {
+        markStripeSaved(sent);
+        takeNextStripeLoad(sent);
+      },
+    });
   }
 
   function handleSiteSubmit(e: React.SyntheticEvent): void {
@@ -289,13 +367,22 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
     if (selectedSiteId == null) return;
     setSiteHasSubmitted(true);
     if (Object.keys(siteErrors).length > 0) return;
-    sitePaymentSaveMutation.mutate({
-      siteId: selectedSiteId,
-      payoutAccountId: siteConnectedAccountId !== '' ? siteConnectedAccountId : null,
-      preAuthAmountCents: parseMajorInputToCents(sitePreAuthAmount) ?? 0,
-      platformFeePercent: sitePlatformFee !== '' ? Number(sitePlatformFee) : null,
-      isEnabled: paymentConfigMap.get(selectedSiteId)?.isEnabled ?? true,
-    });
+    const sent = siteForm;
+    sitePaymentSaveMutation.mutate(
+      {
+        siteId: selectedSiteId,
+        payoutAccountId: siteConnectedAccountId !== '' ? siteConnectedAccountId : null,
+        preAuthAmountCents: parseMajorInputToCents(sitePreAuthAmount) ?? 0,
+        platformFeePercent: sitePlatformFee !== '' ? Number(sitePlatformFee) : null,
+        isEnabled: paymentConfigMap.get(selectedSiteId)?.isEnabled ?? true,
+      },
+      {
+        onSuccess: () => {
+          markSiteSaved(sent);
+          takeNextSiteLoad(sent);
+        },
+      },
+    );
   }
 
   const sitePaymentToggleMutation = useMutation({
@@ -318,6 +405,9 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
         )}
         {hasAllSiteAccess && (
           <TabsTrigger value="adyen">{t('settings.paymentSubTabAdyen')}</TabsTrigger>
+        )}
+        {hasAllSiteAccess && (
+          <TabsTrigger value="terminals">{t('settings.paymentSubTabTerminals')}</TabsTrigger>
         )}
         <TabsTrigger value="siteConfigs">{t('settings.paymentSubTabSiteConfigs')}</TabsTrigger>
       </TabsList>
@@ -358,7 +448,7 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                         setStripeRemoving((current) => ({ ...current, secretKey: removing }));
                         markStripeChanged();
                       }}
-                      canWrite={canWrite}
+                      canWrite={canWriteProvider}
                       hint={t('settings.stripeSecretKeyHint')}
                     />
                   </div>
@@ -370,7 +460,7 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                     <Input
                       id="stripe-publishable-key"
                       value={stripePublishableKey}
-                      disabled={!canWrite}
+                      disabled={!canWriteProvider}
                       onChange={(e) => {
                         setStripePublishableKey(e.target.value);
                         markStripeChanged();
@@ -395,7 +485,7 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                         setStripeRemoving((current) => ({ ...current, webhookSecret: removing }));
                         markStripeChanged();
                       }}
-                      canWrite={canWrite}
+                      canWrite={canWriteProvider}
                       hint={t('settings.stripeWebhookSecretHint')}
                     />
                   </div>
@@ -420,13 +510,13 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                         }));
                         markStripeChanged();
                       }}
-                      canWrite={canWrite}
+                      canWrite={canWriteProvider}
                       hint={t('settings.stripeConnectWebhookSecretHint')}
                     />
                   </div>
                 </div>
 
-                {canWrite && (
+                {canWriteProvider && (
                   <div className="flex items-center justify-end gap-2">
                     {stripeHasUnsavedChanges && (
                       <p className="text-sm text-muted-foreground">
@@ -473,7 +563,7 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
             </CardContent>
           </Card>
           <StripeWebhookCard
-            canWrite={canWrite}
+            canWrite={canWriteProvider}
             secretKeyConfigured={stripeSettings?.secretKeyConfigured}
           />
         </TabsContent>
@@ -481,6 +571,11 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
       {hasAllSiteAccess && (
         <TabsContent value="adyen" className="mt-4">
           <AdyenSettings />
+        </TabsContent>
+      )}
+      {hasAllSiteAccess && (
+        <TabsContent value="terminals" className="mt-4">
+          <PaymentTerminalSettings />
         </TabsContent>
       )}
       <TabsContent value="siteConfigs" className="mt-4">
@@ -512,10 +607,11 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                             e.stopPropagation();
                           }}
                         >
-                          <Toggle
+                          <ConfirmToggle
                             checked={enabled}
                             disabled={!canWrite}
                             aria-label={t('settings.sitePaymentsEnabled', { site: site.name })}
+                            label={t('settings.sitePaymentsEnabled', { site: site.name })}
                             onCheckedChange={(checked) => {
                               sitePaymentToggleMutation.mutate({
                                 siteId: site.id,
@@ -618,7 +714,7 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                           </Label>
                           <DecimalInput
                             id="site-platform-fee"
-                            disabled={!canWrite}
+                            disabled={!canWrite || !hasAllSiteAccess}
                             value={sitePlatformFee}
                             onChange={(value) => {
                               setSitePlatformFee(value);
@@ -636,7 +732,11 @@ export function PaymentSettings({ settings }: PaymentSettingsProps = {}): React.
                             </p>
                           )}
                           <p className="text-xs text-muted-foreground">
-                            {t('settings.sitePlatformFeeHint')}
+                            {t(
+                              hasAllSiteAccess
+                                ? 'settings.sitePlatformFeeHint'
+                                : 'settings.sitePlatformFeeAllSitesOnly',
+                            )}
                           </p>
                         </div>
                       </div>

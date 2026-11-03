@@ -39,6 +39,12 @@ export const CSS_STATUS_REPORTING_VALUES = ['Both', 'StatusNotification', 'Notif
 export type CssStatusReporting = (typeof CSS_STATUS_REPORTING_VALUES)[number];
 export const CSS_STATUS_REPORTING_DEFAULT: CssStatusReporting = 'Both';
 
+// File transfer protocols the simulator uploads logs and downloads firmware with
+// (ReadOnly: OCPP 2.x OCPPCommCtrlr.FileTransferProtocols, 1.6 SupportedFileTransferProtocols,
+// whose value list has no SFTP). The simulator sets them at every boot.
+export const CSS_FILE_TRANSFER_PROTOCOLS_2X = 'FTP,FTPS,HTTP,HTTPS,SFTP';
+export const CSS_FILE_TRANSFER_PROTOCOLS_16 = 'FTP,FTPS,HTTP,HTTPS';
+
 // A simulator fleet spreads its reconnects after a CSMS restart over this window
 // (seconds), so the server does not take every station at once. 1.6 stations add a
 // random delay up to it to their first attempt (OcppClient reconnectSpreadMs).
@@ -103,6 +109,7 @@ export function buildCssConfigDefaults(input: CssConfigDefaultsInput): CssConfig
         'Core,FirmwareManagement,LocalAuthListManagement,Reservation,SmartCharging,RemoteTrigger',
         true,
       ),
+      t('SupportedFileTransferProtocols', CSS_FILE_TRANSFER_PROTOCOLS_16, true),
       t('ChargeProfileMaxStackLevel', '5', true),
       t('ChargingScheduleAllowedChargingRateUnit', 'Current,Power', true),
       t('ChargingScheduleMaxPeriods', '24', true),
@@ -137,7 +144,14 @@ export function buildCssConfigDefaults(input: CssConfigDefaultsInput): CssConfig
     t('OCPPCommCtrlr.HeartbeatInterval', '300', false),
     t('OCPPCommCtrlr.NetworkConfigurationPriority', '1', false),
     t('OCPPCommCtrlr.OfflineThreshold', '60', false),
-    t('OCPPCommCtrlr.MessageTimeout', '30', true),
+    // Station-side values the data plan templates set (instanced where OCPP
+    // defines an instance), so each template push is Accepted. MessageTimeout
+    // exists only with its Default instance (2.1 appendix).
+    t('OCPPCommCtrlr.MessageTimeout#Default', '30', false),
+    t('OCPPCommCtrlr.MessageAttempts#TransactionEvent', '3', false),
+    t('OCPPCommCtrlr.MessageAttemptInterval#TransactionEvent', '60', false),
+    t('OCPPCommCtrlr.WebSocketPingInterval', '30', false),
+    t('OCPPCommCtrlr.QueueAllMessages', 'false', false),
     t(
       'OCPPCommCtrlr.RetryBackOffWaitMinimum',
       String(CSS_RETRY_BACK_OFF_DEFAULTS.waitMinimumS),
@@ -155,7 +169,7 @@ export function buildCssConfigDefaults(input: CssConfigDefaultsInput): CssConfig
     ),
     t('OCPPCommCtrlr.NetworkProfileConnectionAttempts', '3', false),
     t('OCPPCommCtrlr.PublicKeyWithSignedMeterValue', 'Never', false),
-    t('OCPPCommCtrlr.FileTransferProtocols', 'HTTP,HTTPS', true),
+    t('OCPPCommCtrlr.FileTransferProtocols', CSS_FILE_TRANSFER_PROTOCOLS_2X, true),
     t('ChargingStation.AllowNewSessionsPendingFirmwareUpdate', 'true', false),
     t('ChargingStation.VendorName', input.vendorName, true),
     t('ChargingStation.Model', input.model, true),
@@ -199,6 +213,8 @@ export function buildCssConfigDefaults(input: CssConfigDefaultsInput): CssConfig
     t('Connector.Available', 'true', false),
     t('SampledDataCtrlr.TxUpdatedInterval', '10', false),
     t('SampledDataCtrlr.TxEndedInterval', '0', false),
+    t('SampledDataCtrlr.TxStartedMeasurands', 'Energy.Active.Import.Register', false),
+    t('SampledDataCtrlr.RegisterValuesWithoutPhases', 'false', false),
     t('SampledDataCtrlr.TxEndedMeasurands', 'Energy.Active.Import.Register', false),
     t('SampledDataCtrlr.SignReadings', 'false', false),
     t(
@@ -240,6 +256,7 @@ export function buildCssConfigDefaults(input: CssConfigDefaultsInput): CssConfig
     t('AlignedDataCtrlr.Interval', '900', false),
     t('AlignedDataCtrlr.Measurands', 'Energy.Active.Import.Register,Voltage', false),
     t('AlignedDataCtrlr.TxEndedInterval', '0', false),
+    t('AlignedDataCtrlr.SendDuringIdle', 'false', false),
     t('AlignedDataCtrlr.TxEndedMeasurands', 'Energy.Active.Import.Register', false),
     t('AlignedDataCtrlr.SignReadings', 'false', false),
     t('CustomizationCtrlr.CustomTriggers', 'DiagnosticsLog,SecurityAudit', true),

@@ -3,7 +3,7 @@
 
 import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useTab } from '@/hooks/use-tab';
 import { BackButton } from '@/components/back-button';
@@ -17,10 +17,12 @@ import type { UserDetailUser, UserRole } from '@/components/user/UserDetailsTab'
 import { UserPermissionsTab } from '@/components/user/UserPermissionsTab';
 import { UserSecurityTab } from '@/components/user/UserSecurityTab';
 import { UserAccessCards } from '@/components/user/UserAccessCards';
+import { SsoLinkCard } from '@/components/user/SsoLinkCard';
 import { api } from '@/lib/api';
 import { isSubsetOf } from '@evtivity/lib/permissions';
 import { useAuth } from '@/lib/auth';
 import { LoadingLogo } from '@/components/loading-logo';
+import { AccountAvatar } from '@/components/AccountAvatar';
 
 export function UserDetail(): React.JSX.Element {
   const { t } = useTranslation();
@@ -29,6 +31,12 @@ export function UserDetail(): React.JSX.Element {
   const currentUserId = useAuth((s) => s.user?.id);
   const ownPermissions = useAuth((s) => s.permissions);
   const [activeTab, setActiveTab] = useTab('details');
+  const queryClient = useQueryClient();
+  const { data: securityPublic } = useQuery({
+    queryKey: ['security-public'],
+    queryFn: () => api.get<{ ssoEnabled?: boolean }>('/v1/security/public'),
+  });
+  const ssoEnabled = securityPublic?.ssoEnabled === true;
 
   const isOwnUser = id === currentUserId;
 
@@ -67,6 +75,12 @@ export function UserDetail(): React.JSX.Element {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/users" />
+        <AccountAvatar
+          avatar={user.avatar}
+          firstName={user.firstName}
+          lastName={user.lastName}
+          size="lg"
+        />
         <div className="min-w-0">
           <h1 className="text-2xl md:text-3xl font-bold wrap-anywhere">{user.email}</h1>
           <CopyableId id={user.id} />
@@ -99,13 +113,32 @@ export function UserDetail(): React.JSX.Element {
         </TabsContent>
 
         {canAdminister && (
-          <TabsContent value="security" className="space-y-6">
+          <TabsContent value="security">
             <UserSecurityTab userId={user.id} />
             <UserAccessCards
               userId={user.id}
               mfaEnabled={user.mfaEnabled === true}
               mfaMethod={user.mfaMethod ?? null}
             />
+            {ssoEnabled && (
+              <SsoLinkCard
+                linked={user.ssoLinked === true}
+                allowed={user.ssoLinkAllowed === true}
+                allow={(proof) =>
+                  api.patch(`/v1/users/${user.id}`, {
+                    ssoLinkAllowed: true,
+                    ...(proof != null ? { proof } : {}),
+                  })
+                }
+                withdraw={() => api.patch(`/v1/users/${user.id}`, { ssoLinkAllowed: false })}
+                unlink={(proof) =>
+                  api.delete(`/v1/users/${user.id}/sso-link`, proof != null ? { proof } : {})
+                }
+                onChanged={() => {
+                  void queryClient.invalidateQueries({ queryKey: ['users', user.id] });
+                }}
+              />
+            )}
           </TabsContent>
         )}
 

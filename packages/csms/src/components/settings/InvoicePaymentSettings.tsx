@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ParseKeys } from 'i18next';
@@ -21,10 +21,11 @@ import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { api } from '@/lib/api';
 import { useHasCompanyWidePermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 
 type BankValues = Record<InvoicePaymentSettingKey, string>;
 
@@ -89,16 +90,24 @@ export function InvoicePaymentSettings({ settings }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const canWrite = useHasCompanyWidePermission('settings.system:write');
-  const [values, setValues] = useState<BankValues>(() => storedValues(settings));
-  const [epcQrEnabled, setEpcQrEnabled] = useState(
-    () => settings?.[INVOICE_EPC_QR_ENABLED_KEY] !== false,
-  );
   const [submitted, setSubmitted] = useState(false);
-
-  useEffect(() => {
-    setValues(storedValues(settings));
-    setEpcQrEnabled(settings?.[INVOICE_EPC_QR_ENABLED_KEY] !== false);
-  }, [settings]);
+  const loaded = useMemo(
+    () => ({
+      values: storedValues(settings),
+      epcQrEnabled: settings?.[INVOICE_EPC_QR_ENABLED_KEY] !== false,
+    }),
+    [settings],
+  );
+  const [form, setForm, takeNextLoad] = useLoadedValues(loaded, () => {
+    setSubmitted(false);
+  });
+  const { values, epcQrEnabled } = form;
+  const setValues = (update: (prev: BankValues) => BankValues): void => {
+    setForm((prev) => ({ ...prev, values: update(prev.values) }));
+  };
+  const setEpcQrEnabled = (checked: boolean): void => {
+    setForm((prev) => ({ ...prev, epcQrEnabled: checked }));
+  };
 
   const mutation = useMutation({
     mutationFn: async (next: { values: BankValues; epcQrEnabled: boolean }) => {
@@ -132,7 +141,15 @@ export function InvoicePaymentSettings({ settings }: Props): React.JSX.Element {
             if (!canWrite || invalid) return;
             const next = {} as BankValues;
             for (const key of INVOICE_PAYMENT_SETTING_KEYS) next[key] = normalized[key] ?? '';
-            mutation.mutate({ values: next, epcQrEnabled });
+            const sent = form;
+            mutation.mutate(
+              { values: next, epcQrEnabled },
+              {
+                onSuccess: () => {
+                  takeNextLoad(sent);
+                },
+              },
+            );
           }}
           noValidate
           className="space-y-4"
@@ -173,8 +190,9 @@ export function InvoicePaymentSettings({ settings }: Props): React.JSX.Element {
           </div>
 
           <div className="flex items-start gap-3">
-            <Toggle
+            <ConfirmToggle
               id="invoice-payment-epc-qr"
+              label={t('settings.invoicePaymentEpcQr')}
               checked={epcQrEnabled}
               disabled={!canWrite}
               onCheckedChange={setEpcQrEnabled}

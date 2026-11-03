@@ -97,7 +97,7 @@ vi.mock('../lib/mfa-factor-proof.js', async () => {
     FACTOR_PROOF_KINDS: ['totp', 'code', 'passkey', 'password'],
     factorProof: z
       .object({ kind: z.string(), password: z.string().optional(), code: z.string().optional() })
-      .passthrough(),
+      .loose(),
     checkFactorProof: proofCheck.checkFactorProof,
     sendFactorProofRefusal: async (
       reply: { status: (n: number) => { send: (body: unknown) => Promise<unknown> } },
@@ -172,7 +172,7 @@ describe('API key routes', () => {
     proofCheck.checkFactorProof.mockResolvedValue(null);
   });
 
-  describe('fresh proof and notice (security review M4)', () => {
+  describe('fresh proof and notice', () => {
     const created = {
       id: 9,
       rawToken: 'b'.repeat(64),

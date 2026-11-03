@@ -1,19 +1,28 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useMemo, useState } from 'react';
+import { isEditedField, useLoadedValues } from '@/hooks/use-loaded-values';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { tryParseJson } from '@evtivity/lib/safe-json';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { CopyButton } from '@/components/ui/copy-button';
 import { Select } from '@/components/ui/select';
 import { api } from '@/lib/api';
+import { getErrorMessage } from '@/lib/error-message';
+import {
+  FactorProofField,
+  proofRejection,
+  type FactorProof,
+  type ProofRejection,
+} from '@/components/FactorProofField';
+import { useMfaStatus } from '@/components/profile/mfa-status';
 
 interface Props {
   settings: Record<string, unknown> | undefined;
@@ -41,8 +50,9 @@ function ToggleRow({
         <Label className="leading-6">{label}</Label>
         {description != null && <p className="text-xs text-muted-foreground">{description}</p>}
       </div>
-      <Toggle
+      <ConfirmToggle
         aria-label={label}
+        label={label}
         size="lg"
         checked={checked}
         onCheckedChange={() => {
@@ -53,27 +63,166 @@ function ToggleRow({
   );
 }
 
+interface ProtectedSsoFields {
+  enabled: boolean;
+  entryPoint: string;
+  issuer: string;
+  autoProvision: boolean;
+  defaultRoleId: string;
+  attributeMapping: Record<string, string>;
+  allowedDomains: string[];
+}
+
+/** The SSO fields whose change needs a fresh proof (everything but the provider hint). */
+function protectedFields(fields: ProtectedSsoFields): ProtectedSsoFields {
+  return { ...fields, allowedDomains: [...fields.allowedDomains].sort() };
+}
+
+/** The allowed domains typed as a comma or space separated list, lowercased. */
+function parseDomains(text: string): string[] {
+  return [
+    ...new Set(
+      text
+        .split(/[\s,]+/)
+        .map((d) => d.trim().toLowerCase())
+        .filter((d) => d !== ''),
+    ),
+  ];
+}
+
+interface SsoForm {
+  enabled: boolean;
+  provider: string;
+  entryPoint: string;
+  issuer: string;
+  /** The stored certificate when returned, else empty. */
+  cert: string;
+  autoProvision: boolean;
+  defaultRoleId: string;
+  attrEmail: string;
+  attrFirstName: string;
+  attrLastName: string;
+  /** The allowed domains as typed (comma or space separated). */
+  allowedDomains: string;
+}
+
+/** The form values of the stored SSO settings. */
+function ssoFormFrom(s: Record<string, unknown> | undefined): SsoForm {
+  const str = (key: string, fallback: string): string => {
+    const v = s?.[key];
+    return typeof v === 'string' ? v : fallback;
+  };
+  let mapping: Record<string, string> = {
+    email: 'email',
+    firstName: 'firstName',
+    lastName: 'lastName',
+  };
+  const rawMapping = s?.['sso.attributeMapping'];
+  if (typeof rawMapping === 'string') {
+    // Invalid JSON keeps the default mapping.
+    const parsed = tryParseJson(rawMapping);
+    if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      mapping = parsed as Record<string, string>;
+    }
+  } else if (typeof rawMapping === 'object' && rawMapping !== null) {
+    mapping = rawMapping as Record<string, string>;
+  }
+  const rawDomains = s?.['sso.allowedDomains'];
+  const certVal = s?.['sso.certEnc'];
+  return {
+    enabled: s?.['sso.enabled'] === true,
+    provider: str('sso.provider', ''),
+    entryPoint: str('sso.entryPoint', ''),
+    issuer: str('sso.issuer', 'evtivity-csms'),
+    cert: typeof certVal === 'string' && certVal !== '""' ? certVal : '',
+    autoProvision: s?.['sso.autoProvision'] === true,
+    defaultRoleId: str('sso.defaultRoleId', ''),
+    attrEmail: mapping['email'] ?? 'email',
+    attrFirstName: mapping['firstName'] ?? 'firstName',
+    attrLastName: mapping['lastName'] ?? 'lastName',
+    allowedDomains: Array.isArray(rawDomains)
+      ? rawDomains.map(String).join(', ')
+      : typeof rawDomains === 'string'
+        ? rawDomains
+        : '',
+  };
+}
+
+/** The fields of the form that the save sends and that need a proof to change. */
+function protectedOf(form: SsoForm): ProtectedSsoFields {
+  return {
+    enabled: form.enabled,
+    entryPoint: form.entryPoint,
+    issuer: form.issuer,
+    autoProvision: form.autoProvision,
+    defaultRoleId: form.defaultRoleId,
+    attributeMapping: {
+      email: form.attrEmail,
+      firstName: form.attrFirstName,
+      lastName: form.attrLastName,
+    },
+    allowedDomains: parseDomains(form.allowedDomains),
+  };
+}
+
 export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [enabled, setEnabled] = useState(false);
-  const [provider, setProvider] = useState('');
-  const [entryPoint, setEntryPoint] = useState('');
-  const [issuer, setIssuer] = useState('evtivity-csms');
-  const [cert, setCert] = useState('');
-  const [certSet, setCertSet] = useState(false);
-  const [autoProvision, setAutoProvision] = useState(false);
-  const [defaultRoleId, setDefaultRoleId] = useState('');
-  const [attrEmail, setAttrEmail] = useState('email');
-  const [attrFirstName, setAttrFirstName] = useState('firstName');
-  const [attrLastName, setAttrLastName] = useState('lastName');
+  // A signed-in session proves the account again to change who signs in as whom.
+  const { data: mfaStatus } = useMfaStatus();
+  const proofKinds = mfaStatus?.factorProofKinds ?? [];
+  const [proof, setProof] = useState<FactorProof | null>(null);
+  const [proofFailure, setProofFailure] = useState<ProofRejection | null>(null);
+  const [proofAsked, setProofAsked] = useState(false);
+  const [proofRound, setProofRound] = useState(0);
+  const [saveError, setSaveError] = useState('');
 
   // Load SSO settings
   const { data: ssoSettings } = useQuery({
     queryKey: ['sso-settings'],
     queryFn: () => api.get<Record<string, unknown>>('/v1/sso/settings'),
   });
+
+  // A reload replaces the form only while it has no unsaved edits.
+  const stored = ssoSettings ?? settings;
+  const loaded = useMemo(() => ssoFormFrom(stored), [stored]);
+  const [form, setForm, takeNextLoad, taken] = useLoadedValues<SsoForm>(loaded);
+  const {
+    enabled,
+    provider,
+    entryPoint,
+    issuer,
+    cert,
+    autoProvision,
+    defaultRoleId,
+    attrEmail,
+    attrFirstName,
+    attrLastName,
+    allowedDomains,
+  } = form;
+  function setField<K extends keyof SsoForm>(key: K): (value: SsoForm[K]) => void {
+    return (value) => {
+      setForm((f) => ({ ...f, [key]: value }));
+    };
+  }
+  const setEnabled = setField('enabled');
+  const setProvider = setField('provider');
+  const setEntryPoint = setField('entryPoint');
+  const setIssuer = setField('issuer');
+  const setCert = setField('cert');
+  const setAutoProvision = setField('autoProvision');
+  const setDefaultRoleId = setField('defaultRoleId');
+  const setAttrEmail = setField('attrEmail');
+  const setAttrFirstName = setField('attrFirstName');
+  const setAttrLastName = setField('attrLastName');
+  const setAllowedDomains = setField('allowedDomains');
+  // The saved values, to tell whether the form changed what needs a fresh proof.
+  const certSet = loaded.cert !== '';
+  // The certificate goes only when edited in this form, so one another user
+  // rotated since this form loaded is not put back.
+  const certEdited = cert !== '' && isEditedField(form, taken, 'cert');
+  const loadedFields = JSON.stringify(protectedFields(protectedOf(loaded)));
 
   // Load roles for default role dropdown
   const { data: rolesData } = useQuery({
@@ -82,69 +231,46 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
     enabled: autoProvision,
   });
 
-  useEffect(() => {
-    const s = ssoSettings ?? settings;
-    if (s == null) return;
-    setEnabled(s['sso.enabled'] === true);
-    setProvider(typeof s['sso.provider'] === 'string' ? s['sso.provider'] : '');
-    setEntryPoint(typeof s['sso.entryPoint'] === 'string' ? s['sso.entryPoint'] : '');
-    setIssuer(typeof s['sso.issuer'] === 'string' ? s['sso.issuer'] : 'evtivity-csms');
-    setAutoProvision(s['sso.autoProvision'] === true);
-    setDefaultRoleId(typeof s['sso.defaultRoleId'] === 'string' ? s['sso.defaultRoleId'] : '');
-
-    const certVal = s['sso.certEnc'];
-    setCertSet(typeof certVal === 'string' && certVal !== '' && certVal !== '""');
-    setCert(typeof certVal === 'string' && certVal !== '""' ? certVal : '');
-
-    let mapping: Record<string, string> = {
-      email: 'email',
-      firstName: 'firstName',
-      lastName: 'lastName',
-    };
-    const rawMapping = s['sso.attributeMapping'];
-    if (typeof rawMapping === 'string') {
-      // Invalid JSON keeps the default mapping.
-      const parsed = tryParseJson(rawMapping);
-      if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        mapping = parsed as Record<string, string>;
-      }
-    } else if (typeof rawMapping === 'object' && rawMapping !== null) {
-      mapping = rawMapping as Record<string, string>;
-    }
-    setAttrEmail(mapping['email'] ?? 'email');
-    setAttrFirstName(mapping['firstName'] ?? 'firstName');
-    setAttrLastName(mapping['lastName'] ?? 'lastName');
-  }, [ssoSettings, settings]);
-
   const mutation = useMutation({
     mutationFn: (vals: Record<string, unknown>) =>
       api.put<{ success: boolean }>('/v1/sso/settings', vals),
+    onError: (err: unknown) => {
+      setProofFailure(proofRejection(err));
+      setSaveError(getErrorMessage(err, t, 'settings.ssoSaveFailed'));
+    },
     onSuccess: () => {
+      setSaveError('');
+      setProof(null);
+      setProofAsked(false);
+      setProofFailure(null);
+      setProofRound((n) => n + 1);
       void queryClient.invalidateQueries({ queryKey: ['sso-settings'] });
       void queryClient.invalidateQueries({ queryKey: ['security-settings'] });
       void queryClient.invalidateQueries({ queryKey: ['security-public'] });
     },
   });
 
+  const current = protectedOf(form);
+  const needsProof =
+    proofKinds.length > 0 &&
+    (JSON.stringify(protectedFields(current)) !== loadedFields || certEdited);
+
   function handleSave(): void {
-    const payload: Record<string, unknown> = {
-      enabled,
-      provider,
-      entryPoint,
-      issuer,
-      autoProvision,
-      defaultRoleId,
-      attributeMapping: {
-        email: attrEmail,
-        firstName: attrFirstName,
-        lastName: attrLastName,
-      },
-    };
-    // Only send cert when the user changed it
-    if (cert !== '') {
+    if (needsProof && proof == null) {
+      setProofAsked(true);
+      return;
+    }
+    const payload: Record<string, unknown> = { ...current, provider };
+    if (certEdited) {
       payload['cert'] = cert;
     }
-    mutation.mutate(payload);
+    if (needsProof && proof != null) payload['proof'] = proof;
+    const sent = form;
+    mutation.mutate(payload, {
+      onSuccess: () => {
+        takeNextLoad(sent);
+      },
+    });
   }
 
   const callbackUrl = `${window.location.origin}/v1/auth/sso/callback`;
@@ -266,6 +392,22 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
                 </div>
               )}
 
+              {/* Allowed Domains */}
+              <div className="grid gap-2">
+                <Label htmlFor="sso-allowed-domains">{t('settings.ssoAllowedDomains')}</Label>
+                <Input
+                  id="sso-allowed-domains"
+                  value={allowedDomains}
+                  onChange={(e) => {
+                    setAllowedDomains(e.target.value);
+                  }}
+                  placeholder="example.com"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.ssoAllowedDomainsHint')}
+                </p>
+              </div>
+
               {/* Attribute Mapping */}
               <div className="grid gap-4">
                 <Label className="text-base">{t('settings.ssoAttributeMapping')}</Label>
@@ -303,11 +445,26 @@ export function SecuritySsoSettings({ settings }: Props): React.JSX.Element {
             </div>
           )}
 
+          {needsProof && (
+            <FactorProofField
+              key={`sso-${String(proofRound)}`}
+              idPrefix="sso-proof"
+              kinds={proofKinds}
+              codeMethod={mfaStatus?.mfaMethod ?? null}
+              description={t('settings.ssoProofHint')}
+              onChange={setProof}
+              rejection={proofFailure}
+              showMissing={proofAsked}
+            />
+          )}
+
           <SaveButton isPending={mutation.isPending} />
 
           {mutation.isSuccess && <p className="text-sm text-green-600">{t('settings.ssoSaved')}</p>}
           {mutation.isError && (
-            <p className="text-sm text-destructive">{t('settings.ssoSaveFailed')}</p>
+            <p className="text-sm text-destructive" role="alert">
+              {saveError !== '' ? saveError : t('settings.ssoSaveFailed')}
+            </p>
           )}
         </form>
       </CardContent>

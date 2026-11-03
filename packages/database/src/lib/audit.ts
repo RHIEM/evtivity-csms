@@ -4,6 +4,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { PgTable } from 'drizzle-orm/pg-core';
 import type { AiAuditVia } from '@evtivity/lib/ai-proposals';
+import { maskUrlPassword } from '@evtivity/lib/secret-config';
 import { db as defaultDb } from '../config.js';
 
 export type AuditActor = 'operator' | 'driver' | 'api_key' | 'system' | 'ocpp';
@@ -105,15 +106,28 @@ export function isSensitiveAuditKey(key: string): boolean {
  * Returns a redacted copy of `obj` with sensitive fields replaced by the
  * literal string '<redacted>'. Recurses into nested plain objects AND arrays
  * so a sensitive field at any depth is caught (e.g. `before.driver.profile.passwordHash`
- * or `before.tokens[0].tokenHash`). Dates and primitives pass through unchanged.
+ * or `before.tokens[0].tokenHash`). A string keeps everything but the password
+ * of a URL userinfo (`ftp://user:[redacted]@host/fw.bin`, a firmware campaign
+ * URL). Dates and other primitives pass through unchanged.
  */
 export function redactAuditPayload(obj: unknown): unknown {
+  if (typeof obj === 'string') return maskUrlPassword(obj);
   if (obj == null || typeof obj !== 'object') return obj;
   if (obj instanceof Date) return obj;
   if (Array.isArray(obj)) return obj.map((item) => redactAuditPayload(item));
+  const record = obj as Record<string, unknown>;
+  // A setting row ({ key, value }) holds the value of an encrypted setting
+  // under `value`: redacted when the key is encrypted at rest (P12), so no
+  // ciphertext outlives a rotated secret. An empty value (a cleared secret)
+  // holds nothing to hide and stays.
+  const encryptedSettingValue =
+    typeof record['key'] === 'string' &&
+    isSensitiveAuditKey(record['key']) &&
+    record['value'] != null &&
+    record['value'] !== '';
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (isSensitiveAuditKey(k)) {
+  for (const [k, v] of Object.entries(record)) {
+    if (isSensitiveAuditKey(k) || (k === 'value' && encryptedSettingValue)) {
       out[k] = '<redacted>';
     } else {
       out[k] = redactAuditPayload(v);

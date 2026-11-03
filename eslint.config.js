@@ -86,6 +86,16 @@ export default tseslint.config(
       'evtivity/no-raw-switch': 'error',
     },
   },
+  // Form controls are the shared components (frontend/ui.md, shared
+  // controls): no raw <input>, <select> or <textarea>, no native date-time,
+  // time, month or week picker, no hand-built listbox outside components/ui.
+  {
+    files: ['packages/csms/src/**/*.tsx', 'packages/portal/src/**/*.tsx'],
+    ignores: ['**/components/ui/**', '**/__tests__/**', '**/*.test.tsx'],
+    rules: {
+      'evtivity/no-raw-form-control': 'error',
+    },
+  },
   // Inputs, selects and buttons take their height from the shared component
   // (frontend/ui.md, control heights): no height or vertical padding class
   // on them outside components/ui.
@@ -169,9 +179,11 @@ export default tseslint.config(
                 '@evtivity/ai/*',
                 '@evtivity/sim-providers',
                 '@evtivity/sim-providers/*',
+                '@evtivity/payment-terminals',
+                '@evtivity/payment-terminals/*',
               ],
               message:
-                'Do not import another process package (P8), and not @evtivity/ai or @evtivity/sim-providers, which depend on lib. Move shared code to @evtivity/lib.',
+                'Do not import another process package (P8), and not @evtivity/ai, @evtivity/sim-providers or @evtivity/payment-terminals, which depend on lib. Move shared code to @evtivity/lib.',
             },
           ],
         },
@@ -210,6 +222,26 @@ export default tseslint.config(
               regex: '^@evtivity/(?!lib(/|$))',
               message:
                 '@evtivity/sim-providers imports no other workspace package but @evtivity/lib (P8).',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // @evtivity/payment-terminals (the payment terminal provider interface and
+  // adapters) is loaded by @evtivity/payments and @evtivity/services and depends
+  // on @evtivity/lib only (design principle P8). It never touches the database.
+  {
+    files: ['packages/payment-terminals/src/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '^@evtivity/(?!lib(/|$))',
+              message:
+                '@evtivity/payment-terminals imports no other workspace package but @evtivity/lib (P8).',
             },
           ],
         },
@@ -338,6 +370,8 @@ export default tseslint.config(
       'coverage/',
       'scripts/',
       'docker/',
+      // Static browser files Vite copies as they are (no TypeScript project).
+      'packages/*/public/',
       '**/vite.config.*',
       '**/drizzle.config.ts',
       'commitlint.config.cjs',

@@ -44,10 +44,10 @@ export function PricingGroupDetail(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <BackButton to="/pricing" />
-        <div>
-          <h1 className="text-2xl font-bold md:text-3xl">{group.name}</h1>
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold md:text-3xl wrap-anywhere">{group.name}</h1>
           <CopyableId id={group.id} />
         </div>
         <EntityNavButtons resource="pricing-groups" basePath="/pricing" currentId={id} />
@@ -61,7 +61,7 @@ export function PricingGroupDetail(): React.JSX.Element {
           {canReadAudit && <TabsTrigger value="history">{t('common.history')}</TabsTrigger>}
         </TabsList>
 
-        <TabsContent value="details" className="space-y-6">
+        <TabsContent value="details">
           <PricingGroupDetailsTab
             group={group}
             timezone={timezone}
@@ -71,15 +71,15 @@ export function PricingGroupDetail(): React.JSX.Element {
           />
         </TabsContent>
 
-        <TabsContent value="tariffs" className="space-y-6">
+        <TabsContent value="tariffs">
           <PricingGroupTariffsTab groupId={id ?? ''} />
         </TabsContent>
 
-        <TabsContent value="schedule" className="space-y-6">
+        <TabsContent value="schedule">
           <PricingGroupScheduleTab groupId={id ?? ''} />
         </TabsContent>
 
-        <TabsContent value="history" className="space-y-6">
+        <TabsContent value="history">
           <EntityHistoryTab entityType="pricing_group" entityId={id ?? ''} />
         </TabsContent>
       </Tabs>

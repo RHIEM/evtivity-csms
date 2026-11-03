@@ -1,11 +1,20 @@
 {
   "name": "@evtivity/services",
-  "version": "0.1.48-beta.3",
+  "version": "0.1.49-beta.8",
   "private": true,
   "type": "module",
   "exports": {
     "./account-invoice-jobs": {
       "import": "./src/account-invoice-jobs.ts"
+    },
+    "./ad-hoc-payment.service": {
+      "import": "./src/ad-hoc-payment.service.ts"
+    },
+    "./payment-terminal.service": {
+      "import": "./src/payment-terminal.service.ts"
+    },
+    "./payment-terminal-flow": {
+      "import": "./src/payment-terminal-flow.ts"
     },
     "./ai-alerts": {
       "import": "./src/ai-alerts.ts"
@@ -115,8 +124,11 @@
     "./reservation-cancel": {
       "import": "./src/reservation-cancel.ts"
     },
-    "./s3-storage": {
-      "import": "./src/s3-storage.ts"
+    "./storage": {
+      "import": "./src/storage/index.ts"
+    },
+    "./avatar-storage": {
+      "import": "./src/avatar-storage.ts"
     },
     "./reservation-expiry": {
       "import": "./src/reservation-expiry.ts"
@@ -135,6 +147,12 @@
     },
     "./station-message.service": {
       "import": "./src/station-message.service.ts"
+    },
+    "./station-data-plan.service": {
+      "import": "./src/station-data-plan.service.ts"
+    },
+    "./sim-inventory.service": {
+      "import": "./src/sim-inventory.service.ts"
     },
     "./station-sim.service": {
       "import": "./src/station-sim.service.ts"
@@ -161,12 +179,16 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1149.0",
+    "@aws-sdk/s3-presigned-post": "^3.1149.0",
+    "@aws-sdk/s3-request-presigner": "^3.1149.0",
     "@evtivity/ai": "*",
     "@evtivity/database": "*",
     "@evtivity/lib": "*",
+    "@evtivity/payment-terminals": "*",
     "@evtivity/payments": "*",
     "@evtivity/sim-providers": "*",
     "@resvg/resvg-js": "^2.6.2",
+    "@smithy/node-http-handler": "^4.12.1",
     "drizzle-orm": "^0.45.2",
     "exceljs": "^3.4.0",
     "pdfkit": "^0.20.2",
@@ -177,6 +199,6 @@
     "@types/pdfkit": "^0.17.6",
     "@types/qrcode": "^1.5.6",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }

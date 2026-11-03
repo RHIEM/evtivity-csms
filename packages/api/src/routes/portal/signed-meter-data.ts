@@ -27,7 +27,7 @@ const readingItem = z
     unit: z.string().nullable().describe('OCMF RU, e.g. kWh'),
     obis: z.string().nullable().describe('OCMF RI, the OBIS code of the reading'),
   })
-  .passthrough();
+  .loose();
 
 const signedMeterDataItem = z
   .object({
@@ -43,7 +43,7 @@ const signedMeterDataItem = z
     hasPublicKey: z.boolean().describe('The meter key is known and goes into the download'),
     readings: z.array(readingItem).describe('Readings of an OCMF record; empty for other formats'),
   })
-  .passthrough();
+  .loose();
 
 async function loadRecords(
   driverId: string,
@@ -108,7 +108,7 @@ export function portalSignedMeterDataRoutes(app: FastifyInstance): void {
           200: itemResponse(
             z
               .object({ data: z.array(signedMeterDataItem).describe('Records in time order') })
-              .passthrough(),
+              .loose(),
           ),
           404: errorWith('Session not found', [ERROR_CODES.SESSION_NOT_FOUND]),
         },

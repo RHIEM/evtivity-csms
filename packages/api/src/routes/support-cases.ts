@@ -100,7 +100,7 @@ const supportCaseListItem = z
     isRead: z.boolean().describe('True if the current operator has read the latest messages'),
     createdAt: z.coerce.date().describe('Timestamp when the case was created'),
   })
-  .passthrough();
+  .loose();
 
 const supportCaseItem = z
   .object({
@@ -120,7 +120,7 @@ const supportCaseItem = z
     createdAt: z.coerce.date().describe('Timestamp when the case was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the case was last updated'),
   })
-  .passthrough();
+  .loose();
 
 const attachmentItem = z
   .object({
@@ -137,7 +137,7 @@ const attachmentItem = z
       .describe('Content type sniffed from the file (images are stored as JPEG or PNG)'),
     createdAt: z.coerce.date().describe('Timestamp when the attachment was uploaded'),
   })
-  .passthrough();
+  .loose();
 
 const supportCaseMessageItem = z
   .object({
@@ -154,14 +154,14 @@ const supportCaseMessageItem = z
     createdAt: z.coerce.date().describe('Timestamp when the message was created'),
     attachments: z.array(attachmentItem).optional().describe('Attachments on this message'),
   })
-  .passthrough();
+  .loose();
 
 const sessionRef = z
   .object({
     id: z.string().describe('Charging session ID'),
     transactionId: z.string().nullable().describe('OCPP transaction ID for the session'),
   })
-  .passthrough();
+  .loose();
 
 const supportCaseDetail = supportCaseItem
   .extend({
@@ -195,7 +195,7 @@ const supportCaseDetail = supportCaseItem
       .nullable()
       .describe('Who resolved the case (operator or ai); null while it is not resolved'),
   })
-  .passthrough();
+  .loose();
 
 const uploadUrlResponse = z
   .object({
@@ -204,19 +204,21 @@ const uploadUrlResponse = z
       .describe(
         'Presigned S3 POST URL. Send a multipart/form-data POST with every entry of fields, then the file as the last field named file. S3 enforces the size limit and the Content-Type.',
       ),
-    fields: z.record(z.string()).describe('Form fields to send unchanged before the file field'),
+    fields: z
+      .record(z.string(), z.string())
+      .describe('Form fields to send unchanged before the file field'),
     s3Key: z
       .string()
       .describe('Quarantine key of the upload. Pass it to the confirm endpoint after the POST.'),
     expiresAt: z.coerce.date().describe('Time after which S3 refuses the POST'),
   })
-  .passthrough();
+  .loose();
 
 const downloadUrlResponse = z
   .object({
     downloadUrl: z.string().describe('Presigned S3 GET URL for downloading the attachment'),
   })
-  .passthrough();
+  .loose();
 
 const paymentRecordItem = z
   .object({
@@ -233,7 +235,7 @@ const paymentRecordItem = z
     createdAt: z.coerce.date().describe('Timestamp when the payment record was created'),
     updatedAt: z.coerce.date().describe('Timestamp when the payment record was last updated'),
   })
-  .passthrough();
+  .loose();
 
 const supportRefundItem = paymentRecordItem
   .extend({
@@ -243,8 +245,8 @@ const supportRefundItem = paymentRecordItem
         'succeeded: the refund is done. pending: an asynchronous provider (Adyen) accepted it and confirms it by webhook; the driver is notified then.',
       ),
   })
-  .passthrough();
-import { getS3Config, deleteObject } from '../services/s3.service.js';
+  .loose();
+import { getObjectStorage } from '../services/storage.service.js';
 import {
   confirmSupportAttachment,
   requestSupportAttachmentUpload,
@@ -617,7 +619,7 @@ export function supportCaseRoutes(app: FastifyInstance): void {
                   .number()
                   .describe('Number of unread support cases assigned to the current operator'),
               })
-              .passthrough(),
+              .loose(),
           ),
         },
       },
@@ -667,7 +669,7 @@ export function supportCaseRoutes(app: FastifyInstance): void {
                     'Number of open support cases with no assignee in the sites the current operator can access',
                   ),
               })
-              .passthrough(),
+              .loose(),
           ),
         },
       },
@@ -717,14 +719,14 @@ export function supportCaseRoutes(app: FastifyInstance): void {
                     'Whether S3 storage is configured, so attachments can be uploaded to support case messages',
                   ),
               })
-              .passthrough(),
+              .loose(),
           ),
         },
       },
     },
     async (request) => {
       try {
-        return { configured: (await getS3Config()) != null };
+        return { configured: (await getObjectStorage()) != null };
       } catch (err) {
         request.log.warn({ err }, 'S3 configuration could not be read');
         return { configured: false };
@@ -1510,9 +1512,9 @@ export function supportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
-      const s3 = await getS3Config();
-      if (s3 != null) {
-        await deleteObject(s3, attachment.s3Bucket, attachment.s3Key);
+      const storage = await getObjectStorage();
+      if (storage != null) {
+        await storage.deleteObject(attachment.s3Bucket, attachment.s3Key);
       }
 
       await deleteSupportCaseAttachment({
@@ -1531,12 +1533,13 @@ export function supportCaseRoutes(app: FastifyInstance): void {
   app.post(
     '/support-cases/:id/refund',
     {
-      onRequest: [authorize('support:write')],
+      // A refund moves money: payments:write as on the session refund route.
+      onRequest: [authorize('support:write', 'payments:write')],
       schema: {
         tags: ['Support Cases'],
         summary: 'Issue a refund for a session linked to a support case',
         description:
-          'Refunds the payment of the supplied sessionId through the provider it was made with; the session must be linked to this case via the support_case_sessions junction table. Supports partial refunds via amountCents. Allowed against captured or partially_refunded payments; 409 PAYMENT_OPERATION_PENDING while the provider has not confirmed the capture. refundStatus is pending when an asynchronous provider (Adyen) confirms the refund later by webhook. Posts an audit message to the case timeline on success.',
+          'Refunds the payment of the supplied sessionId through the provider it was made with; needs support:write and payments:write. The session must be linked to this case via the support_case_sessions junction table and belong to a site of the caller (the site stored on the session, not the current site of its station). Supports partial refunds via amountCents. Allowed against captured or partially_refunded payments; 409 PAYMENT_OPERATION_PENDING while the provider has not confirmed the capture. refundStatus is pending when an asynchronous provider (Adyen) confirms the refund later by webhook. Posts an audit message to the case timeline on success.',
         operationId: 'refundSupportCaseSession',
         security: [{ bearerAuth: [] }],
         params: zodSchema(caseIdParams),
@@ -1549,6 +1552,9 @@ export function supportCaseRoutes(app: FastifyInstance): void {
             ERROR_CODES.REFUND_EXCEEDS_REMAINING,
             ERROR_CODES.SESSION_NOT_LINKED,
             ERROR_CODES.PAYMENT_PROVIDER_NOT_CONFIGURED,
+          ]),
+          403: errorWith('Missing support:write or payments:write', [
+            ERROR_CODES.INSUFFICIENT_PERMISSIONS,
           ]),
           404: errorWith('Support case not found', [ERROR_CODES.SUPPORT_CASE_NOT_FOUND]),
           409: errorWith(
@@ -1599,22 +1605,23 @@ export function supportCaseRoutes(app: FastifyInstance): void {
         return;
       }
 
-      // Fetch the session's station siteId and transactionId once — used
-      // downstream for the site-access check, the Stripe per-site config
-      // lookup, and the system message label.
+      // The session's own site (charging_sessions.site_id, stamped at the
+      // start) and transaction id: the site-access check and the system
+      // message label. The station's current site is not the session's after
+      // a station move (site-access-control.md, "Sessions").
       const [sessionStation] = await db
         .select({
-          siteId: chargingStations.siteId,
+          siteId: chargingSessions.siteId,
           transactionId: chargingSessions.transactionId,
         })
         .from(chargingSessions)
-        .innerJoin(chargingStations, eq(chargingSessions.stationId, chargingStations.id))
         .where(eq(chargingSessions.id, body.sessionId));
 
-      // Defense in depth: verify the session's station is in the operator's
+      // Defense in depth: verify the session's site is in the operator's
       // accessible sites. The link-time validation in create/PATCH should
       // have caught this already, but historical rows (linked before the
-      // validation was added) could still expose cross-site refunds.
+      // validation was added) or a station moved since could still expose
+      // cross-site refunds.
       if (sessionStation != null && !siteInScope(refundSiteIds, sessionStation.siteId)) {
         await reply.status(400).send({
           error: 'Session not linked to this case',
@@ -1631,6 +1638,7 @@ export function supportCaseRoutes(app: FastifyInstance): void {
         {
           sessionId: body.sessionId,
           ...(body.amountCents != null ? { amountCents: body.amountCents } : {}),
+          actorUserId: userId,
         },
         paymentContext(request.log, getAuditActor(request)),
       );

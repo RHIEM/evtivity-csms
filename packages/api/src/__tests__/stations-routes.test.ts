@@ -45,6 +45,13 @@ const { mockSetStationDisabled, mockSendAvailability, mockRecordSessionEndReques
   }),
 );
 
+// The AI insights scope reads the database; these tests cover the routes only.
+vi.mock('../services/ai-insight-scope.service.js', () => ({
+  initialSiteAiInsightsSelected: vi.fn().mockResolvedValue(true),
+  isOutsideAiInsightScope: () => false,
+  siteAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+  stationAiInsightsScopeStatus: vi.fn().mockResolvedValue({ enabled: true, reason: 'all_sites' }),
+}));
 vi.mock('@evtivity/services/availability-command', () => ({
   sendAvailabilityCommand: mockSendAvailability,
 }));
@@ -122,6 +129,9 @@ function makeChain() {
   return chain;
 }
 
+const mockPlaceStationOnLayout = vi.hoisted(() => vi.fn(() => Promise.resolve({ x: 20, y: 20 })));
+const mockMoveStationLayout = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+
 vi.mock('@evtivity/database', async () => {
   const rawTimestamp = await import('@evtivity/database/src/lib/raw-timestamp.js');
   const dbMock: Record<string, unknown> = {
@@ -154,6 +164,11 @@ vi.mock('@evtivity/database', async () => {
     ...rawTimestamp,
     ...suppression,
     db: dbMock,
+    effectiveDataPlanSql: 'effective_data_plan',
+    dataPlanSourceSql: 'data_plan_source',
+    readStationDataPlans: vi.fn(() => Promise.resolve(new Map())),
+    placeStationOnLayout: mockPlaceStationOnLayout,
+    moveStationLayout: mockMoveStationLayout,
     client: {},
     setStationDisabled: mockSetStationDisabled,
     SESSION_END_REQUEST_CHANNEL: 'session_end_requests',
@@ -321,6 +336,8 @@ vi.mock('../middleware/rbac.js', () => ({
         await reply.status(401).send({ error: 'Unauthorized' });
       }
     },
+  // The caller holds every further permission (security-profile-permission.test.ts covers the refusal).
+  requestHasPermission: vi.fn().mockResolvedValue(true),
 }));
 
 import { registerAuth } from '../plugins/auth.js';
@@ -462,6 +479,9 @@ describe('Station routes - handler logic', () => {
         pendingSecurityProfile: null,
         ocppProtocol: null,
         hasPassword: false,
+        dataPlan: null,
+        effectiveDataPlan: 'wifi_or_wired',
+        dataPlanSource: 'default',
         metadata: null,
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
@@ -706,6 +726,12 @@ describe('Station routes - handler logic', () => {
       expect(response.statusCode).toBe(200);
       const repush = mockAddJob.mock.calls.find((c) => c[0] === 'station-message-repush');
       expect(repush?.[1]).toEqual({ stationId: VALID_STATION_ID });
+      // The move places the station on a free slot of the new site's layout.
+      expect(mockMoveStationLayout).toHaveBeenCalledWith(
+        expect.anything(),
+        VALID_STATION_ID,
+        'sit_000000000002',
+      );
 
       mockAddJob.mockClear();
       setupDbResults([{ id: 'sit_000000000002' }], [moved], [moved]);
@@ -1163,6 +1189,7 @@ describe('Station routes - handler logic', () => {
     it('returns grouped EVSE/connector data', async () => {
       const rows = [
         {
+          evseDbId: 'evs_000000000001',
           evseId: 1,
           evseAutoCreated: false,
           evseRetiredAt: null,
@@ -1176,6 +1203,7 @@ describe('Station routes - handler logic', () => {
           isIdling: false,
         },
         {
+          evseDbId: 'evs_000000000001',
           evseId: 1,
           evseAutoCreated: false,
           evseRetiredAt: null,
@@ -1201,6 +1229,8 @@ describe('Station routes - handler logic', () => {
       const body = response.json();
       expect(body).toHaveLength(1);
       expect(body[0].evseId).toBe(1);
+      // The record id a payment terminal pairs with (features/payment-terminals.md).
+      expect(body[0].id).toBe('evs_000000000001');
       expect(body[0].connectors).toHaveLength(2);
     });
 
@@ -1549,7 +1579,7 @@ describe('Station routes - handler logic', () => {
       expect(body.ghostRecovered).toBe(true);
       expect(body.sessionId).toBe('ses_000000000001');
       expect(body.transactionId).toBe('tx-ghost');
-      // Recorded durably first (P4), then the OCPP server ends it the normal
+      // Recorded durably first, then the OCPP server ends it the normal
       // way (completed, cost, settlement, receipt).
       expect(mockRecordSessionEndRequest).toHaveBeenCalledWith(
         {},
@@ -1562,7 +1592,7 @@ describe('Station routes - handler logic', () => {
       );
     });
 
-    it('publishes nothing when the ghost session ended meanwhile (P5)', async () => {
+    it('publishes nothing when the ghost session ended meanwhile', async () => {
       const { sendOcppCommandAndWait } = await import('@evtivity/services/ocpp-command');
       vi.mocked(sendOcppCommandAndWait).mockResolvedValueOnce({
         commandId: 'm',

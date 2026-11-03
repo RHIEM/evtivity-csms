@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ParseKeys } from 'i18next';
@@ -23,6 +23,7 @@ import { Label } from '@/components/ui/label';
 import { api } from '@/lib/api';
 import { useHasCompanyWidePermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 
 type SellerValues = Record<InvoiceSellerSettingKey, string>;
 
@@ -90,12 +91,11 @@ export function InvoiceSellerSettings({ settings }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const canWrite = useHasCompanyWidePermission('settings.system:write');
-  const [values, setValues] = useState<SellerValues>(() => storedValues(settings));
   const [submitted, setSubmitted] = useState(false);
-
-  useEffect(() => {
-    setValues(storedValues(settings));
-  }, [settings]);
+  const loaded = useMemo(() => storedValues(settings), [settings]);
+  const [values, setValues, takeNextLoad] = useLoadedValues<SellerValues>(loaded, () => {
+    setSubmitted(false);
+  });
 
   const mutation = useMutation({
     mutationFn: async (next: SellerValues) => {
@@ -139,7 +139,12 @@ export function InvoiceSellerSettings({ settings }: Props): React.JSX.Element {
             if (!canWrite || invalid) return;
             const next = {} as SellerValues;
             for (const key of INVOICE_SELLER_SETTING_KEYS) next[key] = normalized[key] ?? '';
-            mutation.mutate(next);
+            const sent = values;
+            mutation.mutate(next, {
+              onSuccess: () => {
+                takeNextLoad(sent);
+              },
+            });
           }}
           noValidate
           className="space-y-4"

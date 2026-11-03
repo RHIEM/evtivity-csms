@@ -85,3 +85,41 @@ export const STATION_WATCH_JOB_OPTIONS = {
   removeOnFail: { count: 500 },
   attempts: 1,
 };
+
+/**
+ * Driver and user avatar objects a delete could not remove (API, worker, conformance
+ * cleanup): an image a replace or removal left, and every object of an erased
+ * or deleted driver or user. The name predates user avatars and stays: the Redis ACLs name it.
+ */
+export const DRIVER_AVATAR_CLEANUP_QUEUE = 'driver-avatar-cleanup';
+
+/**
+ * Retrying is safe: S3 answers success for a key that is gone, and each job
+ * checks again that no driver row still points at what it deletes.
+ * Exponential from 1 minute, 10 attempts (about 17 hours), so a storage outage
+ * of a few hours does not leave the objects behind. A finished job frees its
+ * job id.
+ */
+export const DRIVER_AVATAR_CLEANUP_JOB_OPTIONS = {
+  removeOnComplete: true,
+  removeOnFail: { count: 500 },
+  attempts: 10,
+  backoff: { type: 'exponential', delay: 60_000 },
+};
+
+/**
+ * Payment terminal events (features/payment-terminals.md): signed simulated
+ * terminal events the API and the worker raise, applied by the worker as the
+ * webhook route applies a provider's (signature check, dedupe on the event id).
+ * The producer adds the job itself (jobQueue), so an event survives a stopped
+ * worker (P8).
+ */
+export const PAYMENT_TERMINAL_EVENTS_QUEUE = 'payment-terminal-events';
+
+/** Retrying is safe: each event is deduped on its id under its lock (webhook_events, P7). */
+export const PAYMENT_TERMINAL_EVENTS_JOB_OPTIONS = {
+  removeOnComplete: 200,
+  removeOnFail: { count: 500 },
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 2000 },
+};

@@ -7,11 +7,17 @@ import { Button } from '@/components/ui/button';
 interface EditButtonProps {
   label: string;
   onClick: () => void;
+  /** `header` in a detail page header, next to the Prev and Next buttons. */
+  size?: 'default' | 'header';
 }
 
-export function EditButton({ label, onClick }: EditButtonProps): React.JSX.Element {
+/**
+ * An action button, never a submit: inside a form (such as the Edit Avatar
+ * button of an edit form) a default submit button would also submit the form.
+ */
+export function EditButton({ label, onClick, size }: EditButtonProps): React.JSX.Element {
   return (
-    <Button variant="outline" className="gap-1.5" onClick={onClick}>
+    <Button type="button" variant="outline" size={size} className="gap-1.5" onClick={onClick}>
       <SquarePen className="h-4 w-4" />
       {label}
     </Button>

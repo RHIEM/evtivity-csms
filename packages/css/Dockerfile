@@ -1,4 +1,4 @@
-FROM node:24-slim AS deps
+FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS deps
 # A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
 ENV npm_config_fetch_retries=5 \
     npm_config_fetch_retry_mintimeout=20000 \
@@ -10,6 +10,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/sim-providers/package.json packages/sim-providers/
@@ -37,7 +38,7 @@ COPY packages/css/ packages/css/
 
 RUN node scripts/build.mjs css
 
-FROM node:24-slim
+FROM node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 # A registry connection reset (ECONNRESET) failed whole release builds; retry longer.
 ENV npm_config_fetch_retries=5 \
     npm_config_fetch_retry_mintimeout=20000 \
@@ -49,6 +50,7 @@ COPY package.json package-lock.json ./
 COPY packages/lib/package.json packages/lib/
 COPY packages/database/package.json packages/database/
 COPY packages/payments/package.json packages/payments/
+COPY packages/payment-terminals/package.json packages/payment-terminals/
 COPY packages/services/package.json packages/services/
 COPY packages/ai/package.json packages/ai/
 COPY packages/sim-providers/package.json packages/sim-providers/
@@ -71,7 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -
     && bash scripts/generate-test-certs.sh packages/css/test-certs \
     && chown -R node:node packages/css/test-certs
 
-LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms-helm"
+LABEL org.opencontainers.image.source="https://github.com/EVtivity/evtivity-csms"
 LABEL org.opencontainers.image.licenses="BUSL-1.1"
 LABEL org.opencontainers.image.vendor="EVtivity"
 

@@ -32,6 +32,9 @@ export const EXTERNAL = [
   // Native libvips binding (AI and support attachment re-encoding); the
   // platform binary comes from its @img/sharp-<platform> optional dependency.
   'sharp',
+  // SFTP client of the station simulator: loads its optional native crypto binding
+  // (and cpu-features) with require() at runtime, which a bundle cannot carry.
+  'ssh2',
 ];
 
 export const BANNER =
@@ -42,6 +45,7 @@ export const WORKSPACE_PACKAGES = {
   '@evtivity/lib': resolve(root, 'packages/lib'),
   '@evtivity/ai': resolve(root, 'packages/ai'),
   '@evtivity/sim-providers': resolve(root, 'packages/sim-providers'),
+  '@evtivity/payment-terminals': resolve(root, 'packages/payment-terminals'),
   '@evtivity/database': resolve(root, 'packages/database'),
   '@evtivity/payments': resolve(root, 'packages/payments'),
   '@evtivity/services': resolve(root, 'packages/services'),

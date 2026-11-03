@@ -7,6 +7,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Car, Trash2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Combobox } from '@/components/ui/combobox';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -17,6 +18,9 @@ import { getErrorMessage } from '@/lib/error-message';
 import { formatDate } from '@/lib/utils';
 import { useDriverTimezone } from '@/lib/timezone';
 import { formatVehicleId } from '@evtivity/lib/vehicle-id';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
+import { isVehicleBodyType, isVehicleColor } from '@evtivity/lib/vehicle-appearance';
+import { VehicleAppearanceSelects, type VehicleAppearance } from './VehicleAppearanceSelects';
 
 const CURRENT_YEAR = new Date().getFullYear();
 // Reasonable EV window: current model year + next year (manufacturers preview
@@ -31,6 +35,8 @@ interface Vehicle {
   make: string | null;
   model: string | null;
   year: string | null;
+  color?: string | null;
+  bodyType?: string | null;
   vin?: string | null;
   evccid?: string | null;
   autochargeEnabled?: boolean;
@@ -54,12 +60,21 @@ export function AccountVehicles(): React.JSX.Element {
   const [make, setMake] = useState('');
   const [model, setModel] = useState('');
   const [year, setYear] = useState('');
+  const [appearance, setAppearance] = useState<VehicleAppearance>({
+    color: null,
+    bodyType: null,
+  });
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const timezone = useDriverTimezone();
-  const { data: vehicles } = useQuery({
+  const {
+    data: vehicles,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['portal-vehicles'],
     queryFn: () => api.get<Vehicle[]>('/v1/portal/vehicles'),
   });
@@ -84,6 +99,17 @@ export function AccountVehicles(): React.JSX.Element {
     },
   });
 
+  const appearanceMutation = useMutation({
+    mutationFn: ({ id, ...body }: { id: string } & Partial<VehicleAppearance>) =>
+      api.patch<Vehicle>(`/v1/portal/vehicles/${id}`, body),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['portal-vehicles'] });
+    },
+    onError: (err: unknown) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t, 'vehicles.saveFailed') });
+    },
+  });
+
   const { data: lookup } = useQuery({
     queryKey: ['portal-vehicle-lookup'],
     queryFn: () => api.get<VehicleLookup>('/v1/portal/vehicles/lookup'),
@@ -100,14 +126,20 @@ export function AccountVehicles(): React.JSX.Element {
   const yearError = year.trim() !== '' && !YEAR_REGEX.test(year.trim());
 
   const addMutation = useMutation({
-    mutationFn: (body: { make: string; model: string; year?: string }) =>
-      api.post<Vehicle>('/v1/portal/vehicles', body),
+    mutationFn: (body: {
+      make: string;
+      model: string;
+      year?: string;
+      color?: string;
+      bodyType?: string;
+    }) => api.post<Vehicle>('/v1/portal/vehicles', body),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['portal-vehicles'] });
       await queryClient.invalidateQueries({ queryKey: ['portal-vehicle-efficiency'] });
       setMake('');
       setModel('');
       setYear('');
+      setAppearance({ color: null, bodyType: null });
       setHasSubmitted(false);
       setSubmitError(null);
     },
@@ -145,6 +177,8 @@ export function AccountVehicles(): React.JSX.Element {
       make: make.trim(),
       model: model.trim(),
       ...(year.trim() !== '' ? { year: year.trim() } : {}),
+      ...(appearance.color != null ? { color: appearance.color } : {}),
+      ...(appearance.bodyType != null ? { bodyType: appearance.bodyType } : {}),
     });
   }
 
@@ -157,8 +191,18 @@ export function AccountVehicles(): React.JSX.Element {
     <div className="space-y-4">
       <p className="text-xs text-muted-foreground">{t('vehicles.helper')}</p>
 
+      {isLoading && <LoadingState />}
+
+      {isError && (
+        <ErrorState
+          onRetry={() => {
+            void refetch();
+          }}
+        />
+      )}
+
       {vehicles != null && vehicles.length === 0 && (
-        <p className="text-center text-sm text-muted-foreground">{t('vehicles.noVehicles')}</p>
+        <EmptyState>{t('vehicles.noVehicles')}</EmptyState>
       )}
 
       {/* Card list mirrors Payment Methods / RFID Cards: Car icon + name on the
@@ -193,6 +237,17 @@ export function AccountVehicles(): React.JSX.Element {
                     </Button>
                   </div>
                 </div>
+                <VehicleAppearanceSelects
+                  label={label}
+                  disabled={appearanceMutation.isPending}
+                  value={{
+                    color: isVehicleColor(v.color) ? v.color : null,
+                    bodyType: isVehicleBodyType(v.bodyType) ? v.bodyType : null,
+                  }}
+                  onChange={(next) => {
+                    appearanceMutation.mutate({ id: v.id, ...next });
+                  }}
+                />
                 {hasId && (
                   <dl className="space-y-1 text-xs">
                     {v.vin != null && (
@@ -312,18 +367,25 @@ export function AccountVehicles(): React.JSX.Element {
           />
         </div>
 
+        <VehicleAppearanceSelects
+          value={appearance}
+          onChange={(next) => {
+            setAppearance(next);
+            clearFeedback();
+          }}
+        />
+
         {hasSubmitted && yearError && (
           <p className="text-sm text-destructive">{t('vehicles.yearFormat')}</p>
         )}
         {submitError != null && <p className="text-sm text-destructive">{submitError}</p>}
 
-        <Button
+        <CreateButton
           type="submit"
-          className="w-full"
+          label={t('vehicles.addVehicle')}
+          fullWidth
           disabled={addMutation.isPending || make.trim() === '' || model.trim() === ''}
-        >
-          {t('vehicles.addVehicle')}
-        </Button>
+        />
       </form>
     </div>
   );

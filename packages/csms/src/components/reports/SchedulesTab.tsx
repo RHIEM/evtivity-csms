@@ -286,7 +286,7 @@ export function SchedulesTab(): React.JSX.Element {
                         {schedule.isEnabled ? t('reports.enabled') : t('reports.disabled')}
                       </Badge>
                     </div>
-                    <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex">
+                    <div className="flex flex-wrap gap-2 *:grow sm:*:grow-0">
                       <Button
                         variant="outline"
                         size="sm"
@@ -509,6 +509,7 @@ export function SchedulesTab(): React.JSX.Element {
                   <Input
                     type="date"
                     aria-label={t('common.startDate')}
+                    className="min-w-0 flex-1"
                     value={dateFrom}
                     onChange={(e) => {
                       setDateFrom(e.target.value);
@@ -518,6 +519,7 @@ export function SchedulesTab(): React.JSX.Element {
                   <Input
                     type="date"
                     aria-label={t('common.endDate')}
+                    className="min-w-0 flex-1"
                     value={dateTo}
                     onChange={(e) => {
                       setDateTo(e.target.value);

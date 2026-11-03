@@ -39,10 +39,12 @@ services:
     image: redis:8-alpine
     restart: unless-stopped
     # One ACL user per service from docker/redis/acl-rules.conf (production
-    # parity). The default user stays open for host tooling, so the port is
-    # published on loopback only.
+    # parity). The default user is off: host tooling (npm run dev:*, the
+    # integration tests, redis-cli) signs in as the dev-only admin user. The
+    # port is published on loopback only.
     entrypoint: ['/bin/sh', '/usr/local/etc/redis/start.sh']
     environment:
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:-admin-dev-password}
       REDIS_API_PASSWORD: ${REDIS_API_PASSWORD:-api-dev-password}
       REDIS_OCPP_PASSWORD: ${REDIS_OCPP_PASSWORD:-ocpp-dev-password}
       REDIS_OCPI_PASSWORD: ${REDIS_OCPI_PASSWORD:-ocpi-dev-password}
@@ -56,7 +58,11 @@ services:
     mem_limit: 1g
     cpus: 0.5
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test:
+        [
+          'CMD-SHELL',
+          'redis-cli --user admin --pass "$$REDIS_ADMIN_PASSWORD" --no-auth-warning ping | grep -q PONG',
+        ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -69,7 +75,7 @@ services:
     cpus: 0.5
     environment:
       DATABASE_URL: postgres://evtivity:evtivity@postgres:5432/evtivity
-      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env (scripts/docker-build.sh generates it)}
       REGISTRATION_POLICY: ${REGISTRATION_POLICY:-approval-required}
       INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-admin@evtivity.local}
       INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-admin123}
@@ -105,8 +111,8 @@ services:
       OCPP_TLS_SERVER_URL: wss://ocpp:8443
       # Address stations get when moved to TLS; the simulators reach the ocpp service by name.
       OCPP_STATION_TLS_URL: ${OCPP_STATION_TLS_URL:-wss://ocpp:8443}
-      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-in-production!!}
-      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (scripts/docker-build.sh generates it)}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env (scripts/docker-build.sh generates it)}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
       # Off by default. scripts/docker-build.sh turns it on with the tools profile:
       # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
@@ -114,6 +120,9 @@ services:
       NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
       # Off by default: SIM provider calls go to the vendor hosts.
       SIM_PROVIDER_TEST_BASE_URL: ${SIM_PROVIDER_TEST_BASE_URL:-}
+      PAYMENT_TERMINALS_ALLOW_SIMULATED: ${PAYMENT_TERMINALS_ALLOW_SIMULATED:-true}
+      # Off by default: ID TECH terminal calls go to the PSG hosts.
+      PAYMENT_TERMINAL_TEST_BASE_URL: ${PAYMENT_TERMINAL_TEST_BASE_URL:-}
       CORS_ORIGIN: local
       # Proxy IPs or CIDRs whose X-Forwarded-For is trusted. Empty: the ports are
       # published directly, so the socket address is the client.
@@ -164,18 +173,22 @@ services:
       DATABASE_URL: postgres://evtivity:evtivity@postgres:5432/evtivity
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
       REDIS_URL: redis://ocpp:${REDIS_OCPP_PASSWORD:-ocpp-dev-password}@redis:6379
-      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env (scripts/docker-build.sh generates it)}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
       # Off by default. scripts/docker-build.sh turns it on with the tools profile:
       # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
       NOTIFICATIONS_ALLOW_TEST_SINK: ${NOTIFICATIONS_ALLOW_TEST_SINK:-false}
       NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
+      # Loopback inside the container: no other container reaches the inspector.
+      # Set NODE_INSPECT=--inspect=0.0.0.0:9229 in .env to attach from the host.
       NODE_INSPECT: ${NODE_INSPECT:-}
       OCPP_PORT: ${OCPP_PORT:-7103}
       OCPP_HEALTH_PORT: 8081
       OCPP_MAX_CONNECTIONS_PER_IP: ${OCPP_MAX_CONNECTIONS_PER_IP:-2500}
+      OCPP_MAX_PENDING_AUTH_PER_IP: ${OCPP_MAX_PENDING_AUTH_PER_IP:-50}
       OCPP_MAX_MESSAGES_PER_IP_PER_SECOND: ${OCPP_MAX_MESSAGES_PER_IP_PER_SECOND:-5000}
       OCPP_TRUSTED_PROXY_CIDRS: ${OCPP_TRUSTED_PROXY_CIDRS:-}
+      OCPP_WS_COMPRESSION: ${OCPP_WS_COMPRESSION:-true}
       # Empty: half of DB_POOL_MAX at once, 1000 queued, 10000 ms wait.
       OCPP_AUTH_MAX_CONCURRENT: ${OCPP_AUTH_MAX_CONCURRENT:-}
       OCPP_AUTH_MAX_QUEUED: ${OCPP_AUTH_MAX_QUEUED:-}
@@ -211,6 +224,9 @@ services:
       args:
         VITE_CSMS_AUTO_LOGIN: ${VITE_CSMS_AUTO_LOGIN:-}
     restart: unless-stopped
+    environment:
+      # Object storage origins added to the image CSP (S3-compatible providers).
+      STORAGE_IMG_SRC: ${STORAGE_IMG_SRC:-}
     ports:
       - '${BIND_IP:-0.0.0.0}:${CSMS_PORT:-7100}:8080'
     mem_limit: 1g
@@ -234,6 +250,9 @@ services:
       args:
         VITE_PORTAL_AUTO_LOGIN: ${VITE_PORTAL_AUTO_LOGIN:-}
     restart: unless-stopped
+    environment:
+      # Object storage origins added to the image CSP (S3-compatible providers).
+      STORAGE_IMG_SRC: ${STORAGE_IMG_SRC:-}
     ports:
       - '${BIND_IP:-0.0.0.0}:${PORTAL_PORT:-7101}:8080'
     mem_limit: 1g
@@ -262,10 +281,17 @@ services:
       REDIS_URL: redis://css:${REDIS_CSS_PASSWORD:-css-dev-password}@redis:6379
       OCPP_SERVER_URL: ws://ocpp:${OCPP_PORT:-7103}
       OCPP_TLS_SERVER_URL: wss://ocpp:8443
+      # The TLS address the API gives stations moved to TLS: a simulator connects
+      # only to these three origins.
+      OCPP_STATION_TLS_URL: ${OCPP_STATION_TLS_URL:-wss://ocpp:8443}
       CSS_MODE: ${CSS_MODE:-standby}
       CSS_ACTION_INTERVAL_MS: ${CSS_ACTION_INTERVAL_MS:-3000}
       CSS_STATION_LIMIT: ${CSS_STATION_LIMIT:-0}
       TLS_REJECT_UNAUTHORIZED: ${TLS_REJECT_UNAUTHORIZED:-false}
+      # The file transfer test servers (tools profile) a station may upload logs to and
+      # download firmware from on their private addresses.
+      CSS_FILE_TRANSFER_ALLOWED_HOSTS: ${CSS_FILE_TRANSFER_ALLOWED_HOSTS:-ftp,sftp,file-receiver}
+      CSS_SFTP_HOST_KEY_SHA256: ${CSS_SFTP_HOST_KEY_SHA256:-}
     depends_on:
       ocpp:
         condition: service_healthy
@@ -286,7 +312,7 @@ services:
       DATABASE_URL: postgres://evtivity:evtivity@postgres:5432/evtivity
       DB_POOL_MAX: ${DB_POOL_MAX:-10}
       REDIS_URL: redis://ocpi:${REDIS_OCPI_PASSWORD:-ocpi-dev-password}@redis:6379
-      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env (scripts/docker-build.sh generates it)}
       OCPI_PORT: ${OCPI_PORT:-7104}
       OCPI_BASE_URL: http://localhost:${OCPI_PORT:-7104}
       OCPI_COUNTRY_CODE: US
@@ -375,12 +401,15 @@ services:
       DATABASE_URL: postgres://evtivity:evtivity@postgres:5432/evtivity
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
       REDIS_URL: redis://worker:${REDIS_WORKER_PASSWORD:-worker-dev-password}@redis:6379
-      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-dev-encryption-key-32chars-long!}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env (scripts/docker-build.sh generates it)}
       PAYMENTS_ALLOW_SIMULATED: ${PAYMENTS_ALLOW_SIMULATED:-true}
       # Off by default. scripts/docker-build.sh turns it on with the tools profile:
       # driver SMS and push then go to the notify-sink dev tool, not Twilio and Expo.
       NOTIFICATIONS_ALLOW_TEST_SINK: ${NOTIFICATIONS_ALLOW_TEST_SINK:-false}
       NOTIFICATIONS_TEST_SINK_URL: ${NOTIFICATIONS_TEST_SINK_URL:-}
+      PAYMENT_TERMINALS_ALLOW_SIMULATED: ${PAYMENT_TERMINALS_ALLOW_SIMULATED:-true}
+      # Off by default: ID TECH terminal calls go to the PSG hosts.
+      PAYMENT_TERMINAL_TEST_BASE_URL: ${PAYMENT_TERMINAL_TEST_BASE_URL:-}
       API_PORT: ${API_PORT:-7102}
       OCPP_PORT: ${OCPP_PORT:-7103}
       OCPP_SERVER_URL: ws://ocpp:${OCPP_PORT:-7103}
@@ -397,7 +426,7 @@ services:
         condition: service_healthy
 
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:9.18
     restart: unless-stopped
     ports:
       - '${INFRA_BIND_IP:-127.0.0.1}:${PGADMIN_PORT:-7109}:80'
@@ -417,7 +446,7 @@ services:
       - tools
 
   mailpit:
-    image: axllent/mailpit:latest
+    image: axllent/mailpit:v1.32.0
     restart: unless-stopped
     ports:
       - '${INFRA_BIND_IP:-127.0.0.1}:${MAILPIT_PORT:-7108}:8025'
@@ -456,7 +485,7 @@ services:
       - tools
 
   ftp:
-    image: stilliard/pure-ftpd:latest
+    image: stilliard/pure-ftpd:trixie-1.0.50
     platform: linux/amd64
     restart: unless-stopped
     mem_limit: 1g
@@ -475,8 +504,97 @@ services:
     profiles:
       - tools
 
+  # SFTP test server for station log uploads and firmware downloads (dev tools). User
+  # evtivity/evtivity (dev only), writable folder /upload: sftp://evtivity:evtivity@sftp/upload/
+  sftp:
+    image: atmoz/sftp:alpine@sha256:43dd1c023cf1bae487127d4b54660b0aee6e94c188a6599be36fb89ba115f961
+    platform: linux/amd64
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    command: ['evtivity:evtivity:1001::upload']
+    ports:
+      - '${INFRA_BIND_IP:-127.0.0.1}:${SFTP_PORT:-2222}:22'
+    # No volume: the image creates /upload owned by the user only when it is missing,
+    # and uploaded files are test data.
+    profiles:
+      - tools
+
+  # HTTP and HTTPS upload receiver for station log uploads (dev tools, see
+  # docker/file-receiver/server.mjs). Basic auth evtivity/evtivity (dev only):
+  # http://evtivity:evtivity@file-receiver:8080/upload/ (HTTPS on 8443, self-signed).
+  file-receiver:
+    image: node:24-alpine
+    restart: unless-stopped
+    command: ['node', '/app/server.mjs']
+    working_dir: /app
+    volumes:
+      - ./docker/file-receiver:/app:ro
+    environment:
+      FILE_RECEIVER_USER: evtivity
+      FILE_RECEIVER_PASSWORD: evtivity
+    ports:
+      - '${INFRA_BIND_IP:-127.0.0.1}:${FILE_RECEIVER_PORT:-7112}:8080'
+      - '${INFRA_BIND_IP:-127.0.0.1}:${FILE_RECEIVER_TLS_PORT:-7113}:8443'
+    mem_limit: 256m
+    cpus: 0.25
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:8080/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    profiles:
+      - tools
+
+  # S3-compatible object storage for local testing of Settings > Integrations >
+  # S3 (dev tools only, never in Helm, CDK or the production images). Browsers
+  # upload with presigned POST and view with presigned GET straight to it, so
+  # the S3 API binds BIND_IP like the CSMS; the console binds INFRA_BIND_IP.
+  # Root user evtivity / evtivity-minio (dev only); minio-setup creates the
+  # bucket evtivity-files.
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
+    restart: unless-stopped
+    command: ['server', '/data', '--address', ':9000', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: evtivity
+      MINIO_ROOT_PASSWORD: evtivity-minio
+    ports:
+      - '${BIND_IP:-0.0.0.0}:${MINIO_PORT:-7114}:9000'
+      - '${INFRA_BIND_IP:-127.0.0.1}:${MINIO_CONSOLE_PORT:-7115}:9001'
+    # Named volume: stored files survive a recreate of the container.
+    volumes:
+      - miniodata:/data
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ['CMD', 'minio', '--version']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    profiles:
+      - tools
+
+  minio-setup:
+    image: cgr.dev/chainguard/minio-client@sha256:5b759d9e248ad9f1ab8455f8168b86a47acb1e08207d38603b504bdc5a555d7a
+    depends_on:
+      - minio
+    environment:
+      MC_HOST_local: http://evtivity:evtivity-minio@minio:9000
+    command: ['mb', '--ignore-existing', 'local/evtivity-files']
+    # Retried until MinIO answers; then it exits.
+    restart: on-failure:30
+    profiles:
+      - tools
+
   prometheus:
-    image: prom/prometheus:v3.2.1
+    image: prom/prometheus:v3.15.1
     restart: unless-stopped
     ports:
       - '${INFRA_BIND_IP:-127.0.0.1}:9090:9090'
@@ -489,7 +607,7 @@ services:
       - monitoring
 
   grafana:
-    image: grafana/grafana:11.5.2
+    image: grafana/grafana:11.5.10
     restart: unless-stopped
     ports:
       - '${INFRA_BIND_IP:-127.0.0.1}:${GRAFANA_PORT:-7107}:3000'
@@ -514,7 +632,7 @@ services:
       - monitoring
 
   loki:
-    image: grafana/loki:3.4.2
+    image: grafana/loki:3.4.6
     restart: unless-stopped
     ports:
       - '${INFRA_BIND_IP:-127.0.0.1}:3100:3100'
@@ -528,7 +646,7 @@ services:
       - monitoring
 
   alloy:
-    image: grafana/alloy:v1.8.1
+    image: grafana/alloy:v1.8.3
     restart: unless-stopped
     mem_limit: 1g
     cpus: 0.5
@@ -549,3 +667,4 @@ volumes:
   prometheusdata:
   grafanadata:
   lokidata:
+  miniodata:

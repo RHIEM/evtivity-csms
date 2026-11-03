@@ -20,6 +20,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { LOAD_ALLOCATION_STRATEGIES } from '@evtivity/lib/load-allocation';
+import type { SiteLayoutSettings } from '@evtivity/lib/site-layout';
 import { createId } from '../lib/id.js';
 
 export const chargingStationStatusEnum = pgEnum('charging_station_status', [
@@ -56,6 +57,10 @@ export const connectorStatusEnum = pgEnum('connector_status', [
   'ev_connected',
 ]);
 
+// A station data plan (features/station-data-plans.md): which set of OCPP
+// station settings a station runs. Null on a station or site: not set.
+export const stationDataPlanEnum = pgEnum('station_data_plan', ['wifi_or_wired', 'cellular']);
+
 export const sites = pgTable(
   'sites',
   {
@@ -90,7 +95,9 @@ export const sites = pgTable(
     carbonRegionCode: varchar('carbon_region_code', { length: 20 }),
     // Station display language of the site; null follows stationMessage.language.
     stationMessageLanguage: varchar('station_message_language', { length: 10 }),
-    // Automatic insights for this site (decision D17); all-site users change it.
+    // Selected in the AI insights scope (aiInsights.scope 'selected'); every
+    // site is in scope while the scope is 'all'. Written only by
+    // ai-insight-scope.service.ts (site create sets the initial value).
     aiInsightsEnabled: boolean('ai_insights_enabled').notNull().default(true),
     // Monthly AI token budget of the site; null follows ai.budget.siteMonthlyTokens, 0 is no limit.
     aiMonthlyTokenBudget: bigint('ai_monthly_token_budget', { mode: 'number' }),
@@ -102,11 +109,24 @@ export const sites = pgTable(
     aiInsightsSuppressedUntil: timestamp('ai_insights_suppressed_until', { withTimezone: true }),
     aiInsightsSuppressedBy: text('ai_insights_suppressed_by'),
     aiInsightsSuppressedReason: varchar('ai_insights_suppressed_reason', { length: 500 }),
+    // The site's data plan; its stations without their own choice and without
+    // a confirmed SIM run it. Null: not set (Wi-Fi or wired). Written only by
+    // setSiteDataPlan (lib/station-data-plan.ts).
+    dataPlan: stationDataPlanEnum('data_plan'),
+    // The layout settings: the paved lot and the transformers on the grass
+    // (@evtivity/lib/site-layout-schema). Null: never set, the default 10 by 2
+    // lot grown to hold the stations, with one transformer. Written only by
+    // saveSiteLayout (lib/station-layout.ts).
+    layoutSettings: jsonb('layout_settings').$type<SiteLayoutSettings>(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     unique('sites_name_unique').on(table.name),
+    check(
+      'sites_layout_settings_check',
+      sql`${table.layoutSettings} IS NULL OR jsonb_typeof(${table.layoutSettings}) = 'object'`,
+    ),
     check(
       'sites_station_message_language_check',
       sql`${table.stationMessageLanguage} IN ('en', 'de', 'es', 'ko', 'zh', 'zh-TW')`,
@@ -138,6 +158,17 @@ export const chargingStations = pgTable(
     firmwareVersion: varchar('firmware_version', { length: 255 }),
     iccid: varchar('iccid', { length: 20 }),
     imsi: varchar('imsi', { length: 20 }),
+    // Who wrote the ICCID: `reported` by a BootNotification, `entered` by a
+    // person through the station PATCH, with that person (the migration's
+    // foreign key to users sets it null on delete; assets cannot import
+    // identity) and whether they had access to every site. A Refresh attaches
+    // an entered ICCID as `entered`, never as reported.
+    iccidSource: varchar('iccid_source', { length: 16 })
+      .$type<'reported' | 'entered'>()
+      .notNull()
+      .default('reported'),
+    iccidEnteredBy: text('iccid_entered_by'),
+    iccidEnteredWithAllSites: boolean('iccid_entered_with_all_sites').notNull().default(false),
     availability: chargingStationStatusEnum('availability').notNull().default('available'),
     // The status the station reports for itself as a whole: OCPP 1.6
     // connector 0, OCPP 2.x NotifyEvent ChargingStation AvailabilityState.
@@ -179,10 +210,17 @@ export const chargingStations = pgTable(
     aiInsightsSuppressedUntil: timestamp('ai_insights_suppressed_until', { withTimezone: true }),
     aiInsightsSuppressedBy: text('ai_insights_suppressed_by'),
     aiInsightsSuppressedReason: varchar('ai_insights_suppressed_reason', { length: 500 }),
+    // Turned off in the AI insights scope (false): no insight for the station
+    // while the scope is 'selected', even when its site is selected. Written
+    // only by ai-insight-scope.service.ts.
+    aiInsightsEnabled: boolean('ai_insights_enabled').notNull().default(true),
     metadata: jsonb('metadata'),
     latitude: varchar('latitude', { length: 20 }),
     longitude: varchar('longitude', { length: 20 }),
     reservationsEnabled: boolean('reservations_enabled').notNull().default(true),
+    // The operator's data plan choice for this station; null uses the SIM or
+    // site rule (resolveDataPlan). Written only by setStationDataPlan.
+    dataPlan: stationDataPlanEnum('data_plan'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -196,6 +234,15 @@ export const chargingStations = pgTable(
       .where(sql`is_conformance`),
     index('idx_charging_stations_site_id').on(table.siteId),
     index('idx_charging_stations_vendor_id').on(table.vendorId),
+    check(
+      'charging_stations_iccid_source_check',
+      sql`${table.iccidSource} IN ('reported', 'entered')`,
+    ),
+    // A pending security profile is always an upgrade.
+    check(
+      'ck_pending_security_profile_upgrade',
+      sql`${table.pendingSecurityProfile} IS NULL OR ${table.pendingSecurityProfile} > ${table.securityProfile}`,
+    ),
   ],
 );
 
@@ -239,7 +286,8 @@ export const connectors = pgTable(
     statusReportedAt: timestamp('status_reported_at', { withTimezone: true }),
     connectorType: varchar('connector_type', { length: 50 }),
     maxPowerKw: numeric('max_power_kw'),
-    maxCurrentAmps: integer('max_current_amps'),
+    // Decimal amps (31.5 A); read as a JS number.
+    maxCurrentAmps: numeric('max_current_amps', { mode: 'number' }),
     autoCreated: boolean('auto_created').default(false).notNull(),
     // Retired by an operator, like evses.retired_at; a connector of a retired
     // EVSE is out of service too. Null while in service.
@@ -267,6 +315,11 @@ export const stationLayoutPositions = pgTable(
       .unique(),
     positionX: numeric('position_x').notNull().default('0'),
     positionY: numeric('position_y').notNull().default('0'),
+    // Custom site: the charger point in meters and its turn in degrees
+    // (@evtivity/lib/site-layout FreePlacement); all three or none.
+    freeXM: numeric('free_x_m', { precision: 7, scale: 2 }),
+    freeZM: numeric('free_z_m', { precision: 7, scale: 2 }),
+    freeRotationDeg: numeric('free_rotation_deg', { precision: 4, scale: 1 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

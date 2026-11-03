@@ -5,7 +5,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Nfc } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
@@ -14,7 +14,8 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { api, ApiError } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
-import { DRIVER_ID_TOKEN_TYPES, type DriverIdTokenType } from '@evtivity/lib/id-token-types';
+import { PORTAL_ID_TOKEN_TYPES, type PortalIdTokenType } from '@evtivity/lib/id-token-types';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui/content-state';
 
 interface DriverToken {
   id: string;
@@ -43,17 +44,22 @@ export function AccountRfidCards(): React.JSX.Element {
   const { toast } = useToast();
   const [addOpen, setAddOpen] = useState(false);
   const [newToken, setNewToken] = useState('');
-  const [newTokenType, setNewTokenType] = useState<DriverIdTokenType>('ISO14443');
+  const [newTokenType, setNewTokenType] = useState<PortalIdTokenType>('ISO14443');
   const [addError, setAddError] = useState('');
   const [confirmDeactivate, setConfirmDeactivate] = useState<DriverToken | null>(null);
 
-  const { data: tokens } = useQuery({
+  const {
+    data: tokens,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['portal-tokens'],
     queryFn: () => api.get<DriverToken[]>('/v1/portal/tokens'),
   });
 
   const addMutation = useMutation({
-    mutationFn: (body: { idToken: string; tokenType: DriverIdTokenType }) =>
+    mutationFn: (body: { idToken: string; tokenType: PortalIdTokenType }) =>
       api.post<DriverToken>('/v1/portal/tokens', body),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['portal-tokens'] });
@@ -94,20 +100,29 @@ export function AccountRfidCards(): React.JSX.Element {
 
   return (
     <div className="space-y-4">
-      <Button
-        className="w-full"
+      <CreateButton
+        label={t('rfid.addCard')}
+        fullWidth
         onClick={() => {
           setAddError('');
           setAddOpen(true);
         }}
-      >
-        {t('rfid.addCard')}
-      </Button>
+      />
+
+      {isLoading && <LoadingState />}
+
+      {isError && (
+        <ErrorState
+          onRetry={() => {
+            void refetch();
+          }}
+        />
+      )}
 
       {sortedTokens != null && sortedTokens.length === 0 && (
-        <div className="flex flex-col items-center gap-2 py-8 text-center">
+        <div className="flex flex-col items-center gap-2 pt-8">
           <Nfc className="h-10 w-10 text-muted-foreground" />
-          <p className="text-sm text-muted-foreground">{t('rfid.noCards')}</p>
+          <EmptyState className="pt-0 pb-8">{t('rfid.noCards')}</EmptyState>
         </div>
       )}
 
@@ -167,11 +182,11 @@ export function AccountRfidCards(): React.JSX.Element {
           <Select
             value={newTokenType}
             onChange={(e) => {
-              setNewTokenType(e.target.value as DriverIdTokenType);
+              setNewTokenType(e.target.value as PortalIdTokenType);
             }}
             aria-label={t('rfid.tokenType')}
           >
-            {DRIVER_ID_TOKEN_TYPES.map((tt) => (
+            {PORTAL_ID_TOKEN_TYPES.map((tt) => (
               <option key={tt} value={tt}>
                 {tt}
               </option>

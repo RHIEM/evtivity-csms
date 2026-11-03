@@ -8,9 +8,9 @@ import { AlertTriangle, Info } from 'lucide-react';
 import {
   SIM_FETCH_DAYS,
   SIM_OCPP16_SIGNAL_KEYS_LIMITS,
-  SIM_RETENTION_DAYS,
   SIM_SIGNAL_DBM,
   isHologramOrgId,
+  isOneNceClientId,
   parseOcpp16SignalKeys,
 } from '@evtivity/lib/sim-settings';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -19,15 +19,16 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-import { Toggle } from '@/components/ui/toggle';
+import { ConfirmToggle } from '@/components/ui/confirm-toggle';
 import { SaveButton } from '@/components/save-button';
 import { LoadingLogo } from '@/components/loading-logo';
-import { simErrorMessage } from '@/components/station/sim-connectivity';
+import { simErrorMessage } from '@/components/sim/sim-connectivity';
 import { api } from '@/lib/api';
 import { useHasAllSiteAccess, useHasCompanyWidePermission, useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatNumber } from '@/lib/formatting';
 import { useLoadedValues } from '@/hooks/use-loaded-values';
+import { DataRetentionLink } from './DataRetentionSettings';
 import { StoredSecretInput } from './StoredSecretInput';
 import { secretChange, type StoredSecret } from './stored-secret';
 
@@ -41,6 +42,13 @@ export interface SimProviderSettingsResponse {
     /** Returned only to users who also hold `settings.system:read`. */
     apiKey: string | null;
     apiKeyConfigured: boolean;
+  };
+  '1nce': {
+    enabled: boolean;
+    clientId: string;
+    /** Returned only to users who also hold `settings.system:read`. */
+    clientSecret: string | null;
+    clientSecretConfigured: boolean;
   };
   retentionDays: number;
   fetchDays: number;
@@ -137,7 +145,7 @@ function HologramCard({
     orgId: data.hologram.orgId,
     apiKey: data.hologram.apiKey ?? '',
   };
-  const [form, setForm] = useLoadedValues(loaded, () => {
+  const [form, setForm, , taken] = useLoadedValues(loaded, () => {
     setHasSubmitted(false);
     setRemoving(false);
   });
@@ -166,7 +174,7 @@ function HologramCard({
     setHasSubmitted(true);
     if (Object.keys(errors).length > 0) return;
     const hologram: Record<string, unknown> = { enabled: form.enabled, orgId };
-    const apiKey = secretChange(form.apiKey, secret, removing);
+    const apiKey = secretChange(form.apiKey, secret, removing, taken.apiKey);
     if (apiKey !== undefined) hologram.apiKey = apiKey;
     save.mutate(
       { hologram },
@@ -200,11 +208,12 @@ function HologramCard({
         >
           <p className="text-sm text-muted-foreground">{t('settings.sim.hologramDescription')}</p>
           <div className="flex items-center gap-3">
-            <Toggle
+            <ConfirmToggle
               id="sim-hologram-enabled"
               checked={form.enabled}
               disabled={!canWrite}
               aria-label={t('settings.sim.hologramEnabled')}
+              label={t('settings.sim.hologramEnabled')}
               onCheckedChange={(checked) => {
                 update({ enabled: checked });
               }}
@@ -321,6 +330,192 @@ function HologramCard({
   );
 }
 
+function OneNceCard({
+  data,
+  canWrite,
+}: {
+  data: SimProviderSettingsResponse;
+  canWrite: boolean;
+}): React.JSX.Element {
+  const { t } = useTranslation();
+  const save = useSaveSimSettings();
+  // The settings GET returns a stored secret only to users who also hold this permission.
+  const canReadSecrets = useHasPermission('settings.system:read');
+  const test = useMutation({
+    mutationFn: () => api.post<TestConnectionResult>('/v1/settings/sim-providers/1nce/test', {}),
+  });
+  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const stored = data['1nce'];
+  const loaded = {
+    enabled: stored.enabled,
+    clientId: stored.clientId,
+    clientSecret: stored.clientSecret ?? '',
+  };
+  const [form, setForm, , taken] = useLoadedValues(loaded, () => {
+    setHasSubmitted(false);
+    setRemoving(false);
+  });
+  const secret: StoredSecret = {
+    value: stored.clientSecret,
+    configured: stored.clientSecretConfigured,
+  };
+  const dirty = JSON.stringify(form) !== JSON.stringify(loaded) || removing;
+
+  function update(patch: Partial<typeof form>): void {
+    setForm((current) => ({ ...current, ...patch }));
+    save.reset();
+    test.reset();
+  }
+
+  const errors: Record<string, string> = {};
+  const clientId = form.clientId.trim();
+  if (clientId !== '' && !isOneNceClientId(clientId)) {
+    errors.clientId = t('settings.sim.oneNceClientIdInvalid');
+  } else if (form.enabled && clientId === '') {
+    errors.clientId = t('validation.required');
+  }
+
+  function handleSubmit(e: React.SyntheticEvent): void {
+    e.preventDefault();
+    setHasSubmitted(true);
+    if (Object.keys(errors).length > 0) return;
+    const oneNce: Record<string, unknown> = { enabled: form.enabled, clientId };
+    const clientSecret = secretChange(form.clientSecret, secret, removing, taken.clientSecret);
+    if (clientSecret !== undefined) oneNce.clientSecret = clientSecret;
+    save.mutate(
+      { '1nce': oneNce },
+      {
+        onSuccess: () => {
+          // The reload returns the secret only to users who may read secrets: match what it will hold.
+          setRemoving(false);
+          setForm((current) => ({
+            ...current,
+            clientId,
+            clientSecret: canReadSecrets && !removing ? current.clientSecret.trim() : '',
+          }));
+        },
+      },
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t('settings.sim.oneNceTitle')}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} noValidate className="space-y-4" data-testid="sim-1nce-form">
+          <p className="text-sm text-muted-foreground">{t('settings.sim.oneNceDescription')}</p>
+          <div className="flex items-center gap-3">
+            <ConfirmToggle
+              id="sim-1nce-enabled"
+              checked={form.enabled}
+              disabled={!canWrite}
+              aria-label={t('settings.sim.oneNceEnabled')}
+              label={t('settings.sim.oneNceEnabled')}
+              onCheckedChange={(checked) => {
+                update({ enabled: checked });
+              }}
+            />
+            <Label htmlFor="sim-1nce-enabled">{t('settings.sim.oneNceEnabled')}</Label>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="sim-1nce-client-id" className="leading-6">
+                {t('settings.sim.oneNceClientId')}
+              </Label>
+              <Input
+                id="sim-1nce-client-id"
+                value={form.clientId}
+                autoComplete="off"
+                disabled={!canWrite}
+                className={hasSubmitted && errors.clientId != null ? 'border-destructive' : ''}
+                onChange={(e) => {
+                  update({ clientId: e.target.value });
+                }}
+              />
+              {hasSubmitted && errors.clientId != null && (
+                <p className="text-sm text-destructive">{errors.clientId}</p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                {t('settings.sim.oneNceClientIdHint')}
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="sim-1nce-client-secret" className="leading-6">
+                {t('settings.sim.oneNceClientSecret')}
+              </Label>
+              <StoredSecretInput
+                id="sim-1nce-client-secret"
+                value={form.clientSecret}
+                onChange={(value) => {
+                  update({ clientSecret: value });
+                }}
+                secret={secret}
+                removing={removing}
+                onRemovingChange={(value) => {
+                  setRemoving(value);
+                  save.reset();
+                  test.reset();
+                }}
+                canWrite={canWrite}
+                hint={t('settings.sim.oneNceClientSecretHint')}
+              />
+            </div>
+          </div>
+
+          {canWrite && (
+            <SaveRow
+              dirty={dirty}
+              isPending={save.isPending}
+              isSuccess={save.isSuccess}
+              error={save.error}
+            >
+              <Button
+                type="button"
+                variant="outline"
+                className="relative"
+                disabled={test.isPending || dirty || !stored.enabled}
+                onClick={() => {
+                  test.mutate();
+                }}
+              >
+                {test.isPending && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                  </div>
+                )}
+                <span className={test.isPending ? 'invisible' : ''}>
+                  {t('settings.sim.testConnection')}
+                </span>
+              </Button>
+            </SaveRow>
+          )}
+          {canWrite && dirty && (
+            <p className="text-xs text-muted-foreground">{t('settings.sim.testSaveFirst')}</p>
+          )}
+          {canWrite && !dirty && !stored.enabled && (
+            <p className="text-xs text-muted-foreground">
+              {t('settings.sim.oneNceTestEnableFirst')}
+            </p>
+          )}
+          {test.isError && (
+            <p className="text-sm text-destructive">
+              {simErrorMessage(test.error, t, 'settings.sim.testFailed')}
+            </p>
+          )}
+          {test.data != null && (
+            <p className="text-sm text-success">
+              {t('settings.sim.oneNceTestSuccess', { count: test.data.deviceCount })}
+            </p>
+          )}
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
+
 function SessionHistoryCard({
   data,
   canWrite,
@@ -331,10 +526,7 @@ function SessionHistoryCard({
   const { t } = useTranslation();
   const save = useSaveSimSettings();
   const [hasSubmitted, setHasSubmitted] = useState(false);
-  const loaded = {
-    fetchDays: String(data.fetchDays),
-    retentionDays: String(data.retentionDays),
-  };
+  const loaded = { fetchDays: String(data.fetchDays) };
   const [form, setForm] = useLoadedValues(loaded, () => {
     setHasSubmitted(false);
   });
@@ -346,7 +538,6 @@ function SessionHistoryCard({
   }
 
   const fetchDays = inRange(form.fetchDays, SIM_FETCH_DAYS);
-  const retentionDays = inRange(form.retentionDays, SIM_RETENTION_DAYS);
   const errors: Record<string, string> = {};
   if (fetchDays == null) {
     errors.fetchDays = t('settings.sim.rangeError', {
@@ -354,18 +545,12 @@ function SessionHistoryCard({
       max: SIM_FETCH_DAYS.max,
     });
   }
-  if (retentionDays == null) {
-    errors.retentionDays = t('settings.sim.rangeError', {
-      min: SIM_RETENTION_DAYS.min,
-      max: SIM_RETENTION_DAYS.max,
-    });
-  }
 
   function handleSubmit(e: React.SyntheticEvent): void {
     e.preventDefault();
     setHasSubmitted(true);
-    if (fetchDays == null || retentionDays == null) return;
-    save.mutate({ fetchDays, retentionDays });
+    if (fetchDays == null) return;
+    save.mutate({ fetchDays });
   }
 
   return (
@@ -404,26 +589,8 @@ function SessionHistoryCard({
               )}
               <p className="text-xs text-muted-foreground">{t('settings.sim.fetchDaysHint')}</p>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="sim-retention-days" className="leading-6">
-                {t('settings.sim.retentionDays')}
-              </Label>
-              <Input
-                id="sim-retention-days"
-                value={form.retentionDays}
-                inputMode="numeric"
-                disabled={!canWrite}
-                className={hasSubmitted && errors.retentionDays != null ? 'border-destructive' : ''}
-                onChange={(e) => {
-                  update({ retentionDays: e.target.value });
-                }}
-              />
-              {hasSubmitted && errors.retentionDays != null && (
-                <p className="text-sm text-destructive">{errors.retentionDays}</p>
-              )}
-              <p className="text-xs text-muted-foreground">{t('settings.sim.retentionDaysHint')}</p>
-            </div>
           </div>
+          <DataRetentionLink />
           {canWrite && (
             <SaveRow
               dirty={dirty}
@@ -543,11 +710,12 @@ function StationSignalCard({
         >
           <div className="space-y-2">
             <div className="flex items-center gap-3">
-              <Toggle
+              <ConfirmToggle
                 id="sim-station-signal-enabled"
                 checked={form.enabled}
                 disabled={!canWrite}
                 aria-label={t('settings.sim.stationSignalEnabled')}
+                label={t('settings.sim.stationSignalEnabled')}
                 onCheckedChange={(checked) => {
                   update({ enabled: checked });
                 }}
@@ -613,7 +781,7 @@ function StationSignalCard({
   );
 }
 
-/** Settings > Integrations > SIM Providers: one card per provider, the session history and the station signal. */
+/** Settings > Integrations & Features > SIM Providers: one card per provider, the session history and the station signal. */
 export function SimProvidersSettings(): React.JSX.Element {
   const { t } = useTranslation();
   const allSites = useHasAllSiteAccess();
@@ -657,6 +825,7 @@ export function SimProvidersSettings(): React.JSX.Element {
     <div className="space-y-6">
       <p className="text-sm text-muted-foreground">{t('settings.sim.description')}</p>
       <HologramCard data={data} canWrite={canWrite} />
+      <OneNceCard data={data} canWrite={canWrite} />
       <SessionHistoryCard data={data} canWrite={canWrite} />
       <StationSignalCard data={data} canWrite={canWrite} />
     </div>

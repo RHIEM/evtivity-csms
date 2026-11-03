@@ -36,6 +36,9 @@ import { AppError } from '@evtivity/lib';
 import { registerAuth } from '../plugins/auth.js';
 import { ocppCommandRoutes } from '../routes/ocpp-commands.js';
 import {
+  DataPlanSettingInTemplateError,
+  assertMaskableUrlPasswords,
+  assertNoBootOwnedVariables,
   assertNoCredentialVariables,
   assertNoStationCredentialWrite,
 } from '../lib/station-credential-guard.js';
@@ -182,6 +185,47 @@ describe('station credential guard', () => {
     }
   });
 
+  it('refuses the boot-owned template variables of each version and names them', () => {
+    const refused = (version: string, vars: { component: string; variable: string }[]) => {
+      try {
+        assertNoBootOwnedVariables(version, vars);
+        return null;
+      } catch (err) {
+        expect(err).toBeInstanceOf(DataPlanSettingInTemplateError);
+        const e = err as DataPlanSettingInTemplateError;
+        expect(e.statusCode).toBe(400);
+        expect(e.code).toBe('DATA_PLAN_SETTING_IN_TEMPLATE');
+        return e.variables;
+      }
+    };
+    expect(
+      refused('1.6', [
+        { component: '', variable: ' HeartbeatInterval ' },
+        { component: '', variable: 'StopTxnSampledData' },
+        { component: '', variable: 'LocalPreAuthorize' },
+      ]),
+    ).toEqual(['HeartbeatInterval', 'StopTxnSampledData']);
+    expect(
+      refused('2.1', [
+        { component: 'AlignedDataCtrlr', variable: 'Interval' },
+        { component: 'SampledDataCtrlr', variable: 'TxUpdatedMeasurands' },
+        { component: 'SampledDataCtrlr', variable: 'TxStartedMeasurands' },
+      ]),
+    ).toEqual(['AlignedDataCtrlr.Interval', 'SampledDataCtrlr.TxUpdatedMeasurands']);
+    // The component compares as stored (case kept); the instance does not matter.
+    expect(refused('2.1', [{ component: 'alignedDataCtrlr', variable: 'Interval' }])).toBeNull();
+    expect(
+      refused('2.1', [
+        { component: 'OCPPCommCtrlr', variable: 'HeartbeatInterval', variableInstance: 'X' } as {
+          component: string;
+          variable: string;
+        },
+      ]),
+    ).toEqual(['OCPPCommCtrlr.HeartbeatInterval']);
+    // A 1.6 key in a 2.1 template is not the 2.1 variable.
+    expect(refused('2.1', [{ component: '', variable: 'HeartbeatInterval' }])).toBeNull();
+  });
+
   it('the assistant and MCP never offer the generic configuration write commands', () => {
     for (const op of [
       'ocppv21_SetVariables',
@@ -240,5 +284,120 @@ describe('generic OCPP command routes refuse station credential writes', () => {
     expect(res.statusCode).toBe(400);
     expect(res.json()).toMatchObject({ code: CODE });
     expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+
+  // A space or control inside a URL userinfo: the station reads the whole
+  // password, the stored copies could not mask it.
+  it.each([
+    [
+      '/ocpp/commands/v21/GetLog',
+      {
+        stationId: 'CS-21',
+        logType: 'DiagnosticsLog',
+        requestId: 1,
+        log: { remoteLocation: 'ftp://logs:pa ss@files.example.com/up' },
+      },
+    ],
+    [
+      '/ocpp/commands/v16/GetDiagnostics',
+      { stationId: 'CS-16', location: 'ftp://logs:pa\tss@files.example.com/up' },
+    ],
+    [
+      '/ocpp/commands/v21/UpdateFirmware',
+      {
+        stationId: 'CS-21',
+        requestId: 1,
+        firmware: {
+          location: 'ftp://fw:pa/ss@files.example.com/fw.bin',
+          retrieveDateTime: '2026-10-27T00:00:00Z',
+        },
+      },
+    ],
+  ])('%s refuses a URL password the stored copies cannot mask', async (url, payload) => {
+    pubsub.publish.mockClear();
+    const res = await app.inject({
+      method: 'POST',
+      url,
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+    // The reply never echoes the refused value.
+    expect(res.body).not.toContain('files.example.com');
+    expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('file transfer URL length on the generic OCPP command routes', () => {
+  let app: FastifyInstance;
+  let token: string;
+  const long = `ftp://u:p@files.example.com/${'x'.repeat(2000)}`;
+
+  beforeAll(async () => {
+    app = Fastify();
+    await registerAuth(app);
+    ocppCommandRoutes(app);
+    await app.ready();
+    token = app.jwt.sign({ userId: 'usr_000000000001', roleId: 'rol_000000000001' });
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it.each([
+    ['/ocpp/commands/v16/GetDiagnostics', { stationId: 'CS-16', location: long }],
+    [
+      '/ocpp/commands/v16/UpdateFirmware',
+      { stationId: 'CS-16', location: long, retrieveDate: '2026-10-27T00:00:00Z' },
+    ],
+    [
+      '/ocpp/commands/v21/PublishFirmware',
+      { stationId: 'CS-21', location: long, checksum: 'abc', requestId: 1 },
+    ],
+    [
+      '/ocpp/commands/v21/UpdateFirmware',
+      {
+        stationId: 'CS-21',
+        requestId: 1,
+        firmware: { location: long, retrieveDateTime: '2026-10-27T00:00:00Z' },
+      },
+    ],
+    [
+      '/ocpp/commands/v21/GetLog',
+      {
+        stationId: 'CS-21',
+        logType: 'DiagnosticsLog',
+        requestId: 1,
+        log: { remoteLocation: long },
+      },
+    ],
+  ])('%s refuses a URL longer than 2000 characters', async (url, payload) => {
+    pubsub.publish.mockClear();
+    const res = await app.inject({
+      method: 'POST',
+      url,
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).not.toContain('files.example.com');
+    expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('assertMaskableUrlPasswords', () => {
+  it('refuses a userinfo with a space or control, accepts any other URL password', () => {
+    expect(refusal(() => assertMaskableUrlPasswords({ location: 'ftp://u:a b@h/x' }))).toBe(
+      '400 VALIDATION_ERROR',
+    );
+    expect(refusal(() => assertMaskableUrlPasswords('ftp://u:a\nb@h/x'))).toBe(
+      '400 VALIDATION_ERROR',
+    );
+    expect(refusal(() => assertMaskableUrlPasswords({ location: 'ftp://u:a"b\\c@h/x' }))).toBe(
+      null,
+    );
+    expect(refusal(() => assertMaskableUrlPasswords('https://h/fw 1.bin'))).toBe(null);
   });
 });

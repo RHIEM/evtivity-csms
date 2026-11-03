@@ -149,7 +149,7 @@ const webhookEndpointSchema = z
     apiVersion: z.string().nullable().describe('Always null for Adyen'),
     active: z.boolean().describe('Adyen sends events to this webhook'),
   })
-  .passthrough()
+  .loose()
   .describe('An EVtivity webhook on the Adyen merchant account');
 
 const otherWebhookEndpoints = z
@@ -203,7 +203,7 @@ const adyenWebhookExistsResponse = z
       .describe('The webhooks at the requested URL; send replace: true to update it'),
     otherEndpoints: otherWebhookEndpoints,
   })
-  .passthrough()
+  .loose()
   .describe('A webhook already exists at this URL');
 
 const createAdyenWebhookResponse = z
@@ -292,7 +292,7 @@ export function adyenSettingsRoutes(app: FastifyInstance): void {
   app.get(
     '/settings/adyen',
     {
-      onRequest: [authorize('payments:read')],
+      onRequest: [authorize('settings.payment:read')],
       schema: {
         tags: ['Payments'],
         summary: 'Get Adyen settings',
@@ -338,7 +338,7 @@ export function adyenSettingsRoutes(app: FastifyInstance): void {
   app.put(
     '/settings/adyen',
     {
-      onRequest: [authorize('payments:write')],
+      onRequest: [authorize('settings.payment:write')],
       schema: {
         tags: ['Payments'],
         summary: 'Update Adyen settings',
@@ -413,7 +413,7 @@ export function adyenSettingsRoutes(app: FastifyInstance): void {
   app.post(
     '/settings/adyen/test',
     {
-      onRequest: [authorize('payments:write')],
+      onRequest: [authorize('settings.payment:write')],
       schema: {
         tags: ['Payments'],
         summary: 'Test the Adyen connection',
@@ -468,7 +468,7 @@ export function adyenSettingsRoutes(app: FastifyInstance): void {
   app.get(
     '/settings/adyen/webhook',
     {
-      onRequest: [authorize('payments:read')],
+      onRequest: [authorize('settings.payment:read')],
       schema: {
         tags: ['Payments'],
         summary: 'Get the Adyen webhook',
@@ -525,7 +525,7 @@ export function adyenSettingsRoutes(app: FastifyInstance): void {
   app.post(
     '/settings/adyen/webhook',
     {
-      onRequest: [authorize('payments:write')],
+      onRequest: [authorize('settings.payment:write')],
       schema: {
         tags: ['Payments'],
         summary: 'Create the Adyen webhook',

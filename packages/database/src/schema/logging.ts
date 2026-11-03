@@ -41,8 +41,15 @@ export const ocppMessageLogs = pgTable(
     // leading column, so a plain station_id index would be insert overhead.
     index('idx_ocpp_message_logs_station_created_at').on(table.stationId, table.createdAt),
     index('idx_ocpp_message_logs_station_action').on(table.stationId, table.action),
-    index('idx_ocpp_message_logs_action').on(table.action),
     index('idx_ocpp_message_logs_created_at').on(table.createdAt),
+    // The metrics collector's 24-hour inbound Heartbeat count (migration 0481,
+    // built CONCURRENTLY). Also serves action-only filters (its prefix), so
+    // 0482 dropped the plain idx_ocpp_message_logs_action.
+    index('idx_ocpp_message_logs_action_direction_created_at').on(
+      table.action,
+      table.direction,
+      table.createdAt,
+    ),
   ],
 );
 
@@ -79,6 +86,8 @@ export const ocppServerHealth = pgTable('ocpp_server_health', {
   totalPongsReceived: integer('total_pongs_received').notNull().default(0),
   serverStartedAt: timestamp('server_started_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  // The settings the process runs with (OcppProcessConfig); null from older processes.
+  config: jsonb('config'),
 });
 
 export const accessLogs = pgTable(

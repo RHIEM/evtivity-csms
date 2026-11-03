@@ -40,6 +40,14 @@ export default defineConfig({
             },
             { name: 'query', test: /node_modules[\\/]@tanstack[\\/]/, priority: 20 },
             { name: 'ui', test: /node_modules[\\/]lucide-react[\\/]/, priority: 20 },
+            // three.js: only the lazy 3D site layout imports it. The add-ons
+            // (orbit controls, room environment) load in their own chunk.
+            {
+              name: 'three-addons',
+              test: /node_modules[\\/]three[\\/]examples[\\/]/,
+              priority: 20,
+            },
+            { name: 'three', test: /node_modules[\\/]three[\\/](build|src)[\\/]/, priority: 25 },
           ],
         },
       },

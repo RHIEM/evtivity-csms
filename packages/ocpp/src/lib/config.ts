@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { z } from 'zod';
+import { proxyEntryProblem } from '@evtivity/lib/trust-proxy';
 import { resolveNotificationTestSinkUrl } from '@evtivity/lib/notification-test-sink';
 
 // Compose passes an unset variable as an empty string.
-function optionalInt<T extends z.ZodTypeAny>(schema: T) {
+function optionalInt<T extends z.ZodType>(schema: T) {
   return z.preprocess((v) => (v === '' ? undefined : v), schema.optional());
 }
 
@@ -25,13 +26,48 @@ const schema = z.object({
   OCPP_TLS_CERT_PEM: z.string().optional(),
   OCPP_TLS_KEY_PEM: z.string().optional(),
   OCPP_TLS_CA_PEM: z.string().optional(),
-  DATABASE_URL: z.string().url().default('postgres://evtivity:evtivity@localhost:5433/evtivity'),
-  REDIS_URL: z.string().url().default('redis://localhost:6379'),
+  DATABASE_URL: z.url().default('postgres://evtivity:evtivity@localhost:5433/evtivity'),
+  REDIS_URL: z.url().default('redis://localhost:6379'),
   SETTINGS_ENCRYPTION_KEY: z.string().min(1),
   OCPP_INSTANCE_ID: z.string().optional(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
-  OCPP_TRUSTED_PROXY_CIDRS: z.string().default(''),
+  // Proxies whose X-Forwarded-For and X-Forwarded-Proto count. A /0 entry, or a
+  // malformed prefix a loose parser reads as /0, would trust every peer.
+  OCPP_TRUSTED_PROXY_CIDRS: z
+    .string()
+    .default('')
+    .superRefine((v, ctx) => {
+      for (const entry of v.split(',').map((e) => e.trim())) {
+        if (entry === '') continue;
+        const problem = proxyEntryProblem(entry);
+        if (problem === 'trust-all' || problem === 'cidr') {
+          ctx.addIssue({
+            code: 'custom',
+            message:
+              'OCPP_TRUSTED_PROXY_CIDRS must not trust every address (0.0.0.0/0, ::/0) and takes a prefix of 1 to 3 digits after one slash',
+          });
+          return;
+        }
+        if (problem === 'address') {
+          ctx.addIssue({
+            code: 'custom',
+            message: 'OCPP_TRUSTED_PROXY_CIDRS holds an invalid address or CIDR',
+          });
+          return;
+        }
+      }
+    }),
+  // WebSocket permessage-deflate (RFC 7692) on the plain and TLS listeners. A
+  // station that does not offer it stays uncompressed; false turns it off
+  // (for example to read frames while debugging).
+  OCPP_WS_COMPRESSION: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
   OCPP_MAX_CONNECTIONS_PER_IP: z.coerce.number().int().positive().default(2500),
+  // Upgrade requests from one IP (an IPv6 /64) whose authentication is still
+  // running. Checked before a connection-auth limiter slot.
+  OCPP_MAX_PENDING_AUTH_PER_IP: z.coerce.number().int().positive().default(50),
   OCPP_MAX_MESSAGES_PER_IP_PER_SECOND: z.coerce.number().int().positive().default(5000),
   // Station connection authentications (connection-auth-limiter.ts). Unset or
   // empty: half of DB_POOL_MAX run at once, 1000 wait, for at most 10 s.
@@ -39,12 +75,11 @@ const schema = z.object({
   OCPP_AUTH_MAX_QUEUED: optionalInt(z.coerce.number().int().nonnegative()),
   OCPP_AUTH_MAX_WAIT_MS: optionalInt(z.coerce.number().int().positive()),
   // Allows the simulated (test) payment provider in this process (D-T1). Default:
-  // on when NODE_ENV is development (or unset) or test, off otherwise.
+  // on when NODE_ENV is development or test, off otherwise (unset included: the
+  // service images set production).
   PAYMENTS_ALLOW_SIMULATED: z
     .enum(['true', 'false'])
-    .default(
-      ['development', 'test'].includes(process.env['NODE_ENV'] ?? 'development') ? 'true' : 'false',
-    )
+    .default(['development', 'test'].includes(process.env['NODE_ENV'] ?? '') ? 'true' : 'false')
     .transform((v) => v === 'true'),
   // Notification test sink (local development only, off by default): driver SMS
   // and push go to NOTIFICATIONS_TEST_SINK_URL instead of Twilio and Expo. The
@@ -54,10 +89,7 @@ const schema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
-  NOTIFICATIONS_TEST_SINK_URL: z.preprocess(
-    (v) => (v === '' ? undefined : v),
-    z.string().url().optional(),
-  ),
+  NOTIFICATIONS_TEST_SINK_URL: z.preprocess((v) => (v === '' ? undefined : v), z.url().optional()),
 });
 
 export type OcppConfig = z.infer<typeof schema>;

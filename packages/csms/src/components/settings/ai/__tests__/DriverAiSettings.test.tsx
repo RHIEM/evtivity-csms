@@ -171,3 +171,52 @@ describe('Settings > AI > Driver support (TC-AI-DR-UI-08)', () => {
     expect(values['ai.rateLimit.driverPerMinute']).toBe('2');
   });
 });
+
+describe('Settings > AI > Driver support settings reload', () => {
+  function wrapReloadable(): (settings: Record<string, unknown>) => void {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (settings: Record<string, unknown>): React.JSX.Element => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <DriverAiSettings settings={settings} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(SETTINGS));
+    return (settings) => {
+      rerender(tree(settings));
+    };
+  }
+
+  function value(label: string): string {
+    const input = screen.getByLabelText(label);
+    if (!(input instanceof HTMLInputElement)) throw new Error('not an input');
+    return input.value;
+  }
+
+  const CASES = 'settings.aiDriverSettings.maxCasesPerDriverPerDay';
+
+  it('keeps unsaved edits when the settings reload, takes the reload while clean', () => {
+    const reload = wrapReloadable();
+    reload({ ...SETTINGS, 'driverAi.maxCasesPerDriverPerDay': 6 });
+    expect(value(CASES)).toBe('6');
+    change(CASES, '9');
+    // The switch saves and the settings reload.
+    reload({ ...SETTINGS, 'driverAi.maxCasesPerDriverPerDay': 6, 'driverAi.enabled': true });
+    expect(value(CASES)).toBe('9');
+  });
+
+  it('takes the next reload after its own save', async () => {
+    const reload = wrapReloadable();
+    change(CASES, '5');
+    fireEvent.click(screen.getAllByRole('button', { name: 'common.save' })[1] as HTMLElement);
+    await waitFor(() => {
+      expect(apiMock.put).toHaveBeenCalledWith('/v1/settings/driverAi.maxCasesPerDriverPerDay', {
+        value: 5,
+      });
+    });
+    reload({ ...SETTINGS, 'driverAi.maxCasesPerDriverPerDay': 5 });
+    reload({ ...SETTINGS, 'driverAi.maxCasesPerDriverPerDay': 7 });
+    expect(value(CASES)).toBe('7');
+  });
+});

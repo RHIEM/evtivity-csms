@@ -21,6 +21,11 @@ interface StateRow {
 interface Db {
   stations: StationRow[];
   tokens: Array<{ id_token: string; token_type: string }>;
+  /**
+   * Tokens of the fleets each station is assigned to (fleet_stations). `depot`
+   * marks a station on a site of type Depot.
+   */
+  fleetTokens?: Array<{ station_id: string; id_token: string; token_type: string; depot: boolean }>;
   // Per-station state row; undefined means the row was deleted or disabled.
   state: Record<string, StateRow | undefined>;
   stateError?: Error;
@@ -46,6 +51,15 @@ function makeSql(db: Db): postgres.Sql {
     if (q.includes('FROM charging_stations cs')) {
       if (db.loadError != null) return Promise.reject(db.loadError);
       return Promise.resolve(db.stations);
+    }
+    if (q.includes('FROM fleet_stations')) {
+      // The query keeps depot stations only; an unfiltered query would return every row.
+      const depotOnly = q.includes("layout_settings->>'siteType' = 'depot'");
+      return Promise.resolve(
+        (db.fleetTokens ?? [])
+          .filter((r) => !depotOnly || r.depot)
+          .map(({ station_id, id_token, token_type }) => ({ station_id, id_token, token_type })),
+      );
     }
     if (q.includes('FROM driver_tokens')) {
       db.tokenQueryValues.push(values);
@@ -440,6 +454,73 @@ describe('ChaosOrchestrator session journeys', () => {
 
     expect(pubsub.publish).not.toHaveBeenCalled();
     expect(internals(o).chargingStations.has('CS-2')).toBe(false);
+  });
+
+  it('starts a depot station (a fleet station on a Depot site) with a token of its fleet, leaving large-vehicle drivers out of the public pool', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1_000_000);
+    const db = makeDb({
+      tokens: [{ id_token: 'TOK-A', token_type: 'ISO14443' }],
+      fleetTokens: [{ station_id: 'CS-1', id_token: 'BUS-1', token_type: 'ISO14443', depot: true }],
+      state: { 'CS-1': { status: 'available', evse_status: 'Preparing', has_tx: false } },
+    });
+    const queries: string[] = [];
+    const base = makeSql(db);
+    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      queries.push(strings.join(' '));
+      return (base as unknown as (s: TemplateStringsArray, ...v: unknown[]) => unknown)(
+        strings,
+        ...values,
+      );
+    }) as unknown as postgres.Sql;
+    const pubsub = makePubsub();
+    const o = new ChaosOrchestrator(sql, pubsub, { actionIntervalMs: 1000 });
+    await o.start();
+    o.stop();
+    internals(o).journeys.record('CS-1', 'plugIn', 0);
+    vi.setSystemTime(JOURNEY_WAIT_MS.plugged[1] + 1);
+
+    randomQueue.push(0.1, 0.0);
+    await internals(o).dispatchRandomAction();
+
+    expect(published(pubsub)).toEqual([
+      expect.objectContaining({
+        stationId: 'CS-1',
+        action: 'startCharging',
+        params: { evseId: 1, idToken: 'BUS-1', tokenType: 'ISO14443' },
+      }),
+    ]);
+    const pool = queries.find((q) => q.includes('FROM driver_tokens'));
+    expect(pool).toContain("NOT IN ('box_truck', 'bus', 'semi_truck')");
+  });
+
+  it('starts an ordinary fleet station (not on a Depot site) with a token of the public pool', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1_000_000);
+    const db = makeDb({
+      tokens: [{ id_token: 'TOK-A', token_type: 'ISO14443' }],
+      fleetTokens: [
+        { station_id: 'CS-1', id_token: 'FLEET-1', token_type: 'ISO14443', depot: false },
+      ],
+      state: { 'CS-1': { status: 'available', evse_status: 'Preparing', has_tx: false } },
+    });
+    const pubsub = makePubsub();
+    const o = new ChaosOrchestrator(makeSql(db), pubsub, { actionIntervalMs: 1000 });
+    await o.start();
+    o.stop();
+    internals(o).journeys.record('CS-1', 'plugIn', 0);
+    vi.setSystemTime(JOURNEY_WAIT_MS.plugged[1] + 1);
+
+    randomQueue.push(0.1, 0.0);
+    await internals(o).dispatchRandomAction();
+
+    expect(published(pubsub)).toEqual([
+      expect.objectContaining({
+        stationId: 'CS-1',
+        action: 'startCharging',
+        params: { evseId: 1, idToken: 'TOK-A', tokenType: 'ISO14443' },
+      }),
+    ]);
   });
 
   it('ends the journey when its due step is no longer possible', async () => {

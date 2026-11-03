@@ -29,6 +29,9 @@ import { RecordInsightsTab } from '@/components/ai/insights/RecordInsightsTab';
 import { MeterValuesTable } from '@/components/MeterValuesTable';
 import { StationEventsTab } from '@/components/StationEventsTab';
 import { StationConfigurationsTab } from '@/components/StationConfigurationsTab';
+import { StationDataPlanCard } from '@/components/station/StationDataPlanCard';
+import { StationPaymentTerminalsCard } from '@/components/payment-terminals/StationPaymentTerminalsCard';
+import type { ChargingKind, DataPlan, DataPlanSource } from '@evtivity/lib/station-data-plan';
 import { StationFirmwareTab } from '@/components/StationFirmwareTab';
 import { StationChargingProfilesTab } from '@/components/StationChargingProfilesTab';
 import { StationImages } from '@/components/StationImages';
@@ -85,6 +88,10 @@ interface Station {
   siteHoursOfOperation: string | null;
   siteTimezone: string | null;
   siteFreeVendEnabled: boolean;
+  dataPlan: DataPlan | null;
+  effectiveDataPlan: DataPlan;
+  dataPlanSource: DataPlanSource;
+  chargingKind: ChargingKind;
   createdAt: string;
   updatedAt: string;
 }
@@ -135,7 +142,12 @@ export function StationDetail(): React.JSX.Element {
     enabled: id != null,
   });
 
-  const { data: connectorsData } = useQuery({
+  const {
+    data: connectorsData,
+    isLoading: connectorsLoading,
+    isError: connectorsError,
+    refetch: refetchConnectors,
+  } = useQuery({
     queryKey: ['stations', id, 'connectors'],
     queryFn: () => api.get<Evse[]>(`/v1/stations/${id ?? ''}/connectors`),
     enabled: id != null,
@@ -316,7 +328,7 @@ export function StationDetail(): React.JSX.Element {
           <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm">{t('stations.pendingApproval')}</p>
             {canWriteStations && (
-              <div className="grid grid-cols-2 gap-2 [&>*:last-child:nth-child(odd)]:col-span-2 sm:flex sm:shrink-0">
+              <div className="flex flex-wrap gap-2 *:grow sm:*:grow-0 sm:shrink-0">
                 <Button
                   variant="outline"
                   size="sm"
@@ -411,7 +423,7 @@ export function StationDetail(): React.JSX.Element {
           {canReadAudit && <TabsTrigger value="history">{t('audit.history')}</TabsTrigger>}
         </TabsList>
 
-        <TabsContent value="info" className="space-y-6">
+        <TabsContent value="info">
           <StationInfoTab
             station={station}
             stationId={id ?? ''}
@@ -424,7 +436,7 @@ export function StationDetail(): React.JSX.Element {
           <StationImages stationId={id ?? ''} />
         </TabsContent>
 
-        <TabsContent value="metrics" className="space-y-6">
+        <TabsContent value="metrics">
           <StationMetricsTab stationId={id ?? ''} />
         </TabsContent>
 
@@ -432,20 +444,24 @@ export function StationDetail(): React.JSX.Element {
           <StationSessionsTab stationId={id ?? ''} timezone={siteTimezone} />
         </TabsContent>
 
-        <TabsContent value="connectors" className="space-y-6">
-          {connectorsData != null && (
-            <ConnectorStatus
-              data={connectorsData}
-              stationId={station.id}
-              stationOcppId={station.stationId}
-              ocppProtocol={station.ocppProtocol}
-              isOnline={station.isOnline}
-              isSimulator={station.isSimulator}
-            />
-          )}
+        <TabsContent value="connectors">
+          <ConnectorStatus
+            data={connectorsData}
+            isLoading={connectorsLoading}
+            isError={connectorsError}
+            onRetry={() => {
+              void refetchConnectors();
+            }}
+            stationId={station.id}
+            stationOcppId={station.stationId}
+            ocppProtocol={station.ocppProtocol}
+            isOnline={station.isOnline}
+            isSimulator={station.isSimulator}
+          />
+          <StationPaymentTerminalsCard stationId={station.id} />
         </TabsContent>
 
-        <TabsContent value="commands" className="space-y-6">
+        <TabsContent value="commands">
           <StationCommands stationId={station.stationId} ocppProtocol={station.ocppProtocol} />
           <OcppMessageLog stationDbId={station.id} timezone={siteTimezone} />
         </TabsContent>
@@ -499,24 +515,25 @@ export function StationDetail(): React.JSX.Element {
           />
         </TabsContent>
 
-        <TabsContent value="events" className="space-y-6">
+        <TabsContent value="events">
           <StationEventsTab stationId={station.id} timezone={siteTimezone} />
         </TabsContent>
 
-        <TabsContent value="configurations" className="space-y-6">
+        <TabsContent value="configurations">
           <StationConfigurationsTab
             stationId={station.id}
             stationOcppId={station.stationId}
             isOnline={station.isOnline}
             ocppProtocol={station.ocppProtocol}
           />
+          <StationDataPlanCard station={station} />
         </TabsContent>
 
-        <TabsContent value="firmware-history" className="space-y-6">
+        <TabsContent value="firmware-history">
           <StationFirmwareTab stationId={station.id} timezone={siteTimezone} />
         </TabsContent>
 
-        <TabsContent value="charging-profiles" className="space-y-6">
+        <TabsContent value="charging-profiles">
           <StationChargingProfilesTab
             stationId={station.id}
             timezone={siteTimezone}
@@ -526,7 +543,7 @@ export function StationDetail(): React.JSX.Element {
         </TabsContent>
 
         {station.ocppProtocol !== 'ocpp1.6' && (
-          <TabsContent value="charging-needs" className="space-y-6">
+          <TabsContent value="charging-needs">
             <StationChargingNeedsTab
               stationId={station.id}
               isOnline={station.isOnline}
@@ -546,7 +563,7 @@ export function StationDetail(): React.JSX.Element {
           />
         </TabsContent>
 
-        <TabsContent value="pricing" className="space-y-6">
+        <TabsContent value="pricing">
           <StationPricingTab
             stationId={id ?? ''}
             siteTimezone={station.siteTimezone ?? undefined}
@@ -564,6 +581,7 @@ export function StationDetail(): React.JSX.Element {
         {canReadAuthorizeLog && (
           <TabsContent value="authorize-log">
             <AuthorizeLogView
+              title={t('tokens.authorizeLog')}
               fixedFilters={{ stationId: station.stationId }}
               hideStationColumn
               queryKey={`authorize-attempts-station-${station.id}`}
@@ -572,7 +590,7 @@ export function StationDetail(): React.JSX.Element {
         )}
 
         {reservationEnabled && (
-          <TabsContent value="reservations" className="space-y-6">
+          <TabsContent value="reservations">
             <StationReservationsTab station={station} timezone={siteTimezone} />
           </TabsContent>
         )}

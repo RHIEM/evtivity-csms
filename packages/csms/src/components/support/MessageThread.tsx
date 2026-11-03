@@ -1,10 +1,13 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import { Checkbox } from '@/components/ui/checkbox';
+import { Textarea } from '@/components/ui/textarea';
 import { useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Bot, Download, Sparkles, Square, X } from 'lucide-react';
 import { FileUploadButton } from '@/components/ui/file-upload-button';
+import { useStorageGuard } from '@/components/StorageUnavailableDialog';
 import { Spinner } from '@/components/ui/spinner';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -46,7 +49,8 @@ interface MessageThreadProps {
   caseId: string;
   messages: Message[];
   timezone: string;
-  s3Configured: boolean;
+  /** Whether attachment storage is set up; undefined until known. */
+  s3Configured?: boolean | undefined;
   supportAiEnabled: boolean;
   onMessageSent: () => void;
 }
@@ -68,6 +72,7 @@ export function MessageThread({
   const [messageBody, setMessageBody] = useState('');
   const [isInternal, setIsInternal] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const storage = useStorageGuard(s3Configured);
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<{
@@ -131,7 +136,14 @@ export function MessageThread({
       setIsInternal(false);
       setPendingFiles([]);
     } catch (err) {
-      setSendError(getErrorMessage(err, t, 'supportCases.sendFailed'));
+      if (storage.handleUploadError(err)) {
+        // The message was sent without its files: the dialog explains why.
+        onMessageSent();
+        setMessageBody('');
+        setIsInternal(false);
+      } else {
+        setSendError(getErrorMessage(err, t, 'supportCases.sendFailed'));
+      }
     } finally {
       setIsSending(false);
       setUploadProgress(null);
@@ -193,7 +205,7 @@ export function MessageThread({
     const { downloadUrl } = await api.get<{ downloadUrl: string }>(
       `/v1/support-cases/${caseId}/messages/${String(attachment.messageId)}/attachments/${String(attachment.id)}/download-url`,
     );
-    window.open(downloadUrl, '_blank');
+    window.open(downloadUrl, '_blank', 'noopener,noreferrer');
   }
 
   return (
@@ -225,7 +237,7 @@ export function MessageThread({
           }}
           className="space-y-3 border-t pt-4"
         >
-          <textarea
+          <Textarea
             value={messageBody}
             onChange={(e) => {
               setMessageBody(e.target.value);
@@ -234,7 +246,6 @@ export function MessageThread({
             aria-busy={aiStream.streaming}
             aria-label={t('supportCases.messagePlaceholder')}
             placeholder={t('supportCases.messagePlaceholder')}
-            className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             rows={3}
           />
           {pendingFiles.length > 0 && (
@@ -279,13 +290,11 @@ export function MessageThread({
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
             <div className="flex flex-wrap items-center gap-3">
               <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={isInternal}
                   onChange={(e) => {
                     setIsInternal(e.target.checked);
                   }}
-                  className="rounded"
                 />
                 {t('supportCases.internalNote')}
               </label>
@@ -294,7 +303,8 @@ export function MessageThread({
                 size="sm"
                 multiple
                 accept={ATTACHMENT_ACCEPT}
-                disabled={!s3Configured}
+                guard={storage.guard}
+                data-testid="support-attach"
                 onFiles={(files) => {
                   setPendingFiles((prev) => [...prev, ...files]);
                 }}
@@ -355,6 +365,7 @@ export function MessageThread({
             void handleAiAssist();
           }}
         />
+        {storage.dialog}
       </CardContent>
     </Card>
   );

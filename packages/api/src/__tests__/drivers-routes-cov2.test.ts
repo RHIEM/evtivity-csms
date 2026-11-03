@@ -151,6 +151,7 @@ vi.mock('../services/token.service.js', () => {
   class TokenDriverNotFoundError extends Error {}
   class TokenDriverInactiveError extends Error {}
   class PncContractTokenError extends Error {}
+  class VehicleIdTokenInUseError extends Error {}
   return {
     createToken: createTokenMock,
     bulkSetActive: bulkSetActiveMock,
@@ -158,6 +159,7 @@ vi.mock('../services/token.service.js', () => {
     TokenDriverNotFoundError,
     TokenDriverInactiveError,
     PncContractTokenError,
+    VehicleIdTokenInUseError,
     tokenActorOf: (actor: { actorUserId: string | null }) => ({
       type: 'operator',
       userId: actor.actorUserId,
@@ -725,6 +727,8 @@ describe('Driver routes (operator), uncovered paths', () => {
         year: null,
         vin: null,
         licensePlate: null,
+        color: null,
+        bodyType: null,
         evccid: '92D50A693F80',
         autochargeEnabled: true,
         autochargeBlockedAt: null,
@@ -843,6 +847,7 @@ describe('Driver routes (operator), uncovered paths', () => {
         paymentMethodsRemoved: 1,
         vehiclesRemoved: 2,
         tokensDeactivated: 3,
+        avatarRemoved: true,
       });
       const res = await app.inject({
         method: 'POST',
@@ -855,6 +860,7 @@ describe('Driver routes (operator), uncovered paths', () => {
         paymentMethodsRemoved: 1,
         vehiclesRemoved: 2,
         tokensDeactivated: 3,
+        avatarRemoved: true,
       });
       expect(eraseDriverMock).toHaveBeenCalledWith(
         DRIVER_ID,

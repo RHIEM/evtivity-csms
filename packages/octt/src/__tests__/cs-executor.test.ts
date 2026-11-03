@@ -25,6 +25,9 @@ vi.mock('postgres', () => {
   return { default: vi.fn(() => Object.assign(sql, { end })) };
 });
 
+const raiseStationSimHistoryFloor = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('@evtivity/database', () => ({ raiseStationSimHistoryFloor }));
+
 // A station that opens one WebSocket to the test server and answers nothing.
 vi.mock('@evtivity/css/station-simulator', () => {
   class StationSimulator {
@@ -158,6 +161,21 @@ describe('executeCsTest', () => {
     const deletes = sqlCalls.filter((q) => q.startsWith('DELETE'));
     expect(deletes).toHaveLength(10);
     expect(deletes.at(-1)).toContain('DELETE FROM charging_stations');
+    // The SIM history floor of the station's SIM goes up before the delete.
+    const lookup = sqlCalls.findIndex((q) => q.startsWith('SELECT id FROM charging_stations'));
+    expect(lookup).toBeGreaterThan(-1);
+    expect(lookup).toBeLessThan(sqlCalls.lastIndexOf(deletes.at(-1) ?? ''));
+    expect(raiseStationSimHistoryFloor).toHaveBeenCalledWith([]);
+  });
+
+  it('keeps the station row when its SIM history floor is not raised (security review L4)', async () => {
+    raiseStationSimHistoryFloor.mockRejectedValueOnce(new Error('database down'));
+    await executeCsTest(testCase(passed), config, logger);
+    expect(raiseStationSimHistoryFloor).toHaveBeenCalledTimes(1);
+    // The other cleanup runs; only the station delete, whose cascade would drop the
+    // SIM attachment without a floor, is skipped.
+    expect(sqlCalls.filter((q) => q.startsWith('DELETE FROM css_stations'))).toHaveLength(1);
+    expect(sqlCalls.filter((q) => q.startsWith('DELETE FROM charging_stations'))).toEqual([]);
   });
 
   it('answers station messages with version-aware defaults (2.1)', async () => {
@@ -348,6 +366,12 @@ describe('executeCsTest', () => {
       clientCert: ctx.tls?.chargePoint.pem,
       targetUrl: expect.stringMatching(/^wss:\/\/localhost:/),
     });
+    // The station may move to the test servers only (TC_A_19_CS): the first
+    // one and the one the test started.
+    expect(stations[0]?.config['extraAllowedServerUrls']).toEqual([
+      stations[0]?.config['targetUrl'],
+      extraUrl,
+    ]);
   });
 
   it('a tls test on profile 1 stays on ws:// without client certificates', async () => {
@@ -363,6 +387,44 @@ describe('executeCsTest', () => {
     });
     expect(stations[0]?.config['caCert']).toBeUndefined();
     expect(stations[0]?.config['clientCert']).toBeUndefined();
+  });
+
+  it('lets the station download only from the file servers the test starts, and closes them', async () => {
+    let allowedAtStart: readonly string[] = [];
+    let firstUrl = '';
+    let laterUrl = '';
+    let served = '';
+    await executeCsTest(
+      testCase(
+        async (ctx) => {
+          allowedAtStart = [
+            ...((stations[0]?.config['extraAllowedFileTransferHosts'] as string[] | undefined) ??
+              []),
+          ];
+          firstUrl = (await ctx.startFileServer('/fw.bin', Buffer.from('fw'))).url;
+          // A server started later joins the same list the station reads at each transfer.
+          const later = await ctx.startFileServer('/late.bin', Buffer.from('late'), {
+            delayMs: 10,
+          });
+          laterUrl = later.url;
+          served = Buffer.from(await (await fetch(later.url)).arrayBuffer()).toString();
+          return passed();
+        },
+        { skipAutoBoot: true },
+      ),
+      config,
+      logger,
+    );
+    expect(allowedAtStart).toEqual([]);
+    expect(served).toBe('late');
+    expect(stations[0]?.config['extraAllowedFileTransferHosts']).toEqual([
+      new URL(firstUrl).host,
+      new URL(laterUrl).host,
+    ]);
+    expect(new URL(firstUrl).hostname).toBe('127.0.0.1');
+    // The executor closed both servers after the test.
+    await expect(fetch(firstUrl)).rejects.toThrow();
+    await expect(fetch(laterUrl)).rejects.toThrow();
   });
 
   it('startServer serves ws:// for profile 1 and refuses profile 2 without tls', async () => {

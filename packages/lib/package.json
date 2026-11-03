@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/lib",
-  "version": "0.1.48-beta.3",
+  "version": "0.1.49-beta.8",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -14,8 +14,29 @@
     "./permissions": {
       "import": "./src/permissions.ts"
     },
+    "./ocpp-command-permissions": {
+      "import": "./src/ocpp-command-permissions.ts"
+    },
+    "./admin-equivalent": {
+      "import": "./src/admin-equivalent.ts"
+    },
     "./currency": {
       "import": "./src/currency.ts"
+    },
+    "./object-storage-region": {
+      "import": "./src/object-storage-region.ts"
+    },
+    "./station-data-plan": {
+      "import": "./src/station-data-plan.ts"
+    },
+    "./connector-power": {
+      "import": "./src/connector-power.ts"
+    },
+    "./site-layout": {
+      "import": "./src/site-layout.ts"
+    },
+    "./site-layout-schema": {
+      "import": "./src/site-layout-schema.ts"
     },
     "./phone": {
       "import": "./src/phone.ts"
@@ -56,8 +77,14 @@
     "./vehicle-id": {
       "import": "./src/vehicle-id.ts"
     },
+    "./vehicle-appearance": {
+      "import": "./src/vehicle-appearance.ts"
+    },
     "./secret-config": {
       "import": "./src/secret-config.ts"
+    },
+    "./safe-fetch": {
+      "import": "./src/safe-fetch.ts"
     },
     "./uuid": {
       "import": "./src/uuid.ts"
@@ -86,6 +113,9 @@
     "./firmware-campaign": {
       "import": "./src/firmware-campaign.ts"
     },
+    "./account-avatar": {
+      "import": "./src/account-avatar.ts"
+    },
     "./languages": {
       "import": "./src/languages.ts"
     },
@@ -103,6 +133,9 @@
     },
     "./worker-queues": {
       "import": "./src/worker-queues.ts"
+    },
+    "./avatar-cleanup": {
+      "import": "./src/avatar-cleanup.ts"
     },
     "./safe-json": {
       "import": "./src/safe-json.ts"
@@ -140,11 +173,38 @@
     "./sim-settings": {
       "import": "./src/sim-settings.ts"
     },
+    "./payment-terminal-settings": {
+      "import": "./src/payment-terminal-settings.ts"
+    },
+    "./payment-terminal-env": {
+      "import": "./src/payment-terminal-env.ts"
+    },
+    "./data-retention": {
+      "import": "./src/data-retention.ts"
+    },
+    "./dashboard-layout": {
+      "import": "./src/dashboard-layout.ts"
+    },
     "./signal-grade": {
       "import": "./src/signal-grade.ts"
     },
     "./trust-proxy": {
       "import": "./src/trust-proxy.ts"
+    },
+    "./deployment-secrets": {
+      "import": "./src/deployment-secrets.ts"
+    },
+    "./ip-address": {
+      "import": "./src/ip-address.ts"
+    },
+    "./request-log": {
+      "import": "./src/request-log.ts"
+    },
+    "./ocpi-roles": {
+      "import": "./src/ocpi-roles.ts"
+    },
+    "./derived-keys": {
+      "import": "./src/derived-keys.ts"
     },
     "./pdf-branding": {
       "import": "./src/pdf-branding.ts"
@@ -161,11 +221,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@sentry/node": "^10.42.0",
+    "@dicebear/core": "10.7.0",
+    "@dicebear/styles": "10.6.0",
+    "@sentry/node": "^10.57.0",
     "@xmldom/xmldom": "^0.9.12",
     "bullmq": "^6.3.14",
     "handlebars": "^4.7.10",
     "html-to-text": "^10.0.1",
+    "htmlparser2": "^10.1.0",
     "ioredis": "^5.9.3",
     "libphonenumber-js": "^1.13.15",
     "nanoid": "^6.0.1",
@@ -176,13 +239,13 @@
     "reflect-metadata": "^0.2.2",
     "tsyringe": "^4.8.0",
     "undici": "^8.11.2",
-    "zod": "^3.24.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/html-to-text": "^9.0.4",
     "@types/node": "^25.2.3",
     "fast-check": "^4.10.2",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }

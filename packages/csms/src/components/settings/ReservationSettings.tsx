@@ -1,13 +1,14 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useState, useEffect } from 'react';
+import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 import { api } from '@/lib/api';
 import { useCompanyCurrency } from '@/hooks/use-company-currency';
 import { useCompanyTaxBasis } from '@/hooks/use-company-tax-basis';
@@ -22,27 +23,38 @@ export function ReservationSettings({ settings }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const [bufferMinutes, setBufferMinutes] = useState('15');
-  const [cancellationWindowMinutes, setCancellationWindowMinutes] = useState('5');
   const { currency } = useCompanyCurrency();
   // The fee is entered in the company tax basis, like tariff prices.
   const taxBasis = useCompanyTaxBasis() ?? DEFAULT_TAX_BASIS;
   // Typed in the currency (major units), stored in cents. The fee is net: the
   // station tariff's tax rate is added when it is charged.
-  const [cancellationFee, setCancellationFee] = useState(centsToMajorInput(0));
-  const [maxHours, setMaxHours] = useState('3');
-
-  useEffect(() => {
-    if (settings == null) return;
-    const buf = settings['reservation.bufferMinutes'];
-    if (buf != null) setBufferMinutes(Number(buf).toString());
-    const win = settings['reservation.cancellationWindowMinutes'];
-    if (win != null) setCancellationWindowMinutes(Number(win).toString());
-    const fee = settings['reservation.cancellationFeeCents'];
-    if (fee != null) setCancellationFee(centsToMajorInput(Number(fee)));
-    const max = settings['reservation.maxHours'];
-    if (max != null) setMaxHours(Number(max).toString());
+  const loaded = useMemo(() => {
+    const buf = settings?.['reservation.bufferMinutes'];
+    const win = settings?.['reservation.cancellationWindowMinutes'];
+    const fee = settings?.['reservation.cancellationFeeCents'];
+    const max = settings?.['reservation.maxHours'];
+    return {
+      bufferMinutes: buf != null ? Number(buf).toString() : '15',
+      cancellationWindowMinutes: win != null ? Number(win).toString() : '5',
+      cancellationFee: centsToMajorInput(fee != null ? Number(fee) : 0),
+      maxHours: max != null ? Number(max).toString() : '3',
+    };
   }, [settings]);
+  // A settings reload replaces the values only while they are unedited.
+  const [values, setValues, takeNextLoad] = useLoadedValues(loaded);
+  const { bufferMinutes, cancellationWindowMinutes, cancellationFee, maxHours } = values;
+  const setBufferMinutes = (bufferMinutes: string): void => {
+    setValues((v) => ({ ...v, bufferMinutes }));
+  };
+  const setCancellationWindowMinutes = (cancellationWindowMinutes: string): void => {
+    setValues((v) => ({ ...v, cancellationWindowMinutes }));
+  };
+  const setCancellationFee = (cancellationFee: string): void => {
+    setValues((v) => ({ ...v, cancellationFee }));
+  };
+  const setMaxHours = (maxHours: string): void => {
+    setValues((v) => ({ ...v, maxHours }));
+  };
 
   const bufferMutation = useMutation({
     mutationFn: (value: number) => api.put('/v1/settings/reservation.bufferMinutes', { value }),
@@ -96,12 +108,20 @@ export function ReservationSettings({ settings }: Props): React.JSX.Element {
     const fee = parseMajorInputToCents(cancellationFee);
     const max = parseInt(maxHours, 10);
 
+    const sent = values;
     void Promise.all([
       bufferMutation.mutateAsync(Number.isNaN(buf) ? 15 : Math.max(0, buf)),
       windowMutation.mutateAsync(Number.isNaN(win) ? 5 : Math.max(0, win)),
       feeMutation.mutateAsync(fee ?? 0),
       maxHoursMutation.mutateAsync(Number.isNaN(max) ? 3 : Math.max(0, max)),
-    ]);
+    ]).then(
+      () => {
+        takeNextLoad(sent);
+      },
+      () => {
+        // The failed save shows its error note; the edits stay.
+      },
+    );
   }
 
   return (

@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
@@ -40,7 +40,13 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast: toastMock }) }));
 
+import { useAuth } from '@/lib/auth';
 import { StationSecurity } from '../StationSecurity';
+
+// The profile change needs settings.stationConfig:write.
+beforeEach(() => {
+  useAuth.setState({ permissions: ['stations:write', 'settings.stationConfig:write'] });
+});
 
 function renderSecurity(overrides: Partial<Parameters<typeof StationSecurity>[0]> = {}): void {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -236,5 +242,112 @@ describe('StationSecurity', () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(screen.queryByTestId('json-detail')).toBeNull();
+  });
+
+  function logRow(n: number): Record<string, unknown> {
+    return {
+      id: `connection:${String(n)}`,
+      source: 'connection',
+      event: 'connected',
+      severity: null,
+      remoteAddress: '10.0.0.1',
+      metadata: null,
+      createdAt: '2026-10-15T09:00:00Z',
+    };
+  }
+
+  it('pages the log with the shared Pagination and fetches the next page', async () => {
+    getMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes('/security-logs')
+          ? { data: Array.from({ length: 50 }, (_, i) => logRow(i)), total: 120 }
+          : { data: [], total: 0 },
+      ),
+    );
+    renderSecurity();
+
+    await screen.findByTestId('security-log-row-connection:0');
+    expect(screen.getByText('common.pageOf')).toBeTruthy();
+    expect(getMock.mock.calls.some(([url]) => url.includes('page=1&limit=50'))).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.next' }));
+    await waitFor(() => {
+      expect(getMock.mock.calls.some(([url]) => url.includes('page=2&limit=50'))).toBe(true);
+    });
+
+    // A filter change goes back to page 1.
+    fireEvent.change(screen.getByLabelText('stations.securityLogSource'), {
+      target: { value: 'security' },
+    });
+    await waitFor(() => {
+      expect(getMock.mock.calls.at(-1)?.[0]).toContain('page=1&limit=50&source=security');
+    });
+  });
+
+  it('hides the Pagination when the log fits on one page', async () => {
+    getMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes('/security-logs') ? { data: [logRow(1)], total: 1 } : { data: [], total: 0 },
+      ),
+    );
+    renderSecurity();
+    await screen.findByTestId('security-log-row-connection:1');
+    expect(screen.queryByText('common.pageOf')).toBeNull();
+  });
+
+  it('renders the log through the shared table with its states inside it', async () => {
+    getMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes('/security-logs') ? { data: [logRow(1)], total: 1 } : { data: [], total: 0 },
+      ),
+    );
+    renderSecurity();
+    const row = await screen.findByTestId('security-log-row-connection:1');
+    // The shared TableRow and TableCell classes, inside the shared Table scroll wrapper.
+    expect(row.className).toContain('hover:bg-muted/50');
+    expect(row.querySelector('td')?.className).toContain('p-4');
+    expect(row.closest('table')?.parentElement?.className).toContain('overflow-auto');
+    const headers = Array.from(row.closest('table')?.querySelectorAll('th') ?? []);
+    expect(headers.map((h) => h.textContent)).toEqual([
+      'common.timestamp',
+      'common.source',
+      'stations.eventType',
+      'common.severity',
+      'stations.remoteAddress',
+      'common.details',
+    ]);
+  });
+
+  it('shows the empty state as a row of the table', async () => {
+    renderSecurity();
+    const empty = await screen.findByText('stations.noSecurityLogs');
+    expect(empty.closest('td')?.getAttribute('colspan')).toBe('6');
+  });
+
+  it('gives From and To two of the four filter columns from lg', () => {
+    renderSecurity();
+    const grid = document.getElementById('security-logs-source')?.closest('.grid');
+    expect(grid?.className).toContain('lg:grid-cols-4');
+    for (const id of ['security-logs-from', 'security-logs-to']) {
+      const field = document.getElementById(id)?.closest('.space-y-1');
+      expect(field?.className).toContain('lg:col-span-2');
+      expect(field?.className).toContain('min-w-0');
+    }
+  });
+});
+
+describe('StationSecurity permissions', () => {
+  it('hides the profile change and its cancel without settings.stationConfig:write', () => {
+    useAuth.setState({ permissions: ['stations:write'] });
+    renderSecurity({ pendingSecurityProfile: 2 });
+    expect(screen.queryByLabelText(/stations.changeProfile/)).toBeNull();
+    expect(screen.queryByText('stations.cancelProfileUpgrade')).toBeNull();
+  });
+
+  it('keeps change and rotate password with stations:write alone', () => {
+    useAuth.setState({ permissions: ['stations:write'] });
+    renderSecurity();
+    expect(screen.getByText('stations.changePassword')).toBeTruthy();
+    expect(screen.getByText('stations.rotateCredentials')).toBeTruthy();
   });
 });

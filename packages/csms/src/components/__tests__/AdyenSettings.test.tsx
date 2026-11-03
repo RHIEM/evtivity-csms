@@ -51,7 +51,11 @@ vi.mock('@/lib/api', () => {
 });
 
 vi.mock('@/lib/config', () => ({ API_BASE_URL: 'https://api.example.com' }));
-vi.mock('@/lib/auth', () => ({ useHasPermission: () => permission.canWrite }));
+// canWrite stands for settings.payment:write, the permission of the Adyen
+// routes. payments:write alone never opens the form.
+vi.mock('@/lib/auth', () => ({
+  useHasPermission: (perm: string) => perm === 'settings.payment:write' && permission.canWrite,
+}));
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast: toastMock }) }));
 
 import { ApiError } from '@/lib/api';
@@ -131,13 +135,14 @@ function mockGets(
   });
 }
 
-function renderSettings(): void {
+function renderSettings(): QueryClient {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
       <AdyenSettings />
     </QueryClientProvider>,
   );
+  return queryClient;
 }
 
 async function form(): Promise<HTMLFormElement> {
@@ -464,7 +469,7 @@ describe('AdyenSettings', () => {
     });
   });
 
-  it('hides the write controls without payments:write', async () => {
+  it('hides the write controls without settings.payment:write', async () => {
     permission.canWrite = false;
     mockGets();
     renderSettings();
@@ -473,5 +478,59 @@ describe('AdyenSettings', () => {
     expect(screen.queryByRole('button', { name: /settings\.stripeWebhookCreate/ })).toBeNull();
     expect(asInput(screen.getByLabelText('settings.adyenMerchantAccount')).disabled).toBe(true);
     expect(asInput(screen.getByLabelText('settings.adyenApiKey')).disabled).toBe(true);
+  });
+
+  describe('settings reload', () => {
+    async function reload(client: QueryClient, next: AdyenSettingsResponse): Promise<void> {
+      SETTINGS = next;
+      const calls = getMock.mock.calls.filter(([url]) => url === '/v1/settings/adyen').length;
+      await client.invalidateQueries({ queryKey: ['adyen-settings'] });
+      await waitFor(() => {
+        expect(getMock.mock.calls.filter(([url]) => url === '/v1/settings/adyen').length).toBe(
+          calls + 1,
+        );
+      });
+    }
+
+    it('keeps unsaved edits when the settings reload', async () => {
+      mockGets();
+      const client = renderSettings();
+      await form();
+      fireEvent.change(screen.getByLabelText('settings.adyenMerchantAccount'), {
+        target: { value: 'EditedECOM' },
+      });
+      await reload(client, { ...SETTINGS_WITH_SECRETS, merchantAccount: 'OtherTabECOM' });
+      expect(asInput(screen.getByLabelText('settings.adyenMerchantAccount')).value).toBe(
+        'EditedECOM',
+      );
+      expect(screen.getByText('settings.unsavedChanges')).toBeTruthy();
+    });
+
+    it('takes the reloaded values while the form is clean', async () => {
+      mockGets();
+      const client = renderSettings();
+      await form();
+      await reload(client, { ...SETTINGS_WITH_SECRETS, merchantAccount: 'ReloadedECOM' });
+      expect(await screen.findByDisplayValue('ReloadedECOM')).toBeTruthy();
+      expect(screen.queryByText('settings.unsavedChanges')).toBeNull();
+    });
+
+    it('takes the stored values after its own save', async () => {
+      mockGets();
+      putMock.mockImplementation(() => {
+        SETTINGS = { ...SETTINGS_WITH_SECRETS, merchantAccount: 'SavedECOM' };
+        return Promise.resolve({ success: true });
+      });
+      const client = renderSettings();
+      await form();
+      fireEvent.change(screen.getByLabelText('settings.adyenMerchantAccount'), {
+        target: { value: '  SavedECOM  ' },
+      });
+      fireEvent.submit(await form());
+      expect(await screen.findByDisplayValue('SavedECOM')).toBeTruthy();
+      expect(screen.queryByText('settings.unsavedChanges')).toBeNull();
+      await reload(client, { ...SETTINGS_WITH_SECRETS, merchantAccount: 'LaterECOM' });
+      expect(await screen.findByDisplayValue('LaterECOM')).toBeTruthy();
+    });
   });
 });

@@ -261,11 +261,11 @@ export function sanitizeInsightModelOutput(
   };
 }
 
-function valueAt(answer: unknown, path: readonly (string | number)[]): unknown {
+function valueAt(answer: unknown, path: readonly PropertyKey[]): unknown {
   let value = answer;
   for (const key of path) {
     if (value === null || typeof value !== 'object') return undefined;
-    value = (value as Record<string | number, unknown>)[key];
+    value = (value as Record<PropertyKey, unknown>)[key];
   }
   return value;
 }
@@ -285,9 +285,9 @@ export function insightAnswerProblem(answer: unknown): string | null {
   return parsed.error.issues
     .slice(0, 5)
     .map((issue) => {
-      const field = issue.path.length > 0 ? issue.path.join('.') : 'answer';
+      const field = issue.path.length > 0 ? issue.path.map(String).join('.') : 'answer';
       const value = valueAt(answer, issue.path);
-      if (issue.code === 'too_big' && issue.type === 'string' && typeof value === 'string') {
+      if (issue.code === 'too_big' && issue.origin === 'string' && typeof value === 'string') {
         return `${field} has ${String(value.trim().length)} characters, at most ${String(issue.maximum)} are allowed`;
       }
       return `${field}: ${issue.code}`;
@@ -531,6 +531,45 @@ export const AI_INSIGHT_SETTING_KEYS = {
   /** Days after which a one-off event insight still open is closed `expired`. */
   expireAfterDays: 'aiInsights.expireAfterDays',
 } as const;
+
+/**
+ * The AI insights scope (owner decision v0.1.48): `all` analyzes every site
+ * and station (the default, and the behavior before the scope existed);
+ * `selected` analyzes only the selected sites (`sites.ai_insights_enabled`)
+ * and, inside them, the stations not turned off
+ * (`charging_stations.ai_insights_enabled`). A station without a site is out
+ * of a `selected` scope. Written only through `PUT /v1/settings/ai/insights-scope`.
+ */
+export const AI_INSIGHT_SCOPE_SETTING_KEY = 'aiInsights.scope';
+export const AI_INSIGHT_SCOPE_MODES = ['all', 'selected'] as const;
+export type AiInsightScopeMode = (typeof AI_INSIGHT_SCOPE_MODES)[number];
+export const DEFAULT_AI_INSIGHT_SCOPE_MODE: AiInsightScopeMode = 'all';
+
+export function isAiInsightScopeMode(value: unknown): value is AiInsightScopeMode {
+  return typeof value === 'string' && (AI_INSIGHT_SCOPE_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Why AI insights run or not for a station or site, first match wins:
+ * `feature_off` (AI Insights off), `no_site` (a station without a site in a
+ * `selected` scope), `site_not_selected`, `station_turned_off`; in scope:
+ * `all_sites` or `selected`.
+ */
+export const AI_INSIGHT_SCOPE_REASONS = [
+  'all_sites',
+  'selected',
+  'feature_off',
+  'no_site',
+  'site_not_selected',
+  'station_turned_off',
+] as const;
+export type AiInsightScopeReason = (typeof AI_INSIGHT_SCOPE_REASONS)[number];
+
+/** Reasons that mean insights are produced. */
+export const AI_INSIGHT_IN_SCOPE_REASONS: readonly AiInsightScopeReason[] = [
+  'all_sites',
+  'selected',
+];
 
 /**
  * One-off event insights: nothing the system watches clears them, so an open

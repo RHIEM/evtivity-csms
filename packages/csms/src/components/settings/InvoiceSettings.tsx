@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
+import { useLoadedValues } from '@/hooks/use-loaded-values';
 
 const PAYMENT_TERMS_KEY = 'invoice.paymentTermsDays';
 const DEFAULT_PAYMENT_TERMS_DAYS = 30;
@@ -44,17 +45,27 @@ interface Props {
 export function InvoiceSettings({ settings, readOnly = false }: Props): React.JSX.Element {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [days, setDays] = useState(String(DEFAULT_PAYMENT_TERMS_DAYS));
-  const [runDay, setRunDay] = useState(String(DEFAULT_RUN_DAY));
   const [error, setError] = useState<string | null>(null);
   const [runDayError, setRunDayError] = useState<string | null>(null);
-
-  useEffect(() => {
+  const loaded = useMemo(() => {
     const stored = settings?.[PAYMENT_TERMS_KEY];
-    if (typeof stored === 'number') setDays(String(stored));
     const storedRunDay = settings?.[RUN_DAY_KEY];
-    if (typeof storedRunDay === 'number') setRunDay(String(storedRunDay));
+    return {
+      days: String(typeof stored === 'number' ? stored : DEFAULT_PAYMENT_TERMS_DAYS),
+      runDay: String(typeof storedRunDay === 'number' ? storedRunDay : DEFAULT_RUN_DAY),
+    };
   }, [settings]);
+  const [form, setForm, takeNextLoad] = useLoadedValues(loaded, () => {
+    setError(null);
+    setRunDayError(null);
+  });
+  const { days, runDay } = form;
+  const setDays = (value: string): void => {
+    setForm((prev) => ({ ...prev, days: value }));
+  };
+  const setRunDay = (value: string): void => {
+    setForm((prev) => ({ ...prev, runDay: value }));
+  };
 
   const mutation = useMutation({
     mutationFn: async (values: InvoiceSettingsValues) => {
@@ -78,7 +89,15 @@ export function InvoiceSettings({ settings, readOnly = false }: Props): React.JS
       runDayValue == null ? t('settings.fleetInvoiceRunDayInvalid', { max: MAX_RUN_DAY }) : null,
     );
     if (daysValue == null || runDayValue == null) return;
-    mutation.mutate({ days: daysValue, runDay: runDayValue });
+    const sent = form;
+    mutation.mutate(
+      { days: daysValue, runDay: runDayValue },
+      {
+        onSuccess: () => {
+          takeNextLoad(sent);
+        },
+      },
+    );
   }
 
   return (

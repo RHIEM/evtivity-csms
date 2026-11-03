@@ -10,6 +10,8 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { api } from '@/lib/api';
+import { formatConnectorCurrentAmps, formatConnectorPowerKw } from '@/lib/utils';
+import { EmptyState } from '@/components/ui/content-state';
 
 interface ConnectorSummary {
   connectorType: string | null;
@@ -113,7 +115,7 @@ function maxPowerLabel(conns: ConnectorSummary[]): string | null {
     if (c.maxPowerKw != null && c.maxPowerKw > max) max = c.maxPowerKw;
   }
   if (max === 0) return null;
-  return `${String(max)} kW`;
+  return `${formatConnectorPowerKw(max)} kW`;
 }
 
 function maxCurrentLabel(conns: ConnectorSummary[]): string | null {
@@ -122,7 +124,7 @@ function maxCurrentLabel(conns: ConnectorSummary[]): string | null {
     if (c.maxCurrentAmps != null && c.maxCurrentAmps > max) max = c.maxCurrentAmps;
   }
   if (max === 0) return null;
-  return `${String(max)}A`;
+  return `${formatConnectorCurrentAmps(max)}A`;
 }
 
 // Connector-summary row reused by both the nearby and search station cards.
@@ -481,11 +483,7 @@ export function StationSearchList({
         {tab === 'roaming' &&
           roamingResults != null &&
           roamingResults.length === 0 &&
-          query.length >= 2 && (
-            <p className="text-sm text-muted-foreground text-center py-4">
-              {t('chargerSearch.noRoamingResults')}
-            </p>
-          )}
+          query.length >= 2 && <EmptyState>{t('chargerSearch.noRoamingResults')}</EmptyState>}
       </div>
     </div>
   );

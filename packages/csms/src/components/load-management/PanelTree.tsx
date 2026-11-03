@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, ChevronRight, Pencil, Plus, Trash2, Zap, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CreateButton } from '@/components/create-button';
 import { Badge } from '@/components/ui/badge';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api } from '@/lib/api';
@@ -120,17 +121,25 @@ export function PanelTree({
 
   return (
     <div className="space-y-4">
-      {hierarchy.map((panel) => (
-        <PanelNode
-          key={panel.id}
-          siteId={siteId}
-          panel={panel}
-          allPanels={hierarchy}
-          stations={stations}
-          depth={0}
-          onRefresh={onRefresh}
-        />
-      ))}
+      {hierarchy.length > 0 && (
+        // The tree keeps its desktop layout on phones and scrolls sideways in its own
+        // container: nested panels and circuits indent at every level.
+        <div className="overflow-x-auto" data-testid="panel-tree-scroll">
+          <div className="min-w-[36rem] space-y-4">
+            {hierarchy.map((panel) => (
+              <PanelNode
+                key={panel.id}
+                siteId={siteId}
+                panel={panel}
+                allPanels={hierarchy}
+                stations={stations}
+                depth={0}
+                onRefresh={onRefresh}
+              />
+            ))}
+          </div>
+        </div>
+      )}
 
       {hierarchy.length === 0 && (
         <p className="text-sm text-muted-foreground py-4 text-center">
@@ -226,7 +235,7 @@ function PanelNode({
                 {formatNumber(panel.maxContinuousKw, 1)} kW max
               </span>
               {panel.totalConnectedKw > panel.maxContinuousKw && (
-                <Badge variant="warning" className="text-xs">
+                <Badge variant="warning" className="max-w-full whitespace-normal text-xs">
                   {t('loadManagement.oversubscribed')}{' '}
                   {formatNumber(panel.totalConnectedKw / panel.maxContinuousKw, 2)}x
                 </Badge>
@@ -345,29 +354,23 @@ function PanelNode({
               />
             ))}
 
-            <div className="flex gap-2 pl-4">
-              <Button
+            <div className="flex flex-wrap gap-2 pl-4">
+              <CreateButton
+                label={t('loadManagement.addSubPanel')}
                 variant="outline"
                 size="sm"
                 onClick={() => {
                   setAddSubPanelOpen(true);
                 }}
-                className="text-xs"
-              >
-                <Plus className="h-3 w-3" />
-                {t('loadManagement.addSubPanel')}
-              </Button>
-              <Button
+              />
+              <CreateButton
+                label={t('loadManagement.addUnmanagedLoad')}
                 variant="outline"
                 size="sm"
                 onClick={() => {
                   setAddLoadOpen(true);
                 }}
-                className="text-xs"
-              >
-                <Plus className="h-3 w-3" />
-                {t('loadManagement.addUnmanagedLoad')}
-              </Button>
+              />
             </div>
           </div>
         )}
@@ -477,7 +480,7 @@ function CircuitNode({
     <div className="ml-4 rounded-md border bg-background p-3">
       <div className="flex items-start gap-2">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <p className="text-sm font-medium">{circuit.name}</p>
             <span className="text-xs text-muted-foreground">{circuit.breakerRatingAmps}A</span>
             {circuit.phaseConnections != null && (
@@ -579,16 +582,14 @@ function CircuitNode({
       )}
 
       <div className="mt-2 pl-2">
-        <Button
+        <CreateButton
+          label={t('loadManagement.addUnmanagedLoad')}
           variant="outline"
-          size="xs"
+          size="sm"
           onClick={() => {
             setAddLoadOpen(true);
           }}
-        >
-          <Plus className="h-3 w-3" />
-          {t('loadManagement.addUnmanagedLoad')}
-        </Button>
+        />
       </div>
 
       <CircuitForm

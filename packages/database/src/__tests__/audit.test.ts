@@ -205,6 +205,41 @@ describe('writeAudit', () => {
     expect(out['id']).toBe('ocpiPartner_1');
   });
 
+  it('redactAuditPayload masks the password of a firmware campaign URL', () => {
+    expect(
+      redactAuditPayload({
+        firmwareUrl: 'ftp://fw:UrlSecret99@files.example.com:21/fw.bin',
+        name: 'Fall rollout',
+        retries: 3,
+        nested: ['sftp://u:p@[2001:db8::1]/x', 'https://files.example.com/fw.bin'],
+      }),
+    ).toEqual({
+      firmwareUrl: 'ftp://fw:[redacted]@files.example.com:21/fw.bin',
+      name: 'Fall rollout',
+      retries: 3,
+      nested: ['sftp://u:[redacted]@[2001:db8::1]/x', 'https://files.example.com/fw.bin'],
+    });
+  });
+
+  it('redactAuditPayload redacts the value of a setting row whose key is encrypted at rest', () => {
+    expect(redactAuditPayload({ key: 'stripe.secretKeyEnc', value: 'abc' })).toEqual({
+      key: 'stripe.secretKeyEnc',
+      value: '<redacted>',
+    });
+    // A cleared secret holds nothing to hide.
+    expect(redactAuditPayload({ key: 'smtp.passwordEnc', value: '' })).toEqual({
+      key: 'smtp.passwordEnc',
+      value: '',
+    });
+    expect(redactAuditPayload({ key: 'smtp.host', value: 'mail.example.com' })).toEqual({
+      key: 'smtp.host',
+      value: 'mail.example.com',
+    });
+    expect(
+      redactAuditPayload({ settings: [{ key: 'pnc.hubject.clientSecretEnc', value: 'x' }] }),
+    ).toEqual({ settings: [{ key: 'pnc.hubject.clientSecretEnc', value: '<redacted>' }] });
+  });
+
   it('null-defaults all optional actor and snapshot fields', async () => {
     const insertedValues: unknown[] = [];
     const fakeDb = {
