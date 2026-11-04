@@ -155,6 +155,25 @@ export function readInvoiceSeller(settings: Record<string, unknown>): InvoiceSel
 }
 
 /**
+ * The seller kept on an invoice or credit note at issue (`invoices.seller`,
+ * InvoiceSellerSnapshot), or null on a document issued before the seller was
+ * kept: its PDF prints the current settings (loadInvoiceSeller).
+ */
+export function readStoredInvoiceSeller(stored: unknown): InvoiceSeller | null {
+  if (stored == null || typeof stored !== 'object') return null;
+  const record = stored as Record<string, unknown>;
+  return {
+    name: stringField(record, 'name') ?? 'EVtivity',
+    addressLines: addressLines(record),
+    taxId: stringField(record, 'taxId'),
+    taxIdLabel: stringField(record, 'taxIdLabel'),
+    registrationNumber: stringField(record, 'registrationNumber'),
+    email: stringField(record, 'email'),
+    phone: stringField(record, 'phone'),
+  };
+}
+
+/**
  * The lines printed under the seller's name: the address, the tax ID with
  * its label, the registration number, the invoice email and phone. Fields
  * that are not set are left out.
@@ -406,7 +425,7 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     ...new Set(lineItems.flatMap((item) => (item.sessionId != null ? [item.sessionId] : []))),
   ];
   const [seller, branding, payment, evidence] = await Promise.all([
-    loadInvoiceSeller(),
+    readStoredInvoiceSeller(invoice.seller) ?? loadInvoiceSeller(),
     loadPdfBranding(),
     getInvoicePaymentSettings(),
     loadSessionEvidence(sessionIds),

@@ -107,12 +107,15 @@ export async function creditInvoice(
         driverId: before.driverId,
         // A credit note of a fleet invoice bills the same fleet and period, with
         // the bill-to block and language of the invoice it credits. A member
-        // invoice's credit note is a member credit note (same driver).
+        // invoice's credit note is a member credit note (same driver). Every
+        // credit note keeps the seller of the invoice it credits (null on an
+        // invoice issued before the seller was kept: both print the settings).
         fleetId: before.fleetId,
         memberBilled: before.memberBilled,
         periodStart: before.periodStart,
         periodEnd: before.periodEnd,
         billTo: before.billTo,
+        seller: before.seller,
         language: before.language,
         status: 'issued',
         issuedAt: now,

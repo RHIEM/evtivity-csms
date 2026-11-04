@@ -14,6 +14,7 @@ import {
   getCompanyCurrency,
   getInvoicePaymentTermsDays,
   allocateInvoiceNumber,
+  loadInvoiceSellerSnapshot,
 } from '@evtivity/database';
 import {
   chargedCostBreakdown,
@@ -423,9 +424,9 @@ export interface InsertInvoiceInput {
 /**
  * Insert an invoice and its lines in one transaction, and claim its sessions
  * for it: each session's invoice_id is set only while it is null, so a session
- * claimed by a concurrent invoice rolls this one back. The header holds the
- * sum of the lines; it must equal the amount the sessions and fees were
- * charged.
+ * claimed by a concurrent invoice rolls this one back. The header keeps the
+ * seller as it is at issue (loadInvoiceSellerSnapshot) and holds the sum of
+ * the lines; it must equal the amount the sessions and fees were charged.
  */
 export async function insertInvoice(input: InsertInvoiceInput): Promise<InvoiceWithLineItems> {
   assertLinesMatchCharged(input.lines, input.chargedCents);
@@ -467,12 +468,14 @@ export async function insertInvoiceInTransaction(
   const claimGuard = input.sessionClaimGuard ?? sessionNotOnAccount;
 
   const invoiceNumber = await allocateInvoiceNumber(tx, 'invoice', now);
+  const seller = await loadInvoiceSellerSnapshot(tx);
   const [invoice] = await tx
     .insert(invoices)
     .values({
       invoiceNumber,
       driverId,
       status,
+      seller,
       issuedAt: now,
       dueAt,
       paidAt: status === 'paid' ? now : null,

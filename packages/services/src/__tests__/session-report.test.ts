@@ -104,6 +104,7 @@ function detail(overrides: Partial<InvoiceDetail['invoice']> = {}): InvoiceDetai
       periodStart: '2026-11-01',
       periodEnd: '2026-11-30',
       billTo: { name: 'Erika Muster', email: 'erika@example.com' },
+      seller: null,
       language: 'de',
       sentAt: null,
       overdueNoticeSentAt: null,
