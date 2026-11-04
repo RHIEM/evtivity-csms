@@ -1,6 +1,6 @@
 # Ladesitzungsbericht statt Rechnung (externe Fakturierung)
 
-- **Status:** Freigegeben (03.11.2026), umgesetzt auf `feature/session-report`; noch nicht in `rhiem/main` und nicht deployt
+- **Status:** Zurückgebaut am 04.11.2026 (Reverts `0b97f226` und `5bd53c76` auf `rhiem/main`), ersetzt durch [rechnungssteller.md](rechnungssteller.md). War deployt vom 04.11.2026 bis zum nächsten Deployment.
 - **Zweig:** `feature/session-report`, Basis `rhiem/main` (`aee70a30`) statt des Upstream-Tags (Entscheidung des Nutzers 03.11.2026): Der Bericht nutzt die Eichrecht-Prüfzeile (`invoice-evidence.ts`) und die Token-Bezeichnung (`driver_tokens.label`), die es nur im Fork gibt. Für einen PR an EVtivity muss der Fork-Anteil herausgelöst werden.
 - **Upstream:** zuerst als Ideas-Discussion bei EVtivity vorschlagen; Umsetzung im Fork nur, wenn das nicht bis zur ersten echten Abrechnung (frühestens 01.12.2026) warten kann
 - **Termin:** Die erste echte Abrechnung ist die für November, frühestens am 01.12.2026 (seit v0.1.48 sind nur abgeschlossene Monate abrechenbar)

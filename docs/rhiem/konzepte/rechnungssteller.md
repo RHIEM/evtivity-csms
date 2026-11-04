@@ -1,6 +1,6 @@
 # Mehrere Rechnungssteller mit eigenen Nummernkreisen
 
-- **Status:** Zur Umsetzung freigegeben (04.11.2026); offene Punkte siehe unten. Ersetzt den Ladesitzungsbericht ([ladesitzungsbericht.md](ladesitzungsbericht.md))
+- **Status:** Umgesetzt (04.11.2026), in `rhiem/main` gemergt, nicht deployt; Annahmen und Rückfragen unten. Ersetzt den Ladesitzungsbericht ([ladesitzungsbericht.md](ladesitzungsbericht.md)), der zurückgebaut ist
 - **Anlass:** Abstimmung am 04.11.2026 mit den Fachbereichen (Präsentation, Übergabe, Rechnungsanforderungen). Weitere Anforderungen an die Rechnung folgen per E-Mail.
 - **Basis:** Tag `v0.1.49` (Stand von `rhiem/main` nach dem Update vom 04.11.2026). Jeder Baustein soll für sich als PR bei EVtivity taugen und ohne Rechnungssteller das heutige Verhalten unverändert lassen.
 - **Upstream:** Entscheidung des Nutzers 04.11.2026: erst im Fork umsetzen und an EVtivity melden, wenn der Stand final ist (Ideas-Discussion, Entwurf am Ende, danach PRs).
@@ -143,6 +143,87 @@ Wenn die Bausteine in `rhiem/main` sind und Fall 3 damit läuft:
 - **Logo und Fußzeile je Rechnungssteller?** Im Stamm sind sie global (`pdf.logo`, `pdf.footer`). Falls jede GmbH ihr eigenes Logo bzw. ihre eigene Fußzeile (Geschäftsführer, Registergericht) braucht, kommen zwei Felder an den Rechnungssteller.
 - **Portal:** Soll der Mitarbeiter seine Gehaltsverrechnungs-Rechnungen im Portal sehen, oder nur die Stelle der GmbH per E-Mail?
 - **Nummernkreise:** endgültige Werte je GmbH.
+
+## Umsetzung (04.11.2026)
+
+Alle vier Bausteine sind umgesetzt, geprüft und mit `--no-ff` in `rhiem/main` gemergt. Nicht deployt. Die Zweige sind gestapelt, jeder baut auf dem vorigen auf; für PRs an EVtivity werden sie einzeln auf `upstream/main` gebracht.
+
+| Baustein                    | Zweig                                            | Commit     | Migration                             |
+| --------------------------- | ------------------------------------------------ | ---------- | ------------------------------------- |
+| 2 Verkäufer an der Rechnung | `feature/invoice-seller-snapshot` (ab `v0.1.49`) | `5a4d5a2a` | `rhiem_0005_invoice_seller`           |
+| 1 Rechnungssteller          | `feature/invoice-issuers`                        | `407ee332` | `rhiem_0006_invoice_issuers`          |
+| 4 Zahlung extern            | `feature/fleet-external-settlement`              | `ae2069ed` | `rhiem_0007_fleet_account_settlement` |
+| 3 Zustellung                | `feature/member-invoice-delivery`                | `252b9c13` | `rhiem_0008_member_invoice_delivery`  |
+
+Merges in `rhiem/main`: `c90d124b` (2), `dd8e5588` (1), `5cad30bf` (4), `a4218758` (3). Der Ladesitzungsbericht ist vorher zurückgenommen worden: `0b97f226` (Fix-Merge) und `5bd53c76` (Feature-Merge).
+
+**Geprüft** je Zweig und auf `rhiem/main`: typecheck, lint, format:check, check:migrations, check:openapi, alle Tests. Migration mit PostgreSQL 17: Neuinstallation (247), zweiter Lauf ohne Änderung, Pilot-Abschluss-Dump vom 16.10.2026 (98 nachgeholt, `verify-migrations-applied OK: 247`). Das Schema der Neuinstallation und des Pilot-Dumps stimmt überein, bis auf die Schreibweise alter Upstream-CHECK-Constraints.
+
+### Abweichungen vom Entwurf
+
+- **Eigene Zählertabelle** `invoice_issuer_number_counters` (Rechnungssteller, Art, Jahr; Jahr 0 ohne Jahresangabe) statt Zeilen in `invoice_number_counters`: deren Namensspalte (`varchar(32)`) ist für Schlüssel mit ID zu kurz.
+- **Keine Bankverbindung je Rechnungssteller.** Bei Gehaltsverrechnung entfällt der Zahlungsblock ohnehin; sonst gelten die Bankdaten des Unternehmens.
+- **Audit** der Rechnungssteller in der Einstellungshistorie (`setting_audit_log`, Schlüssel `invoiceIssuer:<id>`), keine eigene Tabelle.
+- **E-Mail an die Rechnungskontakte** mit den vorhandenen Ereignissen `invoice.FleetInvoice` / `invoice.FleetCreditNote` statt einer eigenen Vorlage.
+- **Status „Verrechnet“** ist kein neuer Rechnungsstatus: Die Rechnung ist `paid` und trägt `settlement_note`. CSMS und Portal zeigen in der Detailansicht „Verrechnet“ mit dem Hinweis.
+
+### API und Oberfläche
+
+- `GET/POST /v1/invoice-issuers`, `PATCH/DELETE /v1/invoice-issuers/:id` (`settings.system:read/write`, nur mit Zugriff auf alle Standorte). Neue Fehlercodes `INVOICE_ISSUER_NOT_FOUND`, `INVOICE_ISSUER_IN_USE`, `INVOICE_ISSUER_NUMBER_FORMAT_LOCKED`.
+- `PATCH /v1/fleets/:id/billing-profile`: neue Felder `invoiceIssuerId`, `accountSettlement` (`payment` | `external`), `settlementNote`, `memberInvoiceDelivery` (`driver` | `billing_contacts`).
+- Rechnungen (CSMS und Portal): Felder `seller` (intern), `issuerId`, `settlementNote`.
+- CSMS: Einstellungen → Unternehmen → „Rechnungssteller für Flotten“; im Rechnungsprofil der Flotte die Felder Rechnungssteller, Verrechnung mit Hinweis und „Mitgliederrechnungen senden an“.
+
+### Einrichtung für RHIEM (nach dem Deployment)
+
+1. Unter Einstellungen → Unternehmen die Rechnungssteller anlegen: RHIEM Intermedia, RHIEM Services, RHIEM Packaging & Print und einen für den Sonderfall, jeweils mit Anschrift, USt-ID und Nummernkreisen. Format und Startwerte erst festlegen, wenn sie endgültig sind: Nach der ersten Rechnung sind sie gesperrt.
+2. Flotten je GmbH:
+   - „<Firma> – Dienstwagen“: Kontoabrechnung an, Monatslauf aus, kein Kreditlimit.
+   - „<Firma> – Mitarbeiter“: Kontoabrechnung an, „Each Driver“, Rechnungssteller = GmbH, Verrechnung extern mit Hinweis, Mitgliederrechnungen an die Rechnungskontakte (Stelle der GmbH), Monatslauf an.
+   - Sonderfall: eigene Flotte mit eigenem Rechnungssteller, Zustellung an den Nutzer.
+3. Fahrer den Flotten zuordnen. Unabgerechnete Sitzungen seit 01.11.2026 und die Altdaten des Nutzers per SQL umstempeln (`billing_mode`, `billing_fleet_id`, `member_billed`, nur wo `invoice_id IS NULL`); vorher an einem Produktions-Dump lokal testen.
+4. In der Produktion `invoice.externalInvoicing` löschen (Einstellung des zurückgebauten Ladesitzungsberichts) und prüfen, ob das Ereignis `invoice.MemberSessionReport` noch in den Benachrichtigungseinstellungen steht.
+
+## Annahmen und Rückfragen
+
+Während der Umsetzung getroffene Annahmen. Bitte bestätigen oder korrigieren; in Ausnahmen bauen wir zurück.
+
+### Baustein 2 (Verkäufer an der Rechnung)
+
+1. **Keine Nachträge für alte Rechnungen.** Bereits ausgestellte Rechnungen bekommen keinen gespeicherten Verkäufer, ihr PDF liest weiter die aktuellen Einstellungen. Alternative: einmalig mit dem heutigen Stand füllen.
+2. **Gutschrift übernimmt den Verkäufer der Rechnung**, nicht den aktuellen.
+
+### Baustein 1 (Rechnungssteller)
+
+3. **Eigene Zählertabelle** `invoice_issuer_number_counters` (Rechnungssteller, Art, Jahr) statt `invoice_number_counters`: deren Namensspalte (`varchar(32)`) ist für Schlüssel mit ID zu kurz.
+4. **Präfix:** nur Buchstaben, Ziffern und `- . _`, höchstens 20 Zeichen. Kein `/`, weil die Nummer den PDF-Dateinamen bildet.
+5. **Trennzeichen:** Das Präfix bringt sein Trennzeichen selbst mit (`RPP-`). Nach dem Jahr steht immer `-` (`RPP-26-0001`, ohne Präfix `26-0001`).
+6. **Sperre:** Präfix, Jahr, Startwert und Stellen einer Belegart sind gesperrt, sobald der Rechnungssteller einen Beleg dieser Art ausgestellt hat (auch der Startwert für künftige Jahre). Die Kopfdaten (Name, Anschrift, USt-ID) bleiben änderbar und gelten für später ausgestellte Belege.
+7. **Überschneidung von Kreisen** wird nicht beim Speichern geprüft, nur ein Hinweis im Formular. Hart sichert der globale `UNIQUE`-Index der Rechnungsnummer: Eine doppelte Nummer lässt die Ausstellung scheitern.
+8. **Keine Bankverbindung je Rechnungssteller.** Bei „Zahlung extern“ wird kein Zahlungsblock gedruckt; sonst gelten die Bankdaten des Unternehmens.
+9. **Audit über die Einstellungshistorie:** Anlegen, Ändern und Löschen eines Rechnungsstellers stehen in `setting_audit_log` unter dem Schlüssel `invoiceIssuer:<id>` (Einstellungen → Historie), keine eigene Audit-Tabelle. Die Zuordnung an der Flotte steht wie das übrige Rechnungsprofil im Flotten-Audit.
+10. **Löschen** nur, solange keine Flotte und keine Rechnung den Rechnungssteller nutzt und noch kein Beleg nummeriert wurde.
+11. **Berechtigung:** Rechnungssteller verwalten wie die Verkäuferdaten (`settings.system:read/write`, alle Standorte). Wer nur das Flottenprofil bearbeiten darf, sieht in der Auswahl nur „Das Unternehmen“ und den gesetzten Eintrag.
+12. **Logo und Fußzeile** bleiben für alle Rechnungssteller gleich (global). Offen, ob je GmbH ein eigenes Logo oder eine eigene Fußzeile (Geschäftsführung, Registergericht) nötig ist.
+13. **Neue Fehlercodes** (`INVOICE_ISSUER_IN_USE`, `INVOICE_ISSUER_NOT_FOUND`, `INVOICE_ISSUER_NUMBER_FORMAT_LOCKED`) stehen im Fork direkt in `error-codes.generated.ts`. Für einen PR pflegt EVtivity sie in seiner Website-Liste.
+14. **Zweige gestapelt:** Baustein 1 baut auf Baustein 2 auf (`feature/invoice-issuers` von `feature/invoice-seller-snapshot`).
+
+### Baustein 4 (Zahlung außerhalb von EVtivity)
+
+15. **Status „bezahlt“ statt eigenem Status.** Verrechnete Rechnungen entstehen als `paid` (bezahlt am Rechnungsdatum, fällig am Rechnungsdatum). CSMS und Portal zeigen sie in der Detailansicht als „Verrechnet“ mit dem Hinweis. In den Listen steht weiter „Bezahlt“.
+16. **Hinweistext je Flotte**, nicht je Rechnungssteller (eine GmbH könnte sonst nicht beide Arten haben). Ohne eigenen Text druckt das PDF den Standard „Bitte nicht überweisen. Der Betrag wird gesondert verrechnet.“ in der Rechnungssprache.
+17. **Der Hinweis ersetzt den ganzen Zahlungsblock**, auch wenn eine IBAN hinterlegt ist. Er steht unter der Überschrift „Zahlungsinformationen“.
+18. **Gutschriften** einer verrechneten Rechnung tragen denselben Hinweis (statt „wird erstattet oder verrechnet“). Ihr Status bleibt wie im Stamm „ausgestellt“, ohne Fälligkeit.
+19. **Umstellen wirkt nur auf künftige Rechnungen.** Bereits ausgestellte Rechnungen behalten Status und Hinweis.
+20. **Kreditlimit** sieht verrechnete Rechnungen nicht mehr als offen. Es begrenzt nur noch unabgerechnete und laufende Sitzungen (für Gehaltsverrechnung ist ohnehin keins vorgesehen).
+
+### Baustein 3 (Zustellung der Mitgliederrechnungen)
+
+21. **E-Mail an die Rechnungskontakte mit der Vorlage der Flottenrechnung** (`invoice.FleetInvoice` bzw. `invoice.FleetCreditNote`, Betreff etwa „Rechnung … für Flotte …“). Das PDF liegt bei und nennt den Mitarbeiter. Eine eigene Vorlage „Mitgliederrechnung an Rechnungskontakte“ gibt es nicht.
+22. **Sprache:** Die E-Mail an die Rechnungskontakte ist in der Rechnungssprache der Flotte, das PDF bleibt in der Sprache des Fahrers.
+23. **Der Fahrer bekommt keine E-Mail und keine Push-Nachricht.** Im Portal sieht er die Rechnung weiterhin (offen, ob das gewünscht ist).
+24. **Zahlungserinnerungen** gehen weiter an den Fahrer. Bei Gehaltsverrechnung entstehen ohnehin keine.
+25. **Keine Rechnungskontakte:** Die Rechnung entsteht trotzdem, der Versand meldet „keine Kontakte“, der Monatslauf protokolliert das. Ist der Monatslauf an, verlangt das Profil wie im Stamm mindestens einen Kontakt.
 
 ## Entwurf Ideas-Discussion (EVtivity)
 
