@@ -14,8 +14,12 @@ import {
   getCompanyCurrency,
   getInvoicePaymentTermsDays,
   allocateInvoiceNumber,
+  allocateIssuerInvoiceNumber,
+  invoiceSellerSnapshotFromIssuer,
+  loadInvoiceIssuerForIssue,
   loadInvoiceSellerSnapshot,
 } from '@evtivity/database';
+import type { InvoiceKind, InvoiceSellerSnapshot } from '@evtivity/database';
 import {
   chargedCostBreakdown,
   splitGrossByTaxRate,
@@ -387,10 +391,47 @@ export interface FleetInvoiceHeader {
   language: string;
   /** A member invoice: billed to `driverId` for their sessions on the fleet's account. */
   memberBilled?: boolean;
+  /** The fleet's invoice issuer (seller and number range); null or left out: the company. */
+  issuerId?: string | null;
 }
 
 /** The transaction an invoice is inserted in. */
 export type InvoiceTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** The number, seller and issuer of a new document (allocateDocumentNumber). */
+export interface DocumentNumber {
+  issuerId: string | null;
+  invoiceNumber: string;
+  seller: InvoiceSellerSnapshot;
+}
+
+/**
+ * The number and seller of a new invoice or credit note, inside its
+ * transaction. With an issuer: the next number of the issuer's range of the
+ * kind and the issuer as seller. Without: the next INV-/CN- number and the
+ * company settings as seller.
+ */
+export async function allocateDocumentNumber(
+  tx: InvoiceTx,
+  issuerId: string | null,
+  kind: InvoiceKind,
+  issuedAt: Date,
+): Promise<DocumentNumber> {
+  if (issuerId == null) {
+    return {
+      issuerId: null,
+      invoiceNumber: await allocateInvoiceNumber(tx, kind, issuedAt),
+      seller: await loadInvoiceSellerSnapshot(tx),
+    };
+  }
+  const issuer = await loadInvoiceIssuerForIssue(tx, issuerId);
+  if (issuer == null) throw new Error(`Invoice issuer '${issuerId}' not found`);
+  return {
+    issuerId: issuer.id,
+    invoiceNumber: await allocateIssuerInvoiceNumber(tx, issuer, kind, issuedAt),
+    seller: invoiceSellerSnapshotFromIssuer(issuer),
+  };
+}
 
 export interface InsertInvoiceInput {
   driverId: string | null;
@@ -462,8 +503,12 @@ export async function insertInvoiceInTransaction(
   ];
   const claimGuard = input.sessionClaimGuard ?? sessionNotOnAccount;
 
-  const invoiceNumber = await allocateInvoiceNumber(tx, 'invoice', now);
-  const seller = await loadInvoiceSellerSnapshot(tx);
+  const { issuerId, invoiceNumber, seller } = await allocateDocumentNumber(
+    tx,
+    input.fleet?.issuerId ?? null,
+    'invoice',
+    now,
+  );
   const [invoice] = await tx
     .insert(invoices)
     .values({
@@ -471,6 +516,7 @@ export async function insertInvoiceInTransaction(
       driverId,
       status,
       seller,
+      issuerId,
       issuedAt: now,
       dueAt,
       paidAt: status === 'paid' ? now : null,

@@ -48,6 +48,7 @@ import {
   sites,
   pricingGroupFleets,
   pricingGroups,
+  invoiceIssuers,
 } from '@evtivity/database';
 import type { PaginationParams } from '../lib/pagination.js';
 import { sessionsAtSites } from '../lib/session-site-scope.js';
@@ -359,6 +360,8 @@ export interface FleetBillingProfile {
   paymentTermsDays: number | null;
   autoInvoice: boolean;
   invoiceDateMode: InvoiceDateMode;
+  /** The issuer the fleet's invoices are issued under; null: the company. */
+  invoiceIssuerId: string | null;
 }
 
 export type FleetBillingProfilePatch = {
@@ -378,6 +381,7 @@ const PROFILE_KEYS = [
   'paymentTermsDays',
   'autoInvoice',
   'invoiceDateMode',
+  'invoiceIssuerId',
 ] as const satisfies readonly (keyof FleetBillingProfile)[];
 
 const PROFILE_TEXT_KEYS = [
@@ -423,6 +427,7 @@ export function mergeBillingProfile(
   if (patch.paymentTermsDays !== undefined) next.paymentTermsDays = patch.paymentTermsDays;
   if (patch.autoInvoice !== undefined) next.autoInvoice = patch.autoInvoice;
   if (patch.invoiceDateMode !== undefined) next.invoiceDateMode = patch.invoiceDateMode;
+  if (patch.invoiceIssuerId !== undefined) next.invoiceIssuerId = patch.invoiceIssuerId;
   return next;
 }
 
@@ -454,14 +459,19 @@ const billingContactRequiredError = (): AppError =>
     'FLEET_BILLING_CONTACT_REQUIRED',
   );
 
+const invoiceIssuerNotFoundError = (): AppError =>
+  new AppError('Invoice issuer not found', 400, 'INVOICE_ISSUER_NOT_FOUND');
+
 /**
  * Updates the fleet billing profile: the only writer of the profile columns
  * (billing contacts, bill-to, invoice language, payment terms, auto invoice,
- * invoice date mode;
+ * invoice date mode, invoice issuer;
  * P3). Keys left out keep their value. Refused with 400
  * FLEET_BILLING_CONTACT_REQUIRED when auto invoice would be on without a
  * billing contact (the check `fleets_auto_invoice_contact_check` holds the
- * same rule). Only a change is written and audited (fleet_audit_log
+ * same rule), and with 400 INVOICE_ISSUER_NOT_FOUND when the invoice issuer
+ * to set does not exist (read with a share lock, so it cannot be deleted
+ * before the commit). Only a change is written and audited (fleet_audit_log
  * `billing_updated` with the changed keys), so a repeated request writes
  * nothing (P7). Null when the fleet does not exist.
  */
@@ -476,6 +486,14 @@ export async function updateFleetBillingProfile(
     const next = mergeBillingProfile(current, patch);
     if (next.autoInvoice && next.billingContactEmails.length === 0) {
       throw billingContactRequiredError();
+    }
+    if (next.invoiceIssuerId != null && next.invoiceIssuerId !== current.invoiceIssuerId) {
+      const [issuer] = await tx
+        .select({ id: invoiceIssuers.id })
+        .from(invoiceIssuers)
+        .where(eq(invoiceIssuers.id, next.invoiceIssuerId))
+        .for('share');
+      if (issuer == null) throw invoiceIssuerNotFoundError();
     }
     const diff = diffBillingProfile(pickBillingProfile(current), next);
     if (diff == null) return { fleet: current, diff };

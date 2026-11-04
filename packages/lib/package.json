@@ -217,6 +217,9 @@
     },
     "./invoice-payment": {
       "import": "./src/invoice-payment.ts"
+    },
+    "./invoice-issuer": {
+      "import": "./src/invoice-issuer.ts"
     }
   },
   "scripts": {

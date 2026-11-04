@@ -97,6 +97,10 @@ vi.mock('@evtivity/database', () => {
     invoiceLineItems: h.table('invoiceLineItems'),
     chargingSessions: h.table('chargingSessions'),
     allocateInvoiceNumber: vi.fn(() => Promise.resolve('CN-202606-0001')),
+    loadInvoiceIssuerForIssue: vi.fn((_tx: unknown, id: string) =>
+      Promise.resolve(id === 'iis_rs' ? { id: 'iis_rs', name: 'RHIEM Services GmbH' } : null),
+    ),
+    allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('GS-26-0001')),
   };
 });
 
@@ -114,7 +118,7 @@ vi.mock('../invoice.service.js', async () => {
   };
 });
 
-import { db, allocateInvoiceNumber } from '@evtivity/database';
+import { db, allocateInvoiceNumber, allocateIssuerInvoiceNumber } from '@evtivity/database';
 import { creditInvoice } from '../credit-note.service.js';
 
 const ISSUED = new Date('2026-06-01T10:00:00Z');
@@ -260,6 +264,41 @@ describe('creditInvoice', () => {
     await creditInvoice('inv_1', 'Wrong tariff');
     const [note] = h.state.inserted['invoices'] ?? [];
     expect(note).toMatchObject({ seller: null });
+  });
+
+  it("numbers a credit note of an issuer's invoice from the issuer's credit note range", async () => {
+    h.state.invoice = invoice({ issuerId: 'iis_rs', seller: { name: 'RHIEM Services GmbH' } });
+    await creditInvoice('inv_1', 'Wrong tariff');
+
+    const [note] = h.state.inserted['invoices'] ?? [];
+    expect(note).toMatchObject({
+      invoiceNumber: 'GS-26-0001',
+      issuerId: 'iis_rs',
+      seller: { name: 'RHIEM Services GmbH' },
+    });
+    expect(vi.mocked(allocateIssuerInvoiceNumber)).toHaveBeenCalledWith(
+      db,
+      { id: 'iis_rs', name: 'RHIEM Services GmbH' },
+      'credit_note',
+      expect.any(Date),
+    );
+    expect(vi.mocked(allocateInvoiceNumber)).not.toHaveBeenCalled();
+  });
+
+  it('numbers a credit note without issuer from the CN range', async () => {
+    h.state.invoice = invoice({ issuerId: null });
+    await creditInvoice('inv_1', 'Wrong tariff');
+
+    const [note] = h.state.inserted['invoices'] ?? [];
+    expect(note).toMatchObject({ invoiceNumber: 'CN-202606-0001', issuerId: null });
+    expect(vi.mocked(allocateIssuerInvoiceNumber)).not.toHaveBeenCalled();
+  });
+
+  it('fails when the issuer of the credited invoice is gone', async () => {
+    h.state.invoice = invoice({ issuerId: 'iis_gone' });
+    await expect(creditInvoice('inv_1', 'Wrong tariff')).rejects.toThrow(
+      "Invoice issuer 'iis_gone' not found",
+    );
   });
 
   it('copies member_billed: the credit note of a member invoice is a member credit note', async () => {

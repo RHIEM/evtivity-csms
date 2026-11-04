@@ -15,6 +15,7 @@ import type { Permission } from '@evtivity/lib/permissions';
 import { useAuth, hasPermissionCheck, useHasAllSiteAccess } from '@/lib/auth';
 import { CompanySettings } from '@/components/settings/CompanySettings';
 import { InvoiceSellerSettings } from '@/components/settings/InvoiceSellerSettings';
+import { InvoiceIssuerSettings } from '@/components/settings/InvoiceIssuerSettings';
 import { InvoicePaymentSettings } from '@/components/settings/InvoicePaymentSettings';
 import { PdfBrandingSettings } from '@/components/settings/PdfBrandingSettings';
 import { MarketingSettings } from '@/components/settings/MarketingSettings';
@@ -218,6 +219,7 @@ export function Settings(): React.JSX.Element {
           <TabsContent value="company" className="space-y-6">
             <CompanySettings settings={settings} svgDataUri={svgDataUri} hasIcon={hasIcon} />
             <InvoiceSellerSettings settings={settings} />
+            <InvoiceIssuerSettings />
             <InvoicePaymentSettings settings={settings} />
             <PdfBrandingSettings settings={settings} />
           </TabsContent>

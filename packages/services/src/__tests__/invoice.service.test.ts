@@ -141,6 +141,11 @@ vi.mock('@evtivity/database', () => {
     loadInvoiceSellerSnapshot: vi.fn(() =>
       Promise.resolve({ name: 'Acme Charging GmbH', city: 'Berlin', taxId: 'DE111111111' }),
     ),
+    loadInvoiceIssuerForIssue: vi.fn((_tx: unknown, id: string) =>
+      Promise.resolve(id === 'iis_rs' ? { id: 'iis_rs', name: 'RHIEM Services GmbH' } : null),
+    ),
+    allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('10000')),
+    invoiceSellerSnapshotFromIssuer: vi.fn((issuer: { name: string }) => ({ name: issuer.name })),
   };
 });
 
@@ -178,6 +183,7 @@ import type { TariffInput, TaxBasis } from '@evtivity/lib';
 import { inArray, isNull, sql } from 'drizzle-orm';
 import {
   allocateInvoiceNumber,
+  allocateIssuerInvoiceNumber,
   chargingSessions,
   db,
   loadInvoiceSellerSnapshot,
@@ -185,6 +191,7 @@ import {
 } from '@evtivity/database';
 import { claimFeeRecordsForInvoice, releaseInvoiceFeeRecords } from '@evtivity/payments';
 import {
+  allocateDocumentNumber,
   createSessionInvoice,
   createAggregatedInvoice,
   getInvoice,
@@ -1170,5 +1177,44 @@ describe('markInvoicePaid', () => {
   it('returns null when the invoice does not exist', async () => {
     queue('invoices', []);
     expect(await markInvoicePaid('missing', { paidAt, reference: null })).toBeNull();
+  });
+});
+
+describe('allocateDocumentNumber', () => {
+  const issuedAt = new Date('2026-11-30T12:00:00Z');
+
+  it('numbers from the INV range and keeps the company as seller without an issuer', async () => {
+    const result = await allocateDocumentNumber(db as never, null, 'invoice', issuedAt);
+
+    expect(result).toEqual({
+      issuerId: null,
+      invoiceNumber: 'INV-202606-0042',
+      seller: { name: 'Acme Charging GmbH', city: 'Berlin', taxId: 'DE111111111' },
+    });
+    expect(vi.mocked(allocateIssuerInvoiceNumber)).not.toHaveBeenCalled();
+  });
+
+  it("numbers from the issuer's range and keeps the issuer as seller", async () => {
+    const result = await allocateDocumentNumber(db as never, 'iis_rs', 'invoice', issuedAt);
+
+    expect(result).toEqual({
+      issuerId: 'iis_rs',
+      invoiceNumber: '10000',
+      seller: { name: 'RHIEM Services GmbH' },
+    });
+    expect(vi.mocked(allocateIssuerInvoiceNumber)).toHaveBeenCalledWith(
+      db,
+      { id: 'iis_rs', name: 'RHIEM Services GmbH' },
+      'invoice',
+      issuedAt,
+    );
+    expect(vi.mocked(loadInvoiceSellerSnapshot)).not.toHaveBeenCalled();
+    expect(vi.mocked(allocateInvoiceNumber)).not.toHaveBeenCalled();
+  });
+
+  it('fails when the issuer does not exist', async () => {
+    await expect(
+      allocateDocumentNumber(db as never, 'iis_gone', 'invoice', issuedAt),
+    ).rejects.toThrow("Invoice issuer 'iis_gone' not found");
   });
 });

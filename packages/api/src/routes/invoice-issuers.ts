@@ -1,0 +1,413 @@
+// Copyright (c) 2024-2026 EVtivity. All rights reserved.
+// SPDX-License-Identifier: BUSL-1.1
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+import { asc, eq, sql } from 'drizzle-orm';
+import {
+  db,
+  fleets,
+  invoiceIssuers,
+  invoices,
+  invoiceIssuerNumberCounters,
+  settingAuditLog,
+  writeAudit,
+} from '@evtivity/database';
+import type { InvoiceIssuer } from '@evtivity/database';
+import {
+  MAX_INVOICE_NUMBER_DIGITS,
+  MAX_INVOICE_NUMBER_PREFIX_LENGTH,
+  MAX_INVOICE_NUMBER_START,
+  INVOICE_NUMBER_PREFIX_PATTERN,
+} from '@evtivity/lib';
+import { zodSchema } from '../lib/zod-schema.js';
+import { itemResponse, arrayResponse, errorWith } from '../lib/response-schemas.js';
+import { ERROR_CODES } from '../lib/error-codes.generated.js';
+import { requireAllSiteAccess } from '../lib/site-access.js';
+import { authorize } from '../middleware/rbac.js';
+import { getAuditActor } from '../lib/audit-actor.js';
+
+// Company-wide configuration: a site-restricted user gets this 404 before any
+// read or write (requireAllSiteAccess, features/site-access-control.md).
+const ISSUER_NOT_FOUND = {
+  error: 'Invoice issuer not found',
+  code: 'INVOICE_ISSUER_NOT_FOUND',
+} as const;
+
+const optionalText = (max: number, description: string) =>
+  z.string().max(max).nullable().optional().describe(description);
+
+const prefixSchema = z
+  .string()
+  .max(MAX_INVOICE_NUMBER_PREFIX_LENGTH)
+  .regex(INVOICE_NUMBER_PREFIX_PATTERN, 'Letters, digits and - . _ only');
+const startSchema = z.number().int().min(0).max(MAX_INVOICE_NUMBER_START);
+const digitsSchema = z.number().int().min(0).max(MAX_INVOICE_NUMBER_DIGITS);
+
+const issuerFields = {
+  name: z
+    .string()
+    .max(255)
+    .regex(/\S/, 'Must not be blank')
+    .describe('Seller name printed on the invoice'),
+  street: optionalText(255, 'Street address'),
+  zip: optionalText(20, 'Postal code'),
+  city: optionalText(100, 'City'),
+  state: optionalText(100, 'State or region'),
+  country: optionalText(100, 'Country'),
+  taxId: optionalText(64, 'Tax or VAT number'),
+  taxIdLabel: optionalText(40, 'Label printed before the tax ID; empty: the localized "Tax ID"'),
+  registrationNumber: optionalText(100, 'Company registration number'),
+  email: z.email().max(254).nullable().optional().describe('Contact email printed on invoices'),
+  phone: optionalText(40, 'Contact phone printed on invoices'),
+  invoicePrefix: prefixSchema.optional().describe('Invoice number prefix; may be empty'),
+  invoiceWithYear: z
+    .boolean()
+    .optional()
+    .describe(
+      'Invoice numbers carry the two-digit year after the prefix; the counter restarts yearly',
+    ),
+  invoiceStart: startSchema.optional().describe('First invoice number (of each year with year)'),
+  invoiceDigits: digitsSchema.optional().describe('Minimum invoice number length, zero padded'),
+  creditNotePrefix: prefixSchema.optional().describe('Credit note number prefix; may be empty'),
+  creditNoteWithYear: z
+    .boolean()
+    .optional()
+    .describe('Credit note numbers carry the two-digit year; the counter restarts yearly'),
+  creditNoteStart: startSchema
+    .optional()
+    .describe('First credit note number (of each year with year)'),
+  creditNoteDigits: digitsSchema.optional().describe('Minimum credit note number length'),
+};
+
+const createIssuerBody = z.object(issuerFields);
+const updateIssuerBody = z.object({ ...issuerFields, name: issuerFields.name.optional() });
+
+const issuerItem = z
+  .object({
+    id: z.string().describe('Invoice issuer identifier'),
+    name: z.string().describe('Seller name'),
+    street: z.string().nullable(),
+    zip: z.string().nullable(),
+    city: z.string().nullable(),
+    state: z.string().nullable(),
+    country: z.string().nullable(),
+    taxId: z.string().nullable(),
+    taxIdLabel: z.string().nullable(),
+    registrationNumber: z.string().nullable(),
+    email: z.string().nullable(),
+    phone: z.string().nullable(),
+    invoicePrefix: z.string(),
+    invoiceWithYear: z.boolean(),
+    invoiceStart: z.number(),
+    invoiceDigits: z.number(),
+    creditNotePrefix: z.string(),
+    creditNoteWithYear: z.boolean(),
+    creditNoteStart: z.number(),
+    creditNoteDigits: z.number(),
+    invoiceNumberLocked: z
+      .boolean()
+      .describe('An invoice was issued: the invoice number format can no longer change'),
+    creditNoteNumberLocked: z
+      .boolean()
+      .describe('A credit note was issued: the credit note number format can no longer change'),
+    fleetCount: z.number().describe('Fleets whose invoices are issued under this issuer'),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date(),
+  })
+  .loose();
+
+const idParams = z.object({ id: z.string().describe('Invoice issuer identifier') });
+
+const INVOICE_FORMAT_KEYS = [
+  'invoicePrefix',
+  'invoiceWithYear',
+  'invoiceStart',
+  'invoiceDigits',
+] as const;
+const CREDIT_NOTE_FORMAT_KEYS = [
+  'creditNotePrefix',
+  'creditNoteWithYear',
+  'creditNoteStart',
+  'creditNoteDigits',
+] as const;
+
+type Executor = Pick<typeof db, 'select' | 'selectDistinct'>;
+
+/** The kinds whose number range the issuer has used: those formats are locked. */
+async function lockedKinds(executor: Executor, issuerId: string): Promise<Set<string>> {
+  const rows = await executor
+    .selectDistinct({ kind: invoiceIssuerNumberCounters.kind })
+    .from(invoiceIssuerNumberCounters)
+    .where(eq(invoiceIssuerNumberCounters.issuerId, issuerId));
+  return new Set(rows.map((row) => row.kind));
+}
+
+async function fleetCounts(executor: Executor): Promise<Map<string, number>> {
+  const rows = await executor
+    .select({ issuerId: fleets.invoiceIssuerId, count: sql<number>`count(*)::int` })
+    .from(fleets)
+    .where(sql`${fleets.invoiceIssuerId} IS NOT NULL`)
+    .groupBy(fleets.invoiceIssuerId);
+  return new Map(rows.map((row) => [String(row.issuerId), row.count]));
+}
+
+async function toItem(executor: Executor, issuer: InvoiceIssuer, fleetCount: number) {
+  const locked = await lockedKinds(executor, issuer.id);
+  return {
+    ...issuer,
+    invoiceNumberLocked: locked.has('invoice'),
+    creditNoteNumberLocked: locked.has('credit_note'),
+    fleetCount,
+  };
+}
+
+/** The optional seller details: a blank value is stored as null. */
+const NULLABLE_TEXT_KEYS = new Set([
+  'street',
+  'zip',
+  'city',
+  'state',
+  'country',
+  'taxId',
+  'taxIdLabel',
+  'registrationNumber',
+  'email',
+  'phone',
+]);
+
+/** The body as stored: the name and seller details trimmed, a blank detail as null. */
+function normalized<T extends Record<string, unknown>>(body: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (typeof value === 'string' && (key === 'name' || NULLABLE_TEXT_KEYS.has(key))) {
+      const trimmed = value.trim();
+      out[key] = trimmed === '' && key !== 'name' ? null : trimmed;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out as T;
+}
+
+/**
+ * Audits a change of an issuer in the settings history (setting_audit_log under
+ * the key invoiceIssuer:<id>): issuers are company settings. A create is an
+ * update from nothing.
+ */
+async function auditIssuer(
+  request: FastifyRequest,
+  issuerId: string,
+  change: { action: 'updated' | 'deleted'; before: unknown; after: unknown; notes?: string },
+): Promise<void> {
+  const key = `invoiceIssuer:${issuerId}`;
+  await writeAudit(
+    { table: settingAuditLog, idColumn: 'setting_key' },
+    {
+      entityId: key,
+      entityIdSnapshot: key,
+      action: change.action,
+      ...getAuditActor(request),
+      before: change.before,
+      after: change.after,
+      ...(change.notes != null ? { notes: change.notes } : {}),
+    },
+    db,
+    request.log,
+  );
+}
+
+async function sendNotFound(reply: FastifyReply): Promise<void> {
+  await reply.status(404).send(ISSUER_NOT_FOUND);
+}
+
+export function invoiceIssuerRoutes(app: FastifyInstance): void {
+  app.get(
+    '/invoice-issuers',
+    {
+      onRequest: [authorize('settings.system:read')],
+      schema: {
+        tags: ['Invoices'],
+        summary: 'List the invoice issuers',
+        description:
+          'The sellers other than the company that fleet invoices can be issued under, each with its number ranges for invoices and credit notes, whether a range is already in use (its format is then locked) and how many fleets use the issuer. A user restricted to some sites gets 404 INVOICE_ISSUER_NOT_FOUND: issuers are company-wide.',
+        operationId: 'listInvoiceIssuers',
+        security: [{ bearerAuth: [] }],
+        response: {
+          200: arrayResponse(issuerItem),
+          404: errorWith('Restricted to some sites', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const issuers = await db.select().from(invoiceIssuers).orderBy(asc(invoiceIssuers.name));
+      const counts = await fleetCounts(db);
+      return Promise.all(issuers.map((issuer) => toItem(db, issuer, counts.get(issuer.id) ?? 0)));
+    },
+  );
+
+  app.post(
+    '/invoice-issuers',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: 'Create an invoice issuer',
+        description:
+          'Creates a seller with its number ranges. Number format: the prefix (letters, digits and - . _, may be empty), the two-digit year (the counter then restarts each year), the start value and the minimum length. Defaults: empty prefix, no year, start 1, no padding. A fleet uses it through its billing profile (invoiceIssuerId).',
+        operationId: 'createInvoiceIssuer',
+        security: [{ bearerAuth: [] }],
+        body: zodSchema(createIssuerBody),
+        response: {
+          201: itemResponse(issuerItem),
+          404: errorWith('Restricted to some sites', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const body = normalized(request.body as z.infer<typeof createIssuerBody>);
+      const [issuer] = await db.insert(invoiceIssuers).values(body).returning();
+      if (issuer == null) throw new Error('Failed to create the invoice issuer');
+      await auditIssuer(request, issuer.id, {
+        action: 'updated',
+        before: null,
+        after: issuer,
+        notes: 'Invoice issuer created',
+      });
+      await reply.status(201).send(await toItem(db, issuer, 0));
+    },
+  );
+
+  app.patch(
+    '/invoice-issuers/:id',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: 'Update an invoice issuer',
+        description:
+          'Fields left out keep their value; null or a blank string clears a text field. The seller details apply to documents issued afterwards: an issued document keeps the seller it was issued with. A number format (prefix, year, start, length) can no longer change once the issuer has issued a document of that kind: 409 INVOICE_ISSUER_NUMBER_FORMAT_LOCKED. The issuer row is locked for the update, so a document being issued is numbered with the format it read.',
+        operationId: 'updateInvoiceIssuer',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        body: zodSchema(updateIssuerBody),
+        response: {
+          200: itemResponse(issuerItem),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+          409: errorWith('The number format is in use', [
+            ERROR_CODES.INVOICE_ISSUER_NUMBER_FORMAT_LOCKED,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const body = normalized(request.body as z.infer<typeof updateIssuerBody>);
+      const result = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select()
+          .from(invoiceIssuers)
+          .where(eq(invoiceIssuers.id, id))
+          .for('update');
+        if (current == null) return { kind: 'not_found' as const };
+        const locked = await lockedKinds(tx, id);
+        const changes = (keys: readonly (keyof typeof body & keyof InvoiceIssuer)[]): boolean =>
+          keys.some((key) => body[key] !== undefined && body[key] !== current[key]);
+        if (
+          (locked.has('invoice') && changes(INVOICE_FORMAT_KEYS)) ||
+          (locked.has('credit_note') && changes(CREDIT_NOTE_FORMAT_KEYS))
+        ) {
+          return { kind: 'locked' as const };
+        }
+        const [updated] = await tx
+          .update(invoiceIssuers)
+          .set({ ...body, updatedAt: new Date() })
+          .where(eq(invoiceIssuers.id, id))
+          .returning();
+        const counts = await fleetCounts(tx);
+        return {
+          kind: 'ok' as const,
+          item: await toItem(tx, updated ?? current, counts.get(id) ?? 0),
+          before: current,
+          after: updated ?? current,
+        };
+      });
+      if (result.kind === 'not_found') return sendNotFound(reply);
+      if (result.kind === 'locked') {
+        await reply.status(409).send({
+          error:
+            'The number format cannot change once the issuer has issued a document of that kind',
+          code: 'INVOICE_ISSUER_NUMBER_FORMAT_LOCKED',
+        });
+        return;
+      }
+      await auditIssuer(request, id, {
+        action: 'updated',
+        before: result.before,
+        after: result.after,
+      });
+      return result.item;
+    },
+  );
+
+  app.delete(
+    '/invoice-issuers/:id',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: 'Delete an invoice issuer',
+        description:
+          'Deletes an issuer that no fleet uses and that never issued a document; otherwise 409 INVOICE_ISSUER_IN_USE.',
+        operationId: 'deleteInvoiceIssuer',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        response: {
+          204: { type: 'null' as const },
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+          409: errorWith('The issuer is in use', [ERROR_CODES.INVOICE_ISSUER_IN_USE]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const result = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select()
+          .from(invoiceIssuers)
+          .where(eq(invoiceIssuers.id, id))
+          .for('update');
+        if (current == null) return { kind: 'not_found' as const };
+        const [fleet] = await tx
+          .select({ id: fleets.id })
+          .from(fleets)
+          .where(eq(fleets.invoiceIssuerId, id))
+          .limit(1);
+        const [invoice] = await tx
+          .select({ id: invoices.id })
+          .from(invoices)
+          .where(eq(invoices.issuerId, id))
+          .limit(1);
+        if (fleet != null || invoice != null || (await lockedKinds(tx, id)).size > 0) {
+          return { kind: 'in_use' as const };
+        }
+        await tx.delete(invoiceIssuers).where(eq(invoiceIssuers.id, id));
+        return { kind: 'deleted' as const, before: current };
+      });
+      if (result.kind === 'not_found') return sendNotFound(reply);
+      if (result.kind === 'in_use') {
+        await reply.status(409).send({
+          error: 'The invoice issuer is used by a fleet or an invoice',
+          code: 'INVOICE_ISSUER_IN_USE',
+        });
+        return;
+      }
+      await auditIssuer(request, id, { action: 'deleted', before: result.before, after: null });
+      await reply.status(204).send();
+    },
+  );
+}

@@ -173,6 +173,8 @@ export interface FleetForInvoice {
   invoiceLanguage: string;
   paymentTermsDays: number | null;
   invoiceDateMode: InvoiceDateMode;
+  /** The issuer the fleet's invoices are issued under; null or left out: the company. */
+  invoiceIssuerId?: string | null;
 }
 
 export function billToFromFleet(fleet: FleetForInvoice): FleetBillTo {
@@ -444,7 +446,7 @@ async function loadFleet(
   const rows = (await executor.execute(sql`
     SELECT id, name, billing_legal_name, billing_street, billing_city, billing_state,
            billing_zip, billing_country, billing_tax_id, invoice_language, payment_terms_days,
-           invoice_date_mode
+           invoice_date_mode, invoice_issuer_id
     FROM fleets WHERE id = ${fleetId}
     ${lock ? sql`FOR UPDATE` : sql``}
   `)) as unknown as Array<Record<string, unknown>>;
@@ -467,6 +469,7 @@ async function loadFleet(
     invoiceLanguage: text('invoice_language') ?? 'en',
     paymentTermsDays: row['payment_terms_days'] == null ? null : Number(row['payment_terms_days']),
     invoiceDateMode: row['invoice_date_mode'] === 'period_end' ? 'period_end' : 'run_date',
+    invoiceIssuerId: text('invoice_issuer_id'),
   };
 }
 
@@ -1101,6 +1104,7 @@ async function issueAccountInvoice(
           billTo: { ...billTo },
           language: isInvoiceLanguage(language) ? language : 'en',
           memberBilled: driver != null,
+          issuerId: fleet.invoiceIssuerId ?? null,
         },
         sessionClaimGuard,
       });

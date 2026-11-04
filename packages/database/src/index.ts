@@ -217,6 +217,13 @@ export type {
   InvoiceSellerSnapshot,
   InvoiceSellerExecutor,
 } from './lib/invoice-seller-snapshot.js';
+export {
+  issuerNumberFormat,
+  invoiceSellerSnapshotFromIssuer,
+  loadInvoiceIssuerForIssue,
+  allocateIssuerInvoiceNumber,
+} from './lib/invoice-issuer.js';
+export type { InvoiceIssuer, InvoiceIssuerExecutor } from './lib/invoice-issuer.js';
 export { sessionFeeGrossCents, siteMaxSessionFeeGrossCents } from './lib/session-fee-floor.js';
 export type {
   PricingGroupSource,

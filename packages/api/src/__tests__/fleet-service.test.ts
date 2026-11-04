@@ -118,6 +118,7 @@ vi.mock('@evtivity/database', () => ({
   sites: {},
   pricingGroupFleets: {},
   pricingGroups: {},
+  invoiceIssuers: { id: 'invoiceIssuers.id' },
   driverTokens: {},
   users: {},
   evses: {},
@@ -696,6 +697,7 @@ describe('fleet billing profile', () => {
     paymentTermsDays: null,
     autoInvoice: false,
     invoiceDateMode: 'run_date',
+    invoiceIssuerId: null,
   };
   const fleetRow = { id: 'f1', name: 'Acme', accountBillingEnabled: true, ...profile };
 
@@ -790,6 +792,47 @@ describe('fleet billing profile', () => {
     expect(result).toEqual(fleetRow);
     expect(dbCallIndex).toBe(1); // only the locked read, no UPDATE
     expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('sets an existing invoice issuer and audits the change', async () => {
+    const updated = { ...fleetRow, invoiceIssuerId: 'iis_rs' };
+    setupDbResults([fleetRow], [{ id: 'iis_rs' }], [updated]);
+
+    const result = await updateFleetBillingProfile(
+      'f1',
+      { invoiceIssuerId: 'iis_rs' },
+      { actor, log },
+    );
+
+    expect(result).toEqual(updated);
+    expect(mockWriteAudit).toHaveBeenCalledWith(
+      { table: 'fleetAuditLog', idColumn: 'fleet_id' },
+      expect.objectContaining({
+        before: { invoiceIssuerId: null },
+        after: { invoiceIssuerId: 'iis_rs' },
+      }),
+      db,
+      log,
+    );
+  });
+
+  it('refuses an invoice issuer that does not exist', async () => {
+    setupDbResults([fleetRow], []);
+
+    await expect(
+      updateFleetBillingProfile('f1', { invoiceIssuerId: 'iis_gone' }, { actor, log }),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'INVOICE_ISSUER_NOT_FOUND' });
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('clears the invoice issuer without a lookup', async () => {
+    const current = { ...fleetRow, invoiceIssuerId: 'iis_rs' };
+    const updated = { ...fleetRow, invoiceIssuerId: null };
+    setupDbResults([current], [updated]);
+
+    const result = await updateFleetBillingProfile('f1', { invoiceIssuerId: null }, { actor, log });
+
+    expect(result).toEqual(updated);
   });
 
   it('refuses automatic invoicing without a billing contact', async () => {

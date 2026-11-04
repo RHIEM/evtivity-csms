@@ -372,6 +372,25 @@ describe('accountInvoiceDate', () => {
 describe('createFleetInvoice', () => {
   const now = new Date('2026-10-08T10:00:00Z');
 
+  it("issues the invoice under the fleet's invoice issuer", async () => {
+    h.state.fleet = { ...fleetRow, invoice_issuer_id: 'iis_rs' };
+    h.state.candidates = [candidateRow(candidate())];
+
+    await createFleetInvoice('flt_1', '2026-09', now);
+
+    const input = vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1];
+    expect(input?.fleet?.issuerId).toBe('iis_rs');
+  });
+
+  it('issues the invoice as the company when the fleet has no issuer', async () => {
+    h.state.candidates = [candidateRow(candidate())];
+
+    await createFleetInvoice('flt_1', '2026-09', now);
+
+    const input = vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1];
+    expect(input?.fleet?.issuerId).toBeNull();
+  });
+
   it('issues the invoice of the fleet and period with the bill-to snapshot and terms', async () => {
     h.state.candidates = [candidateRow(candidate()), candidateRow(candidate({ id: 'ses_2' }))];
 

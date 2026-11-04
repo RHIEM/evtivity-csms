@@ -784,6 +784,15 @@ export {
 } from './invoice-payment.js';
 export type { InvoicePaymentSettingKey } from './invoice-payment.js';
 export {
+  INVOICE_NUMBER_PREFIX_PATTERN,
+  MAX_INVOICE_NUMBER_PREFIX_LENGTH,
+  MAX_INVOICE_NUMBER_START,
+  MAX_INVOICE_NUMBER_DIGITS,
+  isValidInvoiceNumberPrefix,
+  formatInvoiceNumber,
+} from './invoice-issuer.js';
+export type { InvoiceNumberFormat } from './invoice-issuer.js';
+export {
   EPC_MAX_NAME_LENGTH,
   EPC_MAX_REMITTANCE_LENGTH,
   EPC_MAX_AMOUNT_CENTS,

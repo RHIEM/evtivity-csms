@@ -53,6 +53,7 @@ import { driverRoutes } from './routes/drivers.js';
 import { driverAvatarRoutes } from './routes/driver-avatar.js';
 import { pricingRoutes } from './routes/pricing.js';
 import { holidayRoutes } from './routes/holidays.js';
+import { invoiceIssuerRoutes } from './routes/invoice-issuers.js';
 import { ocppCommandRoutes } from './routes/ocpp-commands.js';
 import { ocppSchemaRoutes } from './routes/ocpp-schemas.js';
 import { transactionRoutes } from './routes/transactions.js';
@@ -231,6 +232,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       await v1.register(driverAvatarRoutes);
       await v1.register(pricingRoutes);
       await v1.register(holidayRoutes);
+      await v1.register(invoiceIssuerRoutes);
       await v1.register(ocppCommandRoutes);
       await v1.register(ocppSchemaRoutes);
       await v1.register(transactionRoutes);
