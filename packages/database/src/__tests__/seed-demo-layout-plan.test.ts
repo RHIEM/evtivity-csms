@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  CHARGER_PORT_LIMITS,
   accessibleChargingSpace,
   bayInLayout,
   bayToPosition,
@@ -219,6 +220,21 @@ describe('site layout demo plan', () => {
     expect(new Set(fleet.drivers.map((d) => d.vehicle.color)).size).toBeGreaterThanOrEqual(6);
   });
 
+  it('uses ids in the format the detail routes accept (prefix and 12 lowercase characters)', () => {
+    const fleet = LAYOUT_DEMO.fleet;
+    const routeId = (prefix: string) => new RegExp(`^${prefix}_[a-z0-9]{12}$`);
+    expect(fleet.id).toMatch(routeId('flt'));
+    for (const d of fleet.drivers) {
+      expect(d.id).toMatch(routeId('drv'));
+      expect(d.vehicle.id).toMatch(routeId('veh'));
+      expect(`dtk_demodepot${d.id.slice(-3)}`).toMatch(routeId('dtk'));
+    }
+    for (const site of LAYOUT_DEMO.sites) {
+      expect(site.id).toMatch(routeId('sit'));
+      for (const station of site.stations) expect(station.id).toMatch(routeId('sta'));
+    }
+  });
+
   it('has valid settings, every station on its own spot inside the lot, on a circuit of its site', () => {
     for (const site of LAYOUT_DEMO.sites) {
       expect(siteLayoutSettingsSchema.safeParse(site.settings).success).toBe(true);
@@ -363,6 +379,19 @@ describe('site layout demo plan', () => {
     // between their spot and the partner spot, in the slots placement gives them.
     expect(ac.every((st) => st.evses === 2)).toBe(true);
     expect(ac.every((st) => sharesSpotPair({ charging: 'ac', ports: st.evses }, s))).toBe(true);
+    // Every unit within CHARGER_PORT_LIMITS; two DC dispensers at the most cables
+    // (two EVSEs of a CCS1 and a CHAdeMO), the AC pedestals at the most ports.
+    for (const st of patroon!.stations) {
+      const limit = CHARGER_PORT_LIMITS[st.kind];
+      const evses = st.evses ?? (st.kind === 'dc' ? 2 : 1);
+      const perEvse = 1 + (st.extraConnectorTypes?.length ?? 0);
+      expect(evses).toBeLessThanOrEqual(limit.evses);
+      expect(perEvse).toBeLessThanOrEqual(limit.connectorsPerEvse);
+      expect(evses * perEvse).toBeLessThanOrEqual(limit.cables);
+    }
+    const fourCables = dc.filter((st) => st.extraConnectorTypes?.includes('CHAdeMO') === true);
+    expect(fourCables.map((st) => st.stationId)).toEqual(['CS-3050', 'CS-3051']);
+    expect(ac.every((st) => (st.evses ?? 1) === CHARGER_PORT_LIMITS.ac.evses)).toBe(true);
     expect(ac.map((st) => ({ col: st.col, row: st.row }))).toEqual(
       freeSlotsFor(
         ac.map(() => ({ charging: 'ac' as const, depot: null, ports: 2 })),

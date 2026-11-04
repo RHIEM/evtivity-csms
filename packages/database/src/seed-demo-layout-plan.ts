@@ -78,6 +78,12 @@ export interface LayoutDemoStation {
   maxPowerKw?: number;
   /** The EVSEs of the station (default 2 for DC, 1 for AC). */
   evses?: number;
+  /**
+   * More connectors on every EVSE after the first (`connectorType`), as
+   * connectors 2 and up: a dispenser with two cables per EVSE (one charges at
+   * a time). At most `CHARGER_PORT_LIMITS` connectors per EVSE.
+   */
+  extraConnectorTypes?: readonly string[];
 }
 
 export interface LayoutDemoPanel {
@@ -137,6 +143,7 @@ type StationExtra = Pick<
   | 'connectorType'
   | 'maxPowerKw'
   | 'evses'
+  | 'extraConnectorTypes'
 >;
 
 /**
@@ -543,6 +550,14 @@ const PATROON_SETTINGS_FAR_TRANSFORMER: SiteLayoutSettings = {
   transformers: [{ id: 'tx-1', name: 'Utility Transformer', ratedKva: 1000, x: -5, z: 2.5 }],
 };
 const PATROON_DC: readonly number[] = [50, 51, 52, 53];
+/**
+ * The Patroon Creek DC dispensers drawn at the most cables one dispenser holds
+ * (`CHARGER_PORT_LIMITS.dc`): two EVSEs with a CCS1 and a CHAdeMO cable each,
+ * four in all, the four-cable arrangement of the Alpitronic HYC400UL (Product
+ * Data Sheet V1-2: up to 4 outputs, CCS1, J3400 or CHAdeMO). The other two
+ * keep one CCS1 cable per EVSE (ABB Terra 184 dual outlet).
+ */
+export const PATROON_DC_FOUR_CABLES: readonly number[] = [50, 51];
 const PATROON_AC: readonly number[] = [54, 55, 56, 57, 58, 59, 60, 61];
 /** The ports (EVSEs) of each Patroon Creek Level 2 pedestal. */
 export const PATROON_AC_PORTS = 2;
@@ -615,13 +630,15 @@ const depotDriver = (
   vehicle: Omit<LayoutDemoFleetDriver['vehicle'], 'id' | 'licensePlate'>,
 ): LayoutDemoFleetDriver => {
   const nn = String(n).padStart(2, '0');
+  // Ids keep 12 characters after the prefix, the format the detail routes accept.
+  const nnn = String(n).padStart(3, '0');
   return {
-    id: `drv_demodepot${nn}`,
+    id: `drv_demodepot${nnn}`,
     firstName,
     lastName,
     email: `${firstName.toLowerCase()}.${lastName.toLowerCase()}@northgate-fleet.example`,
     idToken: `RFID-DEPOT-${nn}`,
-    vehicle: { id: `veh_demodepot${nn}`, licensePlate: `NGF-${String(100 + n)}`, ...vehicle },
+    vehicle: { id: `veh_demodepot${nnn}`, licensePlate: `NGF-${String(100 + n)}`, ...vehicle },
   };
 };
 
@@ -1125,7 +1142,13 @@ export const LAYOUT_DEMO: {
       stations: [
         ...PATROON_DC.map((n, i) => {
           const spot = PATROON_DC_SPOTS[i] ?? { col: 0, row: 0 };
-          return dc(n, spot.col, spot.row, evseCircuitId(n));
+          return dc(
+            n,
+            spot.col,
+            spot.row,
+            evseCircuitId(n),
+            PATROON_DC_FOUR_CABLES.includes(n) ? { extraConnectorTypes: ['CHAdeMO'] } : {},
+          );
         }),
         ...PATROON_AC.map((n, i) => {
           const spot = PATROON_AC_SPOTS[i] ?? { col: 0, row: 0 };
@@ -1145,7 +1168,7 @@ export const LAYOUT_DEMO: {
    * these drivers' cards and the layout draws their vehicles.
    */
   fleet: {
-    id: 'flt_demodepot01',
+    id: 'flt_demodepot001',
     name: 'Northgate Transit and Freight',
     description: 'Transit buses, semi trucks and box trucks charging at Northgate Fleet Depot',
     siteId: DEPOT,
