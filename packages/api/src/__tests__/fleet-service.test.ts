@@ -700,6 +700,7 @@ describe('fleet billing profile', () => {
     invoiceIssuerId: null,
     accountSettlement: 'payment',
     settlementNote: null,
+    memberInvoiceDelivery: 'driver',
   };
   const fleetRow = { id: 'f1', name: 'Acme', accountBillingEnabled: true, ...profile };
 
@@ -843,6 +844,15 @@ describe('fleet billing profile', () => {
         accountSettlement: 'external',
         settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
       },
+    });
+  });
+
+  it('merges and diffs the member invoice delivery', () => {
+    const next = mergeBillingProfile(profile, { memberInvoiceDelivery: 'billing_contacts' });
+    expect(next.memberInvoiceDelivery).toBe('billing_contacts');
+    expect(diffBillingProfile(profile, next)).toEqual({
+      before: { memberInvoiceDelivery: 'driver' },
+      after: { memberInvoiceDelivery: 'billing_contacts' },
     });
   });
 

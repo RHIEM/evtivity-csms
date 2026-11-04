@@ -361,6 +361,15 @@ export type InvoiceDateMode = (typeof INVOICE_DATE_MODES)[number];
 export const ACCOUNT_SETTLEMENTS = ['payment', 'external'] as const;
 export type AccountSettlement = (typeof ACCOUNT_SETTLEMENTS)[number];
 
+/**
+ * Who a fleet's member invoices and their credit notes are emailed to:
+ * `driver` (the member) or `billing_contacts` (the fleet's billing contacts,
+ * e.g. a payroll office that forwards them). The overdue notice of a member
+ * invoice always goes to the driver.
+ */
+export const MEMBER_INVOICE_DELIVERIES = ['driver', 'billing_contacts'] as const;
+export type MemberInvoiceDelivery = (typeof MEMBER_INVOICE_DELIVERIES)[number];
+
 export const fleets = pgTable(
   'fleets',
   {
@@ -413,6 +422,12 @@ export const fleets = pgTable(
       .notNull()
       .default('payment'),
     settlementNote: varchar('settlement_note', { length: 500 }),
+    // Who the member invoices and their credit notes are emailed to
+    // (MEMBER_INVOICE_DELIVERIES): the member or the fleet's billing contacts.
+    memberInvoiceDelivery: varchar('member_invoice_delivery', { length: 16 })
+      .$type<MemberInvoiceDelivery>()
+      .notNull()
+      .default('driver'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     // Credit limit of the account billing (cents of the company currency, null:
@@ -450,6 +465,10 @@ export const fleets = pgTable(
     check(
       'fleets_account_settlement_check',
       sql`${table.accountSettlement} IN ('payment', 'external')`,
+    ),
+    check(
+      'fleets_member_invoice_delivery_check',
+      sql`${table.memberInvoiceDelivery} IN ('driver', 'billing_contacts')`,
     ),
   ],
 );
