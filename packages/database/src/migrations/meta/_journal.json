@@ -1688,6 +1688,20 @@
       "when": 1791000049201,
       "tag": "rhiem_0004_driver_token_label",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1791000049300,
+      "tag": "0483_release_0_1_49_charger_colors",
+      "breakpoints": true
+    },
+    {
+      "idx": 242,
+      "version": "7",
+      "when": 1791000049400,
+      "tag": "0484_release_0_1_49_board_positions",
+      "breakpoints": true
     }
   ]
 }
