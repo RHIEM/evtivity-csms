@@ -437,6 +437,27 @@ describe('FleetBillingProfileCard', () => {
     );
   });
 
+  it('saves member invoice delivery to the billing contacts and shows it', async () => {
+    getMock.mockResolvedValue([]);
+    patchMock.mockResolvedValueOnce(fleet);
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    expect(screen.getByTestId('fleet-billing-member-delivery').textContent).toBe(
+      'fleets.billingProfile.memberDeliveryDriver',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
+      target: { value: 'billing_contacts' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/fleets/flt_1/billing-profile',
+        expect.objectContaining({ memberInvoiceDelivery: 'billing_contacts' }),
+      );
+    });
+  });
+
   it('saves the chosen invoice issuer', async () => {
     getMock.mockImplementation((url: string) =>
       Promise.resolve(
@@ -495,6 +516,7 @@ describe('FleetBillingProfileCard', () => {
         invoiceIssuerId: null,
         accountSettlement: 'payment',
         settlementNote: null,
+        memberInvoiceDelivery: 'driver',
       });
     });
     await waitFor(() => {

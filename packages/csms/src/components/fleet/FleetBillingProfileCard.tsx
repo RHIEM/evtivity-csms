@@ -44,6 +44,8 @@ export interface FleetBillingProfile {
   accountSettlement: AccountSettlement;
   /** Printed on externally settled invoices instead of the payment block. */
   settlementNote: string | null;
+  /** Who the member invoices are emailed to: the driver or the billing contacts. */
+  memberInvoiceDelivery: MemberInvoiceDelivery;
 }
 
 /** The date of the fleet's account invoices: the issue day or the last day of the billed month. */
@@ -51,6 +53,9 @@ export type InvoiceDateMode = 'run_date' | 'period_end';
 
 /** How the fleet's account invoices are settled. */
 export type AccountSettlement = 'payment' | 'external';
+
+/** Who a fleet's member invoices are emailed to. */
+export type MemberInvoiceDelivery = 'driver' | 'billing_contacts';
 
 export interface FleetBillingProfileCardProps {
   fleet: { id: string; name: string } & Partial<FleetBillingProfile>;
@@ -77,6 +82,7 @@ interface FormState {
   invoiceIssuerId: string;
   accountSettlement: AccountSettlement;
   settlementNote: string;
+  memberInvoiceDelivery: MemberInvoiceDelivery;
 }
 
 /** Splits the contacts field (one per line, or comma or semicolon separated). */
@@ -104,6 +110,8 @@ function toForm(fleet: FleetBillingProfileCardProps['fleet']): FormState {
     invoiceIssuerId: fleet.invoiceIssuerId ?? '',
     accountSettlement: fleet.accountSettlement === 'external' ? 'external' : 'payment',
     settlementNote: fleet.settlementNote ?? '',
+    memberInvoiceDelivery:
+      fleet.memberInvoiceDelivery === 'billing_contacts' ? 'billing_contacts' : 'driver',
   };
 }
 
@@ -196,6 +204,7 @@ export function FleetBillingProfileCard({
       invoiceIssuerId: form.invoiceIssuerId === '' ? null : form.invoiceIssuerId,
       accountSettlement: form.accountSettlement,
       settlementNote: textOrNull(form.settlementNote),
+      memberInvoiceDelivery: form.memberInvoiceDelivery,
       autoInvoice: form.autoInvoice,
       invoiceDateMode: form.invoiceDateMode,
     });
@@ -358,6 +367,29 @@ export function FleetBillingProfileCard({
                 {t('fleets.billingProfile.settlementHelp')}
               </p>
             </div>
+            <div className="space-y-2">
+              <Label htmlFor="billing-member-delivery">
+                {t('fleets.billingProfile.memberDelivery')}
+              </Label>
+              <Select
+                id="billing-member-delivery"
+                value={form.memberInvoiceDelivery}
+                onChange={(e) => {
+                  set(
+                    'memberInvoiceDelivery',
+                    e.target.value === 'billing_contacts' ? 'billing_contacts' : 'driver',
+                  );
+                }}
+              >
+                <option value="driver">{t('fleets.billingProfile.memberDeliveryDriver')}</option>
+                <option value="billing_contacts">
+                  {t('fleets.billingProfile.memberDeliveryContacts')}
+                </option>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t('fleets.billingProfile.memberDeliveryHelp')}
+              </p>
+            </div>
             {form.accountSettlement === 'external' && (
               <div className="space-y-2 md:col-span-2">
                 <Label htmlFor="billing-settlement-note">
@@ -431,6 +463,14 @@ export function FleetBillingProfileCard({
             <dt className="text-muted-foreground">{t('fleets.billingProfile.issuer')}</dt>
             <dd className="font-medium" data-testid="fleet-billing-issuer">
               {issuerName(fleet.invoiceIssuerId)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">{t('fleets.billingProfile.memberDelivery')}</dt>
+            <dd className="font-medium" data-testid="fleet-billing-member-delivery">
+              {fleet.memberInvoiceDelivery === 'billing_contacts'
+                ? t('fleets.billingProfile.memberDeliveryContacts')
+                : t('fleets.billingProfile.memberDeliveryDriver')}
             </dd>
           </div>
           <div>

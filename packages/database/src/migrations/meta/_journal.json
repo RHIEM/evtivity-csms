@@ -1723,6 +1723,13 @@
       "when": 1791000049403,
       "tag": "rhiem_0007_fleet_account_settlement",
       "breakpoints": true
+    },
+    {
+      "idx": 246,
+      "version": "7",
+      "when": 1791000049404,
+      "tag": "rhiem_0008_member_invoice_delivery",
+      "breakpoints": true
     }
   ]
 }

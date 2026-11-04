@@ -192,6 +192,14 @@ async function sendMemberInvoiceEmail(
   return { status: 'sent', recipients: 1 };
 }
 
+/** Who the fleet's member invoices go to; 'driver' when the fleet is gone. */
+async function loadMemberInvoiceDelivery(fleetId: string): Promise<string> {
+  const rows = await client<Array<{ member_invoice_delivery: string }>>`
+    SELECT member_invoice_delivery FROM fleets WHERE id = ${fleetId}
+  `;
+  return rows[0]?.member_invoice_delivery ?? 'driver';
+}
+
 /**
  * Emails an account invoice or its credit note with the PDF attached, routed
  * by `invoices.member_billed`:
@@ -204,6 +212,11 @@ async function sendMemberInvoiceEmail(
  *   driver only, through dispatchDriverNotification (email and push, no SMS),
  *   in the driver's language. A driver that is gone (`no_driver`) or has no
  *   email (`no_email`) sends nothing.
+ * - Member invoice of a fleet that delivers member invoices to its billing
+ *   contacts (`fleets.member_invoice_delivery` 'billing_contacts', e.g. a
+ *   payroll office that forwards them): as a fleet invoice, invoice.FleetInvoice
+ *   or invoice.FleetCreditNote to each billing contact in the fleet's invoice
+ *   language; the PDF keeps the driver's language. The driver gets no email.
  *
  * `invoices.sent_at` is the marker: mode `once` claims it only while it is
  * null, so an issue is emailed once (P7); `resend` sends again and sets it.
@@ -223,7 +236,12 @@ export async function sendAccountInvoiceEmail(
   if (detail == null) return { status: 'not_found' };
   const { invoice } = detail;
   if (invoice.fleetId == null) return { status: 'not_fleet' };
-  if (invoice.memberBilled) return sendMemberInvoiceEmail(detail, mode, deps, audit);
+  if (
+    invoice.memberBilled &&
+    (await loadMemberInvoiceDelivery(invoice.fleetId)) !== 'billing_contacts'
+  ) {
+    return sendMemberInvoiceEmail(detail, mode, deps, audit);
+  }
 
   const contacts = await loadFleetBillingContacts(client, invoice.fleetId);
   if (contacts.emails.length === 0) return { status: 'no_contacts' };
@@ -234,7 +252,11 @@ export async function sendAccountInvoiceEmail(
   const attachment = pdfAttachment(invoice.invoiceNumber, pdf);
   const eventType = invoice.kind === 'credit_note' ? FLEET_CREDIT_NOTE_EVENT : FLEET_INVOICE_EVENT;
   const variables = fleetInvoiceVariables(detail);
-  const language = invoice.language ?? contacts.language ?? 'en';
+  // A member invoice's language is the driver's; its email to the billing
+  // contacts is in the fleet's invoice language.
+  const language = invoice.memberBilled
+    ? (contacts.language ?? invoice.language ?? 'en')
+    : (invoice.language ?? contacts.language ?? 'en');
   const timezone = await getSystemTimezone();
   const delivered: NotificationDelivery[] = [];
   for (const email of contacts.emails) {

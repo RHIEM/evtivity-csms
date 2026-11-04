@@ -9,6 +9,8 @@ interface NoticeState {
   markRows: Array<{ id: string }>;
   statements: string[];
   detail: unknown;
+  // fleets.member_invoice_delivery of the invoice's fleet.
+  delivery: string;
 }
 
 const h = vi.hoisted(
@@ -17,11 +19,15 @@ const h = vi.hoisted(
     markRows: [{ id: 'inv_f1' }],
     statements: [],
     detail: null,
+    delivery: 'driver',
   }),
 );
 
 vi.mock('@evtivity/database', () => ({
   client: vi.fn((strings: TemplateStringsArray) => {
+    if (strings.join('?').includes('member_invoice_delivery')) {
+      return Promise.resolve([{ member_invoice_delivery: h.delivery }]);
+    }
     h.statements.push(strings.join('?').replace(/\s+/g, ' '));
     return Promise.resolve(h.markRows);
   }),
@@ -105,6 +111,7 @@ beforeEach(() => {
   h.markRows = [{ id: 'inv_f1' }];
   h.statements = [];
   h.detail = detail();
+  h.delivery = 'driver';
 });
 
 describe('fleetInvoiceVariables', () => {
@@ -276,6 +283,51 @@ describe('sendAccountInvoiceEmail for a member invoice', () => {
       delivered: [{ channel: 'email', recipient: 'mia@example.com' }],
       resend: false,
     });
+  });
+
+  it('emails a member invoice to the fleet billing contacts when the fleet delivers there', async () => {
+    h.delivery = 'billing_contacts';
+    h.contacts = { emails: ['payroll@acme.test'], language: 'de' };
+    h.detail = {
+      ...detail({ memberBilled: true, driverId: 'drv_1', language: 'en' }),
+      driver: memberDriver,
+    };
+
+    const result = await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit);
+
+    expect(result).toEqual({ status: 'sent', recipients: 1 });
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+    expect(dispatchSystemNotification).toHaveBeenCalledWith(
+      expect.anything(),
+      FLEET_INVOICE_EVENT,
+      { email: 'payroll@acme.test', language: 'de', timezone: 'Europe/Berlin' },
+      expect.objectContaining({ invoiceNumber: 'INV-202610-0007' }),
+      ['/templates'],
+      [expect.objectContaining({ filename: 'INV-202610-0007.pdf' })],
+    );
+    expect(h.statements[0]).toContain('sent_at IS NULL');
+  });
+
+  it('sends nothing to the driver and reports no contacts when the fleet has none', async () => {
+    h.delivery = 'billing_contacts';
+    h.contacts = { emails: [], language: 'de' };
+    h.detail = { ...detail({ memberBilled: true, driverId: 'drv_1' }), driver: memberDriver };
+
+    expect(await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit)).toEqual({
+      status: 'no_contacts',
+    });
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+    expect(h.statements).toHaveLength(0);
+  });
+
+  it('sends a member credit note to the billing contacts as a fleet credit note', async () => {
+    h.delivery = 'billing_contacts';
+    h.detail = {
+      ...detail({ memberBilled: true, kind: 'credit_note', invoiceNumber: 'CN-202610-0001' }),
+      driver: memberDriver,
+    };
+    await sendAccountInvoiceEmail('inv_f1', 'resend', deps, audit);
+    expect(vi.mocked(dispatchSystemNotification).mock.calls[0]?.[1]).toBe(FLEET_CREDIT_NOTE_EVENT);
   });
 
   it('sends the member credit note event for the credit note of a member invoice', async () => {

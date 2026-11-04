@@ -24,6 +24,7 @@ import type {
   AccountInvoiceRecipient,
   InvoiceDateMode,
   AccountSettlement,
+  MemberInvoiceDelivery,
   FleetCreditExposure,
   FleetCreditLevel,
   ReleaseUpgradePending,
@@ -367,6 +368,8 @@ export interface FleetBillingProfile {
   accountSettlement: AccountSettlement;
   /** Printed on externally settled invoices instead of the payment block. */
   settlementNote: string | null;
+  /** Who the member invoices are emailed to: the driver or the billing contacts. */
+  memberInvoiceDelivery: MemberInvoiceDelivery;
 }
 
 export type FleetBillingProfilePatch = {
@@ -389,6 +392,7 @@ const PROFILE_KEYS = [
   'invoiceIssuerId',
   'accountSettlement',
   'settlementNote',
+  'memberInvoiceDelivery',
 ] as const satisfies readonly (keyof FleetBillingProfile)[];
 
 const PROFILE_TEXT_KEYS = [
@@ -437,6 +441,9 @@ export function mergeBillingProfile(
   if (patch.invoiceDateMode !== undefined) next.invoiceDateMode = patch.invoiceDateMode;
   if (patch.invoiceIssuerId !== undefined) next.invoiceIssuerId = patch.invoiceIssuerId;
   if (patch.accountSettlement !== undefined) next.accountSettlement = patch.accountSettlement;
+  if (patch.memberInvoiceDelivery !== undefined) {
+    next.memberInvoiceDelivery = patch.memberInvoiceDelivery;
+  }
   return next;
 }
 

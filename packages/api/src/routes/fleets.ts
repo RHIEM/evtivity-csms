@@ -16,6 +16,7 @@ import {
   PG_FOREIGN_KEY_VIOLATION,
   INVOICE_DATE_MODES,
   ACCOUNT_SETTLEMENTS,
+  MEMBER_INVOICE_DELIVERIES,
 } from '@evtivity/database';
 import type { AccountInvoiceRecipient } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
@@ -107,6 +108,11 @@ const billingProfileFields = {
     .nullable()
     .describe(
       'Printed on externally settled invoices instead of the payment block; null: a default text',
+    ),
+  memberInvoiceDelivery: z
+    .enum(MEMBER_INVOICE_DELIVERIES)
+    .describe(
+      'Who the member invoices and their credit notes are emailed to: driver (the member, default) or billing_contacts (the fleet billing contacts instead of the driver)',
     ),
 };
 const optionalBillingProfileFields = Object.fromEntries(
@@ -465,6 +471,12 @@ const fleetBillingProfileBody = z.object({
     500,
     'Note printed on externally settled invoices, e.g. "Deducted from the next payroll"; blank: a default text',
   ),
+  memberInvoiceDelivery: z
+    .enum(MEMBER_INVOICE_DELIVERIES)
+    .optional()
+    .describe(
+      'Who the member invoices and their credit notes are emailed to: driver (the member) or billing_contacts (the billing contacts, e.g. a payroll office that forwards them)',
+    ),
 });
 
 const fleetCreditLimitBody = z.object({

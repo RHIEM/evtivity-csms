@@ -54,6 +54,7 @@ vi.mock('@evtivity/database', () => {
     PG_FOREIGN_KEY_VIOLATION: '23503',
     INVOICE_DATE_MODES: ['run_date', 'period_end'],
     ACCOUNT_SETTLEMENTS: ['payment', 'external'],
+    MEMBER_INVOICE_DELIVERIES: ['driver', 'billing_contacts'],
   };
 });
 

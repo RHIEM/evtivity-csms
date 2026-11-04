@@ -429,6 +429,11 @@ export async function runMemberInvoiceJob(
       { fleetId, driverId, invoiceId, reason: sent.status },
       'Member invoice not emailed: the driver has no email',
     );
+  } else if (sent.status === 'no_contacts') {
+    log.warn(
+      { fleetId, driverId, invoiceId, reason: sent.status },
+      'Member invoice not emailed: the fleet delivers to its billing contacts and has none',
+    );
   }
   return created
     ? { status: 'invoiced', invoiceId, email: sent.status }
