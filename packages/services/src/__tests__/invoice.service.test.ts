@@ -138,6 +138,9 @@ vi.mock('@evtivity/database', () => {
     getInvoicePaymentTermsDays: vi.fn(() => Promise.resolve(h.state.paymentTermsDays)),
     getSystemTimezone: vi.fn(() => Promise.resolve(h.state.timeZone)),
     allocateInvoiceNumber: vi.fn(() => Promise.resolve('INV-202606-0042')),
+    loadInvoiceSellerSnapshot: vi.fn(() =>
+      Promise.resolve({ name: 'Acme Charging GmbH', city: 'Berlin', taxId: 'DE111111111' }),
+    ),
   };
 });
 
@@ -173,7 +176,13 @@ import {
 } from '@evtivity/lib';
 import type { TariffInput, TaxBasis } from '@evtivity/lib';
 import { inArray, isNull, sql } from 'drizzle-orm';
-import { allocateInvoiceNumber, chargingSessions, db, paymentRecords } from '@evtivity/database';
+import {
+  allocateInvoiceNumber,
+  chargingSessions,
+  db,
+  loadInvoiceSellerSnapshot,
+  paymentRecords,
+} from '@evtivity/database';
 import { claimFeeRecordsForInvoice, releaseInvoiceFeeRecords } from '@evtivity/payments';
 import {
   createSessionInvoice,
@@ -579,6 +588,21 @@ describe('createSessionInvoice', () => {
     expect(vi.mocked(allocateInvoiceNumber).mock.calls[0]?.[1]).toBe('invoice');
     expect(allocation).toBeGreaterThan(transactionStart);
     expect(insertedInvoice()['invoiceNumber']).toMatch(/^INV-\d{6}-0042$/);
+  });
+
+  it('keeps the seller as it is at issue, read inside the invoice transaction', async () => {
+    queue('chargingSessions', [session()]);
+
+    await createSessionInvoice('ses_1');
+
+    const transactionStart = vi.mocked(db.transaction).mock.invocationCallOrder[0] ?? 0;
+    const load = vi.mocked(loadInvoiceSellerSnapshot).mock.invocationCallOrder[0] ?? 0;
+    expect(load).toBeGreaterThan(transactionStart);
+    expect(insertedInvoice()['seller']).toEqual({
+      name: 'Acme Charging GmbH',
+      city: 'Berlin',
+      taxId: 'DE111111111',
+    });
   });
 
   it('rolls back when a concurrent invoice claimed the session first', async () => {

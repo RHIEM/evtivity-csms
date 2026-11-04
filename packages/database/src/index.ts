@@ -208,6 +208,15 @@ export {
 } from './lib/fleet-credit-settings.js';
 export { invoiceNumberPrefix, allocateInvoiceNumber } from './lib/invoice-number.js';
 export type { InvoiceNumberExecutor } from './lib/invoice-number.js';
+export {
+  INVOICE_SELLER_SNAPSHOT_SETTING_KEYS,
+  invoiceSellerSnapshotFromSettings,
+  loadInvoiceSellerSnapshot,
+} from './lib/invoice-seller-snapshot.js';
+export type {
+  InvoiceSellerSnapshot,
+  InvoiceSellerExecutor,
+} from './lib/invoice-seller-snapshot.js';
 export { sessionFeeGrossCents, siteMaxSessionFeeGrossCents } from './lib/session-fee-floor.js';
 export type {
   PricingGroupSource,

@@ -247,6 +247,21 @@ describe('creditInvoice', () => {
     expect(result?.releasedSessionIds).toEqual(['ses_1']);
   });
 
+  it('keeps the seller of the invoice it credits, not the current settings', async () => {
+    const seller = { name: 'Acme Charging GmbH', street: 'Old Street 1', city: 'Berlin' };
+    h.state.invoice = invoice({ seller });
+    await creditInvoice('inv_1', 'Wrong tariff');
+    const [note] = h.state.inserted['invoices'] ?? [];
+    expect(note).toMatchObject({ seller });
+  });
+
+  it('keeps no seller when the credited invoice has none (issued before it was kept)', async () => {
+    h.state.invoice = invoice({ seller: null });
+    await creditInvoice('inv_1', 'Wrong tariff');
+    const [note] = h.state.inserted['invoices'] ?? [];
+    expect(note).toMatchObject({ seller: null });
+  });
+
   it('copies member_billed: the credit note of a member invoice is a member credit note', async () => {
     h.state.invoice = invoice({
       driverId: 'drv_1',

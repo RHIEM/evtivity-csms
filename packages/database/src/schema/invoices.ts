@@ -56,6 +56,9 @@ export const invoices = pgTable(
     periodEnd: date('period_end'),
     // The fleet billing profile's bill-to block at issue (FleetBillTo), never updated.
     billTo: jsonb('bill_to'),
+    // The seller at issue (InvoiceSellerSnapshot: company name, address and invoice
+    // seller settings), never updated. Null on documents issued before it was kept.
+    seller: jsonb('seller'),
     // Language of the fleet invoice PDF and email at issue (INVOICE_LANGUAGES).
     language: varchar('language', { length: 10 }),
     // When the invoice email last went to the fleet billing contacts; the

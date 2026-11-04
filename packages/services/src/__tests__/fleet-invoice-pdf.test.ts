@@ -107,6 +107,7 @@ function fleetDetail(language: string | null = 'en'): InvoiceDetail {
         country: 'Germany',
         taxId: 'DE123456789',
       },
+      seller: null,
       language,
       sentAt: null,
       overdueNoticeSentAt: null,

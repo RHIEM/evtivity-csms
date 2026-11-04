@@ -47,6 +47,7 @@ import {
   INVOICE_ROW_BAND_COLOR,
   generateInvoicePdf,
   readInvoiceSeller,
+  readStoredInvoiceSeller,
   resolveInvoicePdfLanguage,
   sellerDetailLines,
 } from '../invoice-pdf.service.js';
@@ -173,6 +174,7 @@ function detail(language: string): InvoiceDetail {
       periodStart: null,
       periodEnd: null,
       billTo: null,
+      seller: null,
       language: null,
       sentAt: null,
       overdueNoticeSentAt: null,
@@ -280,6 +282,47 @@ describe('invoice seller', () => {
     expect(seller.name).toBe('EVtivity');
     expect(sellerDetailLines(seller, INVOICE_LABELS.en)).toEqual(['Berlin']);
     expect(sellerDetailLines(readInvoiceSeller({}), INVOICE_LABELS.en)).toEqual([]);
+  });
+
+  it('reads the seller kept on the invoice at issue', () => {
+    const seller = readStoredInvoiceSeller({
+      name: 'Acme Services GmbH',
+      street: 'Ringstr. 2',
+      zip: '50667',
+      city: 'Köln',
+      state: null,
+      country: 'DE',
+      taxId: 'DE987654321',
+      taxIdLabel: 'USt-IdNr.',
+      registrationNumber: 'HRB 999',
+      email: null,
+      phone: null,
+    });
+    expect(seller?.name).toBe('Acme Services GmbH');
+    expect(sellerDetailLines(seller!, INVOICE_LABELS.de)).toEqual([
+      'Ringstr. 2',
+      '50667 Köln',
+      'DE',
+      'USt-IdNr.: DE987654321',
+      'Registernummer: HRB 999',
+    ]);
+  });
+
+  it('has no stored seller on a document issued before the seller was kept', () => {
+    expect(readStoredInvoiceSeller(null)).toBeNull();
+    expect(readStoredInvoiceSeller(undefined)).toBeNull();
+    expect(readStoredInvoiceSeller('Acme')).toBeNull();
+  });
+
+  it('prints the seller kept at issue, not the current settings', async () => {
+    settingsRows.rows = FULL_SELLER_ROWS;
+    const issued = detail('en');
+    issued.invoice.seller = { name: 'Old Name GmbH', street: 'Old Street 1', city: 'Hamburg' };
+    const { text } = pdfContent(await generateInvoicePdf(issued));
+    expect(text).toContain('FROMOld Name GmbH');
+    expect(text).toContain('Old Street 1');
+    expect(text).not.toContain('Acme Charging');
+    expect(text).not.toContain('Hauptstrasse 1');
   });
 
   it('draws the full seller block in the From area', async () => {
