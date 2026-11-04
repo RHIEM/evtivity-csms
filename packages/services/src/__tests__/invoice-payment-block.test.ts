@@ -21,6 +21,7 @@ const openFleetInvoice: InvoicePaymentBlockInvoice = {
   dueAt,
   paidAt: null,
   paymentReference: null,
+  settlementNote: null,
 };
 
 const payment: InvoicePaymentSettings = {
@@ -48,6 +49,31 @@ function block(
 }
 
 describe('invoicePaymentBlock', () => {
+  it('prints the settlement note instead of any payment request on a settled invoice', () => {
+    const result = block({
+      status: 'paid',
+      paidAt: issuedAt,
+      settlementNote: ' Bitte nicht überweisen. Verrechnung mit der Gehaltsabrechnung. ',
+    });
+    expect(result).toEqual({
+      kind: 'settlement',
+      text: 'Bitte nicht überweisen. Verrechnung mit der Gehaltsabrechnung.',
+      rows: [],
+      qrPayload: null,
+    });
+  });
+
+  it('prints the default settlement text for an empty note, also without an IBAN', () => {
+    const result = block({ status: 'paid', settlementNote: '' }, { iban: null }, 'de');
+    expect(result?.kind).toBe('settlement');
+    expect(result?.text).toBe(INVOICE_LABELS.de.paymentSettledExternally);
+  });
+
+  it('prints the settlement note on the credit note of a settled invoice', () => {
+    const result = block({ kind: 'credit_note', settlementNote: 'Verrechnung mit dem Gehalt.' });
+    expect(result).toMatchObject({ kind: 'settlement', text: 'Verrechnung mit dem Gehalt.' });
+  });
+
   it('asks for a transfer on an open invoice with the amount, due date and reference', () => {
     const result = block({});
     expect(result?.kind).toBe('transfer');

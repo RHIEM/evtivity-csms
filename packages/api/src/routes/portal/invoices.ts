@@ -75,6 +75,12 @@ const portalInvoiceItem = z
     issuedAt: z.coerce.date().nullable().describe('When it was issued'),
     dueAt: z.coerce.date().nullable().describe('Payment due date, null when nothing is due'),
     paidAt: z.coerce.date().nullable().describe('When it was paid in full, null while unpaid'),
+    settlementNote: z
+      .string()
+      .nullable()
+      .describe(
+        'Settled outside EVtivity (e.g. deducted from the payroll): the note printed instead of the payment details, an empty string for the default text. Null when paid through EVtivity',
+      ),
     currency: z.string().length(3).describe('ISO 4217 currency code'),
     subtotalCents: z
       .number()
@@ -188,6 +194,7 @@ export function toPortalInvoiceDetail(detail: InvoiceDetail): z.infer<typeof por
     issuedAt: invoice.issuedAt,
     dueAt: invoice.dueAt,
     paidAt: invoice.paidAt,
+    settlementNote: invoice.settlementNote,
     currency: invoice.currency,
     subtotalCents: invoice.subtotalCents,
     taxCents: invoice.taxCents,
@@ -277,6 +284,7 @@ export function portalInvoiceRoutes(app: FastifyInstance): void {
             issuedAt: invoices.issuedAt,
             dueAt: invoices.dueAt,
             paidAt: invoices.paidAt,
+            settlementNote: invoices.settlementNote,
             currency: invoices.currency,
             subtotalCents: invoices.subtotalCents,
             taxCents: invoices.taxCents,

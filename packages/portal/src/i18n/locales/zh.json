@@ -1411,6 +1411,8 @@
     "issued": "开具日期",
     "due": "到期日",
     "paidOn": "支付日期",
+    "settled": "已结算",
+    "settlementDefault": "请勿转账。该金额将另行结算。",
     "billTo": "账单抬头",
     "items": "明细",
     "net": "净额",

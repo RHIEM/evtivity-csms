@@ -40,10 +40,17 @@ export interface FleetBillingProfile {
   invoiceDateMode: InvoiceDateMode;
   /** The invoice issuer of the fleet's invoices; null: the company. */
   invoiceIssuerId: string | null;
+  /** payment: paid through EVtivity; external: settled outside it (e.g. payroll). */
+  accountSettlement: AccountSettlement;
+  /** Printed on externally settled invoices instead of the payment block. */
+  settlementNote: string | null;
 }
 
 /** The date of the fleet's account invoices: the issue day or the last day of the billed month. */
 export type InvoiceDateMode = 'run_date' | 'period_end';
+
+/** How the fleet's account invoices are settled. */
+export type AccountSettlement = 'payment' | 'external';
 
 export interface FleetBillingProfileCardProps {
   fleet: { id: string; name: string } & Partial<FleetBillingProfile>;
@@ -68,6 +75,8 @@ interface FormState {
   invoiceDateMode: InvoiceDateMode;
   /** '' for the company. */
   invoiceIssuerId: string;
+  accountSettlement: AccountSettlement;
+  settlementNote: string;
 }
 
 /** Splits the contacts field (one per line, or comma or semicolon separated). */
@@ -93,6 +102,8 @@ function toForm(fleet: FleetBillingProfileCardProps['fleet']): FormState {
     autoInvoice: fleet.autoInvoice === true,
     invoiceDateMode: fleet.invoiceDateMode === 'period_end' ? 'period_end' : 'run_date',
     invoiceIssuerId: fleet.invoiceIssuerId ?? '',
+    accountSettlement: fleet.accountSettlement === 'external' ? 'external' : 'payment',
+    settlementNote: fleet.settlementNote ?? '',
   };
 }
 
@@ -183,6 +194,8 @@ export function FleetBillingProfileCard({
       invoiceLanguage: form.language,
       paymentTermsDays: terms === '' ? null : Number(terms),
       invoiceIssuerId: form.invoiceIssuerId === '' ? null : form.invoiceIssuerId,
+      accountSettlement: form.accountSettlement,
+      settlementNote: textOrNull(form.settlementNote),
       autoInvoice: form.autoInvoice,
       invoiceDateMode: form.invoiceDateMode,
     });
@@ -329,6 +342,38 @@ export function FleetBillingProfileCard({
                 {t('fleets.billingProfile.issuerHelp')}
               </p>
             </div>
+            <div className="space-y-2">
+              <Label htmlFor="billing-settlement">{t('fleets.billingProfile.settlement')}</Label>
+              <Select
+                id="billing-settlement"
+                value={form.accountSettlement}
+                onChange={(e) => {
+                  set('accountSettlement', e.target.value === 'external' ? 'external' : 'payment');
+                }}
+              >
+                <option value="payment">{t('fleets.billingProfile.settlementPayment')}</option>
+                <option value="external">{t('fleets.billingProfile.settlementExternal')}</option>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t('fleets.billingProfile.settlementHelp')}
+              </p>
+            </div>
+            {form.accountSettlement === 'external' && (
+              <div className="space-y-2 md:col-span-2">
+                <Label htmlFor="billing-settlement-note">
+                  {t('fleets.billingProfile.settlementNote')}
+                </Label>
+                <Textarea
+                  id="billing-settlement-note"
+                  value={form.settlementNote}
+                  maxLength={500}
+                  placeholder={t('fleets.billingProfile.settlementNotePlaceholder')}
+                  onChange={(e) => {
+                    set('settlementNote', e.target.value);
+                  }}
+                />
+              </div>
+            )}
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
@@ -386,6 +431,19 @@ export function FleetBillingProfileCard({
             <dt className="text-muted-foreground">{t('fleets.billingProfile.issuer')}</dt>
             <dd className="font-medium" data-testid="fleet-billing-issuer">
               {issuerName(fleet.invoiceIssuerId)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">{t('fleets.billingProfile.settlement')}</dt>
+            <dd className="font-medium" data-testid="fleet-billing-settlement">
+              {fleet.accountSettlement === 'external'
+                ? t('fleets.billingProfile.settlementExternal')
+                : t('fleets.billingProfile.settlementPayment')}
+              {fleet.accountSettlement === 'external' && (
+                <div className="font-normal text-muted-foreground">
+                  {fleet.settlementNote ?? t('fleets.billingProfile.settlementNoteDefault')}
+                </div>
+              )}
             </dd>
           </div>
           <div>

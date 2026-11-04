@@ -178,6 +178,31 @@ describe('InvoiceDetail', () => {
     expect(screen.queryByText('invoices.markPaid')).toBeNull();
   });
 
+  it('shows a payroll-settled invoice as settled with its settlement note', async () => {
+    mockInvoice(
+      detail({
+        status: 'paid',
+        paidAt: '2026-06-01T10:00:00.000Z',
+        settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByText('invoices.settled')).toBeDefined();
+    expect(screen.getByTestId('invoice-settlement').textContent).toContain(
+      'Verrechnung mit der Gehaltsabrechnung',
+    );
+  });
+
+  it('shows the default text for a settlement without its own note', async () => {
+    mockInvoice(detail({ status: 'paid', settlementNote: '' }));
+    renderPage();
+
+    expect((await screen.findByTestId('invoice-settlement')).textContent).toContain(
+      'invoices.settlementDefault',
+    );
+  });
+
   it('hides every write action without payments:write', async () => {
     h.permissions = new Set(['payments:read']);
     mockInvoice(detail());

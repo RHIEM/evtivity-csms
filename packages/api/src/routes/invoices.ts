@@ -172,6 +172,12 @@ const invoiceRecord = z
       .describe(
         'The reference an operator recorded for a payment received outside EVtivity, such as a bank transfer reference',
       ),
+    settlementNote: z
+      .string()
+      .nullable()
+      .describe(
+        "Settled outside EVtivity (the fleet's external settlement, e.g. payroll): the note printed instead of the payment block, an empty string for the default text. Null when paid through EVtivity",
+      ),
     currency: z.string().length(3).describe('ISO 4217 currency code'),
     subtotalCents: z
       .number()

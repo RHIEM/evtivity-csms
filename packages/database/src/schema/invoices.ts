@@ -63,6 +63,10 @@ export const invoices = pgTable(
     // The issuer the document was issued under (its seller and number range); null:
     // the company. A credit note keeps the issuer of the invoice it credits.
     issuerId: text('issuer_id').references(() => invoiceIssuers.id, { onDelete: 'restrict' }),
+    // Settled outside EVtivity (the fleet's account_settlement 'external'): the
+    // note printed instead of the payment block, '' for the default text. Null:
+    // paid through EVtivity. A credit note keeps the note of the invoice.
+    settlementNote: varchar('settlement_note', { length: 500 }),
     // Language of the fleet invoice PDF and email at issue (INVOICE_LANGUAGES).
     language: varchar('language', { length: 10 }),
     // When the invoice email last went to the fleet billing contacts; the

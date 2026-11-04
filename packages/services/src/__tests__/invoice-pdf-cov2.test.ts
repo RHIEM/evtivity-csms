@@ -106,6 +106,7 @@ function detail(overrides: Partial<InvoiceDetail> = {}): InvoiceDetail {
       billTo: null,
       seller: null,
       issuerId: null,
+      settlementNote: null,
       language: null,
       sentAt: null,
       overdueNoticeSentAt: null,

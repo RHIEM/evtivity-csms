@@ -1412,6 +1412,8 @@
     "issued": "Ausgestellt",
     "due": "Fällig",
     "paidOn": "Bezahlt",
+    "settled": "Verrechnet",
+    "settlementDefault": "Bitte nicht überweisen. Der Betrag wird gesondert verrechnet.",
     "billTo": "Rechnungsempfänger",
     "items": "Positionen",
     "net": "Netto",

@@ -128,6 +128,7 @@ export async function creditInvoice(
         billTo: before.billTo,
         seller: before.seller,
         issuerId: before.issuerId,
+        settlementNote: before.settlementNote,
         language: before.language,
         status: 'issued',
         issuedAt: now,

@@ -1411,6 +1411,8 @@
     "issued": "開立日期",
     "due": "到期日",
     "paidOn": "付款日期",
+    "settled": "已結算",
+    "settlementDefault": "請勿轉帳。該金額將另行結算。",
     "billTo": "帳單抬頭",
     "items": "明細",
     "net": "淨額",

@@ -23,6 +23,7 @@ import {
 import type {
   AccountInvoiceRecipient,
   InvoiceDateMode,
+  AccountSettlement,
   FleetCreditExposure,
   FleetCreditLevel,
   ReleaseUpgradePending,
@@ -362,6 +363,10 @@ export interface FleetBillingProfile {
   invoiceDateMode: InvoiceDateMode;
   /** The issuer the fleet's invoices are issued under; null: the company. */
   invoiceIssuerId: string | null;
+  /** How the account invoices are settled: paid through EVtivity or outside it. */
+  accountSettlement: AccountSettlement;
+  /** Printed on externally settled invoices instead of the payment block. */
+  settlementNote: string | null;
 }
 
 export type FleetBillingProfilePatch = {
@@ -382,6 +387,8 @@ const PROFILE_KEYS = [
   'autoInvoice',
   'invoiceDateMode',
   'invoiceIssuerId',
+  'accountSettlement',
+  'settlementNote',
 ] as const satisfies readonly (keyof FleetBillingProfile)[];
 
 const PROFILE_TEXT_KEYS = [
@@ -392,6 +399,7 @@ const PROFILE_TEXT_KEYS = [
   'billingZip',
   'billingCountry',
   'billingTaxId',
+  'settlementNote',
 ] as const;
 
 function pickBillingProfile(fleet: FleetBillingProfile): FleetBillingProfile {
@@ -428,6 +436,7 @@ export function mergeBillingProfile(
   if (patch.autoInvoice !== undefined) next.autoInvoice = patch.autoInvoice;
   if (patch.invoiceDateMode !== undefined) next.invoiceDateMode = patch.invoiceDateMode;
   if (patch.invoiceIssuerId !== undefined) next.invoiceIssuerId = patch.invoiceIssuerId;
+  if (patch.accountSettlement !== undefined) next.accountSettlement = patch.accountSettlement;
   return next;
 }
 

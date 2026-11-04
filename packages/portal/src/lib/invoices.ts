@@ -20,6 +20,8 @@ export interface PortalInvoice {
   issuedAt: string | null;
   dueAt: string | null;
   paidAt: string | null;
+  /** Settled outside EVtivity (e.g. payroll): the note, '' for the default text; null otherwise. */
+  settlementNote?: string | null;
   currency: string;
   subtotalCents: number;
   taxCents: number;

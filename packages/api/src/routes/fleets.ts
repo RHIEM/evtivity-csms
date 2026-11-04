@@ -15,6 +15,7 @@ import {
   pgErrorCode,
   PG_FOREIGN_KEY_VIOLATION,
   INVOICE_DATE_MODES,
+  ACCOUNT_SETTLEMENTS,
 } from '@evtivity/database';
 import type { AccountInvoiceRecipient } from '@evtivity/database';
 import { eq } from 'drizzle-orm';
@@ -94,6 +95,18 @@ const billingProfileFields = {
     .nullable()
     .describe(
       'The invoice issuer (seller and number ranges) of the fleet and member invoices; null: the company',
+    ),
+  accountSettlement: z
+    .enum(ACCOUNT_SETTLEMENTS)
+    .describe(
+      'How the account invoices are settled: payment (paid by transfer, with due date and overdue notice) or external (settled outside EVtivity, e.g. deducted from the payroll: issued as paid, with the settlement note instead of the payment block)',
+    ),
+  settlementNote: z
+    .string()
+    .max(500)
+    .nullable()
+    .describe(
+      'Printed on externally settled invoices instead of the payment block; null: a default text',
     ),
 };
 const optionalBillingProfileFields = Object.fromEntries(
@@ -442,6 +455,16 @@ const fleetBillingProfileBody = z.object({
     .describe(
       'The invoice issuer of the fleet and member invoices (GET /invoice-issuers); null: the company. Applies to invoices issued afterwards',
     ),
+  accountSettlement: z
+    .enum(ACCOUNT_SETTLEMENTS)
+    .optional()
+    .describe(
+      'payment (paid by transfer) or external (settled outside EVtivity: issued as paid, no overdue notice). Applies to invoices issued afterwards',
+    ),
+  settlementNote: optionalText(
+    500,
+    'Note printed on externally settled invoices, e.g. "Deducted from the next payroll"; blank: a default text',
+  ),
 });
 
 const fleetCreditLimitBody = z.object({
