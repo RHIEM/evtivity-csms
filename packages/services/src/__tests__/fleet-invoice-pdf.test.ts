@@ -109,6 +109,7 @@ function fleetDetail(language: string | null = 'en'): InvoiceDetail {
       },
       seller: null,
       issuerId: null,
+      settlementNote: null,
       language,
       sentAt: null,
       overdueNoticeSentAt: null,

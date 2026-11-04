@@ -21,6 +21,7 @@ export type InvoicePaymentBlockInvoice = Pick<
   | 'dueAt'
   | 'paidAt'
   | 'paymentReference'
+  | 'settlementNote'
 >;
 
 /**
@@ -30,9 +31,11 @@ export type InvoicePaymentBlockInvoice = Pick<
  *   hold the bank details; `qrPayload` is the EPC QR code (EUR only, when on).
  * - `paid`: a paid invoice. No transfer request, so nobody pays twice.
  * - `creditNote`: a credit note. Nothing to pay, no QR code.
+ * - `settlement`: a document settled outside EVtivity (e.g. deducted from
+ *   the payroll): its settlement note, or the default text, and nothing else.
  */
 export interface InvoicePaymentBlock {
-  kind: 'transfer' | 'paid' | 'creditNote';
+  kind: 'transfer' | 'paid' | 'creditNote' | 'settlement';
   text: string;
   /** Label and value rows printed under the text. */
   rows: Array<[string, string]>;
@@ -69,10 +72,22 @@ function paidByCardAtIssue(invoice: InvoicePaymentBlockInvoice): boolean {
 
 /**
  * The payment block of an invoice PDF, or null when none is printed: no IBAN
- * is set, or the invoice is a draft, void, credited, or has nothing to pay.
+ * is set, or the invoice is a draft, void, credited, or has nothing to pay. A
+ * document settled outside EVtivity always prints its settlement note.
  */
 export function invoicePaymentBlock(input: InvoicePaymentBlockInput): InvoicePaymentBlock | null {
   const { invoice, labels, payment } = input;
+  // Settled outside EVtivity: the note replaces any transfer request, with or
+  // without bank details.
+  if (invoice.settlementNote != null) {
+    const note = invoice.settlementNote.trim();
+    return {
+      kind: 'settlement',
+      text: note !== '' ? note : labels.paymentSettledExternally,
+      rows: [],
+      qrPayload: null,
+    };
+  }
   if (payment.iban == null) return null;
 
   if (invoice.kind === 'credit_note') {

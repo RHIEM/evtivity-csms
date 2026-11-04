@@ -82,7 +82,9 @@ export function InvoiceDetail(): React.JSX.Element {
         <CardContent className="space-y-3 p-6">
           <div className="flex items-center justify-between">
             <Badge variant={invoiceStatusVariant(invoice.status)}>
-              {t(`invoices.status.${invoice.status}`)}
+              {invoice.status === 'paid' && invoice.settlementNote != null
+                ? t('invoices.settled')
+                : t(`invoices.status.${invoice.status}`)}
             </Badge>
             <span className="text-lg font-bold">
               {formatCents(invoice.totalCents, invoice.currency)}
@@ -105,8 +107,15 @@ export function InvoiceDetail(): React.JSX.Element {
           {invoice.dueAt != null && invoice.status === 'issued' && (
             <Row label={t('invoices.due')} value={formatDay(invoice.dueAt, timezone)} />
           )}
-          {invoice.paidAt != null && (
+          {invoice.paidAt != null && invoice.settlementNote == null && (
             <Row label={t('invoices.paidOn')} value={formatDay(invoice.paidAt, timezone)} />
+          )}
+          {invoice.settlementNote != null && (
+            <p className="text-sm" data-testid="invoice-settlement">
+              {invoice.settlementNote.trim() !== ''
+                ? invoice.settlementNote
+                : t('invoices.settlementDefault')}
+            </p>
           )}
           {invoice.creditedInvoice != null && (
             <p className="text-sm">

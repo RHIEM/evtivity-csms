@@ -397,6 +397,46 @@ describe('FleetBillingProfileCard', () => {
     );
   });
 
+  it('saves external settlement with its note and shows it', async () => {
+    getMock.mockResolvedValue([]);
+    patchMock.mockResolvedValueOnce(fleet);
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    expect(screen.getByTestId('fleet-billing-settlement').textContent).toBe(
+      'fleets.billingProfile.settlementPayment',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(screen.queryByLabelText('fleets.billingProfile.settlementNote')).toBeNull();
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.settlement'), {
+      target: { value: 'external' },
+    });
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.settlementNote'), {
+      target: { value: ' Verrechnung mit der Gehaltsabrechnung ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/fleets/flt_1/billing-profile',
+        expect.objectContaining({
+          accountSettlement: 'external',
+          settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
+        }),
+      );
+    });
+  });
+
+  it('shows the default note of an external settlement without its own note', () => {
+    getMock.mockResolvedValue([]);
+    wrap(
+      <FleetBillingProfileCard
+        fleet={{ ...fleet, accountSettlement: 'external', settlementNote: null }}
+      />,
+    );
+    expect(screen.getByTestId('fleet-billing-settlement').textContent).toBe(
+      'fleets.billingProfile.settlementExternalfleets.billingProfile.settlementNoteDefault',
+    );
+  });
+
   it('saves the chosen invoice issuer', async () => {
     getMock.mockImplementation((url: string) =>
       Promise.resolve(
@@ -453,6 +493,8 @@ describe('FleetBillingProfileCard', () => {
         autoInvoice: true,
         invoiceDateMode: 'period_end',
         invoiceIssuerId: null,
+        accountSettlement: 'payment',
+        settlementNote: null,
       });
     });
     await waitFor(() => {

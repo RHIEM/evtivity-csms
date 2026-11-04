@@ -285,6 +285,13 @@ describe('creditInvoice', () => {
     expect(vi.mocked(allocateInvoiceNumber)).not.toHaveBeenCalled();
   });
 
+  it('keeps the settlement note of a settled invoice on its credit note', async () => {
+    h.state.invoice = invoice({ status: 'paid', settlementNote: 'Verrechnung mit dem Gehalt' });
+    await creditInvoice('inv_1', 'Wrong tariff');
+    const [note] = h.state.inserted['invoices'] ?? [];
+    expect(note).toMatchObject({ settlementNote: 'Verrechnung mit dem Gehalt' });
+  });
+
   it('numbers a credit note without issuer from the CN range', async () => {
     h.state.invoice = invoice({ issuerId: null });
     await creditInvoice('inv_1', 'Wrong tariff');

@@ -147,6 +147,7 @@ function invoiceRow(overrides: Record<string, unknown> = {}): Record<string, unk
     dueAt: '2026-07-30T10:00:00.000Z',
     paidAt: null,
     paymentReference: null,
+    settlementNote: null,
     currency: 'EUR',
     subtotalCents: 1000,
     taxCents: 190,

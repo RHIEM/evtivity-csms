@@ -10,6 +10,7 @@ import {
   pgConstraintName,
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
+  type AccountSettlement,
   type InvoiceDateMode,
 } from '@evtivity/database';
 import {
@@ -175,6 +176,10 @@ export interface FleetForInvoice {
   invoiceDateMode: InvoiceDateMode;
   /** The issuer the fleet's invoices are issued under; null or left out: the company. */
   invoiceIssuerId?: string | null;
+  /** How the account invoices are settled; left out: 'payment'. */
+  accountSettlement?: AccountSettlement;
+  /** The note printed on externally settled invoices; null: the default text. */
+  settlementNote?: string | null;
 }
 
 export function billToFromFleet(fleet: FleetForInvoice): FleetBillTo {
@@ -446,7 +451,7 @@ async function loadFleet(
   const rows = (await executor.execute(sql`
     SELECT id, name, billing_legal_name, billing_street, billing_city, billing_state,
            billing_zip, billing_country, billing_tax_id, invoice_language, payment_terms_days,
-           invoice_date_mode, invoice_issuer_id
+           invoice_date_mode, invoice_issuer_id, account_settlement, settlement_note
     FROM fleets WHERE id = ${fleetId}
     ${lock ? sql`FOR UPDATE` : sql``}
   `)) as unknown as Array<Record<string, unknown>>;
@@ -470,6 +475,8 @@ async function loadFleet(
     paymentTermsDays: row['payment_terms_days'] == null ? null : Number(row['payment_terms_days']),
     invoiceDateMode: row['invoice_date_mode'] === 'period_end' ? 'period_end' : 'run_date',
     invoiceIssuerId: text('invoice_issuer_id'),
+    accountSettlement: row['account_settlement'] === 'external' ? 'external' : 'payment',
+    settlementNote: text('settlement_note'),
   };
 }
 
@@ -1089,13 +1096,16 @@ async function issueAccountInvoice(
 
       const billTo = driver != null ? billToFromDriver(driver) : billToFromFleet(fleet);
       const language = driver != null ? driver.language : fleet.invoiceLanguage;
+      // Settled outside EVtivity: issued as paid at the invoice date and due on
+      // it, so no overdue notice follows and the credit limit sees nothing open.
+      const external = fleet.accountSettlement === 'external';
       const created: InvoiceWithLineItems = await insertInvoiceInTransaction(tx, {
         driverId: driver?.id ?? null,
         currency,
         lines: plan.lines,
         chargedCents: plan.totalCents,
-        status: 'issued',
-        paymentTermsDays: fleet.paymentTermsDays,
+        status: external ? 'paid' : 'issued',
+        paymentTermsDays: external ? 0 : fleet.paymentTermsDays,
         issuedAt: accountInvoiceDate(fleet.invoiceDateMode, bounds, timeZone, now),
         fleet: {
           fleetId,
@@ -1105,6 +1115,7 @@ async function issueAccountInvoice(
           language: isInvoiceLanguage(language) ? language : 'en',
           memberBilled: driver != null,
           issuerId: fleet.invoiceIssuerId ?? null,
+          settlementNote: external ? (fleet.settlementNote ?? '') : null,
         },
         sessionClaimGuard,
       });

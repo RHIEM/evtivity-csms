@@ -1425,6 +1425,8 @@
     "issued": "Emitida",
     "due": "Vencimiento",
     "paidOn": "Pagada",
+    "settled": "Liquidada",
+    "settlementDefault": "No realice ninguna transferencia. El importe se liquida por separado.",
     "billTo": "Facturar a",
     "items": "Conceptos",
     "net": "Neto",

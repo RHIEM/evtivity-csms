@@ -125,6 +125,7 @@ vi.mock('@evtivity/database', () => {
   };
   return {
     INVOICE_DATE_MODES: ['run_date', 'period_end'],
+    ACCOUNT_SETTLEMENTS: ['payment', 'external'],
     db: {
       select: vi.fn(() => buildChain()),
       insert: vi.fn(() => buildChain()),

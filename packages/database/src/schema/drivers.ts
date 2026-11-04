@@ -355,6 +355,15 @@ export type AccountInvoiceRecipient = (typeof ACCOUNT_INVOICE_RECIPIENTS)[number
 export const INVOICE_DATE_MODES = ['run_date', 'period_end'] as const;
 export type InvoiceDateMode = (typeof INVOICE_DATE_MODES)[number];
 
+/**
+ * How a fleet's account invoices are settled: `payment` (paid by transfer:
+ * due date, payment block, overdue notice) or `external` (settled outside
+ * EVtivity, e.g. deducted from the payroll: issued as paid, with the
+ * settlement note instead of the payment block).
+ */
+export const ACCOUNT_SETTLEMENTS = ['payment', 'external'] as const;
+export type AccountSettlement = (typeof ACCOUNT_SETTLEMENTS)[number];
+
 export const fleets = pgTable(
   'fleets',
   {
@@ -400,6 +409,13 @@ export const fleets = pgTable(
     invoiceIssuerId: text('invoice_issuer_id').references(() => invoiceIssuers.id, {
       onDelete: 'restrict',
     }),
+    // How the account invoices are settled (ACCOUNT_SETTLEMENTS) and, when
+    // external, the note printed on them (null: a default text).
+    accountSettlement: varchar('account_settlement', { length: 16 })
+      .$type<AccountSettlement>()
+      .notNull()
+      .default('payment'),
+    settlementNote: varchar('settlement_note', { length: 500 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     // Credit limit of the account billing (cents of the company currency, null:
@@ -433,6 +449,10 @@ export const fleets = pgTable(
     check(
       'fleets_invoice_date_mode_check',
       sql`${table.invoiceDateMode} IN ('run_date', 'period_end')`,
+    ),
+    check(
+      'fleets_account_settlement_check',
+      sql`${table.accountSettlement} IN ('payment', 'external')`,
     ),
   ],
 );

@@ -698,6 +698,8 @@ describe('fleet billing profile', () => {
     autoInvoice: false,
     invoiceDateMode: 'run_date',
     invoiceIssuerId: null,
+    accountSettlement: 'payment',
+    settlementNote: null,
   };
   const fleetRow = { id: 'f1', name: 'Acme', accountBillingEnabled: true, ...profile };
 
@@ -823,6 +825,25 @@ describe('fleet billing profile', () => {
       updateFleetBillingProfile('f1', { invoiceIssuerId: 'iis_gone' }, { actor, log }),
     ).rejects.toMatchObject({ statusCode: 400, code: 'INVOICE_ISSUER_NOT_FOUND' });
     expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
+  it('merges the account settlement and trims the settlement note', () => {
+    const next = mergeBillingProfile(profile, {
+      accountSettlement: 'external',
+      settlementNote: '  Verrechnung mit der Gehaltsabrechnung ',
+    });
+    expect(next).toMatchObject({
+      accountSettlement: 'external',
+      settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
+    });
+    expect(mergeBillingProfile(next, { settlementNote: '  ' }).settlementNote).toBeNull();
+    expect(diffBillingProfile(profile, next)).toEqual({
+      before: { accountSettlement: 'payment', settlementNote: null },
+      after: {
+        accountSettlement: 'external',
+        settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
+      },
+    });
   });
 
   it('clears the invoice issuer without a lookup', async () => {

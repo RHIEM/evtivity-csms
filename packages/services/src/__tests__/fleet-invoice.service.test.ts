@@ -382,6 +382,40 @@ describe('createFleetInvoice', () => {
     expect(input?.fleet?.issuerId).toBe('iis_rs');
   });
 
+  it('issues an externally settled invoice as paid, due on issue, with the settlement note', async () => {
+    h.state.fleet = {
+      ...fleetRow,
+      account_settlement: 'external',
+      settlement_note: 'Verrechnung mit der Gehaltsabrechnung',
+    };
+    h.state.candidates = [candidateRow(candidate())];
+
+    await createFleetInvoice('flt_1', '2026-09', now);
+
+    const input = vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1];
+    expect(input).toMatchObject({ status: 'paid', paymentTermsDays: 0 });
+    expect(input?.fleet?.settlementNote).toBe('Verrechnung mit der Gehaltsabrechnung');
+  });
+
+  it('keeps an empty settlement note for the default text', async () => {
+    h.state.fleet = { ...fleetRow, account_settlement: 'external', settlement_note: null };
+    h.state.candidates = [candidateRow(candidate())];
+
+    await createFleetInvoice('flt_1', '2026-09', now);
+
+    expect(vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1].fleet?.settlementNote).toBe('');
+  });
+
+  it('issues an invoice paid by transfer as issued, without a settlement note', async () => {
+    h.state.candidates = [candidateRow(candidate())];
+
+    await createFleetInvoice('flt_1', '2026-09', now);
+
+    const input = vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1];
+    expect(input).toMatchObject({ status: 'issued', paymentTermsDays: 14 });
+    expect(input?.fleet?.settlementNote).toBeNull();
+  });
+
   it('issues the invoice as the company when the fleet has no issuer', async () => {
     h.state.candidates = [candidateRow(candidate())];
 

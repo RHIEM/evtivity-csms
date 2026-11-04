@@ -393,6 +393,12 @@ export interface FleetInvoiceHeader {
   memberBilled?: boolean;
   /** The fleet's invoice issuer (seller and number range); null or left out: the company. */
   issuerId?: string | null;
+  /**
+   * Settled outside EVtivity (the fleet's account_settlement 'external'): the
+   * note printed instead of the payment block, '' for the default text. Null
+   * or left out: paid through EVtivity.
+   */
+  settlementNote?: string | null;
 }
 
 /** The transaction an invoice is inserted in. */
@@ -517,6 +523,7 @@ export async function insertInvoiceInTransaction(
       status,
       seller,
       issuerId,
+      settlementNote: input.fleet?.settlementNote ?? null,
       issuedAt: now,
       dueAt,
       paidAt: status === 'paid' ? now : null,

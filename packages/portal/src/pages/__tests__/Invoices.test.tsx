@@ -167,6 +167,29 @@ describe('InvoiceDetail', () => {
     expect(getMock).toHaveBeenCalledWith('/v1/portal/invoices/1');
   });
 
+  it('shows a payroll-settled invoice as settled with its note instead of a paid date', async () => {
+    getMock.mockResolvedValue({
+      ...detail,
+      status: 'paid',
+      paidAt: '2026-11-01T00:15:00Z',
+      settlementNote: 'Verrechnung mit der Gehaltsabrechnung',
+    });
+    renderAt('/account/invoices/1');
+    expect(await screen.findByText('invoices.settled')).toBeDefined();
+    expect(screen.getByTestId('invoice-settlement').textContent).toBe(
+      'Verrechnung mit der Gehaltsabrechnung',
+    );
+    expect(screen.queryByText('invoices.paidOn')).toBeNull();
+  });
+
+  it('shows the default text for a settlement without its own note', async () => {
+    getMock.mockResolvedValue({ ...detail, status: 'paid', settlementNote: '' });
+    renderAt('/account/invoices/1');
+    expect((await screen.findByTestId('invoice-settlement')).textContent).toBe(
+      'invoices.settlementDefault',
+    );
+  });
+
   it('bands every second line item', async () => {
     const [line] = detail.lineItems;
     getMock.mockResolvedValue({ ...detail, lineItems: [line, { ...line, id: 8 }] });

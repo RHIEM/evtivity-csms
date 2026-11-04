@@ -50,6 +50,8 @@ interface InvoiceRecord extends DriverInvoice {
   overdueNoticeSentAt?: string | null;
   paidAt: string | null;
   paymentReference: string | null;
+  /** Settled outside EVtivity (e.g. payroll): the note, '' for the default text. */
+  settlementNote?: string | null;
   creditReason: string | null;
   metadata: Record<string, unknown> | null;
   updatedAt: string;
@@ -369,10 +371,12 @@ export function InvoiceDetail(): React.JSX.Element {
             )}
           </div>
           <Badge variant={INVOICE_STATUS_VARIANT[invoice.status]}>
-            {t(
-              // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-              `invoices.status.${invoice.status}` as never,
-            )}
+            {invoice.status === 'paid' && invoice.settlementNote != null
+              ? t('invoices.settled')
+              : t(
+                  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+                  `invoices.status.${invoice.status}` as never,
+                )}
           </Badge>
           <div className="print-hidden ml-auto">
             <EntityNavButtons resource="invoices" basePath="/invoices" currentId={id} />
@@ -719,6 +723,16 @@ export function InvoiceDetail(): React.JSX.Element {
                     {t('invoices.paymentReference')}
                   </dt>
                   <dd className="text-sm font-medium break-words">{invoice.paymentReference}</dd>
+                </div>
+              )}
+              {invoice.settlementNote != null && (
+                <div className="md:col-span-2" data-testid="invoice-settlement">
+                  <dt className="text-sm text-muted-foreground">{t('invoices.settlement')}</dt>
+                  <dd className="text-sm font-medium break-words">
+                    {invoice.settlementNote.trim() !== ''
+                      ? invoice.settlementNote
+                      : t('invoices.settlementDefault')}
+                  </dd>
                 </div>
               )}
             </dl>

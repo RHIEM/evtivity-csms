@@ -183,6 +183,7 @@ function detail(language: string): InvoiceDetail {
       billTo: null,
       seller: null,
       issuerId: null,
+      settlementNote: null,
       language: null,
       sentAt: null,
       overdueNoticeSentAt: null,

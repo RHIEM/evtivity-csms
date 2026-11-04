@@ -1425,6 +1425,8 @@
     "issued": "Issued",
     "due": "Due",
     "paidOn": "Paid",
+    "settled": "Settled",
+    "settlementDefault": "Please do not transfer. The amount is settled separately.",
     "billTo": "Bill To",
     "items": "Items",
     "net": "Net",
