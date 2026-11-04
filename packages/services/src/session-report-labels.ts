@@ -20,8 +20,6 @@ export interface SessionReportLabels {
   period: string;
   created: string;
   reference: string;
-  /** `{date}`: the issue date of the report this one replaces. */
-  replaces: string;
   begin: string;
   end: string;
   place: string;
@@ -50,7 +48,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: 'Period',
     created: 'Created',
     reference: 'Report ID',
-    replaces: 'Replaces the report of {date}',
     begin: 'Start',
     end: 'End',
     place: 'Location',
@@ -75,7 +72,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: 'Zeitraum',
     created: 'Erstellt am',
     reference: 'Bericht-ID',
-    replaces: 'Ersetzt den Bericht vom {date}',
     begin: 'Beginn',
     end: 'Ende',
     place: 'Standort',
@@ -100,7 +96,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: 'Periodo',
     created: 'Creado el',
     reference: 'ID del informe',
-    replaces: 'Sustituye al informe del {date}',
     begin: 'Inicio',
     end: 'Fin',
     place: 'Ubicación',
@@ -125,7 +120,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: '기간',
     created: '작성일',
     reference: '보고서 ID',
-    replaces: '{date} 보고서를 대체합니다',
     begin: '시작',
     end: '종료',
     place: '위치',
@@ -149,7 +143,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: '期间',
     created: '创建日期',
     reference: '报告 ID',
-    replaces: '替代 {date} 的报告',
     begin: '开始',
     end: '结束',
     place: '地点',
@@ -173,7 +166,6 @@ export const SESSION_REPORT_LABELS: Record<InvoiceLanguage, SessionReportLabels>
     period: '期間',
     created: '建立日期',
     reference: '報告 ID',
-    replaces: '取代 {date} 的報告',
     begin: '開始',
     end: '結束',
     place: '地點',
