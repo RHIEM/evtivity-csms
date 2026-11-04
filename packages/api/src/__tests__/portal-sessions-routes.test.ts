@@ -55,7 +55,6 @@ vi.mock('@evtivity/database', async () => ({
   ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
-  getExternalInvoicing: vi.fn(() => Promise.resolve(false)),
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -249,7 +248,6 @@ describe('Portal sessions routes - handler logic', () => {
         invoicedTo: 'fleet',
         invoiceId: null,
         invoiceNumber: null,
-        document: 'invoice',
       });
       // A payment record means the session was paid by card (an operator hold).
       expect(b.accountBilling).toBeNull();
@@ -573,7 +571,6 @@ describe('Portal sessions routes - handler logic', () => {
         invoicedTo: 'fleet',
         invoiceId: null,
         invoiceNumber: null,
-        document: 'invoice',
       });
       expect(body).not.toHaveProperty('billingMode');
       expect(body).not.toHaveProperty('billingInvoiceStatus');

@@ -24,23 +24,18 @@ function makeChain() {
   return chain;
 }
 
-const { invoicesTable, getInvoice, generateInvoicePdf, generateSessionReportPdf, state } =
-  vi.hoisted(() => ({
-    invoicesTable: {
-      id: 'invoices.id',
-      driverId: 'invoices.driver_id',
-      fleetId: 'invoices.fleet_id',
-      memberBilled: 'invoices.member_billed',
-      kind: 'invoices.kind',
-      status: 'invoices.status',
-      createdAt: 'invoices.created_at',
-    },
-    getInvoice: vi.fn(),
-    generateInvoicePdf: vi.fn(),
-    generateSessionReportPdf: vi.fn(),
-    // invoice.externalInvoicing
-    state: { external: false },
-  }));
+const { invoicesTable, getInvoice, generateInvoicePdf } = vi.hoisted(() => ({
+  invoicesTable: {
+    id: 'invoices.id',
+    driverId: 'invoices.driver_id',
+    fleetId: 'invoices.fleet_id',
+    memberBilled: 'invoices.member_billed',
+    status: 'invoices.status',
+    createdAt: 'invoices.created_at',
+  },
+  getInvoice: vi.fn(),
+  generateInvoicePdf: vi.fn(),
+}));
 
 vi.mock('@evtivity/database', () => ({
   db: { select: vi.fn(() => makeChain()) },
@@ -48,11 +43,9 @@ vi.mock('@evtivity/database', () => ({
   fleets: { id: 'fleets.id', name: 'fleets.name' },
   invoiceStatusEnum: { enumValues: ['draft', 'issued', 'paid', 'void', 'credited'] },
   INVOICE_KINDS: ['invoice', 'credit_note'],
-  getExternalInvoicing: vi.fn(() => Promise.resolve(state.external)),
 }));
 
 vi.mock('drizzle-orm', () => ({
-  not: vi.fn((arg: unknown) => ({ op: 'not', arg })),
   eq: vi.fn((col: unknown, val: unknown) => ({ op: 'eq', col, val })),
   and: vi.fn((...args: unknown[]) => ({ op: 'and', args })),
   or: vi.fn((...args: unknown[]) => ({ op: 'or', args })),
@@ -70,17 +63,7 @@ vi.mock('@evtivity/services/invoice-pdf.service', () => ({
   generateInvoicePdf: (...args: unknown[]) => generateInvoicePdf(...args) as unknown,
 }));
 
-vi.mock('@evtivity/services/session-report.service', () => ({
-  generateSessionReportPdf: (...args: unknown[]) => generateSessionReportPdf(...args) as unknown,
-  isSessionReportInvoice: (invoice: {
-    fleetId: string | null;
-    memberBilled: boolean;
-    kind: string;
-  }) => invoice.fleetId != null && invoice.memberBilled && invoice.kind === 'invoice',
-  sessionReportFileName: () => 'Ladesitzungsbericht-2026-10.pdf',
-}));
-
-import { eq, not, notInArray } from 'drizzle-orm';
+import { eq, notInArray } from 'drizzle-orm';
 import { registerAuth } from '../plugins/auth.js';
 import { portalInvoiceRoutes, toPortalInvoiceDetail } from '../routes/portal/invoices.js';
 import type { InvoiceDetail } from '@evtivity/services/invoice.service';
@@ -167,7 +150,6 @@ describe('portal invoice routes', () => {
   beforeEach(() => {
     setupDbResults();
     vi.clearAllMocks();
-    state.external = false;
   });
 
   const auth = () => ({ authorization: `Bearer ${driverToken}` });
@@ -204,22 +186,8 @@ describe('portal invoice routes', () => {
     };
     setupDbResults(
       [
-        {
-          ...base,
-          id: 'inv_1',
-          invoiceNumber: 'A',
-          fleetId: 'flt_1',
-          memberBilled: true,
-          fleetName: 'Acme',
-        },
-        {
-          ...base,
-          id: 'inv_2',
-          invoiceNumber: 'B',
-          fleetId: null,
-          memberBilled: false,
-          fleetName: null,
-        },
+        { ...base, id: 'inv_1', invoiceNumber: 'A', memberBilled: true, fleetName: 'Acme' },
+        { ...base, id: 'inv_2', invoiceNumber: 'B', memberBilled: false, fleetName: null },
       ],
       [{ count: 2 }],
     );
@@ -229,62 +197,6 @@ describe('portal invoice routes', () => {
     expect(body.data[0]?.['viaFleetName']).toBe('Acme');
     expect(body.data[1]?.['viaFleetName']).toBeNull();
     expect(body.data[0]).not.toHaveProperty('memberBilled');
-    expect(body.data[0]).not.toHaveProperty('fleetId');
-    expect(body.data.map((row) => row['document'])).toEqual(['invoice', 'invoice']);
-    expect(vi.mocked(not)).not.toHaveBeenCalled();
-  });
-
-  it('lists a member invoice as its session report under external invoicing', async () => {
-    state.external = true;
-    const base = {
-      kind: 'invoice',
-      status: 'paid',
-      periodStart: '2026-10-01',
-      periodEnd: '2026-10-31',
-      creditedInvoiceId: null,
-      issuedAt: new Date(),
-      dueAt: new Date(),
-      paidAt: new Date(),
-      currency: 'EUR',
-      subtotalCents: 100,
-      taxCents: 19,
-      totalCents: 119,
-      createdAt: new Date(),
-    };
-    setupDbResults(
-      [
-        {
-          ...base,
-          id: 'inv_1',
-          invoiceNumber: 'INV-1',
-          fleetId: 'flt_1',
-          memberBilled: true,
-          fleetName: 'Acme',
-        },
-        {
-          ...base,
-          id: 'inv_2',
-          invoiceNumber: 'INV-2',
-          fleetId: null,
-          memberBilled: false,
-          fleetName: null,
-        },
-      ],
-      [{ count: 2 }],
-    );
-    const res = await app.inject({ method: 'GET', url: '/portal/invoices', headers: auth() });
-    const body = res.json<{ data: Array<Record<string, unknown>> }>();
-    expect(body.data[0]).toMatchObject({
-      document: 'sessionReport',
-      invoiceNumber: 'inv_1',
-      dueAt: null,
-      paidAt: null,
-    });
-    expect(body.data[1]).toMatchObject({ document: 'invoice', invoiceNumber: 'INV-2' });
-    // Member credit notes and credited member invoices are left out.
-    expect(vi.mocked(not)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(eq)).toHaveBeenCalledWith(invoicesTable.kind, 'credit_note');
-    expect(vi.mocked(eq)).toHaveBeenCalledWith(invoicesTable.status, 'credited');
   });
 
   it('answers 404 without reading an invoice outside the scope', async () => {
@@ -321,43 +233,6 @@ describe('portal invoice routes', () => {
     expect(body['billTo']).toMatchObject({ name: 'Erika Muster' });
     expect(body).not.toHaveProperty('paymentReference');
     expect(body).not.toHaveProperty('metadata');
-  });
-
-  it('returns a member invoice as its session report under external invoicing', async () => {
-    state.external = true;
-    setupDbResults([{ id: INVOICE_ID }]);
-    getInvoice.mockResolvedValue(memberDetail());
-    const res = await app.inject({
-      method: 'GET',
-      url: `/portal/invoices/${INVOICE_ID}`,
-      headers: auth(),
-    });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({
-      document: 'sessionReport',
-      invoiceNumber: INVOICE_ID,
-      dueAt: null,
-      paidAt: null,
-      taxBreakdown: [],
-      creditNote: null,
-    });
-  });
-
-  it('streams the session report instead of the invoice PDF under external invoicing', async () => {
-    state.external = true;
-    setupDbResults([{ id: INVOICE_ID }]);
-    const detail = memberDetail();
-    getInvoice.mockResolvedValue(detail);
-    generateSessionReportPdf.mockResolvedValue(Buffer.from('%PDF-report'));
-    const res = await app.inject({
-      method: 'GET',
-      url: `/portal/invoices/${INVOICE_ID}/pdf`,
-      headers: auth(),
-    });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers['content-disposition']).toContain('Ladesitzungsbericht-2026-10.pdf');
-    expect(generateSessionReportPdf).toHaveBeenCalledWith(detail);
-    expect(generateInvoicePdf).not.toHaveBeenCalled();
   });
 
   it('streams the shared invoice PDF of an own invoice', async () => {

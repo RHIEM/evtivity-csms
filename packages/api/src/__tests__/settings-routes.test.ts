@@ -836,7 +836,6 @@ describe('Settings routes', () => {
     ['company.bankAccountHolder', '  Acme Charging GmbH ', 'Acme Charging GmbH'],
     ['company.iban', '', ''],
     ['invoice.epcQrEnabled', false, false],
-    ['invoice.externalInvoicing', true, true],
   ])('PUT /v1/settings/%s stores the normalized value', async (key, value, stored) => {
     vi.mocked(db.insert).mockClear();
     setupDbResults([], [{ key, value: stored }]);
@@ -861,7 +860,6 @@ describe('Settings routes', () => {
     ['company.bankAccountHolder', 'x'.repeat(71)],
     ['company.bankName', 'Bank\nName'],
     ['invoice.epcQrEnabled', 'yes'],
-    ['invoice.externalInvoicing', 'true'],
   ])('PUT /v1/settings/%s rejects %j', async (key, value) => {
     vi.mocked(db.insert).mockClear();
     const response = await app.inject({

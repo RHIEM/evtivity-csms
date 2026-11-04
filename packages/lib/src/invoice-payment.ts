@@ -20,12 +20,6 @@ export const COMPANY_BIC_KEY = 'company.bic';
 export const COMPANY_BANK_NAME_KEY = 'company.bankName';
 /** Whether EUR invoices with an open amount print the EPC QR code (default true). */
 export const INVOICE_EPC_QR_ENABLED_KEY = 'invoice.epcQrEnabled';
-/**
- * Whether member invoices are invoiced outside EVtivity (default false): a
- * member invoice is issued as paid and stays internal, and the driver gets a
- * session report instead of the invoice (email and portal).
- */
-export const INVOICE_EXTERNAL_INVOICING_KEY = 'invoice.externalInvoicing';
 
 /**
  * Longest value accepted for each bank detail, in characters. The holder

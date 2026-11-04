@@ -20,8 +20,6 @@ const h = vi.hoisted(() => {
     periodInvoices: [] as Array<Record<string, unknown> | null>,
     statements: [] as string[],
     params: [] as unknown[][],
-    // invoice.externalInvoicing
-    external: false,
   };
   const table = (name: string) => {
     const columns: Record<string, unknown> = { __table: name };
@@ -77,7 +75,6 @@ vi.mock('@evtivity/database', () => ({
   getCompanyCurrency: vi.fn(() => Promise.resolve(h.state.currency)),
   getSystemTimezone: vi.fn(() => Promise.resolve(h.state.timeZone)),
   getInvoicePaymentTermsDays: vi.fn(() => Promise.resolve(30)),
-  getExternalInvoicing: vi.fn(() => Promise.resolve(h.state.external)),
   PG_UNIQUE_VIOLATION: '23505',
   pgErrorCode: (err: unknown) => (err as { code?: string }).code,
   pgConstraintName: (err: unknown) => (err as { constraint_name?: string }).constraint_name,
@@ -102,7 +99,6 @@ import {
   createFleetInvoice,
   createMemberInvoice,
   driverHasBillingAddress,
-  EXTERNAL_INVOICING_PAYMENT_REFERENCE,
   fleetInvoicePeriod,
   fleetSessionLines,
   planFleetInvoice,
@@ -188,7 +184,6 @@ beforeEach(() => {
   h.state.periodInvoices = [null];
   h.state.statements = [];
   h.state.params = [];
-  h.state.external = false;
   vi.mocked(insertInvoiceInTransaction).mockImplementation((_tx, input: InsertInvoiceInput) =>
     Promise.resolve({
       invoice: { id: 'inv_9', invoiceNumber: 'INV-202610-0009', totalCents: input.chargedCents },
@@ -707,25 +702,6 @@ describe('createMemberInvoice', () => {
         billTo: { name: 'Anna Berg', city: 'Bremen', taxId: null, email: 'anna@fleet.test' },
       },
     });
-  });
-
-  it('issues the member invoice as paid and externally invoiced under external invoicing', async () => {
-    h.state.external = true;
-    h.state.memberCandidates = [candidateRow(candidate())];
-    await createMemberInvoice('flt_1', 'drv_a', '2026-09', now);
-    expect(vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1]).toMatchObject({
-      status: 'paid',
-      paymentReference: EXTERNAL_INVOICING_PAYMENT_REFERENCE,
-    });
-  });
-
-  it('issues a fleet invoice as before under external invoicing', async () => {
-    h.state.external = true;
-    h.state.candidates = [candidateRow(candidate())];
-    await createFleetInvoice('flt_1', '2026-09', now);
-    const input = vi.mocked(insertInvoiceInTransaction).mock.calls[0]?.[1];
-    expect(input?.status).toBe('issued');
-    expect(input).not.toHaveProperty('paymentReference');
   });
 
   it("selects and locks only the driver's member-billed sessions under the fleet lock", async () => {

@@ -1,12 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import {
-  client,
-  getExternalInvoicing,
-  getSystemTimezone,
-  loadFleetBillingContacts,
-} from '@evtivity/database';
+import { client, getSystemTimezone, loadFleetBillingContacts } from '@evtivity/database';
 import {
   dispatchDriverNotification,
   dispatchSystemNotification,
@@ -23,7 +18,6 @@ import {
 } from './invoice-pdf.service.js';
 import { INVOICE_LABELS } from './invoice-labels.js';
 import { writeInvoiceSentAudit } from './invoice-audit.js';
-import { generateSessionReportPdf, sessionReportFileName } from './session-report.service.js';
 import type { InvoiceAuditActor, InvoiceAuditLogger } from './invoice-audit.js';
 
 export const FLEET_INVOICE_EVENT = 'invoice.FleetInvoice';
@@ -32,12 +26,6 @@ export const FLEET_CREDIT_NOTE_EVENT = 'invoice.FleetCreditNote';
 export const MEMBER_INVOICE_EVENT = 'invoice.MemberInvoice';
 export const MEMBER_CREDIT_NOTE_EVENT = 'invoice.MemberCreditNote';
 export const MEMBER_OVERDUE_EVENT = 'invoice.MemberOverdue';
-/**
- * Driver event of a member invoice under external invoicing
- * (`invoice.externalInvoicing`): the session report goes to the driver
- * instead of the invoice. Always on, email and push.
- */
-export const MEMBER_SESSION_REPORT_EVENT = 'invoice.MemberSessionReport';
 export type MemberInvoiceEvent =
   | typeof MEMBER_INVOICE_EVENT
   | typeof MEMBER_CREDIT_NOTE_EVENT
@@ -53,21 +41,13 @@ export type AccountInvoiceSendMode = 'once' | 'resend';
 /**
  * What a send did. `no_contacts`: a fleet invoice whose fleet has no billing
  * contact. `no_driver`: a member invoice whose driver row is gone.
- * `no_email`: a member invoice whose driver has no email address.
- * `internal`: a member credit note under external invoicing, which never
- * leaves EVtivity. None of them marks the invoice sent.
+ * `no_email`: a member invoice whose driver has no email address. None of
+ * them marks the invoice sent.
  */
 export type AccountInvoiceSendResult =
   | { status: 'sent'; recipients: number }
   | {
-      status:
-        | 'already_sent'
-        | 'internal'
-        | 'no_contacts'
-        | 'no_driver'
-        | 'no_email'
-        | 'not_fleet'
-        | 'not_found';
+      status: 'already_sent' | 'no_contacts' | 'no_driver' | 'no_email' | 'not_fleet' | 'not_found';
     };
 
 export interface AccountInvoiceSendDeps {
@@ -115,28 +95,6 @@ export function fleetInvoiceVariables(detail: InvoiceDetail): Record<string, unk
     invoiceNumber: invoice.invoiceNumber,
     dueAt: invoice.dueAt?.toISOString() ?? '',
     sessionCount: sessions.size,
-  };
-}
-
-/**
- * The template variables of a session report (invoice.MemberSessionReport):
- * no invoice number and no due date, the total is the gross sum of the
- * sessions. `invoiceId` lets the app open the report from the push.
- */
-export function sessionReportVariables(detail: InvoiceDetail): Record<string, unknown> {
-  const { invoice, fleet, lineItems } = detail;
-  const language = resolveInvoicePdfLanguage(invoice.language);
-  const sessions = new Set(lineItems.map((item) => item.sessionId).filter((id) => id != null));
-  return {
-    invoiceId: invoice.id,
-    fleetName: fleet?.name ?? '',
-    periodLabel: formatPeriod(invoice.periodStart, INVOICE_LABELS[language].locale) ?? '',
-    issuedAt: invoice.issuedAt?.toISOString() ?? '',
-    sessionCount: sessions.size,
-    // Formatted in the recipient's language by the dispatcher.
-    total: notificationMoney(invoice.totalCents, invoice.currency),
-    totalCents: invoice.totalCents,
-    currency: invoice.currency,
   };
 }
 
@@ -197,54 +155,7 @@ export async function dispatchMemberInvoiceNotice(
   return delivered;
 }
 
-/**
- * Emails the session report of a member invoice to the driver
- * (invoice.MemberSessionReport, email and push, no SMS), with the report PDF
- * attached instead of the invoice. The PDF is rendered before the claim.
- */
-async function sendMemberSessionReportEmail(
-  detail: InvoiceDetail,
-  driverId: string,
-  mode: AccountInvoiceSendMode,
-  deps: AccountInvoiceSendDeps,
-  audit: AccountInvoiceSendAudit,
-): Promise<AccountInvoiceSendResult> {
-  const { invoice } = detail;
-  const pdf = await generateSessionReportPdf(detail);
-  if (!(await markSent(invoice.id, mode))) return { status: 'already_sent' };
-  const { delivered } = await dispatchDriverNotification(
-    client,
-    MEMBER_SESSION_REPORT_EVENT,
-    driverId,
-    sessionReportVariables(detail),
-    deps.templatesDirs,
-    getPubSub(),
-    {
-      attachments: [
-        { filename: sessionReportFileName(detail), content: pdf, contentType: 'application/pdf' },
-      ],
-      sms: false,
-    },
-  );
-  await writeInvoiceSentAudit(
-    {
-      invoiceId: invoice.id,
-      invoiceNumber: invoice.invoiceNumber,
-      eventType: MEMBER_SESSION_REPORT_EVENT,
-      delivered,
-      resend: invoice.sentAt != null,
-      actor: audit.actor,
-    },
-    audit.log,
-  );
-  return { status: 'sent', recipients: 1 };
-}
-
-/**
- * Emails a member invoice or its credit note to the driver
- * (sendAccountInvoiceEmail). Under external invoicing the invoice goes as its
- * session report and a credit note is not sent (`internal`).
- */
+/** Emails a member invoice or its credit note to the driver (sendAccountInvoiceEmail). */
 async function sendMemberInvoiceEmail(
   detail: InvoiceDetail,
   mode: AccountInvoiceSendMode,
@@ -252,13 +163,8 @@ async function sendMemberInvoiceEmail(
   audit: AccountInvoiceSendAudit,
 ): Promise<AccountInvoiceSendResult> {
   const { invoice } = detail;
-  const external = await getExternalInvoicing();
-  if (external && invoice.kind === 'credit_note') return { status: 'internal' };
   const recipient = memberInvoiceRecipient(detail);
   if ('status' in recipient) return recipient;
-  if (external) {
-    return sendMemberSessionReportEmail(detail, recipient.driverId, mode, deps, audit);
-  }
 
   const pdf = await generateInvoicePdf(detail);
   if (!(await markSent(invoice.id, mode))) return { status: 'already_sent' };
@@ -297,10 +203,7 @@ async function sendMemberInvoiceEmail(
  * - Member invoice: invoice.MemberInvoice or invoice.MemberCreditNote to the
  *   driver only, through dispatchDriverNotification (email and push, no SMS),
  *   in the driver's language. A driver that is gone (`no_driver`) or has no
- *   email (`no_email`) sends nothing. Under external invoicing
- *   (`invoice.externalInvoicing`) the invoice goes as its session report
- *   (invoice.MemberSessionReport) and a credit note stays internal
- *   (`internal`).
+ *   email (`no_email`) sends nothing.
  *
  * `invoices.sent_at` is the marker: mode `once` claims it only while it is
  * null, so an issue is emailed once (P7); `resend` sends again and sets it.

@@ -1440,15 +1440,7 @@
       "paid": "已支付",
       "void": "已作废",
       "credited": "已贷记"
-    },
-    "sessionReport": "充电会话报告",
-    "sessionReportsTitle": "充电会话报告",
-    "sessionReportNotice": "本报告不是发票。它列出您在本期间的充电会话。费用另行结算。",
-    "sessions": "充电会话",
-    "totalGross": "总额合计",
-    "created": "创建日期",
-    "downloadReport": "下载报告（PDF）",
-    "openReport": "打开报告"
+    }
   },
   "factorProof": {
     "addFactorHint": "添加第二验证因素前，请先确认身份。",

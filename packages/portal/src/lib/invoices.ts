@@ -6,17 +6,9 @@ import { ApiError } from './api';
 
 export type InvoiceStatus = 'draft' | 'issued' | 'paid' | 'void' | 'credited';
 
-/**
- * What the driver reads: the invoice, or under external invoicing a member
- * invoice's session report (no number, due or paid date, no tax breakdown).
- */
-export type PortalDocument = 'invoice' | 'sessionReport';
-
 /** A row of GET /v1/portal/invoices: an invoice or credit note of the signed-in driver. */
 export interface PortalInvoice {
   id: string;
-  document: PortalDocument;
-  /** The invoice or credit note number; on a session report its report ID. */
   invoiceNumber: string;
   kind: 'invoice' | 'credit_note';
   status: InvoiceStatus;
@@ -88,17 +80,9 @@ export function billToLines(billTo: Record<string, unknown> | null): string[] {
   );
 }
 
-/** The file name of a Content-Disposition attachment header, else the fallback. */
-export function attachmentFileName(header: string | null, fallback: string): string {
-  const match = header != null ? /filename="([^"]+)"/.exec(header) : null;
-  return match?.[1] ?? fallback;
-}
-
 /**
- * Downloads the invoice PDF (GET /v1/portal/invoices/:id/pdf) as a file, or
- * the session report under external invoicing, under the file name the API
- * sends. The session cookie authenticates it; the JSON client cannot return
- * bytes.
+ * Downloads the invoice PDF (GET /v1/portal/invoices/:id/pdf) as a file. The
+ * session cookie authenticates it; the JSON client cannot return bytes.
  */
 export async function downloadInvoicePdf(invoice: {
   id: string;
@@ -111,10 +95,7 @@ export async function downloadInvoicePdf(invoice: {
   const blob = await res.blob();
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
-  link.download = attachmentFileName(
-    res.headers.get('Content-Disposition'),
-    `${invoice.invoiceNumber}.pdf`,
-  );
+  link.download = `${invoice.invoiceNumber}.pdf`;
   link.click();
   URL.revokeObjectURL(link.href);
 }

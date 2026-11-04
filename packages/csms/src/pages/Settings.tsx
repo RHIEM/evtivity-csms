@@ -16,7 +16,6 @@ import { useAuth, hasPermissionCheck, useHasAllSiteAccess } from '@/lib/auth';
 import { CompanySettings } from '@/components/settings/CompanySettings';
 import { InvoiceSellerSettings } from '@/components/settings/InvoiceSellerSettings';
 import { InvoicePaymentSettings } from '@/components/settings/InvoicePaymentSettings';
-import { InvoiceExternalInvoicingSettings } from '@/components/settings/InvoiceExternalInvoicingSettings';
 import { PdfBrandingSettings } from '@/components/settings/PdfBrandingSettings';
 import { MarketingSettings } from '@/components/settings/MarketingSettings';
 import { ContentSettings } from '@/components/settings/ContentSettings';
@@ -220,7 +219,6 @@ export function Settings(): React.JSX.Element {
             <CompanySettings settings={settings} svgDataUri={svgDataUri} hasIcon={hasIcon} />
             <InvoiceSellerSettings settings={settings} />
             <InvoicePaymentSettings settings={settings} />
-            <InvoiceExternalInvoicingSettings settings={settings} />
             <PdfBrandingSettings settings={settings} />
           </TabsContent>
         )}

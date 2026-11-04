@@ -6,7 +6,6 @@ import {
   db,
   chargingSessions,
   getCompanyCurrency,
-  getExternalInvoicing,
   getSystemTimezone,
   pgConstraintName,
   pgErrorCode,
@@ -1041,18 +1040,7 @@ export async function listMemberInvoiceDrivers(
   return rows.map((row) => String(row['driver_id']));
 }
 
-/**
- * The payment reference of a member invoice issued under external invoicing
- * (`invoice.externalInvoicing`): it is issued as paid, so it leaves the
- * fleet's credit exposure and is never reminded.
- */
-export const EXTERNAL_INVOICING_PAYMENT_REFERENCE = 'Invoiced outside EVtivity';
-
-/**
- * The one writer of account invoices: a fleet invoice or a member invoice.
- * Under external invoicing a member invoice is issued as paid with
- * EXTERNAL_INVOICING_PAYMENT_REFERENCE; a fleet invoice is issued as before.
- */
+/** The one writer of account invoices: a fleet invoice or a member invoice. */
 async function issueAccountInvoice(
   target: AccountInvoiceTarget,
   period: string,
@@ -1073,7 +1061,6 @@ async function issueAccountInvoice(
 
   const currency = await getCompanyCurrency();
   const sessionClaimGuard = accountClaimGuard(target);
-  const externallyInvoiced = target.kind === 'member' && (await getExternalInvoicing());
 
   try {
     return await db.transaction(async (tx: InvoiceTx) => {
@@ -1104,8 +1091,7 @@ async function issueAccountInvoice(
         currency,
         lines: plan.lines,
         chargedCents: plan.totalCents,
-        status: externallyInvoiced ? 'paid' : 'issued',
-        ...(externallyInvoiced ? { paymentReference: EXTERNAL_INVOICING_PAYMENT_REFERENCE } : {}),
+        status: 'issued',
         paymentTermsDays: fleet.paymentTermsDays,
         issuedAt: accountInvoiceDate(fleet.invoiceDateMode, bounds, timeZone, now),
         fleet: {

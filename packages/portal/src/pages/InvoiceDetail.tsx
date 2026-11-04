@@ -71,39 +71,23 @@ export function InvoiceDetail(): React.JSX.Element {
   }
 
   const invoice = data;
-  // Under external invoicing a member invoice reads as its session report: no
-  // status, due date, bill-to block or tax lines, and the notice that it is
-  // not an invoice.
-  const report = invoice.document === 'sessionReport';
   const title = invoice.kind === 'credit_note' ? t('invoices.creditNote') : t('invoices.invoice');
-  const billTo = report ? [] : billToLines(invoice.billTo);
+  const billTo = billToLines(invoice.billTo);
 
   return (
     <div className="space-y-4">
-      <PageHeader
-        title={report ? t('invoices.sessionReport') : `${title} ${invoice.invoiceNumber}`}
-        backTo="/account/invoices"
-      />
+      <PageHeader title={`${title} ${invoice.invoiceNumber}`} backTo="/account/invoices" />
 
       <Card>
         <CardContent className="space-y-3 p-6">
           <div className="flex items-center justify-between">
-            {report ? (
-              <span className="text-sm text-muted-foreground">{t('invoices.totalGross')}</span>
-            ) : (
-              <Badge variant={invoiceStatusVariant(invoice.status)}>
-                {t(`invoices.status.${invoice.status}`)}
-              </Badge>
-            )}
+            <Badge variant={invoiceStatusVariant(invoice.status)}>
+              {t(`invoices.status.${invoice.status}`)}
+            </Badge>
             <span className="text-lg font-bold">
               {formatCents(invoice.totalCents, invoice.currency)}
             </span>
           </div>
-          {report && (
-            <p className="text-sm" data-testid="session-report-notice">
-              {t('invoices.sessionReportNotice')}
-            </p>
-          )}
           {invoice.viaFleetName != null && (
             <p className="text-sm text-muted-foreground">
               {t('invoices.viaFleet', { fleet: invoice.viaFleetName })}
@@ -116,10 +100,7 @@ export function InvoiceDetail(): React.JSX.Element {
             />
           )}
           {invoice.issuedAt != null && (
-            <Row
-              label={report ? t('invoices.created') : t('invoices.issued')}
-              value={formatDay(invoice.issuedAt, timezone)}
-            />
+            <Row label={t('invoices.issued')} value={formatDay(invoice.issuedAt, timezone)} />
           )}
           {invoice.dueAt != null && invoice.status === 'issued' && (
             <Row label={t('invoices.due')} value={formatDay(invoice.dueAt, timezone)} />
@@ -160,7 +141,7 @@ export function InvoiceDetail(): React.JSX.Element {
             data-testid="invoice-download-pdf"
           >
             <Download className="mr-2 h-4 w-4" />
-            {report ? t('invoices.downloadReport') : t('invoices.downloadPdf')}
+            {t('invoices.downloadPdf')}
           </Button>
         </CardContent>
       </Card>
@@ -180,9 +161,7 @@ export function InvoiceDetail(): React.JSX.Element {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm">
-            {report ? t('invoices.sessions') : t('invoices.items')}
-          </CardTitle>
+          <CardTitle className="text-sm">{t('invoices.items')}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="-mx-2">
@@ -227,7 +206,7 @@ export function InvoiceDetail(): React.JSX.Element {
               />
             ))}
             <Row
-              label={report ? t('invoices.totalGross') : t('invoices.total')}
+              label={t('invoices.total')}
               value={formatCents(invoice.totalCents, invoice.currency)}
             />
           </div>

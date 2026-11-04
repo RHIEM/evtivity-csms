@@ -76,7 +76,6 @@ import {
   type PdfBranding,
 } from '../pdf-branding.js';
 import { generateInvoicePdf } from '../invoice-pdf.service.js';
-import { generateSessionReportPdf } from '../session-report.service.js';
 import type { InvoiceDetail } from '../invoice.service.js';
 import { PdfReportBuilder } from '../report-generators/pdf-builder.js';
 import { generateRevenueReport } from '../report-generators/revenue-report.js';
@@ -354,23 +353,6 @@ describe('every PDF generator draws the logo and the centered footer on every pa
     expectBranded(pdf, PAGE_WIDTH_PORTRAIT, 2);
   });
 
-  it('a session report over several pages', async () => {
-    const base = detail();
-    const pdf = await generateSessionReportPdf({
-      ...base,
-      invoice: {
-        ...base.invoice,
-        fleetId: 'flt_1',
-        memberBilled: true,
-        periodStart: '2026-05-01',
-        periodEnd: '2026-05-31',
-      },
-      lineItems: base.lineItems.map((item, i) => ({ ...item, sessionId: `ses_${String(i)}` })),
-      fleet: { id: 'flt_1', name: 'Acme Fleet' },
-    });
-    expectBranded(pdf, PAGE_WIDTH_PORTRAIT, 2);
-  });
-
   it('the report builder over several pages', async () => {
     const branding: PdfBranding = await loadPdfBranding();
     const rows = Array.from({ length: 80 }, (_, i) => [`CS-${String(i)}`, String(i)]);
@@ -419,7 +401,6 @@ describe('every PDF generator draws the logo and the centered footer on every pa
     expect(renderers.sort()).toEqual([
       'invoice-pdf.service.ts',
       'report-generators/pdf-builder.ts',
-      'session-report.service.ts',
     ]);
   });
 });

@@ -1441,15 +1441,7 @@
       "paid": "Bezahlt",
       "void": "Storniert",
       "credited": "Storniert (Stornorechnung)"
-    },
-    "sessionReport": "Ladesitzungsbericht",
-    "sessionReportsTitle": "Ladesitzungsberichte",
-    "sessionReportNotice": "Dieser Bericht ist keine Rechnung. Er weist deine Ladevorgänge des Zeitraums nach. Die Abrechnung erfolgt gesondert.",
-    "sessions": "Ladevorgänge",
-    "totalGross": "Summe brutto",
-    "created": "Erstellt am",
-    "downloadReport": "Bericht herunterladen (PDF)",
-    "openReport": "Bericht öffnen"
+    }
   },
   "factorProof": {
     "addFactorHint": "Bestätige deine Identität, bevor du einen zweiten Faktor hinzufügst.",

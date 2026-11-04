@@ -382,22 +382,6 @@ describe('InvoiceDetail', () => {
     expect(banded).toEqual([false, true, false]);
   });
 
-  it('offers the session report only on a member invoice', async () => {
-    mockInvoice(fleetDetail());
-    renderPage();
-    await screen.findByTestId('invoice-bill-to');
-    expect(screen.queryByTestId('invoice-session-report')).toBeNull();
-    cleanup();
-
-    const member = fleetDetail();
-    mockInvoice({
-      ...member,
-      invoice: { ...(member['invoice'] as object), memberBilled: true, driverId: 'drv_a' },
-    });
-    renderPage();
-    expect(await screen.findByTestId('invoice-session-report')).toBeDefined();
-  });
-
   it('emails a fleet invoice to the fleet billing contacts', async () => {
     mockInvoice(fleetDetail());
     h.post.mockResolvedValue({ success: true });

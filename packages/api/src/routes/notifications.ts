@@ -819,17 +819,6 @@ const TEMPLATE_VARIABLES: Record<string, string[]> = {
     'totalCents',
     'currency',
   ],
-  'invoice.MemberSessionReport': [
-    'firstName',
-    'lastName',
-    'fleetName',
-    'periodLabel',
-    'sessionCount',
-    'issuedAt',
-    'total',
-    'totalCents',
-    'currency',
-  ],
   'invoice.MemberCreditNote': [
     'firstName',
     'lastName',

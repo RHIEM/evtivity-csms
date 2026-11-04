@@ -312,7 +312,6 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   // Member invoices: money and personal data, never through the assistant.
   createMemberInvoice: N,
   createMemberInvoiceBatch: N,
-  downloadFleetSessionReportCsv: N,
   // Moves sessions between the fleet and member invoices: billing, never through the assistant.
   moveFleetBillingRecipient: N,
   deleteFleet: W,
@@ -348,7 +347,6 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   createSessionInvoice: N,
   downloadInvoice: N,
   downloadInvoicePdf: N,
-  downloadInvoiceSessionReport: N,
   getInvoice: R,
   getInvoiceNeighbors: N,
   getInvoicePrintLogo: N,

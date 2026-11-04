@@ -51,7 +51,6 @@ import { InvoiceDetail } from '../InvoiceDetail';
 function row(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
-    document: 'invoice',
     invoiceNumber: `INV-${id}`,
     kind: 'invoice',
     status: 'issued',
@@ -109,27 +108,6 @@ describe('Invoices', () => {
     expect(screen.getByText('invoices.status.paid')).toBeDefined();
     expect(screen.getAllByText(/invoices\.creditNote/)).toHaveLength(1);
     expect(getMock).toHaveBeenCalledWith('/v1/portal/invoices?page=1&limit=20');
-  });
-
-  it('lists session reports without number and status under external invoicing', async () => {
-    getMock.mockResolvedValue({
-      data: [
-        row('inv_1', {
-          document: 'sessionReport',
-          invoiceNumber: 'inv_1',
-          status: 'paid',
-          periodStart: '2026-10-01',
-          periodEnd: '2026-10-31',
-        }),
-      ],
-      total: 1,
-    });
-    renderAt('/account/invoices');
-    const card = await screen.findByTestId('invoice-row-inv_1');
-    expect(card.textContent).toContain('invoices.sessionReport');
-    expect(card.textContent).not.toContain('invoices.status.paid');
-    expect(card.textContent).not.toContain('invoices.invoice');
-    expect(screen.getByText('invoices.sessionReportsTitle')).toBeDefined();
   });
 
   it('says when there are no invoices', async () => {
@@ -214,26 +192,5 @@ describe('InvoiceDetail', () => {
         expect.objectContaining({ variant: 'destructive', title: 'invoices.downloadFailed' }),
       );
     });
-  });
-
-  it('shows a session report with the notice, no bill-to, status or tax lines', async () => {
-    getMock.mockResolvedValue({
-      ...detail,
-      document: 'sessionReport',
-      invoiceNumber: '1',
-      status: 'paid',
-      dueAt: null,
-      paidAt: null,
-      taxBreakdown: [],
-      creditNote: null,
-    });
-    renderAt('/account/invoices/1');
-    expect(await screen.findByTestId('session-report-notice')).toBeDefined();
-    expect(screen.queryByTestId('invoice-bill-to')).toBeNull();
-    expect(screen.queryByText('invoices.status.paid')).toBeNull();
-    expect(screen.queryByText('sessionDetail.taxAdded')).toBeNull();
-    expect(screen.getAllByText('invoices.totalGross').length).toBeGreaterThan(0);
-    expect(screen.getByText('invoices.downloadReport')).toBeDefined();
-    expect(screen.getByText('invoices.sessions')).toBeDefined();
   });
 });

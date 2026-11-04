@@ -30,7 +30,6 @@ import {
 import { sendAccountInvoiceEmail } from '@evtivity/services/fleet-invoice-notice';
 import { enqueueMemberInvoiceBatch } from '@evtivity/services/fleet-invoice-run';
 import { getInvoice } from '@evtivity/services/invoice.service';
-import { buildFleetSessionReportCsv } from '@evtivity/services/session-report.service';
 import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import { zodSchema } from '../lib/zod-schema.js';
 import { jobQueue } from '@evtivity/lib/job-queues';
@@ -71,8 +70,6 @@ const unbilledQuery = z.object({
 });
 
 const createBody = z.object({ period: periodField });
-
-const sessionReportCsvQuery = z.object({ period: periodField });
 
 const memberCreateBody = z.object({
   period: periodField,
@@ -637,43 +634,6 @@ export function fleetInvoiceRoutes(app: FastifyInstance): void {
         data,
         total: countResult[0]?.count ?? 0,
       } satisfies PaginatedResponse<(typeof data)[number]>;
-    },
-  );
-
-  app.get(
-    '/fleets/:id/session-report.csv',
-    {
-      onRequest: [authorize('payments:read')],
-      schema: {
-        tags: ['Fleets'],
-        summary: 'Download the session report CSV of a period',
-        description:
-          "The member invoices of the fleet for a calendar month (system timezone) as a CSV for invoicing outside EVtivity (invoice.externalInvoicing): one row per session of each live member invoice (issued or paid; void and credited ones are left out), ordered by invoice number, with the driver, the session's start and end (ISO 8601 with the offset of the system timezone), location, card, energy in kWh, net, tax rate, tax and gross, the currency and the internal invoice number for matching. Semicolon-separated with a UTF-8 BOM, decimal comma, so a German Excel opens it as is. A month without member invoices gives the header only. Streams text/csv as an attachment. A user restricted to some sites gets 404 FLEET_NOT_FOUND.",
-        operationId: 'downloadFleetSessionReportCsv',
-        security: [{ bearerAuth: [] }],
-        params: zodSchema(fleetParams),
-        querystring: zodSchema(sessionReportCsvQuery),
-        response: {
-          400: errorWith('Invalid period', [ERROR_CODES.VALIDATION_ERROR]),
-          404: errorWith('Fleet not found', [ERROR_CODES.FLEET_NOT_FOUND]),
-        },
-      },
-    },
-    async (request, reply) => {
-      if (await refuseSiteRestrictedFleetBilling(request, reply)) return;
-      const { id } = request.params as z.infer<typeof fleetParams>;
-      const { period } = request.query as z.infer<typeof sessionReportCsvQuery>;
-      const [fleet] = await db.select({ id: fleets.id }).from(fleets).where(eq(fleets.id, id));
-      if (fleet == null) {
-        await reply.status(404).send({ error: 'Fleet not found', code: 'FLEET_NOT_FOUND' });
-        return;
-      }
-      // VALIDATION_ERROR is an AppError the error handler sends.
-      const { csv, fileName } = await buildFleetSessionReportCsv(id, period);
-      await reply
-        .header('Content-Type', 'text/csv; charset=utf-8')
-        .header('Content-Disposition', `attachment; filename="${fileName}"`)
-        .send(csv);
     },
   );
 }

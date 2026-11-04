@@ -401,7 +401,6 @@ export {
   parseFleetInvoiceRunDay,
   getFleetInvoiceRunDay,
   clearInvoiceSettingsCache,
-  getExternalInvoicing,
 } from './lib/invoice-settings.js';
 export {
   getStaleSessionTimeoutHours,

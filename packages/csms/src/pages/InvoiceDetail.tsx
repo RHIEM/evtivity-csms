@@ -36,7 +36,6 @@ import { describeInvoiceLine } from '@/lib/invoice-lines';
 import { formatPeriodMonth, groupLinesByDriver, readBillTo } from '@/lib/fleet-invoice';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
 import { LoadingLogo } from '@/components/loading-logo';
-import { downloadSessionReportPdf } from '@/lib/session-report';
 import { EntityHistoryTab } from '@/components/EntityHistoryTab';
 
 interface InvoiceRecord extends DriverInvoice {
@@ -317,12 +316,6 @@ export function InvoiceDetail(): React.JSX.Element {
     });
   }
 
-  function handleSessionReport(): void {
-    void downloadSessionReportPdf(invoice.id).catch((err: unknown) => {
-      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
-    });
-  }
-
   function renderLine(item: InvoiceLineItem, index: number): React.JSX.Element {
     return (
       <TableRow
@@ -403,17 +396,6 @@ export function InvoiceDetail(): React.JSX.Element {
             <Download className="mr-2 h-4 w-4" />
             {t('invoices.download')}
           </Button>
-          {isMemberInvoice && !isCreditNote && (
-            <Button
-              variant="outline"
-              className={HEADER_ACTION_CLASS}
-              onClick={handleSessionReport}
-              data-testid="invoice-session-report"
-            >
-              <Download className="mr-2 h-4 w-4" />
-              {t('invoices.sessionReport')}
-            </Button>
-          )}
           {canWrite && (invoice.driverId != null || isFleetInvoice) && (
             <Button
               variant="outline"

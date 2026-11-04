@@ -1441,15 +1441,7 @@
       "paid": "Pagada",
       "void": "Anulada",
       "credited": "Acreditada"
-    },
-    "sessionReport": "Informe de sesiones de carga",
-    "sessionReportsTitle": "Informes de sesiones de carga",
-    "sessionReportNotice": "Este informe no es una factura. Recoge sus sesiones de carga del periodo. Se facturan por separado.",
-    "sessions": "Sesiones de carga",
-    "totalGross": "Total bruto",
-    "created": "Creado el",
-    "downloadReport": "Descargar informe (PDF)",
-    "openReport": "Abrir informe"
+    }
   },
   "factorProof": {
     "addFactorHint": "Confirme su identidad antes de añadir un segundo factor.",

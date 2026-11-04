@@ -36,16 +36,10 @@ export function Invoices(): React.JSX.Element {
 
   const invoices = data?.data ?? [];
   const totalPages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE_SIZE));
-  // Under external invoicing a driver with member invoices only reads reports.
-  const onlyReports =
-    invoices.length > 0 && invoices.every((invoice) => invoice.document === 'sessionReport');
 
   return (
     <div className="space-y-4">
-      <PageHeader
-        title={onlyReports ? t('invoices.sessionReportsTitle') : t('invoices.title')}
-        backTo="/account"
-      />
+      <PageHeader title={t('invoices.title')} backTo="/account" />
 
       {isLoading && <LoadingState />}
 
@@ -72,28 +66,15 @@ export function Invoices(): React.JSX.Element {
           }}
         >
           <CardContent className="space-y-2 p-4">
-            {invoice.document === 'sessionReport' ? (
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-sm font-medium">{t('invoices.sessionReport')}</span>
-                {invoice.periodStart != null && invoice.periodEnd != null && (
-                  <span className="text-xs text-muted-foreground">
-                    {formatDay(invoice.periodStart)} - {formatDay(invoice.periodEnd)}
-                  </span>
-                )}
-              </div>
-            ) : (
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-sm font-medium">
-                  {invoice.kind === 'credit_note'
-                    ? t('invoices.creditNote')
-                    : t('invoices.invoice')}{' '}
-                  {invoice.invoiceNumber}
-                </span>
-                <Badge variant={invoiceStatusVariant(invoice.status)}>
-                  {t(`invoices.status.${invoice.status}`)}
-                </Badge>
-              </div>
-            )}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-medium">
+                {invoice.kind === 'credit_note' ? t('invoices.creditNote') : t('invoices.invoice')}{' '}
+                {invoice.invoiceNumber}
+              </span>
+              <Badge variant={invoiceStatusVariant(invoice.status)}>
+                {t(`invoices.status.${invoice.status}`)}
+              </Badge>
+            </div>
             {invoice.viaFleetName != null && (
               <p className="text-xs text-muted-foreground">
                 {t('invoices.viaFleet', { fleet: invoice.viaFleetName })}

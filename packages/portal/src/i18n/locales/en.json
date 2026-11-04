@@ -1441,15 +1441,7 @@
       "paid": "Paid",
       "void": "Void",
       "credited": "Credited"
-    },
-    "sessionReport": "Charging session report",
-    "sessionReportsTitle": "Charging Session Reports",
-    "sessionReportNotice": "This report is not an invoice. It lists your charging sessions of the period. They are invoiced separately.",
-    "sessions": "Charging sessions",
-    "totalGross": "Total gross",
-    "created": "Created",
-    "downloadReport": "Download report (PDF)",
-    "openReport": "Open report"
+    }
   },
   "factorProof": {
     "addFactorHint": "Confirm it's you before you add a second factor.",

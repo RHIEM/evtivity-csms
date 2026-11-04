@@ -2570,8 +2570,7 @@
       "recipientMember": "驾驶员",
       "billedTo": "开票对象",
       "sendMemberTitle": "发送驾驶员发票",
-      "sendMemberConfirm": "将 {{number}} 连同 PDF 发送给驾驶员？",
-      "sessionReportCsv": "会话报告 CSV"
+      "sendMemberConfirm": "将 {{number}} 连同 PDF 发送给驾驶员？"
     },
     "bookingStatus": {
       "scheduled": "已安排",
@@ -3923,12 +3922,7 @@
     "uploadReplacesHint": "上传新图片将替换当前图片。",
     "roamingOffDescription": "漫游部分将被隐藏，所有 OCPI 流量将被阻止。",
     "pncOffDescription": "证书部分将被隐藏，证书操作将被阻止。",
-    "paymentSubTabTerminals": "支付终端",
-    "externalInvoicing": "外部开票",
-    "externalInvoicingToggle": "在 EVtivity 之外向成员开票",
-    "externalInvoicingHelp": "适用于向每位司机开票的车队：成员发票以已支付状态开具并仅在内部保留（不发送发票邮件、不催款、不显示在司机门户中）。司机改为通过邮件和门户收到包含净额和总额的充电会话报告。可在车队的账单选项卡下载用于自行开票的 CSV。车队发票不受影响。",
-    "externalInvoicingSaved": "外部开票设置已保存",
-    "externalInvoicingSaveFailed": "无法保存外部开票设置。"
+    "paymentSubTabTerminals": "支付终端"
   },
   "pnc": {
     "certificates": "证书",
@@ -4095,7 +4089,6 @@
       "invoice.MemberInvoice": "成员发票已开具",
       "invoice.MemberCreditNote": "成员贷项通知单已开具",
       "invoice.MemberOverdue": "成员发票已逾期",
-      "invoice.MemberSessionReport": "成员充电会话报告",
       "payment.AccountCreditLimit": "车队信用额度已用完",
       "fleet.CreditLimitWarning": "车队信用额度预警",
       "fleet.CreditLimitReached": "车队信用额度已用完",
@@ -6135,8 +6128,7 @@
     "driver": "驾驶员",
     "viaFleet": "经由车队",
     "viaFleetBadge": "经由 {{fleet}}",
-    "confirmResendMember": "将此发票连同 PDF 发送给驾驶员？",
-    "sessionReport": "会话报告"
+    "confirmResendMember": "将此发票连同 PDF 发送给驾驶员？"
   },
   "authFooter": {
     "privacyPolicy": "隐私政策",
