@@ -208,6 +208,28 @@ export function sessionReportFileName(detail: InvoiceDetail): string {
   return `${SESSION_REPORT_LABELS[language].fileStem}-${month}.pdf`;
 }
 
+/**
+ * When the report this one replaces was issued: the newest credited member
+ * invoice of the same fleet, driver and month created before it. Null for a
+ * first report.
+ */
+async function loadReplacedReportDate(invoice: Invoice): Promise<Date | null> {
+  if (invoice.fleetId == null || invoice.driverId == null || invoice.periodStart == null) {
+    return null;
+  }
+  const rows = await client`
+    SELECT issued_at FROM invoices
+    WHERE fleet_id = ${invoice.fleetId} AND driver_id = ${invoice.driverId}
+      AND period_start = ${invoice.periodStart}::date
+      AND member_billed AND kind = 'invoice' AND status = 'credited'
+      AND id <> ${invoice.id} AND created_at < ${invoice.createdAt}
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+  const [row] = rows as Array<{ issued_at?: unknown }>;
+  return toDate(row?.issued_at);
+}
+
 function formatDay(value: Date | null, locale: string, timeZone: string): string {
   if (value == null) return '—';
   return new Intl.DateTimeFormat(locale, {
@@ -304,12 +326,13 @@ export async function generateSessionReportPdf(detail: InvoiceDetail): Promise<B
   const sessionIds = [
     ...new Set(lineItems.flatMap((item) => (item.sessionId != null ? [item.sessionId] : []))),
   ];
-  const [seller, branding, timeZone, facts, evidence] = await Promise.all([
+  const [seller, branding, timeZone, facts, evidence, replacedAt] = await Promise.all([
     loadInvoiceSeller(),
     loadPdfBranding(),
     getSystemTimezone(),
     loadSessionFacts(sessionIds),
     loadSessionEvidence(sessionIds),
+    loadReplacedReportDate(invoice),
   ]);
   const rows = sessionReportRows(detail, facts, language);
   const evidenceLabels = INVOICE_EVIDENCE_LABELS[language];
@@ -420,6 +443,16 @@ export async function generateSessionReportPdf(detail: InvoiceDetail): Promise<B
       .font(fonts.bold)
       .fillColor(COLOR_TEXT)
       .text(value, MARGIN + 120, y, { width: CONTENT_WIDTH - 120 });
+    y += 16;
+  }
+  if (replacedAt != null) {
+    doc
+      .fontSize(10)
+      .font(fonts.regular)
+      .fillColor(COLOR_TEXT)
+      .text(labels.replaces.replace('{date}', formatDay(replacedAt, locale, timeZone)), MARGIN, y, {
+        width: CONTENT_WIDTH,
+      });
     y += 16;
   }
   y += 8;

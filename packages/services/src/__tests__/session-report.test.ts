@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const h = vi.hoisted(() => ({
   settingsRows: [] as Array<{ key: string; value: unknown }>,
   sessionRows: [] as Array<Record<string, unknown>>,
+  replacedRows: [] as Array<Record<string, unknown>>,
   evidenceRows: [] as Array<Record<string, unknown>>,
   invoiceIds: [] as Array<{ id: string }>,
   statements: [] as Array<{ text: string; values: unknown[] }>,
@@ -18,6 +19,7 @@ vi.mock('@evtivity/database', () => ({
     const text = strings.join('?').replace(/\s+/g, ' ');
     h.statements.push({ text, values });
     if (text.includes('FROM charging_sessions cs')) return Promise.resolve(h.sessionRows);
+    if (text.includes("status = 'credited'")) return Promise.resolve(h.replacedRows);
     if (text.includes('signed_meter_values')) return Promise.resolve(h.evidenceRows);
     if (text.includes('SELECT id FROM invoices')) return Promise.resolve(h.invoiceIds);
     return Promise.resolve(h.settingsRows);
@@ -178,6 +180,7 @@ beforeEach(() => {
     { key: 'company.iban', value: 'DE02120300000000202051' },
   ];
   h.sessionRows = [];
+  h.replacedRows = [];
   h.evidenceRows = [];
   h.invoiceIds = [];
   h.statements = [];
@@ -381,8 +384,14 @@ describe('generateSessionReportPdf', () => {
     expect(text).not.toMatch(/Fällig|Rechnungsnummer|Zahlungsinformationen|USt/);
     expect(text).not.toContain('DE02');
     expect(text).not.toContain('DE123456789');
-    // A corrected report does not refer to the one it replaces.
-    expect(text).not.toContain('Ersetzt');
+  });
+
+  it('names the report it replaces', async () => {
+    h.replacedRows = [{ issued_at: new Date('2026-11-30T11:00:00Z') }];
+    const text = pdfText(await generateSessionReportPdf(detail()));
+    expect(text).toContain('Ersetzt den Bericht vom 30.11.2026');
+    const query = h.statements.find((s) => s.text.includes("status = 'credited'"));
+    expect(query?.values.slice(0, 4)).toEqual(['flt_1', 'drv_1', '2026-11-01', 'inv_1']);
   });
 
   it('renders in English for a language without report labels', async () => {
