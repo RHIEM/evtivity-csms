@@ -147,6 +147,9 @@ export const ERROR_CODES = {
   INVOICE_ALREADY_CREDITED: 'INVOICE_ALREADY_CREDITED',
   INVOICE_ALREADY_PAID: 'INVOICE_ALREADY_PAID',
   INVOICE_CREATION_FAILED: 'INVOICE_CREATION_FAILED',
+  INVOICE_ISSUER_IN_USE: 'INVOICE_ISSUER_IN_USE',
+  INVOICE_ISSUER_NOT_FOUND: 'INVOICE_ISSUER_NOT_FOUND',
+  INVOICE_ISSUER_NUMBER_FORMAT_LOCKED: 'INVOICE_ISSUER_NUMBER_FORMAT_LOCKED',
   INVOICE_IS_CREDIT_NOTE: 'INVOICE_IS_CREDIT_NOTE',
   INVOICE_NO_DRIVER: 'INVOICE_NO_DRIVER',
   INVOICE_NO_DRIVER_EMAIL: 'INVOICE_NO_DRIVER_EMAIL',
@@ -538,6 +541,9 @@ export type ErrorCode =
   | 'INVOICE_ALREADY_CREDITED'
   | 'INVOICE_ALREADY_PAID'
   | 'INVOICE_CREATION_FAILED'
+  | 'INVOICE_ISSUER_IN_USE'
+  | 'INVOICE_ISSUER_NOT_FOUND'
+  | 'INVOICE_ISSUER_NUMBER_FORMAT_LOCKED'
   | 'INVOICE_IS_CREDIT_NOTE'
   | 'INVOICE_NO_DRIVER'
   | 'INVOICE_NO_DRIVER_EMAIL'
@@ -957,6 +963,10 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVOICE_ALREADY_CREDITED: 'The invoice is already credited by a credit note',
   INVOICE_ALREADY_PAID: 'The invoice is already paid',
   INVOICE_CREATION_FAILED: 'Failed to create invoice',
+  INVOICE_ISSUER_IN_USE: 'The invoice issuer is used by a fleet or an invoice',
+  INVOICE_ISSUER_NOT_FOUND: 'Invoice issuer not found',
+  INVOICE_ISSUER_NUMBER_FORMAT_LOCKED:
+    'The number format cannot change once the issuer has issued a document of that kind',
   INVOICE_IS_CREDIT_NOTE: 'A credit note cannot be marked paid or credited',
   INVOICE_NO_DRIVER: 'This invoice has no driver to send to',
   INVOICE_NO_DRIVER_EMAIL: 'The driver of this invoice has no email address',

@@ -380,6 +380,46 @@ describe('FleetBillingProfileCard', () => {
     expect(screen.getByText('fleets.billingProfile.paymentTermsDefault')).toBeTruthy();
   });
 
+  it('shows the invoice issuer by name, the company without one', async () => {
+    getMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url === '/v1/invoice-issuers' ? [{ id: 'iis_rs', name: 'RHIEM Services GmbH' }] : [],
+      ),
+    );
+    wrap(<FleetBillingProfileCard fleet={{ ...fleet, invoiceIssuerId: 'iis_rs' }} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('fleet-billing-issuer').textContent).toBe('RHIEM Services GmbH');
+    });
+    cleanup();
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    expect(screen.getByTestId('fleet-billing-issuer').textContent).toBe(
+      'fleets.billingProfile.issuerCompany',
+    );
+  });
+
+  it('saves the chosen invoice issuer', async () => {
+    getMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url === '/v1/invoice-issuers' ? [{ id: 'iis_rs', name: 'RHIEM Services GmbH' }] : [],
+      ),
+    );
+    patchMock.mockResolvedValueOnce(fleet);
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    await screen.findByRole('option', { name: 'RHIEM Services GmbH' });
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.issuer'), {
+      target: { value: 'iis_rs' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/fleets/flt_1/billing-profile',
+        expect.objectContaining({ invoiceIssuerId: 'iis_rs' }),
+      );
+    });
+  });
+
   it('saves the edited profile', async () => {
     patchMock.mockResolvedValueOnce(fleet);
     wrap(<FleetBillingProfileCard fleet={fleet} />);
@@ -412,6 +452,7 @@ describe('FleetBillingProfileCard', () => {
         paymentTermsDays: null,
         autoInvoice: true,
         invoiceDateMode: 'period_end',
+        invoiceIssuerId: null,
       });
     });
     await waitFor(() => {

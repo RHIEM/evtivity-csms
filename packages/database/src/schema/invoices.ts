@@ -23,6 +23,7 @@ import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { drivers, fleets } from './drivers.js';
 import { chargingSessions } from './charging.js';
+import { invoiceIssuers } from './invoice-issuers.js';
 import { paymentRecords } from './payments.js';
 
 // 'credited': an issued or paid invoice a credit note credited in full. Its
@@ -59,6 +60,9 @@ export const invoices = pgTable(
     // The seller at issue (InvoiceSellerSnapshot: company name, address and invoice
     // seller settings), never updated. Null on documents issued before it was kept.
     seller: jsonb('seller'),
+    // The issuer the document was issued under (its seller and number range); null:
+    // the company. A credit note keeps the issuer of the invoice it credits.
+    issuerId: text('issuer_id').references(() => invoiceIssuers.id, { onDelete: 'restrict' }),
     // Language of the fleet invoice PDF and email at issue (INVOICE_LANGUAGES).
     language: varchar('language', { length: 10 }),
     // When the invoice email last went to the fleet billing contacts; the
@@ -97,6 +101,9 @@ export const invoices = pgTable(
     index('idx_invoices_driver_id').on(table.driverId),
     index('idx_invoices_status').on(table.status),
     index('idx_invoices_invoice_number').on(table.invoiceNumber),
+    index('idx_invoices_issuer_id')
+      .on(table.issuerId)
+      .where(sql`issuer_id IS NOT NULL`),
     index('idx_invoices_fleet_id').on(table.fleetId),
     // One live invoice per fleet and period; a void or credited one frees it.
     uniqueIndex('uq_invoices_fleet_period')

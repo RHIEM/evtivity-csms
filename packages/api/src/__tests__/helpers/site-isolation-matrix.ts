@@ -123,6 +123,8 @@ export interface MatrixWorld {
   tariffMapping: number;
   alertRule: number;
   holiday: number;
+  /** An invoice issuer no fleet or invoice uses. */
+  invoiceIssuer: string;
   /** A role id for user creation. */
   role: string;
   /** A Plug and Charge trust store CA certificate. */
@@ -1390,6 +1392,41 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     {
       body: () => ({ holidays: [{ name: 'Holiday', date: '2026-11-11' }] }),
     },
+  ),
+
+  // invoice issuers (company-wide settings)
+  c(
+    'GET',
+    '/invoice-issuers',
+    'settings.system:read',
+    () => '/invoice-issuers',
+    'INVOICE_ISSUER_NOT_FOUND',
+  ),
+  c(
+    'POST',
+    '/invoice-issuers',
+    'settings.system:write',
+    () => '/invoice-issuers',
+    'INVOICE_ISSUER_NOT_FOUND',
+    {
+      body: () => ({ name: 'Issuer', invoicePrefix: 'MX-' }),
+      control: { body: () => ({ name: 'Control', invoicePrefix: 'MC-' }) },
+    },
+  ),
+  c(
+    'PATCH',
+    '/invoice-issuers/:id',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}`,
+    'INVOICE_ISSUER_NOT_FOUND',
+    { body: () => ({ city: 'Berlin' }) },
+  ),
+  c(
+    'DELETE',
+    '/invoice-issuers/:id',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}`,
+    'INVOICE_ISSUER_NOT_FOUND',
   ),
 
   // invoices (company-wide, except the session invoice)

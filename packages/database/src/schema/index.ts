@@ -20,6 +20,7 @@ export * from './display-messages.js';
 export * from './station-message-templates.js';
 export * from './station-message-pushes.js';
 export * from './reports.js';
+export * from './invoice-issuers.js';
 export * from './invoices.js';
 export * from './reconciliation.js';
 export * from './support-cases.js';

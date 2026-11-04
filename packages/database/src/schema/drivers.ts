@@ -26,6 +26,7 @@ import type { VehicleBodyType, VehicleColor } from '@evtivity/lib/vehicle-appear
 import { createId } from '../lib/id.js';
 import { chargingStations } from './assets.js';
 import { chargingSessions } from './charging.js';
+import { invoiceIssuers } from './invoice-issuers.js';
 
 export const guestSessionStatusEnum = pgEnum('guest_session_status', [
   'pending_payment',
@@ -391,6 +392,11 @@ export const fleets = pgTable(
       .$type<InvoiceDateMode>()
       .notNull()
       .default('run_date'),
+    // The issuer the fleet's invoices are issued under (seller and number ranges);
+    // null: the company. Written only by updateFleetBillingProfile.
+    invoiceIssuerId: text('invoice_issuer_id').references(() => invoiceIssuers.id, {
+      onDelete: 'restrict',
+    }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     // Credit limit of the account billing (cents of the company currency, null:

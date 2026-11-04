@@ -4,7 +4,7 @@
 import { Textarea } from '@/components/ui/textarea';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Badge } from '@/components/ui/badge';
 import { TabPanel } from '@/components/ui/tab-panel';
 import { CancelButton } from '@/components/cancel-button';
@@ -19,6 +19,10 @@ import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
+import {
+  INVOICE_ISSUERS_QUERY_KEY,
+  type InvoiceIssuer,
+} from '@/components/settings/InvoiceIssuerSettings';
 
 /** The fleet billing profile as the API returns it on the fleet. */
 export interface FleetBillingProfile {
@@ -34,6 +38,8 @@ export interface FleetBillingProfile {
   paymentTermsDays: number | null;
   autoInvoice: boolean;
   invoiceDateMode: InvoiceDateMode;
+  /** The invoice issuer of the fleet's invoices; null: the company. */
+  invoiceIssuerId: string | null;
 }
 
 /** The date of the fleet's account invoices: the issue day or the last day of the billed month. */
@@ -60,6 +66,8 @@ interface FormState {
   paymentTerms: string;
   autoInvoice: boolean;
   invoiceDateMode: InvoiceDateMode;
+  /** '' for the company. */
+  invoiceIssuerId: string;
 }
 
 /** Splits the contacts field (one per line, or comma or semicolon separated). */
@@ -84,6 +92,7 @@ function toForm(fleet: FleetBillingProfileCardProps['fleet']): FormState {
     paymentTerms: fleet.paymentTermsDays == null ? '' : String(fleet.paymentTermsDays),
     autoInvoice: fleet.autoInvoice === true,
     invoiceDateMode: fleet.invoiceDateMode === 'period_end' ? 'period_end' : 'run_date',
+    invoiceIssuerId: fleet.invoiceIssuerId ?? '',
   };
 }
 
@@ -103,6 +112,16 @@ export function FleetBillingProfileCard({
   const [editing, setEditing] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [form, setForm] = useState<FormState>(() => toForm(fleet));
+  // The issuers need settings.system:read; without it only the company is offered.
+  const { data: issuers = [] } = useQuery({
+    queryKey: INVOICE_ISSUERS_QUERY_KEY,
+    queryFn: () => api.get<InvoiceIssuer[]>('/v1/invoice-issuers'),
+    retry: false,
+  });
+  const issuerName = (id: string | null | undefined): string =>
+    id == null || id === ''
+      ? t('fleets.billingProfile.issuerCompany')
+      : (issuers.find((issuer) => issuer.id === id)?.name ?? id);
 
   const mutation = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
@@ -163,6 +182,7 @@ export function FleetBillingProfileCard({
       billingTaxId: textOrNull(form.taxId),
       invoiceLanguage: form.language,
       paymentTermsDays: terms === '' ? null : Number(terms),
+      invoiceIssuerId: form.invoiceIssuerId === '' ? null : form.invoiceIssuerId,
       autoInvoice: form.autoInvoice,
       invoiceDateMode: form.invoiceDateMode,
     });
@@ -285,6 +305,30 @@ export function FleetBillingProfileCard({
                 {t('fleets.billingProfile.invoiceDateHelp')}
               </p>
             </div>
+            <div className="space-y-2">
+              <Label htmlFor="billing-issuer">{t('fleets.billingProfile.issuer')}</Label>
+              <Select
+                id="billing-issuer"
+                value={form.invoiceIssuerId}
+                onChange={(e) => {
+                  set('invoiceIssuerId', e.target.value);
+                }}
+              >
+                <option value="">{t('fleets.billingProfile.issuerCompany')}</option>
+                {issuers.map((issuer) => (
+                  <option key={issuer.id} value={issuer.id}>
+                    {issuer.name}
+                  </option>
+                ))}
+                {form.invoiceIssuerId !== '' &&
+                  !issuers.some((issuer) => issuer.id === form.invoiceIssuerId) && (
+                    <option value={form.invoiceIssuerId}>{form.invoiceIssuerId}</option>
+                  )}
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t('fleets.billingProfile.issuerHelp')}
+              </p>
+            </div>
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
@@ -337,6 +381,12 @@ export function FleetBillingProfileCard({
           <div>
             <dt className="text-muted-foreground">{t('fleets.billingProfile.invoiceLanguage')}</dt>
             <dd className="font-medium">{languageLabel}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">{t('fleets.billingProfile.issuer')}</dt>
+            <dd className="font-medium" data-testid="fleet-billing-issuer">
+              {issuerName(fleet.invoiceIssuerId)}
+            </dd>
           </div>
           <div>
             <dt className="text-muted-foreground">{t('fleets.billingProfile.paymentTerms')}</dt>

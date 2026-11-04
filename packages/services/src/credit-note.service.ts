@@ -8,6 +8,8 @@ import {
   invoiceLineItems,
   chargingSessions,
   allocateInvoiceNumber,
+  allocateIssuerInvoiceNumber,
+  loadInvoiceIssuerForIssue,
 } from '@evtivity/database';
 import { AppError } from '@evtivity/lib';
 import { creditNoteError } from './invoice.service.js';
@@ -96,7 +98,16 @@ export async function creditInvoice(
       .orderBy(asc(invoiceLineItems.id));
 
     const now = new Date();
-    const invoiceNumber = await allocateInvoiceNumber(tx, 'credit_note', now);
+    // A credit note of an issuer's invoice takes the issuer's credit note range.
+    const issuer =
+      before.issuerId != null ? await loadInvoiceIssuerForIssue(tx, before.issuerId) : null;
+    if (before.issuerId != null && issuer == null) {
+      throw new Error(`Invoice issuer '${before.issuerId}' not found`);
+    }
+    const invoiceNumber =
+      issuer != null
+        ? await allocateIssuerInvoiceNumber(tx, issuer, 'credit_note', now)
+        : await allocateInvoiceNumber(tx, 'credit_note', now);
     const [creditNote] = await tx
       .insert(invoices)
       .values({
@@ -116,6 +127,7 @@ export async function creditInvoice(
         periodEnd: before.periodEnd,
         billTo: before.billTo,
         seller: before.seller,
+        issuerId: before.issuerId,
         language: before.language,
         status: 'issued',
         issuedAt: now,

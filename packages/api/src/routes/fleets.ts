@@ -89,6 +89,12 @@ const billingProfileFields = {
     .describe(
       'Date of the fleet and member invoices: run_date (the day they are issued) or period_end (the last day of the billed month, system timezone; an invoice of the current month is dated today). The number prefix follows the date',
     ),
+  invoiceIssuerId: z
+    .string()
+    .nullable()
+    .describe(
+      'The invoice issuer (seller and number ranges) of the fleet and member invoices; null: the company',
+    ),
 };
 const optionalBillingProfileFields = Object.fromEntries(
   Object.entries(billingProfileFields).map(([key, schema]) => [key, schema.optional()]),
@@ -428,6 +434,13 @@ const fleetBillingProfileBody = z.object({
     .optional()
     .describe(
       'Date of the fleet and member invoices: run_date (the issue day) or period_end (the last day of the billed month)',
+    ),
+  invoiceIssuerId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      'The invoice issuer of the fleet and member invoices (GET /invoice-issuers); null: the company. Applies to invoices issued afterwards',
     ),
 });
 
@@ -850,9 +863,10 @@ export function fleetRoutes(app: FastifyInstance): void {
         body: zodSchema(fleetBillingProfileBody),
         response: {
           200: itemResponse(fleetItem),
-          400: errorWith('Automatic invoicing needs a billing contact', [
-            ERROR_CODES.FLEET_BILLING_CONTACT_REQUIRED,
-          ]),
+          400: errorWith(
+            'Automatic invoicing needs a billing contact, or the invoice issuer does not exist',
+            [ERROR_CODES.FLEET_BILLING_CONTACT_REQUIRED, ERROR_CODES.INVOICE_ISSUER_NOT_FOUND],
+          ),
           404: errorWith('Fleet not found', [ERROR_CODES.FLEET_NOT_FOUND]),
         },
       },
@@ -872,6 +886,10 @@ export function fleetRoutes(app: FastifyInstance): void {
           await reply
             .status(400)
             .send({ error: err.message, code: 'FLEET_BILLING_CONTACT_REQUIRED' });
+          return;
+        }
+        if (err instanceof AppError && err.code === 'INVOICE_ISSUER_NOT_FOUND') {
+          await reply.status(400).send({ error: err.message, code: 'INVOICE_ISSUER_NOT_FOUND' });
           return;
         }
         throw err;
