@@ -14,12 +14,12 @@ describe('formatInvoiceNumber', () => {
   it('prints prefix, two-digit year and the padded number', () => {
     expect(
       formatInvoiceNumber({ prefix: 'RPP-', withYear: true, start: 1, digits: 4 }, 7, 2026),
-    ).toBe('RPP-26-0007');
+    ).toBe('RPP-260007');
   });
 
   it('prints the year without a prefix and pads a year of the new century', () => {
     expect(formatInvoiceNumber({ prefix: '', withYear: true, start: 1, digits: 3 }, 12, 2105)).toBe(
-      '05-012',
+      '05012',
     );
   });
 

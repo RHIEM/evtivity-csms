@@ -12,7 +12,7 @@
 export interface InvoiceNumberFormat {
   /** Printed first, as entered (it carries its own separator, e.g. "RS-"); may be empty. */
   prefix: string;
-  /** The two-digit year of the document date follows the prefix, then "-"; the counter restarts each year. */
+  /** The two-digit year of the document date follows the prefix, without a separator; the counter restarts each year. */
   withYear: boolean;
   /** The first number of the range (of each year when withYear). */
   start: number;
@@ -38,16 +38,16 @@ export function isValidInvoiceNumberPrefix(prefix: string): boolean {
 }
 
 /**
- * The number of a document: prefix, the two-digit year and "-" (withYear),
- * then the counter value padded to the minimum length. Examples: prefix "",
- * no year, start 10000 gives "10000"; prefix "RPP-", year, 4 digits gives
- * "RPP-26-0001".
+ * The number of a document: prefix, the two-digit year (withYear), then the
+ * counter value padded to the minimum length, with no separator after the
+ * year. Examples: prefix "", no year, start 10000 gives "10000"; prefix
+ * "RI-", year, 5 digits gives "RI-2600001".
  */
 export function formatInvoiceNumber(
   format: InvoiceNumberFormat,
   value: number,
   year: number,
 ): string {
-  const yearPart = format.withYear ? `${String(year % 100).padStart(2, '0')}-` : '';
+  const yearPart = format.withYear ? String(year % 100).padStart(2, '0') : '';
   return `${format.prefix}${yearPart}${String(value).padStart(format.digits, '0')}`;
 }

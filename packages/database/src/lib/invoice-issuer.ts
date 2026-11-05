@@ -91,6 +91,13 @@ export function yearIn(at: Date, timeZone: string): number {
  * the start value or incremented; it stays locked until the commit, so
  * concurrent documents are numbered one after the other and a rollback gives
  * the number back. The year is that of issuedAt in the system timezone.
+ *
+ * The ranges of two issuers should not overlap. When they do, they share
+ * their numbers: a number some document already has (of another issuer, or
+ * entered by any other means) is skipped and the counter moves on to the next
+ * free one. The transaction lock on the number makes a concurrent document of
+ * another issuer that drew the same number wait for this commit, so it sees
+ * the number taken and moves on too.
  */
 export async function allocateIssuerInvoiceNumber(
   tx: InvoiceIssuerExecutor,
@@ -101,14 +108,25 @@ export async function allocateIssuerInvoiceNumber(
   const format = issuerNumberFormat(issuer, kind);
   const year = yearIn(issuedAt, await getSystemTimezone());
   const counterYear = format.withYear ? year : 0;
-  const [row] = await tx.execute(
-    sql`INSERT INTO invoice_issuer_number_counters (issuer_id, kind, year, value)
-        VALUES (${issuer.id}, ${kind}, ${counterYear}, ${format.start})
-        ON CONFLICT (issuer_id, kind, year)
-        DO UPDATE SET value = invoice_issuer_number_counters.value + 1
-        RETURNING value`,
-  );
-  if (row == null) throw new Error(`Invoice issuer counter '${issuer.id}/${kind}' is missing`);
-  const value = Number((row as { value: string | number }).value);
-  return formatInvoiceNumber(format, value, year);
+  for (;;) {
+    const [row] = await tx.execute(
+      sql`INSERT INTO invoice_issuer_number_counters (issuer_id, kind, year, value)
+          VALUES (${issuer.id}, ${kind}, ${counterYear}, ${format.start})
+          ON CONFLICT (issuer_id, kind, year)
+          DO UPDATE SET value = invoice_issuer_number_counters.value + 1
+          RETURNING value`,
+    );
+    if (row == null) throw new Error(`Invoice issuer counter '${issuer.id}/${kind}' is missing`);
+    const value = Number((row as { value: string | number }).value);
+    const number = formatInvoiceNumber(format, value, year);
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`invoice_number:${number}`}))`);
+    const taken = await tx.execute(
+      sql`SELECT 1 FROM invoices WHERE invoice_number = ${number} LIMIT 1`,
+    );
+    if (taken.length === 0) return number;
+    logger.warn(
+      { issuerId: issuer.id, kind, invoiceNumber: number },
+      'Invoice number already taken, the issuer ranges overlap; skipping it',
+    );
+  }
 }

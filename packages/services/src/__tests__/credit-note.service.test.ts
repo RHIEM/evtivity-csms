@@ -100,7 +100,7 @@ vi.mock('@evtivity/database', () => {
     loadInvoiceIssuerForIssue: vi.fn((_tx: unknown, id: string) =>
       Promise.resolve(id === 'iis_rs' ? { id: 'iis_rs', name: 'RHIEM Services GmbH' } : null),
     ),
-    allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('GS-26-0001')),
+    allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('GS-260001')),
   };
 });
 
@@ -272,7 +272,7 @@ describe('creditInvoice', () => {
 
     const [note] = h.state.inserted['invoices'] ?? [];
     expect(note).toMatchObject({
-      invoiceNumber: 'GS-26-0001',
+      invoiceNumber: 'GS-260001',
       issuerId: 'iis_rs',
       seller: { name: 'RHIEM Services GmbH' },
     });

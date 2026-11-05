@@ -68,7 +68,8 @@ export const invoiceIssuers = pgTable(
  * 'credit_note') and year (0 for a range without year). The invoice
  * transaction inserts or increments its row (allocateIssuerInvoiceNumber),
  * so the row stays locked until the commit and a rollback gives the number
- * back: the numbers have no gaps (GoBD), like invoice_number_counters.
+ * back: the numbers have no gaps (GoBD), like invoice_number_counters. When
+ * the ranges of two issuers overlap, a number already taken is skipped.
  */
 export const invoiceIssuerNumberCounters = pgTable(
   'invoice_issuer_number_counters',
