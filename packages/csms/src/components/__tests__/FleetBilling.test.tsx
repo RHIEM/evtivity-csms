@@ -458,6 +458,21 @@ describe('FleetBillingProfileCard', () => {
     });
   });
 
+  it('links to the issuer settings for a user who manages them', () => {
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(
+      screen.getByRole('link', { name: 'fleets.billingProfile.issuerManage' }).getAttribute('href'),
+    ).toBe('/settings?tab=invoiceIssuers');
+  });
+
+  it('shows no issuer link to a user restricted to some sites', () => {
+    permission.allSites = false;
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(screen.queryByRole('link', { name: 'fleets.billingProfile.issuerManage' })).toBeNull();
+  });
+
   it('saves the chosen invoice issuer', async () => {
     getMock.mockImplementation((url: string) =>
       Promise.resolve(

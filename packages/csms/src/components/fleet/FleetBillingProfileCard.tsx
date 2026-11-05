@@ -3,6 +3,7 @@
 
 import { Textarea } from '@/components/ui/textarea';
 import { useState } from 'react';
+import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Badge } from '@/components/ui/badge';
@@ -17,7 +18,7 @@ import { LanguageSelect, LANGUAGES } from '@/components/ui/language-select';
 import { Toggle } from '@/components/ui/toggle';
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
-import { useHasPermission } from '@/lib/auth';
+import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import {
   INVOICE_ISSUERS_QUERY_KEY,
@@ -128,6 +129,8 @@ export function FleetBillingProfileCard({
   const canWriteFleets = useHasPermission('fleets:write');
   const canWritePayments = useHasPermission('payments:write');
   const canWrite = canWriteFleets && canWritePayments;
+  // The issuers are managed in the settings: settings.system:read and every site.
+  const canManageIssuers = useHasPermission('settings.system:read') && useHasAllSiteAccess();
   const [editing, setEditing] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [form, setForm] = useState<FormState>(() => toForm(fleet));
@@ -348,7 +351,15 @@ export function FleetBillingProfileCard({
                   )}
               </Select>
               <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.issuerHelp')}
+                {t('fleets.billingProfile.issuerHelp')}{' '}
+                {canManageIssuers && (
+                  <Link
+                    to="/settings?tab=invoiceIssuers"
+                    className="underline underline-offset-2 hover:text-foreground"
+                  >
+                    {t('fleets.billingProfile.issuerManage')}
+                  </Link>
+                )}
               </p>
             </div>
             <div className="space-y-2">

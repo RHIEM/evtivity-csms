@@ -47,6 +47,7 @@ import { Conformance } from '@/pages/Conformance';
 // the catalog does not hold.
 const TAB_PERMISSIONS: Record<string, Permission> = {
   company: 'settings.system:read',
+  invoiceIssuers: 'settings.system:read',
   marketing: 'settings.system:read',
   content: 'settings.system:read',
   notification: 'settings.notification:read',
@@ -73,6 +74,7 @@ const TAB_PERMISSIONS: Record<string, Permission> = {
  */
 const ALL_SITE_TABS = new Set([
   'company',
+  'invoiceIssuers',
   'marketing',
   'content',
   'notification',
@@ -172,6 +174,9 @@ export function Settings(): React.JSX.Element {
           {tabVisible('company') && (
             <TabsTrigger value="company">{t('settings.companyInfo')}</TabsTrigger>
           )}
+          {tabVisible('invoiceIssuers') && (
+            <TabsTrigger value="invoiceIssuers">{t('settings.invoiceIssuers.tab')}</TabsTrigger>
+          )}
           {tabVisible('marketing') && (
             <TabsTrigger value="marketing">{t('settings.marketing')}</TabsTrigger>
           )}
@@ -219,9 +224,14 @@ export function Settings(): React.JSX.Element {
           <TabsContent value="company" className="space-y-6">
             <CompanySettings settings={settings} svgDataUri={svgDataUri} hasIcon={hasIcon} />
             <InvoiceSellerSettings settings={settings} />
-            <InvoiceIssuerSettings />
             <InvoicePaymentSettings settings={settings} />
             <PdfBrandingSettings settings={settings} />
+          </TabsContent>
+        )}
+
+        {tabVisible('invoiceIssuers') && (
+          <TabsContent value="invoiceIssuers">
+            <InvoiceIssuerSettings />
           </TabsContent>
         )}
 
