@@ -3,15 +3,18 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { desc, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, desc, eq, isNotNull, isNull, sql } from 'drizzle-orm';
 import {
   db,
   invoices,
+  invoiceIssuers,
+  invoiceSellerSnapshotFromIssuer,
   pdfLetterheads,
   settingAuditLog,
   settings,
   writeAudit,
 } from '@evtivity/database';
+import type { InvoiceSellerSnapshot } from '@evtivity/database';
 import {
   DEFAULT_PDF_LETTERHEAD_LAYOUT,
   MAX_PDF_LETTERHEAD_BYTES,
@@ -47,7 +50,7 @@ const LETTERHEAD_NOT_FOUND = {
 } as const;
 
 /** A data URI of MAX_PDF_LETTERHEAD_BYTES in base64, plus the layout fields. */
-const UPLOAD_BODY_LIMIT = Math.ceil((MAX_PDF_LETTERHEAD_BYTES * 4) / 3) + 64 * 1024;
+export const UPLOAD_BODY_LIMIT = Math.ceil((MAX_PDF_LETTERHEAD_BYTES * 4) / 3) + 64 * 1024;
 
 const MAX_LETTERHEAD_KB = MAX_PDF_LETTERHEAD_BYTES / 1024;
 
@@ -94,14 +97,16 @@ const imageField = z
     `The whole A4 portrait page as a PNG (at least ${String(MIN_PDF_LETTERHEAD_PNG_WIDTH)} px wide) or SVG data URI of at most ${String(MAX_LETTERHEAD_KB)} KB; an SVG is stored sanitized`,
   );
 
-const createBody = z.object({
+export const createBody = z.object({
   name: z.string().max(MAX_PDF_LETTERHEAD_NAME_LENGTH).describe('Name of the version'),
   image: imageField,
   ...layoutFields,
   activate: z
     .boolean()
     .optional()
-    .describe('Make the new version current right away (pdf.letterhead); default false'),
+    .describe(
+      'Make the new version current right away (pdf.letterhead, or the invoice issuer\'s letterhead); default false',
+    ),
 });
 
 const previewBody = z.object({
@@ -111,6 +116,12 @@ const previewBody = z.object({
     .enum(INVOICE_LANGUAGES)
     .optional()
     .describe('Language of the sample invoice; default English'),
+  issuerId: z
+    .string()
+    .optional()
+    .describe(
+      'Invoice issuer whose seller the sample invoice names (its letterhead); default the company',
+    ),
 });
 
 const currentBody = z.object({
@@ -124,11 +135,15 @@ const currentResponse = z.object({
   letterheadId: z.string().nullable().describe('The current version; null for none'),
 });
 
-const letterheadItem = z
+export const letterheadItem = z
   .object({
     id: z.string(),
     name: z.string(),
     imageSha256: z.string().describe('SHA-256 of the image bytes'),
+    issuerId: z
+      .string()
+      .nullable()
+      .describe('The invoice issuer the version belongs to; null for a version of the company'),
     addressLeftMm: z.number(),
     addressTopMm: z.number(),
     contentTopMm: z.number(),
@@ -139,7 +154,9 @@ const letterheadItem = z
     createdAt: z.coerce.date(),
     current: z
       .boolean()
-      .describe('New invoices and credit notes are issued under this version (pdf.letterhead)'),
+      .describe(
+        'New invoices and credit notes (of its invoice issuer) are issued under this version',
+      ),
     invoiceCount: z.number().describe('Invoices and credit notes issued under this version'),
   })
   .loose();
@@ -154,10 +171,11 @@ const idParams = z.object({ id: z.string().describe('PDF letterhead version iden
  * The columns of a version without its image (up to 2 MB): lists, responses
  * and the audit trail never carry it, GET .../image returns it.
  */
-const versionColumns = {
+export const versionColumns = {
   id: pdfLetterheads.id,
   name: pdfLetterheads.name,
   imageSha256: pdfLetterheads.imageSha256,
+  issuerId: pdfLetterheads.issuerId,
   addressLeftMm: pdfLetterheads.addressLeftMm,
   addressTopMm: pdfLetterheads.addressTopMm,
   contentTopMm: pdfLetterheads.contentTopMm,
@@ -168,9 +186,9 @@ const versionColumns = {
   createdAt: pdfLetterheads.createdAt,
 };
 
-type LetterheadVersion = Omit<typeof pdfLetterheads.$inferSelect, 'image'>;
+export type LetterheadVersion = Omit<typeof pdfLetterheads.$inferSelect, 'image'>;
 
-function toItem(row: LetterheadVersion, currentId: string | null, invoiceCount: number) {
+export function toItem(row: LetterheadVersion, currentId: string | null, invoiceCount: number) {
   return { ...row, current: row.id === currentId, invoiceCount };
 }
 
@@ -182,7 +200,7 @@ async function currentLetterheadId(): Promise<string | null> {
   return typeof row?.value === 'string' && row.value !== '' ? row.value : null;
 }
 
-async function invoiceCounts(): Promise<Map<string, number>> {
+export async function invoiceCounts(): Promise<Map<string, number>> {
   const rows = await db
     .select({ letterheadId: invoices.letterheadId, count: sql<number>`count(*)::int` })
     .from(invoices)
@@ -221,6 +239,52 @@ function layoutOf(body: PdfLetterheadLayout): PdfLetterheadLayout | null {
     marginLeftMm: body.marginLeftMm,
     marginRightMm: body.marginRightMm,
   });
+}
+
+/** A new version as POST /pdf-letterheads takes it, checked: name, layout and image as stored. */
+export interface CheckedVersion {
+  name: string;
+  layout: PdfLetterheadLayout;
+  image: { dataUri: string; sha256: string };
+}
+
+/**
+ * The name, layout and image of a new version as stored, or the 400 answer
+ * when one of them is invalid.
+ */
+export function checkVersionBody(
+  body: z.infer<typeof createBody>,
+): CheckedVersion | { invalid: { error: string; code: 'VALIDATION_ERROR' } } {
+  const name = normalizePdfLetterheadName(body.name);
+  if (name == null) return { invalid: INVALID_NAME };
+  const layout = layoutOf(body);
+  if (layout == null) return { invalid: INVALID_LAYOUT };
+  const image = imageOf(body.image, layout);
+  if ('error' in image) {
+    return { invalid: { error: IMAGE_ERRORS[image.error], code: 'VALIDATION_ERROR' } };
+  }
+  return { name, layout, image };
+}
+
+/** Audits a new version in the settings history (pdfLetterhead:<id>), without the image. */
+export async function auditVersionCreated(
+  request: FastifyRequest,
+  created: LetterheadVersion,
+): Promise<void> {
+  const key = `pdfLetterhead:${created.id}`;
+  await writeAudit(
+    { table: settingAuditLog, idColumn: 'setting_key' },
+    {
+      entityId: key,
+      entityIdSnapshot: key,
+      action: 'created',
+      ...getAuditActor(request),
+      before: null,
+      after: created,
+    },
+    db,
+    request.log,
+  );
 }
 
 /** Audits a change of the current version in the settings history of pdf.letterhead. */
@@ -276,6 +340,7 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
       const rows = await db
         .select(versionColumns)
         .from(pdfLetterheads)
+        .where(isNull(pdfLetterheads.issuerId))
         .orderBy(desc(pdfLetterheads.createdAt));
       const currentId = await currentLetterheadId();
       const counts = await invoiceCounts();
@@ -306,23 +371,12 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       if (!(await requireAllSiteAccess(request, reply, LETTERHEAD_NOT_FOUND))) return;
       const body = request.body as z.infer<typeof createBody>;
-      const name = normalizePdfLetterheadName(body.name);
-      if (name == null) {
-        await reply.status(400).send(INVALID_NAME);
+      const checked = checkVersionBody(body);
+      if ('invalid' in checked) {
+        await reply.status(400).send(checked.invalid);
         return;
       }
-      const layout = layoutOf(body);
-      if (layout == null) {
-        await reply.status(400).send(INVALID_LAYOUT);
-        return;
-      }
-      const image = imageOf(body.image, layout);
-      if ('error' in image) {
-        await reply
-          .status(400)
-          .send({ error: IMAGE_ERRORS[image.error], code: 'VALIDATION_ERROR' });
-        return;
-      }
+      const { name, layout, image } = checked;
       const actor = getAuditActor(request);
       const before = body.activate === true ? await currentLetterheadId() : null;
       const created = await db.transaction(async (tx) => {
@@ -348,20 +402,7 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
         }
         return row;
       });
-      const key = `pdfLetterhead:${created.id}`;
-      await writeAudit(
-        { table: settingAuditLog, idColumn: 'setting_key' },
-        {
-          entityId: key,
-          entityIdSnapshot: key,
-          action: 'created',
-          ...actor,
-          before: null,
-          after: created,
-        },
-        db,
-        request.log,
-      );
+      await auditVersionCreated(request, created);
       if (body.activate === true) await auditCurrent(request, before, created.id);
       await reply
         .status(201)
@@ -426,7 +467,8 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
         const [row] = await db
           .select({ id: pdfLetterheads.id })
           .from(pdfLetterheads)
-          .where(eq(pdfLetterheads.id, letterheadId));
+          // A version of an invoice issuer is never the company's.
+          .where(and(eq(pdfLetterheads.id, letterheadId), isNull(pdfLetterheads.issuerId)));
         if (row == null) return sendNotFound(reply);
       }
       const before = await currentLetterheadId();
@@ -445,13 +487,16 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
         tags: ['Settings'],
         summary: 'Preview a PDF letterhead',
         description:
-          'Renders a sample invoice of two pages on the given image and layout, stored or not, with the company seller and payment details, so the address and the margins can be checked before a version is created. Nothing is stored. An invalid image or layout answers 400 VALIDATION_ERROR. Streams application/pdf.',
+          'Renders a sample invoice of two pages on the given image and layout, stored or not, with the company seller (or the seller of issuerId) and payment details, so the address and the margins can be checked before a version is created. Nothing is stored. An invalid image or layout answers 400 VALIDATION_ERROR. An unknown issuerId answers 404 INVOICE_ISSUER_NOT_FOUND. Streams application/pdf.',
         operationId: 'previewPdfLetterhead',
         security: [{ bearerAuth: [] }],
         body: zodSchema(previewBody),
         response: {
           400: errorWith('Invalid image or layout', [ERROR_CODES.VALIDATION_ERROR]),
-          404: errorWith('Restricted to some sites', [ERROR_CODES.PDF_LETTERHEAD_NOT_FOUND]),
+          404: errorWith('Restricted to some sites, or the invoice issuer not found', [
+            ERROR_CODES.PDF_LETTERHEAD_NOT_FOUND,
+            ERROR_CODES.INVOICE_ISSUER_NOT_FOUND,
+          ]),
         },
       },
     },
@@ -470,9 +515,25 @@ export function pdfLetterheadRoutes(app: FastifyInstance): void {
           .send({ error: IMAGE_ERRORS[image.error], code: 'VALIDATION_ERROR' });
         return;
       }
+      // The seller of an invoice issuer, so the sample reads like its invoices.
+      let seller: InvoiceSellerSnapshot | null = null;
+      if (body.issuerId != null) {
+        const [issuer] = await db
+          .select()
+          .from(invoiceIssuers)
+          .where(eq(invoiceIssuers.id, body.issuerId));
+        if (issuer == null) {
+          await reply
+            .status(404)
+            .send({ error: 'Invoice issuer not found', code: 'INVOICE_ISSUER_NOT_FOUND' });
+          return;
+        }
+        seller = invoiceSellerSnapshotFromIssuer(issuer);
+      }
       const pdf = await generatePdfLetterheadPreview(
         { image: image.dataUri, imageSha256: image.sha256, layout },
         resolveInvoicePdfLanguage(body.language),
+        seller,
       );
       await reply
         .header('Content-Type', 'application/pdf')

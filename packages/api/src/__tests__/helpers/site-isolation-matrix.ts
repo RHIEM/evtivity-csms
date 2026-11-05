@@ -1487,6 +1487,29 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/pdf-logo`,
     'INVOICE_ISSUER_NOT_FOUND',
   ),
+  c(
+    'GET',
+    '/invoice-issuers/:id/letterheads',
+    'settings.system:read',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/letterheads`,
+    'INVOICE_ISSUER_NOT_FOUND',
+  ),
+  c(
+    'POST',
+    '/invoice-issuers/:id/letterheads',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/letterheads`,
+    'INVOICE_ISSUER_NOT_FOUND',
+    { body: () => ({ name: 'Matrix', image: blankA4Png(), ...DEFAULT_PDF_LETTERHEAD_LAYOUT }) },
+  ),
+  c(
+    'PUT',
+    '/invoice-issuers/:id/letterhead',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/letterhead`,
+    'INVOICE_ISSUER_NOT_FOUND',
+    { body: () => ({ letterheadId: null }) },
+  ),
   // PDF letterheads (company-wide settings)
   c(
     'GET',

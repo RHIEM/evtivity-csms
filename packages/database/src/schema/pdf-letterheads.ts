@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { char, check, numeric, pgTable, text, timestamp, varchar } from 'drizzle-orm/pg-core';
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
 import { users } from './identity.js';
+import { invoiceIssuers } from './invoice-issuers.js';
 
 /**
  * A version of the PDF letterhead (stationery): an A4 image drawn as the
@@ -48,6 +50,11 @@ export const pdfLetterheads = pgTable(
     marginRightMm: numeric('margin_right_mm', { precision: 5, scale: 1, mode: 'number' })
       .notNull()
       .default(20),
+    // The invoice issuer the version belongs to (its own letterhead); null is a
+    // version of the company. Set at creation, never changed.
+    issuerId: text('issuer_id').references((): AnyPgColumn => invoiceIssuers.id, {
+      onDelete: 'restrict',
+    }),
     createdByUserId: text('created_by_user_id').references(() => users.id, {
       onDelete: 'set null',
     }),

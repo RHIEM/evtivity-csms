@@ -3,13 +3,14 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { asc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import {
   db,
   fleets,
   invoiceIssuers,
   invoices,
   invoiceIssuerNumberCounters,
+  pdfLetterheads,
   settingAuditLog,
   writeAudit,
 } from '@evtivity/database';
@@ -31,6 +32,16 @@ import { ERROR_CODES } from '../lib/error-codes.generated.js';
 import { requireAllSiteAccess } from '../lib/site-access.js';
 import { authorize } from '../middleware/rbac.js';
 import { getAuditActor } from '../lib/audit-actor.js';
+import {
+  UPLOAD_BODY_LIMIT as LETTERHEAD_UPLOAD_BODY_LIMIT,
+  auditVersionCreated,
+  checkVersionBody,
+  createBody as createLetterheadBody,
+  invoiceCounts,
+  letterheadItem,
+  toItem as letterheadToItem,
+  versionColumns,
+} from './pdf-letterheads.js';
 
 // Company-wide configuration: a site-restricted user gets this 404 before any
 // read or write (requireAllSiteAccess, features/site-access-control.md).
@@ -134,6 +145,12 @@ const issuerItem = z
     hasPdfLogo: z
       .boolean()
       .describe("The issuer has its own PDF logo; otherwise its PDFs show the company's"),
+    letterheadId: z
+      .string()
+      .nullable()
+      .describe(
+        "The current version of the issuer's own PDF letterhead; null: the company's (pdf.letterhead)",
+      ),
     invoiceNumberLocked: z
       .boolean()
       .describe('An invoice was issued: the invoice number format can no longer change'),
@@ -153,6 +170,14 @@ const pdfLogoBody = z.object({
 });
 const pdfLogoResponse = z.object({
   logo: z.string().nullable().describe("The issuer's logo data URI; null: the company's"),
+});
+const letterheadBody = z.object({
+  letterheadId: z
+    .string()
+    .nullable()
+    .describe(
+      "A version of the issuer's own letterhead its new documents keep; null takes the company letterhead",
+    ),
 });
 
 const INVOICE_FORMAT_KEYS = [
@@ -553,6 +578,189 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.get(
+    '/invoice-issuers/:id/letterheads',
+    {
+      onRequest: [authorize('settings.system:read')],
+      schema: {
+        tags: ['Invoices'],
+        summary: "List an invoice issuer's PDF letterhead versions",
+        description:
+          "The issuer's own letterhead versions, newest first, without the image (GET /pdf-letterheads/:id/image), each with its layout, whether it is the issuer's current version and how many documents were issued under it. Without a current version the issuer's documents take the company letterhead (pdf.letterhead). A user restricted to some sites gets 404 INVOICE_ISSUER_NOT_FOUND.",
+        operationId: 'listInvoiceIssuerLetterheads',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        response: {
+          200: arrayResponse(letterheadItem),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const [issuer] = await db
+        .select({ letterheadId: invoiceIssuers.letterheadId })
+        .from(invoiceIssuers)
+        .where(eq(invoiceIssuers.id, id));
+      if (issuer == null) return sendNotFound(reply);
+      const rows = await db
+        .select(versionColumns)
+        .from(pdfLetterheads)
+        .where(eq(pdfLetterheads.issuerId, id))
+        .orderBy(desc(pdfLetterheads.createdAt));
+      const counts = await invoiceCounts();
+      return rows.map((row) => letterheadToItem(row, issuer.letterheadId, counts.get(row.id) ?? 0));
+    },
+  );
+
+  app.post(
+    '/invoice-issuers/:id/letterheads',
+    {
+      onRequest: [authorize('settings.system:write')],
+      bodyLimit: LETTERHEAD_UPLOAD_BODY_LIMIT,
+      schema: {
+        tags: ['Invoices'],
+        summary: 'Create a PDF letterhead version of an invoice issuer',
+        description:
+          "Stores a new version of the issuer's own letterhead, with the same image and layout rules as POST /pdf-letterheads (preview it with POST /pdf-letterheads/preview and issuerId). With activate it becomes the issuer's current version right away; otherwise set it with PUT /invoice-issuers/:id/letterhead. The issuer's invoices and credit notes keep the version current at their issue and then draw neither the PDF logo nor the PDF footer. An invalid image, layout or name answers 400 VALIDATION_ERROR. Audited in the settings history without the image.",
+        operationId: 'createInvoiceIssuerLetterhead',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        body: zodSchema(createLetterheadBody),
+        response: {
+          201: itemResponse(letterheadItem),
+          400: errorWith('Invalid image, layout or name', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const body = request.body as z.infer<typeof createLetterheadBody>;
+      const checked = checkVersionBody(body);
+      if ('invalid' in checked) {
+        await reply.status(400).send(checked.invalid);
+        return;
+      }
+      const { name, layout, image } = checked;
+      const actorUserId = getAuditActor(request).actorUserId;
+      const result = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select()
+          .from(invoiceIssuers)
+          .where(eq(invoiceIssuers.id, id))
+          .for('update');
+        if (current == null) return null;
+        const [created] = await tx
+          .insert(pdfLetterheads)
+          .values({
+            name,
+            image: image.dataUri,
+            imageSha256: image.sha256,
+            ...layout,
+            issuerId: id,
+            createdByUserId: actorUserId,
+          })
+          .returning(versionColumns);
+        if (created == null) throw new Error('Failed to create the PDF letterhead');
+        if (body.activate !== true) return { created, current, updated: null };
+        const [updated] = await tx
+          .update(invoiceIssuers)
+          .set({ letterheadId: created.id, updatedAt: new Date() })
+          .where(eq(invoiceIssuers.id, id))
+          .returning();
+        return { created, current, updated: updated ?? null };
+      });
+      if (result == null) return sendNotFound(reply);
+      await auditVersionCreated(request, result.created);
+      if (result.updated != null) {
+        await auditIssuer(request, id, {
+          action: 'updated',
+          before: result.current,
+          after: result.updated,
+          notes: 'PDF letterhead set',
+        });
+      }
+      const currentId = (result.updated ?? result.current).letterheadId;
+      await reply.status(201).send(letterheadToItem(result.created, currentId, 0));
+    },
+  );
+
+  app.put(
+    '/invoice-issuers/:id/letterhead',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: "Set an invoice issuer's current PDF letterhead version",
+        description:
+          "The issuer's invoices and credit notes issued from now on keep this version of its own letterhead (invoices.letterhead_id); null makes them take the company letterhead (pdf.letterhead) again. Documents issued before keep their version. A version that is not the issuer's answers 404 PDF_LETTERHEAD_NOT_FOUND. Audited in the settings history.",
+        operationId: 'setInvoiceIssuerLetterhead',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        body: zodSchema(letterheadBody),
+        response: {
+          200: itemResponse(issuerItem),
+          404: errorWith('Invoice issuer or PDF letterhead not found', [
+            ERROR_CODES.INVOICE_ISSUER_NOT_FOUND,
+            ERROR_CODES.PDF_LETTERHEAD_NOT_FOUND,
+          ]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const { letterheadId } = request.body as z.infer<typeof letterheadBody>;
+      const result = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select()
+          .from(invoiceIssuers)
+          .where(eq(invoiceIssuers.id, id))
+          .for('update');
+        if (current == null) return { kind: 'issuer_not_found' as const };
+        if (letterheadId != null) {
+          const [version] = await tx
+            .select({ id: pdfLetterheads.id })
+            .from(pdfLetterheads)
+            .where(and(eq(pdfLetterheads.id, letterheadId), eq(pdfLetterheads.issuerId, id)));
+          if (version == null) return { kind: 'letterhead_not_found' as const };
+        }
+        const [updated] = await tx
+          .update(invoiceIssuers)
+          .set({ letterheadId, updatedAt: new Date() })
+          .where(eq(invoiceIssuers.id, id))
+          .returning();
+        const counts = await fleetCounts(tx);
+        const after = updated ?? current;
+        return {
+          kind: 'updated' as const,
+          before: current,
+          after,
+          item: await toItem(tx, after, counts.get(id) ?? 0),
+        };
+      });
+      if (result.kind === 'issuer_not_found') return sendNotFound(reply);
+      if (result.kind === 'letterhead_not_found') {
+        await reply
+          .status(404)
+          .send({ error: 'PDF letterhead not found', code: 'PDF_LETTERHEAD_NOT_FOUND' });
+        return;
+      }
+      if (result.before.letterheadId !== letterheadId) {
+        await auditIssuer(request, id, {
+          action: 'updated',
+          before: result.before,
+          after: result.after,
+          notes: letterheadId != null ? 'PDF letterhead set' : 'PDF letterhead removed',
+        });
+      }
+      return result.item;
+    },
+  );
+
   app.delete(
     '/invoice-issuers/:id',
     {
@@ -561,7 +769,7 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Delete an invoice issuer',
         description:
-          'Deletes an issuer that no fleet uses and that never issued a document; otherwise 409 INVOICE_ISSUER_IN_USE.',
+          'Deletes an issuer that no fleet uses and that never issued a document, with its own letterhead versions; otherwise 409 INVOICE_ISSUER_IN_USE.',
         operationId: 'deleteInvoiceIssuer',
         security: [{ bearerAuth: [] }],
         params: zodSchema(idParams),
@@ -595,6 +803,15 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
         if (fleet != null || invoice != null || (await lockedKinds(tx, id)).size > 0) {
           return { kind: 'in_use' as const };
         }
+        // Its own letterhead versions go with it: it never issued a document,
+        // so no document keeps one of them.
+        if (current.letterheadId != null) {
+          await tx
+            .update(invoiceIssuers)
+            .set({ letterheadId: null })
+            .where(eq(invoiceIssuers.id, id));
+        }
+        await tx.delete(pdfLetterheads).where(eq(pdfLetterheads.issuerId, id));
         await tx.delete(invoiceIssuers).where(eq(invoiceIssuers.id, id));
         return { kind: 'deleted' as const, before: current };
       });

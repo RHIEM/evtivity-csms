@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { getCompanyCurrency } from '@evtivity/database';
+import type { InvoiceSellerSnapshot } from '@evtivity/database';
 import { taxBreakdownWithGross, taxOnNet } from '@evtivity/lib';
 import type { InvoiceDetail } from './invoice.service.js';
 import type { InvoiceLanguage } from './invoice-labels.js';
@@ -20,6 +21,7 @@ export function letterheadPreviewDetail(
   language: InvoiceLanguage,
   currency: string,
   now = new Date(),
+  seller: InvoiceSellerSnapshot | null = null,
 ): InvoiceDetail {
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
@@ -79,7 +81,7 @@ export function letterheadPreviewDetail(
       paymentReference: null,
       metadata: null,
       letterheadId: null,
-      seller: null,
+      seller,
       issuerId: null,
       settlementNote: null,
       createdAt: now,
@@ -99,12 +101,16 @@ export function letterheadPreviewDetail(
 /**
  * A sample invoice PDF on the given letterhead (stored or not), in the
  * company currency, with the seller, payment details and fonts a real
- * invoice in that language gets.
+ * invoice in that language gets. A seller (an invoice issuer's) replaces
+ * the company as seller.
  */
 export async function generatePdfLetterheadPreview(
   letterhead: PdfLetterhead,
   language: InvoiceLanguage,
+  seller: InvoiceSellerSnapshot | null = null,
 ): Promise<Buffer> {
   const currency = await getCompanyCurrency();
-  return generateInvoicePdf(letterheadPreviewDetail(language, currency), { letterhead });
+  return generateInvoicePdf(letterheadPreviewDetail(language, currency, new Date(), seller), {
+    letterhead,
+  });
 }

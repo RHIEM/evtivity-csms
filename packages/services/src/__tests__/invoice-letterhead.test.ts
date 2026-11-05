@@ -326,6 +326,21 @@ describe('generateInvoicePdf on a letterhead', () => {
     expect(pages.slice(1).some((page) => page.includes(' Do'))).toBe(false);
   });
 
+  it('puts the employee number with the tax ID below the title', async () => {
+    const detail = memberDetail();
+    detail.invoice.billTo = { ...(detail.invoice.billTo as object), employeeNumber: '4711' };
+    const pdf = await generateInvoicePdf(detail, { letterhead: letterhead() });
+    expect(pdfText(pdf)).toContain('Employee no.: 4711');
+  });
+
+  it("heads the later pages with the seller kept on the invoice, e.g. an invoice issuer's", async () => {
+    const detail = memberDetail(40);
+    detail.invoice.seller = { name: 'RHIEM Services GmbH' };
+    const pdf = await generateInvoicePdf(detail, { letterhead: letterhead() });
+    const pages = pageStreams(pdf);
+    expect(streamText(pages[1] ?? '')).toContain('RHIEM Services GmbH · INVOICE RI-2600001');
+  });
+
   it('loads the version the invoice was issued under', async () => {
     const lh = letterhead();
     letterheadRows.rows = [
@@ -375,6 +390,14 @@ describe('generatePdfLetterheadPreview', () => {
     expect(text).toContain('Alex Example');
     expect(text).toContain('Seite 1 von 2');
     expect(text).toContain('Seite 2 von 2');
+  });
+
+  it("names an invoice issuer's seller on the sample", async () => {
+    const pdf = await generatePdfLetterheadPreview(letterhead(), 'de', {
+      name: 'RHIEM Services GmbH',
+    });
+    const pages = pageStreams(pdf);
+    expect(streamText(pages[1] ?? '')).toContain('RHIEM Services GmbH');
   });
 
   it('builds the sample in the given currency without storing anything', () => {

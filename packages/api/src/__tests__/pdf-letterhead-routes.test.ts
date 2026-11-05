@@ -86,9 +86,12 @@ vi.mock('@evtivity/database', () => {
   return {
     db,
     invoices: { letterheadId: 'invoices.letterheadId' },
+    invoiceIssuers: { id: 'invoiceIssuers.id' },
+    invoiceSellerSnapshotFromIssuer: (issuer: { name: string }) => ({ name: issuer.name }),
     pdfLetterheads: {
       id: 'pdfLetterheads.id',
       image: 'pdfLetterheads.image',
+      issuerId: 'pdfLetterheads.issuerId',
       createdAt: 'pdfLetterheads.createdAt',
     },
     settings: { key: 'settings.key', value: 'settings.value' },
@@ -98,9 +101,11 @@ vi.mock('@evtivity/database', () => {
 });
 
 vi.mock('drizzle-orm', () => ({
+  and: vi.fn(),
   desc: vi.fn(),
   eq: vi.fn(),
   isNotNull: vi.fn(),
+  isNull: vi.fn(),
   sql: vi.fn(),
 }));
 
@@ -113,6 +118,7 @@ vi.mock('@evtivity/services/invoice-pdf.service', () => ({
   resolveInvoicePdfLanguage: (language: string | undefined) => language ?? 'en',
 }));
 
+import { isNull } from 'drizzle-orm';
 import { registerAuth } from '../plugins/auth.js';
 import { pdfLetterheadRoutes } from '../routes/pdf-letterheads.js';
 
@@ -146,6 +152,7 @@ function letterheadRow(overrides: Record<string, unknown> = {}): Record<string, 
     id: 'lhd_ri',
     name: 'RHIEM Intermedia 2026',
     imageSha256: 'a'.repeat(64),
+    issuerId: null,
     ...LAYOUT,
     createdByUserId: 'test-id',
     createdAt: NOW,
@@ -183,6 +190,7 @@ describe('PDF letterhead routes', () => {
     writeAuditMock.mockClear();
     previewMock.mockClear();
     rendersMock.mockClear();
+    vi.mocked(isNull).mockClear();
   });
 
   describe('GET /pdf-letterheads', () => {
@@ -204,6 +212,8 @@ describe('PDF letterhead routes', () => {
       expect(body[0]).toMatchObject({ id: 'lhd_ri', current: true, invoiceCount: 0, ...LAYOUT });
       expect(body[1]).toMatchObject({ id: 'lhd_old', current: false, invoiceCount: 12 });
       expect(body[0]).not.toHaveProperty('image');
+      // Only the company's versions: an invoice issuer lists its own.
+      expect(vi.mocked(isNull)).toHaveBeenCalledWith('pdfLetterheads.issuerId');
     });
 
     it('refuses a site-restricted user with 404', async () => {
@@ -387,6 +397,8 @@ describe('PDF letterhead routes', () => {
         payload: { letterheadId: 'lhd_missing' },
       });
       expect(res.statusCode).toBe(404);
+      // A version of an invoice issuer is never the company's current one.
+      expect(vi.mocked(isNull)).toHaveBeenCalledWith('pdfLetterheads.issuerId');
       expect(calls.values).toHaveLength(0);
     });
   });
@@ -405,8 +417,36 @@ describe('PDF letterhead routes', () => {
       expect(previewMock).toHaveBeenCalledWith(
         expect.objectContaining({ image: A4_PNG, layout: LAYOUT }),
         'de',
+        null,
       );
       expect(calls.values).toHaveLength(0);
+    });
+
+    it('names the seller of an invoice issuer with issuerId', async () => {
+      setupDbResults([{ id: 'iis_rs', name: 'RHIEM Services GmbH' }]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/pdf-letterheads/preview',
+        headers: auth(),
+        payload: { image: A4_PNG, ...LAYOUT, issuerId: 'iis_rs' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(previewMock).toHaveBeenCalledWith(expect.anything(), 'en', {
+        name: 'RHIEM Services GmbH',
+      });
+    });
+
+    it('returns 404 for an unknown invoice issuer', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/pdf-letterheads/preview',
+        headers: auth(),
+        payload: { image: A4_PNG, ...LAYOUT, issuerId: 'iis_missing' },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ code: 'INVOICE_ISSUER_NOT_FOUND' });
+      expect(previewMock).not.toHaveBeenCalled();
     });
 
     it('refuses an invalid image with 400', async () => {

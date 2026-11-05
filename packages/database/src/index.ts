@@ -222,6 +222,7 @@ export {
   invoiceSellerSnapshotFromIssuer,
   loadInvoiceIssuerForIssue,
   allocateIssuerInvoiceNumber,
+  letterheadIdForIssue,
 } from './lib/invoice-issuer.js';
 export type { InvoiceIssuer, InvoiceIssuerExecutor } from './lib/invoice-issuer.js';
 export { currentPdfLetterheadId } from './lib/pdf-letterhead.js';

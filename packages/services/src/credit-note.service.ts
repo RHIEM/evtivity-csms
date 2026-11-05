@@ -10,7 +10,7 @@ import {
   allocateInvoiceNumber,
   allocateIssuerInvoiceNumber,
   loadInvoiceIssuerForIssue,
-  currentPdfLetterheadId,
+  letterheadIdForIssue,
 } from '@evtivity/database';
 import { AppError } from '@evtivity/lib';
 import { creditNoteError } from './invoice.service.js';
@@ -110,8 +110,9 @@ export async function creditInvoice(
         ? await allocateIssuerInvoiceNumber(tx, issuer, 'credit_note', now)
         : await allocateInvoiceNumber(tx, 'credit_note', now);
     // A credit note is a new document: it takes the letterhead current at its
-    // issue, not the one of the invoice it credits.
-    const letterheadId = await currentPdfLetterheadId(tx);
+    // issue (the issuer's, else the company's), not the one of the invoice it
+    // credits.
+    const letterheadId = await letterheadIdForIssue(tx, issuer);
     const [creditNote] = await tx
       .insert(invoices)
       .values({

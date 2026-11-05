@@ -146,7 +146,10 @@ vi.mock('@evtivity/database', () => {
     ),
     allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('10000')),
     invoiceSellerSnapshotFromIssuer: vi.fn((issuer: { name: string }) => ({ name: issuer.name })),
-    currentPdfLetterheadId: vi.fn(() => Promise.resolve(null)),
+    // The issuer's own letterhead, else the company's (none here).
+    letterheadIdForIssue: vi.fn((_tx: unknown, issuer: { id: string } | null) =>
+      Promise.resolve(issuer != null ? `lhd_${issuer.id}` : null),
+    ),
   };
 });
 
@@ -1191,6 +1194,7 @@ describe('allocateDocumentNumber', () => {
       issuerId: null,
       invoiceNumber: 'INV-202606-0042',
       seller: { name: 'Acme Charging GmbH', city: 'Berlin', taxId: 'DE111111111' },
+      letterheadId: null,
     });
     expect(vi.mocked(allocateIssuerInvoiceNumber)).not.toHaveBeenCalled();
   });
@@ -1202,6 +1206,7 @@ describe('allocateDocumentNumber', () => {
       issuerId: 'iis_rs',
       invoiceNumber: '10000',
       seller: { name: 'RHIEM Services GmbH' },
+      letterheadId: 'lhd_iis_rs',
     });
     expect(vi.mocked(allocateIssuerInvoiceNumber)).toHaveBeenCalledWith(
       db,

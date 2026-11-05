@@ -23,8 +23,15 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('@/lib/api', () => ({ api: { get, post, patch, put, delete: del } }));
+vi.mock('@/lib/api', () => ({
+  api: { get, post, patch, put, delete: del },
+  postForBlob: vi.fn(),
+}));
 vi.mock('@/lib/auth', () => ({ useHasCompanyWidePermission: () => canWrite.value }));
+vi.mock('@/lib/timezone', () => ({
+  useUserTimezone: () => 'UTC',
+  formatDate: (value: string) => value.slice(0, 10),
+}));
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast }) }));
 
 import { InvoiceIssuerSettings, exampleNumber } from '../InvoiceIssuerSettings';
@@ -54,6 +61,7 @@ function issuer(overrides: Partial<InvoiceIssuer> = {}): InvoiceIssuer {
     creditNoteDigits: 4,
     pdfFooter: null,
     hasPdfLogo: false,
+    letterheadId: null,
     invoiceNumberLocked: false,
     creditNoteNumberLocked: false,
     fleetCount: 0,
@@ -321,6 +329,63 @@ describe('InvoiceIssuerSettings', () => {
         expect(del).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/pdf-logo');
       });
       expect(await screen.findByText('settings.invoiceIssuers.logoCompany')).toBeTruthy();
+    });
+  });
+
+  describe('PDF letterhead', () => {
+    function renderWithLetterheads(list: InvoiceIssuer[], versions: unknown[]): void {
+      get.mockImplementation((url: string) =>
+        Promise.resolve(url.endsWith('/letterheads') ? versions : list),
+      );
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <InvoiceIssuerSettings />
+        </QueryClientProvider>,
+      );
+    }
+
+    const VERSION = {
+      id: 'lhd_rs',
+      name: 'RHIEM Services 2026',
+      createdAt: '2026-11-05T12:00:00.000Z',
+      current: true,
+      invoiceCount: 0,
+      addressLeftMm: 21.2,
+      addressTopMm: 58.9,
+      contentTopMm: 112,
+      contentBottomMm: 258,
+      marginLeftMm: 21.2,
+      marginRightMm: 15.9,
+    };
+
+    it('offers the letterhead once the issuer is created', () => {
+      renderWith([]);
+      fireEvent.click(screen.getByRole('button', { name: 'settings.invoiceIssuers.add' }));
+      const field = screen.getByTestId('issuer-letterhead-field');
+      expect(within(field).getByText('settings.invoiceIssuers.letterheadAfterCreate')).toBeTruthy();
+      expect(within(field).queryByText('settings.invoiceIssuers.letterheadManage')).toBeNull();
+    });
+
+    it('says the company letterhead applies without an own current version', async () => {
+      renderWithLetterheads([issuer()], [{ ...VERSION, current: false }]);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      expect(await screen.findByText('settings.invoiceIssuers.letterheadUsesCompany')).toBeTruthy();
+    });
+
+    it('names its own current version and manages the versions in a dialog', async () => {
+      renderWithLetterheads([issuer({ letterheadId: 'lhd_rs' })], [VERSION]);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      expect(await screen.findByText('settings.invoiceIssuers.letterheadOwn')).toBeTruthy();
+      expect(get).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/letterheads');
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'settings.invoiceIssuers.letterheadManage' }),
+      );
+      const dialog = await screen.findByTestId('issuer-letterhead');
+      expect(
+        within(dialog).getByText('settings.invoiceIssuers.letterheadDescription'),
+      ).toBeTruthy();
+      expect(await within(dialog).findAllByTestId('pdf-letterhead-version')).toHaveLength(1);
     });
   });
 });

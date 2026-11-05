@@ -19,7 +19,8 @@ export async function currentPdfLetterheadId(
   const [row] = await executor.execute(
     sql`SELECT l.id FROM settings s
         JOIN pdf_letterheads l ON l.id = s.value #>> '{}'
-        WHERE s.key = ${PDF_LETTERHEAD_KEY} AND jsonb_typeof(s.value) = 'string'`,
+        WHERE s.key = ${PDF_LETTERHEAD_KEY} AND jsonb_typeof(s.value) = 'string'
+          AND l.issuer_id IS NULL`,
   );
   const id = (row as { id?: unknown } | undefined)?.id;
   return typeof id === 'string' ? id : null;

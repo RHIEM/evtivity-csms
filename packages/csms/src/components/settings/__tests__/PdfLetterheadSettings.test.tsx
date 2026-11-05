@@ -199,3 +199,78 @@ describe('PdfLetterheadSettings', () => {
     expect(screen.getAllByText('settings.pdfLetterheadPreview')).toHaveLength(2);
   });
 });
+
+describe('PdfLetterheadSettings of an invoice issuer', () => {
+  const ISSUER = { id: 'iis_rs', name: 'RHIEM Services GmbH' };
+
+  function renderIssuer(): void {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <PdfLetterheadSettings issuer={ISSUER} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("lists the issuer's own versions, the company letterhead as the alternative", async () => {
+    renderIssuer();
+    await waitFor(() => {
+      expect(screen.getAllByTestId('pdf-letterhead-version')).toHaveLength(2);
+    });
+    expect(get).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/letterheads');
+    expect(screen.getByText('settings.invoiceIssuers.letterheadDescription')).toBeTruthy();
+    expect(screen.getByText('settings.invoiceIssuers.letterheadCompany')).toBeTruthy();
+    // Rendered inside the issuer's dialog, without its own card title.
+    expect(screen.queryByText('settings.pdfLetterhead')).toBeNull();
+  });
+
+  it("sets the issuer's current version, or the company's", async () => {
+    renderIssuer();
+    const select = await screen.findByLabelText('settings.pdfLetterheadCurrent');
+    fireEvent.change(select, { target: { value: 'lhd_old' } });
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/letterhead', {
+        letterheadId: 'lhd_old',
+      });
+    });
+    fireEvent.change(select, { target: { value: '' } });
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/letterhead', {
+        letterheadId: null,
+      });
+    });
+  });
+
+  it('creates a version of the issuer', async () => {
+    renderIssuer();
+    fireEvent.click(await screen.findByText('settings.pdfLetterheadNewVersion'));
+    fireEvent.change(screen.getByLabelText('settings.pdfLetterheadName'), {
+      target: { value: 'Services 2026' },
+    });
+    const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'rs.png', {
+      type: 'image/png',
+    });
+    fireEvent.change(fileInput(), { target: { files: [file] } });
+    await screen.findByTestId('pdf-letterhead-thumbnail');
+    fireEvent.click(screen.getByText('settings.pdfLetterheadCreate'));
+    await waitFor(() => {
+      expect(post).toHaveBeenCalledWith(
+        '/v1/invoice-issuers/iis_rs/letterheads',
+        expect.objectContaining({ name: 'Services 2026', activate: false }),
+      );
+    });
+  });
+
+  it("previews a version with the issuer's seller", async () => {
+    renderIssuer();
+    const [first] = await screen.findAllByText('settings.pdfLetterheadPreview');
+    if (first != null) fireEvent.click(first);
+    await waitFor(() => {
+      expect(postForBlob).toHaveBeenCalledWith('/v1/pdf-letterheads/preview', {
+        image: IMAGE,
+        ...LAYOUT,
+        language: 'de',
+        issuerId: 'iis_rs',
+      });
+    });
+  });
+});
