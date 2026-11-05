@@ -140,9 +140,26 @@ describe('allocateIssuerInvoiceNumber', () => {
   let execute: ReturnType<typeof vi.fn>;
   let tx: InvoiceIssuerExecutor;
 
+  /** Numbers some document already has. */
+  let taken: Set<string>;
+  /** Values the counter statement returns, one per call. */
+  let counterValues: (string | number)[];
+
   beforeEach(() => {
     timeZone.value = 'Europe/Berlin';
-    execute = vi.fn(() => Promise.resolve([{ value: '10000' }]));
+    taken = new Set();
+    counterValues = ['10000'];
+    execute = vi.fn((query: unknown) => {
+      const text = sqlText(query);
+      if (text.includes('invoice_issuer_number_counters')) {
+        const value = counterValues.shift();
+        return Promise.resolve(value == null ? [] : [{ value }]);
+      }
+      if (text.includes('FROM invoices')) {
+        return Promise.resolve(taken.has(String(sqlParams(query)[0])) ? [{ '?column?': 1 }] : []);
+      }
+      return Promise.resolve([]);
+    });
     tx = { execute } as unknown as InvoiceIssuerExecutor;
   });
 
@@ -162,8 +179,20 @@ describe('allocateIssuerInvoiceNumber', () => {
     expect(sqlParams(query)).toEqual(['iis_rs', 'invoice', 0, 10000]);
   });
 
+  it('locks the number for the transaction before it checks whether a document has it', async () => {
+    await allocateIssuerInvoiceNumber(tx, issuer(), 'invoice', new Date('2026-11-30T12:00:00Z'));
+
+    const lock = execute.mock.calls[1]?.[0];
+    expect(sqlText(lock)).toContain('pg_advisory_xact_lock(hashtext(');
+    expect(sqlParams(lock)).toEqual(['invoice_number:10000']);
+    const check = execute.mock.calls[2]?.[0];
+    expect(sqlText(check)).toContain('SELECT 1 FROM invoices WHERE invoice_number = ');
+    expect(sqlParams(check)).toEqual(['10000']);
+    expect(execute).toHaveBeenCalledTimes(3);
+  });
+
   it('counts a range with year per year of the document date in the system timezone', async () => {
-    execute.mockResolvedValueOnce([{ value: 3 }]);
+    counterValues = [3];
 
     const number = await allocateIssuerInvoiceNumber(
       tx,
@@ -172,12 +201,32 @@ describe('allocateIssuerInvoiceNumber', () => {
       new Date('2026-12-31T23:30:00Z'),
     );
 
-    expect(number).toBe('GS-27-0003');
+    // No separator after the year.
+    expect(number).toBe('GS-270003');
     expect(sqlParams(execute.mock.calls[0]?.[0])).toEqual(['iis_rs', 'credit_note', 2027, 1]);
   });
 
+  it('skips numbers a document already has and takes the next free one', async () => {
+    // An overlapping range of another issuer took 10000 and 10001.
+    taken = new Set(['10000', '10001']);
+    counterValues = ['10000', '10001', '10002'];
+
+    const number = await allocateIssuerInvoiceNumber(
+      tx,
+      issuer(),
+      'invoice',
+      new Date('2026-11-30T12:00:00Z'),
+    );
+
+    expect(number).toBe('10002');
+    const counterCalls = execute.mock.calls.filter(([query]) =>
+      sqlText(query).includes('invoice_issuer_number_counters'),
+    );
+    expect(counterCalls).toHaveLength(3);
+  });
+
   it('fails when the counter statement returns no row', async () => {
-    execute.mockResolvedValueOnce([]);
+    counterValues = [];
     await expect(
       allocateIssuerInvoiceNumber(tx, issuer(), 'invoice', new Date('2026-11-30T12:00:00Z')),
     ).rejects.toThrow("Invoice issuer counter 'iis_rs/invoice' is missing");

@@ -3102,7 +3102,7 @@
       "example": "Erste Nummer: {{number}}",
       "formatInvalid": "Präfix: nur Buchstaben, Ziffern und - . _, höchstens {{max}} Zeichen. Startwert und Stellen: ganze Zahlen.",
       "formatLocked": "Es wurden bereits Belege dieser Art ausgestellt: Das Nummernformat ist nicht mehr änderbar.",
-      "numbersHelp": "Die Nummern sind je Rechnungssteller und Belegart lückenlos. Die Kreise zweier Rechnungssteller dürfen sich nicht überschneiden: unterschiedliche Präfixe oder weit auseinanderliegende Startwerte wählen.",
+      "numbersHelp": "Die Nummern sind je Rechnungssteller und Belegart fortlaufend. Die Kreise zweier Rechnungssteller sollten sich nicht überschneiden. Tun sie es doch, teilen sie sich die Nummern: Vergeben wird immer die nächste freie Nummer, bereits vergebene werden übersprungen.",
       "saved": "Rechnungssteller gespeichert",
       "deleted": "Rechnungssteller gelöscht",
       "saveFailed": "Der Rechnungssteller konnte nicht gespeichert werden.",

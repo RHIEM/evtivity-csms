@@ -3102,7 +3102,7 @@
       "example": "First number: {{number}}",
       "formatInvalid": "Prefix: letters, digits and - . _ only, at most {{max}} characters. Start value and digits: whole numbers.",
       "formatLocked": "Documents of this kind were issued: the number format can no longer change.",
-      "numbersHelp": "Numbers are gap-free per issuer and kind. Ranges of two issuers must not overlap: give them different prefixes or start values far apart.",
+      "numbersHelp": "Numbers are consecutive per issuer and kind. Ranges of two issuers should not overlap. If they do, they share the numbers: the next free number is always issued, and numbers already taken are skipped.",
       "saved": "Invoice issuer saved",
       "deleted": "Invoice issuer deleted",
       "saveFailed": "Could not save the invoice issuer.",

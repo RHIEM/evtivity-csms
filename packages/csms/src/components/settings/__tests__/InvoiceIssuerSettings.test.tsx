@@ -82,7 +82,7 @@ function renderWith(issuers: InvoiceIssuer[]): void {
 describe('exampleNumber', () => {
   it('prints the first number of the format in the given year', () => {
     expect(exampleNumber({ prefix: 'RPP-', withYear: true, start: 1, digits: 4 }, 2026)).toBe(
-      'RPP-26-0001',
+      'RPP-260001',
     );
     expect(exampleNumber({ prefix: '', withYear: false, start: 10000, digits: 0 }, 2026)).toBe(
       '10000',
@@ -95,7 +95,7 @@ describe('InvoiceIssuerSettings', () => {
     renderWith([issuer({ fleetCount: 2 })]);
     const row = (await screen.findByText('RHIEM Services GmbH')).closest('tr') as HTMLElement;
     expect(within(row).getByText('10000')).toBeTruthy();
-    expect(within(row).getByText(/^GS-\d{2}-0001$/)).toBeTruthy();
+    expect(within(row).getByText(/^GS-\d{2}0001$/)).toBeTruthy();
     expect(within(row).getByText('2')).toBeTruthy();
   });
 
@@ -122,7 +122,7 @@ describe('InvoiceIssuerSettings', () => {
     });
     fireEvent.click(within(invoice).getByLabelText('settings.invoiceIssuers.withYear'));
     expect(screen.getByTestId('issuer-invoice-example').textContent).toMatch(
-      /^settings\.invoiceIssuers\.example RPP-\d{2}-0001$/,
+      /^settings\.invoiceIssuers\.example RPP-\d{2}0001$/,
     );
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 

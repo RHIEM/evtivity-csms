@@ -144,7 +144,7 @@ function parsedFormat(values: FormatValues): InvoiceNumberFormat | null {
   return { prefix: values.prefix, withYear: values.withYear, start, digits };
 }
 
-/** The first number of the format this year, e.g. "RPP-26-0001". */
+/** The first number of the format this year, e.g. "RI-2600001". */
 export function exampleNumber(
   format: InvoiceNumberFormat,
   year = new Date().getFullYear(),

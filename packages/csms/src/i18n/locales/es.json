@@ -3102,7 +3102,7 @@
       "example": "Primer número: {{number}}",
       "formatInvalid": "Prefijo: solo letras, dígitos y - . _, como máximo {{max}} caracteres. Valor inicial y dígitos: números enteros.",
       "formatLocked": "Ya se emitieron documentos de este tipo: el formato de numeración ya no puede cambiar.",
-      "numbersHelp": "Los números no tienen huecos por emisor y tipo. Las series de dos emisores no deben solaparse: use prefijos distintos o valores iniciales muy separados.",
+      "numbersHelp": "Los números son correlativos por emisor y tipo. Las series de dos emisores no deberían solaparse. Si se solapan, comparten los números: siempre se asigna el siguiente número libre y los ya asignados se omiten.",
       "saved": "Emisor de facturas guardado",
       "deleted": "Emisor de facturas eliminado",
       "saveFailed": "No se pudo guardar el emisor de facturas.",
