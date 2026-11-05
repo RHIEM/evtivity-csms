@@ -2,7 +2,8 @@
 
 - **Status:** Freigegeben (05.11.2026, im Chat: Vorschläge 1 und 2, Schalter nur an der Station), umgesetzt
 - **Zweig:** in `rhiem/main` `feature/portal-unlisted-station-v0.1.49` mit Basis `v0.1.49` (Migration `rhiem_0013_station_portal_listed`); für den PR `feature/portal-unlisted-station` mit Basis `upstream/main` `4790ef78` (v0.1.50, `3ac60b53`, Migration `0487_station_portal_listed`, gleicher Inhalt)
-- **Upstream:** Vorschlag als Ideas-Discussion und PR vorbereitet, noch nicht eingereicht (Freigabe des Nutzers abwarten)
+- **Upstream:** Vorschlag als Discussion [#53](https://github.com/EVtivity/evtivity-csms/discussions/53) („Ideas“, 05.11.2026), eingereicht als PR [#54](https://github.com/EVtivity/evtivity-csms/pull/54) (05.11.2026, Freigabe des Nutzers), Hinweis in #53 kommentiert
+- **Geprüft:** PR-Zweig auf v0.1.50: typecheck, lint, format:check, check:migrations (242), check:openapi, KI-Katalog ohne Diff, test:release, 31.188 Tests; Zweig auf v0.1.49: typecheck, lint, format:check, check:migrations (240), check:openapi, 29.756 Tests; jeweils nur der bekannte Timeout in `FleetReservationsTab` (einzeln grün)
 
 ## Ausgangslage
 
