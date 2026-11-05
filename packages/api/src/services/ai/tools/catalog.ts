@@ -4262,7 +4262,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     pathTemplate: '/v1/drivers',
     pathParams: [],
     queryParams: [],
-    bodyParams: ['firstName', 'lastName', 'language'],
+    bodyParams: ['firstName', 'lastName', 'language', 'employeeNumber'],
     parameters: {
       type: 'object',
       properties: {
@@ -4273,8 +4273,13 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           type: ['string', 'null'],
           enum: ['en', 'de', 'es', 'ko', 'zh', 'zh-TW', null],
         },
+        employeeNumber: {
+          description:
+            "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
+          type: ['string', 'null'],
+        },
       },
-      required: ['firstName', 'lastName', 'language'],
+      required: ['firstName', 'lastName', 'language', 'employeeNumber'],
       additionalProperties: false,
     },
     strict: true,
@@ -4288,6 +4293,13 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           type: 'string',
           enum: ['en', 'de', 'es', 'ko', 'zh', 'zh-TW'],
         },
+        employeeNumber: {
+          description:
+            "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
+          nullable: true,
+          type: 'string',
+          maxLength: 50,
+        },
       },
       required: ['firstName', 'lastName'],
       additionalProperties: false,
@@ -4295,6 +4307,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     responseFields: [
       'createdAt',
       'email',
+      'employeeNumber',
       'erasedAt',
       'expiresAt',
       'firstName',
@@ -7745,6 +7758,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     responseFields: [
       'createdAt',
       'email',
+      'employeeNumber',
       'erasedAt',
       'expiresAt',
       'firstName',
@@ -12692,6 +12706,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     responseFields: [
       'createdAt',
       'email',
+      'employeeNumber',
       'erasedAt',
       'expiresAt',
       'firstName',
@@ -26672,7 +26687,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     pathTemplate: '/v1/drivers/{id}',
     pathParams: ['id'],
     queryParams: [],
-    bodyParams: ['firstName', 'lastName', 'language', 'isActive', 'timezone'],
+    bodyParams: ['firstName', 'lastName', 'language', 'isActive', 'timezone', 'employeeNumber'],
     parameters: {
       type: 'object',
       properties: {
@@ -26693,8 +26708,21 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           description: 'IANA timezone (e.g. America/New_York)',
           type: ['string', 'null'],
         },
+        employeeNumber: {
+          description:
+            "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
+          type: ['string', 'null'],
+        },
       },
-      required: ['id', 'firstName', 'lastName', 'language', 'isActive', 'timezone'],
+      required: [
+        'id',
+        'firstName',
+        'lastName',
+        'language',
+        'isActive',
+        'timezone',
+        'employeeNumber',
+      ],
       additionalProperties: false,
     },
     strict: true,
@@ -26719,6 +26747,13 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           type: 'string',
           maxLength: 50,
         },
+        employeeNumber: {
+          description:
+            "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
+          nullable: true,
+          type: 'string',
+          maxLength: 50,
+        },
       },
       required: ['id'],
       additionalProperties: false,
@@ -26726,6 +26761,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     responseFields: [
       'createdAt',
       'email',
+      'employeeNumber',
       'erasedAt',
       'expiresAt',
       'firstName',

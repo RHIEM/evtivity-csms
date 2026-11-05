@@ -158,6 +158,8 @@ export interface FleetBillTo {
   taxId: string | null;
   /** Member invoice: the driver's email at issue, printed after the address lines. */
   email?: string | null;
+  /** Member invoice: the driver's employee number at issue, printed when set. */
+  employeeNumber?: string | null;
 }
 
 /** The fleet fields a fleet invoice reads. */
@@ -208,6 +210,8 @@ export interface DriverForInvoice {
   billingState: string | null;
   billingZip: string | null;
   billingCountry: string | null;
+  /** The operator's reference for the driver (e.g. a personnel number), printed when set. */
+  employeeNumber: string | null;
 }
 
 function blankToNull(value: string | null): string | null {
@@ -237,6 +241,7 @@ export function billToFromDriver(driver: DriverForInvoice): FleetBillTo {
     country: blankToNull(driver.billingCountry),
     taxId: null,
     email: blankToNull(driver.email),
+    employeeNumber: blankToNull(driver.employeeNumber),
   };
 }
 
@@ -250,6 +255,8 @@ export interface FleetSessionCandidate {
   id: string;
   driverId: string | null;
   driverName: string;
+  /** The driver's employee number, kept on the lines and printed after the name. */
+  employeeNumber?: string | null;
   stationName: string;
   siteName: string | null;
   endedAt: Date | null;
@@ -393,6 +400,7 @@ export function planFleetInvoice(
           energyWh: sessionEnergy,
           ...(session.driverId != null ? { driverId: session.driverId } : {}),
           driverName: session.driverName,
+          ...(session.employeeNumber != null ? { employeeNumber: session.employeeNumber } : {}),
           stationName: place,
         },
       }),
@@ -512,7 +520,8 @@ export async function loadFleetInvoiceCandidates(
       ? sql``
       : sql`AND cs.ended_at >= ${options.startsAt.toISOString()}::timestamptz`;
   const rows = (await executor.execute(sql`
-    SELECT cs.id, cs.driver_id, d.first_name, d.last_name, st.station_id AS station_name,
+    SELECT cs.id, cs.driver_id, d.first_name, d.last_name, d.employee_number,
+           st.station_id AS station_name,
            si.name AS site_name, cs.ended_at, cs.energy_delivered_wh, cs.final_cost_cents,
            upper(cs.currency) AS currency, cs.tariff_tax_rate, cs.cost_breakdown
     FROM charging_sessions cs
@@ -540,6 +549,10 @@ export async function loadFleetInvoiceCandidates(
       id: String(row['id']),
       driverId: typeof row['driver_id'] === 'string' ? row['driver_id'] : null,
       driverName: `${first} ${last}`.trim(),
+      employeeNumber:
+        typeof row['employee_number'] === 'string' && row['employee_number'].trim() !== ''
+          ? row['employee_number'].trim()
+          : null,
       stationName: typeof row['station_name'] === 'string' ? row['station_name'] : '',
       siteName: typeof row['site_name'] === 'string' ? row['site_name'] : null,
       endedAt: ended == null ? null : new Date(ended as string | Date),
@@ -647,7 +660,7 @@ async function loadDrivers(
   if (driverIds.length === 0) return new Map();
   const rows = (await executor.execute(sql`
     SELECT id, first_name, last_name, email, language, billing_name, billing_street,
-           billing_city, billing_state, billing_zip, billing_country
+           billing_city, billing_state, billing_zip, billing_country, employee_number
     FROM drivers WHERE id IN (${sql.join(
       driverIds.map((id) => sql`${id}`),
       sql`, `,
@@ -672,6 +685,7 @@ async function loadDrivers(
       billingState: text('billing_state'),
       billingZip: text('billing_zip'),
       billingCountry: text('billing_country'),
+      employeeNumber: text('employee_number'),
     });
   }
   return drivers;

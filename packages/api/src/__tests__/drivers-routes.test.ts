@@ -76,7 +76,7 @@ vi.mock('@evtivity/database', () => ({
     }),
   },
   client: {},
-  drivers: {},
+  drivers: { employeeNumber: 'drivers.employee_number' },
   driverTokens: {},
   vehicles: {},
   users: {},
@@ -220,6 +220,7 @@ vi.mock('../services/driver-billing.service.js', () => ({
 
 import { AppError } from '@evtivity/lib';
 import { db } from '@evtivity/database';
+import { ilike } from 'drizzle-orm';
 import { registerAuth } from '../plugins/auth.js';
 import { driverRoutes } from '../routes/drivers.js';
 
@@ -387,6 +388,19 @@ describe('Driver routes (operator)', () => {
       const body = res.json();
       expect(body.data).toEqual([{ ...driver, avatar: null }]);
       expect(body.total).toBe(1);
+    });
+
+    it('also finds drivers by their employee number', async () => {
+      setupDbResults([makeDriver()], [{ count: 1 }]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/drivers?search=4711',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(vi.mocked(ilike)).toHaveBeenCalledWith('drivers.employee_number', '%4711%');
     });
 
     it('returns total 0 when count row is missing', async () => {
@@ -733,6 +747,36 @@ describe('Driver routes (operator)', () => {
       expect(lastWrite('insert')).toMatchObject({ language: 'zh-TW' });
     });
 
+    it('stores the employee number trimmed and a blank one as null', async () => {
+      setupDbResults([], [makeDriver({ employeeNumber: '4711' })]);
+      await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', employeeNumber: ' 4711 ' },
+      });
+      expect(lastWrite('insert')).toMatchObject({ employeeNumber: '4711' });
+
+      setupDbResults([], [makeDriver()]);
+      await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', employeeNumber: '  ' },
+      });
+      expect(lastWrite('insert')).toMatchObject({ employeeNumber: null });
+    });
+
+    it('refuses an employee number over 50 characters', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', employeeNumber: '1'.repeat(51) },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
     it('returns 400 for an unsupported language', async () => {
       const res = await app.inject({
         method: 'POST',
@@ -773,6 +817,37 @@ describe('Driver routes (operator)', () => {
       const body = res.json();
       expect(body.error).toBe('Driver not found');
       expect(body.code).toBe('DRIVER_NOT_FOUND');
+    });
+
+    it('sets, keeps and removes the employee number', async () => {
+      setupDbResults([makeDriver()], [makeDriver({ employeeNumber: '4711' })]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { employeeNumber: ' 4711 ' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().employeeNumber).toBe('4711');
+      expect(lastWrite('update')).toMatchObject({ employeeNumber: '4711' });
+
+      setupDbResults([makeDriver({ employeeNumber: '4711' })], [makeDriver()]);
+      await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'Jane' },
+      });
+      expect(lastWrite('update')).not.toHaveProperty('employeeNumber');
+
+      setupDbResults([makeDriver({ employeeNumber: '4711' })], [makeDriver()]);
+      await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { employeeNumber: null },
+      });
+      expect(lastWrite('update')).toMatchObject({ employeeNumber: null });
     });
 
     it('returns 200 with all fields updated', async () => {

@@ -229,6 +229,8 @@
   },
   "profile": {
     "email": "Email",
+    "employeeNumber": "Employee Number",
+    "employeeNumberHelp": "Set by the operator. Printed on your invoices.",
     "firstName": "First name",
     "lastName": "Last name",
     "phone": "Phone",

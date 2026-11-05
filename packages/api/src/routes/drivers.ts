@@ -106,6 +106,13 @@ const driverItem = z
       .string()
       .describe('Preferred language of the portal, notifications and invoices (e.g. en, de)'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
+    employeeNumber: z
+      .string()
+      .nullable()
+      .optional()
+      .describe(
+        "The operator's reference for the driver, e.g. a personnel number; printed on the driver's invoices and credit notes when set",
+      ),
     erasedAt: z.coerce
       .date()
       .nullable()
@@ -303,12 +310,29 @@ const driverLanguage = z
   .enum(UI_LANGUAGES)
   .describe('Preferred language of the portal, notifications and invoices');
 
+const employeeNumberField = z
+  .string()
+  .max(50)
+  .nullable()
+  .optional()
+  .describe(
+    "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
+  );
+
+/** The employee number as stored: trimmed, blank as null; undefined keeps it. */
+function employeeNumberToStore(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value?.trim() ?? '';
+  return trimmed === '' ? null : trimmed;
+}
+
 const createDriverBody = z.object({
   firstName: z.string().min(1).max(100),
   lastName: z.string().min(1).max(100),
   email: z.email().max(255).optional(),
   phone: z.string().max(50).optional(),
   language: driverLanguage.optional().describe('Preferred language (default en)'),
+  employeeNumber: employeeNumberField,
 });
 
 const updateDriverBody = z.object({
@@ -338,6 +362,7 @@ const updateDriverBody = z.object({
       'Whether the driver account is active. false also deactivates every active token of the driver, ends the portal sessions and revokes the open emailed links; true does not reactivate the tokens.',
     ),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
+  employeeNumber: employeeNumberField,
 });
 
 const createTokenBody = z.object({
@@ -496,6 +521,7 @@ const driverSafeSelect = {
   mfaEnabled: drivers.mfaEnabled,
   mfaMethod: drivers.mfaMethod,
   isActive: drivers.isActive,
+  employeeNumber: drivers.employeeNumber,
   emailVerified: drivers.emailVerified,
   lastNotificationReadAt: drivers.lastNotificationReadAt,
   erasedAt: drivers.erasedAt,
@@ -513,6 +539,7 @@ const DRIVER_AUDIT_KEYS = [
   'timezone',
   'isActive',
   'emailVerified',
+  'employeeNumber',
 ] as const;
 
 function pickPublic(row: Record<string, unknown>): Record<string, unknown> {
@@ -547,6 +574,7 @@ export function driverRoutes(app: FastifyInstance): void {
             ilike(drivers.lastName, pattern),
             ilike(drivers.email, pattern),
             ilike(drivers.phone, pattern),
+            ilike(drivers.employeeNumber, pattern),
           ),
         );
       }
@@ -742,6 +770,7 @@ export function driverRoutes(app: FastifyInstance): void {
       }
       const createPhone = phoneToStore(createPhoneIn);
       if (createPhone !== undefined) body.phone = createPhone ?? undefined;
+      body.employeeNumber = employeeNumberToStore(body.employeeNumber);
 
       if (body.email !== undefined) {
         body.email = body.email.toLowerCase();
@@ -882,6 +911,8 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.language !== undefined) fields['language'] = body.language;
       if (body.isActive !== undefined) fields['isActive'] = body.isActive;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
+      const employeeNumber = employeeNumberToStore(body.employeeNumber);
+      if (employeeNumber !== undefined) fields['employeeNumber'] = employeeNumber;
 
       let updated;
       try {

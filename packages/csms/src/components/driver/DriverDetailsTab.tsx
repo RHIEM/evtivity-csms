@@ -36,6 +36,8 @@ interface Driver {
   phone: string | null;
   language: string;
   isActive: boolean;
+  /** The operator's reference, e.g. a personnel number; printed on invoices. */
+  employeeNumber?: string | null;
   erasedAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -60,6 +62,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  const [employeeNumber, setEmployeeNumber] = useState('');
   const [language, setLanguage] = useState('en');
   const [isActive, setIsActive] = useState(true);
   const [hasSubmittedEdit, setHasSubmittedEdit] = useState(false);
@@ -70,6 +73,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       lastName?: string;
       email?: string | null;
       phone?: string | null;
+      employeeNumber?: string | null;
       language?: string;
       isActive?: boolean;
     }) => api.patch<Driver>(`/v1/drivers/${driver.id}`, body),
@@ -89,6 +93,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setLastName(driver.lastName);
     setEmail(driver.email ?? '');
     setPhone(driver.phone ?? '');
+    setEmployeeNumber(driver.employeeNumber ?? '');
     setLanguage(driver.language);
     setIsActive(driver.isActive);
     updateMutation.reset();
@@ -129,6 +134,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     if (Object.keys(editErrors).length > 0) return;
     const trimmedEmail = email.trim();
     const trimmedPhone = phone.trim();
+    const trimmedEmployeeNumber = employeeNumber.trim();
     updateMutation.mutate({
       firstName,
       lastName,
@@ -142,6 +148,11 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
         ? { phone: trimmedPhone }
         : driver.phone != null
           ? { phone: null }
+          : {}),
+      ...(trimmedEmployeeNumber !== ''
+        ? { employeeNumber: trimmedEmployeeNumber }
+        : driver.employeeNumber != null
+          ? { employeeNumber: null }
           : {}),
       language,
       isActive,
@@ -233,6 +244,20 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               />
             </div>
             <div className="space-y-2">
+              <Label htmlFor="edit-employee-number" className="leading-6">
+                {t('drivers.employeeNumber')}
+              </Label>
+              <Input
+                id="edit-employee-number"
+                value={employeeNumber}
+                maxLength={50}
+                onChange={(e) => {
+                  setEmployeeNumber(e.target.value);
+                }}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.employeeNumberHelp')}</p>
+            </div>
+            <div className="space-y-2">
               <Label htmlFor="edit-language" className="leading-6">
                 {t('drivers.language')}
               </Label>
@@ -282,6 +307,12 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
             <div>
               <dt className="text-muted-foreground">{t('drivers.phone')}</dt>
               <dd className="font-medium">{driver.phone ?? t('common.na')}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('drivers.employeeNumber')}</dt>
+              <dd className="font-medium" data-testid="driver-employee-number">
+                {driver.employeeNumber ?? t('common.na')}
+              </dd>
             </div>
             <div>
               <dt className="text-muted-foreground">{t('drivers.language')}</dt>

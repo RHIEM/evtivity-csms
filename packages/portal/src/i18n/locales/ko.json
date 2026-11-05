@@ -229,6 +229,8 @@
   },
   "profile": {
     "email": "이메일",
+    "employeeNumber": "사번",
+    "employeeNumberHelp": "운영자가 설정합니다. 청구서에 표시됩니다.",
     "firstName": "이름",
     "lastName": "성",
     "phone": "전화번호",

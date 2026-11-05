@@ -55,6 +55,8 @@ export interface InvoiceDriver {
   email: string | null;
   /** The driver's preferred language; the invoice PDF renders in it. */
   language: string;
+  /** The operator's reference for the driver (e.g. a personnel number), printed when set. */
+  employeeNumber: string | null;
 }
 
 export interface InvoiceWithLineItems {
@@ -750,6 +752,7 @@ export async function getInvoice(invoiceId: string): Promise<InvoiceDetail | nul
         lastName: drivers.lastName,
         email: drivers.email,
         language: drivers.language,
+        employeeNumber: drivers.employeeNumber,
       })
       .from(drivers)
       .where(eq(drivers.id, invoice.driverId));

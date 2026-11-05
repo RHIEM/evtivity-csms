@@ -679,6 +679,7 @@ describe('billToFromDriver', () => {
     billingState: null,
     billingZip: '28195',
     billingCountry: 'Germany',
+    employeeNumber: null,
   };
 
   it('takes the driver name, the billing address and the email, never a tax ID', () => {
@@ -691,8 +692,14 @@ describe('billToFromDriver', () => {
       country: 'Germany',
       taxId: null,
       email: 'anna@fleet.test',
+      employeeNumber: null,
     });
     expect(driverHasBillingAddress(driver)).toBe(true);
+  });
+
+  it('keeps the employee number, trimmed, and leaves a blank one out', () => {
+    expect(billToFromDriver({ ...driver, employeeNumber: ' 4711 ' }).employeeNumber).toBe('4711');
+    expect(billToFromDriver({ ...driver, employeeNumber: '  ' }).employeeNumber).toBeNull();
   });
 
   it('prefers the billing name and keeps name and email without an address', () => {

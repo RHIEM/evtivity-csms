@@ -229,6 +229,8 @@
   },
   "profile": {
     "email": "邮箱",
+    "employeeNumber": "员工编号",
+    "employeeNumberHelp": "由运营商设置。显示在您的发票上。",
     "firstName": "名",
     "lastName": "姓",
     "phone": "电话",

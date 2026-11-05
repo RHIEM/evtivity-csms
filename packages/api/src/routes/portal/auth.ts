@@ -133,6 +133,12 @@ const portalDriverMe = portalDriverItem
       'The bill-to block of the invoices a fleet addresses to the driver (PATCH /v1/portal/driver/billing-address)',
     ),
     avatar: avatarItem,
+    employeeNumber: z
+      .string()
+      .nullable()
+      .describe(
+        "The operator's reference for the driver, e.g. a personnel number, printed on the driver's invoices. Read-only for the driver",
+      ),
   })
   .loose();
 
@@ -923,7 +929,12 @@ export function portalAuthRoutes(app: FastifyInstance): void {
       const { driverId } = request.user as DriverJwtPayload;
 
       const [row] = await db
-        .select({ ...driverSessionColumns, ...driverBillingAddressColumns, ...driverAvatarColumns })
+        .select({
+          ...driverSessionColumns,
+          ...driverBillingAddressColumns,
+          ...driverAvatarColumns,
+          employeeNumber: drivers.employeeNumber,
+        })
         .from(drivers)
         .where(eq(drivers.id, driverId));
 
@@ -939,12 +950,14 @@ export function portalAuthRoutes(app: FastifyInstance): void {
         billingState,
         billingZip,
         billingCountry,
+        employeeNumber,
         ...withAvatar
       } = row;
       const [driver] = await withAvatars([withAvatar]);
       return {
         ...driver,
         billing: toDriverBilling(await resolveAccountBilling(client, driverId)),
+        employeeNumber: employeeNumber ?? null,
         billingAddress: {
           billingName,
           billingStreet,

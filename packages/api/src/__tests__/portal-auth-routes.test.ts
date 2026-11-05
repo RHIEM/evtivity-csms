@@ -849,6 +849,40 @@ describe('Portal auth routes - handler logic', () => {
       expect(body.billing).toEqual({ mode: 'card', fleetName: null, invoicedTo: null });
     });
 
+    it('returns the employee number read-only with the profile', async () => {
+      setupDbResults([
+        {
+          id: DRIVER_ID,
+          firstName: 'Erika',
+          lastName: 'Muster',
+          email: 'erika@example.com',
+          phone: null,
+          language: 'de',
+          timezone: null,
+          themePreference: 'light',
+          distanceUnit: 'km',
+          priceDisplay: null,
+          isActive: true,
+          emailVerified: true,
+          createdAt: '2024-01-01',
+          billingName: null,
+          billingStreet: null,
+          billingCity: null,
+          billingState: null,
+          billingZip: null,
+          billingCountry: null,
+          employeeNumber: '4711',
+        },
+      ]);
+      const response = await app.inject({
+        method: 'GET',
+        url: '/portal/auth/me',
+        headers: { authorization: `Bearer ${driverToken}` },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().employeeNumber).toBe('4711');
+    });
+
     it('returns the billing address with the profile', async () => {
       setupDbResults([
         {
