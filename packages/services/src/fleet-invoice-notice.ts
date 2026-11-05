@@ -162,6 +162,31 @@ export async function dispatchMemberInvoiceNotice(
   return delivered;
 }
 
+/** Sends a member invoice or its credit note to its driver and audits the send. */
+async function notifyMemberDriver(
+  detail: InvoiceDetail,
+  driverId: string,
+  pdf: Buffer,
+  deps: AccountInvoiceSendDeps,
+  audit: AccountInvoiceSendAudit,
+): Promise<void> {
+  const { invoice } = detail;
+  const eventType =
+    invoice.kind === 'credit_note' ? MEMBER_CREDIT_NOTE_EVENT : MEMBER_INVOICE_EVENT;
+  const delivered = await dispatchMemberInvoiceNotice(detail, eventType, driverId, pdf, deps);
+  await writeInvoiceSentAudit(
+    {
+      invoiceId: invoice.id,
+      invoiceNumber: invoice.invoiceNumber,
+      eventType,
+      delivered,
+      resend: invoice.sentAt != null,
+      actor: audit.actor,
+    },
+    audit.log,
+  );
+}
+
 /** Emails a member invoice or its credit note to the driver (sendAccountInvoiceEmail). */
 async function sendMemberInvoiceEmail(
   detail: InvoiceDetail,
@@ -176,26 +201,7 @@ async function sendMemberInvoiceEmail(
   const pdf = await generateInvoicePdf(detail);
   if (!(await markSent(invoice.id, mode))) return { status: 'already_sent' };
 
-  const eventType =
-    invoice.kind === 'credit_note' ? MEMBER_CREDIT_NOTE_EVENT : MEMBER_INVOICE_EVENT;
-  const delivered = await dispatchMemberInvoiceNotice(
-    detail,
-    eventType,
-    recipient.driverId,
-    pdf,
-    deps,
-  );
-  await writeInvoiceSentAudit(
-    {
-      invoiceId: invoice.id,
-      invoiceNumber: invoice.invoiceNumber,
-      eventType,
-      delivered,
-      resend: invoice.sentAt != null,
-      actor: audit.actor,
-    },
-    audit.log,
-  );
+  await notifyMemberDriver(detail, recipient.driverId, pdf, deps, audit);
   return { status: 'sent', recipients: 1 };
 }
 
@@ -224,6 +230,8 @@ async function loadMemberInvoiceDelivery(fleetId: string): Promise<string> {
  *   payroll office that forwards them): as a fleet invoice, invoice.FleetInvoice
  *   or invoice.FleetCreditNote to each billing contact in the fleet's invoice
  *   language; the PDF keeps the driver's language. The driver gets no email.
+ * - Member invoice of a fleet that delivers to the driver and its billing
+ *   contacts (`driver_and_contacts`): both, with one PDF and one sent_at claim.
  * - Member invoice of a fleet that keeps them in the CSMS
  *   (`member_invoice_delivery` 'none'): nothing is sent (`delivery_off`), and
  *   sent_at stays null.
@@ -249,6 +257,9 @@ export async function sendAccountInvoiceEmail(
   if (invoice.memberBilled) {
     const delivery = await loadMemberInvoiceDelivery(invoice.fleetId);
     if (delivery === 'none') return { status: 'delivery_off' };
+    if (delivery === 'driver_and_contacts') {
+      return sendMemberInvoiceToDriverAndContacts(detail, invoice.fleetId, mode, deps, audit);
+    }
     if (delivery !== 'billing_contacts') return sendMemberInvoiceEmail(detail, mode, deps, audit);
   }
 
@@ -257,7 +268,53 @@ export async function sendAccountInvoiceEmail(
 
   const pdf = await generateInvoicePdf(detail);
   if (!(await markSent(invoice.id, mode))) return { status: 'already_sent' };
+  return sendToBillingContacts(detail, contacts, pdf, audit, deps);
+}
 
+/**
+ * A member invoice of a fleet that emails it to the driver and to its
+ * billing contacts (`driver_and_contacts`): one PDF and one sent_at claim,
+ * then each reachable side. A driver without email still leaves the contacts;
+ * with neither, nothing is sent and the driver's status comes back.
+ */
+async function sendMemberInvoiceToDriverAndContacts(
+  detail: InvoiceDetail,
+  fleetId: string,
+  mode: AccountInvoiceSendMode,
+  deps: AccountInvoiceSendDeps,
+  audit: AccountInvoiceSendAudit,
+): Promise<AccountInvoiceSendResult> {
+  const recipient = memberInvoiceRecipient(detail);
+  const contacts = await loadFleetBillingContacts(client, fleetId);
+  if ('status' in recipient && contacts.emails.length === 0) return recipient;
+
+  const pdf = await generateInvoicePdf(detail);
+  if (!(await markSent(detail.invoice.id, mode))) return { status: 'already_sent' };
+
+  let recipients = 0;
+  if (!('status' in recipient)) {
+    await notifyMemberDriver(detail, recipient.driverId, pdf, deps, audit);
+    recipients += 1;
+  }
+  if (contacts.emails.length > 0) {
+    await sendToBillingContacts(detail, contacts, pdf, audit, deps);
+    recipients += contacts.emails.length;
+  }
+  return { status: 'sent', recipients };
+}
+
+/**
+ * Emails a fleet invoice, or a member invoice delivered to the contacts, to
+ * each billing contact with the PDF attached and audits the send.
+ */
+async function sendToBillingContacts(
+  detail: InvoiceDetail,
+  contacts: Awaited<ReturnType<typeof loadFleetBillingContacts>>,
+  pdf: Buffer,
+  audit: AccountInvoiceSendAudit,
+  deps: AccountInvoiceSendDeps,
+): Promise<AccountInvoiceSendResult> {
+  const { invoice } = detail;
   const attachment = pdfAttachment(invoice.invoiceNumber, pdf);
   const eventType = invoice.kind === 'credit_note' ? FLEET_CREDIT_NOTE_EVENT : FLEET_INVOICE_EVENT;
   const variables = fleetInvoiceVariables(detail);

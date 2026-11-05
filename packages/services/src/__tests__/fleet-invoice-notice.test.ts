@@ -335,6 +335,59 @@ describe('sendAccountInvoiceEmail for a member invoice', () => {
     expect(h.statements).toHaveLength(0);
   });
 
+  it('emails a member invoice to the driver and to the billing contacts, claimed once', async () => {
+    h.delivery = 'driver_and_contacts';
+    h.contacts = { emails: ['payroll@acme.test', 'hr@acme.test'], language: 'de' };
+    h.detail = {
+      ...detail({ memberBilled: true, driverId: 'drv_1', language: 'en' }),
+      driver: memberDriver,
+    };
+
+    const result = await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit);
+
+    expect(result).toEqual({ status: 'sent', recipients: 3 });
+    expect(vi.mocked(dispatchDriverNotification).mock.calls[0]?.[1]).toBe(MEMBER_INVOICE_EVENT);
+    expect(dispatchSystemNotification).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(dispatchSystemNotification).mock.calls[0]?.[2]).toEqual({
+      email: 'payroll@acme.test',
+      language: 'de',
+      timezone: 'Europe/Berlin',
+    });
+    expect(h.statements).toHaveLength(1);
+    expect(h.statements[0]).toContain('sent_at IS NULL');
+    expect(writeInvoiceSentAudit).toHaveBeenCalledTimes(2);
+  });
+
+  it('still emails the billing contacts when the driver has no email', async () => {
+    h.delivery = 'driver_and_contacts';
+    h.contacts = { emails: ['payroll@acme.test'], language: 'de' };
+    h.detail = {
+      ...detail({ memberBilled: true, driverId: 'drv_1' }),
+      driver: { ...memberDriver, email: null },
+    };
+
+    expect(await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit)).toEqual({
+      status: 'sent',
+      recipients: 1,
+    });
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+    expect(dispatchSystemNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends nothing to the driver and the contacts when neither can be reached', async () => {
+    h.delivery = 'driver_and_contacts';
+    h.contacts = { emails: [], language: 'de' };
+    h.detail = {
+      ...detail({ memberBilled: true, driverId: 'drv_1' }),
+      driver: { ...memberDriver, email: null },
+    };
+
+    expect(await sendAccountInvoiceEmail('inv_f1', 'once', deps, audit)).toEqual({
+      status: 'no_email',
+    });
+    expect(h.statements).toHaveLength(0);
+  });
+
   it('sends a member credit note to the billing contacts as a fleet credit note', async () => {
     h.delivery = 'billing_contacts';
     h.detail = {
