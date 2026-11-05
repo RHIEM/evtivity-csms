@@ -95,6 +95,8 @@ export interface InvoiceLabels {
   paymentPaidByCard: string;
   /** Credit note: nothing to pay. */
   paymentCreditNote: string;
+  /** Page number on a document on a letterhead; "{page}" and "{pages}" are replaced. */
+  pageOf: string;
 }
 
 export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
@@ -164,6 +166,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaid: 'Paid on {date}. No payment is due.',
     paymentPaidByCard: 'Paid by card on {date}. No payment is due.',
     paymentCreditNote: 'No payment is due. The amount is refunded or offset against open invoices.',
+    pageOf: 'Page {page} of {pages}',
   },
   de: {
     locale: 'de-DE',
@@ -234,6 +237,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: 'Am {date} per Karte bezahlt. Es ist keine Zahlung fällig.',
     paymentCreditNote:
       'Es ist keine Zahlung fällig. Der Betrag wird erstattet oder mit offenen Rechnungen verrechnet.',
+    pageOf: 'Seite {page} von {pages}',
   },
   es: {
     locale: 'es-ES',
@@ -302,6 +306,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: 'Pagada con tarjeta el {date}. No hay ningún pago pendiente.',
     paymentCreditNote:
       'No hay ningún pago pendiente. El importe se reembolsa o se compensa con facturas pendientes.',
+    pageOf: 'Página {page} de {pages}',
   },
   ko: {
     locale: 'ko-KR',
@@ -369,6 +374,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaid: '{date}에 결제되었습니다. 지불할 금액이 없습니다.',
     paymentPaidByCard: '{date}에 카드로 결제되었습니다. 지불할 금액이 없습니다.',
     paymentCreditNote: '지불할 금액이 없습니다. 금액은 환불되거나 미결제 청구서와 상계됩니다.',
+    pageOf: '{page}/{pages} 페이지',
   },
   zh: {
     locale: 'zh-CN',
@@ -435,6 +441,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaid: '已于 {date} 付款，无需再付款。',
     paymentPaidByCard: '已于 {date} 通过银行卡付款，无需再付款。',
     paymentCreditNote: '无需付款。该金额将退还或与未结发票抵销。',
+    pageOf: '第 {page} 页，共 {pages} 页',
   },
   'zh-TW': {
     locale: 'zh-TW',
@@ -501,6 +508,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaid: '已於 {date} 付款，無需再付款。',
     paymentPaidByCard: '已於 {date} 以卡片付款，無需再付款。',
     paymentCreditNote: '無需付款。該金額將退還或與未結發票抵銷。',
+    pageOf: '第 {page} 頁，共 {pages} 頁',
   },
 };
 

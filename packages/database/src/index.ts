@@ -208,6 +208,8 @@ export {
 } from './lib/fleet-credit-settings.js';
 export { invoiceNumberPrefix, allocateInvoiceNumber } from './lib/invoice-number.js';
 export type { InvoiceNumberExecutor } from './lib/invoice-number.js';
+export { currentPdfLetterheadId } from './lib/pdf-letterhead.js';
+export type { PdfLetterheadExecutor } from './lib/pdf-letterhead.js';
 export { sessionFeeGrossCents, siteMaxSessionFeeGrossCents } from './lib/session-fee-floor.js';
 export type {
   PricingGroupSource,

@@ -61,6 +61,7 @@ import { tokenRoutes } from './routes/tokens.js';
 import { authorizeAttemptRoutes } from './routes/authorize-attempts.js';
 import { dashboardRoutes } from './routes/dashboard.js';
 import { settingsRoutes } from './routes/settings.js';
+import { pdfLetterheadRoutes } from './routes/pdf-letterheads.js';
 import { aiDefaultsRoutes } from './routes/ai-defaults.js';
 import { docsSearchRoutes } from './routes/docs-search.js';
 import { paymentRoutes } from './routes/payments.js';
@@ -238,6 +239,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       await v1.register(authorizeAttemptRoutes);
       await v1.register(dashboardRoutes);
       await v1.register(settingsRoutes);
+      await v1.register(pdfLetterheadRoutes);
       await v1.register(aiDefaultsRoutes);
       await v1.register(docsSearchRoutes);
       await v1.register(paymentRoutes);

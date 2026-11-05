@@ -138,6 +138,7 @@ vi.mock('@evtivity/database', () => {
     getInvoicePaymentTermsDays: vi.fn(() => Promise.resolve(h.state.paymentTermsDays)),
     getSystemTimezone: vi.fn(() => Promise.resolve(h.state.timeZone)),
     allocateInvoiceNumber: vi.fn(() => Promise.resolve('INV-202606-0042')),
+    currentPdfLetterheadId: vi.fn(() => Promise.resolve(null)),
   };
 });
 

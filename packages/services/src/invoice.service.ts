@@ -14,6 +14,7 @@ import {
   getCompanyCurrency,
   getInvoicePaymentTermsDays,
   allocateInvoiceNumber,
+  currentPdfLetterheadId,
 } from '@evtivity/database';
 import {
   chargedCostBreakdown,
@@ -462,10 +463,13 @@ export async function insertInvoiceInTransaction(
   const claimGuard = input.sessionClaimGuard ?? sessionNotOnAccount;
 
   const invoiceNumber = await allocateInvoiceNumber(tx, 'invoice', now);
+  // The PDF keeps drawing the letterhead current at issue.
+  const letterheadId = await currentPdfLetterheadId(tx);
   const [invoice] = await tx
     .insert(invoices)
     .values({
       invoiceNumber,
+      letterheadId,
       driverId,
       status,
       issuedAt: now,

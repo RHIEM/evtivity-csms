@@ -416,6 +416,45 @@ describe('InvoiceDetail', () => {
     expect(document.querySelectorAll('.invoice-print-area img')).toHaveLength(1);
   });
 
+  it('prints the page without a letterhead', async () => {
+    const print = vi.spyOn(window, 'print').mockImplementation(() => undefined);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    mockInvoice(detail());
+    renderPage();
+
+    fireEvent.click(await screen.findByText('invoices.print'));
+    expect(print).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    print.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
+  it('prints the PDF of an invoice on a letterhead', async () => {
+    const print = vi.spyOn(window, 'print').mockImplementation(() => undefined);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(new Blob(['%PDF']), { status: 200 }));
+    URL.createObjectURL = vi.fn(() => 'blob:invoice');
+    URL.revokeObjectURL = vi.fn();
+    mockInvoice(detail({ letterheadId: 'lhd_ri' }));
+    renderPage();
+
+    fireEvent.click(await screen.findByText('invoices.print'));
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="invoice-print-frame"]')).not.toBeNull();
+    });
+    const frame = document.querySelector('[data-testid="invoice-print-frame"]');
+    expect(frame?.getAttribute('src')).toBe('blob:invoice');
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('/v1/invoices/inv_1/pdf'),
+      expect.objectContaining({ credentials: 'include' }),
+    );
+    expect(print).not.toHaveBeenCalled();
+    frame?.remove();
+    print.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
   it('shows no company name heading next to the logo or above the invoice', async () => {
     mockInvoice(detail());
     renderPage();

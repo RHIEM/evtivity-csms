@@ -252,6 +252,7 @@ export const ERROR_CODES = {
   PAYMENT_WEBHOOK_EXISTS: 'PAYMENT_WEBHOOK_EXISTS',
   PAYOUT_ACCOUNT_EXISTS: 'PAYOUT_ACCOUNT_EXISTS',
   PAYOUT_ACCOUNT_NOT_READY: 'PAYOUT_ACCOUNT_NOT_READY',
+  PDF_LETTERHEAD_NOT_FOUND: 'PDF_LETTERHEAD_NOT_FOUND',
   PERMISSIONS_EXCEED_OWN: 'PERMISSIONS_EXCEED_OWN',
   PHONE_REGISTRATION_LIMITED: 'PHONE_REGISTRATION_LIMITED',
   PKI_ROOT_REFRESH_FAILED: 'PKI_ROOT_REFRESH_FAILED',
@@ -643,6 +644,7 @@ export type ErrorCode =
   | 'PAYMENT_WEBHOOK_EXISTS'
   | 'PAYOUT_ACCOUNT_EXISTS'
   | 'PAYOUT_ACCOUNT_NOT_READY'
+  | 'PDF_LETTERHEAD_NOT_FOUND'
   | 'PERMISSIONS_EXCEED_OWN'
   | 'PHONE_REGISTRATION_LIMITED'
   | 'PKI_ROOT_REFRESH_FAILED'
@@ -1074,6 +1076,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PAYMENT_WEBHOOK_EXISTS: 'An EVtivity webhook already exists for this provider',
   PAYOUT_ACCOUNT_EXISTS: 'The site already has a payout account',
   PAYOUT_ACCOUNT_NOT_READY: "The site's payout account cannot receive payments yet",
+  PDF_LETTERHEAD_NOT_FOUND: 'PDF letterhead not found',
   PERMISSIONS_EXCEED_OWN: 'Permissions must be a subset of your own permissions',
   PHONE_REGISTRATION_LIMITED:
     'Too many accounts were registered with this phone number. Try again later.',

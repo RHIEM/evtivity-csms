@@ -95,6 +95,7 @@ function fleetDetail(language: string | null = 'en'): InvoiceDetail {
       creditReason: null,
       paidAt: null,
       paymentReference: null,
+      letterheadId: null,
       fleetId: 'flt_1',
       periodStart: '2026-09-01',
       periodEnd: '2026-09-30',
@@ -147,6 +148,8 @@ describe('fleet invoice PDF helpers', () => {
     expect(readBillTo(fleetDetail().invoice.billTo)).toEqual({
       name: 'Acme Logistics GmbH',
       lines: ['Hafenstr. 1', '20457 Hamburg', 'Germany'],
+      address: ['Hafenstr. 1', '20457 Hamburg', 'Germany'],
+      email: null,
       taxId: 'DE123456789',
     });
     expect(readBillTo(null)).toBeNull();
@@ -220,11 +223,15 @@ describe('generateInvoicePdf for a member invoice', () => {
     expect(readBillTo(memberDetail().invoice.billTo)).toEqual({
       name: 'Anna Berg',
       lines: ['Lindenweg 3', '28195 Bremen', 'Deutschland', 'anna@fleet.test'],
+      address: ['Lindenweg 3', '28195 Bremen', 'Deutschland'],
+      email: 'anna@fleet.test',
       taxId: null,
     });
     expect(readBillTo(memberDetail({ address: false }).invoice.billTo)).toEqual({
       name: 'Anna Berg',
       lines: ['anna@fleet.test'],
+      address: [],
+      email: 'anna@fleet.test',
       taxId: null,
     });
   });

@@ -26,6 +26,7 @@ export const ID_PREFIXES = {
   reservation: 'rsv',
   supportCase: 'cas',
   invoice: 'inv',
+  pdfLetterhead: 'lhd',
   ocpiPartner: 'opr',
   report: 'rpt',
   firmwareCampaign: 'fwc',

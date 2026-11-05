@@ -757,6 +757,33 @@ export {
 } from './pdf-branding.js';
 export { sanitizeSvg, decodePdfLogo, normalizePdfLogo } from './pdf-logo.js';
 export {
+  PDF_LETTERHEAD_KEY,
+  MAX_PDF_LETTERHEAD_BYTES,
+  MIN_PDF_LETTERHEAD_PNG_WIDTH,
+  MAX_PDF_LETTERHEAD_NAME_LENGTH,
+  A4_WIDTH_MM,
+  A4_HEIGHT_MM,
+  MIN_PDF_LETTERHEAD_TEXT_WIDTH_MM,
+  MIN_PDF_LETTERHEAD_FIRST_PAGE_TEXT_MM,
+  PDF_LETTERHEAD_FOLLOWING_TOP_MM,
+  DEFAULT_PDF_LETTERHEAD_LAYOUT,
+  PDF_LETTERHEAD_LAYOUT_KEYS,
+  PDF_LETTERHEAD_LAYOUT_RANGES,
+  normalizePdfLetterheadLayout,
+  normalizePdfLetterheadName,
+} from './pdf-letterhead.js';
+export type { PdfLetterheadLayout } from './pdf-letterhead.js';
+export {
+  decodePdfLetterheadImage,
+  normalizePdfLetterheadImage,
+  isA4Portrait,
+  svgSize,
+} from './pdf-letterhead-image.js';
+export type {
+  NormalizedPdfLetterheadImage,
+  PdfLetterheadImageError,
+} from './pdf-letterhead-image.js';
+export {
   COMPANY_TAX_ID_KEY,
   COMPANY_TAX_ID_LABEL_KEY,
   COMPANY_REGISTRATION_NUMBER_KEY,

@@ -97,6 +97,7 @@ vi.mock('@evtivity/database', () => {
     invoiceLineItems: h.table('invoiceLineItems'),
     chargingSessions: h.table('chargingSessions'),
     allocateInvoiceNumber: vi.fn(() => Promise.resolve('CN-202606-0001')),
+    currentPdfLetterheadId: vi.fn(() => Promise.resolve(null)),
   };
 });
 

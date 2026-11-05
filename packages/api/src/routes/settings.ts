@@ -112,6 +112,7 @@ import {
   createLogger,
   PDF_LOGO_KEY,
   PDF_FOOTER_KEY,
+  PDF_LETTERHEAD_KEY,
   MAX_PDF_LOGO_BYTES,
   MAX_PDF_FOOTER_LENGTH,
   MAX_PDF_FOOTER_LINES,
@@ -309,6 +310,8 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     const footer = normalizePdfFooter(value);
     return footer != null ? { value: footer } : null;
   }
+  // Set with PUT /pdf-letterheads/current, which checks that the version exists.
+  if (key === PDF_LETTERHEAD_KEY) return null;
   if (isInvoiceSellerSettingKey(key)) {
     const seller = normalizeInvoiceSellerSetting(key, value);
     return seller != null ? { value: seller } : null;
@@ -429,6 +432,11 @@ const invalidFleetCreditReservationError = {
 
 const invalidPdfLogoError = {
   error: `${PDF_LOGO_KEY} must be an empty string (the default logo) or a PNG or SVG data URI of at most ${String(MAX_PDF_LOGO_BYTES / 1024)} KB`,
+  code: 'VALIDATION_ERROR',
+};
+
+const pdfLetterheadSettingError = {
+  error: `${PDF_LETTERHEAD_KEY} is set with PUT /v1/pdf-letterheads/current`,
   code: 'VALIDATION_ERROR',
 };
 
@@ -605,6 +613,7 @@ function invalidSettingError(key: string, value?: unknown): { error: string; cod
   if (key === FLEET_INVOICE_RUN_DAY_KEY) return invalidFleetInvoiceRunDayError;
   if (key === PDF_LOGO_KEY) return invalidPdfLogoError;
   if (key === PDF_FOOTER_KEY) return invalidPdfFooterError;
+  if (key === PDF_LETTERHEAD_KEY) return pdfLetterheadSettingError;
   if (isInvoiceSellerSettingKey(key)) return invalidInvoiceSellerError(key);
   if (isInvoicePaymentSettingKey(key)) return invalidInvoicePaymentError(key);
   if (key === INVOICE_EPC_QR_ENABLED_KEY) {

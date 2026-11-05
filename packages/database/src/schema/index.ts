@@ -21,6 +21,7 @@ export * from './station-message-templates.js';
 export * from './station-message-pushes.js';
 export * from './reports.js';
 export * from './invoices.js';
+export * from './pdf-letterheads.js';
 export * from './reconciliation.js';
 export * from './support-cases.js';
 export * from './ocpi.js';

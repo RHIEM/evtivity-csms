@@ -28,7 +28,42 @@
  * the review item number in a comment (`REVIEW2 #n`).
  */
 
+import { crc32, deflateSync } from 'node:zlib';
+import { DEFAULT_PDF_LETTERHEAD_LAYOUT } from '@evtivity/lib';
+
 export type MatrixMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/** A PNG chunk: length, type, data and CRC. */
+function pngChunk(type: string, data: Buffer): Buffer {
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const chunk = Buffer.alloc(body.length + 8);
+  chunk.writeUInt32BE(data.length, 0);
+  body.copy(chunk, 4);
+  chunk.writeUInt32BE(crc32(body) >>> 0, body.length + 4);
+  return chunk;
+}
+
+/**
+ * A blank A4 portrait PNG of 1240 x 1754 pixels (1-bit grayscale, a few
+ * hundred bytes): an upload the PDF letterhead routes accept.
+ */
+export function blankA4Png(): string {
+  const width = 1240;
+  const height = 1754;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 1; // bit depth
+  const row = Buffer.alloc(1 + width / 8, 0xff);
+  row[0] = 0; // filter: none
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(Buffer.concat(Array.from({ length: height }, () => row)))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
 
 /** The seeded resources of one site (or of the unsited station). */
 export interface SiteFixture {
@@ -123,6 +158,8 @@ export interface MatrixWorld {
   tariffMapping: number;
   alertRule: number;
   holiday: number;
+  /** A PDF letterhead version no invoice uses. */
+  pdfLetterhead: string;
   /** A role id for user creation. */
   role: string;
   /** A Plug and Charge trust store CA certificate. */
@@ -1390,6 +1427,46 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     {
       body: () => ({ holidays: [{ name: 'Holiday', date: '2026-11-11' }] }),
     },
+  ),
+
+  // PDF letterheads (company-wide settings)
+  c(
+    'GET',
+    '/pdf-letterheads',
+    'settings.system:read',
+    () => '/pdf-letterheads',
+    'PDF_LETTERHEAD_NOT_FOUND',
+  ),
+  c(
+    'POST',
+    '/pdf-letterheads',
+    'settings.system:write',
+    () => '/pdf-letterheads',
+    'PDF_LETTERHEAD_NOT_FOUND',
+    { body: () => ({ name: 'Matrix', image: blankA4Png(), ...DEFAULT_PDF_LETTERHEAD_LAYOUT }) },
+  ),
+  c(
+    'GET',
+    '/pdf-letterheads/:id/image',
+    'settings.system:read',
+    (_f, w) => `/pdf-letterheads/${w.pdfLetterhead}/image`,
+    'PDF_LETTERHEAD_NOT_FOUND',
+  ),
+  c(
+    'PUT',
+    '/pdf-letterheads/current',
+    'settings.system:write',
+    () => '/pdf-letterheads/current',
+    'PDF_LETTERHEAD_NOT_FOUND',
+    { body: () => ({ letterheadId: null }) },
+  ),
+  c(
+    'POST',
+    '/pdf-letterheads/preview',
+    'settings.system:read',
+    () => '/pdf-letterheads/preview',
+    'PDF_LETTERHEAD_NOT_FOUND',
+    { body: () => ({ image: blankA4Png(), ...DEFAULT_PDF_LETTERHEAD_LAYOUT }) },
   ),
 
   // invoices (company-wide, except the session invoice)
