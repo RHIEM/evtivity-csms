@@ -1702,6 +1702,13 @@
       "when": 1791000049404,
       "tag": "rhiem_0008_member_invoice_delivery",
       "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "7",
+      "when": 1791000049406,
+      "tag": "rhiem_0010_member_invoice_delivery_none",
+      "breakpoints": true
     }
   ]
 }

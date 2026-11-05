@@ -47,7 +47,14 @@ export type AccountInvoiceSendMode = 'once' | 'resend';
 export type AccountInvoiceSendResult =
   | { status: 'sent'; recipients: number }
   | {
-      status: 'already_sent' | 'no_contacts' | 'no_driver' | 'no_email' | 'not_fleet' | 'not_found';
+      status:
+        | 'already_sent'
+        | 'delivery_off'
+        | 'no_contacts'
+        | 'no_driver'
+        | 'no_email'
+        | 'not_fleet'
+        | 'not_found';
     };
 
 export interface AccountInvoiceSendDeps {
@@ -217,6 +224,9 @@ async function loadMemberInvoiceDelivery(fleetId: string): Promise<string> {
  *   payroll office that forwards them): as a fleet invoice, invoice.FleetInvoice
  *   or invoice.FleetCreditNote to each billing contact in the fleet's invoice
  *   language; the PDF keeps the driver's language. The driver gets no email.
+ * - Member invoice of a fleet that keeps them in the CSMS
+ *   (`member_invoice_delivery` 'none'): nothing is sent (`delivery_off`), and
+ *   sent_at stays null.
  *
  * `invoices.sent_at` is the marker: mode `once` claims it only while it is
  * null, so an issue is emailed once (P7); `resend` sends again and sets it.
@@ -236,11 +246,10 @@ export async function sendAccountInvoiceEmail(
   if (detail == null) return { status: 'not_found' };
   const { invoice } = detail;
   if (invoice.fleetId == null) return { status: 'not_fleet' };
-  if (
-    invoice.memberBilled &&
-    (await loadMemberInvoiceDelivery(invoice.fleetId)) !== 'billing_contacts'
-  ) {
-    return sendMemberInvoiceEmail(detail, mode, deps, audit);
+  if (invoice.memberBilled) {
+    const delivery = await loadMemberInvoiceDelivery(invoice.fleetId);
+    if (delivery === 'none') return { status: 'delivery_off' };
+    if (delivery !== 'billing_contacts') return sendMemberInvoiceEmail(detail, mode, deps, audit);
   }
 
   const contacts = await loadFleetBillingContacts(client, invoice.fleetId);

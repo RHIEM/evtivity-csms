@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
 
@@ -46,7 +46,11 @@ vi.mock('@/lib/timezone', () => ({
   formatDateTime: (v: string, tz: string) => `${v}@${tz}`,
 }));
 
-import { FleetBillingTab, oldProcessAllowedFrom } from '../fleet/FleetBillingTab';
+import {
+  FleetBillingTab,
+  FleetInvoiceRecipientField,
+  oldProcessAllowedFrom,
+} from '../fleet/FleetBillingTab';
 import { FleetBillingProfileCard, parseContactEmails } from '../fleet/FleetBillingProfileCard';
 import { FleetDriversTab } from '../fleet/FleetDriversTab';
 import { DriverBillingCard } from '../driver/DriverBillingCard';
@@ -100,7 +104,7 @@ describe('FleetBillingTab', () => {
   it('switches the invoice recipient to each driver after confirmation', async () => {
     patchMock.mockResolvedValueOnce({ id: 'flt_1', accountInvoiceRecipient: 'member' });
     wrap(
-      <FleetBillingTab
+      <FleetInvoiceRecipientField
         fleet={{ id: 'flt_1', accountBillingEnabled: true, accountInvoiceRecipient: 'fleet' }}
       />,
     );
@@ -125,7 +129,7 @@ describe('FleetBillingTab', () => {
         code: 'FLEET_BILLING_OLD_PODS_CONNECTED',
       }),
     );
-    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
+    wrap(<FleetInvoiceRecipientField fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
     fireEvent.change(screen.getByLabelText('fleets.billing.invoiceTo'), {
       target: { value: 'member' },
     });
@@ -185,7 +189,7 @@ describe('FleetBillingTab', () => {
         code: 'FLEET_BILLING_VERSION_CHECK_STALE',
       }),
     );
-    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
+    wrap(<FleetInvoiceRecipientField fleet={{ id: 'flt_1', accountBillingEnabled: true }} />);
     fireEvent.change(screen.getByLabelText('fleets.billing.invoiceTo'), {
       target: { value: 'member' },
     });
@@ -197,7 +201,7 @@ describe('FleetBillingTab', () => {
 
   it('disables the recipient select without fleets:write', () => {
     permission.canWrite = false;
-    wrap(<FleetBillingTab fleet={{ id: 'flt_1', accountInvoiceRecipient: 'member' }} />);
+    wrap(<FleetInvoiceRecipientField fleet={{ id: 'flt_1', accountInvoiceRecipient: 'member' }} />);
     const select = screen.getByLabelText<HTMLSelectElement>('fleets.billing.invoiceTo');
     expect(select.disabled).toBe(true);
     expect(select.value).toBe('member');
@@ -376,7 +380,7 @@ describe('FleetBillingProfileCard', () => {
   it('falls back to the fleet name and the default terms', () => {
     wrap(<FleetBillingProfileCard fleet={{ id: 'flt_1', name: 'Acme Fleet' }} />);
     expect(screen.getByText('Acme Fleet')).toBeTruthy();
-    expect(screen.getByText('fleets.billingProfile.noContacts')).toBeTruthy();
+    expect(screen.getByText('fleets.billingProfile.contactsMissing')).toBeTruthy();
     expect(screen.getByText('fleets.billingProfile.paymentTermsDefault')).toBeTruthy();
   });
 
@@ -440,7 +444,7 @@ describe('FleetBillingProfileCard', () => {
   it('saves member invoice delivery to the billing contacts and shows it', async () => {
     getMock.mockResolvedValue([]);
     patchMock.mockResolvedValueOnce(fleet);
-    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    wrap(<FleetBillingProfileCard fleet={{ ...fleet, accountInvoiceRecipient: 'member' }} />);
     expect(screen.getByTestId('fleet-billing-member-delivery').textContent).toBe(
       'fleets.billingProfile.memberDeliveryDriver',
     );
@@ -456,6 +460,94 @@ describe('FleetBillingProfileCard', () => {
         expect.objectContaining({ memberInvoiceDelivery: 'billing_contacts' }),
       );
     });
+  });
+
+  it('keeps the invoice recipient switch in the recipient group', () => {
+    wrap(<FleetBillingProfileCard fleet={fleet} />);
+    const group = screen.getByTestId('billing-group-recipient');
+    expect(within(group).getByLabelText('fleets.billing.invoiceTo')).toBeTruthy();
+    expect(within(group).getByText('Acme GmbH')).toBeTruthy();
+    expect(within(group).getByText('ap@acme.example')).toBeTruthy();
+    expect(screen.queryByTestId('fleet-billing-member-delivery')).toBeNull();
+  });
+
+  it('shows only the delivery for member invoices sent to the driver', () => {
+    wrap(
+      <FleetBillingProfileCard
+        fleet={{ ...fleet, accountInvoiceRecipient: 'member', memberInvoiceDelivery: 'driver' }}
+      />,
+    );
+    const group = screen.getByTestId('billing-group-recipient');
+    expect(within(group).getByText('fleets.billingProfile.memberBillTo')).toBeTruthy();
+    expect(screen.getByTestId('fleet-billing-member-delivery').textContent).toBe(
+      'fleets.billingProfile.memberDeliveryDriver',
+    );
+    expect(within(group).queryByText('Acme GmbH')).toBeNull();
+    expect(within(group).queryByText('ap@acme.example')).toBeNull();
+    expect(within(group).queryByText('Deutsch')).toBeNull();
+  });
+
+  it('asks for the addresses only when member invoices go to fixed addresses', () => {
+    wrap(
+      <FleetBillingProfileCard
+        fleet={{ ...fleet, accountInvoiceRecipient: 'member', billingContactEmails: [] }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(screen.queryByLabelText('fleets.billingProfile.contacts')).toBeNull();
+    expect(screen.queryByLabelText('fleets.billingProfile.legalName')).toBeNull();
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
+      target: { value: 'billing_contacts' },
+    });
+    expect(screen.getByLabelText('fleets.billingProfile.contacts')).toBeTruthy();
+    expect(screen.getByTestId('billing-contacts-missing')).toBeTruthy();
+    expect(screen.getByText('fleets.billingProfile.memberDeliveryHelpContacts')).toBeTruthy();
+  });
+
+  it('saves automatic member invoices kept in the CSMS without any address', async () => {
+    patchMock.mockResolvedValueOnce(fleet);
+    wrap(
+      <FleetBillingProfileCard
+        fleet={{
+          ...fleet,
+          accountInvoiceRecipient: 'member',
+          billingContactEmails: [],
+          autoInvoice: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
+      target: { value: 'none' },
+    });
+    expect(screen.getByText('fleets.billingProfile.memberDeliveryHelpNone')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/fleets/flt_1/billing-profile',
+        expect.objectContaining({
+          memberInvoiceDelivery: 'none',
+          autoInvoice: true,
+          billingContactEmails: [],
+        }),
+      );
+    });
+  });
+
+  it('still needs an address for automatic fleet invoices', () => {
+    wrap(<FleetBillingProfileCard fleet={{ ...fleet, billingContactEmails: [] }} />);
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    expect(screen.getByText('errors.FLEET_BILLING_CONTACT_REQUIRED')).toBeTruthy();
+    expect(patchMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves out the payment terms for an external settlement', () => {
+    wrap(<FleetBillingProfileCard fleet={{ ...fleet, accountSettlement: 'external' }} />);
+    expect(screen.queryByText('fleets.billingProfile.paymentTerms')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(screen.queryByLabelText('fleets.billingProfile.paymentTerms')).toBeNull();
   });
 
   it('saves the chosen invoice issuer', async () => {

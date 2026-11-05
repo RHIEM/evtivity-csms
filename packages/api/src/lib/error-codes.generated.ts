@@ -151,6 +151,7 @@ export const ERROR_CODES = {
   INVOICE_ISSUER_NOT_FOUND: 'INVOICE_ISSUER_NOT_FOUND',
   INVOICE_ISSUER_NUMBER_FORMAT_LOCKED: 'INVOICE_ISSUER_NUMBER_FORMAT_LOCKED',
   INVOICE_IS_CREDIT_NOTE: 'INVOICE_IS_CREDIT_NOTE',
+  INVOICE_DELIVERY_OFF: 'INVOICE_DELIVERY_OFF',
   INVOICE_NO_DRIVER: 'INVOICE_NO_DRIVER',
   INVOICE_NO_DRIVER_EMAIL: 'INVOICE_NO_DRIVER_EMAIL',
   INVOICE_NO_SESSIONS: 'INVOICE_NO_SESSIONS',
@@ -545,6 +546,7 @@ export type ErrorCode =
   | 'INVOICE_ISSUER_NOT_FOUND'
   | 'INVOICE_ISSUER_NUMBER_FORMAT_LOCKED'
   | 'INVOICE_IS_CREDIT_NOTE'
+  | 'INVOICE_DELIVERY_OFF'
   | 'INVOICE_NO_DRIVER'
   | 'INVOICE_NO_DRIVER_EMAIL'
   | 'INVOICE_NO_SESSIONS'
@@ -968,6 +970,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVOICE_ISSUER_NUMBER_FORMAT_LOCKED:
     'The number format cannot change once the issuer has issued a document of that kind',
   INVOICE_IS_CREDIT_NOTE: 'A credit note cannot be marked paid or credited',
+  INVOICE_DELIVERY_OFF: 'The fleet keeps its member invoices in the CSMS and does not email them',
   INVOICE_NO_DRIVER: 'This invoice has no driver to send to',
   INVOICE_NO_DRIVER_EMAIL: 'The driver of this invoice has no email address',
   INVOICE_NO_SESSIONS: 'No uninvoiced sessions found for this driver in the selected date range',

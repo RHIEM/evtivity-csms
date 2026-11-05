@@ -840,6 +840,7 @@ describe('POST /invoices/:id/send', () => {
   it.each([
     ['no_driver', 'INVOICE_NO_DRIVER'],
     ['no_email', 'INVOICE_NO_DRIVER_EMAIL'],
+    ['delivery_off', 'INVOICE_DELIVERY_OFF'],
   ] as const)(
     'answers 400 %s for a member invoice whose driver cannot be reached (%s)',
     async (status, code) => {

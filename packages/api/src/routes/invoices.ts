@@ -512,7 +512,11 @@ async function notifyAccountCreditNote(
       { templatesDirs: ALL_TEMPLATES_DIRS },
       { actor, log },
     );
-    if (result.status !== 'sent' && result.status !== 'already_sent') {
+    if (
+      result.status !== 'sent' &&
+      result.status !== 'already_sent' &&
+      result.status !== 'delivery_off'
+    ) {
       log.warn(
         { invoiceId: invoice.id, reason: result.status },
         `${kind} credit note not sent: no recipient address`,
@@ -531,6 +535,10 @@ const ACCOUNT_SEND_REFUSALS = {
   },
   no_driver: { error: 'Invoice has no driver', code: 'INVOICE_NO_DRIVER' },
   no_email: { error: 'The driver has no email address', code: 'INVOICE_NO_DRIVER_EMAIL' },
+  delivery_off: {
+    error: 'The fleet keeps its member invoices in the CSMS and does not email them',
+    code: 'INVOICE_DELIVERY_OFF',
+  },
 } as const;
 
 // Invoices are company-wide money: a driver's invoice bills sessions at any
@@ -961,7 +969,7 @@ export function invoiceRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Email an invoice to its driver or fleet',
         description:
-          'Renders the invoice.Sent driver notification (invoice.CreditNote for a credit note) and dispatches it via the configured channels. A fleet invoice (invoice.FleetInvoice) or its credit note (invoice.FleetCreditNote) goes to the fleet billing contacts with the PDF attached and sets sentAt; 400 FLEET_BILLING_CONTACT_REQUIRED when the fleet has none. A member invoice (invoice.MemberInvoice) or its credit note (invoice.MemberCreditNote) goes to its driver only, by email with the PDF attached and by push, and sets sentAt; 400 INVOICE_NO_DRIVER when the driver no longer exists, 400 INVOICE_NO_DRIVER_EMAIL when the driver has no email address. Safe to call repeatedly; each call sends again (deliberate resend semantics). A send a provider accepted is recorded in the invoice audit log (invoice_sent).',
+          'Renders the invoice.Sent driver notification (invoice.CreditNote for a credit note) and dispatches it via the configured channels. A fleet invoice (invoice.FleetInvoice) or its credit note (invoice.FleetCreditNote) goes to the fleet billing contacts with the PDF attached and sets sentAt; 400 FLEET_BILLING_CONTACT_REQUIRED when the fleet has none. A member invoice (invoice.MemberInvoice) or its credit note (invoice.MemberCreditNote) goes to its driver only, by email with the PDF attached and by push, and sets sentAt; 400 INVOICE_NO_DRIVER when the driver no longer exists, 400 INVOICE_NO_DRIVER_EMAIL when the driver has no email address; to the billing contacts instead when the fleet delivers member invoices there, and 400 INVOICE_DELIVERY_OFF when the fleet keeps them in the CSMS without email. Safe to call repeatedly; each call sends again (deliberate resend semantics). A send a provider accepted is recorded in the invoice audit log (invoice_sent).',
         operationId: 'sendInvoice',
         security: [{ bearerAuth: [] }],
         params: zodSchema(invoiceIdParams),
@@ -973,6 +981,7 @@ export function invoiceRoutes(app: FastifyInstance): void {
               ERROR_CODES.INVOICE_NO_DRIVER,
               ERROR_CODES.INVOICE_NO_DRIVER_EMAIL,
               ERROR_CODES.FLEET_BILLING_CONTACT_REQUIRED,
+              ERROR_CODES.INVOICE_DELIVERY_OFF,
             ],
           ),
           404: invoiceNotFound,
@@ -1002,7 +1011,8 @@ export function invoiceRoutes(app: FastifyInstance): void {
         if (
           sent.status === 'no_contacts' ||
           sent.status === 'no_driver' ||
-          sent.status === 'no_email'
+          sent.status === 'no_email' ||
+          sent.status === 'delivery_off'
         ) {
           await reply.status(400).send(ACCOUNT_SEND_REFUSALS[sent.status]);
           return;

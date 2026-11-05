@@ -23,6 +23,7 @@ import {
   INVOICE_ISSUERS_QUERY_KEY,
   type InvoiceIssuer,
 } from '@/components/settings/InvoiceIssuerSettings';
+import { FleetInvoiceRecipientField, type AccountInvoiceRecipient } from './FleetBillingTab';
 
 /** The fleet billing profile as the API returns it on the fleet. */
 export interface FleetBillingProfile {
@@ -44,7 +45,7 @@ export interface FleetBillingProfile {
   accountSettlement: AccountSettlement;
   /** Printed on externally settled invoices instead of the payment block. */
   settlementNote: string | null;
-  /** Who the member invoices are emailed to: the driver or the billing contacts. */
+  /** Who the member invoices are emailed to: the driver, the billing contacts or nobody. */
   memberInvoiceDelivery: MemberInvoiceDelivery;
 }
 
@@ -54,12 +55,45 @@ export type InvoiceDateMode = 'run_date' | 'period_end';
 /** How the fleet's account invoices are settled. */
 export type AccountSettlement = 'payment' | 'external';
 
-/** Who a fleet's member invoices are emailed to. */
-export type MemberInvoiceDelivery = 'driver' | 'billing_contacts';
+/** Who a fleet's member invoices are emailed to; none keeps them in the CSMS. */
+export type MemberInvoiceDelivery = 'driver' | 'billing_contacts' | 'none';
 
 export interface FleetBillingProfileCardProps {
-  fleet: { id: string; name: string } & Partial<FleetBillingProfile>;
+  fleet: {
+    id: string;
+    name: string;
+    accountBillingEnabled?: boolean;
+    accountInvoiceRecipient?: AccountInvoiceRecipient;
+  } & Partial<FleetBillingProfile>;
 }
+
+function memberInvoiceDeliveryOf(value: string | undefined): MemberInvoiceDelivery {
+  return value === 'billing_contacts' || value === 'none' ? value : 'driver';
+}
+
+/**
+ * Whether the fleet's invoices are emailed to its billing contacts: the fleet
+ * invoice, or member invoices delivered to the contacts (as the API's
+ * fleetBillingContactsUsed). Only then the contacts field is shown.
+ */
+export function billingContactsUsed(
+  recipient: AccountInvoiceRecipient,
+  delivery: MemberInvoiceDelivery,
+): boolean {
+  return recipient !== 'member' || delivery === 'billing_contacts';
+}
+
+const MEMBER_DELIVERY_HELP = {
+  driver: 'fleets.billingProfile.memberDeliveryHelpDriver',
+  billing_contacts: 'fleets.billingProfile.memberDeliveryHelpContacts',
+  none: 'fleets.billingProfile.memberDeliveryHelpNone',
+} as const;
+
+const MEMBER_DELIVERY_LABEL = {
+  driver: 'fleets.billingProfile.memberDeliveryDriver',
+  billing_contacts: 'fleets.billingProfile.memberDeliveryContacts',
+  none: 'fleets.billingProfile.memberDeliveryNone',
+} as const;
 
 export const MAX_BILLING_CONTACTS = 10;
 const MAX_PAYMENT_TERMS_DAYS = 365;
@@ -110,14 +144,21 @@ function toForm(fleet: FleetBillingProfileCardProps['fleet']): FormState {
     invoiceIssuerId: fleet.invoiceIssuerId ?? '',
     accountSettlement: fleet.accountSettlement === 'external' ? 'external' : 'payment',
     settlementNote: fleet.settlementNote ?? '',
-    memberInvoiceDelivery:
-      fleet.memberInvoiceDelivery === 'billing_contacts' ? 'billing_contacts' : 'driver',
+    memberInvoiceDelivery: memberInvoiceDeliveryOf(fleet.memberInvoiceDelivery),
   };
 }
 
 const textOrNull = (value: string): string | null => (value.trim() === '' ? null : value.trim());
 
-/** Fleet billing profile: who the fleet invoice goes to and how it is issued. */
+/**
+ * Fleet billing profile in two groups. Invoice recipient: who the invoices go
+ * to (FleetInvoiceRecipientField, saved right away) and only the fields that
+ * apply to it: for the fleet invoice the bill-to block, its language and the
+ * email addresses; for member invoices where they are emailed (the driver,
+ * fixed addresses or nobody) and the addresses when they apply. Issue: issuer,
+ * invoice date, settlement, payment terms (not for an external settlement) and
+ * the monthly run. Hidden fields keep their values.
+ */
 export function FleetBillingProfileCard({
   fleet,
 }: FleetBillingProfileCardProps): React.JSX.Element {
@@ -160,13 +201,15 @@ export function FleetBillingProfileCard({
     },
   });
 
+  const recipient: AccountInvoiceRecipient = fleet.accountInvoiceRecipient ?? 'fleet';
   const contacts = parseContactEmails(form.contacts);
+  const contactsUsed = billingContactsUsed(recipient, form.memberInvoiceDelivery);
   const errors: Partial<Record<'contacts' | 'paymentTerms', string>> = {};
   if (contacts.some((e) => !EMAIL_PATTERN.test(e))) {
     errors.contacts = t('fleets.billingProfile.contactsInvalid');
   } else if (contacts.length > MAX_BILLING_CONTACTS) {
     errors.contacts = t('fleets.billingProfile.contactsTooMany', { max: MAX_BILLING_CONTACTS });
-  } else if (form.autoInvoice && contacts.length === 0) {
+  } else if (form.autoInvoice && contactsUsed && contacts.length === 0) {
     errors.contacts = t('errors.FLEET_BILLING_CONTACT_REQUIRED');
   }
   const terms = form.paymentTerms.trim();
@@ -237,6 +280,37 @@ export function FleetBillingProfileCard({
     fleet.billingCountry,
   ].filter((v) => v != null && v !== '');
   const savedContacts = fleet.billingContactEmails ?? [];
+  const savedDelivery = memberInvoiceDeliveryOf(fleet.memberInvoiceDelivery);
+  const savedContactsUsed = billingContactsUsed(recipient, savedDelivery);
+  const external = fleet.accountSettlement === 'external';
+
+  const groupTitle = (key: 'groupRecipient' | 'groupIssue') => (
+    <h3 className="text-sm font-semibold">{t(`fleets.billingProfile.${key}`)}</h3>
+  );
+
+  const contactsField = (
+    <div className="space-y-2 md:col-span-2">
+      <Label htmlFor="billing-contacts">{t('fleets.billingProfile.contacts')}</Label>
+      <Textarea
+        id="billing-contacts"
+        value={form.contacts}
+        onChange={(e) => {
+          set('contacts', e.target.value);
+        }}
+        className={hasSubmitted && errors.contacts != null ? 'border-destructive' : undefined}
+      />
+      <p className="text-xs text-muted-foreground">{t('fleets.billingProfile.contactsHelp')}</p>
+      {hasSubmitted && errors.contacts != null ? (
+        <p className="text-sm text-destructive">{errors.contacts}</p>
+      ) : (
+        contacts.length === 0 && (
+          <p className="text-sm text-warning" data-testid="billing-contacts-missing">
+            {t('fleets.billingProfile.contactsMissing')}
+          </p>
+        )
+      )}
+    </div>
+  );
 
   return (
     <TabPanel
@@ -248,270 +322,312 @@ export function FleetBillingProfileCard({
           <EditButton label={t('common.edit')} onClick={startEdit} />
         ) : undefined
       }
-      bodyClassName="text-sm"
+      bodyClassName="space-y-6 text-sm"
     >
-      {editing ? (
-        <form onSubmit={handleSave} noValidate className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="billing-contacts">{t('fleets.billingProfile.contacts')}</Label>
-            <Textarea
-              id="billing-contacts"
-              value={form.contacts}
-              onChange={(e) => {
-                set('contacts', e.target.value);
-              }}
-              className={hasSubmitted && errors.contacts != null ? 'border-destructive' : undefined}
-            />
-            <p className="text-xs text-muted-foreground">
-              {t('fleets.billingProfile.contactsHelp')}
-            </p>
-            {hasSubmitted && errors.contacts != null && (
-              <p className="text-sm text-destructive">{errors.contacts}</p>
-            )}
-          </div>
+      <section className="space-y-4" data-testid="billing-group-recipient">
+        {groupTitle('groupRecipient')}
+        <FleetInvoiceRecipientField fleet={fleet} />
+        {editing ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            {textField('legalName', t('fleets.billingProfile.legalName'), 255)}
-            {textField('taxId', t('fleets.billingProfile.taxId'), 50)}
-            {textField('street', t('fleets.billingProfile.street'), 255)}
-            {textField('city', t('fleets.billingProfile.city'), 100)}
-            {textField('state', t('fleets.billingProfile.state'), 100)}
-            {textField('zip', t('fleets.billingProfile.zip'), 20)}
-            {textField('country', t('fleets.billingProfile.country'), 100)}
-            <div className="space-y-2">
-              <Label htmlFor="billing-language">{t('fleets.billingProfile.invoiceLanguage')}</Label>
-              <LanguageSelect
-                id="billing-language"
-                value={form.language}
-                onChange={(v) => {
-                  set('language', v);
-                }}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="billing-terms">{t('fleets.billingProfile.paymentTerms')}</Label>
-              <Input
-                id="billing-terms"
-                inputMode="numeric"
-                value={form.paymentTerms}
-                placeholder={t('fleets.billingProfile.paymentTermsDefault')}
-                className={hasSubmitted && errors.paymentTerms != null ? 'border-destructive' : ''}
-                onChange={(e) => {
-                  set('paymentTerms', e.target.value);
-                }}
-              />
-              <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.paymentTermsHelp')}
-              </p>
-              {hasSubmitted && errors.paymentTerms != null && (
-                <p className="text-sm text-destructive">{errors.paymentTerms}</p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="billing-invoice-date">{t('fleets.billingProfile.invoiceDate')}</Label>
-              <Select
-                id="billing-invoice-date"
-                value={form.invoiceDateMode}
-                onChange={(e) => {
-                  set(
-                    'invoiceDateMode',
-                    e.target.value === 'period_end' ? 'period_end' : 'run_date',
-                  );
-                }}
-              >
-                <option value="run_date">{t('fleets.billingProfile.invoiceDateRunDate')}</option>
-                <option value="period_end">
-                  {t('fleets.billingProfile.invoiceDatePeriodEnd')}
-                </option>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.invoiceDateHelp')}
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="billing-issuer">{t('fleets.billingProfile.issuer')}</Label>
-              <Select
-                id="billing-issuer"
-                value={form.invoiceIssuerId}
-                onChange={(e) => {
-                  set('invoiceIssuerId', e.target.value);
-                }}
-              >
-                <option value="">{t('fleets.billingProfile.issuerCompany')}</option>
-                {issuers.map((issuer) => (
-                  <option key={issuer.id} value={issuer.id}>
-                    {issuer.name}
-                  </option>
-                ))}
-                {form.invoiceIssuerId !== '' &&
-                  !issuers.some((issuer) => issuer.id === form.invoiceIssuerId) && (
-                    <option value={form.invoiceIssuerId}>{form.invoiceIssuerId}</option>
+            {recipient === 'fleet' ? (
+              <>
+                {textField('legalName', t('fleets.billingProfile.legalName'), 255)}
+                {textField('taxId', t('fleets.billingProfile.taxId'), 50)}
+                {textField('street', t('fleets.billingProfile.street'), 255)}
+                {textField('city', t('fleets.billingProfile.city'), 100)}
+                {textField('state', t('fleets.billingProfile.state'), 100)}
+                {textField('zip', t('fleets.billingProfile.zip'), 20)}
+                {textField('country', t('fleets.billingProfile.country'), 100)}
+                <div className="space-y-2">
+                  <Label htmlFor="billing-language">
+                    {t('fleets.billingProfile.invoiceLanguage')}
+                  </Label>
+                  <LanguageSelect
+                    id="billing-language"
+                    value={form.language}
+                    onChange={(v) => {
+                      set('language', v);
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-muted-foreground md:col-span-2">
+                  {t('fleets.billingProfile.memberBillTo')}
+                </p>
+                <div className="space-y-2 md:col-span-2">
+                  <Label htmlFor="billing-member-delivery">
+                    {t('fleets.billingProfile.memberDelivery')}
+                  </Label>
+                  <Select
+                    id="billing-member-delivery"
+                    className="sm:max-w-xs"
+                    value={form.memberInvoiceDelivery}
+                    onChange={(e) => {
+                      set('memberInvoiceDelivery', memberInvoiceDeliveryOf(e.target.value));
+                    }}
+                  >
+                    <option value="driver">{t(MEMBER_DELIVERY_LABEL.driver)}</option>
+                    <option value="billing_contacts">
+                      {t(MEMBER_DELIVERY_LABEL.billing_contacts)}
+                    </option>
+                    <option value="none">{t(MEMBER_DELIVERY_LABEL.none)}</option>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {t(MEMBER_DELIVERY_HELP[form.memberInvoiceDelivery])}
+                  </p>
+                </div>
+              </>
+            )}
+            {contactsUsed && contactsField}
+          </div>
+        ) : (
+          <dl className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {recipient === 'fleet' ? (
+              <>
+                <div>
+                  <dt className="text-muted-foreground">{t('fleets.billingProfile.billTo')}</dt>
+                  <dd className="font-medium">
+                    <div>{fleet.billingLegalName ?? fleet.name}</div>
+                    {address.map((line) => (
+                      <div key={line}>{line}</div>
+                    ))}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">{t('fleets.billingProfile.taxId')}</dt>
+                  <dd className="font-medium">{fleet.billingTaxId ?? '-'}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">
+                    {t('fleets.billingProfile.invoiceLanguage')}
+                  </dt>
+                  <dd className="font-medium">{languageLabel}</dd>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <dt className="text-muted-foreground">{t('fleets.billingProfile.billTo')}</dt>
+                  <dd className="font-medium">{t('fleets.billingProfile.memberBillTo')}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">
+                    {t('fleets.billingProfile.memberDelivery')}
+                  </dt>
+                  <dd className="font-medium" data-testid="fleet-billing-member-delivery">
+                    {t(MEMBER_DELIVERY_LABEL[savedDelivery])}
+                  </dd>
+                </div>
+              </>
+            )}
+            {savedContactsUsed && (
+              <div className="md:col-span-2">
+                <dt className="text-muted-foreground">{t('fleets.billingProfile.contacts')}</dt>
+                <dd className="font-medium break-all">
+                  {savedContacts.length > 0 ? (
+                    savedContacts.join(', ')
+                  ) : (
+                    <span className="text-warning">
+                      {t('fleets.billingProfile.contactsMissing')}
+                    </span>
                   )}
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.issuerHelp')}
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="billing-settlement">{t('fleets.billingProfile.settlement')}</Label>
-              <Select
-                id="billing-settlement"
-                value={form.accountSettlement}
-                onChange={(e) => {
-                  set('accountSettlement', e.target.value === 'external' ? 'external' : 'payment');
-                }}
-              >
-                <option value="payment">{t('fleets.billingProfile.settlementPayment')}</option>
-                <option value="external">{t('fleets.billingProfile.settlementExternal')}</option>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.settlementHelp')}
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="billing-member-delivery">
-                {t('fleets.billingProfile.memberDelivery')}
-              </Label>
-              <Select
-                id="billing-member-delivery"
-                value={form.memberInvoiceDelivery}
-                onChange={(e) => {
-                  set(
-                    'memberInvoiceDelivery',
-                    e.target.value === 'billing_contacts' ? 'billing_contacts' : 'driver',
-                  );
-                }}
-              >
-                <option value="driver">{t('fleets.billingProfile.memberDeliveryDriver')}</option>
-                <option value="billing_contacts">
-                  {t('fleets.billingProfile.memberDeliveryContacts')}
-                </option>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {t('fleets.billingProfile.memberDeliveryHelp')}
-              </p>
-            </div>
-            {form.accountSettlement === 'external' && (
-              <div className="space-y-2 md:col-span-2">
-                <Label htmlFor="billing-settlement-note">
-                  {t('fleets.billingProfile.settlementNote')}
-                </Label>
-                <Textarea
-                  id="billing-settlement-note"
-                  value={form.settlementNote}
-                  maxLength={500}
-                  placeholder={t('fleets.billingProfile.settlementNotePlaceholder')}
-                  onChange={(e) => {
-                    set('settlementNote', e.target.value);
-                  }}
-                />
+                </dd>
               </div>
             )}
-          </div>
-          <div className="space-y-1">
-            <div className="flex items-center gap-3">
-              <Toggle
-                id="billing-auto-invoice"
-                checked={form.autoInvoice}
-                aria-label={t('fleets.billingProfile.autoInvoice')}
-                onCheckedChange={(checked) => {
-                  set('autoInvoice', checked);
-                }}
-              />
-              <Label htmlFor="billing-auto-invoice">{t('fleets.billingProfile.autoInvoice')}</Label>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t('fleets.billingProfile.autoInvoiceHelp')}
-            </p>
-          </div>
-          <div className="flex justify-end gap-2">
-            <CancelButton
-              onClick={() => {
-                setEditing(false);
-              }}
-            />
-            <SaveButton isPending={mutation.isPending} />
-          </div>
-        </form>
-      ) : (
-        <dl className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div className="md:col-span-2">
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.contacts')}</dt>
-            <dd className="font-medium break-all">
-              {savedContacts.length > 0
-                ? savedContacts.join(', ')
-                : t('fleets.billingProfile.noContacts')}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.billTo')}</dt>
-            <dd className="font-medium">
-              <div>{fleet.billingLegalName ?? fleet.name}</div>
-              {address.map((line) => (
-                <div key={line}>{line}</div>
-              ))}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.taxId')}</dt>
-            <dd className="font-medium">{fleet.billingTaxId ?? '-'}</dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.invoiceLanguage')}</dt>
-            <dd className="font-medium">{languageLabel}</dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.issuer')}</dt>
-            <dd className="font-medium" data-testid="fleet-billing-issuer">
-              {issuerName(fleet.invoiceIssuerId)}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.memberDelivery')}</dt>
-            <dd className="font-medium" data-testid="fleet-billing-member-delivery">
-              {fleet.memberInvoiceDelivery === 'billing_contacts'
-                ? t('fleets.billingProfile.memberDeliveryContacts')
-                : t('fleets.billingProfile.memberDeliveryDriver')}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.settlement')}</dt>
-            <dd className="font-medium" data-testid="fleet-billing-settlement">
-              {fleet.accountSettlement === 'external'
-                ? t('fleets.billingProfile.settlementExternal')
-                : t('fleets.billingProfile.settlementPayment')}
-              {fleet.accountSettlement === 'external' && (
-                <div className="font-normal text-muted-foreground">
-                  {fleet.settlementNote ?? t('fleets.billingProfile.settlementNoteDefault')}
+          </dl>
+        )}
+      </section>
+
+      <section className="space-y-4" data-testid="billing-group-issue">
+        {groupTitle('groupIssue')}
+        {editing ? (
+          <form onSubmit={handleSave} noValidate className="space-y-4" id="billing-profile-form">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="billing-issuer">{t('fleets.billingProfile.issuer')}</Label>
+                <Select
+                  id="billing-issuer"
+                  value={form.invoiceIssuerId}
+                  onChange={(e) => {
+                    set('invoiceIssuerId', e.target.value);
+                  }}
+                >
+                  <option value="">{t('fleets.billingProfile.issuerCompany')}</option>
+                  {issuers.map((issuer) => (
+                    <option key={issuer.id} value={issuer.id}>
+                      {issuer.name}
+                    </option>
+                  ))}
+                  {form.invoiceIssuerId !== '' &&
+                    !issuers.some((issuer) => issuer.id === form.invoiceIssuerId) && (
+                      <option value={form.invoiceIssuerId}>{form.invoiceIssuerId}</option>
+                    )}
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('fleets.billingProfile.issuerHelp')}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="billing-invoice-date">
+                  {t('fleets.billingProfile.invoiceDate')}
+                </Label>
+                <Select
+                  id="billing-invoice-date"
+                  value={form.invoiceDateMode}
+                  onChange={(e) => {
+                    set(
+                      'invoiceDateMode',
+                      e.target.value === 'period_end' ? 'period_end' : 'run_date',
+                    );
+                  }}
+                >
+                  <option value="run_date">{t('fleets.billingProfile.invoiceDateRunDate')}</option>
+                  <option value="period_end">
+                    {t('fleets.billingProfile.invoiceDatePeriodEnd')}
+                  </option>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('fleets.billingProfile.invoiceDateHelp')}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="billing-settlement">{t('fleets.billingProfile.settlement')}</Label>
+                <Select
+                  id="billing-settlement"
+                  value={form.accountSettlement}
+                  onChange={(e) => {
+                    set(
+                      'accountSettlement',
+                      e.target.value === 'external' ? 'external' : 'payment',
+                    );
+                  }}
+                >
+                  <option value="payment">{t('fleets.billingProfile.settlementPayment')}</option>
+                  <option value="external">{t('fleets.billingProfile.settlementExternal')}</option>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('fleets.billingProfile.settlementHelp')}
+                </p>
+              </div>
+              {form.accountSettlement === 'payment' && (
+                <div className="space-y-2">
+                  <Label htmlFor="billing-terms">{t('fleets.billingProfile.paymentTerms')}</Label>
+                  <Input
+                    id="billing-terms"
+                    inputMode="numeric"
+                    value={form.paymentTerms}
+                    placeholder={t('fleets.billingProfile.paymentTermsDefault')}
+                    className={
+                      hasSubmitted && errors.paymentTerms != null ? 'border-destructive' : ''
+                    }
+                    onChange={(e) => {
+                      set('paymentTerms', e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('fleets.billingProfile.paymentTermsHelp')}
+                  </p>
+                  {hasSubmitted && errors.paymentTerms != null && (
+                    <p className="text-sm text-destructive">{errors.paymentTerms}</p>
+                  )}
                 </div>
               )}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.paymentTerms')}</dt>
-            <dd className="font-medium">
-              {fleet.paymentTermsDays == null
-                ? t('fleets.billingProfile.paymentTermsDefault')
-                : String(fleet.paymentTermsDays)}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.invoiceDate')}</dt>
-            <dd className="font-medium">
-              {fleet.invoiceDateMode === 'period_end'
-                ? t('fleets.billingProfile.invoiceDatePeriodEnd')
-                : t('fleets.billingProfile.invoiceDateRunDate')}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t('fleets.billingProfile.autoInvoice')}</dt>
-            <dd>
-              <Badge variant={fleet.autoInvoice === true ? 'success' : 'outline'}>
-                {fleet.autoInvoice === true ? t('fleets.billing.on') : t('fleets.billing.off')}
-              </Badge>
-            </dd>
-          </div>
-        </dl>
-      )}
+              {form.accountSettlement === 'external' && (
+                <div className="space-y-2 md:col-span-2">
+                  <Label htmlFor="billing-settlement-note">
+                    {t('fleets.billingProfile.settlementNote')}
+                  </Label>
+                  <Textarea
+                    id="billing-settlement-note"
+                    value={form.settlementNote}
+                    maxLength={500}
+                    placeholder={t('fleets.billingProfile.settlementNotePlaceholder')}
+                    onChange={(e) => {
+                      set('settlementNote', e.target.value);
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center gap-3">
+                <Toggle
+                  id="billing-auto-invoice"
+                  checked={form.autoInvoice}
+                  aria-label={t('fleets.billingProfile.autoInvoice')}
+                  onCheckedChange={(checked) => {
+                    set('autoInvoice', checked);
+                  }}
+                />
+                <Label htmlFor="billing-auto-invoice">
+                  {t('fleets.billingProfile.autoInvoice')}
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('fleets.billingProfile.autoInvoiceHelp')}
+              </p>
+            </div>
+            <div className="flex justify-end gap-2">
+              <CancelButton
+                onClick={() => {
+                  setEditing(false);
+                }}
+              />
+              <SaveButton isPending={mutation.isPending} />
+            </div>
+          </form>
+        ) : (
+          <dl className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div>
+              <dt className="text-muted-foreground">{t('fleets.billingProfile.issuer')}</dt>
+              <dd className="font-medium" data-testid="fleet-billing-issuer">
+                {issuerName(fleet.invoiceIssuerId)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('fleets.billingProfile.invoiceDate')}</dt>
+              <dd className="font-medium">
+                {fleet.invoiceDateMode === 'period_end'
+                  ? t('fleets.billingProfile.invoiceDatePeriodEnd')
+                  : t('fleets.billingProfile.invoiceDateRunDate')}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('fleets.billingProfile.settlement')}</dt>
+              <dd className="font-medium" data-testid="fleet-billing-settlement">
+                {external
+                  ? t('fleets.billingProfile.settlementExternal')
+                  : t('fleets.billingProfile.settlementPayment')}
+                {external && (
+                  <div className="font-normal text-muted-foreground">
+                    {fleet.settlementNote ?? t('fleets.billingProfile.settlementNoteDefault')}
+                  </div>
+                )}
+              </dd>
+            </div>
+            {!external && (
+              <div>
+                <dt className="text-muted-foreground">{t('fleets.billingProfile.paymentTerms')}</dt>
+                <dd className="font-medium">
+                  {fleet.paymentTermsDays == null
+                    ? t('fleets.billingProfile.paymentTermsDefault')
+                    : String(fleet.paymentTermsDays)}
+                </dd>
+              </div>
+            )}
+            <div>
+              <dt className="text-muted-foreground">{t('fleets.billingProfile.autoInvoice')}</dt>
+              <dd>
+                <Badge variant={fleet.autoInvoice === true ? 'success' : 'outline'}>
+                  {fleet.autoInvoice === true ? t('fleets.billing.on') : t('fleets.billing.off')}
+                </Badge>
+              </dd>
+            </div>
+          </dl>
+        )}
+      </section>
     </TabPanel>
   );
 }

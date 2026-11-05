@@ -320,6 +320,21 @@ describe('sendAccountInvoiceEmail for a member invoice', () => {
     expect(h.statements).toHaveLength(0);
   });
 
+  it('sends nothing and keeps the invoice unsent when the fleet keeps member invoices in the CSMS', async () => {
+    h.delivery = 'none';
+    h.contacts = { emails: ['payroll@acme.test'], language: 'de' };
+    h.detail = { ...detail({ memberBilled: true, driverId: 'drv_1' }), driver: memberDriver };
+
+    for (const mode of ['once', 'resend'] as const) {
+      expect(await sendAccountInvoiceEmail('inv_f1', mode, deps, audit)).toEqual({
+        status: 'delivery_off',
+      });
+    }
+    expect(dispatchDriverNotification).not.toHaveBeenCalled();
+    expect(dispatchSystemNotification).not.toHaveBeenCalled();
+    expect(h.statements).toHaveLength(0);
+  });
+
   it('sends a member credit note to the billing contacts as a fleet credit note', async () => {
     h.delivery = 'billing_contacts';
     h.detail = {
