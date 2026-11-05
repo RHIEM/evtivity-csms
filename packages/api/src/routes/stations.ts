@@ -813,6 +813,12 @@ const stationCreated = z
 
 const stationUpdated = stationCreated
   .extend({
+    portalListed: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether the driver portal lists the station in its search, map and location pages; drivers reach an unlisted station by its QR code or a link',
+      ),
     simAttachment: z
       .enum([
         'attached',
@@ -2024,6 +2030,7 @@ export function stationRoutes(app: FastifyInstance): void {
             pendingSecurityProfile: chargingStations.pendingSecurityProfile,
             ocppProtocol: chargingStations.ocppProtocol,
             hasPassword: sql<boolean>`${chargingStations.basicAuthPasswordHash} IS NOT NULL`,
+            portalListed: chargingStations.portalListed,
             createdAt: chargingStations.createdAt,
             updatedAt: chargingStations.updatedAt,
           });
