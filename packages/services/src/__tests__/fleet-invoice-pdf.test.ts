@@ -141,6 +141,16 @@ describe('fleet invoice PDF helpers', () => {
     ]);
   });
 
+  it('reads the employee number of each driver group from the line metadata', () => {
+    const numbered = line(1, 'ses_1', 'drv_a', 'Anna Berg', 100);
+    numbered.metadata = {
+      ...(numbered.metadata as Record<string, unknown>),
+      employeeNumber: '4711',
+    };
+    const groups = groupLinesByDriver([numbered, line(2, 'ses_2', 'drv_z', 'Zoe Ng', 100)]);
+    expect(groups.map((g) => g.employeeNumber)).toEqual(['4711', null]);
+  });
+
   it('keeps sessions of a deleted driver in one group without an id', () => {
     const groups = groupLinesByDriver([line(1, 'ses_1', null, '', 100)]);
     expect(groups).toEqual([expect.objectContaining({ driverId: null, driverName: '' })]);
@@ -151,6 +161,7 @@ describe('fleet invoice PDF helpers', () => {
       name: 'Acme Logistics GmbH',
       lines: ['Hafenstr. 1', '20457 Hamburg', 'Germany'],
       taxId: 'DE123456789',
+      employeeNumber: null,
     });
     expect(readBillTo(null)).toBeNull();
     expect(readBillTo({ street: 'x' })).toBeNull();
@@ -164,6 +175,18 @@ describe('fleet invoice PDF helpers', () => {
 });
 
 describe('generateInvoicePdf for a fleet invoice', () => {
+  it('prints the employee number after the driver name of its group', async () => {
+    const detail = fleetDetail();
+    detail.lineItems = detail.lineItems.map((item) =>
+      (item.metadata as Record<string, unknown>)['driverId'] === 'drv_a'
+        ? { ...item, metadata: { ...(item.metadata as object), employeeNumber: '4711' } }
+        : item,
+    );
+    const text = pdfText(await generateInvoicePdf(detail));
+    expect(text).toContain('Anna Berg · Employee no.: 4711');
+    expect(text).not.toContain('Zoe Ng · ');
+  });
+
   it('prints the bill-to block, the period and each driver with a subtotal', async () => {
     const text = pdfText(await generateInvoicePdf(fleetDetail()));
     expect(text).toContain('Acme Logistics GmbH');
@@ -172,6 +195,7 @@ describe('generateInvoicePdf for a fleet invoice', () => {
     expect(text).toContain('September 2026');
     expect(text).toContain('Subtotal Anna Berg');
     expect(text).toContain('Subtotal Zoe Ng');
+    expect(text).not.toContain('Employee no.');
     expect(text).toContain('Depot CS-01');
     expect(text.indexOf('Subtotal Anna Berg')).toBeLessThan(text.indexOf('Zoe Ng'));
   });
@@ -224,12 +248,26 @@ describe('generateInvoicePdf for a member invoice', () => {
       name: 'Anna Berg',
       lines: ['Lindenweg 3', '28195 Bremen', 'Deutschland', 'anna@fleet.test'],
       taxId: null,
+      employeeNumber: null,
     });
     expect(readBillTo(memberDetail({ address: false }).invoice.billTo)).toEqual({
       name: 'Anna Berg',
       lines: ['anna@fleet.test'],
       taxId: null,
+      employeeNumber: null,
     });
+  });
+
+  it('prints the employee number kept on the member invoice and its credit note', async () => {
+    for (const kind of ['invoice', 'credit_note'] as const) {
+      const detail = memberDetail({ kind });
+      detail.invoice.billTo = {
+        ...(detail.invoice.billTo as Record<string, unknown>),
+        employeeNumber: '4711',
+      };
+      expect(pdfText(await generateInvoicePdf(detail))).toContain('Personalnr.: 4711');
+    }
+    expect(pdfText(await generateInvoicePdf(memberDetail()))).not.toContain('Personalnr.');
   });
 
   it('prints the driver bill-to, the fleet charged and the lines without driver groups', async () => {

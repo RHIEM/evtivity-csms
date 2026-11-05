@@ -87,6 +87,10 @@ export const drivers = pgTable(
     billingState: varchar('billing_state', { length: 100 }),
     billingZip: varchar('billing_zip', { length: 20 }),
     billingCountry: varchar('billing_country', { length: 100 }),
+    // The operator's reference for the driver, e.g. a personnel number. Printed
+    // on the driver's invoices and credit notes when set; the driver sees it
+    // read-only. Not unique.
+    employeeNumber: varchar('employee_number', { length: 50 }),
     // When the driver's personal data was erased (POST /v1/drivers/:id/erase).
     // The row stays as an anonymized stub for the sessions and invoices.
     erasedAt: timestamp('erased_at', { withTimezone: true }),

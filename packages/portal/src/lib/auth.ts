@@ -29,6 +29,8 @@ export interface Driver {
   priceDisplay: PriceDisplay | null;
   isActive: boolean;
   emailVerified: boolean;
+  /** The operator's reference (e.g. a personnel number); read-only for the driver. */
+  employeeNumber?: string | null;
 }
 
 interface LoginResponse {

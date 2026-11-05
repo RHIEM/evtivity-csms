@@ -237,6 +237,8 @@
   },
   "profile": {
     "email": "Correo electrónico",
+    "employeeNumber": "Número de empleado",
+    "employeeNumberHelp": "Lo establece el operador. Aparece en sus facturas.",
     "firstName": "Nombre",
     "lastName": "Apellido",
     "phone": "Teléfono",

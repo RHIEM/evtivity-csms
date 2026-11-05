@@ -142,6 +142,7 @@ function detail(overrides: Partial<InvoiceDetail> = {}): InvoiceDetail {
       lastName: 'Weber',
       email: null,
       language: 'en',
+      employeeNumber: null,
     },
     creditedInvoice: null,
     creditNote: null,

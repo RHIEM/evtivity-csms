@@ -237,6 +237,8 @@
   },
   "profile": {
     "email": "E-Mail",
+    "employeeNumber": "Personalnummer",
+    "employeeNumberHelp": "Vom Betreiber hinterlegt. Steht auf deinen Rechnungen.",
     "firstName": "Vorname",
     "lastName": "Nachname",
     "phone": "Telefon",

@@ -138,6 +138,15 @@ export function AccountPersonalInfo(): React.JSX.Element {
         </label>
         <Input id="acctEmail" value={driver?.email ?? ''} disabled />
       </div>
+      {driver?.employeeNumber != null && driver.employeeNumber !== '' && (
+        <div className="space-y-2">
+          <label htmlFor="acctEmployeeNumber" className="block text-sm font-medium leading-6">
+            {t('profile.employeeNumber')}
+          </label>
+          <Input id="acctEmployeeNumber" value={driver.employeeNumber} disabled />
+          <p className="text-xs text-muted-foreground">{t('profile.employeeNumberHelp')}</p>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-2">
           <label htmlFor="acctFirst" className="block text-sm font-medium leading-6">

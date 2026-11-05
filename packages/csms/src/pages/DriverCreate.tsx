@@ -32,6 +32,7 @@ interface CreateDriverBody {
   lastName: string;
   email?: string;
   phone?: string;
+  employeeNumber?: string;
   language: string;
 }
 
@@ -44,6 +45,7 @@ export function DriverCreate(): React.JSX.Element {
   const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  const [employeeNumber, setEmployeeNumber] = useState('');
   const [language, setLanguage] = useState('en');
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [avatar, setAvatar] = useState<AvatarChoice | null>(null);
@@ -94,6 +96,7 @@ export function DriverCreate(): React.JSX.Element {
     const body: CreateDriverBody = { firstName, lastName, language };
     if (email.trim() !== '') body.email = email;
     if (phone.trim() !== '') body.phone = phone;
+    if (employeeNumber.trim() !== '') body.employeeNumber = employeeNumber.trim();
     createMutation.mutate(body);
   }
 
@@ -177,6 +180,20 @@ export function DriverCreate(): React.JSX.Element {
                   setPhone(e.target.value);
                 }}
               />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="driver-employee-number" className="leading-6">
+                {t('drivers.employeeNumber')}
+              </Label>
+              <Input
+                id="driver-employee-number"
+                value={employeeNumber}
+                maxLength={50}
+                onChange={(e) => {
+                  setEmployeeNumber(e.target.value);
+                }}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.employeeNumberHelp')}</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="driver-language" className="leading-6">

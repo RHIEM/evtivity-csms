@@ -228,7 +228,14 @@ function detail(language: string): InvoiceDetail {
         createdAt: now,
       },
     ],
-    driver: { id: 'drv_1', firstName: 'Jana', lastName: 'Weber', email: null, language },
+    driver: {
+      id: 'drv_1',
+      firstName: 'Jana',
+      lastName: 'Weber',
+      email: null,
+      language,
+      employeeNumber: null,
+    },
     fleet: null,
     creditedInvoice: null,
     creditNote: null,
@@ -442,6 +449,16 @@ describe('describeLineItem', () => {
 });
 
 describe('generateInvoicePdf', () => {
+  it("prints the driver's employee number when set", async () => {
+    const numbered = detail('de');
+    numbered.driver = {
+      ...(numbered.driver as NonNullable<typeof numbered.driver>),
+      employeeNumber: ' 4711 ',
+    };
+    expect(pdfContent(await generateInvoicePdf(numbered)).text).toContain('Personalnr.: 4711');
+    expect(pdfContent(await generateInvoicePdf(detail('de'))).text).not.toContain('Personalnr.');
+  });
+
   it('renders German labels with Helvetica, the tax rate per line, and the per-rate tax summary', async () => {
     const { text, fonts } = pdfContent(await generateInvoicePdf(detail('de')));
     expect(fonts).toEqual(['Helvetica', 'Helvetica-Bold']);

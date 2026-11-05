@@ -110,6 +110,7 @@ export async function eraseDriver(
         priceDisplay: null,
         lastNotificationReadAt: null,
         billingName: null,
+        employeeNumber: null,
         billingStreet: null,
         billingCity: null,
         billingState: null,

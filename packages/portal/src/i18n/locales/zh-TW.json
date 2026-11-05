@@ -237,6 +237,8 @@
   },
   "profile": {
     "email": "電子郵件",
+    "employeeNumber": "員工編號",
+    "employeeNumberHelp": "由營運商設定。顯示在您的發票上。",
     "firstName": "名",
     "lastName": "姓",
     "phone": "電話",

@@ -66,6 +66,8 @@ interface BillToBlock {
   name: string;
   lines: string[];
   taxId: string | null;
+  /** Member invoice: the driver's employee number at issue. */
+  employeeNumber: string | null;
 }
 
 function stringField(record: Record<string, unknown>, key: string): string | null {
@@ -89,6 +91,7 @@ export function readBillTo(billTo: unknown): BillToBlock | null {
     name,
     lines: [...addressLines(record), ...(email != null ? [email] : [])],
     taxId: stringField(record, 'taxId'),
+    employeeNumber: stringField(record, 'employeeNumber'),
   };
 }
 
@@ -226,6 +229,8 @@ type LineItem = InvoiceDetail['lineItems'][number];
 export interface DriverLineGroup {
   driverId: string | null;
   driverName: string;
+  /** The driver's employee number at issue, printed after the name. */
+  employeeNumber: string | null;
   items: LineItem[];
   /** Sum of the lines' net amounts. */
   netCents: number;
@@ -245,10 +250,14 @@ export function groupLinesByDriver(lineItems: LineItem[]): DriverLineGroup[] {
         : {};
     const driverId = typeof meta['driverId'] === 'string' ? meta['driverId'] : null;
     const driverName = typeof meta['driverName'] === 'string' ? meta['driverName'] : '';
+    const employeeNumber =
+      typeof meta['employeeNumber'] === 'string' && meta['employeeNumber'] !== ''
+        ? meta['employeeNumber']
+        : null;
     const key = driverId ?? '';
     let group = byKey.get(key);
     if (group == null) {
-      group = { driverId, driverName, items: [], netCents: 0 };
+      group = { driverId, driverName, employeeNumber, items: [], netCents: 0 };
       byKey.set(key, group);
       groups.push(group);
     }
@@ -487,15 +496,25 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
   const billTo = readBillTo(invoice.billTo);
   const billedToName =
     billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
-  const billedToDetails =
+  // The employee number: kept on a member invoice at issue, read from the
+  // driver on a driver invoice (as its name and email); printed when set.
+  const employeeNumber =
     billTo != null
+      ? billTo.employeeNumber
+      : driver?.employeeNumber != null && driver.employeeNumber.trim() !== ''
+        ? driver.employeeNumber.trim()
+        : null;
+  const billedToDetails = [
+    ...(employeeNumber != null ? [labels.employeeNumber.replace('{id}', employeeNumber)] : []),
+    ...(billTo != null
       ? [
           ...billTo.lines,
           ...(billTo.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
         ]
       : driver?.email != null && driver.email !== ''
         ? [driver.email]
-        : [];
+        : []),
+  ];
   if (isMemberInvoice && fleet != null) {
     billedToDetails.push(labels.viaFleet.replace('{fleet}', fleet.name));
   }
@@ -631,7 +650,11 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     // net subtotal per driver; the tax summary below covers the whole invoice.
     for (const group of groupLinesByDriver(lineItems)) {
       y = ensure(y, 50);
-      const name = group.driverName !== '' ? group.driverName : labels.unknownDriver;
+      const driverName = group.driverName !== '' ? group.driverName : labels.unknownDriver;
+      const name =
+        group.employeeNumber != null
+          ? `${driverName} · ${labels.employeeNumber.replace('{id}', group.employeeNumber)}`
+          : driverName;
       doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, MARGIN, y, {
         width: CONTENT_WIDTH,
       });

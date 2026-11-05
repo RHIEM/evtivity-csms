@@ -25,7 +25,7 @@ vi.mock('../driver/DriverPortalAccessCard', () => ({ DriverPortalAccessCard: () 
 
 import { DriverDetailsTab } from '../driver/DriverDetailsTab';
 
-function renderTab(language = 'de'): void {
+function renderTab(language = 'de', employeeNumber: string | null = null): void {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
@@ -38,6 +38,7 @@ function renderTab(language = 'de'): void {
           phone: null,
           language,
           isActive: true,
+          employeeNumber,
           createdAt: '2026-10-01T00:00:00Z',
           updatedAt: '2026-10-01T00:00:00Z',
         }}
@@ -73,6 +74,41 @@ describe('DriverDetailsTab', () => {
       expect(patchMock).toHaveBeenCalledWith(
         '/v1/drivers/drv_1',
         expect.objectContaining({ language: 'ko' }),
+      );
+    });
+  });
+
+  it('shows the employee number and removes it when the field is emptied', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('de', '4711');
+    expect(screen.getByTestId('driver-employee-number').textContent).toBe('4711');
+
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const input = screen.getByLabelText<HTMLInputElement>('drivers.employeeNumber');
+    expect(input.value).toBe('4711');
+    fireEvent.change(input, { target: { value: ' ' } });
+    fireEvent.submit(input.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ employeeNumber: null }),
+      );
+    });
+  });
+
+  it('sends a new employee number trimmed', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('de');
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const input = screen.getByLabelText<HTMLInputElement>('drivers.employeeNumber');
+    fireEvent.change(input, { target: { value: ' 0815 ' } });
+    fireEvent.submit(input.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ employeeNumber: '0815' }),
       );
     });
   });
