@@ -395,6 +395,16 @@ describe('generatePdfLetterheadPreview', () => {
   it("names an invoice issuer's seller on the sample", async () => {
     const pdf = await generatePdfLetterheadPreview(letterhead(), 'de', {
       name: 'RHIEM Services GmbH',
+      street: null,
+      zip: null,
+      city: null,
+      state: null,
+      country: null,
+      taxId: null,
+      taxIdLabel: null,
+      registrationNumber: null,
+      email: null,
+      phone: null,
     });
     const pages = pageStreams(pdf);
     expect(streamText(pages[1] ?? '')).toContain('RHIEM Services GmbH');

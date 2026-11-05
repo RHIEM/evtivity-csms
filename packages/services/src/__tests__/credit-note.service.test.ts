@@ -306,7 +306,11 @@ describe('creditInvoice', () => {
     await creditInvoice('inv_1', 'Wrong tariff');
 
     const [note] = h.state.inserted['invoices'] ?? [];
-    expect(note).toMatchObject({ invoiceNumber: 'CN-202606-0001', issuerId: null, letterheadId: 'lhd_company' });
+    expect(note).toMatchObject({
+      invoiceNumber: 'CN-202606-0001',
+      issuerId: null,
+      letterheadId: 'lhd_company',
+    });
     expect(vi.mocked(allocateIssuerInvoiceNumber)).not.toHaveBeenCalled();
   });
 

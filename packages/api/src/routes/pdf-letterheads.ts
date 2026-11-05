@@ -105,7 +105,7 @@ export const createBody = z.object({
     .boolean()
     .optional()
     .describe(
-      'Make the new version current right away (pdf.letterhead, or the invoice issuer\'s letterhead); default false',
+      "Make the new version current right away (pdf.letterhead, or the invoice issuer's letterhead); default false",
     ),
 });
 
