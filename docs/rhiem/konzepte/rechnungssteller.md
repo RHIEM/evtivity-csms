@@ -95,18 +95,18 @@ Ein eigener Status `settled` wäre sauberer, ändert aber ein Enum, auf das Filt
 
 Je Rechnungssteller und Art (Rechnung, Gutschrift) vier Felder:
 
-| Feld      | Bedeutung                                            | Beispiel RS        | Beispiel RPP    |
-| --------- | ---------------------------------------------------- | ------------------ | --------------- |
-| Präfix    | optional, frei                                       | leer               | `RPP-`          |
-| Jahr      | zweistelliges Jahr nach dem Präfix, getrennt mit `-` | nein               | ja              |
-| Startwert | erste Nummer                                         | 10000              | 1               |
-| Stellen   | Mindestlänge, mit Nullen aufgefüllt                  | 0                  | 4               |
-| Ergebnis  |                                                      | `10000`, `10001` … | `RPP-26-0001` … |
+| Feld      | Bedeutung                                         | Beispiel RS        | Beispiel RI    |
+| --------- | ------------------------------------------------- | ------------------ | -------------- |
+| Präfix    | optional, frei                                    | leer               | `RI-`          |
+| Jahr      | zweistelliges Jahr nach dem Präfix, ohne Trennung | nein               | ja             |
+| Startwert | erste Nummer                                      | 10000              | 1              |
+| Stellen   | Mindestlänge, mit Nullen aufgefüllt               | 0                  | 5              |
+| Ergebnis  |                                                   | `10000`, `10001` … | `RI-2600001` … |
 
 - **Mit Jahr beginnt der Zähler jedes Jahr neu beim Startwert, ohne Jahr läuft er durch.**
 - Maßgeblich ist das Jahr des Rechnungsdatums, wie heute in der Systemzeitzone. Bei „Rechnungsdatum = Monatsletzter“ trägt die Dezember-Rechnung also noch das alte Jahr.
-- Die Zähler liegen in der bestehenden Tabelle `invoice_number_counters`, eine Zeile je Rechnungssteller, Art und Jahr (`name` z. B. `iss_…:invoice:2026` bzw. `iss_…:credit_note:all`). Die Zeile wird bei der ersten Vergabe angelegt (`INSERT … ON CONFLICT DO UPDATE … RETURNING`). Wie heute ist sie bis zum Commit gesperrt, die Vergabe bleibt also lückenlos.
-- `invoices.invoice_number` bleibt global eindeutig. Beim Speichern warnt das CSMS, wenn sich zwei Kreise überschneiden können (gleiches Präfix, gleiche Jahreseinstellung und überlappende Bereiche). Hart sichert der `UNIQUE`-Index: Eine doppelte Nummer lässt die Ausstellung scheitern, der Monatslauf protokolliert das wie andere Fehler (`fleet_member_invoice_run_failures`).
+- Die Zähler liegen in der Tabelle `invoice_issuer_number_counters`, eine Zeile je Rechnungssteller, Art und Jahr (Jahr 0 für einen Kreis ohne Jahr). Die Zeile wird bei der ersten Vergabe angelegt (`INSERT … ON CONFLICT DO UPDATE … RETURNING`). Wie heute ist sie bis zum Commit gesperrt, die Vergabe bleibt also lückenlos.
+- `invoices.invoice_number` bleibt global eindeutig. **Kreise sollten sich nicht überschneiden. Tun sie es doch, teilen sie sich die Nummern** (Rückmeldung 05.11.2026): Die Vergabe prüft jede gezogene Nummer gegen die vorhandenen Belege und überspringt eine bereits vergebene, gleich woher sie stammt. Eine Transaktionssperre auf die Nummer (`pg_advisory_xact_lock`) lässt einen gleichzeitigen Beleg eines anderen Rechnungsstellers warten, bis der erste festgeschrieben ist; danach sieht er die Nummer als vergeben und zieht die nächste. Für den einzelnen Rechnungssteller entstehen dann Lücken, zusammen bleibt der Kreis lückenlos. Das Formular weist darauf hin.
 - **Nach der ersten vergebenen Nummer sind Präfix, Jahr und Stellen gesperrt.** Der Startwert gilt nur für neue Zähler (also ein neues Jahr), damit kein Kreis rückwärts läuft.
 
 ## Abbildung der drei Fälle
@@ -140,7 +140,6 @@ Wenn die Bausteine in `rhiem/main` sind und Fall 3 damit läuft:
 
 - **E-Mail mit weiteren Rechnungsanforderungen** abwarten und einarbeiten.
 - **Steuerlich:** Wer leistet, wenn ein Mitarbeiter der RPP an einer Säule der RS lädt? Rechnet trotzdem der Arbeitgeber ab? Mit der Steuerberatung klären, ebenso den Text für Gutschriften bei Gehaltsverrechnung.
-- **Logo und Fußzeile je Rechnungssteller?** Im Stamm sind sie global (`pdf.logo`, `pdf.footer`). Falls jede GmbH ihr eigenes Logo bzw. ihre eigene Fußzeile (Geschäftsführer, Registergericht) braucht, kommen zwei Felder an den Rechnungssteller.
 - **Portal:** Soll der Mitarbeiter seine Gehaltsverrechnungs-Rechnungen im Portal sehen, oder nur die Stelle der GmbH per E-Mail?
 - **Nummernkreise:** endgültige Werte je GmbH.
 
@@ -184,6 +183,24 @@ Merges in `rhiem/main`: `c90d124b` (2), `dd8e5588` (1), `5cad30bf` (4), `a421875
 3. Fahrer den Flotten zuordnen. Unabgerechnete Sitzungen seit 01.11.2026 und die Altdaten des Nutzers per SQL umstempeln (`billing_mode`, `billing_fleet_id`, `member_billed`, nur wo `invoice_id IS NULL`); vorher an einem Produktions-Dump lokal testen.
 4. In der Produktion `invoice.externalInvoicing` löschen (Einstellung des zurückgebauten Ladesitzungsberichts) und prüfen, ob das Ereignis `invoice.MemberSessionReport` noch in den Benachrichtigungseinstellungen steht.
 
+## Rückmeldung 05.11.2026
+
+**Umgesetzt** (`fix(invoices)` `76f28d3e` auf `feature/invoice-issuers`, Merge `2d3eda1c`):
+
+- Kein Trennzeichen nach dem Jahr: `RI-2600001` statt `RI-26-00001`.
+- Überschneidende Kreise teilen sich die Nummern; die Vergabe überspringt bereits vergebene (siehe Nummernformat). Hinweistext im Formular entsprechend („fortlaufend“ statt „lückenlos“).
+
+**Freigegeben, in Arbeit:**
+
+1. **Eigener Tab „Rechnungssteller“** in den Einstellungen hinter „Unternehmen“ mit kurzer Einleitung. Nur der eigene Block zieht um, die Upstream-Blöcke bleiben unter „Unternehmen“. Der Hinweis im Rechnungsprofil der Flotte verlinkt direkt auf den Tab.
+2. **PDF-Logo und Fußzeile je Rechnungssteller** (optional, Zweig `feature/invoice-issuer-branding`): `invoice_issuers.pdf_logo` (`NULL` = Logo des Unternehmens) und `pdf_footer` (`NULL` = Fußzeile des Unternehmens, leer = keine Fußzeile). Wie beim Unternehmen live beim Erzeugen des PDFs gelesen, keine Momentaufnahme an der Rechnung. Die Druckansicht holt das Logo des Rechnungsstellers der Rechnung. Berichte behalten das globale Branding.
+3. **Rechnungsempfang als Gruppe im Rechnungsprofil** (auf `feature/member-invoice-delivery`, nur Oberfläche, Daten und API unverändert):
+   - „Rechnung an“ (Flotte / Jeden Fahrer) steht oben in der Gruppe; die Umschaltung speichert wie bisher sofort nach Bestätigung. Die Bestätigung nennt die E-Mail „Abrechnung auf Rechnung geändert“ (`fleet.AccountBillingChanged`, abschaltbar unter Benachrichtigungen → Fahrer-Ereignisse) und dass vor dem Wechsel gestartete Ladevorgänge noch auf eine letzte Flottenrechnung kommen.
+   - Bei „Flotte“: Rechnungsempfänger (Firmenname, Anschrift, USt-ID), Rechnungssprache und „Versand per E-Mail an“ (bisher „Rechnungskontakte“).
+   - Bei „Jeden Fahrer“: Hinweis, dass der Fahrer mit seiner Rechnungsadresse Empfänger ist, und „Versand“ mit drei Optionen: an den Fahrer, an feste E-Mail-Adressen (dann erscheint „Versand per E-Mail an“), nicht versenden (nur im CSMS, neuer Wert `none` in `member_invoice_delivery`).
+   - Warnung, wenn bei Versand an E-Mail-Adressen keine hinterlegt ist. Ausgeblendete Werte bleiben gespeichert.
+   - Gruppe „Ausstellung“ für beide: Rechnungssteller, Rechnungsdatum, Verrechnung mit Hinweis, Zahlungsziel (ausgeblendet bei Verrechnung extern), automatische Monatsrechnung.
+
 ## Annahmen und Rückfragen
 
 Während der Umsetzung getroffene Annahmen. Bitte bestätigen oder korrigieren; in Ausnahmen bauen wir zurück.
@@ -197,9 +214,9 @@ Während der Umsetzung getroffene Annahmen. Bitte bestätigen oder korrigieren; 
 
 3. **Eigene Zählertabelle** `invoice_issuer_number_counters` (Rechnungssteller, Art, Jahr) statt `invoice_number_counters`: deren Namensspalte (`varchar(32)`) ist für Schlüssel mit ID zu kurz.
 4. **Präfix:** nur Buchstaben, Ziffern und `- . _`, höchstens 20 Zeichen. Kein `/`, weil die Nummer den PDF-Dateinamen bildet.
-5. **Trennzeichen:** Das Präfix bringt sein Trennzeichen selbst mit (`RPP-`). Nach dem Jahr steht immer `-` (`RPP-26-0001`, ohne Präfix `26-0001`).
+5. **Trennzeichen:** Das Präfix bringt sein Trennzeichen selbst mit (`RI-`). Nach dem Jahr steht **kein** Trennzeichen (`RI-2600001`, ohne Präfix `2600001`; Rückmeldung 05.11.2026).
 6. **Sperre:** Präfix, Jahr, Startwert und Stellen einer Belegart sind gesperrt, sobald der Rechnungssteller einen Beleg dieser Art ausgestellt hat (auch der Startwert für künftige Jahre). Die Kopfdaten (Name, Anschrift, USt-ID) bleiben änderbar und gelten für später ausgestellte Belege.
-7. **Überschneidung von Kreisen** wird nicht beim Speichern geprüft, nur ein Hinweis im Formular. Hart sichert der globale `UNIQUE`-Index der Rechnungsnummer: Eine doppelte Nummer lässt die Ausstellung scheitern.
+7. **Überschneidung von Kreisen** wird nicht beim Speichern geprüft, nur ein Hinweis im Formular. Überschneiden sich Kreise, teilen sie sich die Nummern: Die Vergabe überspringt bereits vergebene Nummern (Rückmeldung 05.11.2026, siehe Nummernformat).
 8. **Keine Bankverbindung je Rechnungssteller.** Bei „Zahlung extern“ wird kein Zahlungsblock gedruckt; sonst gelten die Bankdaten des Unternehmens.
 9. **Audit über die Einstellungshistorie:** Anlegen, Ändern und Löschen eines Rechnungsstellers stehen in `setting_audit_log` unter dem Schlüssel `invoiceIssuer:<id>` (Einstellungen → Historie), keine eigene Audit-Tabelle. Die Zuordnung an der Flotte steht wie das übrige Rechnungsprofil im Flotten-Audit.
 10. **Löschen** nur, solange keine Flotte und keine Rechnung den Rechnungssteller nutzt und noch kein Beleg nummeriert wurde.
