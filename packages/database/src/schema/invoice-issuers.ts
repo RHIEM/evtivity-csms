@@ -52,6 +52,11 @@ export const invoiceIssuers = pgTable(
     creditNoteWithYear: boolean('credit_note_with_year').notNull().default(false),
     creditNoteStart: integer('credit_note_start').notNull().default(1),
     creditNoteDigits: smallint('credit_note_digits').notNull().default(0),
+    // PDF branding of its documents; null takes the company's (pdf.logo,
+    // pdf.footer). The logo is a PNG, JPEG or SVG data URI; an empty footer
+    // draws no footer.
+    pdfLogo: text('pdf_logo'),
+    pdfFooter: text('pdf_footer'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

@@ -5,10 +5,11 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
-const { get, post, patch, del, toast, canWrite } = vi.hoisted(() => ({
+const { get, post, patch, put, del, toast, canWrite } = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(() => Promise.resolve({})),
   patch: vi.fn(() => Promise.resolve({})),
+  put: vi.fn(() => Promise.resolve({})),
   del: vi.fn(() => Promise.resolve(undefined)),
   toast: vi.fn(),
   canWrite: { value: true },
@@ -22,7 +23,7 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('@/lib/api', () => ({ api: { get, post, patch, delete: del } }));
+vi.mock('@/lib/api', () => ({ api: { get, post, patch, put, delete: del } }));
 vi.mock('@/lib/auth', () => ({ useHasCompanyWidePermission: () => canWrite.value }));
 vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast }) }));
 
@@ -51,6 +52,8 @@ function issuer(overrides: Partial<InvoiceIssuer> = {}): InvoiceIssuer {
     creditNoteWithYear: true,
     creditNoteStart: 1,
     creditNoteDigits: 4,
+    pdfFooter: null,
+    hasPdfLogo: false,
     invoiceNumberLocked: false,
     creditNoteNumberLocked: false,
     fleetCount: 0,
@@ -63,6 +66,7 @@ beforeEach(() => {
   get.mockReset();
   post.mockClear();
   patch.mockClear();
+  put.mockClear();
   del.mockClear();
 });
 
@@ -205,5 +209,118 @@ describe('InvoiceIssuerSettings', () => {
     expect(await screen.findByText('RHIEM Services GmbH')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'settings.invoiceIssuers.add' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'common.edit' })).toBeNull();
+  });
+
+  describe('PDF logo and footer', () => {
+    const PNG_URI = 'data:image/png;base64,iVBORw0KGgo=';
+
+    function renderWithLogo(list: InvoiceIssuer[], logo: string | null): void {
+      get.mockImplementation((url: string) =>
+        Promise.resolve(url.endsWith('/pdf-logo') ? { logo } : list),
+      );
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <InvoiceIssuerSettings />
+        </QueryClientProvider>,
+      );
+    }
+
+    it("takes the company's footer for a new issuer and offers the logo after creating it", async () => {
+      renderWith([]);
+      fireEvent.click(screen.getByRole('button', { name: 'settings.invoiceIssuers.add' }));
+      expect(screen.getByText('settings.invoiceIssuers.logoAfterCreate')).toBeTruthy();
+      expect(screen.getByText('settings.invoiceIssuers.footerHelpCompany')).toBeTruthy();
+      fireEvent.change(screen.getByLabelText('settings.invoiceIssuers.name'), {
+        target: { value: 'RHIEM Intermedia GmbH' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => {
+        expect(post).toHaveBeenCalledWith(
+          '/v1/invoice-issuers',
+          expect.objectContaining({ pdfFooter: null }),
+        );
+      });
+    });
+
+    it('saves an own footer, an empty one meaning no footer', async () => {
+      renderWith([issuer()]);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      fireEvent.click(screen.getByLabelText('settings.invoiceIssuers.ownFooter'));
+      fireEvent.change(screen.getByLabelText('settings.pdfFooter'), {
+        target: { value: 'RHIEM Services GmbH\r\nHRB 1  ' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => {
+        expect(patch).toHaveBeenCalledWith(
+          '/v1/invoice-issuers/iis_rs',
+          expect.objectContaining({ pdfFooter: 'RHIEM Services GmbH\nHRB 1' }),
+        );
+      });
+      cleanup();
+      patch.mockClear();
+
+      renderWith([issuer({ pdfFooter: '' })]);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      expect(screen.getByLabelText('settings.invoiceIssuers.ownFooter')).toHaveProperty(
+        'checked',
+        true,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      await waitFor(() => {
+        expect(patch).toHaveBeenCalledWith(
+          '/v1/invoice-issuers/iis_rs',
+          expect.objectContaining({ pdfFooter: '' }),
+        );
+      });
+    });
+
+    it('refuses a footer with too many lines', () => {
+      renderWith([]);
+      fireEvent.click(screen.getByRole('button', { name: 'settings.invoiceIssuers.add' }));
+      fireEvent.change(screen.getByLabelText('settings.invoiceIssuers.name'), {
+        target: { value: 'X' },
+      });
+      fireEvent.click(screen.getByLabelText('settings.invoiceIssuers.ownFooter'));
+      fireEvent.change(screen.getByLabelText('settings.pdfFooter'), {
+        target: { value: '1\n2\n3\n4\n5\n6' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      expect(screen.getByText('settings.pdfFooterInvalid')).toBeTruthy();
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it('shows the company logo without an own one and uploads a logo', async () => {
+      renderWithLogo([issuer()], null);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      expect(await screen.findByText('settings.invoiceIssuers.logoCompany')).toBeTruthy();
+      const input = screen
+        .getByTestId('issuer-branding')
+        .querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'logo.png', {
+        type: 'image/png',
+      });
+      fireEvent.change(input, { target: { files: [file] } });
+
+      await waitFor(() => {
+        expect(put).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/pdf-logo', {
+          logo: expect.stringMatching(/^data:image\/png;base64,/) as unknown,
+        });
+      });
+    });
+
+    it('previews an own logo and removes it', async () => {
+      renderWithLogo([issuer({ hasPdfLogo: true })], PNG_URI);
+      fireEvent.click(await screen.findByRole('button', { name: 'common.edit' }));
+      expect((await screen.findByTestId('issuer-logo-preview')).getAttribute('src')).toBe(PNG_URI);
+      fireEvent.click(screen.getByRole('button', { name: 'settings.invoiceIssuers.logoRemove' }));
+
+      await waitFor(() => {
+        expect(del).toHaveBeenCalledWith('/v1/invoice-issuers/iis_rs/pdf-logo');
+      });
+      expect(await screen.findByText('settings.invoiceIssuers.logoCompany')).toBeTruthy();
+    });
   });
 });

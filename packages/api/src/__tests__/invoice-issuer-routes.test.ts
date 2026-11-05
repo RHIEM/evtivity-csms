@@ -131,6 +131,8 @@ function issuerRow(overrides: Record<string, unknown> = {}): Record<string, unkn
     creditNoteWithYear: true,
     creditNoteStart: 1,
     creditNoteDigits: 4,
+    pdfLogo: null,
+    pdfFooter: null,
     createdAt: NOW,
     updatedAt: NOW,
     ...overrides,
@@ -385,6 +387,173 @@ describe('Invoice issuer routes', () => {
       const res = await app.inject({
         method: 'DELETE',
         url: '/invoice-issuers/iis_x',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(404);
+    });
+  });
+
+  describe('PDF branding', () => {
+    const PNG_URI = 'data:image/png;base64,iVBORw0KGgo=';
+
+    it('lists whether an issuer has a logo, never the logo itself', async () => {
+      setupDbResults([issuerRow({ pdfLogo: PNG_URI, pdfFooter: '' })], [], []);
+      const res = await app.inject({ method: 'GET', url: '/invoice-issuers', headers: auth() });
+
+      const body: Array<Record<string, unknown>> = res.json();
+      expect(body[0]).toMatchObject({ hasPdfLogo: true, pdfFooter: '' });
+      expect(body[0]).not.toHaveProperty('pdfLogo');
+    });
+
+    it('stores the footer normalized', async () => {
+      setupDbResults([issuerRow()], [], [issuerRow({ pdfFooter: 'Line 1\nLine 2' })], [], []);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/invoice-issuers/iis_rs',
+        headers: auth(),
+        payload: { pdfFooter: 'Line 1  \r\nLine 2\n\n' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(calls.set[0]).toMatchObject({ pdfFooter: 'Line 1\nLine 2' });
+      expect(res.json()).toMatchObject({ pdfFooter: 'Line 1\nLine 2', hasPdfLogo: false });
+    });
+
+    it('keeps null (the company footer) and an empty footer (none) apart', async () => {
+      setupDbResults([issuerRow()], [], [issuerRow()], [], []);
+      await app.inject({
+        method: 'PATCH',
+        url: '/invoice-issuers/iis_rs',
+        headers: auth(),
+        payload: { pdfFooter: null },
+      });
+      setupDbResults([issuerRow()], [], [issuerRow({ pdfFooter: '' })], [], []);
+      await app.inject({
+        method: 'PATCH',
+        url: '/invoice-issuers/iis_rs',
+        headers: auth(),
+        payload: { pdfFooter: '' },
+      });
+
+      expect(calls.set[0]).toMatchObject({ pdfFooter: null });
+      expect(calls.set[1]).toMatchObject({ pdfFooter: '' });
+    });
+
+    it('refuses a footer with too many lines with 400 VALIDATION_ERROR', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/invoice-issuers/iis_rs',
+        headers: auth(),
+        payload: { pdfFooter: '1\n2\n3\n4\n5\n6' },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+      expect(calls.set).toHaveLength(0);
+    });
+
+    it('returns the stored logo', async () => {
+      setupDbResults([{ logo: PNG_URI }]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/invoice-issuers/iis_rs/pdf-logo',
+        headers: auth(),
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ logo: PNG_URI });
+    });
+
+    it('answers 404 for the logo of an unknown issuer', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/invoice-issuers/iis_x/pdf-logo',
+        headers: auth(),
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ code: 'INVOICE_ISSUER_NOT_FOUND' });
+    });
+
+    it('sets the logo and audits it without the image', async () => {
+      setupDbResults([issuerRow()], [issuerRow({ pdfLogo: PNG_URI })], [], []);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/invoice-issuers/iis_rs/pdf-logo',
+        headers: auth(),
+        payload: { logo: PNG_URI },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(calls.set[0]).toMatchObject({ pdfLogo: PNG_URI });
+      expect(res.json()).toMatchObject({ hasPdfLogo: true });
+      expect(res.json()).not.toHaveProperty('pdfLogo');
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          entityId: 'invoiceIssuer:iis_rs',
+          before: expect.objectContaining({ hasPdfLogo: false }),
+          after: expect.objectContaining({ hasPdfLogo: true }),
+          notes: 'PDF logo set',
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+      const audit = (writeAuditMock.mock.calls[0] as unknown[])[1] as { after: object };
+      expect(audit.after).not.toHaveProperty('pdfLogo');
+    });
+
+    it('refuses a logo that is not a PNG or SVG data URI with 400', async () => {
+      for (const logo of ['', 'data:text/plain;base64,aGk=', 'data:image/png;base64,aGk=']) {
+        const res = await app.inject({
+          method: 'PUT',
+          url: '/invoice-issuers/iis_rs/pdf-logo',
+          headers: auth(),
+          payload: { logo },
+        });
+        expect(res.statusCode).toBe(400);
+      }
+      expect(calls.set).toHaveLength(0);
+    });
+
+    it('removes the logo', async () => {
+      setupDbResults([issuerRow({ pdfLogo: PNG_URI })], [issuerRow()], [], []);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: '/invoice-issuers/iis_rs/pdf-logo',
+        headers: auth(),
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(calls.set[0]).toMatchObject({ pdfLogo: null });
+      expect(res.json()).toMatchObject({ hasPdfLogo: false });
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ notes: 'PDF logo removed' }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('answers 404 when setting the logo of an unknown issuer', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/invoice-issuers/iis_x/pdf-logo',
+        headers: auth(),
+        payload: { logo: PNG_URI },
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(writeAuditMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a site-restricted user with 404', async () => {
+      setMockUserSiteIds(['sit_a']);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/invoice-issuers/iis_rs/pdf-logo',
         headers: auth(),
       });
       expect(res.statusCode).toBe(404);

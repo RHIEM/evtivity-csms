@@ -18,7 +18,12 @@ import {
   MAX_INVOICE_NUMBER_DIGITS,
   MAX_INVOICE_NUMBER_PREFIX_LENGTH,
   MAX_INVOICE_NUMBER_START,
+  MAX_PDF_FOOTER_LENGTH,
+  MAX_PDF_FOOTER_LINES,
+  MAX_PDF_LOGO_BYTES,
   INVOICE_NUMBER_PREFIX_PATTERN,
+  normalizePdfFooter,
+  normalizePdfLogo,
 } from '@evtivity/lib';
 import { zodSchema } from '../lib/zod-schema.js';
 import { itemResponse, arrayResponse, errorWith } from '../lib/response-schemas.js';
@@ -32,6 +37,16 @@ import { getAuditActor } from '../lib/audit-actor.js';
 const ISSUER_NOT_FOUND = {
   error: 'Invoice issuer not found',
   code: 'INVOICE_ISSUER_NOT_FOUND',
+} as const;
+
+const INVALID_PDF_FOOTER = {
+  error: `pdfFooter must be plain text of at most ${String(MAX_PDF_FOOTER_LENGTH)} characters and ${String(MAX_PDF_FOOTER_LINES)} lines`,
+  code: 'VALIDATION_ERROR',
+} as const;
+
+const INVALID_PDF_LOGO = {
+  error: `logo must be a PNG or SVG data URI of at most ${String(MAX_PDF_LOGO_BYTES / 1024)} KB`,
+  code: 'VALIDATION_ERROR',
 } as const;
 
 const optionalText = (max: number, description: string) =>
@@ -78,6 +93,13 @@ const issuerFields = {
     .optional()
     .describe('First credit note number (of each year with year)'),
   creditNoteDigits: digitsSchema.optional().describe('Minimum credit note number length'),
+  pdfFooter: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "Footer of the issuer's PDFs: null takes the company's (pdf.footer), an empty string draws none",
+    ),
 };
 
 const createIssuerBody = z.object(issuerFields);
@@ -105,6 +127,13 @@ const issuerItem = z
     creditNoteWithYear: z.boolean(),
     creditNoteStart: z.number(),
     creditNoteDigits: z.number(),
+    pdfFooter: z
+      .string()
+      .nullable()
+      .describe("Footer of the issuer's PDFs; null: the company's, empty: none"),
+    hasPdfLogo: z
+      .boolean()
+      .describe("The issuer has its own PDF logo; otherwise its PDFs show the company's"),
     invoiceNumberLocked: z
       .boolean()
       .describe('An invoice was issued: the invoice number format can no longer change'),
@@ -118,6 +147,13 @@ const issuerItem = z
   .loose();
 
 const idParams = z.object({ id: z.string().describe('Invoice issuer identifier') });
+
+const pdfLogoBody = z.object({
+  logo: z.string().describe('PNG or SVG data URI of at most 512 KB; an SVG is stored sanitized'),
+});
+const pdfLogoResponse = z.object({
+  logo: z.string().nullable().describe("The issuer's logo data URI; null: the company's"),
+});
 
 const INVOICE_FORMAT_KEYS = [
   'invoicePrefix',
@@ -152,10 +188,21 @@ async function fleetCounts(executor: Executor): Promise<Map<string, number>> {
   return new Map(rows.map((row) => [String(row.issuerId), row.count]));
 }
 
+/**
+ * The issuer without its logo bytes (up to 512 KB): lists, responses and the
+ * audit trail say whether it has one, GET .../pdf-logo returns it.
+ */
+function withoutLogo(issuer: InvoiceIssuer): Omit<InvoiceIssuer, 'pdfLogo'> & {
+  hasPdfLogo: boolean;
+} {
+  const { pdfLogo, ...rest } = issuer;
+  return { ...rest, hasPdfLogo: pdfLogo != null };
+}
+
 async function toItem(executor: Executor, issuer: InvoiceIssuer, fleetCount: number) {
   const locked = await lockedKinds(executor, issuer.id);
   return {
-    ...issuer,
+    ...withoutLogo(issuer),
     invoiceNumberLocked: locked.has('invoice'),
     creditNoteNumberLocked: locked.has('credit_note'),
     fleetCount,
@@ -176,11 +223,19 @@ const NULLABLE_TEXT_KEYS = new Set([
   'phone',
 ]);
 
-/** The body as stored: the name and seller details trimmed, a blank detail as null. */
-function normalized<T extends Record<string, unknown>>(body: T): T {
+/**
+ * The body as stored: the name and seller details trimmed, a blank detail as
+ * null, the footer normalized (normalizePdfFooter). Null when the footer is
+ * not a valid footer.
+ */
+function normalized<T extends Record<string, unknown>>(body: T): T | null {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(body)) {
-    if (typeof value === 'string' && (key === 'name' || NULLABLE_TEXT_KEYS.has(key))) {
+    if (key === 'pdfFooter' && typeof value === 'string') {
+      const footer = normalizePdfFooter(value);
+      if (footer == null) return null;
+      out[key] = footer;
+    } else if (typeof value === 'string' && (key === 'name' || NULLABLE_TEXT_KEYS.has(key))) {
       const trimmed = value.trim();
       out[key] = trimmed === '' && key !== 'name' ? null : trimmed;
     } else {
@@ -198,7 +253,12 @@ function normalized<T extends Record<string, unknown>>(body: T): T {
 async function auditIssuer(
   request: FastifyRequest,
   issuerId: string,
-  change: { action: 'updated' | 'deleted'; before: unknown; after: unknown; notes?: string },
+  change: {
+    action: 'updated' | 'deleted';
+    before: InvoiceIssuer | null;
+    after: InvoiceIssuer | null;
+    notes?: string;
+  },
 ): Promise<void> {
   const key = `invoiceIssuer:${issuerId}`;
   await writeAudit(
@@ -208,8 +268,8 @@ async function auditIssuer(
       entityIdSnapshot: key,
       action: change.action,
       ...getAuditActor(request),
-      before: change.before,
-      after: change.after,
+      before: change.before != null ? withoutLogo(change.before) : null,
+      after: change.after != null ? withoutLogo(change.after) : null,
       ...(change.notes != null ? { notes: change.notes } : {}),
     },
     db,
@@ -219,6 +279,32 @@ async function auditIssuer(
 
 async function sendNotFound(reply: FastifyReply): Promise<void> {
   await reply.status(404).send(ISSUER_NOT_FOUND);
+}
+
+/**
+ * Sets (a data URI) or removes (null) the issuer's logo. Null when the issuer
+ * does not exist; the caller audits the change.
+ */
+async function updatePdfLogo(
+  id: string,
+  logo: string | null,
+): Promise<{ before: InvoiceIssuer; after: InvoiceIssuer; item: unknown } | null> {
+  return db.transaction(async (tx) => {
+    const [current] = await tx
+      .select()
+      .from(invoiceIssuers)
+      .where(eq(invoiceIssuers.id, id))
+      .for('update');
+    if (current == null) return null;
+    const [updated] = await tx
+      .update(invoiceIssuers)
+      .set({ pdfLogo: logo, updatedAt: new Date() })
+      .where(eq(invoiceIssuers.id, id))
+      .returning();
+    const counts = await fleetCounts(tx);
+    const after = updated ?? current;
+    return { before: current, after, item: await toItem(tx, after, counts.get(id) ?? 0) };
+  });
 }
 
 export function invoiceIssuerRoutes(app: FastifyInstance): void {
@@ -255,12 +341,13 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Create an invoice issuer',
         description:
-          'Creates a seller with its number ranges. Number format: the prefix (letters, digits and - . _, may be empty), the two-digit year (the counter then restarts each year), the start value and the minimum length. Defaults: empty prefix, no year, start 1, no padding. A fleet uses it through its billing profile (invoiceIssuerId).',
+          'Creates a seller with its number ranges. Number format: the prefix (letters, digits and - . _, may be empty), the two-digit year right after the prefix, without a separator (the counter then restarts each year), the start value and the minimum length. Defaults: empty prefix, no year, start 1, no padding. pdfFooter (null by default) is the footer of its PDFs: null takes the company footer (pdf.footer), an empty string draws none; an invalid footer answers 400 VALIDATION_ERROR. The logo is set with PUT /invoice-issuers/:id/pdf-logo. A fleet uses it through its billing profile (invoiceIssuerId).',
         operationId: 'createInvoiceIssuer',
         security: [{ bearerAuth: [] }],
         body: zodSchema(createIssuerBody),
         response: {
           201: itemResponse(issuerItem),
+          400: errorWith('Invalid PDF footer', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Restricted to some sites', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
         },
       },
@@ -268,6 +355,10 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
       const body = normalized(request.body as z.infer<typeof createIssuerBody>);
+      if (body == null) {
+        await reply.status(400).send(INVALID_PDF_FOOTER);
+        return;
+      }
       const [issuer] = await db.insert(invoiceIssuers).values(body).returning();
       if (issuer == null) throw new Error('Failed to create the invoice issuer');
       await auditIssuer(request, issuer.id, {
@@ -288,13 +379,14 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Update an invoice issuer',
         description:
-          'Fields left out keep their value; null or a blank string clears a text field. The seller details apply to documents issued afterwards: an issued document keeps the seller it was issued with. A number format (prefix, year, start, length) can no longer change once the issuer has issued a document of that kind: 409 INVOICE_ISSUER_NUMBER_FORMAT_LOCKED. The issuer row is locked for the update, so a document being issued is numbered with the format it read.',
+          'Fields left out keep their value; null or a blank string clears a text field (pdfFooter: null takes the company footer, an empty string draws none). The seller details and the footer apply to documents issued afterwards: an issued document keeps the seller it was issued with. A number format (prefix, year, start, length) can no longer change once the issuer has issued a document of that kind: 409 INVOICE_ISSUER_NUMBER_FORMAT_LOCKED. The issuer row is locked for the update, so a document being issued is numbered with the format it read.',
         operationId: 'updateInvoiceIssuer',
         security: [{ bearerAuth: [] }],
         params: zodSchema(idParams),
         body: zodSchema(updateIssuerBody),
         response: {
           200: itemResponse(issuerItem),
+          400: errorWith('Invalid PDF footer', [ERROR_CODES.VALIDATION_ERROR]),
           404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
           409: errorWith('The number format is in use', [
             ERROR_CODES.INVOICE_ISSUER_NUMBER_FORMAT_LOCKED,
@@ -306,6 +398,10 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
       if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
       const { id } = request.params as z.infer<typeof idParams>;
       const body = normalized(request.body as z.infer<typeof updateIssuerBody>);
+      if (body == null) {
+        await reply.status(400).send(INVALID_PDF_FOOTER);
+        return;
+      }
       const result = await db.transaction(async (tx) => {
         const [current] = await tx
           .select()
@@ -348,6 +444,110 @@ export function invoiceIssuerRoutes(app: FastifyInstance): void {
         action: 'updated',
         before: result.before,
         after: result.after,
+      });
+      return result.item;
+    },
+  );
+
+  app.get(
+    '/invoice-issuers/:id/pdf-logo',
+    {
+      onRequest: [authorize('settings.system:read')],
+      schema: {
+        tags: ['Invoices'],
+        summary: "Get an invoice issuer's PDF logo",
+        description:
+          "The logo the issuer's invoices and credit notes draw, as stored (a PNG, JPEG or SVG data URI), or null when its PDFs draw the company logo (pdf.logo). A user restricted to some sites gets 404 INVOICE_ISSUER_NOT_FOUND.",
+        operationId: 'getInvoiceIssuerPdfLogo',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        response: {
+          200: zodSchema(pdfLogoResponse),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const [row] = await db
+        .select({ logo: invoiceIssuers.pdfLogo })
+        .from(invoiceIssuers)
+        .where(eq(invoiceIssuers.id, id));
+      if (row == null) return sendNotFound(reply);
+      return { logo: row.logo };
+    },
+  );
+
+  app.put(
+    '/invoice-issuers/:id/pdf-logo',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: "Set an invoice issuer's PDF logo",
+        description:
+          "Sets the logo the issuer's invoices and credit notes draw instead of the company logo, from the next PDF on (also of documents issued before, as the company logo). A PNG or SVG data URI of at most 512 KB; an SVG is stored sanitized. Anything else answers 400 VALIDATION_ERROR. Audited in the settings history without the image.",
+        operationId: 'setInvoiceIssuerPdfLogo',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        body: zodSchema(pdfLogoBody),
+        response: {
+          200: itemResponse(issuerItem),
+          400: errorWith('Invalid logo', [ERROR_CODES.VALIDATION_ERROR]),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const { logo } = request.body as z.infer<typeof pdfLogoBody>;
+      const stored = normalizePdfLogo(logo);
+      if (stored == null || stored === '') {
+        await reply.status(400).send(INVALID_PDF_LOGO);
+        return;
+      }
+      const result = await updatePdfLogo(id, stored);
+      if (result == null) return sendNotFound(reply);
+      await auditIssuer(request, id, {
+        action: 'updated',
+        before: result.before,
+        after: result.after,
+        notes: 'PDF logo set',
+      });
+      return result.item;
+    },
+  );
+
+  app.delete(
+    '/invoice-issuers/:id/pdf-logo',
+    {
+      onRequest: [authorize('settings.system:write')],
+      schema: {
+        tags: ['Invoices'],
+        summary: "Remove an invoice issuer's PDF logo",
+        description:
+          "The issuer's invoices and credit notes draw the company logo (pdf.logo) again, from the next PDF on. Audited in the settings history.",
+        operationId: 'deleteInvoiceIssuerPdfLogo',
+        security: [{ bearerAuth: [] }],
+        params: zodSchema(idParams),
+        response: {
+          200: itemResponse(issuerItem),
+          404: errorWith('Invoice issuer not found', [ERROR_CODES.INVOICE_ISSUER_NOT_FOUND]),
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!(await requireAllSiteAccess(request, reply, ISSUER_NOT_FOUND))) return;
+      const { id } = request.params as z.infer<typeof idParams>;
+      const result = await updatePdfLogo(id, null);
+      if (result == null) return sendNotFound(reply);
+      await auditIssuer(request, id, {
+        action: 'updated',
+        before: result.before,
+        after: result.after,
+        notes: 'PDF logo removed',
       });
       return result.item;
     },

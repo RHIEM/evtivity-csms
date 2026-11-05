@@ -3122,7 +3122,17 @@
       "saved": "發票開立方已儲存",
       "deleted": "發票開立方已刪除",
       "saveFailed": "無法儲存發票開立方。",
-      "inUse": "已被車隊或發票使用"
+      "inUse": "已被車隊或發票使用",
+      "branding": "PDF 標誌和頁尾（選用）",
+      "brandingHelp": "沒有自己的標誌和頁尾時，此開立方的 PDF 顯示公司的標誌和頁尾（公司分頁）。變更從下一個產生的 PDF 起生效，也適用於已開立的單據。",
+      "logoCompany": "公司標誌",
+      "logoRemove": "移除自有標誌",
+      "logoAfterCreate": "建立開立方後再上傳標誌。",
+      "logoSaved": "標誌已儲存",
+      "logoRemoved": "自有標誌已移除",
+      "ownFooter": "自有頁尾",
+      "footerHelpOwn": "依輸入內容置中顯示於每頁底部。留空則不顯示頁尾。",
+      "footerHelpCompany": "PDF 顯示公司頁尾。"
     },
     "invoicePayment": "發票付款資訊",
     "invoicePaymentDescription": "列印在每張發票 PDF 合計下方的付款資訊區塊中。未結發票要求以發票號碼作為備註進行銀行轉帳，已付款發票顯示已付款，貸項通知單說明無需付款。未設定 IBAN 時不列印該區塊。",

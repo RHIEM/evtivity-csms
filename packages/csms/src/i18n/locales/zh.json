@@ -3122,7 +3122,17 @@
       "saved": "发票开具方已保存",
       "deleted": "发票开具方已删除",
       "saveFailed": "无法保存发票开具方。",
-      "inUse": "已被车队或发票使用"
+      "inUse": "已被车队或发票使用",
+      "branding": "PDF 徽标和页脚（可选）",
+      "brandingHelp": "没有自己的徽标和页脚时，此开票方的 PDF 显示公司的徽标和页脚（公司选项卡）。更改从下一个生成的 PDF 起生效，也适用于已开具的单据。",
+      "logoCompany": "公司徽标",
+      "logoRemove": "移除自有徽标",
+      "logoAfterCreate": "创建开票方后再上传徽标。",
+      "logoSaved": "徽标已保存",
+      "logoRemoved": "自有徽标已移除",
+      "ownFooter": "自有页脚",
+      "footerHelpOwn": "按输入内容居中显示在每页底部。留空则不显示页脚。",
+      "footerHelpCompany": "PDF 显示公司页脚。"
     },
     "invoicePayment": "发票付款信息",
     "invoicePaymentDescription": "打印在每张发票 PDF 合计下方的付款信息区块中。未结发票要求以发票号作为备注进行银行转账，已付款发票显示已付款，贷项通知单说明无需付款。未设置 IBAN 时不打印该区块。",

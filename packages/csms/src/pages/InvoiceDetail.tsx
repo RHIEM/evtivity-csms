@@ -164,10 +164,15 @@ export function InvoiceDetail(): React.JSX.Element {
   });
   const companyName =
     branding?.['name'] != null && branding['name'] !== '' ? branding['name'] : 'EVtivity';
-  // The logo the invoice PDF draws (pdf.logo or the default), shown only when printed.
+  // The logo the invoice PDF draws (its issuer's, else pdf.logo or the default),
+  // shown only when printed.
   const { data: printLogo } = useQuery({
-    queryKey: ['invoice-print-logo'],
-    queryFn: () => api.get<{ logo: string }>('/v1/invoices/print-logo'),
+    queryKey: ['invoice-print-logo', id],
+    queryFn: () =>
+      api.get<{ logo: string }>(
+        `/v1/invoices/print-logo?invoiceId=${encodeURIComponent(id ?? '')}`,
+      ),
+    enabled: id != null,
     staleTime: 60_000,
   });
 

@@ -1730,6 +1730,13 @@
       "when": 1791000049404,
       "tag": "rhiem_0008_member_invoice_delivery",
       "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "7",
+      "when": 1791000049405,
+      "tag": "rhiem_0009_invoice_issuer_branding",
+      "breakpoints": true
     }
   ]
 }

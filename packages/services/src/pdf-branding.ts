@@ -80,8 +80,14 @@ export function resolvePdfLogo(value: unknown): Buffer | null {
  * Reads `pdf.logo` and `pdf.footer`. A missing or unusable logo is the
  * default logo, a missing footer row the default footer. An empty footer
  * (the operator cleared it) draws no footer.
+ *
+ * With `issuerId` (the invoice issuer a document was issued under), the
+ * issuer's own logo and footer (invoice_issuers.pdf_logo, pdf_footer) take
+ * the place of the company's, each on its own: null keeps the company's, an
+ * unusable issuer logo falls back to the company logo, an empty issuer
+ * footer draws no footer.
  */
-export async function loadPdfBranding(): Promise<PdfBranding> {
+export async function loadPdfBranding(issuerId?: string | null): Promise<PdfBranding> {
   const rows = await client`
     SELECT key, value FROM settings WHERE key IN (${PDF_LOGO_KEY}, ${PDF_FOOTER_KEY})
   `;
@@ -92,7 +98,15 @@ export async function loadPdfBranding(): Promise<PdfBranding> {
     if (key === PDF_LOGO_KEY) logoValue = value;
     else if (key === PDF_FOOTER_KEY) footerValue = value;
   }
-  const logo = resolvePdfLogo(logoValue);
+  let issuerLogo: Buffer | null = null;
+  if (issuerId != null) {
+    const [issuer] = await client<Array<{ pdf_logo: string | null; pdf_footer: string | null }>>`
+      SELECT pdf_logo, pdf_footer FROM invoice_issuers WHERE id = ${issuerId}
+    `;
+    if (issuer?.pdf_logo != null) issuerLogo = resolvePdfLogo(issuer.pdf_logo);
+    if (issuer?.pdf_footer != null) footerValue = issuer.pdf_footer;
+  }
+  const logo = issuerLogo ?? resolvePdfLogo(logoValue);
   const footer = normalizePdfFooter(footerValue);
   if (footer == null) logger.warn('pdf.footer is not a valid footer, leaving the footer out');
   return {

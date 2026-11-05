@@ -3122,7 +3122,17 @@
       "saved": "Emisor de facturas guardado",
       "deleted": "Emisor de facturas eliminado",
       "saveFailed": "No se pudo guardar el emisor de facturas.",
-      "inUse": "Usado por una flota o una factura"
+      "inUse": "Usado por una flota o una factura",
+      "branding": "Logotipo y pie de página del PDF (opcional)",
+      "brandingHelp": "Sin logotipo ni pie de página propios, los PDF de este emisor muestran los de la empresa (pestaña Empresa). Los cambios se aplican desde el siguiente PDF generado, también a documentos ya emitidos.",
+      "logoCompany": "Logotipo de la empresa",
+      "logoRemove": "Quitar logotipo propio",
+      "logoAfterCreate": "Suba el logotipo una vez creado el emisor.",
+      "logoSaved": "Logotipo guardado",
+      "logoRemoved": "Logotipo propio quitado",
+      "ownFooter": "Pie de página propio",
+      "footerHelpOwn": "Centrado en la parte inferior de cada página, tal como se introduce. Déjelo vacío para no mostrar pie de página.",
+      "footerHelpCompany": "Los PDF muestran el pie de página de la empresa."
     },
     "invoicePayment": "Información de Pago en Facturas",
     "invoicePaymentDescription": "Se imprime en el bloque Información de pago debajo de los totales de cada factura en PDF. Las facturas pendientes piden una transferencia con el número de factura como referencia, las pagadas muestran Pagada y las notas de crédito indican que no hay nada pendiente. Sin IBAN, el bloque no se imprime.",

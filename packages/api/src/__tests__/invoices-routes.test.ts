@@ -887,13 +887,36 @@ describe('GET /invoices/print-logo', () => {
     userSiteIds = null;
   });
 
-  function getLogo() {
+  function getLogo(query = '') {
     return app.inject({
       method: 'GET',
-      url: '/invoices/print-logo',
+      url: `/invoices/print-logo${query}`,
       headers: { authorization: `Bearer ${token}` },
     });
   }
+
+  it("returns the logo of the invoice's issuer for an invoice", async () => {
+    vi.mocked(getInvoice).mockResolvedValue({
+      invoice: { issuerId: 'iis_rs' },
+    } as unknown as Awaited<ReturnType<typeof getInvoice>>);
+    vi.mocked(loadPdfBranding).mockResolvedValue({ logo: PNG, isDefaultLogo: false, footer: '' });
+
+    const res = await getLogo('?invoiceId=inv_000000000001');
+
+    expect(res.statusCode).toBe(200);
+    expect(getInvoice).toHaveBeenCalledWith('inv_000000000001');
+    expect(loadPdfBranding).toHaveBeenCalledWith('iis_rs');
+  });
+
+  it('answers 404 INVOICE_NOT_FOUND for an unknown invoice', async () => {
+    vi.mocked(getInvoice).mockResolvedValue(null);
+
+    const res = await getLogo('?invoiceId=inv_missing');
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' });
+    expect(loadPdfBranding).not.toHaveBeenCalled();
+  });
 
   it('returns the PDF logo as a PNG data URI, behind payments:read', async () => {
     vi.mocked(loadPdfBranding).mockResolvedValue({ logo: PNG, isDefaultLogo: true, footer: '' });
@@ -904,6 +927,7 @@ describe('GET /invoices/print-logo', () => {
     expect(res.json()).toEqual({ logo: `data:image/png;base64,${PNG.toString('base64')}` });
     expect(authorizedPermissions.has('payments:read')).toBe(true);
     expect(getInvoice).not.toHaveBeenCalled();
+    expect(loadPdfBranding).toHaveBeenCalledWith(null);
   });
 
   it('keeps a JPEG logo a JPEG', async () => {

@@ -94,7 +94,7 @@ const PRINT_LOGO = 'data:image/png;base64,iVBORw0KGgo=';
 
 function mockInvoice(data: Record<string, unknown>): void {
   h.get.mockImplementation((path: string) => {
-    if (path === '/v1/invoices/print-logo') return Promise.resolve({ logo: PRINT_LOGO });
+    if (path.startsWith('/v1/invoices/print-logo')) return Promise.resolve({ logo: PRINT_LOGO });
     if (path === '/v1/portal/branding') {
       return Promise.resolve({ name: 'Acme Charging', logo: 'data:image/png;base64,COMPANY' });
     }
@@ -436,7 +436,8 @@ describe('InvoiceDetail', () => {
     expect(logo.getAttribute('src')).toBe(PRINT_LOGO);
     expect(logo.classList.contains('print-only')).toBe(true);
     expect(logo.getAttribute('alt')).toBe('Acme Charging');
-    expect(h.get).toHaveBeenCalledWith('/v1/invoices/print-logo');
+    // The logo of the issuer the invoice was issued under, if it has one.
+    expect(h.get).toHaveBeenCalledWith('/v1/invoices/print-logo?invoiceId=inv_1');
     expect(document.querySelector('img[src="data:image/png;base64,COMPANY"]')).toBeNull();
     expect(document.querySelectorAll('.invoice-print-area img')).toHaveLength(1);
   });
