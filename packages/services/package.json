@@ -79,6 +79,12 @@
     "./invoice-labels": {
       "import": "./src/invoice-labels.ts"
     },
+    "./invoice-letterhead": {
+      "import": "./src/invoice-letterhead.ts"
+    },
+    "./invoice-letterhead-preview": {
+      "import": "./src/invoice-letterhead-preview.ts"
+    },
     "./invoice-pdf.service": {
       "import": "./src/invoice-pdf.service.ts"
     },

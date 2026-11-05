@@ -271,6 +271,25 @@ export const api = {
 };
 
 /**
+ * POSTs JSON to an endpoint that answers a file (e.g. a PDF preview) and
+ * returns it as a Blob. Same cookie and CSRF handling as `api.post`; an error
+ * answer (JSON) throws `ApiError`.
+ */
+export async function postForBlob(path: string, body: unknown): Promise<Blob> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const csrf = getCsrfToken();
+  if (csrf != null) headers['X-CSRF-Token'] = csrf;
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    credentials: 'include',
+  });
+  if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => null));
+  return res.blob();
+}
+
+/**
  * POSTs JSON to an endpoint that answers text/event-stream and returns the
  * response body for `readAiStream`. Same cookie, CSRF and refresh handling as
  * `api.post`. Errors before the stream opens are JSON and throw `ApiError`.

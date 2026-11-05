@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import {
   bigint,
   boolean,
@@ -15,6 +16,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createId } from '../lib/id.js';
+import { pdfLetterheads } from './pdf-letterheads.js';
 
 /**
  * An invoice issuer: a seller other than the company (`company.*` settings)
@@ -57,6 +59,12 @@ export const invoiceIssuers = pgTable(
     // draws no footer.
     pdfLogo: text('pdf_logo'),
     pdfFooter: text('pdf_footer'),
+    // The current version of its own PDF letterhead (pdf_letterheads with its
+    // issuer_id); null takes the company's (pdf.letterhead). Its invoices and
+    // credit notes keep the version current at their issue.
+    letterheadId: text('letterhead_id').references((): AnyPgColumn => pdfLetterheads.id, {
+      onDelete: 'restrict',
+    }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

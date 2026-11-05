@@ -99,6 +99,8 @@ export interface InvoiceLabels {
   paymentCreditNote: string;
   /** Settled outside EVtivity without a settlement note of the fleet. */
   paymentSettledExternally: string;
+  /** Page number on a document on a letterhead; "{page}" and "{pages}" are replaced. */
+  pageOf: string;
 }
 
 export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
@@ -170,6 +172,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: 'Paid by card on {date}. No payment is due.',
     paymentCreditNote: 'No payment is due. The amount is refunded or offset against open invoices.',
     paymentSettledExternally: 'Please do not transfer. The amount is settled separately.',
+    pageOf: 'Page {page} of {pages}',
   },
   de: {
     locale: 'de-DE',
@@ -242,6 +245,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentCreditNote:
       'Es ist keine Zahlung fällig. Der Betrag wird erstattet oder mit offenen Rechnungen verrechnet.',
     paymentSettledExternally: 'Bitte nicht überweisen. Der Betrag wird gesondert verrechnet.',
+    pageOf: 'Seite {page} von {pages}',
   },
   es: {
     locale: 'es-ES',
@@ -313,6 +317,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
       'No hay ningún pago pendiente. El importe se reembolsa o se compensa con facturas pendientes.',
     paymentSettledExternally:
       'No realice ninguna transferencia. El importe se liquida por separado.',
+    pageOf: 'Página {page} de {pages}',
   },
   ko: {
     locale: 'ko-KR',
@@ -382,6 +387,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: '{date}에 카드로 결제되었습니다. 지불할 금액이 없습니다.',
     paymentCreditNote: '지불할 금액이 없습니다. 금액은 환불되거나 미결제 청구서와 상계됩니다.',
     paymentSettledExternally: '송금하지 마세요. 금액은 별도로 정산됩니다.',
+    pageOf: '{page}/{pages} 페이지',
   },
   zh: {
     locale: 'zh-CN',
@@ -450,6 +456,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: '已于 {date} 通过银行卡付款，无需再付款。',
     paymentCreditNote: '无需付款。该金额将退还或与未结发票抵销。',
     paymentSettledExternally: '请勿转账。该金额将另行结算。',
+    pageOf: '第 {page} 页，共 {pages} 页',
   },
   'zh-TW': {
     locale: 'zh-TW',
@@ -518,6 +525,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     paymentPaidByCard: '已於 {date} 以卡片付款，無需再付款。',
     paymentCreditNote: '無需付款。該金額將退還或與未結發票抵銷。',
     paymentSettledExternally: '請勿轉帳。該金額將另行結算。',
+    pageOf: '第 {page} 頁，共 {pages} 頁',
   },
 };
 

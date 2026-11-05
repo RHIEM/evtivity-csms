@@ -345,6 +345,7 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   createAggregatedInvoice: N,
   createCreditNote: N,
   createInvoiceIssuer: N,
+  createInvoiceIssuerLetterhead: N,
   createSessionInvoice: N,
   deleteInvoiceIssuer: N,
   deleteInvoiceIssuerPdfLogo: N,
@@ -354,10 +355,12 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   getInvoiceIssuerPdfLogo: N,
   getInvoiceNeighbors: N,
   getInvoicePrintLogo: N,
+  listInvoiceIssuerLetterheads: N,
   listInvoiceIssuers: N,
   listInvoices: R,
   markInvoicePaid: N,
   sendInvoice: N,
+  setInvoiceIssuerLetterhead: N,
   setInvoiceIssuerPdfLogo: N,
   updateInvoiceIssuer: N,
   voidInvoice: N,
@@ -866,6 +869,12 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   updateSsoSettings: N,
   updateStationMessageTemplate: N,
   upsertSetting: N,
+  // PDF letterheads: company stationery, configured by the operator only.
+  createPdfLetterhead: N,
+  getPdfLetterheadImage: N,
+  listPdfLetterheads: N,
+  previewPdfLetterhead: N,
+  setCurrentPdfLetterhead: N,
   // Sites
   // What the AI watches is the operator's call: suppressing or resuming a
   // site's AI insights is never an AI tool.

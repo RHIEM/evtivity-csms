@@ -92,6 +92,13 @@ vi.mock('@evtivity/database', () => {
     fleets: { id: 'fleets.id', invoiceIssuerId: 'fleets.invoiceIssuerId' },
     invoices: { id: 'invoices.id', issuerId: 'invoices.issuerId' },
     invoiceIssuers: { id: 'invoiceIssuers.id', name: 'invoiceIssuers.name' },
+    invoiceSellerSnapshotFromIssuer: vi.fn(),
+    pdfLetterheads: {
+      __table: 'pdfLetterheads',
+      id: 'pdfLetterheads.id',
+      issuerId: 'pdfLetterheads.issuerId',
+    },
+    settings: { key: 'settings.key', value: 'settings.value' },
     invoiceIssuerNumberCounters: { issuerId: 'c.issuerId', kind: 'c.kind' },
     settingAuditLog: { __table: 'settingAuditLog' },
     writeAudit: writeAuditMock,
@@ -99,11 +106,27 @@ vi.mock('@evtivity/database', () => {
 });
 
 vi.mock('drizzle-orm', () => ({
+  and: vi.fn(),
   asc: vi.fn(),
+  desc: vi.fn(),
   eq: vi.fn(),
+  isNotNull: vi.fn(),
+  isNull: vi.fn(),
   sql: vi.fn(),
 }));
 
+// The letterhead checks shared with routes/pdf-letterheads.ts: pdfkit reads the
+// image (real PNG data is not needed for the route checks).
+vi.mock('@evtivity/services/invoice-letterhead-preview', () => ({
+  generatePdfLetterheadPreview: vi.fn(),
+}));
+vi.mock('@evtivity/services/invoice-pdf.service', () => ({
+  letterheadBackground: () => Buffer.from('png'),
+  resolveInvoicePdfLanguage: (language: string | undefined) => language ?? 'en',
+}));
+
+import { eq } from 'drizzle-orm';
+import { db } from '@evtivity/database';
 import { registerAuth } from '../plugins/auth.js';
 import { invoiceIssuerRoutes } from '../routes/invoice-issuers.js';
 
@@ -133,8 +156,45 @@ function issuerRow(overrides: Record<string, unknown> = {}): Record<string, unkn
     creditNoteDigits: 4,
     pdfLogo: null,
     pdfFooter: null,
+    letterheadId: null,
     createdAt: NOW,
     updatedAt: NOW,
+    ...overrides,
+  };
+}
+
+/** A PNG header (signature and IHDR) of the given size: enough for the upload checks. */
+function pngDataUri(width: number, height: number): string {
+  const header = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(header, 0);
+  header.writeUInt32BE(13, 8);
+  header.write('IHDR', 12, 'latin1');
+  header.writeUInt32BE(width, 16);
+  header.writeUInt32BE(height, 20);
+  return `data:image/png;base64,${header.toString('base64')}`;
+}
+
+const A4_PNG = pngDataUri(2480, 3508);
+
+const LAYOUT = {
+  addressLeftMm: 21.2,
+  addressTopMm: 58.9,
+  contentTopMm: 112,
+  contentBottomMm: 258,
+  marginLeftMm: 21.2,
+  marginRightMm: 15.9,
+};
+
+/** A letterhead version of the issuer as the routes select it (without the image). */
+function letterheadRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'lhd_rs',
+    name: 'RHIEM Services 2026',
+    imageSha256: 'a'.repeat(64),
+    issuerId: 'iis_rs',
+    ...LAYOUT,
+    createdByUserId: 'test-id',
+    createdAt: NOW,
     ...overrides,
   };
 }
@@ -557,6 +617,199 @@ describe('Invoice issuer routes', () => {
         headers: auth(),
       });
       expect(res.statusCode).toBe(404);
+    });
+  });
+
+  describe('PDF letterhead', () => {
+    const payload = { name: 'RHIEM Services 2026', image: A4_PNG, ...LAYOUT };
+
+    it("lists the issuer's own versions with its current one", async () => {
+      setupDbResults(
+        [{ letterheadId: 'lhd_rs' }],
+        [letterheadRow(), letterheadRow({ id: 'lhd_old', name: 'Old' })],
+        [{ letterheadId: 'lhd_old', count: 3 }],
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/invoice-issuers/iis_rs/letterheads',
+        headers: auth(),
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body: Array<Record<string, unknown>> = res.json();
+      expect(body[0]).toMatchObject({ id: 'lhd_rs', issuerId: 'iis_rs', current: true });
+      expect(body[1]).toMatchObject({ id: 'lhd_old', current: false, invoiceCount: 3 });
+      expect(body[0]).not.toHaveProperty('image');
+      expect(vi.mocked(eq)).toHaveBeenCalledWith('pdfLetterheads.issuerId', 'iis_rs');
+    });
+
+    it('answers 404 for the versions of an unknown issuer', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/invoice-issuers/iis_missing/letterheads',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ code: 'INVOICE_ISSUER_NOT_FOUND' });
+    });
+
+    it('creates a version of the issuer and audits it without the image', async () => {
+      setupDbResults([issuerRow()], [letterheadRow()]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/invoice-issuers/iis_rs/letterheads',
+        headers: auth(),
+        payload,
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(calls.values[0]).toMatchObject({
+        name: 'RHIEM Services 2026',
+        image: A4_PNG,
+        ...LAYOUT,
+        issuerId: 'iis_rs',
+        createdByUserId: 'test-id',
+      });
+      expect(res.json()).toMatchObject({ id: 'lhd_rs', current: false, invoiceCount: 0 });
+      expect(calls.set).toHaveLength(0);
+      expect(writeAuditMock).toHaveBeenCalledTimes(1);
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          entityId: 'pdfLetterhead:lhd_rs',
+          action: 'created',
+          after: expect.not.objectContaining({ image: expect.anything() }),
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("makes the version the issuer's current one with activate", async () => {
+      setupDbResults([issuerRow()], [letterheadRow()], [issuerRow({ letterheadId: 'lhd_rs' })]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/invoice-issuers/iis_rs/letterheads',
+        headers: auth(),
+        payload: { ...payload, activate: true },
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.json()).toMatchObject({ current: true });
+      expect(calls.set[0]).toMatchObject({ letterheadId: 'lhd_rs' });
+      expect(writeAuditMock).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          entityId: 'invoiceIssuer:iis_rs',
+          before: expect.objectContaining({ letterheadId: null }),
+          after: expect.objectContaining({ letterheadId: 'lhd_rs' }),
+          notes: 'PDF letterhead set',
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('refuses an invalid image with 400 before touching the issuer', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/invoice-issuers/iis_rs/letterheads',
+        headers: auth(),
+        payload: { ...payload, image: pngDataUri(100, 100) },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ code: 'VALIDATION_ERROR' });
+      expect(calls.values).toHaveLength(0);
+    });
+
+    it('answers 404 when creating a version of an unknown issuer', async () => {
+      setupDbResults([]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/invoice-issuers/iis_missing/letterheads',
+        headers: auth(),
+        payload,
+      });
+      expect(res.statusCode).toBe(404);
+      expect(calls.values).toHaveLength(0);
+      expect(writeAuditMock).not.toHaveBeenCalled();
+    });
+
+    it("sets one of the issuer's versions as current and audits it", async () => {
+      setupDbResults(
+        [issuerRow()],
+        [{ id: 'lhd_rs' }],
+        [issuerRow({ letterheadId: 'lhd_rs' })],
+        [],
+        [],
+      );
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/invoice-issuers/iis_rs/letterhead',
+        headers: auth(),
+        payload: { letterheadId: 'lhd_rs' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ id: 'iis_rs', letterheadId: 'lhd_rs' });
+      expect(calls.set[0]).toMatchObject({ letterheadId: 'lhd_rs' });
+      expect(vi.mocked(eq)).toHaveBeenCalledWith('pdfLetterheads.issuerId', 'iis_rs');
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ notes: 'PDF letterhead set' }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('refuses a version that is not the issuer’s with 404', async () => {
+      setupDbResults([issuerRow()], []);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/invoice-issuers/iis_rs/letterhead',
+        headers: auth(),
+        payload: { letterheadId: 'lhd_company' },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ code: 'PDF_LETTERHEAD_NOT_FOUND' });
+      expect(calls.set).toHaveLength(0);
+      expect(writeAuditMock).not.toHaveBeenCalled();
+    });
+
+    it('goes back to the company letterhead with null', async () => {
+      setupDbResults([issuerRow({ letterheadId: 'lhd_rs' })], [issuerRow()], [], []);
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/invoice-issuers/iis_rs/letterhead',
+        headers: auth(),
+        payload: { letterheadId: null },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ letterheadId: null });
+      expect(calls.set[0]).toMatchObject({ letterheadId: null });
+      expect(writeAuditMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ notes: 'PDF letterhead removed' }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('deletes an unused issuer together with its own versions', async () => {
+      setupDbResults([issuerRow({ letterheadId: 'lhd_rs' })], [], [], [], [], [], []);
+      const res = await app.inject({
+        method: 'DELETE',
+        url: '/invoice-issuers/iis_rs',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(204);
+      expect(calls.set[0]).toEqual({ letterheadId: null });
+      expect(vi.mocked(db.delete)).toHaveBeenCalledWith({
+        __table: 'pdfLetterheads',
+        id: 'pdfLetterheads.id',
+        issuerId: 'pdfLetterheads.issuerId',
+      });
     });
   });
 });

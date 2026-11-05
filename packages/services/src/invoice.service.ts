@@ -18,6 +18,7 @@ import {
   invoiceSellerSnapshotFromIssuer,
   loadInvoiceIssuerForIssue,
   loadInvoiceSellerSnapshot,
+  letterheadIdForIssue,
 } from '@evtivity/database';
 import type { InvoiceKind, InvoiceSellerSnapshot } from '@evtivity/database';
 import {
@@ -411,6 +412,8 @@ export interface DocumentNumber {
   issuerId: string | null;
   invoiceNumber: string;
   seller: InvoiceSellerSnapshot;
+  /** The letterhead version the document keeps (letterheadIdForIssue). */
+  letterheadId: string | null;
 }
 
 /**
@@ -430,6 +433,7 @@ export async function allocateDocumentNumber(
       issuerId: null,
       invoiceNumber: await allocateInvoiceNumber(tx, kind, issuedAt),
       seller: await loadInvoiceSellerSnapshot(tx),
+      letterheadId: await letterheadIdForIssue(tx, null),
     };
   }
   const issuer = await loadInvoiceIssuerForIssue(tx, issuerId);
@@ -438,6 +442,7 @@ export async function allocateDocumentNumber(
     issuerId: issuer.id,
     invoiceNumber: await allocateIssuerInvoiceNumber(tx, issuer, kind, issuedAt),
     seller: invoiceSellerSnapshotFromIssuer(issuer),
+    letterheadId: await letterheadIdForIssue(tx, issuer),
   };
 }
 
@@ -511,7 +516,8 @@ export async function insertInvoiceInTransaction(
   ];
   const claimGuard = input.sessionClaimGuard ?? sessionNotOnAccount;
 
-  const { issuerId, invoiceNumber, seller } = await allocateDocumentNumber(
+  // The PDF keeps drawing the letterhead current at issue.
+  const { issuerId, invoiceNumber, seller, letterheadId } = await allocateDocumentNumber(
     tx,
     input.fleet?.issuerId ?? null,
     'invoice',
@@ -521,6 +527,7 @@ export async function insertInvoiceInTransaction(
     .insert(invoices)
     .values({
       invoiceNumber,
+      letterheadId,
       driverId,
       status,
       seller,

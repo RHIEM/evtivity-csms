@@ -5,7 +5,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ParseKeys } from 'i18next';
-import { Pencil, RotateCcw, Trash2 } from 'lucide-react';
+import { FileText, Pencil, RotateCcw, Trash2 } from 'lucide-react';
 import {
   MAX_INVOICE_NUMBER_DIGITS,
   MAX_INVOICE_NUMBER_PREFIX_LENGTH,
@@ -45,6 +45,11 @@ import {
 } from '@/components/ui/table';
 import { CreateButton } from '@/components/create-button';
 import { SaveButton } from '@/components/save-button';
+import {
+  PdfLetterheadSettings,
+  issuerLetterheadsQueryKey,
+} from '@/components/settings/PdfLetterheadSettings';
+import type { PdfLetterheadVersion } from '@/components/settings/PdfLetterheadSettings';
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { useHasCompanyWidePermission } from '@/lib/auth';
@@ -76,6 +81,8 @@ export interface InvoiceIssuer {
   pdfFooter: string | null;
   /** It has its own PDF logo (GET .../pdf-logo); otherwise its PDFs show the company's. */
   hasPdfLogo: boolean;
+  /** The current version of its own PDF letterhead; null: the company's. */
+  letterheadId: string | null;
   invoiceNumberLocked: boolean;
   creditNoteNumberLocked: boolean;
   fleetCount: number;
@@ -490,6 +497,53 @@ function BrandingFields({
   );
 }
 
+interface LetterheadFieldProps {
+  issuerId: string | undefined;
+  onManage: () => void;
+}
+
+/**
+ * The issuer's own PDF letterhead: the version its new invoices and credit
+ * notes keep, or the company's. Managed in its own dialog
+ * (PdfLetterheadSettings), so it needs a saved issuer.
+ */
+function LetterheadField({ issuerId, onManage }: LetterheadFieldProps) {
+  const { t } = useTranslation();
+  const { data: versions } = useQuery({
+    queryKey: issuerLetterheadsQueryKey(issuerId ?? ''),
+    queryFn: () =>
+      api.get<PdfLetterheadVersion[]>(`/v1/invoice-issuers/${issuerId ?? ''}/letterheads`),
+    enabled: issuerId != null,
+  });
+  const current = versions?.find((version) => version.current) ?? null;
+
+  return (
+    <fieldset className="space-y-2 rounded-md border p-3" data-testid="issuer-letterhead-field">
+      <legend className="px-1 text-sm font-medium">
+        {t('settings.invoiceIssuers.letterhead')}
+      </legend>
+      {issuerId == null ? (
+        <p className="text-xs text-muted-foreground">
+          {t('settings.invoiceIssuers.letterheadAfterCreate')}
+        </p>
+      ) : (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm">
+            {current != null
+              ? t('settings.invoiceIssuers.letterheadOwn', { name: current.name })
+              : t('settings.invoiceIssuers.letterheadUsesCompany')}
+          </p>
+          <Button type="button" variant="outline" size="sm" onClick={onManage}>
+            <FileText className="h-4 w-4" />
+            {t('settings.invoiceIssuers.letterheadManage')}
+          </Button>
+        </div>
+      )}
+      <p className="text-xs text-muted-foreground">{t('settings.invoiceIssuers.letterheadHint')}</p>
+    </fieldset>
+  );
+}
+
 /**
  * The invoice issuers: sellers other than the company that a fleet's invoices
  * can be issued under (fleet billing profile), each with its own number range
@@ -506,6 +560,8 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
   const [values, setValues] = useState<FormValues>(emptyForm);
   const [submitted, setSubmitted] = useState(false);
   const [deleting, setDeleting] = useState<InvoiceIssuer | null>(null);
+  // The issuer whose own letterhead versions are managed in their dialog.
+  const [letterheadOf, setLetterheadOf] = useState<InvoiceIssuer | null>(null);
 
   const { data: issuers = [] } = useQuery({
     queryKey: INVOICE_ISSUERS_QUERY_KEY,
@@ -738,6 +794,12 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
                 setValues((prev) => ({ ...prev, ownFooter, footer: footerText }));
               }}
             />
+            <LetterheadField
+              issuerId={current?.id}
+              onManage={() => {
+                if (current != null) setLetterheadOf(current);
+              }}
+            />
             {saveMutation.isError && (
               <p className="text-sm text-destructive">
                 {getErrorMessage(saveMutation.error, t, 'settings.invoiceIssuers.saveFailed')}
@@ -756,6 +818,24 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
               <SaveButton isPending={saveMutation.isPending} />
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={letterheadOf != null}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setLetterheadOf(null);
+        }}
+      >
+        <DialogContent className="max-h-[90vh] max-w-[95vw] overflow-y-auto md:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>
+              {t('settings.invoiceIssuers.letterheadTitle', { name: letterheadOf?.name ?? '' })}
+            </DialogTitle>
+          </DialogHeader>
+          {letterheadOf != null && (
+            <PdfLetterheadSettings issuer={{ id: letterheadOf.id, name: letterheadOf.name }} />
+          )}
         </DialogContent>
       </Dialog>
 

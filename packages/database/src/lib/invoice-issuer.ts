@@ -8,6 +8,7 @@ import type { db } from '../config.js';
 import { invoiceIssuers } from '../schema/invoice-issuers.js';
 import type { InvoiceKind } from '../schema/invoices.js';
 import type { InvoiceSellerSnapshot } from './invoice-seller-snapshot.js';
+import { currentPdfLetterheadId } from './pdf-letterhead.js';
 import { getSystemTimezone } from './system-settings.js';
 
 const logger = createLogger('invoice-issuer');
@@ -69,6 +70,19 @@ export async function loadInvoiceIssuerForIssue(
     .where(eq(invoiceIssuers.id, issuerId))
     .for('share');
   return issuer ?? null;
+}
+
+/**
+ * The letterhead version a new invoice or credit note keeps
+ * (invoices.letterhead_id): the issuer's own current version, else the
+ * company's (pdf.letterhead); null for none. Read inside the invoice
+ * transaction, like the issuer.
+ */
+export async function letterheadIdForIssue(
+  tx: InvoiceIssuerExecutor,
+  issuer: Pick<InvoiceIssuer, 'letterheadId'> | null,
+): Promise<string | null> {
+  return issuer?.letterheadId ?? currentPdfLetterheadId(tx);
 }
 
 /** The calendar year of `at` in the time zone; an invalid zone falls back to UTC. */

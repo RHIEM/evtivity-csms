@@ -25,6 +25,7 @@ import { drivers, fleets } from './drivers.js';
 import { chargingSessions } from './charging.js';
 import { invoiceIssuers } from './invoice-issuers.js';
 import { paymentRecords } from './payments.js';
+import { pdfLetterheads } from './pdf-letterheads.js';
 
 // 'credited': an issued or paid invoice a credit note credited in full. Its
 // content never changes after issue (GoBD); only the status moves.
@@ -98,6 +99,11 @@ export const invoices = pgTable(
     // The operator's note of a payment received outside EVtivity (bank transfer reference).
     paymentReference: varchar('payment_reference', { length: 200 }),
     metadata: jsonb('metadata'),
+    // The PDF letterhead version current at issue (the pdf.letterhead setting),
+    // never updated; null draws the PDF without a letterhead.
+    letterheadId: text('letterhead_id').references(() => pdfLetterheads.id, {
+      onDelete: 'restrict',
+    }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -109,6 +115,9 @@ export const invoices = pgTable(
       .on(table.issuerId)
       .where(sql`issuer_id IS NOT NULL`),
     index('idx_invoices_fleet_id').on(table.fleetId),
+    index('idx_invoices_letterhead_id')
+      .on(table.letterheadId)
+      .where(sql`letterhead_id IS NOT NULL`),
     // One live invoice per fleet and period; a void or credited one frees it.
     uniqueIndex('uq_invoices_fleet_period')
       .on(table.fleetId, table.periodStart)

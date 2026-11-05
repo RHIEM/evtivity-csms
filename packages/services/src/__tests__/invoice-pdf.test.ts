@@ -178,6 +178,7 @@ function detail(language: string): InvoiceDetail {
       creditReason: null,
       paidAt: null,
       paymentReference: null,
+      letterheadId: null,
       fleetId: null,
       periodStart: null,
       periodEnd: null,

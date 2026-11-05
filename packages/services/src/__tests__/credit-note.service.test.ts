@@ -101,6 +101,9 @@ vi.mock('@evtivity/database', () => {
       Promise.resolve(id === 'iis_rs' ? { id: 'iis_rs', name: 'RHIEM Services GmbH' } : null),
     ),
     allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('GS-260001')),
+    letterheadIdForIssue: vi.fn((_tx: unknown, issuer: { id: string } | null) =>
+      Promise.resolve(issuer != null ? `lhd_${issuer.id}` : 'lhd_company'),
+    ),
   };
 });
 
@@ -267,7 +270,11 @@ describe('creditInvoice', () => {
   });
 
   it("numbers a credit note of an issuer's invoice from the issuer's credit note range", async () => {
-    h.state.invoice = invoice({ issuerId: 'iis_rs', seller: { name: 'RHIEM Services GmbH' } });
+    h.state.invoice = invoice({
+      issuerId: 'iis_rs',
+      seller: { name: 'RHIEM Services GmbH' },
+      letterheadId: 'lhd_old',
+    });
     await creditInvoice('inv_1', 'Wrong tariff');
 
     const [note] = h.state.inserted['invoices'] ?? [];
@@ -275,6 +282,8 @@ describe('creditInvoice', () => {
       invoiceNumber: 'GS-260001',
       issuerId: 'iis_rs',
       seller: { name: 'RHIEM Services GmbH' },
+      // The issuer's letterhead current now, not the one of the credited invoice.
+      letterheadId: 'lhd_iis_rs',
     });
     expect(vi.mocked(allocateIssuerInvoiceNumber)).toHaveBeenCalledWith(
       db,
@@ -297,7 +306,11 @@ describe('creditInvoice', () => {
     await creditInvoice('inv_1', 'Wrong tariff');
 
     const [note] = h.state.inserted['invoices'] ?? [];
-    expect(note).toMatchObject({ invoiceNumber: 'CN-202606-0001', issuerId: null });
+    expect(note).toMatchObject({
+      invoiceNumber: 'CN-202606-0001',
+      issuerId: null,
+      letterheadId: 'lhd_company',
+    });
     expect(vi.mocked(allocateIssuerInvoiceNumber)).not.toHaveBeenCalled();
   });
 

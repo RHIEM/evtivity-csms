@@ -212,6 +212,9 @@
     "./pdf-branding": {
       "import": "./src/pdf-branding.ts"
     },
+    "./pdf-letterhead": {
+      "import": "./src/pdf-letterhead.ts"
+    },
     "./invoice-seller": {
       "import": "./src/invoice-seller.ts"
     },
