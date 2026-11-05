@@ -171,11 +171,11 @@ Merges in `rhiem/main`: `c90d124b` (2), `dd8e5588` (1), `5cad30bf` (4), `a421875
 - `GET/POST /v1/invoice-issuers`, `PATCH/DELETE /v1/invoice-issuers/:id` (`settings.system:read/write`, nur mit Zugriff auf alle Standorte). Neue Fehlercodes `INVOICE_ISSUER_NOT_FOUND`, `INVOICE_ISSUER_IN_USE`, `INVOICE_ISSUER_NUMBER_FORMAT_LOCKED`.
 - `PATCH /v1/fleets/:id/billing-profile`: neue Felder `invoiceIssuerId`, `accountSettlement` (`payment` | `external`), `settlementNote`, `memberInvoiceDelivery` (`driver` | `billing_contacts`).
 - Rechnungen (CSMS und Portal): Felder `seller` (intern), `issuerId`, `settlementNote`.
-- CSMS: Einstellungen → Unternehmen → „Rechnungssteller für Flotten“; im Rechnungsprofil der Flotte die Felder Rechnungssteller, Verrechnung mit Hinweis und „Mitgliederrechnungen senden an“.
+- CSMS: Einstellungen → Rechnungssteller (bis 05.11.2026 unter Unternehmen); im Rechnungsprofil der Flotte die Felder Rechnungssteller, Verrechnung mit Hinweis und „Mitgliederrechnungen senden an“.
 
 ### Einrichtung für RHIEM (nach dem Deployment)
 
-1. Unter Einstellungen → Unternehmen die Rechnungssteller anlegen: RHIEM Intermedia, RHIEM Services, RHIEM Packaging & Print und einen für den Sonderfall, jeweils mit Anschrift, USt-ID und Nummernkreisen. Format und Startwerte erst festlegen, wenn sie endgültig sind: Nach der ersten Rechnung sind sie gesperrt.
+1. Unter Einstellungen → Rechnungssteller die Rechnungssteller anlegen: RHIEM Intermedia, RHIEM Services, RHIEM Packaging & Print und einen für den Sonderfall, jeweils mit Anschrift, USt-ID und Nummernkreisen. Format und Startwerte erst festlegen, wenn sie endgültig sind: Nach der ersten Rechnung sind sie gesperrt.
 2. Flotten je GmbH:
    - „<Firma> – Dienstwagen“: Kontoabrechnung an, Monatslauf aus, kein Kreditlimit.
    - „<Firma> – Mitarbeiter“: Kontoabrechnung an, „Each Driver“, Rechnungssteller = GmbH, Verrechnung extern mit Hinweis, Mitgliederrechnungen an die Rechnungskontakte (Stelle der GmbH), Monatslauf an.
@@ -190,16 +190,29 @@ Merges in `rhiem/main`: `c90d124b` (2), `dd8e5588` (1), `5cad30bf` (4), `a421875
 - Kein Trennzeichen nach dem Jahr: `RI-2600001` statt `RI-26-00001`.
 - Überschneidende Kreise teilen sich die Nummern; die Vergabe überspringt bereits vergebene (siehe Nummernformat). Hinweistext im Formular entsprechend („fortlaufend“ statt „lückenlos“).
 
-**Freigegeben, in Arbeit:**
+**Umgesetzt** (freigegeben 05.11.2026), mit `--no-ff` in `rhiem/main` gemergt:
 
-1. **Eigener Tab „Rechnungssteller“** in den Einstellungen hinter „Unternehmen“ mit kurzer Einleitung. Nur der eigene Block zieht um, die Upstream-Blöcke bleiben unter „Unternehmen“. Der Hinweis im Rechnungsprofil der Flotte verlinkt direkt auf den Tab.
-2. **PDF-Logo und Fußzeile je Rechnungssteller** (optional, Zweig `feature/invoice-issuer-branding`): `invoice_issuers.pdf_logo` (`NULL` = Logo des Unternehmens) und `pdf_footer` (`NULL` = Fußzeile des Unternehmens, leer = keine Fußzeile). Wie beim Unternehmen live beim Erzeugen des PDFs gelesen, keine Momentaufnahme an der Rechnung. Die Druckansicht holt das Logo des Rechnungsstellers der Rechnung. Berichte behalten das globale Branding.
-3. **Rechnungsempfang als Gruppe im Rechnungsprofil** (auf `feature/member-invoice-delivery`, nur Oberfläche, Daten und API unverändert):
-   - „Rechnung an“ (Flotte / Jeden Fahrer) steht oben in der Gruppe; die Umschaltung speichert wie bisher sofort nach Bestätigung. Die Bestätigung nennt die E-Mail „Abrechnung auf Rechnung geändert“ (`fleet.AccountBillingChanged`, abschaltbar unter Benachrichtigungen → Fahrer-Ereignisse) und dass vor dem Wechsel gestartete Ladevorgänge noch auf eine letzte Flottenrechnung kommen.
+| Teil                             | Zweig                             | Commit     | Migration                                 |
+| -------------------------------- | --------------------------------- | ---------- | ----------------------------------------- |
+| Tab „Rechnungssteller“           | `feature/invoice-issuers`         | `81798a71` | –                                         |
+| PDF-Logo und Fußzeile je Steller | `feature/invoice-issuer-branding` | `ffdbf7c2` | `rhiem_0009_invoice_issuer_branding`      |
+| Rechnungsempfang als Gruppe      | `feature/member-invoice-delivery` | `9aab11ee` | `rhiem_0010_member_invoice_delivery_none` |
+
+1. **Eigener Tab „Rechnungssteller“** in den Einstellungen hinter „Unternehmen“ (`settings.system:read`, alle Standorte) mit Einleitung. Nur der eigene Block zieht um, die Upstream-Blöcke bleiben unter „Unternehmen“. Das Rechnungsprofil der Flotte verlinkt mit „Rechnungssteller verwalten“ direkt auf den Tab (`/settings?tab=invoiceIssuers`).
+2. **PDF-Logo und Fußzeile je Rechnungssteller** (optional): `invoice_issuers.pdf_logo` (`NULL` = Logo des Unternehmens) und `pdf_footer` (`NULL` = Fußzeile des Unternehmens, leer = keine Fußzeile). Wie beim Unternehmen live beim Erzeugen des PDFs gelesen, keine Momentaufnahme an der Rechnung; ein unbrauchbares Logo fällt auf das des Unternehmens zurück. API: `GET/PUT/DELETE /v1/invoice-issuers/:id/pdf-logo`, `pdfFooter` beim Anlegen und Ändern; Liste und Audit tragen nur `hasPdfLogo`, nie das Bild. Die Druckansicht holt das Logo über `GET /v1/invoices/print-logo?invoiceId=`. Berichte behalten das globale Branding. Im Formular: Logo hochladen/entfernen (erst nach dem Anlegen), Ankreuzfeld „Eigene Fußzeile“.
+3. **Rechnungsempfang als Gruppe im Rechnungsprofil:**
+   - „Rechnung an“ (Flotte / Jeden Fahrer) zieht aus der Karte „Abrechnung“ oben in die Gruppe; die Umschaltung speichert wie bisher sofort nach Bestätigung. Die Bestätigung nennt die E-Mail „Abrechnung auf Rechnung geändert“ (`fleet.AccountBillingChanged`, abschaltbar unter Benachrichtigungen → Fahrer-Ereignisse) und dass vor dem Wechsel gestartete Ladevorgänge noch auf eine letzte Flottenrechnung kommen.
    - Bei „Flotte“: Rechnungsempfänger (Firmenname, Anschrift, USt-ID), Rechnungssprache und „Versand per E-Mail an“ (bisher „Rechnungskontakte“).
-   - Bei „Jeden Fahrer“: Hinweis, dass der Fahrer mit seiner Rechnungsadresse Empfänger ist, und „Versand“ mit drei Optionen: an den Fahrer, an feste E-Mail-Adressen (dann erscheint „Versand per E-Mail an“), nicht versenden (nur im CSMS, neuer Wert `none` in `member_invoice_delivery`).
+   - Bei „Jeden Fahrer“: Hinweis, dass der Fahrer mit seiner Rechnungsadresse Empfänger ist, und „Versand“: an den Fahrer, an feste E-Mail-Adressen (dann erscheint „Versand per E-Mail an“) oder „Nicht versenden (nur im CSMS)“.
    - Warnung, wenn bei Versand an E-Mail-Adressen keine hinterlegt ist. Ausgeblendete Werte bleiben gespeichert.
-   - Gruppe „Ausstellung“ für beide: Rechnungssteller, Rechnungsdatum, Verrechnung mit Hinweis, Zahlungsziel (ausgeblendet bei Verrechnung extern), automatische Monatsrechnung.
+   - Gruppe „Ausstellung“: Rechnungssteller, Rechnungsdatum, Verrechnung mit Hinweis, Zahlungsziel (ausgeblendet bei Verrechnung extern), automatische Monatsrechnung.
+
+**Abweichung vom Entwurf („nur Oberfläche“):** Zwei Backend-Änderungen waren nötig, damit die Gruppe so funktioniert:
+
+- **Neuer Wert `none`** in `fleets.member_invoice_delivery`: Mitgliederrechnungen und Gutschriften werden ausgestellt, aber nicht versendet (`sent_at` bleibt leer), und es gibt keine Zahlungserinnerung. „Senden“ auf einer solchen Rechnung antwortet 400 `INVOICE_DELIVERY_OFF`.
+- **Rechnungskontakte nur noch Pflicht, wenn sie Empfänger sind.** Upstream verlangt für die automatische Monatsrechnung immer einen Kontakt (API und Constraint `fleets_auto_invoice_contact_check`). Jetzt nur noch bei „Rechnung an: Flotte“ oder bei Versand der Mitgliederrechnungen an die Kontakte; sonst ließe sich „Jeden Fahrer“ mit Versand an den Fahrer und Monatslauf nicht speichern. Der Wechsel zurück auf „Flotte“ ohne Kontakt bei aktivem Monatslauf antwortet 400 `FLEET_BILLING_CONTACT_REQUIRED`. Eine letzte Flottenrechnung für Ladevorgänge vor dem Wechsel auf „Jeden Fahrer“ wird ohne Kontakte ausgestellt, aber nicht versendet (wie bisher protokolliert).
+
+**Geprüft** auf dem zusammengeführten Stand: typecheck, lint, format:check, check:migrations (249), check:openapi, 29.917 Tests grün (der bekannte Zeitlimit-Test `FleetReservationsTab` einzeln grün). Vergabe bei überschneidenden Kreisen mit zwei gleichzeitigen Sitzungen an PostgreSQL 17 geprüft.
 
 ## Annahmen und Rückfragen
 
