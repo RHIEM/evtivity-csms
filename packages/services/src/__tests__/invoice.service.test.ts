@@ -146,6 +146,7 @@ vi.mock('@evtivity/database', () => {
     ),
     allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('10000')),
     invoiceSellerSnapshotFromIssuer: vi.fn((issuer: { name: string }) => ({ name: issuer.name })),
+    currentPdfLetterheadId: vi.fn(() => Promise.resolve(null)),
   };
 });
 

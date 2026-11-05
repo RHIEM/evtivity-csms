@@ -101,6 +101,7 @@ vi.mock('@evtivity/database', () => {
       Promise.resolve(id === 'iis_rs' ? { id: 'iis_rs', name: 'RHIEM Services GmbH' } : null),
     ),
     allocateIssuerInvoiceNumber: vi.fn(() => Promise.resolve('GS-260001')),
+    currentPdfLetterheadId: vi.fn(() => Promise.resolve(null)),
   };
 });
 

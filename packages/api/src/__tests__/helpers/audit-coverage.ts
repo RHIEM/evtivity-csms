@@ -251,10 +251,13 @@ export const AUDIT_COVERAGE: Readonly<Record<string, AuditCoverage>> = {
     audited: 'payment_terminal',
     service: 'services/src/payment-terminal.service.ts',
   },
+  'POST /pdf-letterheads': { audited: 'setting' },
+  'POST /pdf-letterheads/preview': { allow: 'preview render, no stored state' },
   'POST /settings/payment-terminals/:provider/test': { allow: 'connection test, no stored state' },
   'POST /webhooks/payment-terminals/idtech': {
     allow: 'provider-signed webhook, no operator (see section 3)',
   },
+  'PUT /pdf-letterheads/current': { audited: 'setting' },
   'PUT /settings/payment-terminals': { audited: 'setting' },
   'PUT /users/me/avatar': { audited: 'user', service: 'api/src/services/user-avatar.service.ts' },
   'DELETE /users/me/avatar': {

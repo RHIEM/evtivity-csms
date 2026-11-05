@@ -11,6 +11,7 @@ import {
   COMPANY_TAX_ID_KEY,
   COMPANY_TAX_ID_LABEL_KEY,
   INVOICE_SELLER_SETTING_KEYS,
+  PDF_LETTERHEAD_FOLLOWING_TOP_MM,
   createLogger,
   formatCurrencyAmount,
   formatTaxRatePercent,
@@ -33,11 +34,14 @@ import {
   loadPdfBranding,
   reservePdfFooterSpace,
 } from './pdf-branding.js';
+import { loadPdfLetterhead, mmToPt, renderPdfLetterheadBackground } from './invoice-letterhead.js';
+import type { PdfLetterhead } from './invoice-letterhead.js';
 
 const logger = createLogger('invoice-pdf');
 
 const MARGIN = 50;
 const PAGE_WIDTH = 595.28; // A4 portrait width in points
+const PAGE_HEIGHT = 841.89; // A4 portrait height in points
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 const LOGO_MAX_WIDTH = 160;
 const LOGO_MAX_HEIGHT = 60;
@@ -65,6 +69,9 @@ export function resolveInvoicePdfLanguage(
 interface BillToBlock {
   name: string;
   lines: string[];
+  /** The postal address lines alone (lines without the email). */
+  address: string[];
+  email: string | null;
   taxId: string | null;
   /** Member invoice: the driver's employee number at issue. */
   employeeNumber: string | null;
@@ -87,9 +94,12 @@ export function readBillTo(billTo: unknown): BillToBlock | null {
   const name = stringField(record, 'name');
   if (name == null) return null;
   const email = stringField(record, 'email');
+  const address = addressLines(record);
   return {
     name,
-    lines: [...addressLines(record), ...(email != null ? [email] : [])],
+    lines: [...address, ...(email != null ? [email] : [])],
+    address,
+    email,
     taxId: stringField(record, 'taxId'),
     employeeNumber: stringField(record, 'employeeNumber'),
   };
@@ -278,6 +288,30 @@ function formatDate(value: Date | string | null, locale: string): string {
   }).format(date);
 }
 
+/**
+ * Where the text of the pages goes: the left edge and width of the text, the
+ * first y of the text on a page added for the overflow, and the lowest y of
+ * the text. Without a letterhead the page margins; with one its layout.
+ */
+interface PageFrame {
+  left: number;
+  width: number;
+  top: number;
+  bottom: number;
+}
+
+/** The frame of a letterhead layout (millimetres) in points. */
+function letterheadFrame(letterhead: PdfLetterhead): PageFrame {
+  const { layout } = letterhead;
+  const left = mmToPt(layout.marginLeftMm);
+  return {
+    left,
+    width: PAGE_WIDTH - left - mmToPt(layout.marginRightMm),
+    top: mmToPt(PDF_LETTERHEAD_FOLLOWING_TOP_MM),
+    bottom: mmToPt(layout.contentBottomMm),
+  };
+}
+
 /** A table column: x offset from the margin, width, and alignment. */
 interface Column {
   x: number;
@@ -294,9 +328,15 @@ function rowHeight(doc: PDFKit.PDFDocument, columns: Column[], values: string[])
   return Math.max(16, height + 4);
 }
 
-function drawRow(doc: PDFKit.PDFDocument, columns: Column[], values: string[], y: number): number {
+function drawRow(
+  doc: PDFKit.PDFDocument,
+  frame: PageFrame,
+  columns: Column[],
+  values: string[],
+  y: number,
+): number {
   columns.forEach((col, i) => {
-    doc.text(values[i] ?? '', MARGIN + col.x, y, { width: col.width, align: col.align });
+    doc.text(values[i] ?? '', frame.left + col.x, y, { width: col.width, align: col.align });
   });
   return rowHeight(doc, columns, values);
 }
@@ -304,22 +344,17 @@ function drawRow(doc: PDFKit.PDFDocument, columns: Column[], values: string[], y
 /** Line item rows alternate a light band, starting with the second row. */
 export const INVOICE_ROW_BAND_COLOR = '#f5f7fa';
 
-function drawRule(doc: PDFKit.PDFDocument, y: number, fromX = MARGIN): void {
+function drawRule(doc: PDFKit.PDFDocument, frame: PageFrame, y: number, fromX = frame.left): void {
   doc
     .moveTo(fromX, y)
-    .lineTo(MARGIN + CONTENT_WIDTH, y)
+    .lineTo(frame.left + frame.width, y)
     .stroke(COLOR_LINE);
 }
 
-function ensureSpace(
-  doc: PDFKit.PDFDocument,
-  y: number,
-  needed: number,
-  pageBottom: number,
-): number {
-  if (y + needed > pageBottom) {
+function ensureSpace(doc: PDFKit.PDFDocument, frame: PageFrame, y: number, needed: number): number {
+  if (y + needed > frame.bottom) {
     doc.addPage();
-    return MARGIN;
+    return frame.top;
   }
   return y;
 }
@@ -359,13 +394,14 @@ function drawQrCode(doc: PDFKit.PDFDocument, payload: string, x: number, y: numb
  */
 function drawPaymentBlock(
   doc: PDFKit.PDFDocument,
+  frame: PageFrame,
   block: InvoicePaymentBlock,
   labels: InvoiceLabels,
   fonts: { regular: string; bold: string },
   startY: number,
   ensure: (y: number, needed: number) => number,
 ): void {
-  const textWidth = block.qrPayload != null ? CONTENT_WIDTH - QR_SIZE - QR_GAP : CONTENT_WIDTH;
+  const textWidth = block.qrPayload != null ? frame.width - QR_SIZE - QR_GAP : frame.width;
   const labelWidth = 110;
   doc.fontSize(10).font(fonts.regular);
   const textHeight = doc.heightOfString(block.text, { width: textWidth });
@@ -379,34 +415,34 @@ function drawPaymentBlock(
   let y = ensure(startY, needed);
   const top = y;
 
-  drawRule(doc, y - 6);
+  drawRule(doc, frame, y - 6);
   doc
     .fontSize(9)
     .font(fonts.bold)
     .fillColor(COLOR_MUTED)
-    .text(labels.paymentInformation, MARGIN, y, { width: textWidth });
+    .text(labels.paymentInformation, frame.left, y, { width: textWidth });
   y += 16;
   doc
     .fontSize(10)
     .font(fonts.regular)
     .fillColor(COLOR_TEXT)
-    .text(block.text, MARGIN, y, { width: textWidth });
+    .text(block.text, frame.left, y, { width: textWidth });
   y += textHeight + 6;
   for (const [label, value] of block.rows) {
     doc
       .fontSize(10)
       .font(fonts.regular)
       .fillColor(COLOR_MUTED)
-      .text(label, MARGIN, y, { width: labelWidth });
+      .text(label, frame.left, y, { width: labelWidth });
     doc
       .font(fonts.bold)
       .fillColor(COLOR_TEXT)
-      .text(value, MARGIN + labelWidth, y, { width: textWidth - labelWidth });
+      .text(value, frame.left + labelWidth, y, { width: textWidth - labelWidth });
     y += Math.max(14, doc.heightOfString(value, { width: textWidth - labelWidth }) + 2);
   }
 
   if (block.qrPayload != null) {
-    const qrX = MARGIN + CONTENT_WIDTH - QR_SIZE;
+    const qrX = frame.left + frame.width - QR_SIZE;
     drawQrCode(doc, block.qrPayload, qrX, top);
     doc
       .fontSize(7)
@@ -416,7 +452,115 @@ function drawPaymentBlock(
   }
 }
 
-export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer> {
+/**
+ * The letterhead image as the PNG the invoice PDF embeds, or null when it
+ * cannot be used: not a valid PNG or SVG, or a PNG pdfkit cannot read. The
+ * PDF is then drawn without the letterhead, and an upload is refused.
+ */
+export function letterheadBackground(letterhead: PdfLetterhead): Buffer | null {
+  const png = renderPdfLetterheadBackground(letterhead);
+  if (png == null) return null;
+  try {
+    // A PNG with a valid header can still be unreadable; pdfkit parses it here.
+    new PDFDocument({ size: 'A4' }).image(png, 0, 0, { width: 1 });
+    return png;
+  } catch (err) {
+    logger.warn({ err }, 'pdfkit rejected the letterhead image, drawing the PDF without it');
+    return null;
+  }
+}
+
+/** Width of the recipient address in the envelope window (DIN 5008: 85 mm field, 5 mm indent). */
+const ADDRESS_WIDTH = mmToPt(80);
+/** Where the page header of the pages after the first starts. */
+const FOLLOWING_HEADER_Y = mmToPt(12);
+
+/**
+ * The first page on a letterhead: the letterhead as the background, the
+ * recipient address in the envelope window, and the title with the document
+ * number where the text starts. Returns the y below the title.
+ */
+function drawLetterheadFirstPage(
+  doc: PDFKit.PDFDocument,
+  letterhead: PdfLetterhead,
+  background: Buffer,
+  frame: PageFrame,
+  fonts: { regular: string; bold: string },
+  content: { title: string; addressName: string; addressLines: string[] },
+): number {
+  doc.image(background, 0, 0, { width: PAGE_WIDTH, height: PAGE_HEIGHT });
+
+  const x = mmToPt(letterhead.layout.addressLeftMm);
+  const addressWidth = Math.min(ADDRESS_WIDTH, PAGE_WIDTH - x - frame.left / 2);
+  let y = mmToPt(letterhead.layout.addressTopMm);
+  doc.fontSize(10).font(fonts.regular).fillColor(COLOR_TEXT);
+  for (const line of [content.addressName, ...content.addressLines]) {
+    doc.text(line, x, y, { width: addressWidth });
+    y += Math.max(13, doc.heightOfString(line, { width: addressWidth }));
+  }
+
+  const top = mmToPt(letterhead.layout.contentTopMm);
+  doc
+    .fontSize(14)
+    .font(fonts.bold)
+    .fillColor(COLOR_TEXT)
+    .text(content.title, frame.left, top, { width: frame.width });
+  return top + doc.heightOfString(content.title, { width: frame.width }) + 12;
+}
+
+/**
+ * On a letterhead document of two or more pages: "Page 1 of n" above the
+ * letterhead's footer on the first page, and a header with the seller, the
+ * document and the page on every later page (which has no letterhead). Call
+ * it once, right before `doc.end()`.
+ */
+function drawLetterheadPageMarks(
+  doc: PDFKit.PDFDocument,
+  frame: PageFrame,
+  fonts: { regular: string; bold: string },
+  documentLabel: string,
+  pageOf: string,
+): void {
+  const range = doc.bufferedPageRange();
+  if (range.count < 2) return;
+  const headerFonts = registerPdfTextFonts(doc, fonts, documentLabel);
+  for (let i = 0; i < range.count; i++) {
+    doc.switchToPage(range.start + i);
+    const { margins } = doc.page;
+    const bottomMargin = margins.bottom;
+    // Text below the bottom margin would make pdfkit open a new page.
+    margins.bottom = 0;
+    const page = pageOf.replace('{page}', String(i + 1)).replace('{pages}', String(range.count));
+    doc.fontSize(8).fillColor(COLOR_MUTED);
+    if (i === 0) {
+      doc.font(fonts.regular).text(page, frame.left, frame.bottom + 6, {
+        width: frame.width,
+        align: 'right',
+      });
+    } else {
+      doc
+        .font(headerFonts.regular)
+        .text(`${documentLabel} · ${page}`, frame.left, FOLLOWING_HEADER_Y, {
+          width: frame.width,
+        });
+    }
+    margins.bottom = bottomMargin;
+  }
+}
+
+export interface GenerateInvoicePdfOptions {
+  /**
+   * The letterhead to draw instead of the one the invoice was issued under
+   * (invoices.letterhead_id), e.g. the preview of a letterhead not yet stored.
+   * Null draws no letterhead.
+   */
+  letterhead?: PdfLetterhead | null;
+}
+
+export async function generateInvoicePdf(
+  detail: InvoiceDetail,
+  options: GenerateInvoicePdfOptions = {},
+): Promise<Buffer> {
   const { invoice, lineItems, driver, fleet, taxBreakdown, creditedInvoice, creditNote } = detail;
   const isCreditNote = invoice.kind === 'credit_note';
   // A member invoice (and its credit note) bills one driver: its lines are not
@@ -433,25 +577,48 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
   const sessionIds = [
     ...new Set(lineItems.flatMap((item) => (item.sessionId != null ? [item.sessionId] : []))),
   ];
-  const [seller, branding, payment, evidence] = await Promise.all([
+  const [seller, branding, payment, evidence, issuedLetterhead] = await Promise.all([
     readStoredInvoiceSeller(invoice.seller) ?? loadInvoiceSeller(),
     loadPdfBranding(invoice.issuerId),
     getInvoicePaymentSettings(),
     loadSessionEvidence(sessionIds),
+    options.letterhead !== undefined
+      ? options.letterhead
+      : invoice.letterheadId != null
+        ? loadPdfLetterhead(invoice.letterheadId)
+        : null,
   ]);
   const evidenceLabels = INVOICE_EVIDENCE_LABELS[language];
+  // A letterhead whose image cannot be used draws the PDF without it.
+  const background = issuedLetterhead != null ? letterheadBackground(issuedLetterhead) : null;
+  const letterhead = background != null ? issuedLetterhead : null;
+  const letterheadPageFrame = letterhead != null ? letterheadFrame(letterhead) : null;
 
   const doc = new PDFDocument({
-    margins: { top: MARGIN, left: MARGIN, right: MARGIN, bottom: MARGIN },
+    margins:
+      letterheadPageFrame != null
+        ? {
+            top: letterheadPageFrame.top,
+            left: letterheadPageFrame.left,
+            right: PAGE_WIDTH - letterheadPageFrame.left - letterheadPageFrame.width,
+            bottom: PAGE_HEIGHT - letterheadPageFrame.bottom,
+          }
+        : { top: MARGIN, left: MARGIN, right: MARGIN, bottom: MARGIN },
     size: 'A4',
     layout: 'portrait',
     bufferPages: true,
   });
   const fonts = registerPdfFonts(doc, language);
-  const footer = layoutPdfFooter(doc, branding.footer, CONTENT_WIDTH);
-  // A footer taller than the bottom margin moves the content limit up.
-  const pageBottom = PAGE_BOTTOM - (reservePdfFooterSpace(doc, footer, MARGIN) - MARGIN);
-  const ensure = (y: number, needed: number): number => ensureSpace(doc, y, needed, pageBottom);
+  // A letterhead carries its own footer.
+  const footer = layoutPdfFooter(doc, letterhead != null ? '' : branding.footer, CONTENT_WIDTH);
+  const frame: PageFrame = letterheadPageFrame ?? {
+    left: MARGIN,
+    width: CONTENT_WIDTH,
+    top: MARGIN,
+    // A footer taller than the bottom margin moves the content limit up.
+    bottom: PAGE_BOTTOM - (reservePdfFooterSpace(doc, footer, MARGIN) - MARGIN),
+  };
+  const ensure = (y: number, needed: number): number => ensureSpace(doc, frame, y, needed);
   const chunks: Buffer[] = [];
 
   const built = new Promise<Buffer>((resolve, reject) => {
@@ -464,38 +631,7 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     doc.on('error', reject);
   });
 
-  // Header: the PDF logo on the left, invoice meta on the right.
-  try {
-    doc.image(branding.logo, MARGIN, MARGIN, { fit: [LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT] });
-  } catch (err) {
-    logger.warn({ err }, 'pdfkit rejected the PDF logo, using the default logo');
-    doc.image(defaultPdfLogoPng(), MARGIN, MARGIN, { fit: [LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT] });
-  }
-  const headerBottom = MARGIN + LOGO_MAX_HEIGHT;
-
-  doc
-    .fontSize(20)
-    .font(fonts.bold)
-    .fillColor(COLOR_TEXT)
-    .text(isCreditNote ? labels.creditNoteTitle : labels.title, MARGIN, MARGIN, {
-      width: CONTENT_WIDTH,
-      align: 'right',
-    });
-  doc
-    .fontSize(11)
-    .font(fonts.regular)
-    .fillColor(COLOR_MUTED)
-    .text(invoice.invoiceNumber, MARGIN, MARGIN + 26, { width: CONTENT_WIDTH, align: 'right' });
-
-  let y = Math.max(headerBottom, MARGIN + 50) + 20;
-  drawRule(doc, y);
-  y += 20;
-
-  // Meta block: billed-to driver (or the fleet's bill-to block) and the issuing company.
-  const rightX = MARGIN + CONTENT_WIDTH / 2;
   const billTo = readBillTo(invoice.billTo);
-  const billedToName =
-    billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
   // The employee number: kept on a member invoice at issue, read from the
   // driver on a driver invoice (as its name and email); printed when set.
   const employeeNumber =
@@ -504,55 +640,121 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
       : driver?.employeeNumber != null && driver.employeeNumber.trim() !== ''
         ? driver.employeeNumber.trim()
         : null;
-  const billedToDetails = [
-    ...(employeeNumber != null ? [labels.employeeNumber.replace('{id}', employeeNumber)] : []),
-    ...(billTo != null
-      ? [
-          ...billTo.lines,
-          ...(billTo.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
-        ]
-      : driver?.email != null && driver.email !== ''
-        ? [driver.email]
-        : []),
-  ];
-  if (isMemberInvoice && fleet != null) {
-    billedToDetails.push(labels.viaFleet.replace('{fleet}', fleet.name));
-  }
+  const employeeNumberLine =
+    employeeNumber != null ? [labels.employeeNumber.replace('{id}', employeeNumber)] : [];
+  const documentTitle = isCreditNote ? labels.creditNoteTitle : labels.title;
+  let y: number;
+  if (letterhead != null && background != null) {
+    // The letterhead holds the logo and the seller; the recipient goes into
+    // the envelope window, the fleet and tax ID below the title.
+    const addressName =
+      billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
+    const fallbackEmail = billTo != null ? billTo.email : (driver?.email ?? null);
+    const addressLines =
+      billTo != null && billTo.address.length > 0
+        ? billTo.address
+        : fallbackEmail != null && fallbackEmail !== ''
+          ? [fallbackEmail]
+          : [];
+    y = drawLetterheadFirstPage(doc, letterhead, background, frame, fonts, {
+      title: `${documentTitle} ${invoice.invoiceNumber}`,
+      addressName,
+      addressLines,
+    });
+    const recipientLines = [
+      ...employeeNumberLine,
+      ...(billTo?.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
+      ...(isMemberInvoice && fleet != null ? [labels.viaFleet.replace('{fleet}', fleet.name)] : []),
+    ];
+    for (const line of recipientLines) {
+      doc.fontSize(10).font(fonts.regular).fillColor(COLOR_MUTED).text(line, frame.left, y, {
+        width: frame.width,
+      });
+      y += 14;
+    }
+    if (recipientLines.length > 0) y += 6;
+  } else {
+    // Header: the PDF logo on the left, invoice meta on the right.
+    try {
+      doc.image(branding.logo, MARGIN, MARGIN, { fit: [LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT] });
+    } catch (err) {
+      logger.warn({ err }, 'pdfkit rejected the PDF logo, using the default logo');
+      doc.image(defaultPdfLogoPng(), MARGIN, MARGIN, { fit: [LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT] });
+    }
+    const headerBottom = MARGIN + LOGO_MAX_HEIGHT;
 
-  doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.billedTo, MARGIN, y);
-  doc
-    .fontSize(11)
-    .font(fonts.regular)
-    .fillColor(COLOR_TEXT)
-    .text(billedToName, MARGIN, y + 12, { width: CONTENT_WIDTH / 2 - 10 });
-  let detailY = y + 27;
-  for (const detailLine of billedToDetails) {
     doc
-      .fontSize(10)
+      .fontSize(20)
+      .font(fonts.bold)
+      .fillColor(COLOR_TEXT)
+      .text(isCreditNote ? labels.creditNoteTitle : labels.title, MARGIN, MARGIN, {
+        width: CONTENT_WIDTH,
+        align: 'right',
+      });
+    doc
+      .fontSize(11)
+      .font(fonts.regular)
       .fillColor(COLOR_MUTED)
-      .text(detailLine, MARGIN, detailY, { width: CONTENT_WIDTH / 2 - 10 });
-    detailY += 14;
-  }
+      .text(invoice.invoiceNumber, MARGIN, MARGIN + 26, { width: CONTENT_WIDTH, align: 'right' });
 
-  // The seller: name, address, tax ID, registration number and contact. The
-  // operator's text can hold characters the document font lacks.
-  const sellerLines = sellerDetailLines(seller, labels);
-  const sellerFonts = registerPdfTextFonts(doc, fonts, [seller.name, ...sellerLines].join('\n'));
-  const sellerWidth = CONTENT_WIDTH / 2;
-  doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.from, rightX, y);
-  doc
-    .fontSize(11)
-    .font(sellerFonts.regular)
-    .fillColor(COLOR_TEXT)
-    .text(seller.name, rightX, y + 12, { width: sellerWidth });
-  let sellerY = y + 12 + Math.max(15, doc.heightOfString(seller.name, { width: sellerWidth }));
-  doc.fontSize(10).fillColor(COLOR_MUTED);
-  for (const sellerLine of sellerLines) {
-    doc.text(sellerLine, rightX, sellerY, { width: sellerWidth });
-    sellerY += Math.max(14, doc.heightOfString(sellerLine, { width: sellerWidth }));
-  }
+    y = Math.max(headerBottom, MARGIN + 50) + 20;
+    drawRule(doc, frame, y);
+    y += 20;
 
-  y = Math.max(y + 50, detailY + 10, sellerY + 10);
+    // Meta block: billed-to driver (or the fleet's bill-to block) and the issuing company.
+    const rightX = MARGIN + CONTENT_WIDTH / 2;
+    const billedToName =
+      billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
+    const billedToDetails = [
+      ...employeeNumberLine,
+      ...(billTo != null
+        ? [
+            ...billTo.lines,
+            ...(billTo.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
+          ]
+        : driver?.email != null && driver.email !== ''
+          ? [driver.email]
+          : []),
+    ];
+    if (isMemberInvoice && fleet != null) {
+      billedToDetails.push(labels.viaFleet.replace('{fleet}', fleet.name));
+    }
+
+    doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.billedTo, MARGIN, y);
+    doc
+      .fontSize(11)
+      .font(fonts.regular)
+      .fillColor(COLOR_TEXT)
+      .text(billedToName, MARGIN, y + 12, { width: CONTENT_WIDTH / 2 - 10 });
+    let detailY = y + 27;
+    for (const detailLine of billedToDetails) {
+      doc
+        .fontSize(10)
+        .fillColor(COLOR_MUTED)
+        .text(detailLine, MARGIN, detailY, { width: CONTENT_WIDTH / 2 - 10 });
+      detailY += 14;
+    }
+
+    // The seller: name, address, tax ID, registration number and contact. The
+    // operator's text can hold characters the document font lacks.
+    const sellerLines = sellerDetailLines(seller, labels);
+    const sellerFonts = registerPdfTextFonts(doc, fonts, [seller.name, ...sellerLines].join('\n'));
+    const sellerWidth = CONTENT_WIDTH / 2;
+    doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.from, rightX, y);
+    doc
+      .fontSize(11)
+      .font(sellerFonts.regular)
+      .fillColor(COLOR_TEXT)
+      .text(seller.name, rightX, y + 12, { width: sellerWidth });
+    let sellerY = y + 12 + Math.max(15, doc.heightOfString(seller.name, { width: sellerWidth }));
+    doc.fontSize(10).fillColor(COLOR_MUTED);
+    for (const sellerLine of sellerLines) {
+      doc.text(sellerLine, rightX, sellerY, { width: sellerWidth });
+      sellerY += Math.max(14, doc.heightOfString(sellerLine, { width: sellerWidth }));
+    }
+
+    y = Math.max(y + 50, detailY + 10, sellerY + 10);
+  }
 
   const metaRows: Array<[string, string]> = [
     [labels.status, labels.statuses[invoice.status]],
@@ -569,15 +771,15 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
   }
   if (creditNote != null) metaRows.push([labels.creditedBy, creditNote.invoiceNumber]);
   for (const [label, value] of metaRows) {
-    doc.fontSize(10).font(fonts.regular).fillColor(COLOR_MUTED).text(label, MARGIN, y, {
+    doc.fontSize(10).font(fonts.regular).fillColor(COLOR_MUTED).text(label, frame.left, y, {
       width: 120,
     });
     doc
       .fontSize(10)
       .font(fonts.bold)
       .fillColor(COLOR_TEXT)
-      .text(value, MARGIN + 120, y, { width: CONTENT_WIDTH - 120 });
-    y += Math.max(16, doc.heightOfString(value, { width: CONTENT_WIDTH - 120 }) + 4);
+      .text(value, frame.left + 120, y, { width: frame.width - 120 });
+    y += Math.max(16, doc.heightOfString(value, { width: frame.width - 120 }) + 4);
   }
 
   y += 14;
@@ -588,16 +790,17 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     { x: 210, width: 35, align: 'right' },
     { x: 250, width: 80, align: 'right' },
     { x: 335, width: 60, align: 'right' },
-    { x: 400, width: CONTENT_WIDTH - 400, align: 'right' },
+    { x: 400, width: frame.width - 400, align: 'right' },
   ];
   doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED);
   y += drawRow(
     doc,
+    frame,
     itemColumns,
     [labels.description, labels.quantity, labels.unitPrice, labels.taxRate, labels.amount],
     y,
   );
-  drawRule(doc, y - 4);
+  drawRule(doc, frame, y - 4);
 
   const drawItem = (item: LineItem, index: number): void => {
     y = ensure(y, 30);
@@ -613,11 +816,11 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     if (index % 2 === 1) {
       // The band spans the row's text plus half the row gap above and below.
       doc
-        .rect(MARGIN - 4, y - 2, CONTENT_WIDTH + 8, rowHeight(doc, itemColumns, values))
+        .rect(frame.left - 4, y - 2, frame.width + 8, rowHeight(doc, itemColumns, values))
         .fill(INVOICE_ROW_BAND_COLOR);
     }
     doc.fillColor(COLOR_TEXT);
-    y += drawRow(doc, itemColumns, values, y);
+    y += drawRow(doc, frame, itemColumns, values, y);
   };
 
   // The check line under a session's last line: the session id, and the
@@ -630,9 +833,9 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
       evidence.get(sessionId),
     );
     doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
-    const height = doc.heightOfString(text, { width: CONTENT_WIDTH });
+    const height = doc.heightOfString(text, { width: frame.width });
     y = ensure(y - 3, height + 4);
-    doc.text(text, MARGIN, y, { width: CONTENT_WIDTH });
+    doc.text(text, frame.left, y, { width: frame.width });
     y += height + 4;
   };
 
@@ -655,16 +858,17 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
         group.employeeNumber != null
           ? `${driverName} · ${labels.employeeNumber.replace('{id}', group.employeeNumber)}`
           : driverName;
-      doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, MARGIN, y, {
-        width: CONTENT_WIDTH,
+      doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, frame.left, y, {
+        width: frame.width,
       });
       y += 16;
       drawItems(group.items);
       y = ensure(y, 20);
-      drawRule(doc, y - 2, MARGIN + CONTENT_WIDTH / 2);
+      drawRule(doc, frame, y - 2, frame.left + frame.width / 2);
       doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT);
       y += drawRow(
         doc,
+        frame,
         itemColumns,
         [labels.driverSubtotal.replace('{driver}', name), '', '', '', money(group.netCents)],
         y,
@@ -677,9 +881,9 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
 
   if (evidence.size > 0) {
     doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
-    const height = doc.heightOfString(evidenceLabels.note, { width: CONTENT_WIDTH });
+    const height = doc.heightOfString(evidenceLabels.note, { width: frame.width });
     y = ensure(y + 4, height + 4);
-    doc.text(evidenceLabels.note, MARGIN, y, { width: CONTENT_WIDTH });
+    doc.text(evidenceLabels.note, frame.left, y, { width: frame.width });
     y += height + 4;
   }
 
@@ -691,22 +895,24 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     { x: 0, width: 120, align: 'left' },
     { x: 125, width: 120, align: 'right' },
     { x: 250, width: 120, align: 'right' },
-    { x: 375, width: CONTENT_WIDTH - 375, align: 'right' },
+    { x: 375, width: frame.width - 375, align: 'right' },
   ];
   y = ensure(y, 30 + taxBreakdown.length * 16);
-  doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.taxSummary, MARGIN, y);
+  doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.taxSummary, frame.left, y);
   y += 16;
   y += drawRow(
     doc,
+    frame,
     summaryColumns,
     [labels.taxRate, labels.netAmount, labels.tax, labels.grossAmount],
     y,
   );
-  drawRule(doc, y - 4);
+  drawRule(doc, frame, y - 4);
   doc.font(fonts.regular).fontSize(10).fillColor(COLOR_TEXT);
   for (const line of taxBreakdown) {
     y += drawRow(
       doc,
+      frame,
       summaryColumns,
       [rate(line.taxRate), money(line.netCents), money(line.taxCents), money(line.grossCents)],
       y,
@@ -717,12 +923,12 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
 
   // Totals block (divider + net subtotal + tax + total) must not split across pages.
   y = ensure(y, 10 + 16 + 16 + 20 + 20);
-  drawRule(doc, y, MARGIN + CONTENT_WIDTH / 2);
+  drawRule(doc, frame, y, frame.left + frame.width / 2);
   y += 10;
 
-  const totalsX = MARGIN + CONTENT_WIDTH / 2;
-  const amountCol = itemColumns[4] ?? { x: 400, width: CONTENT_WIDTH - 400, align: 'right' };
-  const totalsLabelWidth = CONTENT_WIDTH / 2 - amountCol.width;
+  const totalsX = frame.left + frame.width / 2;
+  const amountCol = itemColumns[4] ?? { x: 400, width: frame.width - 400, align: 'right' };
+  const totalsLabelWidth = frame.width / 2 - amountCol.width;
   const totalRows: Array<[string, string, boolean]> = [
     [labels.subtotal, money(invoice.subtotalCents), false],
     [labels.totalTax, money(invoice.taxCents), false],
@@ -738,7 +944,7 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
       .fontSize(bold ? 12 : 10)
       .font(bold ? fonts.bold : fonts.regular)
       .fillColor(COLOR_TEXT)
-      .text(value, MARGIN + amountCol.x, y, { width: amountCol.width, align: 'right' });
+      .text(value, frame.left + amountCol.x, y, { width: amountCol.width, align: 'right' });
     y += bold ? 20 : 16;
   }
 
@@ -746,12 +952,12 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
     .fontSize(8)
     .font(fonts.regular)
     .fillColor(COLOR_MUTED)
-    .text(labels.amountsNote, MARGIN, y + 4, { width: CONTENT_WIDTH });
+    .text(labels.amountsNote, frame.left, y + 4, { width: frame.width });
   y += 16;
   if (isCreditNote && creditedInvoice?.paidAt != null) {
     y = ensure(y, 24);
-    doc.text(labels.creditNotePaidNote, MARGIN, y, { width: CONTENT_WIDTH });
-    y += Math.max(12, doc.heightOfString(labels.creditNotePaidNote, { width: CONTENT_WIDTH }));
+    doc.text(labels.creditNotePaidNote, frame.left, y, { width: frame.width });
+    y += Math.max(12, doc.heightOfString(labels.creditNotePaidNote, { width: frame.width }));
   }
 
   const paymentBlock = invoicePaymentBlock({
@@ -767,9 +973,18 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
       fonts,
       [paymentBlock.text, ...paymentBlock.rows.map(([, value]) => value)].join('\n'),
     );
-    drawPaymentBlock(doc, paymentBlock, labels, blockFonts, y + 14, ensure);
+    drawPaymentBlock(doc, frame, paymentBlock, labels, blockFonts, y + 14, ensure);
   }
 
+  if (letterhead != null) {
+    drawLetterheadPageMarks(
+      doc,
+      frame,
+      fonts,
+      `${seller.name} · ${documentTitle} ${invoice.invoiceNumber}`,
+      labels.pageOf,
+    );
+  }
   drawPdfFooter(doc, footer, MARGIN, CONTENT_WIDTH);
   doc.end();
   return built;

@@ -18,6 +18,7 @@ import {
   invoiceSellerSnapshotFromIssuer,
   loadInvoiceIssuerForIssue,
   loadInvoiceSellerSnapshot,
+  currentPdfLetterheadId,
 } from '@evtivity/database';
 import type { InvoiceKind, InvoiceSellerSnapshot } from '@evtivity/database';
 import {
@@ -517,10 +518,13 @@ export async function insertInvoiceInTransaction(
     'invoice',
     now,
   );
+  // The PDF keeps drawing the letterhead current at issue.
+  const letterheadId = await currentPdfLetterheadId(tx);
   const [invoice] = await tx
     .insert(invoices)
     .values({
       invoiceNumber,
+      letterheadId,
       driverId,
       status,
       seller,

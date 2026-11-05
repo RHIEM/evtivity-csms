@@ -52,6 +52,8 @@ interface InvoiceRecord extends DriverInvoice {
   paymentReference: string | null;
   /** Settled outside EVtivity (e.g. payroll): the note, '' for the default text. */
   settlementNote?: string | null;
+  /** The PDF letterhead version it was issued under; printing then prints its PDF. */
+  letterheadId?: string | null;
   creditReason: string | null;
   metadata: Record<string, unknown> | null;
   updatedAt: string;
@@ -116,17 +118,48 @@ const CREDIT_REASON_MAX = 500;
 const HEADER_ACTION_CLASS = 'h-11 grow sm:h-10 sm:grow-0';
 const PAYMENT_REFERENCE_MAX = 200;
 
-async function downloadInvoicePdf(invoice: { id: string; invoiceNumber: string }): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/v1/invoices/${invoice.id}/pdf`, {
+async function fetchInvoicePdf(invoiceId: string): Promise<Blob> {
+  const res = await fetch(`${API_BASE_URL}/v1/invoices/${invoiceId}/pdf`, {
     credentials: 'include',
   });
   if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => null));
-  const blob = await res.blob();
+  return res.blob();
+}
+
+async function downloadInvoicePdf(invoice: { id: string; invoiceNumber: string }): Promise<void> {
+  const blob = await fetchInvoicePdf(invoice.id);
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
   link.download = `${invoice.invoiceNumber}.pdf`;
   link.click();
   URL.revokeObjectURL(link.href);
+}
+
+/**
+ * Prints the invoice PDF: an invoice on a letterhead prints as its PDF, so the
+ * printout shows the letterhead. The PDF loads in a hidden frame whose print
+ * dialog opens once it has loaded.
+ */
+async function printInvoicePdf(invoiceId: string): Promise<void> {
+  const url = URL.createObjectURL(await fetchInvoicePdf(invoiceId));
+  const frame = document.createElement('iframe');
+  frame.style.position = 'fixed';
+  frame.style.width = '0';
+  frame.style.height = '0';
+  frame.style.border = '0';
+  frame.setAttribute('aria-hidden', 'true');
+  frame.dataset['testid'] = 'invoice-print-frame';
+  frame.onload = () => {
+    frame.contentWindow?.focus();
+    frame.contentWindow?.print();
+    // The print dialog blocks until it closes; keep the frame a while for slow viewers.
+    window.setTimeout(() => {
+      frame.remove();
+      URL.revokeObjectURL(url);
+    }, 60_000);
+  };
+  frame.src = url;
+  document.body.appendChild(frame);
 }
 
 export function InvoiceDetail(): React.JSX.Element {
@@ -317,6 +350,16 @@ export function InvoiceDetail(): React.JSX.Element {
     setCreditOpen(true);
   }
 
+  function handlePrint(): void {
+    if (invoice.letterheadId == null) {
+      window.print();
+      return;
+    }
+    void printInvoicePdf(invoice.id).catch((err: unknown) => {
+      toast({ variant: 'destructive', title: getErrorMessage(err, t) });
+    });
+  }
+
   function handleDownload(): void {
     void downloadInvoicePdf(invoice).catch((err: unknown) => {
       toast({ variant: 'destructive', title: getErrorMessage(err, t) });
@@ -391,13 +434,7 @@ export function InvoiceDetail(): React.JSX.Element {
           className="print-hidden flex flex-wrap items-start gap-2"
           data-testid="invoice-actions"
         >
-          <Button
-            variant="outline"
-            className={HEADER_ACTION_CLASS}
-            onClick={() => {
-              window.print();
-            }}
-          >
+          <Button variant="outline" className={HEADER_ACTION_CLASS} onClick={handlePrint}>
             <Printer className="mr-2 h-4 w-4" />
             {t('invoices.print')}
           </Button>

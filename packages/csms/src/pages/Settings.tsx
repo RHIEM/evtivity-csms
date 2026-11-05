@@ -18,6 +18,7 @@ import { InvoiceSellerSettings } from '@/components/settings/InvoiceSellerSettin
 import { InvoiceIssuerSettings } from '@/components/settings/InvoiceIssuerSettings';
 import { InvoicePaymentSettings } from '@/components/settings/InvoicePaymentSettings';
 import { PdfBrandingSettings } from '@/components/settings/PdfBrandingSettings';
+import { PdfLetterheadSettings } from '@/components/settings/PdfLetterheadSettings';
 import { MarketingSettings } from '@/components/settings/MarketingSettings';
 import { ContentSettings } from '@/components/settings/ContentSettings';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -226,6 +227,7 @@ export function Settings(): React.JSX.Element {
             <InvoiceSellerSettings settings={settings} />
             <InvoicePaymentSettings settings={settings} />
             <PdfBrandingSettings settings={settings} />
+            <PdfLetterheadSettings />
           </TabsContent>
         )}
 

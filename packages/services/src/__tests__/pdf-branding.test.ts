@@ -218,6 +218,7 @@ function detail(overrides: Partial<InvoiceDetail> = {}): InvoiceDetail {
       creditReason: null,
       paidAt: null,
       paymentReference: null,
+      letterheadId: null,
       fleetId: null,
       periodStart: null,
       periodEnd: null,

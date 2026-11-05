@@ -224,6 +224,8 @@ export {
   allocateIssuerInvoiceNumber,
 } from './lib/invoice-issuer.js';
 export type { InvoiceIssuer, InvoiceIssuerExecutor } from './lib/invoice-issuer.js';
+export { currentPdfLetterheadId } from './lib/pdf-letterhead.js';
+export type { PdfLetterheadExecutor } from './lib/pdf-letterhead.js';
 export { sessionFeeGrossCents, siteMaxSessionFeeGrossCents } from './lib/session-fee-floor.js';
 export type {
   PricingGroupSource,

@@ -226,10 +226,11 @@ function dropChainedUses(root: Element): void {
 /**
  * The SVG with only allowed elements and attributes, or null when it is not
  * a well-formed SVG document, declares a DOCTYPE or entities, is larger than
- * MAX_PDF_LOGO_BYTES, or has more than 10000 elements or 64 levels.
+ * `maxBytes` (default MAX_PDF_LOGO_BYTES), or has more than 10000 elements or
+ * 64 levels.
  */
-export function sanitizeSvg(svg: string): string | null {
-  if (Buffer.byteLength(svg, 'utf8') > MAX_PDF_LOGO_BYTES) return null;
+export function sanitizeSvg(svg: string, maxBytes = MAX_PDF_LOGO_BYTES): string | null {
+  if (Buffer.byteLength(svg, 'utf8') > maxBytes) return null;
   if (/<!DOCTYPE|<!ENTITY/i.test(svg)) return null;
   let parsed: Document;
   try {
@@ -292,19 +293,21 @@ function decodeDataUri(value: string): { mime: string; data: Buffer } | null {
  * and JPEG must carry their file signature. `allowJpeg` is for rendering
  * only: an upload accepts PNG and SVG, while a JPEG `company.logo` copied by
  * migration 0395 still renders. Returns null for anything else, an empty
- * file, or one larger than MAX_PDF_LOGO_BYTES.
+ * file, or one larger than `maxBytes` (default MAX_PDF_LOGO_BYTES; a PDF
+ * letterhead allows more).
  */
 export function decodePdfLogo(
   value: unknown,
-  options: { allowJpeg?: boolean } = {},
+  options: { allowJpeg?: boolean; maxBytes?: number } = {},
 ): DecodedPdfLogo | null {
   if (typeof value !== 'string' || value.trim() === '') return null;
   const decoded = decodeDataUri(value);
   if (decoded == null) return null;
   const { mime, data } = decoded;
-  if (data.length === 0 || data.length > MAX_PDF_LOGO_BYTES) return null;
+  const maxBytes = options.maxBytes ?? MAX_PDF_LOGO_BYTES;
+  if (data.length === 0 || data.length > maxBytes) return null;
   if (mime === 'image/svg+xml') {
-    const svg = sanitizeSvg(data.toString('utf8'));
+    const svg = sanitizeSvg(data.toString('utf8'), maxBytes);
     return svg != null ? { kind: 'svg', svg } : null;
   }
   if (mime === 'image/png') {

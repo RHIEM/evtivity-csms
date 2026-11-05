@@ -178,6 +178,13 @@ const invoiceRecord = z
       .describe(
         "Settled outside EVtivity (the fleet's external settlement, e.g. payroll): the note printed instead of the payment block, an empty string for the default text. Null when paid through EVtivity",
       ),
+    letterheadId: z
+      .string()
+      .nullable()
+      .optional()
+      .describe(
+        'The PDF letterhead version the invoice was issued under (pdf.letterhead at issue); null draws its PDF without a letterhead',
+      ),
     currency: z.string().length(3).describe('ISO 4217 currency code'),
     subtotalCents: z
       .number()
@@ -1100,7 +1107,7 @@ export function invoiceRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Download an invoice as a PDF',
         description:
-          "Renders a portrait A4 PDF of the invoice in the driver's language (a fleet invoice in the language stored on it; English otherwise) with the PDF logo (pdf.logo), billed-to driver (a fleet invoice: the fleet's bill-to block, the period, and the lines grouped by driver with a subtotal each), line items with their tax rate, the net amount, tax rate, and tax amount per rate, and the totals, and the PDF footer (pdf.footer) centered at the bottom of every page. A credit note is titled as one and names the invoice it credits and the reason; a credited invoice names its credit note. Streams application/pdf as an attachment.",
+          "Renders a portrait A4 PDF of the invoice in the driver's language (a fleet invoice in the language stored on it; English otherwise) with the PDF logo (pdf.logo), billed-to driver (a fleet invoice: the fleet's bill-to block, the period, and the lines grouped by driver with a subtotal each), line items with their tax rate, the net amount, tax rate, and tax amount per rate, and the totals, and the PDF footer (pdf.footer) centered at the bottom of every page. An invoice issued under a PDF letterhead (letterheadId) draws it as the background of the first page instead of the logo, the seller block and the footer, with the recipient address in the envelope window; later pages carry a header with the seller, the number and the page. A credit note is titled as one and names the invoice it credits and the reason; a credited invoice names its credit note. Streams application/pdf as an attachment.",
         operationId: 'downloadInvoicePdf',
         security: [{ bearerAuth: [] }],
         params: zodSchema(invoiceIdParams),
