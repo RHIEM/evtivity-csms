@@ -51,7 +51,12 @@ import {
   FleetInvoiceRecipientField,
   oldProcessAllowedFrom,
 } from '../fleet/FleetBillingTab';
-import { FleetBillingProfileCard, parseContactEmails } from '../fleet/FleetBillingProfileCard';
+import {
+  FleetBillingProfileCard,
+  memberDeliveryFlags,
+  memberDeliveryOfFlags,
+  parseContactEmails,
+} from '../fleet/FleetBillingProfileCard';
 import { FleetDriversTab } from '../fleet/FleetDriversTab';
 import { DriverBillingCard } from '../driver/DriverBillingCard';
 import { accountBillingState, isBilledOnAccount } from '@/lib/account-billing';
@@ -449,9 +454,8 @@ describe('FleetBillingProfileCard', () => {
       'fleets.billingProfile.memberDeliveryDriver',
     );
     fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
-    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
-      target: { value: 'billing_contacts' },
-    });
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToDriver'));
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToContacts'));
     fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
 
     await waitFor(() => {
@@ -511,12 +515,43 @@ describe('FleetBillingProfileCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
     expect(screen.queryByLabelText('fleets.billingProfile.contacts')).toBeNull();
     expect(screen.queryByLabelText('fleets.billingProfile.legalName')).toBeNull();
-    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
-      target: { value: 'billing_contacts' },
-    });
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToDriver'));
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToContacts'));
     expect(screen.getByLabelText('fleets.billingProfile.contacts')).toBeTruthy();
     expect(screen.getByTestId('billing-contacts-missing')).toBeTruthy();
     expect(screen.getByText('fleets.billingProfile.memberDeliveryHelpContacts')).toBeTruthy();
+  });
+
+  it('saves the delivery to the driver and to fixed addresses with both boxes ticked', async () => {
+    patchMock.mockResolvedValueOnce(fleet);
+    wrap(<FleetBillingProfileCard fleet={{ ...fleet, accountInvoiceRecipient: 'member' }} />);
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    expect(
+      screen.getByLabelText<HTMLInputElement>('fleets.billingProfile.memberDeliveryToDriver')
+        .checked,
+    ).toBe(true);
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToContacts'));
+    expect(screen.getByLabelText('fleets.billingProfile.contacts')).toBeTruthy();
+    expect(screen.getByText('fleets.billingProfile.memberDeliveryHelpBoth')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/fleets/flt_1/billing-profile',
+        expect.objectContaining({ memberInvoiceDelivery: 'driver_and_contacts' }),
+      );
+    });
+  });
+
+  it('maps the two delivery boxes to the stored delivery and back', () => {
+    expect(memberDeliveryOfFlags(true, false)).toBe('driver');
+    expect(memberDeliveryOfFlags(false, true)).toBe('billing_contacts');
+    expect(memberDeliveryOfFlags(true, true)).toBe('driver_and_contacts');
+    expect(memberDeliveryOfFlags(false, false)).toBe('none');
+    for (const delivery of ['driver', 'billing_contacts', 'driver_and_contacts', 'none'] as const) {
+      const { toDriver, toContacts } = memberDeliveryFlags(delivery);
+      expect(memberDeliveryOfFlags(toDriver, toContacts)).toBe(delivery);
+    }
   });
 
   it('saves automatic member invoices kept in the CSMS without any address', async () => {
@@ -532,9 +567,7 @@ describe('FleetBillingProfileCard', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
-    fireEvent.change(screen.getByLabelText('fleets.billingProfile.memberDelivery'), {
-      target: { value: 'none' },
-    });
+    fireEvent.click(screen.getByLabelText('fleets.billingProfile.memberDeliveryToDriver'));
     expect(screen.getByText('fleets.billingProfile.memberDeliveryHelpNone')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
 

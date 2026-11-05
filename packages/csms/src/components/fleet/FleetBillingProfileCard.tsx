@@ -7,6 +7,7 @@ import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import { TabPanel } from '@/components/ui/tab-panel';
 import { CancelButton } from '@/components/cancel-button';
 import { EditButton } from '@/components/edit-button';
@@ -57,7 +58,7 @@ export type InvoiceDateMode = 'run_date' | 'period_end';
 export type AccountSettlement = 'payment' | 'external';
 
 /** Who a fleet's member invoices are emailed to; none keeps them in the CSMS. */
-export type MemberInvoiceDelivery = 'driver' | 'billing_contacts' | 'none';
+export type MemberInvoiceDelivery = 'driver' | 'billing_contacts' | 'driver_and_contacts' | 'none';
 
 export interface FleetBillingProfileCardProps {
   fleet: {
@@ -69,7 +70,30 @@ export interface FleetBillingProfileCardProps {
 }
 
 function memberInvoiceDeliveryOf(value: string | undefined): MemberInvoiceDelivery {
-  return value === 'billing_contacts' || value === 'none' ? value : 'driver';
+  return value === 'billing_contacts' || value === 'driver_and_contacts' || value === 'none'
+    ? value
+    : 'driver';
+}
+
+/** The two delivery checkboxes of a member invoice delivery. */
+export function memberDeliveryFlags(delivery: MemberInvoiceDelivery): {
+  toDriver: boolean;
+  toContacts: boolean;
+} {
+  return {
+    toDriver: delivery === 'driver' || delivery === 'driver_and_contacts',
+    toContacts: delivery === 'billing_contacts' || delivery === 'driver_and_contacts',
+  };
+}
+
+/** The member invoice delivery of the two checkboxes. */
+export function memberDeliveryOfFlags(
+  toDriver: boolean,
+  toContacts: boolean,
+): MemberInvoiceDelivery {
+  if (toDriver && toContacts) return 'driver_and_contacts';
+  if (toDriver) return 'driver';
+  return toContacts ? 'billing_contacts' : 'none';
 }
 
 /**
@@ -81,18 +105,20 @@ export function billingContactsUsed(
   recipient: AccountInvoiceRecipient,
   delivery: MemberInvoiceDelivery,
 ): boolean {
-  return recipient !== 'member' || delivery === 'billing_contacts';
+  return recipient !== 'member' || memberDeliveryFlags(delivery).toContacts;
 }
 
 const MEMBER_DELIVERY_HELP = {
   driver: 'fleets.billingProfile.memberDeliveryHelpDriver',
   billing_contacts: 'fleets.billingProfile.memberDeliveryHelpContacts',
+  driver_and_contacts: 'fleets.billingProfile.memberDeliveryHelpBoth',
   none: 'fleets.billingProfile.memberDeliveryHelpNone',
 } as const;
 
 const MEMBER_DELIVERY_LABEL = {
   driver: 'fleets.billingProfile.memberDeliveryDriver',
   billing_contacts: 'fleets.billingProfile.memberDeliveryContacts',
+  driver_and_contacts: 'fleets.billingProfile.memberDeliveryBoth',
   none: 'fleets.billingProfile.memberDeliveryNone',
 } as const;
 
@@ -359,28 +385,47 @@ export function FleetBillingProfileCard({
                 <p className="text-muted-foreground md:col-span-2">
                   {t('fleets.billingProfile.memberBillTo')}
                 </p>
-                <div className="space-y-2 md:col-span-2">
-                  <Label htmlFor="billing-member-delivery">
+                <fieldset className="space-y-2 md:col-span-2" data-testid="billing-member-delivery">
+                  <legend className="text-sm font-medium">
                     {t('fleets.billingProfile.memberDelivery')}
-                  </Label>
-                  <Select
-                    id="billing-member-delivery"
-                    className="sm:max-w-xs"
-                    value={form.memberInvoiceDelivery}
-                    onChange={(e) => {
-                      set('memberInvoiceDelivery', memberInvoiceDeliveryOf(e.target.value));
-                    }}
+                  </legend>
+                  {(['toDriver', 'toContacts'] as const).map((flag) => {
+                    const flags = memberDeliveryFlags(form.memberInvoiceDelivery);
+                    return (
+                      <label
+                        key={flag}
+                        className="flex items-center gap-2 text-sm"
+                        htmlFor={`billing-member-delivery-${flag}`}
+                      >
+                        <Checkbox
+                          id={`billing-member-delivery-${flag}`}
+                          checked={flags[flag]}
+                          onChange={(e) => {
+                            const next = { ...flags, [flag]: e.target.checked };
+                            set(
+                              'memberInvoiceDelivery',
+                              memberDeliveryOfFlags(next.toDriver, next.toContacts),
+                            );
+                          }}
+                        />
+                        {t(
+                          flag === 'toDriver'
+                            ? 'fleets.billingProfile.memberDeliveryToDriver'
+                            : 'fleets.billingProfile.memberDeliveryToContacts',
+                        )}
+                      </label>
+                    );
+                  })}
+                  <p
+                    className={
+                      form.memberInvoiceDelivery === 'none'
+                        ? 'text-xs text-warning'
+                        : 'text-xs text-muted-foreground'
+                    }
                   >
-                    <option value="driver">{t(MEMBER_DELIVERY_LABEL.driver)}</option>
-                    <option value="billing_contacts">
-                      {t(MEMBER_DELIVERY_LABEL.billing_contacts)}
-                    </option>
-                    <option value="none">{t(MEMBER_DELIVERY_LABEL.none)}</option>
-                  </Select>
-                  <p className="text-xs text-muted-foreground">
                     {t(MEMBER_DELIVERY_HELP[form.memberInvoiceDelivery])}
                   </p>
-                </div>
+                </fieldset>
               </>
             )}
             {contactsUsed && contactsField}

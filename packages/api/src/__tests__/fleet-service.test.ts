@@ -85,7 +85,7 @@ vi.mock('@evtivity/database', () => ({
   MEMBER_INVOICE_MIN_VERSION: '0.1.46',
   guardVersion: (min: string) => min,
   fleetBillingContactsUsed: (recipient: string, delivery: string) =>
-    recipient !== 'member' || delivery === 'billing_contacts',
+    recipient !== 'member' || delivery === 'billing_contacts' || delivery === 'driver_and_contacts',
   loadFleetCreditExposure: mockLoadExposure,
   fleetCreditLevel: (exposure: number, limit: number, percent: number) =>
     exposure >= limit ? 'reached' : exposure * 100 >= limit * percent ? 'warning' : 'ok',
@@ -922,13 +922,15 @@ describe('fleet billing profile', () => {
   });
 
   it('refuses automatic invoicing without a contact when member invoices go to the contacts', async () => {
-    setupDbResults([{ ...fleetRow, accountInvoiceRecipient: 'member' }]);
-    const err = await updateFleetBillingProfile(
-      'f1',
-      { autoInvoice: true, memberInvoiceDelivery: 'billing_contacts' },
-      { actor, log },
-    ).catch((e: unknown) => e);
-    expect(err).toMatchObject({ code: 'FLEET_BILLING_CONTACT_REQUIRED' });
+    for (const memberInvoiceDelivery of ['billing_contacts', 'driver_and_contacts'] as const) {
+      setupDbResults([{ ...fleetRow, accountInvoiceRecipient: 'member' }]);
+      const err = await updateFleetBillingProfile(
+        'f1',
+        { autoInvoice: true, memberInvoiceDelivery },
+        { actor, log },
+      ).catch((e: unknown) => e);
+      expect(err).toMatchObject({ code: 'FLEET_BILLING_CONTACT_REQUIRED' });
+    }
   });
 
   it('returns null for an unknown fleet', async () => {

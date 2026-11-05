@@ -112,7 +112,7 @@ const billingProfileFields = {
   memberInvoiceDelivery: z
     .enum(MEMBER_INVOICE_DELIVERIES)
     .describe(
-      'Who the member invoices and their credit notes are emailed to: driver (the member, default), billing_contacts (the fleet billing contacts instead of the driver) or none (not emailed, kept in the CSMS)',
+      'Who the member invoices and their credit notes are emailed to: driver (the member, default), billing_contacts (the fleet billing contacts instead of the driver), driver_and_contacts (both) or none (not emailed, kept in the CSMS)',
     ),
 };
 const optionalBillingProfileFields = Object.fromEntries(
@@ -475,7 +475,7 @@ const fleetBillingProfileBody = z.object({
     .enum(MEMBER_INVOICE_DELIVERIES)
     .optional()
     .describe(
-      'Who the member invoices and their credit notes are emailed to: driver (the member), billing_contacts (the billing contacts, e.g. a payroll office that forwards them) or none (not emailed, kept in the CSMS; no overdue notice either). Automatic invoicing needs a billing contact only where the contacts receive the invoices (the fleet invoice, or member invoices delivered to them)',
+      'Who the member invoices and their credit notes are emailed to: driver (the member), billing_contacts (the billing contacts, e.g. a payroll office that forwards them), driver_and_contacts (both) or none (not emailed, kept in the CSMS; no overdue notice either). Automatic invoicing needs a billing contact only where the contacts receive the invoices (the fleet invoice, or member invoices delivered to them)',
     ),
 });
 
