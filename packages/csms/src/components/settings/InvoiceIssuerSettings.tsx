@@ -5,7 +5,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ParseKeys } from 'i18next';
-import { Pencil, Trash2 } from 'lucide-react';
+import { Pencil, RotateCcw, Trash2 } from 'lucide-react';
 import {
   MAX_INVOICE_NUMBER_DIGITS,
   MAX_INVOICE_NUMBER_PREFIX_LENGTH,
@@ -14,6 +14,12 @@ import {
   isValidInvoiceNumberPrefix,
 } from '@evtivity/lib/invoice-issuer';
 import type { InvoiceNumberFormat } from '@evtivity/lib/invoice-issuer';
+import {
+  MAX_PDF_FOOTER_LENGTH,
+  MAX_PDF_FOOTER_LINES,
+  MAX_PDF_LOGO_BYTES,
+  normalizePdfFooter,
+} from '@evtivity/lib/pdf-branding';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -25,8 +31,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { FileUploadButton } from '@/components/ui/file-upload-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import {
   Table,
   TableBody,
@@ -64,6 +72,10 @@ export interface InvoiceIssuer {
   creditNoteWithYear: boolean;
   creditNoteStart: number;
   creditNoteDigits: number;
+  /** Footer of its PDFs: null takes the company's, '' draws none. */
+  pdfFooter: string | null;
+  /** It has its own PDF logo (GET .../pdf-logo); otherwise its PDFs show the company's. */
+  hasPdfLogo: boolean;
   invoiceNumberLocked: boolean;
   creditNoteNumberLocked: boolean;
   fleetCount: number;
@@ -99,6 +111,27 @@ interface FormValues {
   text: Record<TextKey, string>;
   invoice: FormatValues;
   creditNote: FormatValues;
+  /** Own footer (else the company's); an empty one draws none. */
+  ownFooter: boolean;
+  footer: string;
+}
+
+const LOGO_TYPES = ['image/png', 'image/svg+xml'];
+const MAX_LOGO_KB = MAX_PDF_LOGO_BYTES / 1024;
+
+const issuerLogoQueryKey = (id: string) => ['invoice-issuers', id, 'pdf-logo'] as const;
+
+function readAsDataUri(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      resolve(reader.result as string);
+    };
+    reader.onerror = () => {
+      reject(reader.error ?? new Error('Could not read the file'));
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 const EMPTY_FORMAT: FormatValues = { prefix: '', withYear: false, start: '1', digits: '0' };
@@ -106,7 +139,14 @@ const EMPTY_FORMAT: FormatValues = { prefix: '', withYear: false, start: '1', di
 function emptyForm(): FormValues {
   const text = {} as Record<TextKey, string>;
   for (const field of TEXT_FIELDS) text[field.key] = '';
-  return { name: '', text, invoice: { ...EMPTY_FORMAT }, creditNote: { ...EMPTY_FORMAT } };
+  return {
+    name: '',
+    text,
+    invoice: { ...EMPTY_FORMAT },
+    creditNote: { ...EMPTY_FORMAT },
+    ownFooter: false,
+    footer: '',
+  };
 }
 
 function formOf(issuer: InvoiceIssuer): FormValues {
@@ -127,6 +167,8 @@ function formOf(issuer: InvoiceIssuer): FormValues {
       start: String(issuer.creditNoteStart),
       digits: String(issuer.creditNoteDigits),
     },
+    ownFooter: issuer.pdfFooter != null,
+    footer: issuer.pdfFooter ?? '',
   };
 }
 
@@ -257,6 +299,197 @@ function FormatFields({ kind, values, locked, submitted, onChange }: FormatField
   );
 }
 
+interface BrandingFieldsProps {
+  issuer: InvoiceIssuer | null;
+  ownFooter: boolean;
+  footer: string;
+  submitted: boolean;
+  onFooterChange: (ownFooter: boolean, footer: string) => void;
+}
+
+/**
+ * The issuer's own PDF logo and footer, both optional: without them its PDFs
+ * show the company's (pdf.logo, pdf.footer). The logo is saved right away
+ * (PUT/DELETE .../pdf-logo), so it needs a saved issuer; the footer is saved
+ * with the form.
+ */
+function BrandingFields({
+  issuer,
+  ownFooter,
+  footer,
+  submitted,
+  onFooterChange,
+}: BrandingFieldsProps) {
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const id = issuer?.id;
+
+  const { data: logoData } = useQuery({
+    queryKey: issuerLogoQueryKey(id ?? ''),
+    queryFn: () => api.get<{ logo: string | null }>(`/v1/invoice-issuers/${id ?? ''}/pdf-logo`),
+    enabled: id != null,
+  });
+  const logo = logoData?.logo ?? null;
+
+  const logoMutation = useMutation({
+    mutationFn: (value: string | null) =>
+      value != null
+        ? api.put<InvoiceIssuer>(`/v1/invoice-issuers/${id ?? ''}/pdf-logo`, { logo: value })
+        : api.delete<InvoiceIssuer>(`/v1/invoice-issuers/${id ?? ''}/pdf-logo`),
+    onSuccess: (_issuer, value) => {
+      queryClient.setQueryData(issuerLogoQueryKey(id ?? ''), { logo: value });
+      void queryClient.invalidateQueries({ queryKey: INVOICE_ISSUERS_QUERY_KEY, exact: true });
+      toast({
+        title: t(
+          value != null
+            ? 'settings.invoiceIssuers.logoSaved'
+            : 'settings.invoiceIssuers.logoRemoved',
+        ),
+        variant: 'success',
+      });
+    },
+    onError: (err: unknown) => {
+      toast({
+        title: getErrorMessage(err, t, 'settings.pdfBrandingSaveFailed'),
+        variant: 'destructive',
+      });
+    },
+  });
+
+  async function handleLogoFiles(files: File[]): Promise<void> {
+    const file = files[0];
+    if (file == null) return;
+    if (!LOGO_TYPES.includes(file.type)) {
+      toast({ title: t('settings.pdfLogoInvalidType'), variant: 'destructive' });
+      return;
+    }
+    if (file.size > MAX_PDF_LOGO_BYTES) {
+      toast({
+        title: t('settings.pdfLogoTooLarge', { maxKb: MAX_LOGO_KB }),
+        variant: 'destructive',
+      });
+      return;
+    }
+    try {
+      logoMutation.mutate(await readAsDataUri(file));
+    } catch (err) {
+      toast({
+        title: getErrorMessage(err, t, 'settings.pdfBrandingSaveFailed'),
+        variant: 'destructive',
+      });
+    }
+  }
+
+  const footerInvalid = ownFooter && normalizePdfFooter(footer) == null;
+
+  return (
+    <fieldset className="space-y-4 rounded-md border p-3" data-testid="issuer-branding">
+      <legend className="px-1 text-sm font-medium">{t('settings.invoiceIssuers.branding')}</legend>
+      <p className="text-xs text-muted-foreground">{t('settings.invoiceIssuers.brandingHelp')}</p>
+
+      <div className="space-y-2">
+        <Label className="leading-6">{t('settings.pdfLogo')}</Label>
+        {id == null ? (
+          <p className="text-xs text-muted-foreground">
+            {t('settings.invoiceIssuers.logoAfterCreate')}
+          </p>
+        ) : (
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex h-16 w-48 items-center justify-center rounded border bg-white p-2">
+              {logo != null ? (
+                <img
+                  src={logo}
+                  alt={t('settings.pdfLogo')}
+                  className="max-h-full max-w-full object-contain"
+                  data-testid="issuer-logo-preview"
+                />
+              ) : (
+                <span className="text-center text-xs text-muted-foreground">
+                  {t('settings.invoiceIssuers.logoCompany')}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <FileUploadButton
+                variant="outline"
+                size="sm"
+                accept=".png,.svg,image/png,image/svg+xml"
+                disabled={logoMutation.isPending}
+                onFiles={(files) => {
+                  void handleLogoFiles(files);
+                }}
+              >
+                {t('settings.pdfLogoUpload')}
+              </FileUploadButton>
+              {logo != null && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={logoMutation.isPending}
+                  onClick={() => {
+                    logoMutation.mutate(null);
+                  }}
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  {t('settings.invoiceIssuers.logoRemove')}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {t('settings.pdfLogoHelp', { maxKb: MAX_LOGO_KB })}
+        </p>
+      </div>
+
+      <div className="space-y-2">
+        <label className="flex items-center gap-2 text-sm" htmlFor="issuer-own-footer">
+          <Checkbox
+            id="issuer-own-footer"
+            checked={ownFooter}
+            onChange={(e) => {
+              onFooterChange(e.target.checked, footer);
+            }}
+          />
+          {t('settings.invoiceIssuers.ownFooter')}
+        </label>
+        {ownFooter && (
+          <>
+            <Textarea
+              id="issuer-footer"
+              aria-label={t('settings.pdfFooter')}
+              rows={MAX_PDF_FOOTER_LINES}
+              maxLength={MAX_PDF_FOOTER_LENGTH}
+              value={footer}
+              aria-invalid={submitted && footerInvalid}
+              onChange={(e) => {
+                onFooterChange(true, e.target.value);
+              }}
+            />
+            {submitted && footerInvalid && (
+              <p className="text-sm text-destructive">
+                {t('settings.pdfFooterInvalid', {
+                  maxLines: MAX_PDF_FOOTER_LINES,
+                  maxLength: MAX_PDF_FOOTER_LENGTH,
+                })}
+              </p>
+            )}
+          </>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {t(
+            ownFooter
+              ? 'settings.invoiceIssuers.footerHelpOwn'
+              : 'settings.invoiceIssuers.footerHelpCompany',
+          )}
+        </p>
+      </div>
+    </fieldset>
+  );
+}
+
 /**
  * The invoice issuers: sellers other than the company that a fleet's invoices
  * can be issued under (fleet billing profile), each with its own number range
@@ -314,7 +547,9 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
   const invoiceFormat = parsedFormat(values.invoice);
   const creditNoteFormat = parsedFormat(values.creditNote);
   const nameInvalid = values.name.trim() === '';
-  const invalid = nameInvalid || invoiceFormat == null || creditNoteFormat == null;
+  const footer = values.ownFooter ? normalizePdfFooter(values.footer) : null;
+  const footerInvalid = values.ownFooter && footer == null;
+  const invalid = nameInvalid || invoiceFormat == null || creditNoteFormat == null || footerInvalid;
   const current = editing != null && editing !== 'new' ? editing : null;
 
   function submit(): void {
@@ -337,6 +572,7 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
       body['creditNoteStart'] = creditNoteFormat.start;
       body['creditNoteDigits'] = creditNoteFormat.digits;
     }
+    body['pdfFooter'] = footer;
     saveMutation.mutate(body);
   }
 
@@ -493,6 +729,15 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
             <p className="text-xs text-muted-foreground">
               {t('settings.invoiceIssuers.numbersHelp')}
             </p>
+            <BrandingFields
+              issuer={current}
+              ownFooter={values.ownFooter}
+              footer={values.footer}
+              submitted={submitted}
+              onFooterChange={(ownFooter, footerText) => {
+                setValues((prev) => ({ ...prev, ownFooter, footer: footerText }));
+              }}
+            />
             {saveMutation.isError && (
               <p className="text-sm text-destructive">
                 {getErrorMessage(saveMutation.error, t, 'settings.invoiceIssuers.saveFailed')}

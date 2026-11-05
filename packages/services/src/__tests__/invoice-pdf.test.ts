@@ -4,6 +4,7 @@
 import { inflateSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { client } from '@evtivity/database';
 
 const { warn, settingsRows, paymentSettings } = vi.hoisted(() => ({
   warn: vi.fn(),
@@ -324,6 +325,17 @@ describe('invoice seller', () => {
     expect(text).toContain('Old Street 1');
     expect(text).not.toContain('Acme Charging');
     expect(text).not.toContain('Hauptstrasse 1');
+  });
+
+  it('reads the branding of the issuer the invoice was issued under', async () => {
+    const issued = detail('en');
+    issued.invoice.issuerId = 'iis_rs';
+    await generateInvoicePdf(issued);
+    const calls = (client as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const issuerQuery = calls.find(([strings]) =>
+      (strings as string[]).join('?').includes('FROM invoice_issuers'),
+    );
+    expect(issuerQuery?.slice(1)).toEqual(['iis_rs']);
   });
 
   it('draws the full seller block in the From area', async () => {

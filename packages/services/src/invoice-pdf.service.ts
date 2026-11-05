@@ -418,7 +418,7 @@ export async function generateInvoicePdf(detail: InvoiceDetail): Promise<Buffer>
 
   const [seller, branding, payment] = await Promise.all([
     readStoredInvoiceSeller(invoice.seller) ?? loadInvoiceSeller(),
-    loadPdfBranding(),
+    loadPdfBranding(invoice.issuerId),
     getInvoicePaymentSettings(),
   ]);
 

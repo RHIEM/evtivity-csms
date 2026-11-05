@@ -549,6 +549,13 @@ function imageDataUri(bytes: Buffer): string {
   return `data:image/${isJpeg ? 'jpeg' : 'png'};base64,${bytes.toString('base64')}`;
 }
 
+const printLogoQuery = z.object({
+  invoiceId: z
+    .string()
+    .optional()
+    .describe('The invoice printed: the logo of the issuer it was issued under, if it has one'),
+});
+
 const invoiceNotFound = errorWith('Invoice not found, or the user is restricted to some sites', [
   ERROR_CODES.INVOICE_NOT_FOUND,
 ]);
@@ -1044,15 +1051,26 @@ export function invoiceRoutes(app: FastifyInstance): void {
         tags: ['Invoices'],
         summary: 'Get the logo of the printed invoice',
         description:
-          'The logo the invoice PDF draws (pdf.logo, or the default logo when it is empty or unusable), as a PNG or JPEG data URI, so the printed invoice page shows the same image as the PDF. The CSMS shows it only in the print layout. Invoices span sites, so a user restricted to some sites gets 404 INVOICE_NOT_FOUND.',
+          'The logo the invoice PDF draws (pdf.logo, or the default logo when it is empty or unusable), as a PNG or JPEG data URI, so the printed invoice page shows the same image as the PDF. With invoiceId, the logo of the invoice issuer the invoice was issued under when it has its own (404 INVOICE_NOT_FOUND for an unknown invoice). The CSMS shows it only in the print layout. Invoices span sites, so a user restricted to some sites gets 404 INVOICE_NOT_FOUND.',
         operationId: 'getInvoicePrintLogo',
         security: [{ bearerAuth: [] }],
+        querystring: zodSchema(printLogoQuery),
         response: { 200: zodSchema(printLogoResponse), 404: invoiceNotFound },
       },
     },
     async (request, reply) => {
       if (!(await requireAllSiteAccess(request, reply, invoiceAccessDenied))) return;
-      const { logo } = await loadPdfBranding();
+      const { invoiceId } = request.query as z.infer<typeof printLogoQuery>;
+      let issuerId: string | null = null;
+      if (invoiceId != null) {
+        const detail = await getInvoice(invoiceId);
+        if (detail == null) {
+          await reply.status(404).send({ error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' });
+          return;
+        }
+        issuerId = detail.invoice.issuerId;
+      }
+      const { logo } = await loadPdfBranding(issuerId);
       return { logo: imageDataUri(logo) };
     },
   );

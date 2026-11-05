@@ -10,7 +10,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { warn, settingsRows } = vi.hoisted(() => ({
   warn: vi.fn(),
-  settingsRows: { rows: [] as Array<{ key: string; value: unknown }> },
+  settingsRows: {
+    rows: [] as Array<{ key: string; value: unknown }>,
+    issuer: null as { pdf_logo: string | null; pdf_footer: string | null } | null,
+  },
 }));
 
 /**
@@ -39,6 +42,9 @@ vi.mock('@evtivity/database', () => {
   const settingsClient = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
     const keys = values.filter((v): v is string => typeof v === 'string');
     const text = strings.join('?');
+    if (text.includes('FROM invoice_issuers')) {
+      return Promise.resolve(settingsRows.issuer != null ? [settingsRows.issuer] : []);
+    }
     return Promise.resolve(
       settingsRows.rows.filter((row) => keys.includes(row.key) || text.includes(`'${row.key}'`)),
     );
@@ -244,6 +250,7 @@ function detail(overrides: Partial<InvoiceDetail> = {}): InvoiceDetail {
 beforeEach(() => {
   warn.mockClear();
   settingsRows.rows = [{ key: 'pdf.footer', value: FOOTER }];
+  settingsRows.issuer = null;
 });
 
 describe('loadPdfBranding', () => {
@@ -275,6 +282,51 @@ describe('loadPdfBranding', () => {
     settingsRows.rows = [{ key: 'pdf.footer', value: 'x'.repeat(501) }];
     expect((await loadPdfBranding()).footer).toBe('');
     expect(warn).toHaveBeenCalledWith('pdf.footer is not a valid footer, leaving the footer out');
+  });
+
+  it("takes the issuer's logo and footer instead of the company's", async () => {
+    settingsRows.rows = [
+      { key: 'pdf.logo', value: 'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=' },
+      { key: 'pdf.footer', value: 'Company footer' },
+    ];
+    settingsRows.issuer = {
+      pdf_logo: `data:image/png;base64,${PNG_B64}`,
+      pdf_footer: 'RHIEM Services GmbH',
+    };
+    const branding = await loadPdfBranding('iis_rs');
+    expect(branding.isDefaultLogo).toBe(false);
+    expect(branding.logo.toString('base64')).toBe(PNG_B64);
+    expect(branding.footer).toBe('RHIEM Services GmbH');
+  });
+
+  it("keeps the company's logo and footer where the issuer has none", async () => {
+    settingsRows.rows = [
+      { key: 'pdf.logo', value: `data:image/png;base64,${PNG_B64}` },
+      { key: 'pdf.footer', value: 'Company footer' },
+    ];
+    settingsRows.issuer = { pdf_logo: null, pdf_footer: null };
+    const branding = await loadPdfBranding('iis_rs');
+    expect(branding.logo.toString('base64')).toBe(PNG_B64);
+    expect(branding.footer).toBe('Company footer');
+  });
+
+  it('draws no footer when the issuer cleared its footer', async () => {
+    settingsRows.rows = [{ key: 'pdf.footer', value: 'Company footer' }];
+    settingsRows.issuer = { pdf_logo: null, pdf_footer: '' };
+    expect((await loadPdfBranding('iis_rs')).footer).toBe('');
+  });
+
+  it('falls back to the company logo when the issuer logo is unusable', async () => {
+    settingsRows.rows = [{ key: 'pdf.logo', value: `data:image/png;base64,${PNG_B64}` }];
+    settingsRows.issuer = { pdf_logo: 'data:text/plain;base64,aGk=', pdf_footer: null };
+    const branding = await loadPdfBranding('iis_rs');
+    expect(branding.logo.toString('base64')).toBe(PNG_B64);
+  });
+
+  it('reads the company branding for a document without issuer', async () => {
+    settingsRows.rows = [{ key: 'pdf.footer', value: 'Company footer' }];
+    settingsRows.issuer = { pdf_logo: null, pdf_footer: 'Issuer footer' };
+    expect((await loadPdfBranding(null)).footer).toBe('Company footer');
   });
 
   it('rasterizes the default logo as a wide PNG', () => {

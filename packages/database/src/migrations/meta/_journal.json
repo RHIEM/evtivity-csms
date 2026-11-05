@@ -1688,6 +1688,13 @@
       "when": 1791000049402,
       "tag": "rhiem_0006_invoice_issuers",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1791000049405,
+      "tag": "rhiem_0009_invoice_issuer_branding",
+      "breakpoints": true
     }
   ]
 }

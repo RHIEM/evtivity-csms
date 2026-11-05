@@ -1428,6 +1428,28 @@ export const SITE_ISOLATION_MATRIX: MatrixEntry[] = [
     (_f, w) => `/invoice-issuers/${w.invoiceIssuer}`,
     'INVOICE_ISSUER_NOT_FOUND',
   ),
+  c(
+    'GET',
+    '/invoice-issuers/:id/pdf-logo',
+    'settings.system:read',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/pdf-logo`,
+    'INVOICE_ISSUER_NOT_FOUND',
+  ),
+  c(
+    'PUT',
+    '/invoice-issuers/:id/pdf-logo',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/pdf-logo`,
+    'INVOICE_ISSUER_NOT_FOUND',
+    { body: () => ({ logo: 'data:image/png;base64,iVBORw0KGgo=' }) },
+  ),
+  c(
+    'DELETE',
+    '/invoice-issuers/:id/pdf-logo',
+    'settings.system:write',
+    (_f, w) => `/invoice-issuers/${w.invoiceIssuer}/pdf-logo`,
+    'INVOICE_ISSUER_NOT_FOUND',
+  ),
 
   // invoices (company-wide, except the session invoice)
   c('GET', '/invoices', 'payments:read', () => '/invoices', 'INVOICE_NOT_FOUND'),

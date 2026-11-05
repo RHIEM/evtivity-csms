@@ -40,6 +40,8 @@ function issuer(overrides: Partial<InvoiceIssuer> = {}): InvoiceIssuer {
     creditNoteWithYear: true,
     creditNoteStart: 1,
     creditNoteDigits: 4,
+    pdfLogo: null,
+    pdfFooter: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,

@@ -3108,7 +3108,17 @@
       "saved": "Invoice issuer saved",
       "deleted": "Invoice issuer deleted",
       "saveFailed": "Could not save the invoice issuer.",
-      "inUse": "Used by a fleet or an invoice"
+      "inUse": "Used by a fleet or an invoice",
+      "branding": "PDF Logo and Footer (optional)",
+      "brandingHelp": "Without its own logo and footer, this issuer's PDFs show the company's (Company tab). Changes apply from the next PDF generated, also to documents already issued.",
+      "logoCompany": "Company logo",
+      "logoRemove": "Remove own logo",
+      "logoAfterCreate": "Upload the logo once the issuer is created.",
+      "logoSaved": "Logo saved",
+      "logoRemoved": "Own logo removed",
+      "ownFooter": "Own footer",
+      "footerHelpOwn": "Centered at the bottom of every page, exactly as entered. Leave it empty for no footer.",
+      "footerHelpCompany": "The PDFs show the company footer."
     },
     "invoicePayment": "Invoice Payment Information",
     "invoicePaymentDescription": "Printed in the Payment information block below the totals of every invoice PDF. Open invoices ask for a bank transfer with the invoice number as the reference, paid invoices show Paid, and credit notes state that nothing is due. Without an IBAN the block is left off.",

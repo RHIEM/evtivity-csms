@@ -3108,7 +3108,17 @@
       "saved": "Rechnungssteller gespeichert",
       "deleted": "Rechnungssteller gelöscht",
       "saveFailed": "Der Rechnungssteller konnte nicht gespeichert werden.",
-      "inUse": "Von einer Flotte oder Rechnung verwendet"
+      "inUse": "Von einer Flotte oder Rechnung verwendet",
+      "branding": "PDF-Logo und Fußzeile (optional)",
+      "brandingHelp": "Ohne eigenes Logo und ohne eigene Fußzeile zeigen die PDFs dieses Rechnungsstellers die des Unternehmens (Tab Unternehmen). Änderungen gelten ab dem nächsten erzeugten PDF, auch für bereits ausgestellte Belege.",
+      "logoCompany": "Logo des Unternehmens",
+      "logoRemove": "Eigenes Logo entfernen",
+      "logoAfterCreate": "Das Logo laden Sie hoch, nachdem der Rechnungssteller angelegt ist.",
+      "logoSaved": "Logo gespeichert",
+      "logoRemoved": "Eigenes Logo entfernt",
+      "ownFooter": "Eigene Fußzeile",
+      "footerHelpOwn": "Erscheint zentriert am unteren Rand jeder Seite, genau wie eingegeben. Leer lassen für keine Fußzeile.",
+      "footerHelpCompany": "Die PDFs zeigen die Fußzeile des Unternehmens."
     },
     "invoicePayment": "Zahlungsinformationen auf Rechnungen",
     "invoicePaymentDescription": "Erscheint im Block Zahlungsinformationen unter den Summen jeder Rechnungs-PDF. Offene Rechnungen bitten um eine Überweisung mit der Rechnungsnummer als Verwendungszweck, bezahlte Rechnungen zeigen Bezahlt, und Stornorechnungen geben an, dass nichts fällig ist. Ohne IBAN entfällt der Block.",
