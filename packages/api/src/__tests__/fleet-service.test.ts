@@ -84,6 +84,8 @@ vi.mock('@evtivity/database', () => ({
   ACCOUNT_BILLING_MIN_VERSION: '0.1.41',
   MEMBER_INVOICE_MIN_VERSION: '0.1.46',
   guardVersion: (min: string) => min,
+  fleetBillingContactsUsed: (recipient: string, delivery: string) =>
+    recipient !== 'member' || delivery === 'billing_contacts',
   loadFleetCreditExposure: mockLoadExposure,
   fleetCreditLevel: (exposure: number, limit: number, percent: number) =>
     exposure >= limit ? 'reached' : exposure * 100 >= limit * percent ? 'warning' : 'ok',
@@ -478,6 +480,28 @@ describe('fleet account billing', () => {
 
     expect(await setFleetAccountBilling('f1', { enabled: false }, { actor, log })).toEqual(fleet);
     expect(mockReleaseUpgradePending).not.toHaveBeenCalled();
+  });
+
+  it('refuses going back to the fleet invoice with automatic invoicing and no contact', async () => {
+    setupDbResults([
+      {
+        id: 'f1',
+        name: 'Acme',
+        accountBillingEnabled: true,
+        accountInvoiceRecipient: 'member',
+        autoInvoice: true,
+        billingContactEmails: [],
+        memberInvoiceDelivery: 'driver',
+        updatedAt: new Date(),
+      },
+    ]);
+
+    const err = await setFleetAccountBilling('f1', { recipient: 'fleet' }, { actor, log }).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toMatchObject({ statusCode: 400, code: 'FLEET_BILLING_CONTACT_REQUIRED' });
+    expect(mockWriteAudit).not.toHaveBeenCalled();
   });
 
   it('a request that changes nothing audits and publishes nothing (once per change)', async () => {
@@ -880,6 +904,28 @@ describe('fleet billing profile', () => {
     const err = await updateFleetBillingProfile(
       'f1',
       { billingContactEmails: [] },
+      { actor, log },
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'FLEET_BILLING_CONTACT_REQUIRED' });
+  });
+
+  it('allows automatic invoicing without a contact when no invoice goes to the contacts', async () => {
+    for (const memberInvoiceDelivery of ['driver', 'none'] as const) {
+      const current = { ...fleetRow, accountInvoiceRecipient: 'member', memberInvoiceDelivery };
+      const updated = { ...current, autoInvoice: true };
+      setupDbResults([current], [updated]);
+
+      const result = await updateFleetBillingProfile('f1', { autoInvoice: true }, { actor, log });
+
+      expect(result).toEqual(updated);
+    }
+  });
+
+  it('refuses automatic invoicing without a contact when member invoices go to the contacts', async () => {
+    setupDbResults([{ ...fleetRow, accountInvoiceRecipient: 'member' }]);
+    const err = await updateFleetBillingProfile(
+      'f1',
+      { autoInvoice: true, memberInvoiceDelivery: 'billing_contacts' },
       { actor, log },
     ).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: 'FLEET_BILLING_CONTACT_REQUIRED' });

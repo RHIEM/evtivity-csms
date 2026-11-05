@@ -19,6 +19,7 @@ import {
   loadFleetCreditExposure,
   isOperatorStation,
   inOperatorStation,
+  fleetBillingContactsUsed,
 } from '@evtivity/database';
 import type {
   AccountInvoiceRecipient,
@@ -293,6 +294,15 @@ export async function setFleetAccountBilling(
       after.accountInvoiceRecipient = input.recipient;
     }
     if (Object.keys(after).length === 0) return { fleet: current, diff: null };
+    // Back to the fleet invoice with automatic invoicing: the contacts receive it.
+    if (
+      after.accountInvoiceRecipient !== undefined &&
+      current.autoInvoice &&
+      current.billingContactEmails.length === 0 &&
+      fleetBillingContactsUsed(after.accountInvoiceRecipient, current.memberInvoiceDelivery)
+    ) {
+      throw billingContactRequiredError();
+    }
     // Rollout rule (P11): the release guard shared with the payment provider
     // switch (process-versions.ts), only for a change older processes cannot follow.
     const minVersion = fleetBillingMinVersion({
@@ -484,8 +494,9 @@ const invoiceIssuerNotFoundError = (): AppError =>
  * invoice date mode, invoice issuer;
  * P3). Keys left out keep their value. Refused with 400
  * FLEET_BILLING_CONTACT_REQUIRED when auto invoice would be on without a
- * billing contact (the check `fleets_auto_invoice_contact_check` holds the
- * same rule), and with 400 INVOICE_ISSUER_NOT_FOUND when the invoice issuer
+ * billing contact although the contacts receive the invoices
+ * (fleetBillingContactsUsed; the check `fleets_auto_invoice_contact_check`
+ * holds the same rule), and with 400 INVOICE_ISSUER_NOT_FOUND when the invoice issuer
  * to set does not exist (read with a share lock, so it cannot be deleted
  * before the commit). Only a change is written and audited (fleet_audit_log
  * `billing_updated` with the changed keys), so a repeated request writes
@@ -500,7 +511,11 @@ export async function updateFleetBillingProfile(
     const [current] = await tx.select().from(fleets).where(eq(fleets.id, fleetId)).for('update');
     if (current == null) return null;
     const next = mergeBillingProfile(current, patch);
-    if (next.autoInvoice && next.billingContactEmails.length === 0) {
+    if (
+      next.autoInvoice &&
+      next.billingContactEmails.length === 0 &&
+      fleetBillingContactsUsed(current.accountInvoiceRecipient, next.memberInvoiceDelivery)
+    ) {
       throw billingContactRequiredError();
     }
     if (next.invoiceIssuerId != null && next.invoiceIssuerId !== current.invoiceIssuerId) {

@@ -922,7 +922,8 @@ export interface MemberOverdueRunSummary {
 /**
  * Sends invoice.MemberOverdue for every issued member invoice past its due
  * date whose reminder was not sent yet and whose driver has an email, oldest
- * due first, at most FLEET_INVOICE_OVERDUE_BATCH per pass. A driver without
+ * due first, except those of a fleet that keeps its member invoices in the
+ * CSMS (member_invoice_delivery 'none'), at most FLEET_INVOICE_OVERDUE_BATCH per pass. A driver without
  * an email is left out (not claimed), so the reminder goes once an email is
  * added. Each invoice is fail-open (P9).
  */
@@ -934,9 +935,11 @@ export async function sendMemberInvoiceOverdueNotices(
   const rows = await client<Array<{ id: string }>>`
     SELECT i.id FROM invoices i
     JOIN drivers d ON d.id = i.driver_id
+    JOIN fleets f ON f.id = i.fleet_id
     WHERE i.member_billed AND i.kind = 'invoice' AND i.status = 'issued'
       AND i.due_at < ${now} AND i.overdue_notice_sent_at IS NULL
       AND coalesce(d.email, '') <> ''
+      AND f.member_invoice_delivery <> 'none'
     ORDER BY i.due_at, i.id
     LIMIT ${FLEET_INVOICE_OVERDUE_BATCH}
   `;

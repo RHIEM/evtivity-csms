@@ -366,12 +366,26 @@ export type AccountSettlement = (typeof ACCOUNT_SETTLEMENTS)[number];
 
 /**
  * Who a fleet's member invoices and their credit notes are emailed to:
- * `driver` (the member) or `billing_contacts` (the fleet's billing contacts,
- * e.g. a payroll office that forwards them). The overdue notice of a member
- * invoice always goes to the driver.
+ * `driver` (the member), `billing_contacts` (the fleet's billing contacts,
+ * e.g. a payroll office that forwards them) or `none` (not emailed, kept in
+ * the CSMS only). The overdue notice of a member invoice goes to the driver,
+ * except with `none`.
  */
-export const MEMBER_INVOICE_DELIVERIES = ['driver', 'billing_contacts'] as const;
+export const MEMBER_INVOICE_DELIVERIES = ['driver', 'billing_contacts', 'none'] as const;
 export type MemberInvoiceDelivery = (typeof MEMBER_INVOICE_DELIVERIES)[number];
+
+/**
+ * Whether the fleet's invoices are emailed to its billing contacts: the fleet
+ * invoice (recipient `fleet`), or the member invoices of a fleet that
+ * delivers them to the contacts. Automatic invoicing needs a contact only
+ * then (fleets_auto_invoice_contact_check).
+ */
+export function fleetBillingContactsUsed(
+  recipient: string,
+  memberInvoiceDelivery: string,
+): boolean {
+  return recipient !== 'member' || memberInvoiceDelivery === 'billing_contacts';
+}
 
 export const fleets = pgTable(
   'fleets',
@@ -447,7 +461,7 @@ export const fleets = pgTable(
     ),
     check(
       'fleets_auto_invoice_contact_check',
-      sql`NOT ${table.autoInvoice} OR cardinality(${table.billingContactEmails}) > 0`,
+      sql`NOT ${table.autoInvoice} OR cardinality(${table.billingContactEmails}) > 0 OR (${table.accountInvoiceRecipient} = 'member' AND ${table.memberInvoiceDelivery} <> 'billing_contacts')`,
     ),
     check(
       'fleets_credit_limit_cents_check',
@@ -471,7 +485,7 @@ export const fleets = pgTable(
     ),
     check(
       'fleets_member_invoice_delivery_check',
-      sql`${table.memberInvoiceDelivery} IN ('driver', 'billing_contacts')`,
+      sql`${table.memberInvoiceDelivery} IN ('driver', 'billing_contacts', 'none')`,
     ),
   ],
 );
