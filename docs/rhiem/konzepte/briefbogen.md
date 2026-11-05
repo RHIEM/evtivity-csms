@@ -1,6 +1,6 @@
 # Rechnungen im Briefbogen der GmbH
 
-- **Status:** Baustein 1 umgesetzt (05.11.2026) auf `feature/pdf-letterhead` (ab `v0.1.49`), nicht deployt; Baustein 2 offen. Entscheidungen des Nutzers am 05.11.2026: Briefbögen werden versioniert; Folgeseiten ohne Briefbogen, mit Kopfzeile; Drucken im CSMS öffnet bei Briefbogen das PDF; Vorlage sind die Ausgangsrechnungen aus dem ERP; Upload bleibt bei PNG und SVG (kein PDF, keine neue Abhängigkeit).
+- **Status:** Baustein 1 und 2 umgesetzt (05.11.2026), in `rhiem/main` gemergt (`ab0a5781`). Baustein 1 liegt upstreamfähig auf `feature/pdf-letterhead` (ab `v0.1.49`). Entscheidungen des Nutzers am 05.11.2026: Briefbögen werden versioniert; Folgeseiten ohne Briefbogen, mit Kopfzeile; Drucken im CSMS öffnet bei Briefbogen das PDF; Vorlage sind die Ausgangsrechnungen aus dem ERP; Upload bleibt bei PNG und SVG (kein PDF, keine neue Abhängigkeit).
 - **Anlass:** Die Rechnungen der Rechnungssteller sollen wie die Briefbögen der jeweiligen GmbH aussehen. Vorlage war zuerst der Scan `Briefbögen.pdf`, dann die Ausgangsrechnungen der fünf GmbHs aus dem ERP. Daraus ist `Briefbögen-Vektor.pdf` entstanden (nur der Briefbogen, Rechnungsinhalt entfernt) und daraus je GmbH ein PNG mit 300 dpi (`Briefbögen-PNG/`). Alle Dateien liegen außerhalb des Repos im Projektordner.
 - **Basis:** `rhiem/main` mit den Rechnungsstellern ([rechnungssteller.md](rechnungssteller.md)), Stand `ac8f1561`, auf Tag `v0.1.49`.
 - **Leitlinie:** Nah am Upstream bleiben. Wir bauen keine eigene Rechnungsstellung, das Layout wird nicht nachgebaut, und es kommt keine neue Abhängigkeit dazu. Der allgemeine Teil soll als Vorschlag an EVtivity taugen. Im Fork bleibt nur die Übersteuerung je Rechnungssteller, nach dem Muster von `rhiem_0009`.
@@ -215,9 +215,34 @@ Zweig `feature/pdf-letterhead` ab `v0.1.49`, Migration `rhiem_0013_pdf_letterhea
 | RHIEM Branding Solutions | `Briefbogen-RBS.png` | 27,2 / 53,6            | 105             | 262      | 27,2 / 19,4         |
 | CAPREO                   | `Briefbogen-CAP.png` | 22,9 / 53,6            | 100             | 255      | 15,2 / 15,2         |
 
+## Umsetzung Baustein 2 (05.11.2026)
+
+Zweig `feature/issuer-letterhead` ab `rhiem/main` `69499436`. Er enthält den Merge von `feature/pdf-letterhead` (`703397ac`) und Baustein 2 (`6f07d6f3`, `e5197ac0`), mit `--no-ff` in `rhiem/main` gemergt.
+
+- **Merge von Baustein 1:**
+  - Die Migration heißt im Fork `rhiem_0014_pdf_letterheads`, weil `rhiem_0013` schon die Portal-Sichtbarkeit belegt. Auf `feature/pdf-letterhead` heißt sie weiter `rhiem_0013`; für einen PR bekommt sie ohnehin eine Upstream-Nummer.
+  - Konflikte in `invoice-pdf.service.ts` mit Verkäufer-Speicherung, Personalnummer und Messnachweis: Mit Briefbogen steht die Personalnummer im Infoblock unter dem Titel (vor USt-ID und Flotte), wie in Annahme 5. Die Prüfzeilen folgen dem Satzspiegel des Briefbogens.
+- **Datenbank (`rhiem_0015_invoice_issuer_letterhead`):** `pdf_letterheads.issuer_id` und `invoice_issuers.letterhead_id`, beide mit `ON DELETE RESTRICT`.
+- **Ausstellung:** `letterheadIdForIssue(tx, issuer)` liefert die eigene gültige Version des Stellers, sonst `pdf.letterhead`. `allocateDocumentNumber` gibt sie zusammen mit Nummer und Verkäufer zurück. Eine Gutschrift nimmt die Version ihres Stellers, die bei ihrer Ausstellung gilt. `currentPdfLetterheadId` nimmt nur Versionen des Unternehmens.
+- **API:**
+  - `GET/POST /v1/invoice-issuers/:id/letterheads` und `PUT /v1/invoice-issuers/:id/letterhead`. Eine Version eines anderen Stellers oder des Unternehmens wird mit 404 `PDF_LETTERHEAD_NOT_FOUND` abgelehnt.
+  - Audit wie bei Baustein 1 (`pdfLetterhead:<id>`), das Setzen der gültigen Version zusätzlich im Verlauf des Stellers.
+  - `GET /v1/pdf-letterheads` und `PUT /v1/pdf-letterheads/current` nehmen nur Versionen des Unternehmens.
+  - Die Probe-PDF nimmt mit `issuerId` den Verkäufer des Stellers (Kopfzeile der Folgeseiten).
+  - Das Löschen eines unbenutzten Stellers löscht seine Versionen mit; kein Beleg kann sie nutzen.
+- **CSMS:** Im Formular des Rechnungsstellers zeigt der Abschnitt „PDF-Briefbogen“, ob ein eigener Briefbogen gilt (mit Namen) oder der des Unternehmens, und weist darauf hin, dass mit Briefbogen weder Logo noch Fußzeile gezeichnet werden. „Briefbogen verwalten“ öffnet die Versionsverwaltung aus Baustein 1 für den Steller in einem eigenen Dialog.
+- **Abweichung vom Entwurf:** Die Versionsverwaltung sitzt in einem eigenen Dialog statt direkt im Formular. Sie hat ein eigenes Formular für neue Versionen, und Formulare lassen sich nicht verschachteln.
+- **Geprüft:**
+  - Typecheck, lint, format:check, check:migrations (254) und check:openapi.
+  - Alle Tests: 30.045 grün. Der eine Ausfall (die neuen Routen fehlten in der Audit-Klassifizierung) ist behoben und einzeln grün.
+  - Die Migrationen liefen an einer lokalen Postgres 17 vom Stand `69499436` aus sauber, ein zweiter Lauf fand nichts mehr.
+  - `npm run test:integration` verweist auf ein fehlendes `vitest.integration.ts` und lief nicht.
+
 ## Offene Punkte
 
-1. **Baustein 2** (Briefbogen je Rechnungssteller) umsetzen.
+Baustein 2 ist umgesetzt (siehe oben).
+
+1. **Briefbögen einrichten:** je Rechnungssteller eine Version mit den Lagen aus der Tabelle oben hochladen und als gültig setzen, Probe-PDF prüfen.
 2. **Weitere Rechnungssteller:** Werden CAPREO und RHIEM Branding Solutions Rechnungssteller? Für den Code ändert das nichts, nur für die Einrichtung.
 3. **Abnahme:** Probe-PDF je GmbH ausdrucken und in einen DL-Fensterumschlag stecken.
 
@@ -225,7 +250,7 @@ Zweig `feature/pdf-letterhead` ab `v0.1.49`, Migration `rhiem_0013_pdf_letterhea
 
 1. Folgeseiten ohne Hintergrund, mit Kopfzeile „Firma · Rechnung … · Seite n von m“ in EVtivity-Text.
 2. Eine Gutschrift nimmt den bei ihrer Ausstellung gültigen Briefbogen, nicht den der Rechnung.
-3. Versionen werden nie gelöscht, auch unbenutzte nicht. Es sind wenige, und das hält die Regel einfach.
+3. Versionen werden nie gelöscht, auch unbenutzte nicht, außer zusammen mit einem Rechnungssteller, der nie einen Beleg ausgestellt hat. Es sind wenige, und das hält die Regel einfach.
 4. Ein Rechnungssteller kann den Briefbogen des Unternehmens nicht ausdrücklich abschalten (`NULL` = Unternehmen). Bei drei GmbHs mit eigenem Briefbogen reicht das.
 5. Personalnummer und Käufer-USt-ID stehen im Infoblock und nicht im Anschriftfeld.
 6. Berichte bekommen keinen Briefbogen.
