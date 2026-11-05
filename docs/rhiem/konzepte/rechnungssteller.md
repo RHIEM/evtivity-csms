@@ -214,6 +214,19 @@ Merges in `rhiem/main`: `c90d124b` (2), `dd8e5588` (1), `5cad30bf` (4), `a421875
 
 **Geprüft** auf dem zusammengeführten Stand: typecheck, lint, format:check, check:migrations (249), check:openapi, 29.917 Tests grün (der bekannte Zeitlimit-Test `FleetReservationsTab` einzeln grün). Vergabe bei überschneidenden Kreisen mit zwei gleichzeitigen Sitzungen an PostgreSQL 17 geprüft.
 
+### Nachtrag 05.11.2026: Personalnummer und Versand an beide
+
+**Personalnummer am Fahrer** (`feature/driver-employee-number`, `d8c1d135`, Migration `rhiem_0011_driver_employee_number`, freigegeben 05.11.2026):
+
+- Neues optionales Feld `drivers.employee_number` (Text bis 50 Zeichen, nicht eindeutig). Pflege im CSMS beim Anlegen und in der Detailansicht des Fahrers (`drivers:write`), im Verlauf des Fahrers festgehalten, von der DSGVO-Löschung geleert. Die Fahrersuche findet es.
+- Der Fahrer sieht es im Portal unter den persönlichen Daten nur lesend (`GET /v1/portal/auth/me`, Feld `employeeNumber`).
+- Auf Rechnung und Gutschrift „Personalnr.: …“ im Block „Rechnung an“, nur wenn gesetzt: bei der Mitgliederrechnung beim Ausstellen im Empfängerblock eingefroren (die Gutschrift erbt ihn), bei der Fahrerrechnung ohne Flotte live wie Name und E-Mail, bei der Flottenrechnung hinter dem Fahrernamen jeder Gruppe (beim Ausstellen in den Positions-Metadaten). Bereits ausgestellte Rechnungen bleiben unverändert.
+
+**Versand der Mitgliederrechnungen als zwei Ankreuzfelder** (`feature/member-invoice-delivery`, `35aaea2e`, Migration `rhiem_0012_member_invoice_delivery_both`, freigegeben 05.11.2026):
+
+- „E-Mail an den Fahrer“ und „E-Mail an feste E-Mail-Adressen“; bei der zweiten erscheint „Versand per E-Mail an“. Abgebildet auf `member_invoice_delivery`: nur Fahrer `driver`, nur Adressen `billing_contacts`, beide `driver_and_contacts` (neu), keines `none` (nicht versenden, Hinweis im Formular).
+- Bei beiden: ein PDF, eine Versandmarke (`sent_at`), dann Fahrer und jede Adresse. Ein Fahrer ohne E-Mail verhindert den Versand an die Adressen nicht. Zahlungserinnerungen gehen an den Fahrer. Die Monatsrechnung braucht wie bei `billing_contacts` eine Adresse.
+
 ## Annahmen und Rückfragen
 
 Während der Umsetzung getroffene Annahmen. Bitte bestätigen oder korrigieren; in Ausnahmen bauen wir zurück.
