@@ -372,6 +372,17 @@ function drawRow(
   return rowHeight(doc, columns, values, minHeight);
 }
 
+/**
+ * A note with a lead ("Signed meter data (calibration law): …") breaks after
+ * the colon when the rest then fits on one line, in the current font.
+ */
+export function breakAfterLead(doc: PDFKit.PDFDocument, note: string, width: number): string {
+  const colon = note.search(/[:：]\s/);
+  if (colon < 0) return note;
+  const rest = note.slice(colon + 1).trim();
+  return doc.widthOfString(rest) <= width ? `${note.slice(0, colon + 1)}\n${rest}` : note;
+}
+
 /** Line item rows alternate a light band, starting with the second row. */
 export const INVOICE_ROW_BAND_COLOR = '#f5f7fa';
 
@@ -603,11 +614,10 @@ export async function generateInvoicePdf(
   detail: InvoiceDetail,
   options: GenerateInvoicePdfOptions = {},
 ): Promise<Buffer> {
-  const { invoice, lineItems, driver, fleet, taxBreakdown, creditedInvoice, creditNote } = detail;
+  const { invoice, lineItems, driver, taxBreakdown, creditedInvoice, creditNote } = detail;
   const isCreditNote = invoice.kind === 'credit_note';
-  // A member invoice (and its credit note) bills one driver: its lines are not
-  // grouped by driver, and it names the fleet whose account was charged.
-  const isMemberInvoice = invoice.fleetId != null && invoice.memberBilled;
+  // A fleet invoice groups its lines by driver; a member invoice (and its
+  // credit note) bills one driver.
   const isFleetInvoice = invoice.fleetId != null && !invoice.memberBilled;
   const language = resolveInvoicePdfLanguage(invoice.language ?? driver?.language);
   const labels: InvoiceLabels = INVOICE_LABELS[language];
@@ -694,32 +704,24 @@ export async function generateInvoicePdf(
   let y: number;
   if (letterhead != null && background != null) {
     // The letterhead holds the logo and the seller; the recipient goes into
-    // the envelope window, the fleet and tax ID below the title.
+    // the envelope window with the employee number and the email in small
+    // print above it, the tax ID below the title.
     const addressName =
       billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
     const fallbackEmail = billTo != null ? billTo.email : (driver?.email ?? null);
     const recipientEmail = fallbackEmail != null && fallbackEmail !== '' ? fallbackEmail : null;
-    const hasPostalAddress = billTo != null && billTo.address.length > 0;
-    const addressLines = hasPostalAddress
-      ? billTo.address
-      : recipientEmail != null
-        ? [recipientEmail]
-        : [];
+    const addressNote = [
+      ...employeeNumberLine,
+      ...(recipientEmail != null ? [recipientEmail] : []),
+    ];
     y = drawLetterheadFirstPage(doc, letterhead, background, frame, fonts, {
       title: `${documentTitle} ${invoice.invoiceNumber}`,
       addressName,
-      addressLines,
-      addressNote: employeeNumberLine[0] ?? null,
+      addressLines: billTo?.address ?? [],
+      addressNote: addressNote.length > 0 ? addressNote.join(' · ') : null,
     });
-    // The email stays out of the envelope window when there is a postal
-    // address; it follows below the title instead.
-    const recipientLines = [
-      ...(hasPostalAddress && recipientEmail != null
-        ? [labels.recipientEmail.replace('{email}', recipientEmail)]
-        : []),
-      ...(billTo?.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
-      ...(isMemberInvoice && fleet != null ? [labels.viaFleet.replace('{fleet}', fleet.name)] : []),
-    ];
+    const recipientLines =
+      billTo?.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : [];
     for (const line of recipientLines) {
       doc.fontSize(10).font(fonts.regular).fillColor(COLOR_MUTED).text(line, frame.left, y, {
         width: frame.width,
@@ -770,9 +772,6 @@ export async function generateInvoicePdf(
           ? [driver.email]
           : []),
     ];
-    if (isMemberInvoice && fleet != null) {
-      billedToDetails.push(labels.viaFleet.replace('{fleet}', fleet.name));
-    }
 
     doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED).text(labels.billedTo, MARGIN, y);
     doc
@@ -966,9 +965,10 @@ export async function generateInvoicePdf(
     // No readings in the table: the signed data is in the portal.
     if (evidence.size > 0) {
       doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
-      const height = doc.heightOfString(evidenceLabels.portalNote, { width: frame.width });
+      const note = breakAfterLead(doc, evidenceLabels.portalNote, frame.width);
+      const height = doc.heightOfString(note, { width: frame.width });
       ty = ensure(ty + 4, height + 4);
-      doc.text(evidenceLabels.portalNote, frame.left, ty, { width: frame.width });
+      doc.text(note, frame.left, ty, { width: frame.width });
       ty += height + 4;
     }
     return ty + 10;

@@ -51,8 +51,10 @@ vi.mock('../pdf-fonts.js', async (importOriginal) => ({
   },
 }));
 
+import PDFDocument from 'pdfkit';
 import {
   INVOICE_ROW_BAND_COLOR,
+  breakAfterLead,
   generateInvoicePdf,
   readInvoiceSeller,
   readStoredInvoiceSeller,
@@ -750,5 +752,23 @@ describe('session check lines', () => {
       // The CJK fixture fonts are subsets without the glyphs of these labels.
       if (['en', 'de', 'es'].includes(language)) expect(missingGlyphs).toEqual([]);
     }
+  });
+});
+
+describe('breakAfterLead', () => {
+  const doc = new PDFDocument({ size: 'A4' });
+  doc.fontSize(7);
+  const note =
+    'Signierte Messdaten (Eichrecht): Die signierten Daten der Ladesitzungen stehen im Kundenportal zum Download bereit und lassen sich mit der Transparenzsoftware prüfen.';
+
+  it('breaks after the colon when the rest fits on one line', () => {
+    expect(breakAfterLead(doc, note, 500)).toBe(
+      'Signierte Messdaten (Eichrecht):\nDie signierten Daten der Ladesitzungen stehen im Kundenportal zum Download bereit und lassen sich mit der Transparenzsoftware prüfen.',
+    );
+  });
+
+  it('keeps the note as it is when the rest is too long or there is no lead', () => {
+    expect(breakAfterLead(doc, note, 200)).toBe(note);
+    expect(breakAfterLead(doc, 'No lead here.', 500)).toBe('No lead here.');
   });
 });
