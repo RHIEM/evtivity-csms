@@ -825,6 +825,8 @@ export const AI_TOOL_POLICY: Readonly<Record<string, ToolPolicy>> = {
   getPortalBranding: N,
   getPortalContent: N,
   getPortalFeatures: N,
+  getPortalWebAppManifest: N,
+  getPortalAppIcon: N,
   getPublicSecuritySettings: N,
   getS3Status: N,
   getSecuritySettings: N,

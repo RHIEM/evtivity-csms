@@ -102,6 +102,7 @@ import { portalEventRoutes } from './routes/portal/events.js';
 import { portalStationEventRoutes } from './routes/portal/station-events.js';
 import { portalFavoriteRoutes } from './routes/portal/favorites.js';
 import { portalStationWatchRoutes } from './routes/portal/station-watches.js';
+import { portalWebAppRoutes } from './routes/portal/web-app.js';
 import { ocpiPartnerRoutes } from './routes/ocpi-partners.js';
 import { ocpiLocationRoutes } from './routes/ocpi-locations.js';
 import { ocpiSessionRoutes } from './routes/ocpi-sessions.js';
@@ -280,6 +281,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       await v1.register(portalStationEventRoutes);
       await v1.register(portalFavoriteRoutes);
       await v1.register(portalStationWatchRoutes);
+      await v1.register(portalWebAppRoutes);
       await v1.register(ocpiPartnerRoutes);
       await v1.register(ocpiLocationRoutes);
       await v1.register(ocpiSessionRoutes);
