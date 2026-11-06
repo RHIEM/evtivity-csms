@@ -36,6 +36,14 @@ import {
 } from './pdf-branding.js';
 import { loadPdfLetterhead, mmToPt, renderPdfLetterheadBackground } from './invoice-letterhead.js';
 import type { PdfLetterhead } from './invoice-letterhead.js';
+import {
+  billsSessionsOnly,
+  loadInvoiceSessionDetails,
+  sessionPlaceText,
+  sessionStartText,
+  sessionTableRows,
+} from './invoice-session-lines.js';
+import type { InvoiceSessionDetails, SessionTableRow } from './invoice-session-lines.js';
 
 const logger = createLogger('invoice-pdf');
 
@@ -277,6 +285,23 @@ export function groupLinesByDriver(lineItems: LineItem[]): DriverLineGroup[] {
   return groups;
 }
 
+/**
+ * The energy of the charging session lines (metadata `kind` 'session' with
+ * `energyWh`), or null when the invoice has none, e.g. one billed per tariff
+ * component.
+ */
+export function sessionEnergyWh(lineItems: LineItem[]): number | null {
+  let total: number | null = null;
+  for (const item of lineItems) {
+    const meta = item.metadata;
+    if (meta == null || typeof meta !== 'object') continue;
+    const record = meta as Record<string, unknown>;
+    if (record['kind'] !== 'session' || typeof record['energyWh'] !== 'number') continue;
+    total = (total ?? 0) + record['energyWh'];
+  }
+  return total;
+}
+
 function formatDate(value: Date | string | null, locale: string): string {
   if (value == null) return '—';
   const date = typeof value === 'string' ? new Date(value) : value;
@@ -320,12 +345,17 @@ interface Column {
 }
 
 /** The height drawRow gives a row of these values, in the current font. */
-function rowHeight(doc: PDFKit.PDFDocument, columns: Column[], values: string[]): number {
+function rowHeight(
+  doc: PDFKit.PDFDocument,
+  columns: Column[],
+  values: string[],
+  minHeight = 16,
+): number {
   let height = 0;
   columns.forEach((col, i) => {
     height = Math.max(height, doc.heightOfString(values[i] ?? '', { width: col.width }));
   });
-  return Math.max(16, height + 4);
+  return Math.max(minHeight, height + 4);
 }
 
 function drawRow(
@@ -334,11 +364,12 @@ function drawRow(
   columns: Column[],
   values: string[],
   y: number,
+  minHeight = 16,
 ): number {
   columns.forEach((col, i) => {
     doc.text(values[i] ?? '', frame.left + col.x, y, { width: col.width, align: col.align });
   });
-  return rowHeight(doc, columns, values);
+  return rowHeight(doc, columns, values, minHeight);
 }
 
 /** Line item rows alternate a light band, starting with the second row. */
@@ -486,13 +517,24 @@ function drawLetterheadFirstPage(
   background: Buffer,
   frame: PageFrame,
   fonts: { regular: string; bold: string },
-  content: { title: string; addressName: string; addressLines: string[] },
+  content: {
+    title: string;
+    addressName: string;
+    addressLines: string[];
+    addressNote: string | null;
+  },
 ): number {
   doc.image(background, 0, 0, { width: PAGE_WIDTH, height: PAGE_HEIGHT });
 
   const x = mmToPt(letterhead.layout.addressLeftMm);
   const addressWidth = Math.min(ADDRESS_WIDTH, PAGE_WIDTH - x - frame.left / 2);
   let y = mmToPt(letterhead.layout.addressTopMm);
+  // The note (e.g. the employee number) goes in small print right above the
+  // address, in the window's endorsement zone (DIN 5008).
+  if (content.addressNote != null) {
+    doc.fontSize(7).font(fonts.regular).fillColor(COLOR_MUTED);
+    doc.text(content.addressNote, x, y - 10, { width: addressWidth, lineBreak: false });
+  }
   doc.fontSize(10).font(fonts.regular).fillColor(COLOR_TEXT);
   for (const line of [content.addressName, ...content.addressLines]) {
     doc.text(line, x, y, { width: addressWidth });
@@ -577,17 +619,23 @@ export async function generateInvoicePdf(
   const sessionIds = [
     ...new Set(lineItems.flatMap((item) => (item.sessionId != null ? [item.sessionId] : []))),
   ];
-  const [seller, branding, payment, evidence, issuedLetterhead] = await Promise.all([
-    readStoredInvoiceSeller(invoice.seller) ?? loadInvoiceSeller(),
-    loadPdfBranding(invoice.issuerId),
-    getInvoicePaymentSettings(),
-    loadSessionEvidence(sessionIds),
-    options.letterhead !== undefined
-      ? options.letterhead
-      : invoice.letterheadId != null
-        ? loadPdfLetterhead(invoice.letterheadId)
-        : null,
-  ]);
+  // An invoice of charging sessions alone gets the session table (start,
+  // energy, price per kWh and amount, tax included) without the meter readings.
+  const sessionsOnly = billsSessionsOnly(lineItems);
+  const [seller, branding, payment, evidence, issuedLetterhead, sessionDetails] = await Promise.all(
+    [
+      readStoredInvoiceSeller(invoice.seller) ?? loadInvoiceSeller(),
+      loadPdfBranding(invoice.issuerId),
+      getInvoicePaymentSettings(),
+      loadSessionEvidence(sessionIds),
+      options.letterhead !== undefined
+        ? options.letterhead
+        : invoice.letterheadId != null
+          ? loadPdfLetterhead(invoice.letterheadId)
+          : null,
+      sessionsOnly ? loadInvoiceSessionDetails(sessionIds) : null,
+    ],
+  );
   const evidenceLabels = INVOICE_EVIDENCE_LABELS[language];
   // A letterhead whose image cannot be used draws the PDF without it.
   const background = issuedLetterhead != null ? letterheadBackground(issuedLetterhead) : null;
@@ -650,19 +698,25 @@ export async function generateInvoicePdf(
     const addressName =
       billTo?.name ?? (driver != null ? `${driver.firstName} ${driver.lastName}`.trim() : '—');
     const fallbackEmail = billTo != null ? billTo.email : (driver?.email ?? null);
-    const addressLines =
-      billTo != null && billTo.address.length > 0
-        ? billTo.address
-        : fallbackEmail != null && fallbackEmail !== ''
-          ? [fallbackEmail]
-          : [];
+    const recipientEmail = fallbackEmail != null && fallbackEmail !== '' ? fallbackEmail : null;
+    const hasPostalAddress = billTo != null && billTo.address.length > 0;
+    const addressLines = hasPostalAddress
+      ? billTo.address
+      : recipientEmail != null
+        ? [recipientEmail]
+        : [];
     y = drawLetterheadFirstPage(doc, letterhead, background, frame, fonts, {
       title: `${documentTitle} ${invoice.invoiceNumber}`,
       addressName,
       addressLines,
+      addressNote: employeeNumberLine[0] ?? null,
     });
+    // The email stays out of the envelope window when there is a postal
+    // address; it follows below the title instead.
     const recipientLines = [
-      ...employeeNumberLine,
+      ...(hasPostalAddress && recipientEmail != null
+        ? [labels.recipientEmail.replace('{email}', recipientEmail)]
+        : []),
       ...(billTo?.taxId != null ? [labels.taxId.replace('{id}', billTo.taxId)] : []),
       ...(isMemberInvoice && fleet != null ? [labels.viaFleet.replace('{fleet}', fleet.name)] : []),
     ];
@@ -756,17 +810,27 @@ export async function generateInvoicePdf(
     y = Math.max(y + 50, detailY + 10, sellerY + 10);
   }
 
+  // The document carries no status: it is fixed at issue while the status
+  // changes after it.
   const metaRows: Array<[string, string]> = [
-    [labels.status, labels.statuses[invoice.status]],
     [labels.issued, formatDate(invoice.issuedAt, labels.locale)],
   ];
   const period = formatPeriod(invoice.periodStart, labels.locale);
   if (period != null) metaRows.push([labels.period, period]);
+  const totalEnergyWh = sessionEnergyWh(lineItems);
+  if (totalEnergyWh != null) {
+    const kwh = new Intl.NumberFormat(labels.locale, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(totalEnergyWh / 1000);
+    metaRows.push([labels.totalEnergy, `${kwh} kWh`]);
+  }
   // A credit note has no due date; it names the invoice it credits and why.
+  // An invoice settled outside EVtivity has none either.
   if (isCreditNote) {
     metaRows.push([labels.creditsInvoice, creditedInvoice?.invoiceNumber ?? '—']);
     if (invoice.creditReason != null) metaRows.push([labels.reason, invoice.creditReason]);
-  } else {
+  } else if (invoice.settlementNote == null) {
     metaRows.push([labels.due, formatDate(invoice.dueAt, labels.locale)]);
   }
   if (creditNote != null) metaRows.push([labels.creditedBy, creditNote.invoiceNumber]);
@@ -792,102 +856,223 @@ export async function generateInvoicePdf(
     { x: 335, width: 60, align: 'right' },
     { x: 400, width: frame.width - 400, align: 'right' },
   ];
-  doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED);
-  y += drawRow(
-    doc,
-    frame,
-    itemColumns,
-    [labels.description, labels.quantity, labels.unitPrice, labels.taxRate, labels.amount],
-    y,
-  );
-  drawRule(doc, frame, y - 4);
-
-  const drawItem = (item: LineItem, index: number): void => {
-    y = ensure(y, 30);
-    const qty = Number(item.quantity);
-    const values = [
-      describeLineItem(labels, item.description, item.metadata),
-      Number.isNaN(qty) ? item.quantity : qty.toString(),
-      money(item.unitPriceCents),
-      rate(item.taxRate),
-      money(item.totalCents),
-    ];
-    doc.font(fonts.regular).fontSize(10);
-    if (index % 2 === 1) {
-      // The band spans the row's text plus half the row gap above and below.
-      doc
-        .rect(frame.left - 4, y - 2, frame.width + 8, rowHeight(doc, itemColumns, values))
-        .fill(INVOICE_ROW_BAND_COLOR);
-    }
-    doc.fillColor(COLOR_TEXT);
-    y += drawRow(doc, frame, itemColumns, values, y);
-  };
-
-  // The check line under a session's last line: the session id, and the
-  // signed begin and end readings when the station signed its meter data.
-  const drawSessionEvidence = (sessionId: string): void => {
-    const text = sessionEvidenceLine(
-      evidenceLabels,
-      labels.locale,
-      sessionId,
-      evidence.get(sessionId),
-    );
-    doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
-    const height = doc.heightOfString(text, { width: frame.width });
-    y = ensure(y - 3, height + 4);
-    doc.text(text, frame.left, y, { width: frame.width });
-    y += height + 4;
-  };
-
-  const drawItems = (items: LineItem[]): void => {
-    items.forEach((item, i) => {
-      drawItem(item, i);
-      if (item.sessionId != null && items[i + 1]?.sessionId !== item.sessionId) {
-        drawSessionEvidence(item.sessionId);
-      }
-    });
-  };
-
-  if (isFleetInvoice) {
-    // A fleet invoice lists each driver's sessions under the driver, with a
-    // net subtotal per driver; the tax summary below covers the whole invoice.
-    for (const group of groupLinesByDriver(lineItems)) {
-      y = ensure(y, 50);
-      const driverName = group.driverName !== '' ? group.driverName : labels.unknownDriver;
-      const name =
-        group.employeeNumber != null
-          ? `${driverName} · ${labels.employeeNumber.replace('{id}', group.employeeNumber)}`
-          : driverName;
-      doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, frame.left, y, {
-        width: frame.width,
-      });
-      y += 16;
-      drawItems(group.items);
-      y = ensure(y, 20);
-      drawRule(doc, frame, y - 2, frame.left + frame.width / 2);
-      doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT);
-      y += drawRow(
-        doc,
-        frame,
-        itemColumns,
-        [labels.driverSubtotal.replace('{driver}', name), '', '', '', money(group.netCents)],
-        y,
-      );
-      y += 6;
-    }
+  if (sessionDetails != null) {
+    y = drawSessionTable(y, sessionDetails);
   } else {
-    drawItems(lineItems);
+    y = drawLineItemTable(y);
   }
 
-  if (evidence.size > 0) {
-    doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
-    const height = doc.heightOfString(evidenceLabels.note, { width: frame.width });
-    y = ensure(y + 4, height + 4);
-    doc.text(evidenceLabels.note, frame.left, y, { width: frame.width });
-    y += height + 4;
+  function drawSessionTable(startY: number, details: InvoiceSessionDetails): number {
+    let ty = startY;
+    // Session, energy, price per kWh and amount, the amount column aligned
+    // with the totals below.
+    const columns: Column[] = [
+      { x: 0, width: 195, align: 'left' },
+      { x: 200, width: 95, align: 'right' },
+      { x: 300, width: 95, align: 'right' },
+      { x: 400, width: frame.width - 400, align: 'right' },
+    ];
+    const kwhFormat = new Intl.NumberFormat(labels.locale, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    const priceFormat = new Intl.NumberFormat(labels.locale, {
+      style: 'currency',
+      currency: invoice.currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    });
+    doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED);
+    ty += drawRow(
+      doc,
+      frame,
+      columns,
+      [labels.sessionColumn, labels.quantity, labels.pricePerKwh, labels.amount],
+      ty,
+    );
+    drawRule(doc, frame, ty - 4);
+
+    const drawSessionRow = (row: SessionTableRow, index: number): void => {
+      const values =
+        row.idleFee != null
+          ? [
+              describeLineItem(labels, row.idleFee.description, row.idleFee.metadata),
+              '',
+              '',
+              money(row.grossCents),
+            ]
+          : [
+              sessionStartText(row, labels.locale, details.timeZone),
+              `${kwhFormat.format((row.energyWh ?? 0) / 1000)} kWh`,
+              row.grossPricePerKwh != null ? priceFormat.format(row.grossPricePerKwh) : '',
+              money(row.grossCents),
+            ];
+      const place =
+        row.idleFee != null ? '' : sessionPlaceText(row, labels.locale, details.timeZone);
+      doc.font(fonts.regular).fontSize(9);
+      const mainHeight = rowHeight(doc, columns, values, 12);
+      doc.fontSize(7);
+      const placeHeight = place !== '' ? doc.heightOfString(place, { width: frame.width }) + 2 : 0;
+      ty = ensure(ty, mainHeight + placeHeight + 2);
+      if (index % 2 === 1) {
+        doc
+          .rect(frame.left - 4, ty - 2, frame.width + 8, mainHeight + placeHeight)
+          .fill(INVOICE_ROW_BAND_COLOR);
+      }
+      doc.font(fonts.regular).fontSize(9).fillColor(COLOR_TEXT);
+      ty += drawRow(doc, frame, columns, values, ty, 12) - 2;
+      if (place !== '') {
+        doc.fontSize(7).fillColor(COLOR_MUTED).text(place, frame.left, ty, { width: frame.width });
+        ty += placeHeight;
+      }
+      ty += 2;
+    };
+
+    if (isFleetInvoice) {
+      // Each driver's sessions under the driver, with the driver's total.
+      for (const group of groupLinesByDriver(lineItems)) {
+        ty = ensure(ty, 50);
+        const driverName = group.driverName !== '' ? group.driverName : labels.unknownDriver;
+        const name =
+          group.employeeNumber != null
+            ? `${driverName} · ${labels.employeeNumber.replace('{id}', group.employeeNumber)}`
+            : driverName;
+        doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, frame.left, ty, {
+          width: frame.width,
+        });
+        ty += 15;
+        const rows = sessionTableRows(group.items, details.sessions);
+        rows.forEach(drawSessionRow);
+        ty = ensure(ty, 20);
+        drawRule(doc, frame, ty - 2, frame.left + frame.width / 2);
+        doc.font(fonts.bold).fontSize(9).fillColor(COLOR_TEXT);
+        ty += drawRow(
+          doc,
+          frame,
+          columns,
+          [
+            labels.driverSubtotal.replace('{driver}', name),
+            '',
+            '',
+            money(rows.reduce((sum, row) => sum + row.grossCents, 0)),
+          ],
+          ty,
+        );
+        ty += 6;
+      }
+    } else {
+      sessionTableRows(lineItems, details.sessions).forEach(drawSessionRow);
+    }
+    // No readings in the table: the signed data is in the portal.
+    if (evidence.size > 0) {
+      doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
+      const height = doc.heightOfString(evidenceLabels.portalNote, { width: frame.width });
+      ty = ensure(ty + 4, height + 4);
+      doc.text(evidenceLabels.portalNote, frame.left, ty, { width: frame.width });
+      ty += height + 4;
+    }
+    return ty + 10;
   }
 
-  y += 10;
+  function drawLineItemTable(startY: number): number {
+    y = startY;
+    doc.fontSize(9).font(fonts.bold).fillColor(COLOR_MUTED);
+    y += drawRow(
+      doc,
+      frame,
+      itemColumns,
+      [labels.description, labels.quantity, labels.unitPrice, labels.taxRate, labels.amount],
+      y,
+    );
+    drawRule(doc, frame, y - 4);
+
+    const drawItem = (item: LineItem, index: number): void => {
+      y = ensure(y, 30);
+      const qty = Number(item.quantity);
+      const values = [
+        describeLineItem(labels, item.description, item.metadata),
+        Number.isNaN(qty) ? item.quantity : qty.toString(),
+        money(item.unitPriceCents),
+        rate(item.taxRate),
+        money(item.totalCents),
+      ];
+      doc.font(fonts.regular).fontSize(10);
+      if (index % 2 === 1) {
+        // The band spans the row's text plus half the row gap above and below.
+        doc
+          .rect(frame.left - 4, y - 2, frame.width + 8, rowHeight(doc, itemColumns, values))
+          .fill(INVOICE_ROW_BAND_COLOR);
+      }
+      doc.fillColor(COLOR_TEXT);
+      y += drawRow(doc, frame, itemColumns, values, y);
+    };
+
+    // The check line under a session's last line: the session id, and the
+    // signed begin and end readings when the station signed its meter data.
+    const drawSessionEvidence = (sessionId: string): void => {
+      const text = sessionEvidenceLine(
+        evidenceLabels,
+        labels.locale,
+        sessionId,
+        evidence.get(sessionId),
+      );
+      doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
+      const height = doc.heightOfString(text, { width: frame.width });
+      y = ensure(y - 3, height + 4);
+      doc.text(text, frame.left, y, { width: frame.width });
+      y += height + 4;
+    };
+
+    const drawItems = (items: LineItem[]): void => {
+      items.forEach((item, i) => {
+        drawItem(item, i);
+        if (item.sessionId != null && items[i + 1]?.sessionId !== item.sessionId) {
+          drawSessionEvidence(item.sessionId);
+        }
+      });
+    };
+
+    if (isFleetInvoice) {
+      // A fleet invoice lists each driver's sessions under the driver, with a
+      // net subtotal per driver; the tax summary below covers the whole invoice.
+      for (const group of groupLinesByDriver(lineItems)) {
+        y = ensure(y, 50);
+        const driverName = group.driverName !== '' ? group.driverName : labels.unknownDriver;
+        const name =
+          group.employeeNumber != null
+            ? `${driverName} · ${labels.employeeNumber.replace('{id}', group.employeeNumber)}`
+            : driverName;
+        doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT).text(name, frame.left, y, {
+          width: frame.width,
+        });
+        y += 16;
+        drawItems(group.items);
+        y = ensure(y, 20);
+        drawRule(doc, frame, y - 2, frame.left + frame.width / 2);
+        doc.font(fonts.bold).fontSize(10).fillColor(COLOR_TEXT);
+        y += drawRow(
+          doc,
+          frame,
+          itemColumns,
+          [labels.driverSubtotal.replace('{driver}', name), '', '', '', money(group.netCents)],
+          y,
+        );
+        y += 6;
+      }
+    } else {
+      drawItems(lineItems);
+    }
+
+    if (evidence.size > 0) {
+      doc.font(fonts.regular).fontSize(7).fillColor(COLOR_MUTED);
+      const height = doc.heightOfString(evidenceLabels.note, { width: frame.width });
+      y = ensure(y + 4, height + 4);
+      doc.text(evidenceLabels.note, frame.left, y, { width: frame.width });
+      y += height + 4;
+    }
+
+    return y + 10;
+  }
 
   // Tax summary: net amount, tax rate, and tax amount per rate. Must not
   // split across pages.
@@ -952,7 +1137,14 @@ export async function generateInvoicePdf(
     .fontSize(8)
     .font(fonts.regular)
     .fillColor(COLOR_MUTED)
-    .text(labels.amountsNote, frame.left, y + 4, { width: frame.width });
+    .text(
+      sessionDetails != null ? labels.grossAmountsNote : labels.amountsNote,
+      frame.left,
+      y + 4,
+      {
+        width: frame.width,
+      },
+    );
   y += 16;
   if (isCreditNote && creditedInvoice?.paidAt != null) {
     y = ensure(y, 24);

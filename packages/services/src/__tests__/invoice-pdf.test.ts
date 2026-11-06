@@ -522,6 +522,26 @@ describe('generateInvoicePdf', () => {
     expect(text).toContain('Gesamtbetrag-5,18');
   });
 
+  it('prints no status and the due date on an invoice paid by transfer', async () => {
+    const labels = INVOICE_LABELS.de;
+    const paid = detail('de');
+    paid.invoice.status = 'paid';
+    const { text } = pdfContent(await generateInvoicePdf(paid));
+    expect(text).not.toContain(`${labels.status}${labels.statuses.paid}`);
+    expect(text).toContain(`${labels.due}4. Juni 2026`);
+  });
+
+  it('prints no due date on an invoice settled outside EVtivity', async () => {
+    const labels = INVOICE_LABELS.de;
+    const settled = detail('de');
+    settled.invoice.status = 'paid';
+    settled.invoice.settlementNote = '';
+    const { text } = pdfContent(await generateInvoicePdf(settled));
+    expect(text).toContain(labels.issued);
+    expect(text).not.toContain(labels.due);
+    expect(text).not.toContain(`${labels.status}${labels.statuses.paid}`);
+  });
+
   it('bands every second line item with the row band color', async () => {
     const hex = INVOICE_ROW_BAND_COLOR.slice(1);
     const rgb = [0, 2, 4].map((i) => String(parseInt(hex.slice(i, i + 2), 16) / 255)).join(' ');
@@ -557,7 +577,7 @@ describe('generateInvoicePdf', () => {
     const { text } = pdfContent(await generateInvoicePdf(credited));
 
     expect(text).toContain('INVOICE');
-    expect(text).toContain('StatusCredited');
+    expect(text).not.toContain('StatusCredited');
     expect(text).toContain('Credit noteCN-202606-0001');
     expect(text).not.toContain(INVOICE_LABELS.en.creditNotePaidNote);
   });
@@ -592,7 +612,7 @@ describe('generateInvoicePdf', () => {
         labels.from,
         labels.sellerTaxId.replace('{id}', 'DE123456789'),
         labels.registrationNumber.replace('{id}', 'HRB 12345'),
-        labels.statuses.issued,
+        labels.issued,
         labels.taxSummary,
         labels.netAmount,
         labels.subtotal,

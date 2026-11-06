@@ -32,6 +32,8 @@ export interface InvoiceLabels {
   creditNotePaidNote: string;
   /** Fleet invoice: the billed calendar month. */
   period: string;
+  /** Invoice header: the energy of all charging sessions on the invoice. */
+  totalEnergy: string;
   /** Fleet invoice bill-to block: the VAT or tax ID; "{id}" is replaced. */
   taxId: string;
   /** "From" block: the seller's tax ID when company.taxIdLabel is empty; "{id}" is replaced. */
@@ -42,6 +44,8 @@ export interface InvoiceLabels {
   driverSubtotal: string;
   /** Fleet invoice: the group of sessions whose driver was deleted. */
   unknownDriver: string;
+  /** On a letterhead: the recipient's email below the title; "{email}" is replaced. */
+  recipientEmail: string;
   /** The driver's employee number (the operator's reference); "{id}" is replaced. */
   employeeNumber: string;
   /** Member invoice and its credit note: the fleet whose account the sessions were charged on; "{fleet}" is replaced. */
@@ -61,6 +65,12 @@ export interface InvoiceLabels {
   totalTax: string;
   total: string;
   amountsNote: string;
+  /** Session table: the column of the charging sessions. */
+  sessionColumn: string;
+  /** Session table: the energy price per kWh, tax included. */
+  pricePerKwh: string;
+  /** Session table: prices and amounts include tax. */
+  grossAmountsNote: string;
   kinds: Record<
     | 'energy'
     | 'time'
@@ -125,11 +135,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: 'Reason',
     creditNotePaidNote: 'The credited invoice was paid. The amount is refunded separately.',
     period: 'Period',
+    totalEnergy: 'Total energy',
     taxId: 'VAT ID: {id}',
     sellerTaxId: 'Tax ID: {id}',
     registrationNumber: 'Registration no.: {id}',
     driverSubtotal: 'Subtotal {driver}',
     unknownDriver: 'Unknown driver',
+    recipientEmail: 'Email: {email}',
     employeeNumber: 'Employee no.: {id}',
     viaFleet: 'Charged on account of {fleet}',
     description: 'DESCRIPTION',
@@ -146,6 +158,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: 'Total tax',
     total: 'Total',
     amountsNote: 'Unit prices and amounts exclude tax.',
+    sessionColumn: 'CHARGING SESSION',
+    pricePerKwh: 'PRICE/kWh',
+    grossAmountsNote: 'Prices and amounts include tax.',
     kinds: {
       energy: 'Energy',
       time: 'Charging time',
@@ -196,11 +211,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     creditNotePaidNote:
       'Die stornierte Rechnung wurde bezahlt. Der Betrag wird gesondert erstattet.',
     period: 'Zeitraum',
+    totalEnergy: 'Energie gesamt',
     taxId: 'USt-IdNr.: {id}',
     sellerTaxId: 'Steuernummer: {id}',
     registrationNumber: 'Registernummer: {id}',
     driverSubtotal: 'Zwischensumme {driver}',
     unknownDriver: 'Unbekannter Fahrer',
+    recipientEmail: 'E-Mail: {email}',
     employeeNumber: 'Personalnr.: {id}',
     viaFleet: 'Abgerechnet über das Konto von {fleet}',
     description: 'BESCHREIBUNG',
@@ -217,6 +234,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: 'Steuer gesamt',
     total: 'Gesamtbetrag',
     amountsNote: 'Einzelpreise und Beträge ohne Steuer.',
+    sessionColumn: 'LADEVORGANG',
+    pricePerKwh: 'PREIS/kWh',
+    grossAmountsNote: 'Preise und Beträge inklusive Steuer.',
     kinds: {
       energy: 'Energie',
       time: 'Ladezeit',
@@ -268,11 +288,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: 'Motivo',
     creditNotePaidNote: 'La factura acreditada fue pagada. El importe se reembolsa por separado.',
     period: 'Periodo',
+    totalEnergy: 'Energía total',
     taxId: 'NIF/CIF: {id}',
     sellerTaxId: 'NIF: {id}',
     registrationNumber: 'N.º de registro: {id}',
     driverSubtotal: 'Subtotal {driver}',
     unknownDriver: 'Conductor desconocido',
+    recipientEmail: 'Correo electrónico: {email}',
     employeeNumber: 'N.º de empleado: {id}',
     viaFleet: 'Cargado a la cuenta de {fleet}',
     description: 'DESCRIPCIÓN',
@@ -289,6 +311,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: 'Total impuestos',
     total: 'Total',
     amountsNote: 'Los precios unitarios y los importes no incluyen impuestos.',
+    sessionColumn: 'SESIÓN DE CARGA',
+    pricePerKwh: 'PRECIO/kWh',
+    grossAmountsNote: 'Los precios y los importes incluyen impuestos.',
     kinds: {
       energy: 'Energía',
       time: 'Tiempo de carga',
@@ -340,11 +365,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: '사유',
     creditNotePaidNote: '크레딧 처리된 청구서는 결제되었습니다. 금액은 별도로 환불됩니다.',
     period: '기간',
+    totalEnergy: '총 충전량',
     taxId: '사업자등록번호: {id}',
     sellerTaxId: '사업자등록번호: {id}',
     registrationNumber: '법인등록번호: {id}',
     driverSubtotal: '{driver} 소계',
     unknownDriver: '알 수 없는 운전자',
+    recipientEmail: '이메일: {email}',
     employeeNumber: '사번: {id}',
     viaFleet: '{fleet} 계정으로 청구됨',
     description: '설명',
@@ -361,6 +388,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: '세액 합계',
     total: '총액',
     amountsNote: '단가와 금액은 세금 별도입니다.',
+    sessionColumn: '충전 세션',
+    pricePerKwh: 'kWh당 가격',
+    grossAmountsNote: '가격과 금액은 세금 포함입니다.',
     kinds: {
       energy: '에너지',
       time: '충전 시간',
@@ -410,11 +440,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: '原因',
     creditNotePaidNote: '被贷记的发票已支付。款项将另行退还。',
     period: '账期',
+    totalEnergy: '总电量',
     taxId: '税号：{id}',
     sellerTaxId: '税号：{id}',
     registrationNumber: '注册号：{id}',
     driverSubtotal: '{driver} 小计',
     unknownDriver: '未知驾驶员',
+    recipientEmail: '电子邮件：{email}',
     employeeNumber: '员工编号：{id}',
     viaFleet: '通过 {fleet} 账户计费',
     description: '描述',
@@ -431,6 +463,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: '税额合计',
     total: '合计',
     amountsNote: '单价和金额均不含税。',
+    sessionColumn: '充电会话',
+    pricePerKwh: '每 kWh 价格',
+    grossAmountsNote: '价格和金额均含税。',
     kinds: {
       energy: '电量',
       time: '充电时长',
@@ -479,11 +514,13 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: '原因',
     creditNotePaidNote: '被貸記的發票已付款。款項將另行退還。',
     period: '帳期',
+    totalEnergy: '總電量',
     taxId: '統一編號：{id}',
     sellerTaxId: '統一編號：{id}',
     registrationNumber: '登記字號：{id}',
     driverSubtotal: '{driver} 小計',
     unknownDriver: '未知駕駛員',
+    recipientEmail: '電子郵件：{email}',
     employeeNumber: '員工編號：{id}',
     viaFleet: '透過 {fleet} 帳戶計費',
     description: '描述',
@@ -500,6 +537,9 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     totalTax: '稅額合計',
     total: '合計',
     amountsNote: '單價與金額均未稅。',
+    sessionColumn: '充電會話',
+    pricePerKwh: '每 kWh 價格',
+    grossAmountsNote: '價格與金額均含稅。',
     kinds: {
       energy: '電量',
       time: '充電時長',

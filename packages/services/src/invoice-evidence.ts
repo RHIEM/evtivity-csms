@@ -22,6 +22,8 @@ export interface InvoiceEvidenceLabels {
   meter: string;
   begin: string;
   end: string;
+  /** Session table: printed once below it when a session has signed meter data. */
+  portalNote: string;
   /** Printed once below the line items when a session has signed meter data. */
   note: string;
 }
@@ -34,6 +36,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: 'meter {serial}',
     begin: 'start {time}: {value}',
     end: 'end {time}: {value}',
+    portalNote:
+      'Signed meter data (calibration law): the signed data of the charging sessions can be downloaded in the customer portal and verified with the transparency software.',
     note: 'Signed meter data (calibration law): the meter signed the readings named under a session. Download the signed data of a session in the customer portal and verify it with the transparency software.',
   },
   de: {
@@ -43,6 +47,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: 'Zähler {serial}',
     begin: 'Beginn {time}: {value}',
     end: 'Ende {time}: {value}',
+    portalNote:
+      'Signierte Messdaten (Eichrecht): Die signierten Daten der Ladesitzungen stehen im Kundenportal zum Download bereit und lassen sich mit der Transparenzsoftware prüfen.',
     note: 'Signierte Messdaten (Eichrecht): Die unter einer Sitzung genannten Zählerstände hat der Zähler signiert. Die signierten Daten einer Sitzung stehen im Kundenportal zum Download bereit und lassen sich mit der Transparenzsoftware prüfen.',
   },
   es: {
@@ -52,6 +58,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: 'contador {serial}',
     begin: 'inicio {time}: {value}',
     end: 'fin {time}: {value}',
+    portalNote:
+      'Datos de medición firmados (ley de metrología): los datos firmados de las sesiones de carga se pueden descargar en el portal de clientes y verificar con el software de transparencia.',
     note: 'Datos de medición firmados (ley de metrología): el contador firmó las lecturas indicadas bajo una sesión. Descargue los datos firmados de una sesión en el portal de clientes y verifíquelos con el software de transparencia.',
   },
   ko: {
@@ -61,6 +69,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: '계량기 {serial}',
     begin: '시작 {time}: {value}',
     end: '종료 {time}: {value}',
+    portalNote:
+      '서명된 계량 데이터(계량법): 충전 세션의 서명된 데이터는 고객 포털에서 다운로드하여 투명성 소프트웨어로 확인할 수 있습니다.',
     note: '서명된 계량 데이터(계량법): 세션 아래에 표시된 계량값은 계량기가 서명한 값입니다. 세션의 서명된 데이터는 고객 포털에서 다운로드하여 투명성 소프트웨어로 확인할 수 있습니다.',
   },
   zh: {
@@ -70,6 +80,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: '电表 {serial}',
     begin: '开始 {time}：{value}',
     end: '结束 {time}：{value}',
+    portalNote:
+      '签名计量数据（计量法）：充电会话的签名数据可在客户门户下载，并使用透明度软件进行验证。',
     note: '签名计量数据（计量法）：会话下列出的读数已由电表签名。可在客户门户下载会话的签名数据，并使用透明度软件进行验证。',
   },
   'zh-TW': {
@@ -79,6 +91,8 @@ export const INVOICE_EVIDENCE_LABELS: Record<InvoiceLanguage, InvoiceEvidenceLab
     meter: '電表 {serial}',
     begin: '開始 {time}：{value}',
     end: '結束 {time}：{value}',
+    portalNote:
+      '簽章計量資料（計量法）：充電會話的簽章資料可在客戶入口網站下載，並使用透明度軟體進行驗證。',
     note: '簽章計量資料（計量法）：會話下列出的讀數已由電表簽章。可在客戶入口網站下載會話的簽章資料，並使用透明度軟體進行驗證。',
   },
 };
