@@ -68,6 +68,8 @@ Diese Abweichungen gibt es nicht mehr, weil EVtivity sie übernommen oder selbst
 
 ## Zweige auf `origin`
 
+Am 06.11.2026 gelöscht: `fix/csp-blob-frame` (Fix steckt in `feature/pdf-letterhead`) und `feature/invoice-payment-mode` (Laden auf Rechnung, abgelöst).
+
 PR-fähig heißt: Basis ist ein Upstream-Tag, keine RHIEM-Dateien, keine Fork-Features außer den eigenen Vorgängern im Stapel.
 
 | Zweig                                                                                   | Basis            | PR-fähig       | Bemerkung                                                                                  |
@@ -79,5 +81,3 @@ PR-fähig heißt: Basis ist ein Upstream-Tag, keine RHIEM-Dateien, keine Fork-Fe
 | `feature/ocpp16-signed-meter-data`                                                      | `v0.1.47-beta.1` | technisch ja   | bewusst nicht eingereicht; spätere Commits zum Messnachweis liegen direkt auf `rhiem/main` |
 | `feature/issuer-letterhead`, `feature/invoice-session-table`                            | `rhiem/main`     | nein           | hängen an Fork-Features, siehe Tabelle oben                                                |
 | `feature/session-report`, `fix/session-report-no-replaces`                              | `rhiem/main`     | nein           | zurückgebaut, für einen möglichen späteren PR aufbewahrt                                   |
-| `fix/csp-blob-frame`                                                                    | `rhiem/main`     | nein           | überholt: Fix steckt in `feature/pdf-letterhead`, Zweig kann gelöscht werden               |
-| `feature/invoice-payment-mode`                                                          | `v0.1.37`        | –              | Historie (Laden auf Rechnung, abgelöst), kann gelöscht werden                              |
