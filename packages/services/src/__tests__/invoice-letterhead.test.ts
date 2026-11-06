@@ -53,8 +53,10 @@ import type { InvoiceDetail } from '../invoice.service.js';
 function pageStreams(pdf: Buffer): string[] {
   const raw = pdf.toString('latin1');
   const pages: string[] = [];
-  for (const m of raw.matchAll(/stream\r?\n([\s\S]*?)\r?\nendstream/g)) {
-    let data = Buffer.from(m[1] ?? '', 'latin1');
+  // Read each stream by its /Length: binary data can hold "endstream".
+  for (const m of raw.matchAll(/\/Length (\d+)[^>]*>>\s*stream\r?\n/g)) {
+    const start = m.index + m[0].length;
+    let data = Buffer.from(raw.slice(start, start + Number(m[1])), 'latin1');
     try {
       data = inflateSync(data);
     } catch {
@@ -282,7 +284,7 @@ describe('generateInvoicePdf on a letterhead', () => {
     expect(text).not.toContain('BILLED TO');
     expect(text).not.toContain('FROM');
     expect(text).not.toContain('www.evtivity.com');
-    expect(text).not.toContain('anna@fleet.test');
+    expect(text).toContain('Email: anna@fleet.test');
     expect(text).not.toContain('Page 1 of');
     // The letterhead is the only image: no PDF logo.
     expect(pdfImages(pdf)).toEqual([{ width: 1240, height: 1754 }]);
@@ -326,11 +328,30 @@ describe('generateInvoicePdf on a letterhead', () => {
     expect(pages.slice(1).some((page) => page.includes(' Do'))).toBe(false);
   });
 
-  it('puts the employee number with the tax ID below the title', async () => {
+  it('puts the employee number in small print above the address', async () => {
     const detail = memberDetail();
     detail.invoice.billTo = { ...(detail.invoice.billTo as object), employeeNumber: '4711' };
     const pdf = await generateInvoicePdf(detail, { letterhead: letterhead() });
     expect(pdfText(pdf)).toContain('Employee no.: 4711');
+  });
+
+  it("puts the recipient's email below the title when the window holds the address", async () => {
+    const text = pdfText(await generateInvoicePdf(memberDetail(), { letterhead: letterhead() }));
+    expect(text).toContain('Lindenweg 3');
+    expect(text).toContain('Email: anna@fleet.test');
+  });
+
+  it('prints the total energy of the sessions in the header', async () => {
+    const text = pdfText(await generateInvoicePdf(memberDetail(), { letterhead: letterhead() }));
+    expect(text).toContain('Total energy24.00 kWh');
+  });
+
+  it('puts the email into the window when there is no address', async () => {
+    const detail = memberDetail();
+    detail.invoice.billTo = { name: 'Anna Berg', email: 'anna@fleet.test' };
+    const text = pdfText(await generateInvoicePdf(detail, { letterhead: letterhead() }));
+    expect(text).toContain('anna@fleet.test');
+    expect(text).not.toContain('Email: anna@fleet.test');
   });
 
   it("heads the later pages with the seller kept on the invoice, e.g. an invoice issuer's", async () => {

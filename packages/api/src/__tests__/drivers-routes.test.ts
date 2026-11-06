@@ -77,6 +77,8 @@ vi.mock('@evtivity/database', () => ({
   },
   client: {},
   drivers: { employeeNumber: 'drivers.employee_number' },
+  fleets: {},
+  fleetDrivers: {},
   driverTokens: {},
   vehicles: {},
   users: {},
@@ -371,8 +373,32 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.data).toEqual([{ ...driver, avatar: null }]);
+      expect(body.data).toEqual([{ ...driver, avatar: null, fleets: [] }]);
       expect(body.total).toBe(1);
+    });
+
+    it("lists each driver's fleets", async () => {
+      const driver = makeDriver();
+      setupDbResults(
+        [driver],
+        [{ count: 1 }],
+        [
+          { driverId: driver.id, id: 'flt_a', name: 'Leitung' },
+          { driverId: driver.id, id: 'flt_b', name: 'RHIEM Services' },
+          { driverId: 'drv_other', id: 'flt_c', name: 'Other' },
+        ],
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(200);
+      const [row] = res.json().data as Array<Record<string, unknown>>;
+      expect(row?.['fleets']).toEqual([
+        { id: 'flt_a', name: 'Leitung' },
+        { id: 'flt_b', name: 'RHIEM Services' },
+      ]);
     });
 
     it('returns 200 with search param', async () => {
@@ -387,7 +413,7 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.data).toEqual([{ ...driver, avatar: null }]);
+      expect(body.data).toEqual([{ ...driver, avatar: null, fleets: [] }]);
       expect(body.total).toBe(1);
     });
 

@@ -1962,6 +1962,7 @@
     "search": "Search",
     "driverId": "Driver ID",
     "driverName": "Driver Name",
+    "fleets": "Fleets",
     "addDriver": "Create Driver",
     "createDriver": "Create Driver",
     "searchPlaceholder": "Search drivers (name, email, phone, employee number)...",
