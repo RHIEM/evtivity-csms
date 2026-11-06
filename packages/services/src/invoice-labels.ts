@@ -44,8 +44,6 @@ export interface InvoiceLabels {
   driverSubtotal: string;
   /** Fleet invoice: the group of sessions whose driver was deleted. */
   unknownDriver: string;
-  /** On a letterhead: the recipient's email below the title; "{email}" is replaced. */
-  recipientEmail: string;
   /** The driver's employee number (the operator's reference); "{id}" is replaced. */
   employeeNumber: string;
   /** Member invoice and its credit note: the fleet whose account the sessions were charged on; "{fleet}" is replaced. */
@@ -141,7 +139,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: 'Registration no.: {id}',
     driverSubtotal: 'Subtotal {driver}',
     unknownDriver: 'Unknown driver',
-    recipientEmail: 'Email: {email}',
     employeeNumber: 'Employee no.: {id}',
     viaFleet: 'Charged on account of {fleet}',
     description: 'DESCRIPTION',
@@ -217,7 +214,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: 'Registernummer: {id}',
     driverSubtotal: 'Zwischensumme {driver}',
     unknownDriver: 'Unbekannter Fahrer',
-    recipientEmail: 'E-Mail: {email}',
     employeeNumber: 'Personalnr.: {id}',
     viaFleet: 'Abgerechnet über das Konto von {fleet}',
     description: 'BESCHREIBUNG',
@@ -294,7 +290,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: 'N.º de registro: {id}',
     driverSubtotal: 'Subtotal {driver}',
     unknownDriver: 'Conductor desconocido',
-    recipientEmail: 'Correo electrónico: {email}',
     employeeNumber: 'N.º de empleado: {id}',
     viaFleet: 'Cargado a la cuenta de {fleet}',
     description: 'DESCRIPCIÓN',
@@ -371,7 +366,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: '법인등록번호: {id}',
     driverSubtotal: '{driver} 소계',
     unknownDriver: '알 수 없는 운전자',
-    recipientEmail: '이메일: {email}',
     employeeNumber: '사번: {id}',
     viaFleet: '{fleet} 계정으로 청구됨',
     description: '설명',
@@ -446,7 +440,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: '注册号：{id}',
     driverSubtotal: '{driver} 小计',
     unknownDriver: '未知驾驶员',
-    recipientEmail: '电子邮件：{email}',
     employeeNumber: '员工编号：{id}',
     viaFleet: '通过 {fleet} 账户计费',
     description: '描述',
@@ -520,7 +513,6 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     registrationNumber: '登記字號：{id}',
     driverSubtotal: '{driver} 小計',
     unknownDriver: '未知駕駛員',
-    recipientEmail: '電子郵件：{email}',
     employeeNumber: '員工編號：{id}',
     viaFleet: '透過 {fleet} 帳戶計費',
     description: '描述',

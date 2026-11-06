@@ -280,11 +280,11 @@ describe('generateInvoicePdf on a letterhead', () => {
     expect(text).toContain('Anna Berg');
     expect(text).toContain('28195 Bremen');
     expect(text).toContain('VAT ID: DE123456789');
-    expect(text).toContain('Charged on account of Staff');
+    expect(text).not.toContain('Charged on account of');
     expect(text).not.toContain('BILLED TO');
     expect(text).not.toContain('FROM');
     expect(text).not.toContain('www.evtivity.com');
-    expect(text).toContain('Email: anna@fleet.test');
+    expect(text).toContain('anna@fleet.test');
     expect(text).not.toContain('Page 1 of');
     // The letterhead is the only image: no PDF logo.
     expect(pdfImages(pdf)).toEqual([{ width: 1240, height: 1754 }]);
@@ -332,13 +332,13 @@ describe('generateInvoicePdf on a letterhead', () => {
     const detail = memberDetail();
     detail.invoice.billTo = { ...(detail.invoice.billTo as object), employeeNumber: '4711' };
     const pdf = await generateInvoicePdf(detail, { letterhead: letterhead() });
-    expect(pdfText(pdf)).toContain('Employee no.: 4711');
+    expect(pdfText(pdf)).toContain('Employee no.: 4711 · anna@fleet.test');
   });
 
-  it("puts the recipient's email below the title when the window holds the address", async () => {
+  it("puts the recipient's email in small print above the address", async () => {
     const text = pdfText(await generateInvoicePdf(memberDetail(), { letterhead: letterhead() }));
-    expect(text).toContain('Lindenweg 3');
-    expect(text).toContain('Email: anna@fleet.test');
+    expect(text.indexOf('anna@fleet.test')).toBeLessThan(text.indexOf('Lindenweg 3'));
+    expect(text).not.toContain('Email:');
   });
 
   it('prints the total energy of the sessions in the header', async () => {
@@ -346,12 +346,11 @@ describe('generateInvoicePdf on a letterhead', () => {
     expect(text).toContain('Total energy24.00 kWh');
   });
 
-  it('puts the email into the window when there is no address', async () => {
+  it('keeps the email above the name when there is no address', async () => {
     const detail = memberDetail();
     detail.invoice.billTo = { name: 'Anna Berg', email: 'anna@fleet.test' };
     const text = pdfText(await generateInvoicePdf(detail, { letterhead: letterhead() }));
-    expect(text).toContain('anna@fleet.test');
-    expect(text).not.toContain('Email: anna@fleet.test');
+    expect(text.indexOf('anna@fleet.test')).toBeLessThan(text.indexOf('Anna Berg'));
   });
 
   it("heads the later pages with the seller kept on the invoice, e.g. an invoice issuer's", async () => {

@@ -277,12 +277,12 @@ describe('generateInvoicePdf for a member invoice', () => {
     expect(pdfText(await generateInvoicePdf(memberDetail()))).not.toContain('Personalnr.');
   });
 
-  it('prints the driver bill-to, the fleet charged and the lines without driver groups', async () => {
+  it('prints the driver bill-to without the fleet charged and the lines without driver groups', async () => {
     const text = pdfText(await generateInvoicePdf(memberDetail()));
     expect(text).toContain('Anna Berg');
     expect(text).toContain('28195 Bremen');
     expect(text).toContain('anna@fleet.test');
-    expect(text).toContain('Abgerechnet über das Konto von Acme Logistics');
+    expect(text).not.toContain('Abgerechnet über das Konto');
     expect(text).not.toContain('Zwischensumme Anna Berg');
     expect(text).not.toContain('USt-IdNr.');
   });
@@ -293,9 +293,9 @@ describe('generateInvoicePdf for a member invoice', () => {
     expect(text).not.toContain('Bremen');
   });
 
-  it('names the fleet on the credit note of a member invoice', async () => {
+  it('leaves the fleet off the credit note of a member invoice', async () => {
     const text = pdfText(await generateInvoicePdf(memberDetail({ kind: 'credit_note' })));
-    expect(text).toContain('Abgerechnet über das Konto von Acme Logistics');
+    expect(text).not.toContain('Abgerechnet über das Konto');
     expect(text).not.toContain('Zwischensumme Anna Berg');
   });
 
