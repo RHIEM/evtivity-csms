@@ -308,7 +308,7 @@ function formatDate(value: Date | string | null, locale: string): string {
   if (Number.isNaN(date.getTime())) return '—';
   return new Intl.DateTimeFormat(locale, {
     year: 'numeric',
-    month: 'short',
+    month: 'long',
     day: 'numeric',
   }).format(date);
 }
