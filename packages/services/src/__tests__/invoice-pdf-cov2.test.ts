@@ -256,7 +256,7 @@ describe('generateInvoicePdf content', () => {
     // pdfkit writes the em dash as WinAnsi 0x97.
     expect((pdfText(withDates).match(/\u0097/g) ?? []).length).toBeGreaterThanOrEqual(2);
     const normal = await generateInvoicePdf(d);
-    expect(pdfText(normal)).toContain('Jun 4, 2026');
+    expect(pdfText(normal)).toContain('June 4, 2026');
   });
 
   it('breaks long invoices across pages', async () => {

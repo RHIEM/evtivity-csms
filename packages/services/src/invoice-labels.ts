@@ -207,7 +207,7 @@ export const INVOICE_LABELS: Record<InvoiceLanguage, InvoiceLabels> = {
     reason: 'Grund',
     creditNotePaidNote:
       'Die stornierte Rechnung wurde bezahlt. Der Betrag wird gesondert erstattet.',
-    period: 'Zeitraum',
+    period: 'Leistungsdatum',
     totalEnergy: 'Energie gesamt',
     taxId: 'USt-IdNr.: {id}',
     sellerTaxId: 'Steuernummer: {id}',

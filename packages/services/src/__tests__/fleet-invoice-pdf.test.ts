@@ -205,7 +205,7 @@ describe('generateInvoicePdf for a fleet invoice', () => {
 
   it('renders in the language stored on the invoice', async () => {
     const text = pdfText(await generateInvoicePdf(fleetDetail('de')));
-    expect(text).toContain('Zeitraum');
+    expect(text).toContain('Leistungsdatum');
     expect(text).toContain('Zwischensumme Anna Berg');
     expect(text).toContain('USt-IdNr.: DE123456789');
   });
