@@ -38,6 +38,9 @@ describe.each(['csms', 'portal'])('%s security headers', (app) => {
     expect(csp).toMatch(/script-src 'self'[^;]*;/);
     expect(csp).toMatch(/connect-src 'self'[^;]*;/);
     expect(/script-src ([^;]*);/.exec(csp)?.[1]).not.toContain("'unsafe-inline'");
+    // The CSMS shows and prints PDFs (letterhead preview, invoice print) from
+    // blob: URLs in an iframe.
+    if (app === 'csms') expect(/frame-src ([^;]*);/.exec(csp)?.[1]).toContain('blob:');
     expect(snippet).toContain('add_header X-Frame-Options "DENY" always;');
     expect(snippet).toContain('add_header X-Content-Type-Options "nosniff" always;');
     expect(snippet).toContain(
