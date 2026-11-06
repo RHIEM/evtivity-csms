@@ -7,9 +7,11 @@ import { i18nReady } from './i18n/index';
 import './index.css';
 import { App } from './App';
 import { applyTheme, type Theme } from './lib/theme';
+import { installWebAppLinks } from './lib/web-app';
 
 const savedTheme = (localStorage.getItem('portal_theme') as Theme | null) ?? 'light';
 applyTheme(savedTheme);
+installWebAppLinks();
 
 const root = document.getElementById('root');
 if (root == null) {
