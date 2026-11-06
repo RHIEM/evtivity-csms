@@ -1957,6 +1957,7 @@
     "search": "Buscar",
     "driverId": "ID de conductor",
     "driverName": "Nombre del conductor",
+    "fleets": "Flotas",
     "addDriver": "Crear conductor",
     "createDriver": "Crear conductor",
     "searchPlaceholder": "Buscar conductores...",

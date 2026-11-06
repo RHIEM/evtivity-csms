@@ -126,6 +126,7 @@ export function Drivers(): React.JSX.Element {
             timezone={timezone}
             isLoading={isLoading}
             visibility={visibility}
+            showFleets
           />
         </CardContent>
       </Card>
