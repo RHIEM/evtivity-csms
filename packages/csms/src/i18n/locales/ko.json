@@ -1962,6 +1962,7 @@
     "search": "검색",
     "driverId": "운전자 ID",
     "driverName": "운전자 이름",
+    "fleets": "차량대",
     "addDriver": "운전자 생성",
     "createDriver": "운전자 생성",
     "searchPlaceholder": "운전자 검색(이름, 이메일, 전화, 사번)...",

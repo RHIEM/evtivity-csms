@@ -1962,6 +1962,7 @@
     "search": "Suche",
     "driverId": "Fahrer-ID",
     "driverName": "Fahrername",
+    "fleets": "Flotten",
     "addDriver": "Fahrer erstellen",
     "createDriver": "Fahrer erstellen",
     "searchPlaceholder": "Fahrer suchen (Name, E-Mail, Telefon, Personalnummer)...",

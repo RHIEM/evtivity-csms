@@ -34,6 +34,7 @@ export const DRIVERS_COLUMNS: ColumnMeta[] = [
     defaultVisibleMobile: true,
     alwaysVisible: true,
   },
+  { key: 'fleets', label: 'drivers.fleets', defaultVisible: true, defaultVisibleMobile: false },
   { key: 'email', label: 'common.email', defaultVisible: true, defaultVisibleMobile: true },
   { key: 'phone', label: 'drivers.phone', defaultVisible: true, defaultVisibleMobile: false },
   { key: 'status', label: 'common.status', defaultVisible: true, defaultVisibleMobile: true },
@@ -52,6 +53,8 @@ export interface Driver {
   createdAt: string;
   /** The avatar the driver set in the portal or app. */
   avatar?: AvatarData | null;
+  /** The fleets the driver is a member of (the driver list returns them). */
+  fleets?: Array<{ id: string; name: string }>;
 }
 
 /** An extra column a caller adds before the remove button (the fleet member billing switch). */
@@ -74,6 +77,8 @@ interface DriversTableProps {
   removeDisabled?: boolean;
   visibility?: ColumnVisibility;
   extraColumn?: DriversTableExtraColumn;
+  /** Show the fleets column (the driver list); a fleet's member list leaves it out. */
+  showFleets?: boolean;
 }
 
 export function DriversTable({
@@ -87,11 +92,13 @@ export function DriversTable({
   removeDisabled,
   visibility,
   extraColumn,
+  showFleets = false,
 }: DriversTableProps): React.JSX.Element {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const hasRemove = onRemove != null;
-  const isVisible = (key: string): boolean => visibility == null || visibility[key] !== false;
+  const isVisible = (key: string): boolean =>
+    (key !== 'fleets' || showFleets) && (visibility == null || visibility[key] !== false);
   const visibleCount = DRIVERS_COLUMNS.filter((c) => isVisible(c.key)).length;
   const colSpan = visibleCount + (extraColumn != null ? 1 : 0) + (hasRemove ? 1 : 0);
 
@@ -103,6 +110,7 @@ export function DriversTable({
             <TableRow>
               {isVisible('driverId') && <TableHead>{t('drivers.driverId')}</TableHead>}
               {isVisible('driverName') && <TableHead>{t('drivers.driverName')}</TableHead>}
+              {isVisible('fleets') && <TableHead>{t('drivers.fleets')}</TableHead>}
               {isVisible('email') && <TableHead>{t('common.email')}</TableHead>}
               {isVisible('phone') && <TableHead>{t('drivers.phone')}</TableHead>}
               {isVisible('status') && <TableHead>{t('common.status')}</TableHead>}
@@ -148,6 +156,29 @@ export function DriversTable({
                         ? t('drivers.erasedName')
                         : `${driver.firstName} ${driver.lastName}`}
                     </span>
+                  </TableCell>
+                )}
+                {isVisible('fleets') && (
+                  <TableCell>
+                    {driver.fleets != null && driver.fleets.length > 0 ? (
+                      <span className="flex flex-wrap gap-1">
+                        {driver.fleets.map((fleet) => (
+                          <Badge
+                            key={fleet.id}
+                            variant="outline"
+                            className="cursor-pointer"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void navigate(`/fleets/${fleet.id}`);
+                            }}
+                          >
+                            {fleet.name}
+                          </Badge>
+                        ))}
+                      </span>
+                    ) : (
+                      '-'
+                    )}
                   </TableCell>
                 )}
                 {isVisible('email') && <TableCell>{driver.email ?? '-'}</TableCell>}

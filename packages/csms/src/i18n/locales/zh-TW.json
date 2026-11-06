@@ -1962,6 +1962,7 @@
     "search": "搜尋",
     "driverId": "駕駛員 ID",
     "driverName": "駕駛員姓名",
+    "fleets": "車隊",
     "addDriver": "建立駕駛員",
     "createDriver": "建立駕駛員",
     "searchPlaceholder": "搜尋駕駛員（姓名、電子郵件、電話、員工編號）...",

@@ -3,7 +3,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { eq, ne, and, or, ilike, sql, desc, asc } from 'drizzle-orm';
+import { eq, ne, and, or, ilike, inArray, sql, desc, asc } from 'drizzle-orm';
 import {
   db,
   client,
@@ -25,6 +25,8 @@ import {
   sites,
   pricingGroupDrivers,
   pricingGroups,
+  fleets,
+  fleetDrivers,
   reservations,
   writeAudit,
   driverAuditLog,
@@ -127,6 +129,41 @@ const driverItem = z
       .describe('The avatar the driver set in the portal or app. Read-only for operators'),
   })
   .loose();
+
+const driverListItem = driverItem
+  .extend({
+    fleets: z
+      .array(
+        z
+          .object({
+            id: z.string().describe('Fleet identifier'),
+            name: z.string().describe('Fleet name'),
+          })
+          .strict(),
+      )
+      .describe('The fleets the driver is a member of, by name'),
+  })
+  .loose();
+
+/** The fleets of the drivers by driver id, each driver's ordered by fleet name. */
+async function fleetsOfDrivers(
+  driverIds: string[],
+): Promise<Map<string, Array<{ id: string; name: string }>>> {
+  const byDriver = new Map<string, Array<{ id: string; name: string }>>();
+  if (driverIds.length === 0) return byDriver;
+  const rows = await db
+    .select({ driverId: fleetDrivers.driverId, id: fleets.id, name: fleets.name })
+    .from(fleetDrivers)
+    .innerJoin(fleets, eq(fleets.id, fleetDrivers.fleetId))
+    .where(inArray(fleetDrivers.driverId, driverIds))
+    .orderBy(asc(fleets.name), asc(fleets.id));
+  for (const row of rows) {
+    const list = byDriver.get(row.driverId) ?? [];
+    list.push({ id: row.id, name: row.name });
+    byDriver.set(row.driverId, list);
+  }
+  return byDriver;
+}
 
 const portalAccessItem = z
   .object({
@@ -564,7 +601,7 @@ export function driverRoutes(app: FastifyInstance): void {
         operationId: 'listDrivers',
         security: [{ bearerAuth: [] }],
         querystring: zodSchema(driverListQuery),
-        response: { 200: paginatedResponse(driverItem) },
+        response: { 200: paginatedResponse(driverListItem) },
       },
     },
     async (request) => {
@@ -607,8 +644,13 @@ export function driverRoutes(app: FastifyInstance): void {
           .where(where),
       ]);
 
-      return { data, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
-        (typeof data)[number]
+      const fleetsByDriver = await fleetsOfDrivers(data.map((driver) => driver.id));
+      const withFleets = data.map((driver) => ({
+        ...driver,
+        fleets: fleetsByDriver.get(driver.id) ?? [],
+      }));
+      return { data: withFleets, total: countRows[0]?.count ?? 0 } satisfies PaginatedResponse<
+        (typeof withFleets)[number]
       >;
     },
   );
