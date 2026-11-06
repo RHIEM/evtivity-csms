@@ -203,7 +203,10 @@ export function portalWebAppRoutes(app: FastifyInstance): void {
         operationId: 'getPortalAppIcon',
         security: [],
         params: zodSchema(iconParams),
-        response: { 404: errorWith('No company logo', [ERROR_CODES.NOT_FOUND]) },
+        response: {
+          304: zodSchema(z.null().describe('The icon is unchanged (If-None-Match)')),
+          404: errorWith('No company logo', [ERROR_CODES.NOT_FOUND]),
+        },
       },
     },
     async (request, reply) => {
