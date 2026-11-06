@@ -52,7 +52,8 @@ Alle Mails landen in Mailpit, nichts wird tatsächlich versendet.
 Details und Begründung: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategie.md).
 
 - `rhiem/main` ist unser Release-Zweig: ein EVtivity-Release-Tag (derzeit `v0.1.49`, stabiles Release mit Station Data Plans, S3-kompatiblem Speicher und 3D-Standortlayout) plus RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`, `.direnv/` in `.gitignore`). Diese gehen nie in Pull-Requests an EVtivity.
-- Features zweigen deshalb vom **Upstream-Tag** ab, auf dem `rhiem/main` steht – nicht von `rhiem/main`.
+- Features zweigen deshalb vom **Upstream-Tag** ab, auf dem `rhiem/main` steht – nicht von `rhiem/main`. Ausnahme nur mit Begründung, wenn ein Feature auf einem Fork-Feature aufbaut.
+- Was vom Upstream abweicht, warum und mit welchem Upstream-Stand, steht im [Abweichungsregister](docs/rhiem/abweichungen.md). Nach jedem Merge und Upstream-Update nachführen.
 
 | Zweck                                    | Abzweigen von                 | Präfix               |
 | ---------------------------------------- | ----------------------------- | -------------------- |

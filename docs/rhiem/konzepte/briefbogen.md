@@ -238,6 +238,16 @@ Zweig `feature/issuer-letterhead` ab `rhiem/main` `69499436`. Er enthält den Me
   - Die Migrationen liefen an einer lokalen Postgres 17 vom Stand `69499436` aus sauber, ein zweiter Lauf fand nichts mehr.
   - `npm run test:integration` verweist auf ein fehlendes `vitest.integration.ts` und lief nicht.
 
+## Nachtrag 06.11.2026
+
+Nach der Durchsicht der Probe-PDFs, mit `--no-ff` in `rhiem/main` gemergt:
+
+- **CSP `frame-src blob:`** (`80cbc120`): Die Probe-PDF des Briefbogens und die Druckansicht der Rechnung laden das PDF als `blob:`-URL in einen iframe, den `frame-src` blockierte (`ERR_BLOCKED_BY_CSP`). Beide iframes kommen aus Baustein 1, upstream gibt es keinen solchen. Der Fix lag zuerst auf `fix/csp-blob-frame` ab `rhiem/main` und gehört jetzt als `c63d8e57` zu `feature/pdf-letterhead`, damit der Zweig für sich funktioniert. `fix/csp-blob-frame` ist überholt.
+- **Sitzungstabelle auf Ladesitzungsrechnungen** (`d068adc1`, Zweig `feature/invoice-session-table` ab `rhiem/main`): Eine Rechnung nur aus Ladevorgängen listet jede Sitzung mit Beginn, Energie, Energiepreis des Tarifs und Betrag (beides brutto) und einer kleinen Zeile mit Standort, Station und Zeiten. Die Steuerübersicht bleibt netto. Statt der Zählerstände steht ein Hinweis, dass die signierten Messdaten im Kundenportal liegen. Im Kopf entfallen der Status und bei Verrechnung außerhalb das Fälligkeitsdatum, dazu kommt die Gesamtenergie.
+- **Anschriftfeld mit Briefbogen** (`aeda15af`, gleicher Zweig): Personalnummer und E-Mail des Empfängers stehen klein über der Anschrift. Die Zeile mit der belasteten Flotte entfällt auf Mitgliederrechnungen und ihren Gutschriften. Das ändert Annahme 5 (unten).
+- Der Zweig zweigt von `rhiem/main` ab, weil er Messnachweis (`invoice-evidence.ts`), Briefbogen und Personalnummer voraussetzt. Er ist nicht PR-fähig ([ADR 0001](../adr/0001-fork-und-branch-strategie.md)).
+- Ebenfalls auf diesem Zweig entstanden, aber unabhängig: **Flotten je Fahrer in der Fahrerliste** (`f9ce7a1f`). Für einen PR neu aufgebaut als `feature/driver-list-fleets` ab `v0.1.49` (`109dbc3b`, Konflikt nur im Test-Mock wegen der Personalnummer).
+
 ## Offene Punkte
 
 Baustein 2 ist umgesetzt (siehe oben).
@@ -252,5 +262,5 @@ Baustein 2 ist umgesetzt (siehe oben).
 2. Eine Gutschrift nimmt den bei ihrer Ausstellung gültigen Briefbogen, nicht den der Rechnung.
 3. Versionen werden nie gelöscht, auch unbenutzte nicht, außer zusammen mit einem Rechnungssteller, der nie einen Beleg ausgestellt hat. Es sind wenige, und das hält die Regel einfach.
 4. Ein Rechnungssteller kann den Briefbogen des Unternehmens nicht ausdrücklich abschalten (`NULL` = Unternehmen). Bei drei GmbHs mit eigenem Briefbogen reicht das.
-5. Personalnummer und Käufer-USt-ID stehen im Infoblock und nicht im Anschriftfeld.
+5. Personalnummer und Käufer-USt-ID stehen im Infoblock und nicht im Anschriftfeld. Geändert am 06.11.2026: Personalnummer und E-Mail stehen klein über der Anschrift (siehe Nachtrag).
 6. Berichte bekommen keinen Briefbogen.

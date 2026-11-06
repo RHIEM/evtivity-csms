@@ -21,13 +21,14 @@ Grundlage ist [CONTRIBUTING.md](CONTRIBUTING.md). Alle Features werden so umgese
 - TypeScript strict, kein `any` ohne Begründung.
 - Tests für jede Änderung: Unit-Tests für Logik, Integrationstests für API-Routen.
 - Fertig heißt: `npm run typecheck && npm run lint && npm test` grün; bei API-, Datenbank- oder Auth-Änderungen zusätzlich `npm run test:integration` ohne stderr-Ausgabe.
-- Schemaänderungen über Drizzle (`npm run db:generate`) und `npm run check:migrations`.
+- Schemaänderungen: Migration `rhiem_NNNN_name.sql` von Hand anlegen (`db:generate` ist nicht nutzbar, siehe [ADR 0002](docs/rhiem/adr/0002-eigene-datenbankmigrationen.md)), dann `npm run check:migrations`.
 
 ## Git
 
 Strategie: [ADR 0001](docs/rhiem/adr/0001-fork-und-branch-strategie.md).
 
 - `rhiem/main` ist unser Release-Zweig. Features entstehen als `feature/…` bzw. `fix/…` vom Upstream-Tag, auf dem `rhiem/main` steht, und werden mit `--no-ff` in `rhiem/main` gemergt.
+- Nach jedem Merge in `rhiem/main` und jedem Upstream-Update das [Abweichungsregister](docs/rhiem/abweichungen.md) nachführen.
 - RHIEM-eigene Dateien (`CLAUDE.md`, `README.rhiem.md`, `docs/rhiem/`, `shell.nix`, `.envrc`) nur auf `rhiem/main` bzw. `rhiem/…`-Zweigen ändern, nie auf Feature-Zweigen.
 - Conventional Commits (commitlint). Nach freigegebener Umsetzung selbstständig committen und pushen – das Repo aktuell halten.
 - Git-Hooks brauchen `npx`: Befehle ohne aktives direnv mit `nix-shell --run '…'` ausführen.

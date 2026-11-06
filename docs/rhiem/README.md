@@ -7,11 +7,14 @@ Konzepte und Architekturentscheidungen für den RHIEM-Fork. Liegt nur auf `rhiem
 | [adr/](adr/)           | Architekturentscheidungen, fortlaufend nummeriert: `NNNN-kurztitel.md`      |
 | [konzepte/](konzepte/) | Fachliche und technische Konzepte je Feature, z. B. `laden-auf-rechnung.md` |
 
+Den Überblick, was vom EVtivity-Release abweicht und warum, gibt das [Abweichungsregister](abweichungen.md).
+
 ## Ablauf
 
 1. Konzept in `konzepte/` entwerfen (Status **Entwurf**), gemeinsam abstimmen.
 2. Nach Freigabe Status auf **Freigegeben** setzen, dann umsetzen.
 3. Grundsätzliche Entscheidungen, die über ein Feature hinausgehen, zusätzlich als ADR festhalten.
+4. Nach dem Merge in `rhiem/main` das [Abweichungsregister](abweichungen.md) nachführen.
 
 ## Entscheidungen
 
