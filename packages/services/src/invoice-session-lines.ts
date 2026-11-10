@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { client } from '@evtivity/database';
-import { resolveTaxBasis } from '@evtivity/lib';
+import { grossUnitPrice, resolveTaxBasis } from '@evtivity/lib';
 import type { InvoiceDetail } from './invoice.service.js';
 
 /**
@@ -65,7 +65,7 @@ export function grossEnergyPrice(row: {
   if (row.pricePerMinute !== 0 || row.pricePerSession !== 0 || row.idleFeePricePerMinute !== 0) {
     return null;
   }
-  return row.basis === 'gross' ? row.pricePerKwh : row.pricePerKwh * (1 + row.taxRate);
+  return grossUnitPrice(row.pricePerKwh, row.taxRate, row.basis);
 }
 
 /** The sessions of the invoice lines with their station, site and tariff snapshot. */

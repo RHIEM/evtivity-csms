@@ -31,6 +31,7 @@ export const ID_PREFIXES = {
   reservation: 'rsv',
   supportCase: 'cas',
   invoice: 'inv',
+  pdfLetterhead: 'lhd',
   ocpiPartner: 'opr',
   report: 'rpt',
   firmwareCampaign: 'fwc',
@@ -55,6 +56,8 @@ export const ID_PREFIXES = {
   cpPush: 'cpp',
   panel: 'pnl',
   circuit: 'cir',
+  transformer: 'tfm',
+  energyAsset: 'ena',
   maintenanceEvent: 'mne',
   aiConversation: 'aic',
   aiMessage: 'aim',
@@ -66,6 +69,10 @@ export const ID_PREFIXES = {
   sim: 'sim',
   paymentTerminal: 'ptm',
   paymentTerminalTransaction: 'ptx',
+  invoiceIssuer: 'iis',
+  departureSchedule: 'vds',
+  departure: 'vdp',
+  depotSystem: 'dms',
 } as const;
 
 export type EntityType = keyof typeof ID_PREFIXES;

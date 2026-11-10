@@ -450,7 +450,7 @@ export function PdfLetterheadSettings({
             </p>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 items-start">
             {PDF_LETTERHEAD_LAYOUT_KEYS.map((key) => (
               <div key={key} className="space-y-2">
                 <Label htmlFor={`pdf-letterhead-${key}`}>{layoutLabels[key]}</Label>

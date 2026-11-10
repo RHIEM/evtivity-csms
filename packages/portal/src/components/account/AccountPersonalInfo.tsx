@@ -147,7 +147,7 @@ export function AccountPersonalInfo(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">{t('profile.employeeNumberHelp')}</p>
         </div>
       )}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 items-start">
         <div className="space-y-2">
           <label htmlFor="acctFirst" className="block text-sm font-medium leading-6">
             {t('profile.firstName')}

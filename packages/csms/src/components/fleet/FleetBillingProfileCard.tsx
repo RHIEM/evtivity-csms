@@ -357,7 +357,7 @@ export function FleetBillingProfileCard({
         {groupTitle('groupRecipient')}
         <FleetInvoiceRecipientField fleet={fleet} />
         {editing ? (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 items-start">
             {recipient === 'fleet' ? (
               <>
                 {textField('legalName', t('fleets.billingProfile.legalName'), 255)}
@@ -492,7 +492,7 @@ export function FleetBillingProfileCard({
         {groupTitle('groupIssue')}
         {editing ? (
           <form onSubmit={handleSave} noValidate className="space-y-4" id="billing-profile-form">
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 items-start">
               <div className="space-y-2">
                 <Label htmlFor="billing-issuer">{t('fleets.billingProfile.issuer')}</Label>
                 <Select

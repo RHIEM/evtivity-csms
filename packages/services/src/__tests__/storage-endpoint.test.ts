@@ -10,6 +10,8 @@ import { BlockedDestinationError } from '@evtivity/lib';
 import {
   createStorageRequestHandler,
   parseStorageAllowedPrivateHosts,
+  r2EndpointBucket,
+  validateR2Endpoint,
   validateStorageEndpoint,
 } from '../storage/index.js';
 
@@ -93,6 +95,147 @@ describe('validateStorageEndpoint', () => {
         expect(validateStorageEndpoint(`${scheme}://${literal}`, [host]), host).toBeNull();
       }
     }
+  });
+});
+
+describe('validateR2Endpoint', () => {
+  const ACCOUNT = '0123456789abcdef0123456789abcdef';
+  const ORIGIN = `https://${ACCOUNT}.r2.cloudflarestorage.com`;
+
+  it.each([
+    [ORIGIN, ORIGIN],
+    [`${ORIGIN}/`, ORIGIN],
+    [`  https://${ACCOUNT}.R2.CloudflareStorage.com  `, ORIGIN],
+    [
+      `https://${ACCOUNT}.eu.r2.cloudflarestorage.com`,
+      `https://${ACCOUNT}.eu.r2.cloudflarestorage.com`,
+    ],
+    [
+      `https://${ACCOUNT}.fedramp.r2.cloudflarestorage.com`,
+      `https://${ACCOUNT}.fedramp.r2.cloudflarestorage.com`,
+    ],
+    [
+      `https://${ACCOUNT}.us.r2.cloudflarestorage.com`,
+      `https://${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    ],
+    [
+      `https://${ACCOUNT}.us.r2.cloudflarestorage.com/my-bucket`,
+      `https://${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    ],
+    // The S3 API URL Cloudflare shows on a bucket ends in the bucket name.
+    [`${ORIGIN}/my-bucket`, ORIGIN],
+    [`${ORIGIN}/my-bucket/`, ORIGIN],
+    // A trailing dot of the host is dropped, so the stored origin matches the
+    // signed Host and the STORAGE_IMG_SRC origin.
+    [`https://${ACCOUNT}.r2.cloudflarestorage.com.`, ORIGIN],
+    [`https://${ACCOUNT}.r2.cloudflarestorage.com./my-bucket`, ORIGIN],
+    [
+      `https://${ACCOUNT}.eu.r2.cloudflarestorage.com.`,
+      `https://${ACCOUNT}.eu.r2.cloudflarestorage.com`,
+    ],
+  ])('accepts %s', (value, origin) => {
+    expect(validateR2Endpoint(value)).toBe(origin);
+  });
+
+  it.each([
+    undefined,
+    42,
+    '',
+    'not a url',
+    // Not https, a port, or credentials.
+    `http://${ACCOUNT}.r2.cloudflarestorage.com`,
+    `${ORIGIN}:8443`,
+    `https://user:pass@${ACCOUNT}.r2.cloudflarestorage.com`,
+    // A query, a fragment, a deeper path or a bucket name R2 does not allow.
+    `${ORIGIN}/?x=1`,
+    `${ORIGIN}/#x`,
+    `${ORIGIN}/my-bucket/key`,
+    `${ORIGIN}/My_Bucket`,
+    // Not an account's S3 API host: presigned URLs work only there.
+    'https://r2.cloudflarestorage.com',
+    'https://abc.r2.cloudflarestorage.com',
+    `https://${ACCOUNT}0.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.asia.r2.cloudflarestorage.com`,
+    `https://x.${ACCOUNT}.r2.cloudflarestorage.com`,
+    `${ORIGIN}.evil.example`,
+    'https://pub-0123456789abcdef0123456789abcdef.r2.dev',
+    'https://files.example.com',
+    'https://10.0.0.5',
+    'https://169.254.169.254',
+  ])('refuses %s', (value) => {
+    expect(validateR2Endpoint(value)).toBeNull();
+  });
+
+  // Addresses close to an account S3 API host (case 364): a near jurisdiction label,
+  // two jurisdictions, an extra or missing label, a port, an IDN label, a look-alike
+  // registrable domain or a host hidden behind userinfo.
+  it.each([
+    `https://${ACCOUNT}.usa.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us-east.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.eur.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.fed.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.eu.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.eu.us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}..r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us..r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com:443x`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com:8443`,
+    `https://${ACCOUNT}.eu.r2.cloudflarestorage.com:444`,
+    `https://${ACCOUNT}.xn--us-6ka.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.xn--r2-dka.cloudflarestorage.com`,
+    `https://${ACCOUNT}.r2.xn--cloudflarestorage-o0b.com`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com.evil.example`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com.us`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.co`,
+    `https://${ACCOUNT}.us.r2-cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.r2.cloudflare-storage.com`,
+    `https://${ACCOUNT}.us.r3.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.cloudflarestorage.com`,
+    `https://${ACCOUNT}us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT.slice(1)}.us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT.slice(1)}g.us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com@evil.example`,
+    `https://${ACCOUNT}.US.r2.cloudflarestorage.com@evil.example`,
+    `https://evil.example\\@${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    `https://evil.example#@${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    `https://evil.example/${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com%2Fevil.example`,
+    `wss://${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    `//${ACCOUNT}.us.r2.cloudflarestorage.com`,
+    `${ACCOUNT}.us.r2.cloudflarestorage.com`,
+  ])('refuses the look-alike %s', (value) => {
+    expect(validateR2Endpoint(value)).toBeNull();
+  });
+
+  // Spellings a URL parser reads as the same host: accepted and stored in the one
+  // lower-case form, so the stored origin never differs from the signed Host.
+  it.each([
+    `https://${ACCOUNT.toUpperCase()}.US.R2.CLOUDFLARESTORAGE.COM`,
+    `https://${ACCOUNT}.Us.R2.cloudflarestorage.com`,
+    `https://${ACCOUNT}.us.r2.cloudflarestorage.com:443`,
+    `https://${ACCOUNT}.\uff55\uff53.r2.cloudflarestorage.com`,
+    `https://${ACCOUNT}%2Eus.r2.cloudflarestorage.com`,
+  ])('stores %s as the lower-case origin', (value) => {
+    expect(validateR2Endpoint(value)).toBe(`https://${ACCOUNT}.us.r2.cloudflarestorage.com`);
+  });
+});
+
+describe('r2EndpointBucket', () => {
+  const ORIGIN = 'https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com';
+
+  it.each([
+    [`${ORIGIN}/my-bucket`, 'my-bucket'],
+    [`${ORIGIN}/my-bucket/`, 'my-bucket'],
+    [` ${ORIGIN}/my-bucket `, 'my-bucket'],
+    [ORIGIN, null],
+    [`${ORIGIN}/`, null],
+    // Not a valid R2 endpoint: no bucket is read from it.
+    ['https://files.example.com/my-bucket', null],
+    [`${ORIGIN}/my-bucket/key`, null],
+    [undefined, null],
+  ])('reads %s as %s', (value, bucket) => {
+    expect(r2EndpointBucket(value)).toBe(bucket);
   });
 });
 

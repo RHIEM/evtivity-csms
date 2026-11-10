@@ -3,18 +3,14 @@
 
 import type { FastifyRequest } from 'fastify';
 import { db, writeAudit, userAuditLog, driverAuditLog } from '@evtivity/database';
+import {
+  countAuthFailure,
+  type AuthFailureMethod,
+  type AuthFailureReason,
+} from '../plugins/metrics.js';
 
-/** How the account proved its identity. */
-export type AuthMethod =
-  | 'password'
-  | 'mfa'
-  | 'recovery_code'
-  | 'webauthn'
-  | 'passkey'
-  | 'mfa_enrollment'
-  | 'sso'
-  | 'reset_token'
-  | 'verification_token';
+/** How the account proved its identity (the `auth_failures_total` methods but `api_key`). */
+export type AuthMethod = Exclude<AuthFailureMethod, 'api_key'>;
 
 export type AuthAuditAction =
   | 'login_succeeded'
@@ -31,8 +27,8 @@ export interface AuthAuditArgs {
   accountId: string | null;
   action: AuthAuditAction;
   method: AuthMethod;
-  /** Why a login failed (bad_password, inactive, mfa_code_invalid, ...). */
-  reason?: string;
+  /** Why a login failed: one of the fixed reasons of `auth_failures_total`. */
+  reason?: AuthFailureReason;
 }
 
 const USER_AGENT_MAX = 255;
@@ -60,10 +56,18 @@ export function authRequestOrigin(request: FastifyRequest): {
  * by token, email verification) on the user or driver audit log. The request is
  * not authenticated yet, so the actor is the account itself on success and
  * `system` labelled `login` on a failure (the caller has not proved it owns the
- * account). Fail-open like every audit write.
+ * account). Fail-open like every audit write. A failure also counts on
+ * `auth_failures_total`.
  */
 export async function recordAuthAudit(request: FastifyRequest, args: AuthAuditArgs): Promise<void> {
   const failed = args.action === 'login_failed';
+  if (failed) {
+    countAuthFailure(
+      args.kind === 'user' ? 'operator' : 'driver',
+      args.method,
+      args.reason ?? 'unknown',
+    );
+  }
   if (!failed && args.accountId == null) return;
   const actor =
     failed || args.accountId == null

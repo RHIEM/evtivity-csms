@@ -241,7 +241,7 @@ function FormatFields({ kind, values, locked, submitted, onChange }: FormatField
       {locked && (
         <p className="text-xs text-muted-foreground">{t('settings.invoiceIssuers.formatLocked')}</p>
       )}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 items-start">
         <div className="space-y-1">
           <Label htmlFor={id('prefix')}>{t('settings.invoiceIssuers.prefix')}</Label>
           <Input
@@ -747,7 +747,7 @@ export function InvoiceIssuerSettings(): React.JSX.Element {
                 </p>
               )}
             </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 items-start">
               {TEXT_FIELDS.map((field) => (
                 <div key={field.key} className="space-y-1">
                   <Label htmlFor={`issuer-${field.key}`}>{t(field.label)}</Label>

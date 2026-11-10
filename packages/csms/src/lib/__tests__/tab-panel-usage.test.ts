@@ -45,10 +45,13 @@ const NOT_DETAIL_TABS: Record<string, string> = {
   'components/settings/OcppDataPlanSettings.tsx': 'settings sub-tabs',
   'components/settings/ApiKeysSettings.tsx': 'settings sub-tabs',
   'components/settings/AiSettings.tsx': 'settings sub-tabs',
+  'components/settings/StorageSettings.tsx': 'settings sub-tabs',
   'components/reports/NeviComplianceTab.tsx': 'reports page sub-tabs',
   'components/certificates/StationCertificatesTab.tsx': 'certificates page tab',
   'components/certificates/CsrRequestsTab.tsx': 'certificates page tab',
   'components/certificates/CaCertificatesTab.tsx': 'certificates page tab',
+  'components/depot-systems/DepotSystemDetail.tsx':
+    'settings sub view (a depot system in Settings > Integrations)',
   'components/ui/tabs.tsx': 'the tabs primitive itself',
 };
 
