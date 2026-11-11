@@ -23,6 +23,7 @@ import {
   isFleetEnabled,
   isFleetChargingEnabled,
   isGuestChargingEnabled,
+  isPortalRegistrationEnabled,
   isAutochargeOffered,
   clearCompanyPortalUrlCache,
   isChatbotAiEnabled,
@@ -959,6 +960,11 @@ export function settingsRoutes(app: FastifyInstance): void {
                   .describe(
                     'Whether guest charging (pay at the station without an account) is enabled',
                   ),
+                registrationEnabled: z
+                  .boolean()
+                  .describe(
+                    'Whether drivers can create their own portal account (portal.registrationEnabled), so the portal offers sign-up',
+                  ),
                 autochargeEnabled: z
                   .boolean()
                   .describe(
@@ -1043,6 +1049,7 @@ export function settingsRoutes(app: FastifyInstance): void {
       const fleetEnabled = await isFleetEnabled();
       const fleetChargingEnabled = await isFleetChargingEnabled();
       const guestChargingEnabled = await isGuestChargingEnabled();
+      const registrationEnabled = await isPortalRegistrationEnabled();
       const autochargeEnabled = await isAutochargeOffered();
       const chatbotAiEnabled = await isChatbotAiEnabled();
       const aiInsightsEnabled = await isAiInsightsEnabled();
@@ -1064,6 +1071,7 @@ export function settingsRoutes(app: FastifyInstance): void {
         fleetEnabled,
         fleetChargingEnabled,
         guestChargingEnabled,
+        registrationEnabled,
         autochargeEnabled,
         chatbotAiEnabled,
         aiInsightsEnabled,

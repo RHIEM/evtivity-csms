@@ -21,6 +21,7 @@ const { state, rec, mocks } = vi.hoisted(() => ({
     isFleetEnabled: vi.fn(),
     isFleetChargingEnabled: vi.fn(),
     isGuestChargingEnabled: vi.fn(),
+    isPortalRegistrationEnabled: vi.fn(),
     isChatbotAiEnabled: vi.fn(),
     isAiInsightsEnabled: vi.fn(),
     clearRoamingCache: vi.fn(),
@@ -94,6 +95,7 @@ vi.mock('@evtivity/database', () => ({
   isFleetEnabled: mocks.isFleetEnabled,
   isFleetChargingEnabled: mocks.isFleetChargingEnabled,
   isGuestChargingEnabled: mocks.isGuestChargingEnabled,
+  isPortalRegistrationEnabled: mocks.isPortalRegistrationEnabled,
   isChatbotAiEnabled: mocks.isChatbotAiEnabled,
   isAiInsightsEnabled: mocks.isAiInsightsEnabled,
   clearRoamingCache: mocks.clearRoamingCache,
@@ -294,6 +296,7 @@ describe('settings routes (cov2)', () => {
     mocks.isFleetEnabled.mockResolvedValue(true);
     mocks.isFleetChargingEnabled.mockResolvedValue(true);
     mocks.isGuestChargingEnabled.mockResolvedValue(false);
+    mocks.isPortalRegistrationEnabled.mockResolvedValue(true);
     mocks.isChatbotAiEnabled.mockResolvedValue(true);
     mocks.isAiInsightsEnabled.mockResolvedValue(false);
     mocks.getReservationSettings.mockResolvedValue({
@@ -311,6 +314,7 @@ describe('settings routes (cov2)', () => {
       fleetEnabled: true,
       fleetChargingEnabled: true,
       guestChargingEnabled: false,
+      registrationEnabled: true,
       autochargeEnabled: false,
       chatbotAiEnabled: true,
       aiInsightsEnabled: false,
@@ -335,6 +339,7 @@ describe('settings routes (cov2)', () => {
       mocks.isFleetEnabled,
       mocks.isFleetChargingEnabled,
       mocks.isGuestChargingEnabled,
+      mocks.isPortalRegistrationEnabled,
       mocks.isChatbotAiEnabled,
       mocks.isAiInsightsEnabled,
     ]) {
@@ -363,6 +368,7 @@ describe('settings routes (cov2)', () => {
       mocks.isFleetEnabled,
       mocks.isFleetChargingEnabled,
       mocks.isGuestChargingEnabled,
+      mocks.isPortalRegistrationEnabled,
       mocks.isChatbotAiEnabled,
       mocks.isAiInsightsEnabled,
     ]) {
@@ -379,6 +385,8 @@ describe('settings routes (cov2)', () => {
       return res.json();
     };
     const off = await keys();
+    // A closed portal reports sign-up off, so the portal hides it.
+    expect(off['registrationEnabled']).toBe(false);
     expect(off).not.toHaveProperty('simEnabled');
     expect(off).not.toHaveProperty('simStationSignalEnabled');
     mocks.readSimSettings.mockResolvedValue(simSettings(true, false));
