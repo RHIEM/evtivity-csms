@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router';
+import { Link, Navigate, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,6 +13,7 @@ import { useAuth } from '@/lib/auth';
 import { getErrorMessage } from '@/lib/error-message';
 import { getApiErrorCode } from '@/lib/api';
 import { useRecaptchaToken } from '@/hooks/use-recaptcha-token';
+import { useRegistrationEnabled } from '@/hooks/use-registration-enabled';
 import { ButtonPendingLabel } from '@/components/ButtonPendingLabel';
 import { passwordRulesMessage } from '@/lib/password-rules';
 import { usePasswordPolicy, useWeakPasswordReply } from '@/hooks/use-password-policy';
@@ -43,6 +44,7 @@ export function Register(): React.JSX.Element {
 
   const { configPending: recaptchaConfigPending, getToken: getRecaptchaToken } =
     useRecaptchaToken();
+  const registrationEnabled = useRegistrationEnabled();
 
   function getValidationErrors(): Record<string, string> {
     const errors: Record<string, string> = {};
@@ -92,6 +94,11 @@ export function Register(): React.JSX.Element {
     } finally {
       setLoading(false);
     }
+  }
+
+  // A closed portal sends a direct visit back to sign-in instead of a form the API refuses.
+  if (registrationEnabled === false) {
+    return <Navigate to="/login" replace />;
   }
 
   if (submittedEmail != null) {
