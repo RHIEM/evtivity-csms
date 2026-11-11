@@ -103,7 +103,7 @@ describe('NewSupportCase driver AI consent', () => {
       expect(screen.getByText(`${NOTICE}.reads.${item}`)).toBeTruthy();
     }
     const privacy = screen.getByRole('link', { name: `${NOTICE}.privacy` });
-    expect(privacy.getAttribute('href')).toBe('/privacy-policy');
+    expect(privacy.getAttribute('href')).toBe('https://www.rhiem.com/de/datenschutz/');
   });
 
   it('TC-AI-AD-13: the consent notice shows the driver AI data note, not the operator one', async () => {

@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { LanguageSelect } from '@/components/ui/language-select';
 import { tryParseJson } from '@evtivity/lib/safe-json';
 import { api } from '@/lib/api';
+import { legalLinks } from '@/lib/legal-links';
 import { APP_VERSION } from '@/lib/version';
 
 interface Branding {
@@ -173,7 +174,8 @@ export function AuthFooter({
   branding?: Branding | undefined;
   recaptchaEnabled?: boolean | undefined;
 }): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const links = legalLinks(i18n.language);
   const year = new Date().getFullYear();
   const name = companyName ?? 'EVtivity';
 
@@ -199,13 +201,23 @@ export function AuthFooter({
       )}
       <div className="space-y-1">
         <p>
-          <Link to="/privacy-policy" className="hover:underline">
+          <a
+            href={links.privacy}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:underline"
+          >
             {t('authFooter.privacyPolicy')}
-          </Link>
+          </a>
           {' | '}
-          <Link to="/terms-of-service" className="hover:underline">
-            {t('authFooter.termsOfService')}
-          </Link>
+          <a
+            href={links.imprint}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:underline"
+          >
+            {t('authFooter.imprint')}
+          </a>
         </p>
         <p>{t('authFooter.allRightsReserved', { year: String(year), name })}</p>
         <p>v{APP_VERSION}</p>

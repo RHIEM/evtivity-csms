@@ -1315,6 +1315,7 @@
   "authFooter": {
     "privacyPolicy": "개인정보처리방침",
     "termsOfService": "이용약관",
+    "imprint": "법적 고지",
     "allRightsReserved": "{{year}} {{name}}. 모든 권리 보유.",
     "recaptchaProtected": "reCAPTCHA로 보호됩니다.",
     "recaptchaPrivacy": "개인정보",

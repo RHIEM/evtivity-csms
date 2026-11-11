@@ -1315,6 +1315,7 @@
   "authFooter": {
     "privacyPolicy": "隐私政策",
     "termsOfService": "服务条款",
+    "imprint": "法律声明",
     "allRightsReserved": "{{year}} {{name}} 版权所有",
     "recaptchaProtected": "受 reCAPTCHA 保护。",
     "recaptchaPrivacy": "隐私",
