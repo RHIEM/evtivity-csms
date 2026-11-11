@@ -1316,6 +1316,7 @@
   "authFooter": {
     "privacyPolicy": "Datenschutzerklärung",
     "termsOfService": "Nutzungsbedingungen",
+    "imprint": "Impressum",
     "allRightsReserved": "Alle Rechte vorbehalten, {{year}} {{name}}",
     "recaptchaProtected": "Geschützt durch reCAPTCHA.",
     "recaptchaPrivacy": "Datenschutz",

@@ -1,12 +1,12 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Bot, Users } from 'lucide-react';
 import type { DriverAiConsentDecision } from '@evtivity/lib/driver-ai';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { legalLinks } from '@/lib/legal-links';
 
 const NOTICE_POINTS = ['automated', 'provider', 'person', 'choice'] as const;
 const READS = ['case', 'sessions', 'tokens', 'payments', 'stations', 'reservations'] as const;
@@ -25,7 +25,7 @@ interface AiConsentStepProps {
  * remembered; the parent sends `aiConsent` only after a press.
  */
 export function AiConsentStep({ noticeVersion, onChoose }: AiConsentStepProps): React.JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const notice = `supportCases.ai.notice.v${String(noticeVersion)}`;
 
   return (
@@ -57,12 +57,14 @@ export function AiConsentStep({ noticeVersion, onChoose }: AiConsentStepProps): 
             <p className="text-muted-foreground">{t('supportCases.ai.dataNotice.body')}</p>
           </div>
 
-          <Link
-            to="/privacy-policy"
+          <a
+            href={legalLinks(i18n.language).privacy}
+            target="_blank"
+            rel="noopener noreferrer"
             className="inline-block text-link underline-offset-4 hover:underline"
           >
             {t(`${notice}.privacy`)}
-          </Link>
+          </a>
         </CardContent>
       </Card>
 
