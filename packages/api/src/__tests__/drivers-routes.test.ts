@@ -81,7 +81,7 @@ vi.mock('@evtivity/database', () => ({
     }),
   },
   client: {},
-  drivers: { employeeNumber: 'drivers.employee_number' },
+  drivers: { employeeNumber: 'drivers.employee_number', debtorNumber: 'drivers.debtor_number' },
   fleets: {},
   fleetDrivers: {},
   driverTokens: {},
@@ -450,6 +450,19 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(200);
       expect(vi.mocked(ilike)).toHaveBeenCalledWith('drivers.employee_number', '%4711%');
+    });
+
+    it('also finds drivers by their debtor number', async () => {
+      setupDbResults([makeDriver()], [{ count: 1 }]);
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/drivers?search=10001',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(vi.mocked(ilike)).toHaveBeenCalledWith('drivers.debtor_number', '%10001%');
     });
 
     it('returns total 0 when count row is missing', async () => {
@@ -841,6 +854,37 @@ describe('Driver routes (operator)', () => {
       expect(lastWrite('insert')).toMatchObject({ employeeNumber: null });
     });
 
+    it('stores the debtor number trimmed and a blank one as null', async () => {
+      setupDbResults([], [makeDriver({ debtorNumber: '10001' })]);
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', debtorNumber: ' 10001 ' },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(lastWrite('insert')).toMatchObject({ debtorNumber: '10001' });
+
+      setupDbResults([], [makeDriver()]);
+      await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', debtorNumber: '  ' },
+      });
+      expect(lastWrite('insert')).toMatchObject({ debtorNumber: null });
+    });
+
+    it('refuses a debtor number over 20 characters', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', debtorNumber: '1'.repeat(21) },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
     it('refuses an employee number over 50 characters', async () => {
       const res = await app.inject({
         method: 'POST',
@@ -992,6 +1036,37 @@ describe('Driver routes (operator)', () => {
         payload: { employeeNumber: null },
       });
       expect(lastWrite('update')).toMatchObject({ employeeNumber: null });
+    });
+
+    it('sets, keeps and removes the debtor number', async () => {
+      setupDbResults([makeDriver()], [makeDriver({ debtorNumber: '10001' })]);
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { debtorNumber: ' 10001 ' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().debtorNumber).toBe('10001');
+      expect(lastWrite('update')).toMatchObject({ debtorNumber: '10001' });
+
+      setupDbResults([makeDriver({ debtorNumber: '10001' })], [makeDriver()]);
+      await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'Jane' },
+      });
+      expect(lastWrite('update')).not.toHaveProperty('debtorNumber');
+
+      setupDbResults([makeDriver({ debtorNumber: '10001' })], [makeDriver()]);
+      await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { debtorNumber: null },
+      });
+      expect(lastWrite('update')).toMatchObject({ debtorNumber: null });
     });
 
     it('returns 200 with all fields updated', async () => {

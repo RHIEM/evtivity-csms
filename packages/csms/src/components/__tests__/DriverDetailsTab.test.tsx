@@ -29,6 +29,7 @@ function renderTab(
   language = 'de',
   distanceUnit = 'miles',
   employeeNumber: string | null = null,
+  debtorNumber: string | null = null,
 ): void {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -45,6 +46,7 @@ function renderTab(
           timezone: 'Europe/Berlin',
           isActive: true,
           employeeNumber,
+          debtorNumber,
           createdAt: '2026-10-01T00:00:00Z',
           updatedAt: '2026-10-01T00:00:00Z',
         }}
@@ -115,6 +117,41 @@ describe('DriverDetailsTab', () => {
       expect(patchMock).toHaveBeenCalledWith(
         '/v1/drivers/drv_1',
         expect.objectContaining({ employeeNumber: '0815' }),
+      );
+    });
+  });
+
+  it('shows the debtor number and removes it when the field is emptied', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('de', 'miles', null, '10001');
+    expect(screen.getByTestId('driver-debtor-number').textContent).toBe('10001');
+
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const input = screen.getByLabelText<HTMLInputElement>('drivers.debtorNumber');
+    expect(input.value).toBe('10001');
+    fireEvent.change(input, { target: { value: ' ' } });
+    fireEvent.submit(input.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ debtorNumber: null }),
+      );
+    });
+  });
+
+  it('sends a new debtor number trimmed', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('de');
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const input = screen.getByLabelText<HTMLInputElement>('drivers.debtorNumber');
+    fireEvent.change(input, { target: { value: ' 10002 ' } });
+    fireEvent.submit(input.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ debtorNumber: '10002' }),
       );
     });
   });

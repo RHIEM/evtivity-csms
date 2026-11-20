@@ -2031,6 +2031,8 @@
     "phone": "電話",
     "employeeNumber": "員工編號",
     "employeeNumberHelp": "選填。顯示在駕駛員的發票和貸項通知單上。駕駛員可在入口網站中查看，但無法變更。",
+    "debtorNumber": "債務人編號",
+    "debtorNumberHelp": "選填。由財務部門指派的會計參考編號，用於 Sage 匯出。不會列印在發票上，司機也看不到。",
     "language": "語言",
     "languageHelp": "用於駕駛員入口網站、通知和發票。",
     "activeHelp": "停用駕駛員也會停用其權杖，並將其從駕駛員入口網站登出。重新啟用駕駛員不會重新啟用權杖。",

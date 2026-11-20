@@ -2031,6 +2031,8 @@
     "phone": "电话",
     "employeeNumber": "员工编号",
     "employeeNumberHelp": "可选。显示在驾驶员的发票和贷项通知单上。驾驶员可在门户中查看，但不能更改。",
+    "debtorNumber": "债务人编号",
+    "debtorNumberHelp": "可选。由财务部门分配的会计参考编号，用于 Sage 导出。不会打印在发票上，司机也看不到。",
     "language": "语言",
     "languageHelp": "用于驾驶员门户、通知和发票。",
     "activeHelp": "停用驾驶员也会停用其令牌，并将其从驾驶员门户注销。重新启用驾驶员不会重新启用令牌。",

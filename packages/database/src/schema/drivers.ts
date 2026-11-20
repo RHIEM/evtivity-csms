@@ -93,6 +93,10 @@ export const drivers = pgTable(
     // on the driver's invoices and credit notes when set; the driver sees it
     // read-only. Not unique.
     employeeNumber: varchar('employee_number', { length: 50 }),
+    // The accounting reference (Debitorennummer) the finance department assigns.
+    // Used in the Sage export; not printed on invoices and not shown to the
+    // driver. Not unique.
+    debtorNumber: varchar('debtor_number', { length: 20 }),
     // When the driver's personal data was erased (POST /v1/drivers/:id/erase).
     // The row stays as an anonymized stub for the sessions and invoices.
     erasedAt: timestamp('erased_at', { withTimezone: true }),

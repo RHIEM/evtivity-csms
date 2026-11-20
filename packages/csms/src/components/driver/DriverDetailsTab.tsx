@@ -42,6 +42,8 @@ interface Driver {
   isActive: boolean;
   /** The operator's reference, e.g. a personnel number; printed on invoices. */
   employeeNumber?: string | null;
+  /** The accounting reference (Debitorennummer), used in the Sage export. */
+  debtorNumber?: string | null;
   erasedAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -68,6 +70,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [employeeNumber, setEmployeeNumber] = useState('');
+  const [debtorNumber, setDebtorNumber] = useState('');
   const [language, setLanguage] = useState('en');
   const [distanceUnit, setDistanceUnit] = useState('miles');
   const [driverTimezone, setDriverTimezone] = useState('America/New_York');
@@ -81,6 +84,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       email?: string | null;
       phone?: string | null;
       employeeNumber?: string | null;
+      debtorNumber?: string | null;
       language?: string;
       distanceUnit?: string;
       timezone?: string;
@@ -103,6 +107,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setEmail(driver.email ?? '');
     setPhone(driver.phone ?? '');
     setEmployeeNumber(driver.employeeNumber ?? '');
+    setDebtorNumber(driver.debtorNumber ?? '');
     setLanguage(driver.language);
     setDistanceUnit(driver.distanceUnit ?? 'miles');
     setDriverTimezone(driver.timezone ?? 'America/New_York');
@@ -146,6 +151,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     const trimmedEmail = email.trim();
     const trimmedPhone = phone.trim();
     const trimmedEmployeeNumber = employeeNumber.trim();
+    const trimmedDebtorNumber = debtorNumber.trim();
     updateMutation.mutate({
       firstName,
       lastName,
@@ -164,6 +170,11 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
         ? { employeeNumber: trimmedEmployeeNumber }
         : driver.employeeNumber != null
           ? { employeeNumber: null }
+          : {}),
+      ...(trimmedDebtorNumber !== ''
+        ? { debtorNumber: trimmedDebtorNumber }
+        : driver.debtorNumber != null
+          ? { debtorNumber: null }
           : {}),
       language,
       distanceUnit,
@@ -271,6 +282,20 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               <p className="text-sm text-muted-foreground">{t('drivers.employeeNumberHelp')}</p>
             </div>
             <div className="space-y-2">
+              <Label htmlFor="edit-debtor-number" className="leading-6">
+                {t('drivers.debtorNumber')}
+              </Label>
+              <Input
+                id="edit-debtor-number"
+                value={debtorNumber}
+                maxLength={20}
+                onChange={(e) => {
+                  setDebtorNumber(e.target.value);
+                }}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.debtorNumberHelp')}</p>
+            </div>
+            <div className="space-y-2">
               <Label htmlFor="edit-language" className="leading-6">
                 {t('drivers.language')}
               </Label>
@@ -347,6 +372,12 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               <dt className="text-muted-foreground">{t('drivers.employeeNumber')}</dt>
               <dd className="font-medium" data-testid="driver-employee-number">
                 {driver.employeeNumber ?? t('common.na')}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t('drivers.debtorNumber')}</dt>
+              <dd className="font-medium" data-testid="driver-debtor-number">
+                {driver.debtorNumber ?? t('common.na')}
               </dd>
             </div>
             <div>

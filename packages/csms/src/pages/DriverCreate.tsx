@@ -35,6 +35,7 @@ interface CreateDriverBody {
   email?: string;
   phone?: string;
   employeeNumber?: string;
+  debtorNumber?: string;
   language: string;
   timezone: string;
   distanceUnit: string;
@@ -57,6 +58,7 @@ export function DriverCreate(): React.JSX.Element {
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [employeeNumber, setEmployeeNumber] = useState('');
+  const [debtorNumber, setDebtorNumber] = useState('');
   // Null: the company default (below) until the user picks a value.
   const [languagePick, setLanguage] = useState<string | null>(null);
   const [timezonePick, setTimezone] = useState<string | null>(null);
@@ -122,6 +124,7 @@ export function DriverCreate(): React.JSX.Element {
     if (email.trim() !== '') body.email = email;
     if (phone.trim() !== '') body.phone = phone;
     if (employeeNumber.trim() !== '') body.employeeNumber = employeeNumber.trim();
+    if (debtorNumber.trim() !== '') body.debtorNumber = debtorNumber.trim();
     createMutation.mutate(body);
   }
 
@@ -219,6 +222,20 @@ export function DriverCreate(): React.JSX.Element {
                 }}
               />
               <p className="text-sm text-muted-foreground">{t('drivers.employeeNumberHelp')}</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="driver-debtor-number" className="leading-6">
+                {t('drivers.debtorNumber')}
+              </Label>
+              <Input
+                id="driver-debtor-number"
+                value={debtorNumber}
+                maxLength={20}
+                onChange={(e) => {
+                  setDebtorNumber(e.target.value);
+                }}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.debtorNumberHelp')}</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="driver-language" className="leading-6">

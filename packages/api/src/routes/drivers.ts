@@ -129,6 +129,13 @@ const driverItem = z
       .describe(
         "The operator's reference for the driver, e.g. a personnel number; printed on the driver's invoices and credit notes when set",
       ),
+    debtorNumber: z
+      .string()
+      .nullable()
+      .optional()
+      .describe(
+        'The accounting reference (Debitorennummer) the finance department assigns; used in the Sage export, not printed on invoices and not shown to the driver',
+      ),
     erasedAt: z.coerce
       .date()
       .nullable()
@@ -379,6 +386,22 @@ function employeeNumberToStore(value: string | null | undefined): string | null 
   return trimmed === '' ? null : trimmed;
 }
 
+const debtorNumberField = z
+  .string()
+  .max(20)
+  .nullable()
+  .optional()
+  .describe(
+    'The accounting reference (Debitorennummer) the finance department assigns (not unique); used in the Sage export, not printed on invoices and not shown to the driver. Null or a blank string removes it',
+  );
+
+/** The debtor number as stored: trimmed, blank as null; undefined keeps it. */
+function debtorNumberToStore(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value?.trim() ?? '';
+  return trimmed === '' ? null : trimmed;
+}
+
 const driverDistanceUnit = z
   .enum(DISTANCE_UNITS)
   .describe('Preferred distance unit of the portal and app (miles or km)');
@@ -400,6 +423,7 @@ const createDriverBody = z.object({
     .optional()
     .describe('Preferred distance unit. Unset: the system.distanceUnit setting (default miles)'),
   employeeNumber: employeeNumberField,
+  debtorNumber: debtorNumberField,
 });
 
 const updateDriverBody = z.object({
@@ -430,6 +454,7 @@ const updateDriverBody = z.object({
     ),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
   employeeNumber: employeeNumberField,
+  debtorNumber: debtorNumberField,
   distanceUnit: driverDistanceUnit.optional(),
 });
 
@@ -607,6 +632,7 @@ const driverSafeSelect = {
   mfaMethod: drivers.mfaMethod,
   isActive: drivers.isActive,
   employeeNumber: drivers.employeeNumber,
+  debtorNumber: drivers.debtorNumber,
   emailVerified: drivers.emailVerified,
   lastNotificationReadAt: drivers.lastNotificationReadAt,
   erasedAt: drivers.erasedAt,
@@ -626,6 +652,7 @@ const DRIVER_AUDIT_KEYS = [
   'isActive',
   'emailVerified',
   'employeeNumber',
+  'debtorNumber',
 ] as const;
 
 function pickPublic(row: Record<string, unknown>): Record<string, unknown> {
@@ -662,6 +689,7 @@ export function driverRoutes(app: FastifyInstance): void {
             ilike(drivers.email, pattern),
             ilike(drivers.phone, pattern),
             ilike(drivers.employeeNumber, pattern),
+            ilike(drivers.debtorNumber, pattern),
           ),
         );
       }
@@ -895,6 +923,7 @@ export function driverRoutes(app: FastifyInstance): void {
       const createPhone = phoneToStore(createPhoneIn);
       if (createPhone !== undefined) body.phone = createPhone ?? undefined;
       body.employeeNumber = employeeNumberToStore(body.employeeNumber);
+      body.debtorNumber = debtorNumberToStore(body.debtorNumber);
 
       if (body.email !== undefined) {
         body.email = body.email.toLowerCase();
@@ -1043,6 +1072,8 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
       const employeeNumber = employeeNumberToStore(body.employeeNumber);
       if (employeeNumber !== undefined) fields['employeeNumber'] = employeeNumber;
+      const debtorNumber = debtorNumberToStore(body.debtorNumber);
+      if (debtorNumber !== undefined) fields['debtorNumber'] = debtorNumber;
       if (body.distanceUnit !== undefined) fields['distanceUnit'] = body.distanceUnit;
 
       let updated;
