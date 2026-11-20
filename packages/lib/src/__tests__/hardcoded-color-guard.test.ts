@@ -52,6 +52,14 @@ const ALLOWED: Record<string, { max: number; reason: string }> = {
     max: 1,
     reason: 'the PDF logo preview sits on white like the printed invoice',
   },
+  'csms/src/components/settings/PdfLetterheadSettings.tsx': {
+    max: 1,
+    reason: 'the letterhead preview sits on white like the printed invoice',
+  },
+  'csms/src/components/settings/InvoiceIssuerSettings.tsx': {
+    max: 1,
+    reason: 'the issuer logo preview sits on white like the printed invoice',
+  },
   'csms/src/components/layout/SiteLayout3D.tsx': {
     max: 3,
     reason: 'the overhead badges are an opaque white disc in every theme (site layout standards)',

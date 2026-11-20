@@ -936,6 +936,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'de',
           timezone: null,
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'km',
           priceDisplay: null,
           isActive: true,
