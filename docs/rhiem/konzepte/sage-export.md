@@ -2,7 +2,7 @@
 
 - **Status:** Freigegeben am 20.11.2026 (Nutzer): Variante B für den Portal-Titel, Abbruch bei fehlender Debitorennummer, Bericht zunächst händisch. Antworten der FIBU (Philipp Krischke, Teams-Abfrage vom 20.11.2026) stehen noch aus; alle davon abhängigen Werte sind Einstellungen, kein Code.
 - **Anlass:** Termin vom 20.11.2026 (siehe `evtivity-prod/Entscheidungen.md`): Rechnungen erstellt und versendet EVtivity am 1. des Monats, die FIBU liest die Rechnungsdaten per Datei in Sage ein; Zahlung per Lastschrift; Debitorennummer je Fahrer.
-- **Basis:** `rhiem/main` (enthält `v0.1.51`). Features entstehen als `feature/…` vom Tag `v0.1.51`.
+- **Basis:** `rhiem/main` (enthält `v0.1.51`). Die Zweige entstehen ausnahmsweise auf Basis von `rhiem/main` (siehe Abschnitt Zweige).
 - **Vorbild für das Format:** RAB-Datei des ERPHelper (`erp-helper/go/internal/entity/rab.go`, `controller/sage_importer.go`).
 
 Das Konzept hat drei Bausteine, einzeln umsetz- und prüfbar.
@@ -85,4 +85,4 @@ Offen, nach Antwort der FIBU: Eindeutigkeit der Debitorennummer erzwingen oder n
 
 ## Zweige
 
-Die Bausteine hängen am Code der Personalnummer und der Unternehmenseinstellungen von und sind RHIEM-spezifisch; sie entstehen deshalb ausnahmsweise als auf Basis von und nicht vom Tag: , , .
+Die Bausteine hängen am Code der Personalnummer und der Unternehmenseinstellungen von `rhiem/main` und sind RHIEM-spezifisch; sie entstehen deshalb ausnahmsweise als `feature/…` auf Basis von `rhiem/main` und nicht vom Tag: `feature/driver-debtor-number`, `feature/sage-rab-report`, `feature/portal-title`.
