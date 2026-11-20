@@ -2031,6 +2031,8 @@
     "phone": "Phone",
     "employeeNumber": "Employee Number",
     "employeeNumberHelp": "Optional. Printed on the driver's invoices and credit notes. The driver sees it in the portal but cannot change it.",
+    "debtorNumber": "Debtor Number",
+    "debtorNumberHelp": "Optional. The accounting reference the finance department assigns; used in the Sage export. Not printed on invoices and not shown to the driver.",
     "language": "Language",
     "languageHelp": "Used for the driver portal, notifications, and invoices.",
     "activeHelp": "Making a driver inactive also deactivates their tokens and signs them out of the driver portal. Making the driver active again does not reactivate the tokens.",

@@ -2031,6 +2031,8 @@
     "phone": "Teléfono",
     "employeeNumber": "Número de empleado",
     "employeeNumberHelp": "Opcional. Aparece en las facturas y notas de crédito del conductor. El conductor lo ve en el portal, pero no puede cambiarlo.",
+    "debtorNumber": "Número de deudor",
+    "debtorNumberHelp": "Opcional. La referencia contable que asigna el departamento de finanzas; se usa en la exportación a Sage. No aparece en las facturas ni lo ve el conductor.",
     "language": "Idioma",
     "languageHelp": "Se usa en el portal del conductor, las notificaciones y las facturas.",
     "activeHelp": "Al marcar un conductor como inactivo también se desactivan sus tokens y se cierra su sesión en el portal del conductor. Al volver a activarlo, los tokens siguen desactivados.",

@@ -4399,7 +4399,15 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     pathTemplate: '/v1/drivers',
     pathParams: [],
     queryParams: [],
-    bodyParams: ['firstName', 'lastName', 'language', 'timezone', 'distanceUnit', 'employeeNumber'],
+    bodyParams: [
+      'firstName',
+      'lastName',
+      'language',
+      'timezone',
+      'distanceUnit',
+      'employeeNumber',
+      'debtorNumber',
+    ],
     parameters: {
       type: 'object',
       properties: {
@@ -4426,8 +4434,21 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
             "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
           type: ['string', 'null'],
         },
+        debtorNumber: {
+          description:
+            'The accounting reference (Debitorennummer) the finance department assigns (not unique); used in the Sage export, not printed on invoices and not shown to the driver. Null or a blank string removes it',
+          type: ['string', 'null'],
+        },
       },
-      required: ['firstName', 'lastName', 'language', 'timezone', 'distanceUnit', 'employeeNumber'],
+      required: [
+        'firstName',
+        'lastName',
+        'language',
+        'timezone',
+        'distanceUnit',
+        'employeeNumber',
+        'debtorNumber',
+      ],
       additionalProperties: false,
     },
     strict: true,
@@ -4460,12 +4481,20 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           type: 'string',
           maxLength: 50,
         },
+        debtorNumber: {
+          description:
+            'The accounting reference (Debitorennummer) the finance department assigns (not unique); used in the Sage export, not printed on invoices and not shown to the driver. Null or a blank string removes it',
+          nullable: true,
+          type: 'string',
+          maxLength: 20,
+        },
       },
       required: ['firstName', 'lastName'],
       additionalProperties: false,
     },
     responseFields: [
       'createdAt',
+      'debtorNumber',
       'distanceUnit',
       'email',
       'employeeNumber',
@@ -8346,6 +8375,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     },
     responseFields: [
       'createdAt',
+      'debtorNumber',
       'distanceUnit',
       'email',
       'employeeNumber',
@@ -13841,6 +13871,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     },
     responseFields: [
       'createdAt',
+      'debtorNumber',
       'distanceUnit',
       'email',
       'employeeNumber',
@@ -29702,6 +29733,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
       'isActive',
       'timezone',
       'employeeNumber',
+      'debtorNumber',
       'distanceUnit',
     ],
     parameters: {
@@ -29729,6 +29761,11 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
             "The operator's reference for the driver, e.g. a personnel number (not unique); printed on the driver's invoices and credit notes. Null or a blank string removes it",
           type: ['string', 'null'],
         },
+        debtorNumber: {
+          description:
+            'The accounting reference (Debitorennummer) the finance department assigns (not unique); used in the Sage export, not printed on invoices and not shown to the driver. Null or a blank string removes it',
+          type: ['string', 'null'],
+        },
         distanceUnit: {
           type: ['string', 'null'],
           enum: ['miles', 'km', null],
@@ -29743,6 +29780,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
         'isActive',
         'timezone',
         'employeeNumber',
+        'debtorNumber',
         'distanceUnit',
       ],
       additionalProperties: false,
@@ -29776,6 +29814,13 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
           type: 'string',
           maxLength: 50,
         },
+        debtorNumber: {
+          description:
+            'The accounting reference (Debitorennummer) the finance department assigns (not unique); used in the Sage export, not printed on invoices and not shown to the driver. Null or a blank string removes it',
+          nullable: true,
+          type: 'string',
+          maxLength: 20,
+        },
         distanceUnit: {
           type: 'string',
           enum: ['miles', 'km'],
@@ -29787,6 +29832,7 @@ export const AI_TOOL_CATALOG: readonly AiCatalogTool[] = [
     },
     responseFields: [
       'createdAt',
+      'debtorNumber',
       'distanceUnit',
       'email',
       'employeeNumber',

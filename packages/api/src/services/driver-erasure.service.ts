@@ -115,6 +115,7 @@ export async function eraseDriver(
         lastNotificationReadAt: null,
         billingName: null,
         employeeNumber: null,
+        debtorNumber: null,
         billingStreet: null,
         billingCity: null,
         billingState: null,
