@@ -6,7 +6,7 @@ Register aller Stellen, an denen `rhiem/main` vom EVtivity-Release abweicht: was
 
 ## Stand
 
-- **Stand:** 20.11.2026, Zweig `update/v0.1.51` mit Merge von Tag **`v0.1.51`** (noch nicht in `rhiem/main`, nicht deployt)
+- **Stand:** 20.11.2026, `rhiem/main` mit Merge von Tag **`v0.1.51`** (`e52973e1`, nicht deployt)
 - **Übernommen mit v0.1.51:** Registrierung nur anbieten, solange sie offen ist (PR #60), QR-Scan zeigt nur den gescannten Anschluss (PR #61) und Support-Einstiege ausblenden (PR #62) jeweils in der Upstream-Fassung. Dublette in `ChargerDetail.tsx` und `Register.tsx` entfernt. Fahrerliste: Upstreams Spaltensortierung mit unserer Flottenspalte kombiniert; Spalte „Fahrer-ID“ entfällt wie upstream. Journal: `0488`/`0489`, dahinter unsere `rhiem_`-Einträge (`idx` 247–256).
 - **Probe-Merge 20.11.2026:** 21 Konfliktdateien (11 Dubletten der übernommenen PRs, 10 echt), aufgelöst; typecheck, lint, check:migrations, check:openapi grün, gezielte Tests 540 grün.
 - **Übernommen mit v0.1.50:** Token-Bezeichnung (PR #50) und Station aus den Listen des Fahrerportals nehmen (PR #54) jeweils in der Upstream-Fassung; `rhiem_0004` und `rhiem_0013` entfernt (hashgleich mit `0485` und `0487`). Unsere Felder stehen jetzt wie upstream oben ausgerichtet (`items-start`), Präfixe `invoiceIssuer` und `pdfLetterhead` auch in `@evtivity/lib`.
