@@ -49,6 +49,7 @@ import {
 import type { StationInsightSuppressionSource } from '@evtivity/database';
 import { getAuditActor } from '../lib/audit-actor.js';
 import { AI_INSIGHT_SCOPE_REASONS } from '@evtivity/lib/ai-insights';
+import { SECURITY_SEVERITIES } from '@evtivity/lib/security-severity';
 import {
   isOutsideAiInsightScope,
   stationAiInsightsScopeStatus,
@@ -79,6 +80,7 @@ import {
 import { isSimFeatureOn, readSimSettings } from '../lib/sim.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import { listStationMessageLog } from '../lib/station-message-log.js';
+import { hiddenOcppLogActions } from '../lib/ocpp-log-visibility.js';
 import { stationLogSince } from '../lib/station-log-window.js';
 import {
   chargingStations,
@@ -108,6 +110,7 @@ import {
   pricingAssignmentAuditLog,
 } from '@evtivity/database';
 import { parseZodRequest, zodSchema } from '../lib/zod-schema.js';
+import { sessionListSort } from '../lib/sorts/session-list-sort.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { paginationQuery } from '../lib/pagination.js';
@@ -158,6 +161,12 @@ import {
   buildStatusReasonSubquery,
 } from '@evtivity/services/station-derived-status';
 import { buildUnderMaintenanceSubquery } from '../lib/station-maintenance-flag.js';
+import { stationListSort } from '../lib/sorts/station-list-sort.js';
+import { stationVariableListSort } from '../lib/sorts/station-variable-list-sort.js';
+import { stationFirmwareListSort } from '../lib/sorts/station-firmware-list-sort.js';
+import { stationChargingProfileListSort } from '../lib/sorts/station-charging-profile-list-sort.js';
+import { evChargingScheduleListSort } from '../lib/sorts/ev-charging-schedule-list-sort.js';
+import { monitoringRuleListSort } from '../lib/sorts/monitoring-rule-list-sort.js';
 import {
   resumeStationAiInsights,
   suppressStationAiInsights,
@@ -207,6 +216,7 @@ import {
   CONNECTOR_TYPES,
   DATA_PLANS,
   DATA_PLAN_SOURCES,
+  escapeLikePattern,
 } from '@evtivity/lib';
 import { ocppVersionMismatchReason } from '../lib/ocpp-version-mismatch.js';
 import {
@@ -219,7 +229,7 @@ import {
   METRICS_MONEY_FIELDS,
   REVENUE_HISTORY_MONEY_FIELDS,
 } from '../lib/money-visibility.js';
-import { authorize } from '../middleware/rbac.js';
+import { authorize, requestHasPermission } from '../middleware/rbac.js';
 import { sessionsAtSites } from '../lib/session-site-scope.js';
 import { refuseSecurityProfileChange } from '../lib/security-profile-permission.js';
 import { ocppCommandRoutePermissions } from '@evtivity/lib/ocpp-command-permissions';
@@ -326,6 +336,16 @@ const stationMeterValueItem = z
   })
   .loose();
 
+const stationVariablesQuery = paginationQuery.extend({ ...stationVariableListSort.query });
+const stationFirmwareHistoryQuery = paginationQuery.extend({ ...stationFirmwareListSort.query });
+const stationChargingProfilesQuery = paginationQuery.extend({
+  ...stationChargingProfileListSort.query,
+});
+const stationEvChargingSchedulesQuery = paginationQuery.extend({
+  ...evChargingScheduleListSort.query,
+});
+const stationMonitoringRulesQuery = paginationQuery.extend({ ...monitoringRuleListSort.query });
+
 const stationMeterValueQuery = paginationQuery.extend({
   measurand: z.string().optional().describe('Filter by measurand name'),
 });
@@ -349,6 +369,7 @@ const stationListQuery = paginationQuery.extend(
       .describe(
         'Filter by AI insight scope: suppressed (by an operator on the station or its site, or by an active maintenance event) or in_scope',
       ),
+    ...stationListSort.query,
   }).shape,
 );
 
@@ -1333,10 +1354,9 @@ export function stationRoutes(app: FastifyInstance): void {
         .leftJoin(vendors, eq(vendors.id, chargingStations.vendorId))
         .leftJoin(sites, eq(sites.id, chargingStations.siteId))
         .where(where)
-        // Stable sort: newest first, then id as tiebreaker so two rows with
-        // the same createdAt millisecond don't swap order between pages and
-        // cause the user to see duplicates or skips on the boundary.
-        .orderBy(desc(chargingStations.createdAt), desc(chargingStations.id));
+        // Stable sort: the chosen column, then id as tiebreaker (default newest
+        // first) so rows with equal values never swap order between pages.
+        .orderBy(...stationListSort.orderBy(query));
 
       const [data, countResult] = await Promise.all([
         baseQuery.limit(limit).offset(offset),
@@ -4160,6 +4180,7 @@ export function stationRoutes(app: FastifyInstance): void {
       .enum(['active', 'completed', 'faulted', 'idling'])
       .optional()
       .describe('Filter by session status'),
+    ...sessionListSort.query,
   });
 
   app.get(
@@ -4229,7 +4250,7 @@ export function stationRoutes(app: FastifyInstance): void {
           .leftJoin(drivers, eq(chargingSessions.driverId, drivers.id))
           .leftJoin(guestSessions, eq(guestSessions.chargingSessionId, chargingSessions.id))
           .where(where)
-          .orderBy(desc(chargingSessions.createdAt), desc(chargingSessions.id))
+          .orderBy(...sessionListSort.orderBy(request.query as z.infer<typeof sessionsQuery>))
           .limit(limit)
           .offset(offset),
         db
@@ -4261,6 +4282,8 @@ export function stationRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Stations'],
         summary: 'Get OCPP message logs for a station',
+        description:
+          'The processed OCPP messages and the queued commands of a station, newest first, with credentials and URL passwords masked. SecurityEventNotification messages (station security events) and their replies are left out of the rows, the total and the action list unless the caller holds securityEvents:read.',
         operationId: 'getStationOcppLogs',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -4281,7 +4304,11 @@ export function stationRoutes(app: FastifyInstance): void {
       const query = request.query as z.infer<typeof ocppLogsQuery>;
       const since = await stationLogSince(id, userId);
       if (since === 'closed') return { data: [], total: 0, actions: [] };
-      return listStationMessageLog(id, { ...query, since });
+      return listStationMessageLog(id, {
+        ...query,
+        since,
+        hiddenActions: await hiddenOcppLogActions(request),
+      });
     },
   );
 
@@ -4421,7 +4448,7 @@ export function stationRoutes(app: FastifyInstance): void {
       .optional()
       .describe('Restrict to a single source table'),
     severity: z
-      .enum(['critical', 'high', 'medium', 'low', 'info'])
+      .enum(SECURITY_SEVERITIES)
       .optional()
       .describe(
         'Filter by severity level. Only security source rows carry a severity, so this returns security rows only',
@@ -4437,6 +4464,8 @@ export function stationRoutes(app: FastifyInstance): void {
       schema: {
         tags: ['Stations'],
         summary: 'Get security event logs for a station',
+        description:
+          'Connection log rows (stations:read) and OCPP security event rows of the station. The security event rows (source security) are included only for a caller with securityEvents:read; without it the feed holds the connection rows only.',
         operationId: 'getStationSecurityLogs',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
@@ -4450,6 +4479,9 @@ export function stationRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof stationParams>;
       const { userId } = request.user as JwtPayload;
+      // OCPP security event rows need securityEvents:read; without it the feed
+      // holds the connection rows only (owner decision 2026-11-10).
+      const canReadSecurityEvents = await requestHasPermission(request, 'securityEvents:read');
       if (!(await checkStationSiteAccess(id, userId))) {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
@@ -4474,7 +4506,8 @@ export function stationRoutes(app: FastifyInstance): void {
       // Connection rows have no severity, so a severity filter leaves them out.
       const wantConnection =
         severityFilter == null && (query.source == null || query.source === 'connection');
-      const wantSecurity = query.source == null || query.source === 'security';
+      const wantSecurity =
+        canReadSecurityEvents && (query.source == null || query.source === 'security');
 
       const eventList = sql.join(
         CONNECTION_LOG_EVENTS.map((e) => sql`${e}`),
@@ -5230,17 +5263,14 @@ export function stationRoutes(app: FastifyInstance): void {
 
   const securityEventsQuery = paginationQuery.extend(
     z.object({
-      severity: z
-        .enum(['critical', 'high', 'medium', 'low', 'info'])
-        .optional()
-        .describe('Filter by severity level'),
+      severity: z.enum(SECURITY_SEVERITIES).optional().describe('Filter by severity level'),
     }).shape,
   );
 
   app.get(
     '/stations/:id/security-events',
     {
-      onRequest: [authorize('stations:read')],
+      onRequest: [authorize('stations:read', 'securityEvents:read')],
       schema: {
         tags: ['Stations'],
         summary: 'List security events for a station',
@@ -5262,13 +5292,18 @@ export function stationRoutes(app: FastifyInstance): void {
         return;
       }
       const query = request.query as z.infer<typeof securityEventsQuery>;
+      // A site user reads a moved station's events from its time at the site
+      // only, by receipt time (security case 284).
+      const since = await stationLogSince(id, userId);
+      if (since === 'closed') return { data: [], total: 0 };
 
       const conditions = [eq(securityEvents.stationId, id)];
+      if (since != null) conditions.push(gte(securityEvents.createdAt, since));
       if (query.severity != null) {
         conditions.push(eq(securityEvents.severity, query.severity));
       }
       if (query.search != null && query.search.length > 0) {
-        conditions.push(ilike(securityEvents.type, `%${query.search}%`));
+        conditions.push(ilike(securityEvents.type, `%${escapeLikePattern(query.search)}%`));
       }
 
       const where = and(...conditions);
@@ -5396,7 +5431,7 @@ export function stationRoutes(app: FastifyInstance): void {
         operationId: 'listStationVariables',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(stationVariablesQuery),
         response: {
           200: paginatedResponse(stationVariableItem),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
@@ -5410,7 +5445,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof paginationQuery>;
+      const query = request.query as z.infer<typeof stationVariablesQuery>;
 
       const [station] = await db
         .select({ id: chargingStations.id })
@@ -5456,7 +5491,7 @@ export function stationRoutes(app: FastifyInstance): void {
           })
           .from(stationConfigurations)
           .where(where)
-          .orderBy(stationConfigurations.component, stationConfigurations.variable)
+          .orderBy(...stationVariableListSort.orderBy(query))
           .limit(limit)
           .offset(offset),
         db.select({ total: count() }).from(stationConfigurations).where(where),
@@ -5507,7 +5542,7 @@ export function stationRoutes(app: FastifyInstance): void {
         operationId: 'listStationFirmwareHistory',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(stationFirmwareHistoryQuery),
         response: {
           200: paginatedResponse(firmwareHistoryItem),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
@@ -5521,7 +5556,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof paginationQuery>;
+      const query = request.query as z.infer<typeof stationFirmwareHistoryQuery>;
 
       const [station] = await db
         .select({ id: chargingStations.id })
@@ -5557,7 +5592,7 @@ export function stationRoutes(app: FastifyInstance): void {
           .from(firmwareUpdates)
           .leftJoin(firmwareCampaigns, eq(firmwareCampaigns.id, firmwareUpdates.campaignId))
           .where(where)
-          .orderBy(desc(firmwareUpdates.createdAt), desc(firmwareUpdates.id))
+          .orderBy(...stationFirmwareListSort.orderBy(query))
           .limit(limit)
           .offset(offset),
         db.select({ total: count() }).from(firmwareUpdates).where(where),
@@ -5608,7 +5643,7 @@ export function stationRoutes(app: FastifyInstance): void {
         operationId: 'listStationChargingProfiles',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(stationChargingProfilesQuery),
         response: {
           200: paginatedResponse(chargingProfileItem),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
@@ -5622,7 +5657,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof paginationQuery>;
+      const query = request.query as z.infer<typeof stationChargingProfilesQuery>;
 
       const [station] = await db
         .select({ id: chargingStations.id })
@@ -5667,7 +5702,7 @@ export function stationRoutes(app: FastifyInstance): void {
             ),
           )
           .where(where)
-          .orderBy(desc(chargingProfiles.createdAt), desc(chargingProfiles.id))
+          .orderBy(...stationChargingProfileListSort.orderBy(query))
           .limit(limit)
           .offset(offset),
         db.select({ total: count() }).from(chargingProfiles).where(where),
@@ -6646,7 +6681,7 @@ export function stationRoutes(app: FastifyInstance): void {
         operationId: 'listStationEvChargingSchedules',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(stationEvChargingSchedulesQuery),
         response: {
           200: paginatedResponse(evChargingScheduleItem),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
@@ -6668,14 +6703,14 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof paginationQuery>;
+      const query = request.query as z.infer<typeof stationEvChargingSchedulesQuery>;
       const where = eq(evChargingSchedules.stationId, id);
       const [data, countResult] = await Promise.all([
         db
           .select()
           .from(evChargingSchedules)
           .where(where)
-          .orderBy(desc(evChargingSchedules.createdAt), desc(evChargingSchedules.id))
+          .orderBy(...evChargingScheduleListSort.orderBy(query))
           .limit(query.limit)
           .offset((query.page - 1) * query.limit),
         db.select({ total: count() }).from(evChargingSchedules).where(where),
@@ -6788,7 +6823,7 @@ export function stationRoutes(app: FastifyInstance): void {
         operationId: 'listStationMonitoringRules',
         security: [{ bearerAuth: [] }],
         params: zodSchema(stationParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(stationMonitoringRulesQuery),
         response: {
           200: paginatedResponse(monitoringRuleItem),
           404: errorWith('Station not found', [ERROR_CODES.STATION_NOT_FOUND]),
@@ -6802,7 +6837,7 @@ export function stationRoutes(app: FastifyInstance): void {
         await reply.status(404).send({ error: 'Station not found', code: 'STATION_NOT_FOUND' });
         return;
       }
-      const query = request.query as z.infer<typeof paginationQuery>;
+      const query = request.query as z.infer<typeof stationMonitoringRulesQuery>;
 
       const [station] = await db
         .select({ id: chargingStations.id })
@@ -6827,7 +6862,7 @@ export function stationRoutes(app: FastifyInstance): void {
           .select(MONITORING_RULE_COLUMNS)
           .from(variableMonitoringRules)
           .where(where)
-          .orderBy(desc(variableMonitoringRules.createdAt), desc(variableMonitoringRules.id))
+          .orderBy(...monitoringRuleListSort.orderBy(query))
           .limit(limit)
           .offset(offset),
         db.select({ total: count() }).from(variableMonitoringRules).where(where),

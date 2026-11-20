@@ -222,6 +222,7 @@ export const ERROR_CODES = {
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
   NOT_PENDING: 'NOT_PENDING',
   NOT_SUPPORTED: 'NOT_SUPPORTED',
+  NOTIFICATION_EVENT_MANDATORY: 'NOTIFICATION_EVENT_MANDATORY',
   NOTIFICATION_EVENT_REQUIRED: 'NOTIFICATION_EVENT_REQUIRED',
   OCPP_COMMAND_FAILED: 'OCPP_COMMAND_FAILED',
   OCPP_VERSION_MISMATCH: 'OCPP_VERSION_MISMATCH',
@@ -311,6 +312,7 @@ export const ERROR_CODES = {
   RESERVATION_TIMEOUT: 'RESERVATION_TIMEOUT',
   RESERVATION_TOO_LONG: 'RESERVATION_TOO_LONG',
   RESERVATION_WINDOW_TOO_SHORT: 'RESERVATION_WINDOW_TOO_SHORT',
+  RFID_SELF_SERVICE_DISABLED: 'RFID_SELF_SERVICE_DISABLED',
   ROAMING_DISABLED: 'ROAMING_DISABLED',
   ROLE_NOT_FOUND: 'ROLE_NOT_FOUND',
   ROTATION_NOT_APPLICABLE: 'ROTATION_NOT_APPLICABLE',
@@ -631,6 +633,7 @@ export type ErrorCode =
   | 'NOT_IMPLEMENTED'
   | 'NOT_PENDING'
   | 'NOT_SUPPORTED'
+  | 'NOTIFICATION_EVENT_MANDATORY'
   | 'NOTIFICATION_EVENT_REQUIRED'
   | 'OCPP_COMMAND_FAILED'
   | 'OCPP_VERSION_MISMATCH'
@@ -720,6 +723,7 @@ export type ErrorCode =
   | 'RESERVATION_TIMEOUT'
   | 'RESERVATION_TOO_LONG'
   | 'RESERVATION_WINDOW_TOO_SHORT'
+  | 'RFID_SELF_SERVICE_DISABLED'
   | 'ROAMING_DISABLED'
   | 'ROLE_NOT_FOUND'
   | 'ROTATION_NOT_APPLICABLE'
@@ -1073,6 +1077,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   NOT_IMPLEMENTED: 'Remote start on partner networks requires the OCPI Commands module',
   NOT_PENDING: 'Station is not pending approval',
   NOT_SUPPORTED: 'Not supported for OCPP 1.6',
+  NOTIFICATION_EVENT_MANDATORY:
+    'Your operator requires this notification on this channel, so it cannot be turned off',
   NOTIFICATION_EVENT_REQUIRED:
     'This notification is required for account access and cannot be turned off',
   OCPP_COMMAND_FAILED: 'OCPP command failed',
@@ -1178,6 +1184,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   RESERVATION_TIMEOUT: 'Reservation command timed out',
   RESERVATION_TOO_LONG: 'Reservation cannot exceed ... hours',
   RESERVATION_WINDOW_TOO_SHORT: 'Reservation must end at least 60 seconds after it starts',
+  RFID_SELF_SERVICE_DISABLED:
+    'Your operator manages your RFID cards. Contact the operator to add, change, deactivate or remove a card.',
   ROAMING_DISABLED: 'Roaming is disabled',
   ROLE_NOT_FOUND: 'Role does not exist',
   ROTATION_NOT_APPLICABLE: 'Credential rotation only applies to security profiles 1 and 2',

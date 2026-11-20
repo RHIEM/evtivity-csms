@@ -52,6 +52,8 @@ export const drivers = pgTable(
     language: varchar('language', { length: 10 }).notNull().default('en'),
     timezone: varchar('timezone', { length: 50 }).notNull().default('America/New_York'),
     themePreference: varchar('theme_preference', { length: 10 }).notNull().default('light'),
+    // The UI theme (default, soft, high-contrast; @evtivity/lib/ui-theme). theme_preference is the mode.
+    uiTheme: varchar('ui_theme', { length: 20 }).notNull().default('default'),
     distanceUnit: varchar('distance_unit', { length: 10 }).notNull().default('miles'),
     // 'gross' or 'net'. Null follows the company setting company.priceDisplay.
     priceDisplay: varchar('price_display', { length: 10 }),
@@ -107,6 +109,7 @@ export const drivers = pgTable(
   },
   (table) => [
     index('idx_drivers_email').on(table.email),
+    check('drivers_ui_theme_check', sql`"ui_theme" IN ('default', 'soft', 'high-contrast')`),
     check(
       'drivers_avatar_check',
       sql`(${table.avatarKind} IS NULL AND ${table.avatarOptions} IS NULL AND ${table.avatarS3Key} IS NULL AND ${table.avatarS3Bucket} IS NULL)
@@ -135,6 +138,31 @@ export const driverNotificationPreferences = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [unique('uq_driver_notification_prefs_driver').on(table.driverId)],
+);
+
+// A driver's choice of one notification event on one channel (discussion 56).
+// No row: the channel switch above decides. Only driver preference events
+// (`DRIVER_PREFERENCE_EVENT_TYPES`) have rows; a channel the operator made
+// mandatory is sent whatever is stored. Written only by
+// `lib/driver-notification-settings.ts`.
+export const driverNotificationEventPreferences = pgTable(
+  'driver_notification_event_preferences',
+  {
+    driverId: text('driver_id')
+      .notNull()
+      .references(() => drivers.id, { onDelete: 'cascade' }),
+    eventType: varchar('event_type', { length: 255 }).notNull(),
+    channel: varchar('channel', { length: 10 }).notNull(),
+    enabled: boolean('enabled').notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.driverId, table.eventType, table.channel] }),
+    check(
+      'driver_notification_event_prefs_channel_check',
+      sql`${table.channel} IN ('email', 'sms', 'push')`,
+    ),
+  ],
 );
 
 export const guestSessions = pgTable(

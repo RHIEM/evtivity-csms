@@ -8,6 +8,7 @@ import {
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
   PG_FOREIGN_KEY_VIOLATION,
+  isDriverRfidSelfServiceEnabled,
 } from '@evtivity/database';
 import {
   chargingStations,
@@ -35,6 +36,8 @@ import { isVehicleShapedTokenValue, tokenVehicleIdCandidates } from '@evtivity/l
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
 import { ALL_TEMPLATES_DIRS } from '@evtivity/services/template-dirs';
 import type { PaginationParams, PaginatedResponse } from '../lib/pagination.js';
+import type { ListSortParams } from '../lib/list-sort.js';
+import { tokenListSort } from '../lib/sorts/token-list-sort.js';
 import type { AuditActorInfo } from '../lib/audit-actor.js';
 import { publishOcpiTokenPush, type OcpiTokenTombstoneRef } from '../lib/ocpi-token-push.js';
 import {
@@ -45,7 +48,7 @@ import {
 
 const logger = createLogger('token-service');
 
-interface TokenListParams extends PaginationParams {
+interface TokenListParams extends PaginationParams, ListSortParams {
   tokenType?: string | undefined;
   status?: 'active' | 'inactive' | undefined;
 }
@@ -138,7 +141,7 @@ export async function listTokens(
       .from(driverTokens)
       .leftJoin(drivers, eq(driverTokens.driverId, drivers.id))
       .where(where)
-      .orderBy(desc(driverTokens.createdAt), desc(driverTokens.id))
+      .orderBy(...tokenListSort.orderBy(params))
       .limit(limit)
       .offset(offset),
     db
@@ -196,6 +199,29 @@ export class TokenReactivationBlockedError extends Error {
     super('Token was deactivated by the operator');
     this.name = 'TokenReactivationBlockedError';
   }
+}
+
+/**
+ * A driver tried to change an RFID card while the operator manages them
+ * (`portal.rfidSelfServiceEnabled` off): every driver write is refused.
+ */
+export class RfidSelfServiceDisabledError extends Error {
+  constructor() {
+    super('Drivers cannot change RFID cards; the operator manages them');
+    this.name = 'RfidSelfServiceDisabledError';
+  }
+}
+
+/**
+ * Refuses every driver-actor card write while drivers do not manage their
+ * own cards. Strictly read-only (owner decision 2026-11-10): a driver cannot
+ * add, rename, deactivate, reactivate or remove a card then, and contacts the
+ * operator to block a lost one. Operators, API keys and the system are never
+ * refused. The reader fails closed, so a settings read error refuses too.
+ */
+async function assertDriverCardWriteAllowed(actor: TokenActor): Promise<void> {
+  if (actor.type !== 'driver') return;
+  if (!(await isDriverRfidSelfServiceEnabled())) throw new RfidSelfServiceDisabledError();
 }
 
 /**
@@ -633,6 +659,8 @@ export async function createToken(
   },
   actor: TokenActor = { type: 'system' },
 ) {
+  // Before any lookup, so a refused driver learns nothing about existing cards.
+  await assertDriverCardWriteAllowed(actor);
   assertTokenLabel(data.label);
   const label = normalizeTokenLabel(data.label);
   // Before any lookup, so the answer says nothing about existing cards.
@@ -753,6 +781,7 @@ export async function updateToken(
   },
   actor: TokenActor = { type: 'system' },
 ) {
+  await assertDriverCardWriteAllowed(actor);
   if (data.prepaidBalanceCents !== undefined && data.expectedPrepaidBalanceCents === undefined) {
     throw new PrepaidBalanceExpectedError();
   }

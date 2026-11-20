@@ -115,6 +115,7 @@ export const accessLogs = pgTable(
     index('idx_access_logs_category').on(table.category),
     index('idx_access_logs_created_at').on(table.createdAt),
     index('idx_access_logs_action').on(table.action),
+    index('idx_access_logs_duration_desc').on(table.durationMs.desc().nullsLast(), table.id.desc()),
   ],
 );
 
@@ -160,5 +161,7 @@ export const portStatusLog = pgTable(
     index('idx_port_status_log_station_timestamp').on(table.stationId, table.timestamp),
     index('idx_port_status_log_timestamp').on(table.timestamp),
     index('idx_port_status_log_station_evse').on(table.stationId, table.evseId),
+    // The retention prune filters by receipt time, never the station time.
+    index('idx_port_status_log_created_at').on(table.createdAt),
   ],
 );

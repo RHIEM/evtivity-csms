@@ -1,6 +1,9 @@
 {
   "common": {
     "loading": "로딩 중...",
+    "sortAscending": "오름차순 정렬",
+    "sortDescending": "내림차순 정렬",
+    "sortDefault": "기본 순서로 되돌리기",
     "pageNotFound": "페이지를 찾을 수 없습니다",
     "pageNotFoundDescription": "요청하신 페이지가 존재하지 않거나 이동되었습니다.",
     "allSiteAccessRequired": "전체 사이트 접근 권한 필요",
@@ -107,7 +110,26 @@
       "confirm": "끄기",
       "cancel": "켜진 상태로 유지"
     },
-    "ok": "확인"
+    "ok": "확인",
+    "datePicker": {
+      "open": "달력 열기",
+      "title": "날짜 선택",
+      "previousMonth": "이전 달",
+      "nextMonth": "다음 달",
+      "month": "월",
+      "year": "연도",
+      "today": "오늘",
+      "clear": "지우기"
+    },
+    "sessionFallback": "세션",
+    "unnamedSite": "이름 없는 사이트",
+    "unnamedStation": "이름 없는 충전기",
+    "unnamedTerminal": "이름 없는 단말기",
+    "unnamedPanel": "이름 없는 분전반",
+    "unnamedTransformer": "이름 없는 변압기",
+    "unnamedUser": "이름 없는 사용자",
+    "unnamedTemplate": "이름 없는 템플릿",
+    "unnamedReservation": "이름 없는 예약"
   },
   "status": {
     "online": "온라인",
@@ -175,7 +197,7 @@
     "settings": "설정",
     "profile": "프로필",
     "language": "언어",
-    "theme": "테마",
+    "theme": "모드",
     "back": "뒤로",
     "logOut": "로그아웃",
     "sustainability": "지속가능성",
@@ -574,7 +596,27 @@
     "freeVend": "무료 충전",
     "freeVendInfo": "사이트의 무료 충전 세션과 에너지이며, 무료 충전이 켜진 사이트 수가 함께 표시됩니다.",
     "freeVendSites": "무료 충전 사이트: {{value}}",
-    "noFreeVendSessions": "이 기간에 무료 충전 세션이 없습니다"
+    "noFreeVendSessions": "이 기간에 무료 충전 세션이 없습니다",
+    "securityEvents": {
+      "title": "보안 이벤트",
+      "info": "충전소가 보고한 보안 이벤트를 심각도별, 충전소별로 보여줍니다. 심각도가 가장 높은 충전소가 먼저 표시됩니다. 충전소를 선택하면 보안 탭이 열립니다.",
+      "range": "기간",
+      "range24h": "최근 24시간",
+      "range7d": "최근 7일",
+      "range30d": "최근 30일",
+      "site": "사이트",
+      "allSites": "모든 사이트",
+      "severity": "심각도",
+      "allSeverities": "모든 심각도",
+      "station": "충전소",
+      "worstSeverity": "최고 심각도",
+      "events": "이벤트",
+      "lastEvent": "마지막 이벤트",
+      "empty": "이 기간에 보안 이벤트가 없습니다.",
+      "noStations": "이 심각도의 이벤트가 있는 충전소가 없습니다.",
+      "truncated": "충전소 {{total}}개 중 {{shown}}개를 표시합니다.",
+      "criticalRow": "위험"
+    }
   },
   "sites": {
     "title": "사이트",
@@ -758,8 +800,8 @@
       "fitToView": "화면에 맞추기",
       "editLayout": "레이아웃 편집",
       "doneEditing": "편집 완료",
-      "hint": "드래그하여 회전, 두 손가락으로 쓸거나 Shift를 누른 채 드래그하여 이동, 핀치하거나 스크롤 휠로 확대/축소합니다. 충전소를 클릭하면 상세 정보가 표시됩니다.",
-      "hintViewOnly": "드래그하여 둘러보기, 두 손가락으로 쓸어 이동, 핀치하거나 스크롤 휠로 확대/축소합니다. 충전소를 클릭하면 상세 정보가 표시됩니다.",
+      "hint": "드래그하여 회전, 두 손가락으로 쓸거나 Shift를 누른 채 드래그하여 이동, 핀치하거나 스크롤 휠로 확대/축소합니다. 충전소를 클릭하면 상세 정보가 표시됩니다. 충전기를 더블클릭하면 확대됩니다.",
+      "hintViewOnly": "드래그하여 둘러보기, 두 손가락으로 쓸어 이동, 핀치하거나 스크롤 휠로 확대/축소합니다. 충전소를 클릭하면 상세 정보가 표시됩니다. 충전기를 더블클릭하면 확대됩니다.",
       "hintEdit": "편집 모드: 충전소를 빈 주차면으로, 변압기를 잔디 위로 드래그하세요. 충전소는 주차면에 맞춰지며 다른 충전소 위에 놓이지 않습니다.",
       "webglUnavailable": "이 브라우저는 3D 보기를 표시할 수 없어(WebGL을 사용할 수 없음) 2D 보기를 표시합니다.",
       "loading3d": "3D 보기 불러오는 중",
@@ -867,7 +909,7 @@
         "pointerZoom": "확대/축소",
         "pointerZoomKeys": "핀치 또는 스크롤 휠"
       },
-      "hintTouch": "드래그하여 회전, 핀치하여 확대/축소, 두 손가락으로 드래그하여 이동합니다. 충전소를 탭하면 상세 정보가 표시됩니다.",
+      "hintTouch": "드래그하여 회전, 핀치하여 확대/축소, 두 손가락으로 드래그하여 이동합니다. 충전소를 탭하면 상세 정보가 표시됩니다. 충전기를 두 번 탭하면 확대됩니다.",
       "hintViewOnlyTouch": "드래그하여 둘러보기, 핀치하여 확대/축소합니다. 충전소를 탭하면 상세 정보가 표시됩니다.",
       "hintReplayTouch": "지난 시점을 재생하는 중입니다. 드래그하여 회전, 핀치하여 확대/축소합니다.",
       "portIconLabel": "EVSE {{n}}, {{type}}, {{state}}",
@@ -886,7 +928,8 @@
       "cannotMeetShort": "달성 불가: {{kwh}} kWh 부족",
       "transformerLoad": "용량의 {{percent}}%",
       "supplyCredit": "공급 {{kw}} kW",
-      "supplyNoReading": "최신 측정값 없음"
+      "supplyNoReading": "최신 측정값 없음",
+      "evsePlateHover": "EVSE {{n}}, {{types}}"
     },
     "layoutState": {
       "faulted": "고장",
@@ -972,7 +1015,8 @@
       "reservedWindow": "{{id}} {{start}}부터 {{end}}까지 예약됨",
       "maintenanceNow": "{{id}} 유지보수 중",
       "maintenanceUntil": "{{id}} {{end}}까지 유지보수 중",
-      "maintenanceWindow": "{{id}} {{start}}부터 {{end}}까지 유지보수 중"
+      "maintenanceWindow": "{{id}} {{start}}부터 {{end}}까지 유지보수 중",
+      "rfidTap": "RFID 카드를 대세요"
     },
     "fleetReadiness": {
       "title": "차량대 준비 상태",
@@ -1122,6 +1166,7 @@
     "changePasswordOcppOnline": "서버에서 비밀번호를 업데이트하고 OCPP SetVariables를 통해 {{stationId}}에 전달한 후 충전소를 재설정하여 재연결합니다.",
     "changePasswordOcppOffline": "충전소가 오프라인입니다. 비밀번호가 서버에 저장되고 다음 연결 시 충전소 인증에 사용됩니다.",
     "securityLog": "보안 이벤트 로그",
+    "securityEventsHidden": "충전소 보안 이벤트는 보안 이벤트 권한이 있는 사용자에게만 표시됩니다. 이 로그에는 연결 이벤트가 표시됩니다.",
     "noSecurityLogs": "기록된 보안 이벤트가 없습니다",
     "eventType": "이벤트",
     "eventTypePlaceholder": "예: TamperDetectionActivated",
@@ -2079,7 +2124,13 @@
       "empty": "청구지 주소가 없습니다. 청구서에는 이름과 이메일이 표시됩니다.",
       "updated": "청구지 주소가 업데이트되었습니다",
       "updateFailed": "청구지 주소를 업데이트할 수 없습니다"
-    }
+    },
+    "timezone": "시간대",
+    "distanceUnit": "거리 단위",
+    "distanceUnitMiles": "마일",
+    "distanceUnitKm": "킬로미터",
+    "distanceUnitHelp": "운전자 포털과 앱의 거리에 사용됩니다.",
+    "timezoneHelp": "운전자 포털, 앱, 알림의 시간에 사용됩니다."
   },
   "transactions": {
     "title": "거래",
@@ -2266,6 +2317,7 @@
       "loadManagement": "부하 관리",
       "notifications": "알림",
       "logs": "로그",
+      "securityEvents": "보안 이벤트",
       "users": "사용자",
       "audit": "감사 로그",
       "maintenance": "유지보수",
@@ -2350,9 +2402,16 @@
     "language": "언어",
     "timezone": "시간대",
     "appearance": "외관",
-    "theme": "테마",
+    "theme": "모드",
     "themeLight": "라이트",
     "themeDark": "다크",
+    "uiTheme": "테마",
+    "uiThemeDefault": "기본",
+    "uiThemeSoft": "부드러움",
+    "uiThemeHighContrast": "고대비",
+    "uiThemeDefaultDescription": "앱의 기본 모양입니다.",
+    "uiThemeSoftDescription": "더 둥근 모서리, 더 옅은 테두리, 더 부드러운 그림자입니다.",
+    "uiThemeHighContrastDescription": "흑백 배경, 뚜렷한 테두리, 굵은 글자로 가장 읽기 쉽게 표시합니다.",
     "chatbotAi": "챗봇 AI",
     "conformance": "적합성",
     "supportAi": "지원 AI",
@@ -2965,7 +3024,9 @@
     "uptime": "가동률",
     "uptimePerDay": "가동률 (일일 %)",
     "noUptimeData": "사용 가능한 가동률 데이터가 없습니다",
-    "noData": "이 기간의 데이터가 없습니다"
+    "noData": "이 기간의 데이터가 없습니다",
+    "noPayments": "이 기간의 결제가 없습니다",
+    "total": "합계"
   },
   "metrics": {
     "uptime": "가동률",
@@ -3201,6 +3262,7 @@
     "testSuccess": "테스트 알림이 전송되었습니다.",
     "testFailed": "테스트 알림 전송에 실패했습니다.",
     "companyInfo": "회사 정보",
+    "systemTab": "시스템",
     "companyInfoDescription": "조직 이름, 연락처 및 주소입니다.",
     "companyName": "회사 이름",
     "companyCurrency": "통화",
@@ -3371,7 +3433,7 @@
     "uploadOgImage": "이미지 업로드",
     "noOgImage": "업로드된 소셜 공유 이미지가 없습니다.",
     "ogImageDescription": "소셜 미디어에서 링크 공유 시 표시됩니다. 권장 크기: 1200x630 픽셀.",
-    "themeColor": "테마 색상",
+    "themeColor": "브랜드 색상",
     "themeColorDescription": "모바일 기기의 브라우저 크롬 색상입니다. 로그인 및 포털 페이지에서 사용됩니다.",
     "chargerColorAc": "AC 충전기 전면 패널 색상",
     "chargerColorAcDescription": "3D 사이트 레이아웃에서 AC 충전기 전면 패널의 색상입니다. 비워 두면 브랜드 색상을 사용합니다.",
@@ -3867,7 +3929,7 @@
     "secretRemovePending": "저장하면 저장된 값이 삭제됩니다.",
     "secretRemoveUndo": "유지",
     "copyCode": "코드 복사",
-    "themeColorPicker": "테마 색상 선택기",
+    "themeColorPicker": "브랜드 색상 선택기",
     "emailLayoutPreviewFrame": "이메일 레이아웃 미리보기",
     "aiProvidersTitle": "AI 제공업체",
     "aiProvidersDescription": "제공업체마다 API 키 하나를 사용합니다. AI 어시스턴트와 지원 AI는 아래에서 각각 제공업체를 선택합니다.",
@@ -4131,7 +4193,9 @@
       "signalGoodDbmHint": "이 값 이상의 신호는 좋음으로 평가됩니다.",
       "signalFairDbm": "보통 신호 기준(dBm)",
       "signalFairDbmHint": "이 값 이상의 신호는 보통, 그 아래는 약함으로 평가됩니다.",
-      "signalOrderError": "좋음 기준은 보통 기준보다 높아야 합니다."
+      "signalOrderError": "좋음 기준은 보통 기준보다 높아야 합니다.",
+      "simCardsNote": "SIM은 다음 페이지에서 추가하거나 가져옵니다:",
+      "simCardsLink": "SIM"
     },
     "ssoAllowedDomains": "허용된 이메일 도메인",
     "ssoAllowedDomainsHint": "SSO는 쉼표로 구분된 이 도메인에 대해서만 로그인하고 계정을 생성합니다. 권장: 회사 도메인을 입력하십시오. 비워 두면 모든 도메인이 허용됩니다.",
@@ -4231,7 +4295,25 @@
     "paymentSubTabTerminals": "결제 단말기",
     "fleetChargingEnabled": "차량대 충전",
     "fleetChargingEnabledDesc": "출발 기반 전략을 사용하는 사이트에서 각 차량의 출발에 맞춰 차고지 충전을 계획합니다.",
-    "fleetChargingEnabledOff": "차고지 계획이 중지되고 보낸 충전 프로필이 지워지며, 출발 기반 사이트는 전력을 균등하게 나눕니다. 출발은 저장된 상태로 남습니다."
+    "fleetChargingEnabledOff": "차고지 계획이 중지되고 보낸 충전 프로필이 지워지며, 출발 기반 사이트는 전력을 균등하게 나눕니다. 출발은 저장된 상태로 남습니다.",
+    "driverLanguage": "운전자 언어",
+    "driverLanguageHelper": "생성 시 지정하지 않으면 새 운전자에게 적용되는 언어입니다. 기존 운전자는 자신의 설정을 유지합니다.",
+    "driverDistanceUnit": "운전자 거리 단위",
+    "driverDistanceUnitHelper": "생성 시 지정하지 않으면 새 운전자에게 적용되는 거리 단위입니다. 기존 운전자는 자신의 설정을 유지합니다.",
+    "companyTimezone": "시간대",
+    "companyTimezoneHelper": "회사 시간대입니다. 대시보드의 일자, 청구서, 보고서가 사용하며, 생성 시 지정하지 않으면 새 운전자에게 적용됩니다. 기존 운전자는 자신의 설정을 유지합니다.",
+    "rfidCards": "RFID 카드",
+    "rfidCardsDescription": "운전자가 RFID 카드를 직접 관리할지, 운영자가 관리할지 정합니다.",
+    "rfidSelfServiceEnabled": "운전자가 RFID 카드 관리",
+    "rfidSelfServiceEnabledDesc": "켜짐: 운전자가 포털과 모바일 앱에서 자신의 RFID 카드를 추가, 이름 변경, 비활성화, 재활성화, 삭제합니다. 꺼짐: 운전자는 카드를 보기만 하고, 운영자가 토큰 페이지에서 카드를 관리합니다.",
+    "rfidSelfServiceOffEffect": "운전자는 더 이상 RFID 카드를 추가, 이름 변경, 비활성화, 재활성화, 삭제할 수 없으며, 분실한 카드를 차단하려면 운영자에게 문의합니다. 기존 카드는 계속 작동합니다.",
+    "updateCheck": {
+      "title": "업데이트 확인",
+      "description": "새로운 EVtivity CSMS 릴리스가 나오면 관리자에게 알립니다.",
+      "enabled": "새 릴리스 확인",
+      "enabledDesc": "켜짐: 서버가 하루에 한 번 evtivity.com에서 최신 릴리스 번호를 읽고, 새 릴리스가 나오면 관리자가 대시보드에서 알림을 봅니다. evtivity.com에는 서버의 IP 주소만 전달되며 브라우저는 접속하지 않습니다. 꺼짐: 아무것도 보내지 않습니다.",
+      "offEffect": "서버가 evtivity.com에서 최신 릴리스를 더 이상 읽지 않으며, 새 릴리스가 나와도 관리자에게 알림이 표시되지 않습니다."
+    }
   },
   "pnc": {
     "certificates": "인증서",
@@ -4435,7 +4517,21 @@
     "aiEvents": "AI",
     "channelToggleLabel": "{{event}} {{channel}} 알림",
     "eventToggleLabel": "{{event}} 알림",
-    "securityEvents": "계정 보안"
+    "securityEvents": "계정 보안",
+    "driverChoice": {
+      "title": "운전자 선택",
+      "tooltip": "선택: 각 운전자가 포털과 앱에서 정합니다. 필수: 모든 운전자가 선택과 관계없이 이 채널로 알림을 받습니다. 꺼진 이벤트는 필수 여부와 관계없이 보내지 않습니다.",
+      "alwaysSent": "운전자는 이 알림을 항상 받습니다. 계정 및 보안 알림은 운전자가 끌 수 없습니다.",
+      "eventOff": "이 이벤트는 꺼져 있으므로 필수 여부와 관계없이 운전자는 어떤 채널로도 받지 않습니다.",
+      "channelEmail": "이메일",
+      "channelSms": "SMS",
+      "channelPush": "푸시",
+      "selectLabel": "{{event}}의 {{channel}}",
+      "optional": "선택",
+      "mandatory": "필수",
+      "notConfigured": "설정되지 않음: 이 채널로는 아무것도 보내지 않습니다.",
+      "explanation": "운전자에게 필수 알림은 켜진 채로 잠겨 있으며 운영자가 요구한 알림으로 표시됩니다."
+    }
   },
   "reservations": {
     "title": "예약",
@@ -4960,7 +5056,9 @@
     "DEPARTURE_MANAGED_BY_DEPOT_SYSTEM": "이 출발은 버스 차고지 시스템이 관리합니다. 해당 시스템에서 변경하거나 차고지 시스템을 비활성화하세요.",
     "DEPOT_SYSTEM_NOT_FOUND": "버스 차고지 시스템을 찾을 수 없습니다.",
     "DEPOT_SYSTEM_ID_IN_USE": "다른 버스 차고지 시스템이 이 시스템 ID를 사용합니다.",
-    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "버스 차고지 시스템은 차고지 사이트만 지원합니다."
+    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "버스 차고지 시스템은 차고지 사이트만 지원합니다.",
+    "RFID_SELF_SERVICE_DISABLED": "운영자가 RFID 카드를 관리합니다. 카드를 추가, 변경, 비활성화 또는 삭제하려면 운영자에게 문의하세요.",
+    "NOTIFICATION_EVENT_MANDATORY": "운영자가 이 채널에서 이 알림을 필수로 지정했으므로 끌 수 없습니다"
   },
   "logs": {
     "title": "로그",
@@ -5382,6 +5480,7 @@
     "failedStations": "실패",
     "noStationsTargeted": "대상 충전소 없음",
     "noCampaignRuns": "아직 캠페인 실행 없음",
+    "noCampaigns": "펌웨어 캠페인 없음",
     "error": "오류",
     "confirmStart": "캠페인 시작",
     "confirmStartDescription": "일치하는 모든 온라인 충전소에 지금 펌웨어 업데이트를 보냅니다. 오프라인 충전소는 연결될 때 받습니다. 계속하시겠습니까?",
@@ -5610,6 +5709,11 @@
     "faultMode": "결함 모드",
     "faultModeEnd": "세션 종료",
     "faultModeSuspend": "세션 유지 (일시 중지)",
+    "faultType": "고장 유형",
+    "faultCodes": {
+      "internalError": "내부 오류",
+      "highTemp": "고온"
+    },
     "goOffline": "오프라인 전환",
     "comeOnline": "온라인 전환",
     "actionSent": "{{action}} 전송됨",
@@ -5618,7 +5722,42 @@
     "tokenRequired": "이 작업에는 토큰이 필요합니다.",
     "tokenNotFound": "운전자 토큰에서 토큰을 찾을 수 없습니다. 인증 및 충전 시작이 거부됩니다.",
     "stationOffline": "충전소가 오프라인 상태입니다. 먼저 온라인으로 전환하세요.",
-    "invalidForState": "현재 커넥터 상태({{status}})에서 사용할 수 없습니다."
+    "invalidForState": "현재 커넥터 상태({{status}})에서 사용할 수 없습니다.",
+    "securityEvent": "보안 이벤트",
+    "securityEventType": "이벤트",
+    "securityEventOcppType": "OCPP 유형: {{type}}",
+    "securityEventTechInfo": "기술 정보 (선택)",
+    "sendSecurityEvent": "보안 이벤트 보내기",
+    "securityEventDescription": "시뮬레이터가 이 보안 이벤트를 충전기에서 CSMS로 보냅니다.",
+    "securityEvents": {
+      "TamperDetectionActivated": "충전기 열림 (변조 감지 센서)",
+      "TiltDetected": "충전기 기울어짐 (제조사 이벤트)",
+      "CableCutDetected": "충전 케이블 절단 (제조사 이벤트)",
+      "SettingSystemTime": "시스템 시간 변경",
+      "InvalidFirmwareSignature": "잘못된 펌웨어 서명",
+      "InvalidFirmwareSigningCertificate": "잘못된 펌웨어 서명 인증서",
+      "AttemptedReplayAttacks": "재전송된 메시지 수신",
+      "FailedToAuthenticateAtCsms": "충전소가 CSMS에 로그인하지 못함",
+      "FailedToAuthenticateAtCentralSystem": "충전소가 CSMS에 로그인하지 못함",
+      "CsmsFailedToAuthenticate": "CSMS가 충전소에 로그인하지 못함",
+      "CentralSystemFailedToAuthenticate": "CSMS가 충전소에 로그인하지 못함",
+      "InvalidCsmsCertificate": "잘못된 CSMS 인증서",
+      "InvalidCentralSystemCertificate": "잘못된 CSMS 인증서",
+      "InvalidChargingStationCertificate": "잘못된 충전소 인증서",
+      "InvalidChargePointCertificate": "잘못된 충전소 인증서",
+      "InvalidTLSVersion": "허용되지 않는 TLS 버전",
+      "InvalidTLSCipherSuite": "허용되지 않는 TLS 암호 스위트",
+      "MaintenanceLoginFailed": "유지보수 로그인 실패",
+      "SecurityLogWasCleared": "보안 로그 삭제됨",
+      "InvalidMessages": "잘못된 메시지 수신",
+      "MemoryExhaustion": "메모리 거의 가득 참",
+      "ReconfigurationOfSecurityParameters": "보안 설정 변경",
+      "DiscardedRenewedClientCertificate": "갱신된 클라이언트 인증서 폐기",
+      "StartupOfTheDevice": "충전소 시작",
+      "ResetOrReboot": "충전소 재설정 또는 재부팅",
+      "MaintenanceLoginAccepted": "유지보수 로그인 성공",
+      "FirmwareUpdated": "펌웨어 업데이트됨"
+    }
   },
   "loadManagement": {
     "allocationStrategy": "할당 전략",
@@ -6400,7 +6539,9 @@
       "mcp": "MCP",
       "proposal": "확인된 AI 작업"
     },
-    "entryTitle": "{{action}} ({{entity}})"
+    "entryTitle": "{{action}} ({{entity}})",
+    "actorKindUser": "사용자",
+    "entityName": "이름"
   },
   "maintenance": {
     "colType": "유형",

@@ -157,7 +157,8 @@ vi.mock('drizzle-orm', () => ({
   isNull: vi.fn(),
   ne: vi.fn(),
   ilike: vi.fn(),
-  sql: vi.fn(),
+  // `sql.raw` builds the sort direction of a sorted list.
+  sql: Object.assign(vi.fn(), { raw: vi.fn() }),
   desc: vi.fn(),
   count: vi.fn(),
   asc: vi.fn(),
@@ -543,6 +544,7 @@ describe('User routes', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           lastLoginAt: null,
           createdAt: '2025-01-01T00:00:00Z',
         },
@@ -591,6 +593,7 @@ describe('User routes', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           lastLoginAt: null,
           createdAt: '2025-01-01T00:00:00Z',
         },
@@ -609,6 +612,31 @@ describe('User routes', () => {
     expect(body).toHaveProperty('data');
     expect(body).toHaveProperty('total');
     expect(Array.isArray(body.data)).toBe(true);
+  });
+
+  it('GET /v1/users accepts every sort key in both directions', async () => {
+    for (const sort of ['name', 'email', 'role', 'status', 'lastLoginAt', 'createdAt']) {
+      for (const order of ['asc', 'desc']) {
+        setupDbResults([], [{ count: 0 }]);
+        const response = await app.inject({
+          method: 'GET',
+          url: `/users?sort=${sort}&order=${order}&status=active`,
+          headers: { authorization: `Bearer ${token}` },
+        });
+        expect(response.statusCode, `${sort} ${order}`).toBe(200);
+      }
+    }
+  });
+
+  it('GET /v1/users refuses a sort key it does not offer and an unknown order', async () => {
+    for (const query of ['sort=id', 'sort=users.id', 'sort=siteAccess', 'sort=name&order=up']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/users?${query}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode, query).toBe(400);
+    }
   });
 
   it('POST /v1/users creates a new user and sends invite email', async () => {
@@ -661,6 +689,7 @@ describe('User routes', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           lastLoginAt: null,
           createdAt: '2025-01-01T00:00:00Z',
         },
@@ -706,6 +735,7 @@ describe('User routes', () => {
       language: 'en',
       timezone: 'America/New_York',
       themePreference: 'light',
+      uiTheme: 'default',
       lastLoginAt: null,
       createdAt: '2025-01-01T00:00:00Z',
     };
@@ -778,6 +808,7 @@ describe('User routes', () => {
       language: 'es',
       timezone: 'Europe/Madrid',
       themePreference: 'dark',
+      uiTheme: 'default',
       hasAllSiteAccess: false,
       lastLoginAt: null,
       createdAt: new Date().toISOString(),
@@ -1051,6 +1082,7 @@ describe('User routes', () => {
         language: 'en',
         timezone: 'America/New_York',
         themePreference: 'light',
+        uiTheme: 'default',
         mfaEnabled: false,
         mfaMethod: null,
         totpSecretEnc: null,
@@ -1085,6 +1117,7 @@ describe('User routes', () => {
         language: 'en',
         timezone: 'America/New_York',
         themePreference: 'light',
+        uiTheme: 'default',
         mfaEnabled: false,
         mfaMethod: null,
         totpSecretEnc: null,
@@ -1120,6 +1153,7 @@ describe('User routes', () => {
         language: 'en',
         timezone: 'America/New_York',
         themePreference: 'light',
+        uiTheme: 'default',
         mfaEnabled: false,
         mfaMethod: null,
         totpSecretEnc: null,
@@ -1155,6 +1189,7 @@ describe('User routes', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           mfaEnabled: false,
           mfaMethod: null,
           totpSecretEnc: null,

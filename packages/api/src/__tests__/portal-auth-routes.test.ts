@@ -141,6 +141,11 @@ vi.mock('@evtivity/database', () => ({
   }),
   isPortalRegistrationEnabled: vi.fn().mockResolvedValue(true),
   resolveAccountBilling: vi.fn().mockResolvedValue(null),
+  getDriverDefaults: vi.fn().mockResolvedValue({
+    timezone: 'Europe/Berlin',
+    distanceUnit: 'km',
+    language: 'de',
+  }),
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -392,6 +397,7 @@ describe('Portal auth routes - handler logic', () => {
         language: 'en',
         timezone: 'America/New_York',
         themePreference: 'light',
+        uiTheme: 'default',
         distanceUnit: 'miles',
         priceDisplay: null,
         isActive: true,
@@ -427,6 +433,73 @@ describe('Portal auth routes - handler logic', () => {
       const cookies = parseCookies(response);
       expect(cookies.has('portal_token')).toBe(false);
       expect(cookies.has('portal_refresh')).toBe(false);
+    });
+
+    it('gives a registered driver the company language, timezone and distance unit', async () => {
+      const { db } = await import('@evtivity/database');
+      vi.mocked(db.insert).mockClear();
+      setupDbResults([], [{ id: DRIVER_ID, firstName: 'John', lastName: 'Doe' }], [], []);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/register',
+        payload: {
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          password: 'TestPassword1',
+        },
+      });
+      expect(response.statusCode).toBe(202);
+      const chain = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: { mock: { calls: unknown[][] } };
+      };
+      expect(chain.values.mock.calls[0]?.[0]).toMatchObject({
+        registrationSource: 'portal',
+        language: 'de',
+        timezone: 'Europe/Berlin',
+        distanceUnit: 'km',
+      });
+    });
+
+    it('keeps the language the visitor registered in', async () => {
+      const { db } = await import('@evtivity/database');
+      vi.mocked(db.insert).mockClear();
+      setupDbResults([], [{ id: DRIVER_ID, firstName: 'John', lastName: 'Doe' }], [], []);
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/register',
+        payload: {
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          password: 'TestPassword1',
+          language: 'ko',
+        },
+      });
+      expect(response.statusCode).toBe(202);
+      const chain = vi.mocked(db.insert).mock.results[0]?.value as {
+        values: { mock: { calls: unknown[][] } };
+      };
+      expect(chain.values.mock.calls[0]?.[0]).toMatchObject({
+        language: 'ko',
+        timezone: 'Europe/Berlin',
+        distanceUnit: 'km',
+      });
+    });
+
+    it('refuses a language the portal does not offer', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/portal/auth/register',
+        payload: {
+          firstName: 'John',
+          lastName: 'Doe',
+          email: 'john@example.com',
+          password: 'TestPassword1',
+          language: 'fr',
+        },
+      });
+      expect(response.statusCode).toBe(400);
     });
 
     it('answers 202 before the account is created, even when the insert returns no rows', async () => {
@@ -588,6 +661,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,
@@ -790,6 +864,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,
@@ -829,6 +904,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,
@@ -860,6 +936,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'de',
           timezone: null,
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'km',
           priceDisplay: null,
           isActive: true,
@@ -894,6 +971,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'de',
           timezone: null,
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'km',
           priceDisplay: null,
           isActive: true,
@@ -936,6 +1014,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: null,
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,
@@ -1129,6 +1208,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,
@@ -1244,6 +1324,7 @@ describe('Portal auth routes - handler logic', () => {
           language: 'en',
           timezone: 'America/New_York',
           themePreference: 'light',
+          uiTheme: 'default',
           distanceUnit: 'miles',
           priceDisplay: null,
           isActive: true,

@@ -3,15 +3,17 @@
 
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
 import { Shuffle, Upload } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { Select } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useStorageGuard } from '@/components/StorageUnavailableDialog';
 import { DriverAvatar } from '@/components/account/DriverAvatar';
 import { api } from '@/lib/api';
+import { usePortalFeatures, PORTAL_FEATURES_QUERY_KEY } from '@/hooks/use-portal-features';
 import { getErrorMessage } from '@/lib/error-message';
 import { cn } from '@/lib/utils';
 import { AVATAR_QUERY_KEY, uploadAvatarImage, type DriverAvatar as Avatar } from '@/lib/avatar';
@@ -72,12 +74,7 @@ export function AvatarEditor({
   const queryClient = useQueryClient();
   const lib = useAvatarLib();
   const live = mode === 'live';
-  const { data: features } = useQuery({
-    queryKey: ['portal-features'],
-    queryFn: () => api.get<{ avatarUploadEnabled?: boolean }>('/v1/portal/features'),
-    staleTime: 5 * 60_000,
-    enabled: live,
-  });
+  const { data: features } = usePortalFeatures({ enabled: live });
   const uploadEnabled = live && features?.avatarUploadEnabled === true;
 
   const [tab, setTab] = useState<'create' | 'upload'>('create');
@@ -109,7 +106,7 @@ export function AvatarEditor({
     } catch (err) {
       if (storage.handleUploadError(err)) {
         // Storage went away after the features read: hide the upload again.
-        void queryClient.invalidateQueries({ queryKey: ['portal-features'] });
+        void queryClient.invalidateQueries({ queryKey: PORTAL_FEATURES_QUERY_KEY });
       } else {
         setError(getErrorMessage(err, t, 'account.avatarSaveFailed'));
       }
@@ -181,23 +178,18 @@ export function AvatarEditor({
           className="h-28 w-28 text-4xl"
         />
         {uploadEnabled && (
-          <div className="inline-flex rounded-md border p-1" role="group">
-            {(['create', 'upload'] as const).map((m) => (
-              <Button
-                key={m}
-                type="button"
-                size="sm"
-                variant={tab === m ? 'default' : 'ghost'}
-                aria-pressed={tab === m}
-                onClick={() => {
-                  setTab(m);
-                  setError(null);
-                }}
-              >
-                {t(m === 'create' ? 'account.avatarCreate' : 'account.avatarUpload')}
-              </Button>
-            ))}
-          </div>
+          <SegmentedControl
+            aria-label={t('account.avatarSource')}
+            value={tab}
+            onValueChange={(m) => {
+              setTab(m);
+              setError(null);
+            }}
+            options={[
+              { value: 'create', label: t('account.avatarCreate') },
+              { value: 'upload', label: t('account.avatarUpload') },
+            ]}
+          />
         )}
       </div>
 

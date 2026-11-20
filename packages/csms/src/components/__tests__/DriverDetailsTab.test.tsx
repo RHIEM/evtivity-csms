@@ -25,7 +25,11 @@ vi.mock('../driver/DriverPortalAccessCard', () => ({ DriverPortalAccessCard: () 
 
 import { DriverDetailsTab } from '../driver/DriverDetailsTab';
 
-function renderTab(language = 'de', employeeNumber: string | null = null): void {
+function renderTab(
+  language = 'de',
+  distanceUnit = 'miles',
+  employeeNumber: string | null = null,
+): void {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
@@ -37,6 +41,8 @@ function renderTab(language = 'de', employeeNumber: string | null = null): void 
           email: 'jane@example.com',
           phone: null,
           language,
+          distanceUnit,
+          timezone: 'Europe/Berlin',
           isActive: true,
           employeeNumber,
           createdAt: '2026-10-01T00:00:00Z',
@@ -80,7 +86,7 @@ describe('DriverDetailsTab', () => {
 
   it('shows the employee number and removes it when the field is emptied', async () => {
     patchMock.mockResolvedValue({});
-    renderTab('de', '4711');
+    renderTab('de', 'miles', '4711');
     expect(screen.getByTestId('driver-employee-number').textContent).toBe('4711');
 
     fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
@@ -109,6 +115,45 @@ describe('DriverDetailsTab', () => {
       expect(patchMock).toHaveBeenCalledWith(
         '/v1/drivers/drv_1',
         expect.objectContaining({ employeeNumber: '0815' }),
+      );
+    });
+  });
+
+  it('shows the distance unit, edits it and sends it with the update', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('en', 'km');
+    expect(screen.getByText('drivers.distanceUnit')).toBeTruthy();
+    expect(screen.getByText('drivers.distanceUnitKm')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const select = screen.getByLabelText<HTMLSelectElement>('drivers.distanceUnit');
+    expect(select.value).toBe('km');
+    fireEvent.change(select, { target: { value: 'miles' } });
+    fireEvent.submit(select.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ distanceUnit: 'miles' }),
+      );
+    });
+  });
+
+  it('shows the timezone, edits it and sends it with the update', async () => {
+    patchMock.mockResolvedValue({});
+    renderTab('en', 'km');
+    expect(screen.getByText('drivers.timezone')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /common\.edit/ }));
+    const select = screen.getByLabelText<HTMLSelectElement>('drivers.timezone');
+    expect(select.value).toBe('Europe/Berlin');
+    fireEvent.change(select, { target: { value: 'Asia/Seoul' } });
+    fireEvent.submit(select.closest('form') as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        '/v1/drivers/drv_1',
+        expect.objectContaining({ timezone: 'Asia/Seoul' }),
       );
     });
   });

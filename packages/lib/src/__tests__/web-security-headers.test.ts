@@ -148,6 +148,21 @@ describe.each(['csms', 'portal'])('%s security headers', (app) => {
     });
   });
 
+  it('serves the UI font itself and lets the CSP load fonts from the own origin only', () => {
+    const csp = /add_header Content-Security-Policy "([^"]+)" always;/.exec(snippet)?.[1] ?? '';
+    expect(/font-src ([^;]*);/.exec(csp)?.[1]).toBe("'self'");
+    expect(/style-src ([^;]*);/.exec(csp)?.[1]).toBe("'self' 'unsafe-inline'");
+    expect(read('index.html')).not.toMatch(/fonts\.(googleapis|gstatic)\.com/);
+    const main = read('src/main.tsx');
+    for (const weight of [400, 500, 600, 700]) {
+      expect(main).toContain(`import '@fontsource/inter/${String(weight)}.css';`);
+    }
+    // The font loads before the app stylesheet, so --font-sans finds it.
+    expect(main.indexOf("import '@fontsource/inter/700.css';")).toBeLessThan(
+      main.indexOf("import './index.css';"),
+    );
+  });
+
   it('index.html carries no meta CSP and no inline script', () => {
     const html = read('index.html');
     expect(html).not.toContain('Content-Security-Policy');

@@ -54,6 +54,8 @@ interface EventSettingsLayoutProps {
   enabledMap?: Map<string, boolean>;
   defaultEnabled?: boolean;
   eventSwitch?: EventSwitch;
+  /** Shown for the selected event below its settings, whatever the channel (driver choice). */
+  renderEventExtra?: (selectedEvent: string) => React.ReactNode;
   renderSettingsExtra?: (props: {
     selectedEvent: string;
     channel: string;
@@ -80,6 +82,7 @@ export function EventSettingsLayout({
   enabledMap,
   defaultEnabled,
   eventSwitch,
+  renderEventExtra,
   renderSettingsExtra,
   isSettingsExtraDirty,
   onSave,
@@ -184,7 +187,7 @@ export function EventSettingsLayout({
               {sections.map((section) => (
                 <div key={section.title}>
                   {
-                    <p className="text-xs font-semibold text-link/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded bg-primary/5 border border-primary/10">
+                    <p className="text-xs font-semibold text-link/70 uppercase tracking-wide px-2 py-1.5 mt-2 rounded-sm bg-primary/5 border border-primary/10">
                       {section.title}
                     </p>
                   }
@@ -201,7 +204,7 @@ export function EventSettingsLayout({
                     return (
                       <div
                         key={et}
-                        className={`flex items-center justify-between p-2 rounded cursor-pointer ${
+                        className={`flex items-center justify-between p-2 rounded-sm cursor-pointer ${
                           isSelected ? 'bg-accent' : 'hover:bg-muted'
                         }`}
                         onClick={() => {
@@ -396,6 +399,8 @@ export function EventSettingsLayout({
                     </div>
                   </CardContent>
                 </Card>
+
+                {renderEventExtra?.(selectedEvent)}
 
                 {templateLocked && (
                   <p

@@ -7,11 +7,14 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { CreateButton } from '@/components/create-button';
 import { Badge } from '@/components/ui/badge';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
+import { usePortalFeatures } from '@/hooks/use-portal-features';
+import { DEFAULT_CURRENCY } from '@evtivity/lib/currency';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatDate } from '@/lib/utils';
 import { cancellationFeeApplies, cancellationFeeWarning } from '@/lib/reservation-fee';
@@ -33,13 +36,6 @@ interface Reservation {
 
 interface ReservationsResponse {
   data: Reservation[];
-}
-
-interface PortalFeatures {
-  reservationEnabled: boolean;
-  supportEnabled: boolean;
-  reservationCancellationWindowMinutes: number;
-  currency: string;
 }
 
 function statusVariant(
@@ -84,18 +80,14 @@ export function Reservations(): React.JSX.Element {
 
   // Cancellation policy lives on /v1/portal/features so the cancel dialog can
   // warn the holder about a potential fee before they confirm.
-  const { data: features } = useQuery({
-    queryKey: ['portal-features'],
-    queryFn: () => api.get<PortalFeatures>('/v1/portal/features'),
-    staleTime: 5 * 60_000,
-  });
+  const { data: features } = usePortalFeatures();
 
   // The fee amount comes with each reservation (gross, on the terms
   // snapshotted when it was made); the window comes from the features.
   function feeWillApply(reservation: Reservation): boolean {
     return (
       features != null &&
-      cancellationFeeApplies(reservation, features.reservationCancellationWindowMinutes)
+      cancellationFeeApplies(reservation, features.reservationCancellationWindowMinutes ?? 0)
     );
   }
 
@@ -132,24 +124,16 @@ export function Reservations(): React.JSX.Element {
         />
       </div>
 
-      {/* Upcoming / Past toggle */}
-      <div className="flex rounded-lg border">
-        {(['upcoming', 'past'] as const).map((tb) => (
-          <button
-            key={tb}
-            onClick={() => {
-              setTab(tb);
-            }}
-            className={`flex-1 py-2 text-center text-sm font-medium transition-colors ${
-              tab === tb
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            } ${tb === 'upcoming' ? 'rounded-l-lg' : 'rounded-r-lg'}`}
-          >
-            {t(`reservations.${tb}`)}
-          </button>
-        ))}
-      </div>
+      <SegmentedControl
+        aria-label={t('reservations.viewLabel')}
+        className="w-full"
+        value={tab}
+        onValueChange={setTab}
+        options={[
+          { value: 'upcoming', label: t('reservations.upcoming') },
+          { value: 'past', label: t('reservations.past') },
+        ]}
+      />
 
       {isLoading && <LoadingState />}
 
@@ -235,7 +219,11 @@ export function Reservations(): React.JSX.Element {
                 feeWillApply(pendingCancel) &&
                 features != null &&
                 pendingCancel.cancellationFee != null
-                  ? cancellationFeeWarning(t, pendingCancel.cancellationFee, features.currency)
+                  ? cancellationFeeWarning(
+                      t,
+                      pendingCancel.cancellationFee,
+                      features.currency ?? DEFAULT_CURRENCY,
+                    )
                   : '',
               ]
                 .filter(Boolean)

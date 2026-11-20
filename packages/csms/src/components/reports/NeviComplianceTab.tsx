@@ -10,6 +10,8 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { API_BASE_URL } from '@/lib/config';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
+import { useListSort } from '@/hooks/use-list-sort';
+import { SortableTableHead } from '@/components/ui/sortable-table-head';
 import { api } from '@/lib/api';
 import { getErrorMessage } from '@/lib/error-message';
 import { formatDateTime, useUserTimezone } from '@/lib/timezone';
@@ -23,6 +25,7 @@ import { RemoveButton } from '@/components/remove-button';
 import { GenerateButton } from '@/components/generate-button';
 import { DecimalInput } from '@/components/ui/decimal-input';
 import { Input } from '@/components/ui/input';
+import { DateInput } from '@/components/ui/date-input';
 import { DateTimeInput } from '@/components/ui/date-time-input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
@@ -56,6 +59,9 @@ const DOWNTIME_REASONS = [
 ] as const;
 
 type DowntimeReason = (typeof DOWNTIME_REASONS)[number];
+
+/** The sort keys of `GET /v1/nevi/excluded-downtime` (`neviDowntimeListSort` in the API). */
+const DOWNTIME_SORT_KEYS = ['station', 'evseId', 'reason', 'startedAt', 'endedAt'] as const;
 
 interface NeviReport {
   id: string;
@@ -638,6 +644,8 @@ function ExcludedDowntimeSection(): React.JSX.Element {
   if (stationFilter) extraParams['stationId'] = stationFilter;
   if (fromFilter) extraParams['from'] = fromFilter;
   if (toFilter) extraParams['to'] = toFilter;
+  const downtimeSort = useListSort(DOWNTIME_SORT_KEYS);
+  Object.assign(extraParams, downtimeSort.params);
 
   const {
     data: downtimeRecords,
@@ -780,13 +788,12 @@ function ExcludedDowntimeSection(): React.JSX.Element {
             <Label htmlFor="nevi-downtime-filter-from" className="leading-6">
               {t('nevi.startedAt')}
             </Label>
-            <Input
+            <DateInput
               id="nevi-downtime-filter-from"
-              type="date"
               aria-label={t('common.startDate')}
               value={fromFilter}
-              onChange={(e) => {
-                setFromFilter(e.target.value);
+              onChange={(value) => {
+                setFromFilter(value);
                 setPage(1);
               }}
               className="w-40"
@@ -796,13 +803,12 @@ function ExcludedDowntimeSection(): React.JSX.Element {
             <Label htmlFor="nevi-downtime-filter-to" className="leading-6">
               {t('nevi.endedAt')}
             </Label>
-            <Input
+            <DateInput
               id="nevi-downtime-filter-to"
-              type="date"
               aria-label={t('common.endDate')}
               value={toFilter}
-              onChange={(e) => {
-                setToFilter(e.target.value);
+              onChange={(value) => {
+                setToFilter(value);
                 setPage(1);
               }}
               className="w-40"
@@ -814,11 +820,21 @@ function ExcludedDowntimeSection(): React.JSX.Element {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>{t('nevi.station')}</TableHead>
-                <TableHead>{t('nevi.evseId')}</TableHead>
-                <TableHead>{t('nevi.reason')}</TableHead>
-                <TableHead>{t('nevi.startedAt')}</TableHead>
-                <TableHead>{t('nevi.endedAt')}</TableHead>
+                <SortableTableHead sortKey="station" sort={downtimeSort}>
+                  {t('nevi.station')}
+                </SortableTableHead>
+                <SortableTableHead sortKey="evseId" sort={downtimeSort}>
+                  {t('nevi.evseId')}
+                </SortableTableHead>
+                <SortableTableHead sortKey="reason" sort={downtimeSort}>
+                  {t('nevi.reason')}
+                </SortableTableHead>
+                <SortableTableHead sortKey="startedAt" sort={downtimeSort}>
+                  {t('nevi.startedAt')}
+                </SortableTableHead>
+                <SortableTableHead sortKey="endedAt" sort={downtimeSort}>
+                  {t('nevi.endedAt')}
+                </SortableTableHead>
                 <TableHead>{t('nevi.notes')}</TableHead>
                 <TableHead />
               </TableRow>

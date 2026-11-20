@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { eq, and, or, isNull, ilike, sql, inArray, desc, ne } from 'drizzle-orm';
+import { eq, and, or, isNull, ilike, sql, inArray, ne } from 'drizzle-orm';
 import argon2 from 'argon2';
 import { afterReply } from '../lib/after-reply.js';
 import { bearerToken, completePendingSsoLink, voidPendingSsoLink } from '../lib/sso-link.js';
@@ -111,6 +111,8 @@ import { generateUserToken, hashUserToken } from '../lib/user-token.js';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
+import type { ListSortParams } from '../lib/list-sort.js';
+import { userListSort } from '../lib/sorts/user-list-sort.js';
 import {
   successResponse,
   paginatedResponse,
@@ -133,6 +135,7 @@ import {
   sendFactorProofRefusal,
 } from '../lib/mfa-factor-proof.js';
 import { loginResponse } from '../lib/login-response.js';
+import { UI_THEMES } from '@evtivity/lib/ui-theme';
 import {
   SESSION_PROOF_ERROR_CODES,
   requireSessionProof,
@@ -345,7 +348,11 @@ const updateMeBody = z.object({
     .describe(
       'IANA timezone (e.g. America/New_York). An unknown zone returns 400 VALIDATION_ERROR.',
     ),
-  themePreference: z.enum(['light', 'dark']).optional(),
+  themePreference: z.enum(['light', 'dark']).optional().describe('Mode: light or dark'),
+  uiTheme: z
+    .enum(UI_THEMES)
+    .optional()
+    .describe('Theme of the own account: default, soft or high-contrast'),
 });
 
 const resetPasswordBody = z.object({
@@ -395,6 +402,7 @@ const userSelect = {
   language: users.language,
   timezone: users.timezone,
   themePreference: users.themePreference,
+  uiTheme: users.uiTheme,
   mfaEnabled: users.mfaEnabled,
   mfaMethod: users.mfaMethod,
   authSource: users.authSource,
@@ -419,7 +427,8 @@ const userItem = z
       .describe('Whether the user must reset their password on next login'),
     language: z.string().describe('Preferred UI language code'),
     timezone: z.string().describe('IANA timezone identifier'),
-    themePreference: z.string().describe('Preferred dashboard theme (light, dark, system)'),
+    themePreference: z.string().describe('Mode of the dashboard: light or dark'),
+    uiTheme: z.enum(UI_THEMES).describe('Theme of the dashboard: default, soft or high-contrast'),
     mfaEnabled: z.boolean().optional().describe('Whether the user signs in with a second factor'),
     mfaMethod: z
       .string()
@@ -777,6 +786,7 @@ export function userRoutes(app: FastifyInstance): void {
           language: user.language,
           timezone: user.timezone,
           themePreference: user.themePreference,
+          uiTheme: user.uiTheme,
         },
         role: role ? { id: role.id, name: role.name } : null,
       };
@@ -1368,6 +1378,7 @@ export function userRoutes(app: FastifyInstance): void {
           language: user.language,
           timezone: user.timezone,
           themePreference: user.themePreference,
+          uiTheme: user.uiTheme,
         },
         role: role ? { id: role.id, name: role.name } : null,
       };
@@ -1510,6 +1521,7 @@ export function userRoutes(app: FastifyInstance): void {
       if (body.language !== undefined) fields['language'] = body.language;
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
       if (body.themePreference !== undefined) fields['themePreference'] = body.themePreference;
+      if (body.uiTheme !== undefined) fields['uiTheme'] = body.uiTheme;
 
       const [before] = await db.select(userSelect).from(users).where(eq(users.id, userId));
       const [updated] = await db
@@ -1822,16 +1834,18 @@ export function userRoutes(app: FastifyInstance): void {
           paginationQuery.extend({
             roleId: ID_PARAMS.roleId.optional().describe('Filter by role ID'),
             status: z.enum(['active', 'inactive']).optional().describe('Filter by user status'),
+            ...userListSort.query,
           }),
         ),
         response: { 200: paginatedResponse(userItem) },
       },
     },
     async (request) => {
-      const query = request.query as z.infer<typeof paginationQuery> & {
-        roleId?: string;
-        status?: 'active' | 'inactive';
-      };
+      const query = request.query as z.infer<typeof paginationQuery> &
+        ListSortParams & {
+          roleId?: string;
+          status?: 'active' | 'inactive';
+        };
       const { page, limit, search, roleId, status } = query;
       const offset = (page - 1) * limit;
 
@@ -1865,7 +1879,7 @@ export function userRoutes(app: FastifyInstance): void {
           .select({ ...userSelect, ...userAvatarColumns })
           .from(users)
           .where(where)
-          .orderBy(desc(users.createdAt), desc(users.id))
+          .orderBy(...userListSort.orderBy(query))
           .limit(limit)
           .offset(offset)
           .then((rows) => withAvatars(rows)),
@@ -3259,6 +3273,7 @@ export function userRoutes(app: FastifyInstance): void {
           language: user.language,
           timezone: user.timezone,
           themePreference: user.themePreference,
+          uiTheme: user.uiTheme,
         },
         role: role ? { id: role.id, name: role.name } : null,
         ...(recoveryCodesRemaining != null ? { recoveryCodesRemaining } : {}),
@@ -4020,6 +4035,7 @@ export function userRoutes(app: FastifyInstance): void {
           language: users.language,
           timezone: users.timezone,
           themePreference: users.themePreference,
+          uiTheme: users.uiTheme,
           roleId: roles.id,
           roleName: roles.name,
         })
@@ -4040,6 +4056,7 @@ export function userRoutes(app: FastifyInstance): void {
                 language: signedIn.language,
                 timezone: signedIn.timezone,
                 themePreference: signedIn.themePreference,
+                uiTheme: signedIn.uiTheme,
               },
               role:
                 signedIn.roleId != null && signedIn.roleName != null
