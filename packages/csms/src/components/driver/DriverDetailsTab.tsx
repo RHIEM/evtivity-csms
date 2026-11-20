@@ -10,6 +10,8 @@ import { SaveButton } from '@/components/save-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LANGUAGES, LanguageSelect } from '@/components/ui/language-select';
+import { DistanceUnitSelect, useDistanceUnitLabel } from '@/components/ui/distance-unit-select';
+import { TimezoneSelect, timezoneLabel } from '@/components/ui/timezone-select';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { TabPanel } from '@/components/ui/tab-panel';
@@ -35,6 +37,8 @@ interface Driver {
   email: string | null;
   phone: string | null;
   language: string;
+  distanceUnit?: string;
+  timezone?: string;
   isActive: boolean;
   /** The operator's reference, e.g. a personnel number; printed on invoices. */
   employeeNumber?: string | null;
@@ -56,6 +60,7 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const canWrite = useHasPermission('drivers:write');
+  const distanceUnitLabel = useDistanceUnitLabel();
 
   const [editing, setEditing] = useState(false);
   const [firstName, setFirstName] = useState('');
@@ -64,6 +69,8 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
   const [phone, setPhone] = useState('');
   const [employeeNumber, setEmployeeNumber] = useState('');
   const [language, setLanguage] = useState('en');
+  const [distanceUnit, setDistanceUnit] = useState('miles');
+  const [driverTimezone, setDriverTimezone] = useState('America/New_York');
   const [isActive, setIsActive] = useState(true);
   const [hasSubmittedEdit, setHasSubmittedEdit] = useState(false);
 
@@ -75,6 +82,8 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
       phone?: string | null;
       employeeNumber?: string | null;
       language?: string;
+      distanceUnit?: string;
+      timezone?: string;
       isActive?: boolean;
     }) => api.patch<Driver>(`/v1/drivers/${driver.id}`, body),
     onSuccess: () => {
@@ -95,6 +104,8 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
     setPhone(driver.phone ?? '');
     setEmployeeNumber(driver.employeeNumber ?? '');
     setLanguage(driver.language);
+    setDistanceUnit(driver.distanceUnit ?? 'miles');
+    setDriverTimezone(driver.timezone ?? 'America/New_York');
     setIsActive(driver.isActive);
     updateMutation.reset();
     setEditing(true);
@@ -155,6 +166,8 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
           ? { employeeNumber: null }
           : {}),
       language,
+      distanceUnit,
+      timezone: driverTimezone,
       isActive,
     });
   }
@@ -265,6 +278,28 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
               <p className="text-sm text-muted-foreground">{t('drivers.languageHelp')}</p>
             </div>
             <div className="space-y-2">
+              <Label htmlFor="edit-distance-unit" className="leading-6">
+                {t('drivers.distanceUnit')}
+              </Label>
+              <DistanceUnitSelect
+                id="edit-distance-unit"
+                value={distanceUnit}
+                onChange={setDistanceUnit}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.distanceUnitHelp')}</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-timezone" className="leading-6">
+                {t('drivers.timezone')}
+              </Label>
+              <TimezoneSelect
+                id="edit-timezone"
+                value={driverTimezone}
+                onChange={setDriverTimezone}
+              />
+              <p className="text-sm text-muted-foreground">{t('drivers.timezoneHelp')}</p>
+            </div>
+            <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <Checkbox
                   id="edit-active"
@@ -320,6 +355,18 @@ export function DriverDetailsTab({ driver, timezone }: DriverDetailsTabProps): R
                 {LANGUAGES.find((lang) => lang.code === driver.language)?.label ?? driver.language}
               </dd>
             </div>
+            {driver.timezone != null && (
+              <div>
+                <dt className="text-muted-foreground">{t('drivers.timezone')}</dt>
+                <dd className="font-medium">{timezoneLabel(driver.timezone)}</dd>
+              </div>
+            )}
+            {driver.distanceUnit != null && (
+              <div>
+                <dt className="text-muted-foreground">{t('drivers.distanceUnit')}</dt>
+                <dd className="font-medium">{distanceUnitLabel(driver.distanceUnit)}</dd>
+              </div>
+            )}
             <div>
               <dt className="text-muted-foreground">{t('common.status')}</dt>
               <dd className="font-medium">

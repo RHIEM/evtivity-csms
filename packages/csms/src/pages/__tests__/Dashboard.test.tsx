@@ -92,6 +92,9 @@ vi.mock('@/components/ai/insights/ActiveInsightsWidget', () => ({
 vi.mock('@/components/charts/StationStatusChart', () => ({
   StationStatusChart: () => <div data-testid="chart" />,
 }));
+vi.mock('@/components/charts/SecurityEventsCard', () => ({
+  SecurityEventsCard: () => <div data-testid="security-events-card" />,
+}));
 vi.mock('@/components/charts/EnergyChart', () => ({
   EnergyChart: () => <div data-testid="chart" />,
 }));
@@ -125,6 +128,7 @@ vi.mock('@/components/charts/PaymentBreakdownChart', () => ({
 }));
 vi.mock('@/components/charts/Sparkline', () => ({ Sparkline: () => null }));
 vi.mock('@/components/SessionsTable', () => ({
+  ALL_SESSIONS_SORT_KEYS: ['station'],
   SessionsTable: (props: {
     isLoading?: boolean;
     sessions?: unknown[];
@@ -161,7 +165,7 @@ vi.stubGlobal(
   },
 );
 
-import { Dashboard, statGridClass } from '../Dashboard';
+import { Dashboard, statCardCount, statGridClass, statGridColumns } from '../Dashboard';
 import { useAuth } from '@/lib/auth';
 import {
   defaultDashboardLayout,
@@ -173,8 +177,9 @@ import {
 async function renderDashboard(
   role: string,
   permissions: string[] = ['dashboard:read', 'payments:read'],
+  hasAllSiteAccess = true,
 ): Promise<void> {
-  useAuth.setState({ role, permissions, hasAllSiteAccess: true });
+  useAuth.setState({ role, permissions, hasAllSiteAccess });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
@@ -444,6 +449,37 @@ describe('Dashboard layout customizing', () => {
     '/v1/dashboard/free-vend',
   ];
 
+  it('hides the Security Events card by default, also with securityEvents:read', async () => {
+    await renderDashboard('operator', ['dashboard:read', 'securityEvents:read']);
+    expect(screen.queryByTestId('security-events-card')).toBeNull();
+  });
+
+  it('shows the Security Events card right after the station status chart once the layout shows it', async () => {
+    savedLayout({
+      version: 1,
+      charts: defaultDashboardLayout().charts.map((c) =>
+        c.id === 'chart.securityEvents' ? { ...c, hidden: false } : c,
+      ),
+    });
+    await renderDashboard('operator', ['dashboard:read', 'securityEvents:read']);
+    const card = await screen.findByTestId('security-events-card');
+    const status = screen.getAllByTestId('chart')[0] as HTMLElement;
+    expect(before(status, card)).toBe(true);
+    const energy = screen.getAllByTestId('chart')[1] as HTMLElement;
+    expect(before(card, energy)).toBe(true);
+  });
+
+  it('hides the Security Events card without securityEvents:read, also when the layout shows it', async () => {
+    savedLayout({
+      version: 1,
+      charts: defaultDashboardLayout().charts.map((c) =>
+        c.id === 'chart.securityEvents' ? { ...c, hidden: false } : c,
+      ),
+    });
+    await renderDashboard('viewer', ['dashboard:read']);
+    expect(screen.queryByTestId('security-events-card')).toBeNull();
+  });
+
   it('hides Active insights without aiInsights:read', async () => {
     await renderDashboard('admin');
     expect(screen.queryByTestId('active-insights')).toBeNull();
@@ -616,5 +652,65 @@ describe('Dashboard layout customizing', () => {
     expect(screen.getByRole('button', { name: 'dashboard.customize' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'dashboard.trend' }));
     expect(screen.queryByRole('button', { name: 'dashboard.customize' })).toBeNull();
+  });
+});
+
+describe('dashboard stat row column count', () => {
+  it('counts each card inside a fragment, so a four-card row gets four columns', () => {
+    // The Historical money cards sit in a fragment; counting it as one card gave
+    // a row of four cards three columns, which wrapped onto the charts below.
+    const row = (
+      <>
+        <p>Day Energy</p>
+        <p>Day Sessions</p>
+        <>
+          <p>Day Revenue</p>
+          <p>Day Transactions</p>
+        </>
+      </>
+    );
+    expect(statCardCount(row)).toBe(4);
+    expect(statGridClass(statCardCount(row))).toBe('grid gap-4 grid-cols-2 lg:grid-cols-4');
+    expect(statCardCount([<p key="a">A</p>, false, null, <p key="b">B</p>])).toBe(2);
+  });
+});
+
+describe('live health row for a site-restricted user', () => {
+  const rowOf = (title: string): HTMLElement =>
+    screen.getByText(title).parentElement?.parentElement?.parentElement as HTMLElement;
+
+  it('keeps six cards across for an all-site user', async () => {
+    await renderDashboard('admin', ['dashboard:read'], true);
+    expect(screen.getByText('dashboard.pingLatency')).toBeTruthy();
+    expect(rowOf('dashboard.totalPorts').className).toBe(
+      'grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-6',
+    );
+  });
+
+  it('lays the four cards left without the ping cards four across, with no gaps', async () => {
+    await renderDashboard('operator', ['dashboard:read'], false);
+    expect(screen.queryByText('dashboard.pingLatency')).toBeNull();
+    const row = rowOf('dashboard.totalPorts');
+    expect(row.children).toHaveLength(4);
+    expect(row.className).toBe(statGridClass(4));
+  });
+});
+
+describe('stat rows fill every viewport', () => {
+  // Every card count a dashboard row can hold: Live 6, 4 (no all-site access)
+  // and the money grids 4 and 2; Historical 4, 2 and 1; Trend 8 and 6.
+  it.each([1, 2, 3, 4, 6, 8])('puts %i cards in whole rows on phones, md, lg and xl', (count) => {
+    for (const cols of statGridColumns(count)) {
+      expect(count % cols).toBe(0);
+    }
+  });
+
+  it('keeps the layouts that already filled their rows', () => {
+    expect(statGridClass(1)).toBe('grid gap-4 grid-cols-1');
+    expect(statGridClass(2)).toBe('grid gap-4 grid-cols-1 md:grid-cols-2');
+    expect(statGridClass(3)).toBe('grid gap-4 grid-cols-1 md:grid-cols-3');
+    expect(statGridClass(4)).toBe('grid gap-4 grid-cols-2 lg:grid-cols-4');
+    expect(statGridClass(6)).toBe('grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-6');
+    expect(statGridClass(8)).toBe('grid gap-4 grid-cols-2 lg:grid-cols-4');
   });
 });

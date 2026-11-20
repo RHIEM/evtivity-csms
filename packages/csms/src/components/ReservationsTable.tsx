@@ -16,11 +16,25 @@ import { Pagination } from '@/components/ui/pagination';
 import { Select } from '@/components/ui/select';
 import { TabPanel } from '@/components/ui/tab-panel';
 import { EmptyState, ErrorState, LoadingState, TableStateRow } from '@/components/ui/content-state';
+import { sessionLabel } from '@/lib/session-label';
 import { formatDateTime } from '@/lib/timezone';
 import { usePaginatedQuery } from '@/hooks/use-paginated-query';
+import { useListSort } from '@/hooks/use-list-sort';
+import { SortableTableHead } from '@/components/ui/sortable-table-head';
 import { useState } from 'react';
 import { FilterPopover } from '@/components/FilterBar';
 import { reservationStatusVariant } from '@/lib/status-variants';
+
+/** The sort keys of `GET /v1/reservations` (`reservationListSort` in the API). */
+export const RESERVATION_SORT_KEYS = [
+  'reservationId',
+  'station',
+  'driver',
+  'status',
+  'startsAt',
+  'expiresAt',
+  'createdAt',
+] as const;
 
 interface Reservation {
   id: string;
@@ -37,6 +51,7 @@ interface Reservation {
   expiresAt: string;
   createdAt: string;
   sessionId: string | null;
+  sessionStartedAt?: string | null;
 }
 
 function getStatusLabel(status: string, t: (key: string) => string): string {
@@ -74,8 +89,9 @@ export function ReservationsTable({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [statusFilter, setStatusFilter] = useState('');
+  const sort = useListSort(RESERVATION_SORT_KEYS);
 
-  const extraParams: Record<string, string> = {};
+  const extraParams: Record<string, string> = { ...sort.params };
   if (siteId != null) extraParams.siteId = siteId;
   if (stationId != null) extraParams.stationId = stationId;
   if (statusFilter !== '') extraParams.status = statusFilter;
@@ -140,14 +156,30 @@ export function ReservationsTable({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>{t('reservations.reservationId')}</TableHead>
-              {hideStationName !== true && <TableHead>{t('reservations.stationName')}</TableHead>}
-              <TableHead>{t('reservations.driverName')}</TableHead>
-              <TableHead>{t('common.status')}</TableHead>
+              <SortableTableHead sortKey="reservationId" sort={sort}>
+                {t('reservations.reservationId')}
+              </SortableTableHead>
+              {hideStationName !== true && (
+                <SortableTableHead sortKey="station" sort={sort}>
+                  {t('reservations.stationName')}
+                </SortableTableHead>
+              )}
+              <SortableTableHead sortKey="driver" sort={sort}>
+                {t('reservations.driverName')}
+              </SortableTableHead>
+              <SortableTableHead sortKey="status" sort={sort}>
+                {t('common.status')}
+              </SortableTableHead>
               <TableHead>{t('reservations.session')}</TableHead>
-              <TableHead>{t('reservations.startsAt')}</TableHead>
-              <TableHead>{t('reservations.expiresAt')}</TableHead>
-              <TableHead>{t('reservations.createdAt')}</TableHead>
+              <SortableTableHead sortKey="startsAt" sort={sort}>
+                {t('reservations.startsAt')}
+              </SortableTableHead>
+              <SortableTableHead sortKey="expiresAt" sort={sort}>
+                {t('reservations.expiresAt')}
+              </SortableTableHead>
+              <SortableTableHead sortKey="createdAt" sort={sort}>
+                {t('reservations.createdAt')}
+              </SortableTableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -170,7 +202,9 @@ export function ReservationsTable({
                   void navigate(`/reservations/${r.id}`);
                 }}
               >
-                <TableCell className="text-muted-foreground">{r.id}</TableCell>
+                <TableCell className="whitespace-nowrap font-medium text-link">
+                  #{r.reservationId}
+                </TableCell>
                 {hideStationName !== true && (
                   <TableCell className="whitespace-nowrap">
                     <Link
@@ -213,7 +247,11 @@ export function ReservationsTable({
                         e.stopPropagation();
                       }}
                     >
-                      {r.sessionId}
+                      {sessionLabel(
+                        t,
+                        { stationOcppId: r.stationOcppId, startedAt: r.sessionStartedAt },
+                        timezone,
+                      )}
                     </Link>
                   ) : (
                     <span className="text-muted-foreground">n/a</span>

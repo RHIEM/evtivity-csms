@@ -6,6 +6,7 @@ import type { Dispatch, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTab } from '@/hooks/use-tab';
 import { AutochargeSettings } from '@/components/settings/AutochargeSettings';
+import { RfidSelfServiceSettings } from '@/components/settings/RfidSelfServiceSettings';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { SaveButton } from '@/components/save-button';
 import { Spinner } from '@/components/ui/spinner';
@@ -459,6 +460,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
         <TabsTrigger value="autocharge">{t('settings.autocharge')}</TabsTrigger>
         <TabsTrigger value="reservation">{t('settings.reservation')}</TabsTrigger>
         <TabsTrigger value="support">{t('settings.support')}</TabsTrigger>
+        <TabsTrigger value="rfidCards">{t('settings.rfidCards')}</TabsTrigger>
         <TabsTrigger value="fleet">{t('settings.fleet')}</TabsTrigger>
         <TabsTrigger value="depot-systems">{t('depotSystems.tab')}</TabsTrigger>
         <TabsTrigger value="guest">{t('settings.guestCharging')}</TabsTrigger>
@@ -811,13 +813,13 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
                   </Button>
                 </div>
                 {pncSaveMutation.isSuccess && (
-                  <p className="text-sm text-green-600">{t('settings.pncSaved')}</p>
+                  <p className="text-sm text-success">{t('settings.pncSaved')}</p>
                 )}
                 {pncSaveMutation.isError && (
                   <p className="text-sm text-destructive">{t('settings.pncSaveFailed')}</p>
                 )}
                 {pncTestMutation.isSuccess && (
-                  <p className="text-sm text-green-600">{t('settings.pncTestSuccess')}</p>
+                  <p className="text-sm text-success">{t('settings.pncTestSuccess')}</p>
                 )}
                 {pncTestMutation.isError && (
                   <p className="text-sm text-destructive">{t('settings.pncTestFailed')}</p>
@@ -883,6 +885,9 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
             </div>
           </CardContent>
         </Card>
+      </TabsContent>
+      <TabsContent value="rfidCards" className="mt-4">
+        <RfidSelfServiceSettings settings={settings} />
       </TabsContent>
       <TabsContent value="fleet" className="mt-4">
         <Card>
@@ -1414,7 +1419,7 @@ export function IntegrationsSettings({ settings }: IntegrationsSettingsProps): R
               }}
             />
             {ftpMutation.isSuccess && (
-              <p className="text-sm text-green-600">{t('settings.ftpSaved')}</p>
+              <p className="text-sm text-success">{t('settings.ftpSaved')}</p>
             )}
             {ftpMutation.isError && (
               <p className="text-sm text-destructive">{t('settings.ftpSaveFailed')}</p>

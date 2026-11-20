@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 EVtivity. All rights reserved.
 // SPDX-License-Identifier: BUSL-1.1
 
-import { Children, useEffect, useRef, useState } from 'react';
+import { Children, Fragment, isValidElement, useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { ArrowUp, ArrowDown, ArrowRight, ChevronDown } from 'lucide-react';
@@ -13,15 +13,16 @@ import { useHasAllSiteAccess, useHasPermission } from '@/lib/auth';
 import { EnergyChart } from '@/components/charts/EnergyChart';
 import { SessionsChart } from '@/components/charts/SessionsChart';
 import { Sparkline } from '@/components/charts/Sparkline';
+import { SecurityEventsCard } from '@/components/charts/SecurityEventsCard';
 import { StationStatusChart } from '@/components/charts/StationStatusChart';
 import { UtilizationChart } from '@/components/charts/UtilizationChart';
 import { PeakUsageChart } from '@/components/charts/PeakUsageChart';
 import { StationMapChart } from '@/components/charts/StationMapChart';
 import { RevenueChart } from '@/components/charts/RevenueChart';
-import { SessionsTable } from '@/components/SessionsTable';
+import { ALL_SESSIONS_SORT_KEYS, SessionsTable } from '@/components/SessionsTable';
 import { Pagination } from '@/components/ui/pagination';
 import { ScrollSnapRow } from '@/components/ui/scroll-snap-row';
-import type { Session } from '@/components/SessionsTable';
+import type { Session, SessionSortKey } from '@/components/SessionsTable';
 import { useUserTimezone } from '@/lib/timezone';
 import { PaymentBreakdownChart } from '@/components/charts/PaymentBreakdownChart';
 import { LoadErrorRetry, queryState, type QueryState } from '@/components/charts/ChartBody';
@@ -29,6 +30,7 @@ import { DateRangeControl } from '@/components/DateRangeControl';
 import { useDateRange } from '@/hooks/useDateRange';
 import { localDateString } from '@/lib/date-range';
 import { useUpdateCheck } from '@/hooks/use-update-check';
+import { useListSort, type ListSort } from '@/hooks/use-list-sort';
 import { ActiveInsightsWidget } from '@/components/ai/insights/ActiveInsightsWidget';
 import { useFeatureFlags } from '@/hooks/use-feature-flags';
 import { useDashboardLayout } from '@/hooks/use-dashboard-layout';
@@ -86,25 +88,69 @@ interface TrendDay extends SnapshotData {
 const STAT_VALUE_CLASS =
   'text-base @min-[6.5rem]:text-lg @min-[9rem]:text-2xl font-bold whitespace-nowrap';
 
-/** Rows of six stat cards; three per row below xl, where six leave no room for the values. */
-const SIX_CARD_GRID_CLASS = 'grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-6';
+/** The most columns a stat row may use from each breakpoint up: values need room. */
+const STAT_GRID_MAX_COLUMNS = [
+  ['', 2],
+  ['md:', 3],
+  ['lg:', 4],
+  ['xl:', 6],
+] as const;
+
+/** Full class names, so Tailwind finds every one in the source. */
+const GRID_COLS: Record<string, Record<number, string>> = {
+  '': { 1: 'grid-cols-1', 2: 'grid-cols-2' },
+  'md:': { 1: 'md:grid-cols-1', 2: 'md:grid-cols-2', 3: 'md:grid-cols-3' },
+  'lg:': { 1: 'lg:grid-cols-1', 2: 'lg:grid-cols-2', 3: 'lg:grid-cols-3', 4: 'lg:grid-cols-4' },
+  'xl:': {
+    1: 'xl:grid-cols-1',
+    2: 'xl:grid-cols-2',
+    3: 'xl:grid-cols-3',
+    4: 'xl:grid-cols-4',
+    5: 'xl:grid-cols-5',
+    6: 'xl:grid-cols-6',
+  },
+};
 
 /**
- * Columns of a stat card row by its card count, so a short row fits its
- * cards instead of leaving empty columns: one card spans the row; two or
- * three stack on phones and share the row from md; four or more keep two
- * columns on phones and four from lg.
+ * The columns of a stat row at each breakpoint: the most that divide the card
+ * count, so every row is full at every width. Rows of two or three cards stack
+ * on phones, where two narrow cards would cut off their values.
  */
+export function statGridColumns(count: number): number[] {
+  const n = Math.max(1, count);
+  return STAT_GRID_MAX_COLUMNS.map(([prefix, max]) => {
+    const limit = prefix === '' && n <= 3 ? 1 : max;
+    let cols = Math.min(limit, n);
+    while (n % cols !== 0) cols -= 1;
+    return cols;
+  });
+}
+
+/** Grid classes of a stat row by its card count (`statGridColumns`). */
 export function statGridClass(count: number): string {
-  if (count <= 1) return 'grid gap-4 grid-cols-1';
-  if (count === 2) return 'grid gap-4 grid-cols-1 md:grid-cols-2';
-  if (count === 3) return 'grid gap-4 grid-cols-1 md:grid-cols-3';
-  return 'grid gap-4 grid-cols-2 lg:grid-cols-4';
+  const classes = ['grid', 'gap-4'];
+  let previous = 0;
+  statGridColumns(count).forEach((cols, i) => {
+    const prefix = STAT_GRID_MAX_COLUMNS[i]?.[0] ?? '';
+    if (cols !== previous) classes.push(GRID_COLS[prefix]?.[cols] ?? '');
+    previous = cols;
+  });
+  return classes.join(' ');
+}
+
+/** The cards a row renders: a fragment around some of them counts each card, not one. */
+export function statCardCount(children: React.ReactNode): number {
+  return Children.toArray(children).reduce<number>((count, child) => {
+    if (isValidElement<{ children?: React.ReactNode }>(child) && child.type === Fragment) {
+      return count + statCardCount(child.props.children);
+    }
+    return count + 1;
+  }, 0);
 }
 
 /** A row of stat cards laid out by `statGridClass` (every dashboard stat row). */
 function StatGrid({ children }: { children: React.ReactNode }): React.JSX.Element {
-  return <div className={statGridClass(Children.toArray(children).length)}>{children}</div>;
+  return <div className={statGridClass(statCardCount(children))}>{children}</div>;
 }
 
 type DashboardMode = 'live' | 'historical' | 'trend';
@@ -560,6 +606,7 @@ function DashboardBody({
   const canReadInsights = useHasPermission('aiInsights:read');
   // The site Layout tab reads with sites:read.
   const canReadSites = useHasPermission('sites:read');
+  const canReadSecurityEvents = useHasPermission('securityEvents:read');
   const featureFlags = useFeatureFlags();
   const timezone = useUserTimezone();
   const dashboardLayout = useDashboardLayout();
@@ -681,11 +728,25 @@ function DashboardBody({
   });
 
   const [activeSessionsPage, setActiveSessionsPage] = useState(1);
+  const activeSessionsSort = useListSort<SessionSortKey>(ALL_SESSIONS_SORT_KEYS);
+  // A new sort starts again at page 1.
+  const activeSessionsTableSort: ListSort<SessionSortKey> = {
+    ...activeSessionsSort,
+    toggle: (key) => {
+      setActiveSessionsPage(1);
+      activeSessionsSort.toggle(key);
+    },
+  };
   const activeSessions = useQuery({
-    queryKey: ['sessions', 'active', activeSessionsPage],
+    queryKey: ['sessions', 'active', activeSessionsPage, activeSessionsSort.params],
     queryFn: () =>
       api.get<{ data: Session[]; total: number }>(
-        `/v1/sessions?page=${String(activeSessionsPage)}&limit=${String(ACTIVE_SESSIONS_PAGE_SIZE)}&status=active`,
+        `/v1/sessions?${new URLSearchParams({
+          page: String(activeSessionsPage),
+          limit: String(ACTIVE_SESSIONS_PAGE_SIZE),
+          status: 'active',
+          ...activeSessionsSort.params,
+        }).toString()}`,
       ),
     refetchInterval: 30_000,
     enabled: canSeeSessions,
@@ -893,7 +954,7 @@ function DashboardBody({
 
     return (
       <>
-        <div className={SIX_CARD_GRID_CLASS}>
+        <StatGrid>
           <StatCard
             title={t('dashboard.totalStations')}
             value={stats?.totalStations ?? 0}
@@ -945,9 +1006,10 @@ function DashboardBody({
             state={carbonState}
             valueClassName="text-success"
           />
-        </div>
+        </StatGrid>
 
-        <div className={SIX_CARD_GRID_CLASS}>
+        {/* The ping cards cover every site: a site-restricted user's row holds four. */}
+        <StatGrid>
           <StatCard
             title={t('dashboard.energyDelivered')}
             value={formatEnergy(stats?.totalEnergyWh ?? 0)}
@@ -1013,7 +1075,7 @@ function DashboardBody({
             deltaLabel={deltaLabel}
             state={uptimeState}
           />
-        </div>
+        </StatGrid>
 
         {canSeeMoney && (
           <ScrollSnapRow
@@ -1332,6 +1394,11 @@ function DashboardBody({
         />
       ),
     },
+    'chart.securityEvents': {
+      name: t('dashboard.securityEvents.title'),
+      visible: canReadSecurityEvents,
+      render: () => <SecurityEventsCard />,
+    },
     'chart.utilization': {
       name: t('charts.topUtilization'),
       visible: true,
@@ -1436,6 +1503,8 @@ function DashboardBody({
                   timezone={timezone}
                   isLoading={activeSessions.isLoading}
                   emptyMessage={t('charts.noActiveSessions')}
+                  sort={activeSessionsTableSort}
+                  sortKeys={ALL_SESSIONS_SORT_KEYS}
                 />
                 {/* SessionsTable renders no page controls: every caller adds them. */}
                 <Pagination
@@ -1534,13 +1603,18 @@ function DashboardBody({
           isResetting={dashboardLayout.isResetting}
         />
       )}
-      <div className="relative">
+      {/* Historical and Trend keep the Live cards' height so the charts do not
+          jump between modes; both share one grid cell, so the taller one sets it. */}
+      <div className="grid">
         {mode !== 'live' && (
-          <div className="hidden lg:block invisible space-y-4" aria-hidden="true">
+          <div
+            className="invisible col-start-1 row-start-1 hidden space-y-4 lg:block"
+            aria-hidden="true"
+          >
             {renderLiveStatCards()}
           </div>
         )}
-        <div className={mode !== 'live' ? 'space-y-4 lg:absolute lg:inset-0' : 'space-y-4'}>
+        <div className="col-start-1 row-start-1 space-y-4">
           {mode === 'live' && renderLiveStatCards()}
           {mode === 'historical' && renderHistoricalStatCards()}
           {mode === 'trend' && renderTrendStatCards()}

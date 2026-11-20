@@ -58,6 +58,9 @@ function pgError(code: string): Error {
 vi.mock('@evtivity/database', async () => ({
   ...(await import('./helpers/conformance-station-mocks.js')).conformanceStationMocks(),
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
+  getDriverDefaults: vi.fn(() =>
+    Promise.resolve({ timezone: 'America/New_York', distanceUnit: 'miles', language: 'en' }),
+  ),
   db: {
     select: vi.fn(() => makeChain('select')),
     selectDistinct: vi.fn(() => makeChain('selectDistinct')),
@@ -114,7 +117,7 @@ vi.mock('drizzle-orm', () => ({
   or: vi.fn(),
   ilike: vi.fn(),
   inArray: vi.fn(),
-  sql: vi.fn(),
+  sql: Object.assign(vi.fn(), { raw: vi.fn() }),
   desc: vi.fn(),
   asc: vi.fn(),
 }));
@@ -950,6 +953,45 @@ describe('Driver routes (operator), uncovered paths', () => {
   });
 
   describe('GET /drivers/:id/sessions', () => {
+    it('accepts every sort key in both directions', async () => {
+      for (const sort of [
+        'sessionId',
+        'station',
+        'driver',
+        'status',
+        'startedAt',
+        'duration',
+        'energy',
+        'cost',
+      ]) {
+        for (const order of ['asc', 'desc']) {
+          setupDbResults([{ id: DRIVER_ID }], [], [{ count: 0 }]);
+          const response = await app.inject({
+            method: 'GET',
+            url: `/drivers/${DRIVER_ID}/sessions?sort=${sort}&order=${order}`,
+            headers: auth,
+          });
+          expect(response.statusCode, `${sort} ${order}`).toBe(200);
+        }
+      }
+    });
+
+    it('refuses a sort key it does not offer and an unknown order', async () => {
+      for (const query of [
+        'sort=vehicle',
+        'sort=id',
+        'sort=charging_sessions.id',
+        'sort=energy&order=up',
+      ]) {
+        const response = await app.inject({
+          method: 'GET',
+          url: `/drivers/${DRIVER_ID}/sessions?${query}`,
+          headers: auth,
+        });
+        expect(response.statusCode, query).toBe(400);
+      }
+    });
+
     it('returns 404 when the driver does not exist', async () => {
       setupDbResults([], [], [{ count: 0 }]);
       const res = await app.inject({
@@ -1008,6 +1050,43 @@ describe('Driver routes (operator), uncovered paths', () => {
   });
 
   describe('GET /drivers/:id/reservations', () => {
+    it('accepts every sort key in both directions', async () => {
+      for (const sort of [
+        'reservationId',
+        'station',
+        'status',
+        'startsAt',
+        'expiresAt',
+        'cancellationFee',
+      ]) {
+        for (const order of ['asc', 'desc']) {
+          setupDbResults([{ id: DRIVER_ID }], [], [{ count: 0 }]);
+          const response = await app.inject({
+            method: 'GET',
+            url: `/drivers/${DRIVER_ID}/reservations?sort=${sort}&order=${order}`,
+            headers: auth,
+          });
+          expect(response.statusCode, `${sort} ${order}`).toBe(200);
+        }
+      }
+    });
+
+    it('refuses a sort key it does not offer and an unknown order', async () => {
+      for (const query of [
+        'sort=cancelReason',
+        'sort=id',
+        'sort=reservations.id',
+        'sort=status&order=up',
+      ]) {
+        const response = await app.inject({
+          method: 'GET',
+          url: `/drivers/${DRIVER_ID}/reservations?${query}`,
+          headers: auth,
+        });
+        expect(response.statusCode, query).toBe(400);
+      }
+    });
+
     it('returns 404 when the driver does not exist', async () => {
       setupDbResults([], [], [{ count: 0 }]);
       const res = await app.inject({

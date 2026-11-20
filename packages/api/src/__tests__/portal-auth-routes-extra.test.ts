@@ -133,6 +133,11 @@ vi.mock('@evtivity/database', () => ({
   getRecaptchaConfig: vi.fn().mockResolvedValue(null),
   getMfaConfig: vi.fn(),
   isPortalRegistrationEnabled: vi.fn().mockResolvedValue(true),
+  getDriverDefaults: vi.fn().mockResolvedValue({
+    timezone: 'America/New_York',
+    distanceUnit: 'miles',
+    language: 'en',
+  }),
   pgErrorCode: (err: unknown) => (err as { code?: string } | null)?.code,
   PG_UNIQUE_VIOLATION: '23505',
 }));
@@ -271,6 +276,7 @@ const driverRow = {
   language: 'en',
   timezone: 'America/New_York',
   themePreference: 'light',
+  uiTheme: 'default',
   distanceUnit: 'miles',
   priceDisplay: null,
   isActive: true,
@@ -515,6 +521,10 @@ describe('Portal auth routes - extra coverage', () => {
         phone: '+12015550112',
         passwordHash: '$argon2id$hashed_password',
         registrationSource: 'portal',
+        // The company defaults (Settings > Company).
+        language: 'en',
+        timezone: 'America/New_York',
+        distanceUnit: 'miles',
       });
       expect(tokenInsert).toMatchObject({ driverId: DRIVER_ID, type: 'email_verification' });
       const expiresAt = (tokenInsert as { expiresAt: Date }).expiresAt.getTime();

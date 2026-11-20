@@ -1,6 +1,6 @@
 {
   "name": "@evtivity/lib",
-  "version": "0.1.50",
+  "version": "0.1.51",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -19,6 +19,9 @@
     },
     "./admin-equivalent": {
       "import": "./src/admin-equivalent.ts"
+    },
+    "./calendar-date": {
+      "import": "./src/calendar-date.ts"
     },
     "./currency": {
       "import": "./src/currency.ts"
@@ -104,6 +107,9 @@
     "./secret-config": {
       "import": "./src/secret-config.ts"
     },
+    "./security-severity": {
+      "import": "./src/security-severity.ts"
+    },
     "./safe-fetch": {
       "import": "./src/safe-fetch.ts"
     },
@@ -137,11 +143,20 @@
     "./account-avatar": {
       "import": "./src/account-avatar.ts"
     },
+    "./ui-theme": {
+      "import": "./src/ui-theme.ts"
+    },
+    "./ui-theme-tokens": {
+      "import": "./src/ui-theme-tokens.ts"
+    },
     "./storage-upload": {
       "import": "./src/storage-upload.ts"
     },
     "./languages": {
       "import": "./src/languages.ts"
+    },
+    "./driver-defaults": {
+      "import": "./src/driver-defaults.ts"
     },
     "./notification-events": {
       "import": "./src/notification-events.ts"

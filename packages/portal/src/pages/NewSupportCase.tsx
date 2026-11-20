@@ -10,8 +10,10 @@ import { Select } from '@/components/ui/select';
 import { PageHeader } from '@/components/PageHeader';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { cn } from '@/lib/utils';
+import { cn, formatDate } from '@/lib/utils';
+import { useDriverTimezone } from '@/lib/timezone';
 import { api } from '@/lib/api';
+import { PORTAL_FEATURES_QUERY_KEY } from '@/hooks/use-portal-features';
 import { getErrorMessage } from '@/lib/error-message';
 import { ApiError } from '@/lib/api';
 import { LoadingLogo } from '@/components/loading-logo';
@@ -37,6 +39,13 @@ export function NewSupportCase(): React.JSX.Element {
   const sessionId = searchParams.get('sessionId') ?? undefined;
   const stationId = searchParams.get('stationId') ?? undefined;
   const stationName = searchParams.get('stationName') ?? undefined;
+  const sessionStartedAt = searchParams.get('sessionStartedAt') ?? undefined;
+  const timezone = useDriverTimezone();
+  // The linked session by its station and start time, never its internal id.
+  const sessionText =
+    [stationName, sessionStartedAt != null ? formatDate(sessionStartedAt, timezone) : undefined]
+      .filter((part): part is string => part != null && part !== '')
+      .join(', ') || t('supportCases.linkedSessionFallback');
 
   const [category, setCategory] = useState<string>('general_inquiry');
   const [subject, setSubject] = useState(stationName != null ? `Issue at ${stationName}` : '');
@@ -66,7 +75,7 @@ export function NewSupportCase(): React.JSX.Element {
         err instanceof ApiError ? (err.body as { code?: unknown } | null)?.code : undefined;
       if (code === 'DRIVER_AI_NOTICE_OUTDATED') {
         setAiChoice(null);
-        void queryClient.invalidateQueries({ queryKey: ['portal-features'] });
+        void queryClient.invalidateQueries({ queryKey: PORTAL_FEATURES_QUERY_KEY });
       }
     },
   });
@@ -204,13 +213,14 @@ export function NewSupportCase(): React.JSX.Element {
 
         {sessionId != null && (
           <p className="text-xs text-muted-foreground">
-            {t('supportCases.linkedSession')}: {sessionId}
+            {t('supportCases.linkedSession')}: {sessionText}
           </p>
         )}
 
         {sessionId == null && stationId != null && (
           <p className="text-xs text-muted-foreground">
-            {t('supportCases.linkedStation')}: {stationName ?? stationId}
+            {t('supportCases.linkedStation')}:{' '}
+            {stationName ?? t('supportCases.linkedStationFallback')}
           </p>
         )}
 

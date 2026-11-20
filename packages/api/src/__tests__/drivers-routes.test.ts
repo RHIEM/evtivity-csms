@@ -49,16 +49,21 @@ function makeChain() {
   return chain;
 }
 
-const { mockResolveAccountBilling, mockResolveDriverPricingSource } = vi.hoisted(() => ({
-  mockResolveAccountBilling: vi.fn(() => Promise.resolve(null)),
-  mockResolveDriverPricingSource: vi.fn(() => Promise.resolve(null)),
-}));
+const { mockResolveAccountBilling, mockResolveDriverPricingSource, mockGetDriverDefaults } =
+  vi.hoisted(() => ({
+    mockGetDriverDefaults: vi.fn(() =>
+      Promise.resolve({ timezone: 'Europe/Berlin', distanceUnit: 'km', language: 'de' }),
+    ),
+    mockResolveAccountBilling: vi.fn(() => Promise.resolve(null)),
+    mockResolveDriverPricingSource: vi.fn(() => Promise.resolve(null)),
+  }));
 
 vi.mock('@evtivity/database', () => ({
   ACCOUNT_INVOICE_RECIPIENTS: ['fleet', 'member'],
   resolveAccountBilling: mockResolveAccountBilling,
   resolveDriverPricingSource: mockResolveDriverPricingSource,
   getCompanyCurrency: vi.fn(() => Promise.resolve('EUR')),
+  getDriverDefaults: mockGetDriverDefaults,
   db: {
     select: vi.fn(() => makeChain()),
     insert: vi.fn(() => makeChain()),
@@ -81,6 +86,10 @@ vi.mock('@evtivity/database', () => ({
   fleetDrivers: {},
   driverTokens: {},
   vehicles: {},
+  // Read by the list sort definitions the routes import.
+  chargingStations: {},
+  chargingSessions: {},
+  reservations: {},
   users: {},
   tokenAuditLog: {},
   stationLocalAuthEntries: {},
@@ -129,7 +138,8 @@ vi.mock('drizzle-orm', () => ({
   and: vi.fn(),
   or: vi.fn(),
   ilike: vi.fn(),
-  sql: vi.fn(),
+  // `sql.raw` builds the sort direction of a sorted list.
+  sql: Object.assign(vi.fn(), { raw: vi.fn() }),
   desc: vi.fn(),
   count: vi.fn(),
   asc: vi.fn(),
@@ -137,7 +147,15 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 vi.mock('@evtivity/lib', async (importOriginal) => ({
-  UI_LANGUAGES: (await importOriginal<typeof import('@evtivity/lib')>()).UI_LANGUAGES,
+  ...(await (async () => {
+    const actual = await importOriginal<typeof import('@evtivity/lib')>();
+    return {
+      UI_LANGUAGES: actual.UI_LANGUAGES,
+      DISTANCE_UNITS: actual.DISTANCE_UNITS,
+      isValidTimezone: actual.isValidTimezone,
+      newDriverPreferences: actual.newDriverPreferences,
+    };
+  })()),
   AppError: class AppError extends Error {
     constructor(
       message: string,
@@ -447,6 +465,31 @@ describe('Driver routes (operator)', () => {
       const body = res.json();
       expect(body.data).toEqual([]);
       expect(body.total).toBe(0);
+    });
+
+    it('accepts every sort key in both directions', async () => {
+      for (const sort of ['name', 'email', 'phone', 'status', 'createdAt']) {
+        for (const order of ['asc', 'desc']) {
+          setupDbResults([], [{ count: 0 }]);
+          const res = await app.inject({
+            method: 'GET',
+            url: `/drivers?sort=${sort}&order=${order}&status=active`,
+            headers: { authorization: `Bearer ${token}` },
+          });
+          expect(res.statusCode, `${sort} ${order}`).toBe(200);
+        }
+      }
+    });
+
+    it('refuses a sort key it does not offer and an unknown order', async () => {
+      for (const query of ['sort=id', 'sort=drivers.id', 'sort=name&order=up']) {
+        const res = await app.inject({
+          method: 'GET',
+          url: `/drivers?${query}`,
+          headers: { authorization: `Bearer ${token}` },
+        });
+        expect(res.statusCode, query).toBe(400);
+      }
     });
   });
 
@@ -818,6 +861,76 @@ describe('Driver routes (operator)', () => {
 
       expect(res.statusCode).toBe(400);
     });
+
+    it('gives a driver created without preferences the company defaults', async () => {
+      setupDbResults([], [makeDriver()]);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: { firstName: 'John', lastName: 'Doe', email: 'john@example.com' },
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(lastWrite('insert')).toMatchObject({
+        timezone: 'Europe/Berlin',
+        distanceUnit: 'km',
+        language: 'de',
+      });
+    });
+
+    it('keeps the preferences the request sends', async () => {
+      setupDbResults([], [makeDriver()]);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/drivers',
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          firstName: 'John',
+          lastName: 'Doe',
+          language: 'ko',
+          timezone: 'Asia/Seoul',
+          distanceUnit: 'miles',
+        },
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(lastWrite('insert')).toMatchObject({
+        timezone: 'Asia/Seoul',
+        distanceUnit: 'miles',
+        language: 'ko',
+      });
+    });
+
+    it('returns 400 for an unknown timezone or distance unit', async () => {
+      for (const payload of [
+        { firstName: 'John', lastName: 'Doe', timezone: 'Mars/Olympus' },
+        { firstName: 'John', lastName: 'Doe', distanceUnit: 'furlongs' },
+      ]) {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/drivers',
+          headers: { authorization: `Bearer ${token}` },
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+      }
+    });
+  });
+
+  describe('GET /v1/drivers/defaults', () => {
+    it('returns the preferences new drivers start with', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/drivers/defaults',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ timezone: 'Europe/Berlin', distanceUnit: 'km', language: 'de' });
+    });
   });
 
   // -------------------------------------------------------
@@ -912,6 +1025,45 @@ describe('Driver routes (operator)', () => {
       expect(body.email).toBe('jane@example.com');
       expect(body.phone).toBe('+12015550143');
       expect(body.isActive).toBe(false);
+    });
+
+    it('changes the distance unit and audits it', async () => {
+      const { writeAudit } = await import('@evtivity/database');
+      vi.mocked(writeAudit).mockClear();
+      const updated = makeDriver({ distanceUnit: 'km' });
+      setupDbResults([makeDriver({ distanceUnit: 'miles' })], [updated]);
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { distanceUnit: 'km' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().distanceUnit).toBe('km');
+      expect(lastWrite('update')).toMatchObject({ distanceUnit: 'km' });
+      expect(vi.mocked(writeAudit)).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: 'updated',
+          before: { distanceUnit: 'miles' },
+          after: { distanceUnit: 'km' },
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('returns 400 for an unknown distance unit', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/drivers/${VALID_DRIVER_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { distanceUnit: 'furlongs' },
+      });
+
+      expect(res.statusCode).toBe(400);
     });
 
     it('returns 200 with only firstName', async () => {

@@ -13,6 +13,7 @@ import {
   resolveAccountBilling,
   resolveDriverPricingSource,
   inOperatorStation,
+  getDriverDefaults,
 } from '@evtivity/database';
 import {
   ACCOUNT_INVOICE_RECIPIENTS,
@@ -43,9 +44,12 @@ import { sendSecurityNotice } from '../lib/security-notice.js';
 import { publishPricingChanged } from '../lib/pricing-events.js';
 import { pricingGroupExists } from '../lib/pricing-group-lookup.js';
 import { zodSchema } from '../lib/zod-schema.js';
+import { sessionListSort } from '../lib/sorts/session-list-sort.js';
+import { driverReservationListSort } from '../lib/sorts/reservation-list-sort.js';
 import { sessionCurrencySql } from '@evtivity/services/company-currency';
 import { ID_PARAMS } from '../lib/id-validation.js';
 import { paginationQuery } from '../lib/pagination.js';
+import { driverListSort } from '../lib/sorts/driver-list-sort.js';
 import type { PaginatedResponse } from '../lib/pagination.js';
 import { authorize } from '../middleware/rbac.js';
 import { getUserSiteIds, requireAllSiteAccess } from '../lib/site-access.js';
@@ -62,7 +66,7 @@ import {
 } from '../lib/driver-billing-address-schema.js';
 import { OCPP_ID_TOKEN_TYPES } from '@evtivity/lib/id-token-types';
 import type { JwtPayload } from '../plugins/auth.js';
-import { isValidTimezone, UI_LANGUAGES } from '@evtivity/lib';
+import { DISTANCE_UNITS, isValidTimezone, newDriverPreferences, UI_LANGUAGES } from '@evtivity/lib';
 import {
   paginatedResponse,
   itemResponse,
@@ -112,6 +116,11 @@ const driverItem = z
     language: z
       .string()
       .describe('Preferred language of the portal, notifications and invoices (e.g. en, de)'),
+    timezone: z.string().optional().describe('IANA timezone of the driver (e.g. America/New_York)'),
+    distanceUnit: z
+      .enum(DISTANCE_UNITS)
+      .optional()
+      .describe('Preferred distance unit of the portal and app (miles or km)'),
     isActive: z.boolean().describe('Whether the driver account is enabled'),
     employeeNumber: z
       .string()
@@ -370,12 +379,26 @@ function employeeNumberToStore(value: string | null | undefined): string | null 
   return trimmed === '' ? null : trimmed;
 }
 
+const driverDistanceUnit = z
+  .enum(DISTANCE_UNITS)
+  .describe('Preferred distance unit of the portal and app (miles or km)');
+
 const createDriverBody = z.object({
   firstName: z.string().min(1).max(100),
   lastName: z.string().min(1).max(100),
   email: z.email().max(255).optional(),
   phone: z.string().max(50).optional(),
-  language: driverLanguage.optional().describe('Preferred language (default en)'),
+  language: driverLanguage
+    .optional()
+    .describe('Preferred language. Unset: the system.driverLanguage setting (default en)'),
+  timezone: z
+    .string()
+    .max(50)
+    .optional()
+    .describe('IANA timezone. Unset: the system.timezone setting (default America/New_York)'),
+  distanceUnit: driverDistanceUnit
+    .optional()
+    .describe('Preferred distance unit. Unset: the system.distanceUnit setting (default miles)'),
   employeeNumber: employeeNumberField,
 });
 
@@ -407,6 +430,7 @@ const updateDriverBody = z.object({
     ),
   timezone: z.string().max(50).optional().describe('IANA timezone (e.g. America/New_York)'),
   employeeNumber: employeeNumberField,
+  distanceUnit: driverDistanceUnit.optional(),
 });
 
 const createTokenBody = z.object({
@@ -552,10 +576,16 @@ const vehicleParams = z.object({
 const sessionsQuery = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(10),
+  ...sessionListSort.query,
+});
+
+const driverReservationsQuery = paginationQuery.extend({
+  ...driverReservationListSort.query,
 });
 
 const driverListQuery = paginationQuery.extend({
   status: z.enum(['active', 'inactive']).optional().describe('Filter by driver status'),
+  ...driverListSort.query,
 });
 
 // Safe column projection used by every operator-facing read of `drivers`.
@@ -592,6 +622,7 @@ const DRIVER_AUDIT_KEYS = [
   'phone',
   'language',
   'timezone',
+  'distanceUnit',
   'isActive',
   'emailVerified',
   'employeeNumber',
@@ -616,7 +647,8 @@ export function driverRoutes(app: FastifyInstance): void {
       },
     },
     async (request) => {
-      const { page, limit, search, status } = request.query as z.infer<typeof driverListQuery>;
+      const query = request.query as z.infer<typeof driverListQuery>;
+      const { page, limit, search, status } = query;
       const offset = (page - 1) * limit;
 
       const conditions = [];
@@ -645,7 +677,7 @@ export function driverRoutes(app: FastifyInstance): void {
           .from(drivers)
           .where(where)
           // Stable ordering so pagination doesn't shuffle rows between pages.
-          .orderBy(desc(drivers.createdAt), desc(drivers.id))
+          .orderBy(...driverListSort.orderBy(query))
           .limit(limit)
           .offset(offset)
           .then((rows) => withAvatars(rows)),
@@ -802,6 +834,33 @@ export function driverRoutes(app: FastifyInstance): void {
     },
   );
 
+  app.get(
+    '/drivers/defaults',
+    {
+      onRequest: [authorize('drivers:read')],
+      schema: {
+        tags: ['Drivers'],
+        summary: 'Get the preferences new drivers start with',
+        description:
+          'The timezone (system.timezone), distance unit (system.distanceUnit) and language (system.driverLanguage) a driver created without them gets. An unset or invalid setting answers America/New_York, miles and en.',
+        operationId: 'getDriverDefaults',
+        security: [{ bearerAuth: [] }],
+        response: {
+          200: itemResponse(
+            z
+              .object({
+                timezone: z.string().describe('IANA timezone of new drivers'),
+                distanceUnit: z.enum(DISTANCE_UNITS).describe('Distance unit of new drivers'),
+                language: z.enum(UI_LANGUAGES).describe('Language of new drivers'),
+              })
+              .loose(),
+          ),
+        },
+      },
+    },
+    async () => getDriverDefaults(),
+  );
+
   app.post(
     '/drivers',
     {
@@ -821,6 +880,11 @@ export function driverRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const body = request.body as z.infer<typeof createDriverBody>;
+
+      if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+        await reply.status(400).send({ error: 'Invalid IANA timezone', code: 'VALIDATION_ERROR' });
+        return;
+      }
 
       // Stored, compared and texted in E.164 only.
       const createPhoneIn = readPhoneInput(body.phone);
@@ -846,7 +910,13 @@ export function driverRoutes(app: FastifyInstance): void {
 
       let driver;
       try {
-        [driver] = await db.insert(drivers).values(body).returning(driverSafeSelect);
+        // Preferences the request leaves out take the company defaults
+        // (Settings > Company).
+        const preferences = newDriverPreferences(body, await getDriverDefaults());
+        [driver] = await db
+          .insert(drivers)
+          .values({ ...body, ...preferences })
+          .returning(driverSafeSelect);
       } catch (err) {
         // The pre-check above is non-transactional, so two concurrent POSTs with the
         // same lowercased email can both pass it and race here. The partial unique
@@ -973,6 +1043,7 @@ export function driverRoutes(app: FastifyInstance): void {
       if (body.timezone !== undefined) fields['timezone'] = body.timezone;
       const employeeNumber = employeeNumberToStore(body.employeeNumber);
       if (employeeNumber !== undefined) fields['employeeNumber'] = employeeNumber;
+      if (body.distanceUnit !== undefined) fields['distanceUnit'] = body.distanceUnit;
 
       let updated;
       try {
@@ -1637,7 +1708,7 @@ export function driverRoutes(app: FastifyInstance): void {
           .leftJoin(sites, eq(chargingSessions.siteId, sites.id))
           .leftJoin(drivers, eq(chargingSessions.driverId, drivers.id))
           .where(where)
-          .orderBy(desc(chargingSessions.createdAt), desc(chargingSessions.id))
+          .orderBy(...sessionListSort.orderBy(request.query as z.infer<typeof sessionsQuery>))
           .limit(limit)
           .offset(offset),
         db
@@ -1671,7 +1742,7 @@ export function driverRoutes(app: FastifyInstance): void {
         operationId: 'listDriverReservations',
         security: [{ bearerAuth: [] }],
         params: zodSchema(driverParams),
-        querystring: zodSchema(paginationQuery),
+        querystring: zodSchema(driverReservationsQuery),
         response: {
           200: paginatedResponse(driverReservationItem),
           404: errorWith('Driver not found', [ERROR_CODES.DRIVER_NOT_FOUND]),
@@ -1680,7 +1751,7 @@ export function driverRoutes(app: FastifyInstance): void {
     },
     async (request, reply) => {
       const { id } = request.params as z.infer<typeof driverParams>;
-      const { page, limit } = request.query as z.infer<typeof paginationQuery>;
+      const { page, limit } = request.query as z.infer<typeof driverReservationsQuery>;
       const offset = (page - 1) * limit;
 
       const { userId } = request.user as JwtPayload;
@@ -1715,7 +1786,11 @@ export function driverRoutes(app: FastifyInstance): void {
           .innerJoin(chargingStations, eq(reservations.stationId, chargingStations.id))
           .leftJoin(sites, eq(chargingStations.siteId, sites.id))
           .where(where)
-          .orderBy(desc(reservations.createdAt), desc(reservations.id))
+          .orderBy(
+            ...driverReservationListSort.orderBy(
+              request.query as z.infer<typeof driverReservationsQuery>,
+            ),
+          )
           .limit(limit)
           .offset(offset),
         db

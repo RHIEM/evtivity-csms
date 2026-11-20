@@ -1,6 +1,9 @@
 {
   "common": {
     "loading": "加载中...",
+    "sortAscending": "升序排序",
+    "sortDescending": "降序排序",
+    "sortDefault": "恢复默认顺序",
     "pageNotFound": "页面未找到",
     "pageNotFoundDescription": "您访问的页面不存在或已被移动。",
     "allSiteAccessRequired": "需要所有充电站的访问权限",
@@ -107,7 +110,26 @@
       "confirm": "关闭",
       "cancel": "保持开启"
     },
-    "ok": "确定"
+    "ok": "确定",
+    "datePicker": {
+      "open": "打开日历",
+      "title": "选择日期",
+      "previousMonth": "上个月",
+      "nextMonth": "下个月",
+      "month": "月份",
+      "year": "年份",
+      "today": "今天",
+      "clear": "清除"
+    },
+    "sessionFallback": "会话",
+    "unnamedSite": "未命名充电站",
+    "unnamedStation": "未命名充电桩",
+    "unnamedTerminal": "未命名终端",
+    "unnamedPanel": "未命名配电盘",
+    "unnamedTransformer": "未命名变压器",
+    "unnamedUser": "未命名用户",
+    "unnamedTemplate": "未命名模板",
+    "unnamedReservation": "未命名预约"
   },
   "status": {
     "online": "在线",
@@ -175,7 +197,7 @@
     "settings": "设置",
     "profile": "个人资料",
     "language": "语言",
-    "theme": "主题",
+    "theme": "模式",
     "back": "返回",
     "logOut": "退出登录",
     "sustainability": "可持续性",
@@ -574,7 +596,27 @@
     "freeVend": "免费充电",
     "freeVendInfo": "您的充电站中的免费充电会话及其能量，以及已开启免费充电的充电站数量。",
     "freeVendSites": "开启免费充电的充电站：{{value}}",
-    "noFreeVendSessions": "此期间没有免费充电会话"
+    "noFreeVendSessions": "此期间没有免费充电会话",
+    "securityEvents": {
+      "title": "安全事件",
+      "info": "您的充电桩上报的安全事件，按严重程度和充电桩统计。严重程度最高的充电桩排在最前。选择充电桩可打开其安全选项卡。",
+      "range": "时间范围",
+      "range24h": "最近 24 小时",
+      "range7d": "最近 7 天",
+      "range30d": "最近 30 天",
+      "site": "充电站",
+      "allSites": "所有充电站",
+      "severity": "严重程度",
+      "allSeverities": "所有严重程度",
+      "station": "充电桩",
+      "worstSeverity": "最高严重程度",
+      "events": "事件",
+      "lastEvent": "最近事件",
+      "empty": "此时间范围内没有安全事件。",
+      "noStations": "没有此严重程度事件的充电桩。",
+      "truncated": "显示 {{total}} 个充电桩中的 {{shown}} 个。",
+      "criticalRow": "严重"
+    }
   },
   "sites": {
     "title": "充电站",
@@ -758,8 +800,8 @@
       "fitToView": "适应视图",
       "editLayout": "编辑布局",
       "doneEditing": "完成编辑",
-      "hint": "拖动以旋转，双指滑动或按住 Shift 拖动以平移，捏合或滚动滚轮以缩放。点击充电桩查看详情。",
-      "hintViewOnly": "拖动以环视，双指滑动以平移，捏合或滚动滚轮以缩放。点击充电桩查看详情。",
+      "hint": "拖动以旋转，双指滑动或按住 Shift 拖动以平移，捏合或滚动滚轮以缩放。点击充电桩查看详情。双击充电桩可放大。",
+      "hintViewOnly": "拖动以环视，双指滑动以平移，捏合或滚动滚轮以缩放。点击充电桩查看详情。双击充电桩可放大。",
       "hintEdit": "编辑模式：将充电桩拖到空闲车位，或将变压器拖到草地上。充电桩会对齐到车位，且不会落在其他充电桩上。",
       "webglUnavailable": "此浏览器无法显示 3D 视图（WebGL 不可用），因此显示 2D 视图。",
       "loading3d": "正在加载 3D 视图",
@@ -867,7 +909,7 @@
         "pointerZoom": "缩放",
         "pointerZoomKeys": "捏合或滚轮"
       },
-      "hintTouch": "拖动以旋转，捏合以缩放，双指拖动以平移。轻点充电桩查看详情。",
+      "hintTouch": "拖动以旋转，捏合以缩放，双指拖动以平移。轻点充电桩查看详情。双击充电桩可放大。",
       "hintViewOnlyTouch": "拖动以环视，捏合以缩放。轻点充电桩查看详情。",
       "hintReplayTouch": "正在回放过去的时刻。拖动以旋转，捏合以缩放。",
       "portIconLabel": "EVSE {{n}}，{{type}}，{{state}}",
@@ -886,7 +928,8 @@
       "cannotMeetShort": "无法满足：缺 {{kwh}} kWh",
       "transformerLoad": "容量的 {{percent}}%",
       "supplyCredit": "供电 {{kw}} kW",
-      "supplyNoReading": "无最新读数"
+      "supplyNoReading": "无最新读数",
+      "evsePlateHover": "EVSE {{n}}，{{types}}"
     },
     "layoutState": {
       "faulted": "故障",
@@ -972,7 +1015,8 @@
       "reservedWindow": "{{id}} 预约时间 {{start}} 至 {{end}}",
       "maintenanceNow": "{{id}} 维护中",
       "maintenanceUntil": "{{id}} 维护至 {{end}}",
-      "maintenanceWindow": "{{id}} 维护时间 {{start}} 至 {{end}}"
+      "maintenanceWindow": "{{id}} 维护时间 {{start}} 至 {{end}}",
+      "rfidTap": "请刷 RFID 卡"
     },
     "fleetReadiness": {
       "title": "车队就绪",
@@ -1122,6 +1166,7 @@
     "changePasswordOcppOnline": "这将更新服务器上的密码并通过 OCPP SetVariables 推送到 {{stationId}}，然后重置充电桩以重新连接。",
     "changePasswordOcppOffline": "充电桩离线。密码将保存在服务器上，并在下次连接时用于认证充电桩。",
     "securityLog": "安全事件日志",
+    "securityEventsHidden": "充电桩安全事件仅向拥有安全事件权限的用户显示。此日志列出连接事件。",
     "noSecurityLogs": "没有安全事件记录",
     "eventType": "事件",
     "eventTypePlaceholder": "例如：TamperDetectionActivated",
@@ -2079,7 +2124,13 @@
       "empty": "没有账单地址。发票显示姓名和电子邮件。",
       "updated": "账单地址已更新",
       "updateFailed": "无法更新账单地址"
-    }
+    },
+    "timezone": "时区",
+    "distanceUnit": "距离单位",
+    "distanceUnitMiles": "英里",
+    "distanceUnitKm": "公里",
+    "distanceUnitHelp": "用于驾驶员门户和应用中的距离。",
+    "timezoneHelp": "用于驾驶员门户、应用和通知中的时间。"
   },
   "transactions": {
     "title": "交易记录",
@@ -2266,6 +2317,7 @@
       "loadManagement": "负载管理",
       "notifications": "通知",
       "logs": "日志",
+      "securityEvents": "安全事件",
       "users": "用户",
       "audit": "审计日志",
       "maintenance": "维护",
@@ -2350,9 +2402,16 @@
     "language": "语言",
     "timezone": "时区",
     "appearance": "外观",
-    "theme": "主题",
+    "theme": "模式",
     "themeLight": "浅色",
     "themeDark": "深色",
+    "uiTheme": "主题",
+    "uiThemeDefault": "默认",
+    "uiThemeSoft": "柔和",
+    "uiThemeHighContrast": "高对比度",
+    "uiThemeDefaultDescription": "应用的标准外观。",
+    "uiThemeSoftDescription": "更圆的边角、更浅的边框和更柔和的阴影。",
+    "uiThemeHighContrastDescription": "纯黑白背景、清晰的边框和更粗的文字，阅读最清楚。",
     "chatbotAi": "聊天机器人 AI",
     "conformance": "合规测试",
     "supportAi": "支持 AI",
@@ -2965,7 +3024,9 @@
     "uptime": "运行时间",
     "uptimePerDay": "正常运行时间 (每日%)",
     "noUptimeData": "无正常运行时间数据",
-    "noData": "此时段没有数据"
+    "noData": "此时段没有数据",
+    "noPayments": "此时段没有付款",
+    "total": "总计"
   },
   "metrics": {
     "uptime": "运行时间",
@@ -3201,6 +3262,7 @@
     "testSuccess": "测试通知已发送。",
     "testFailed": "发送测试通知失败。",
     "companyInfo": "公司信息",
+    "systemTab": "系统",
     "companyInfoDescription": "组织名称、联系方式和地址。",
     "companyName": "公司名称",
     "companyCurrency": "货币",
@@ -3371,7 +3433,7 @@
     "uploadOgImage": "上传图片",
     "noOgImage": "未上传社交分享图片。",
     "ogImageDescription": "在社交媒体上分享链接时显示。推荐尺寸: 1200x630 像素。",
-    "themeColor": "主题颜色",
+    "themeColor": "品牌颜色",
     "themeColorDescription": "移动设备的浏览器地址栏颜色。用于登录页和门户页面。",
     "chargerColorAc": "交流充电桩面板颜色",
     "chargerColorAcDescription": "3D 充电站布局中交流充电桩前面板的颜色。留空则使用品牌颜色。",
@@ -3867,7 +3929,7 @@
     "secretRemovePending": "保存时将删除已存储的值。",
     "secretRemoveUndo": "保留",
     "copyCode": "复制代码",
-    "themeColorPicker": "主题颜色选择器",
+    "themeColorPicker": "品牌颜色选择器",
     "emailLayoutPreviewFrame": "电子邮件布局预览",
     "aiProvidersTitle": "AI 提供商",
     "aiProvidersDescription": "每个提供商一个 API 密钥。AI 助手和支持 AI 在下方各自选择提供商。",
@@ -4131,7 +4193,9 @@
       "signalGoodDbmHint": "达到或高于此值的信号评为良好。",
       "signalFairDbm": "一般信号起点（dBm）",
       "signalFairDbmHint": "达到或高于此值的信号评为一般，低于此值为较差。",
-      "signalOrderError": "良好阈值必须高于一般阈值。"
+      "signalOrderError": "良好阈值必须高于一般阈值。",
+      "simCardsNote": "在以下页面添加或导入 SIM 卡：",
+      "simCardsLink": "SIM 卡"
     },
     "ssoAllowedDomains": "允许的电子邮件域",
     "ssoAllowedDomainsHint": "SSO 仅为这些域登录和创建账户，以逗号分隔。建议：列出您公司的域。留空则允许所有域。",
@@ -4231,7 +4295,25 @@
     "paymentSubTabTerminals": "支付终端",
     "fleetChargingEnabled": "车队充电",
     "fleetChargingEnabledDesc": "在使用按发车规划策略的充电站，按每辆车的发车时间规划场站充电。",
-    "fleetChargingEnabledOff": "场站规划停止，已发送的充电配置文件将被清除，按发车规划的充电站平均分配功率。发车仍会保存。"
+    "fleetChargingEnabledOff": "场站规划停止，已发送的充电配置文件将被清除，按发车规划的充电站平均分配功率。发车仍会保存。",
+    "driverLanguage": "驾驶员语言",
+    "driverLanguageHelper": "新驾驶员创建时未指定语言则使用此语言。现有驾驶员保留各自的设置。",
+    "driverDistanceUnit": "驾驶员距离单位",
+    "driverDistanceUnitHelper": "新驾驶员创建时未指定距离单位则使用此单位。现有驾驶员保留各自的设置。",
+    "companyTimezone": "时区",
+    "companyTimezoneHelper": "公司时区：仪表板的日期、发票和报告使用此时区；新驾驶员创建时未指定时区则使用此时区。现有驾驶员保留各自的设置。",
+    "rfidCards": "RFID 卡",
+    "rfidCardsDescription": "决定驾驶员自行管理 RFID 卡，还是由运营商管理。",
+    "rfidSelfServiceEnabled": "驾驶员管理自己的 RFID 卡",
+    "rfidSelfServiceEnabledDesc": "开启：驾驶员在门户和移动应用中添加、重命名、停用、重新启用和移除自己的 RFID 卡。关闭：驾驶员只能查看自己的卡，由运营商在令牌页面管理。",
+    "rfidSelfServiceOffEffect": "驾驶员将无法再添加、重命名、停用、重新启用或移除 RFID 卡，如需停用丢失的卡需联系您。现有的卡继续可用。",
+    "updateCheck": {
+      "title": "更新检查",
+      "description": "有更新的 EVtivity CSMS 版本发布时通知管理员。",
+      "enabled": "检查新版本",
+      "enabledDesc": "开启：服务器每天从 evtivity.com 读取一次最新版本号，有更新版本发布时，管理员会在仪表板上看到通知。只有服务器的 IP 地址会到达 evtivity.com，浏览器从不访问它。关闭：不发送任何内容。",
+      "offEffect": "服务器不再从 evtivity.com 读取最新版本，有更新版本发布时管理员也不会再看到通知。"
+    }
   },
   "pnc": {
     "certificates": "证书",
@@ -4435,7 +4517,21 @@
     "aiEvents": "AI",
     "channelToggleLabel": "{{event}} {{channel}} 通知",
     "eventToggleLabel": "{{event}} 通知",
-    "securityEvents": "账户安全"
+    "securityEvents": "账户安全",
+    "driverChoice": {
+      "title": "驾驶员选择",
+      "tooltip": "可选：每位驾驶员在门户和应用中自行决定。必需：无论驾驶员如何选择，所有驾驶员都会在此渠道收到此通知。已关闭的事件不会发送，无论是否必需。",
+      "alwaysSent": "驾驶员始终会收到此通知。驾驶员无法关闭账户和安全通知。",
+      "eventOff": "此事件已关闭，因此无论是否必需，驾驶员都不会在任何渠道收到。",
+      "channelEmail": "电子邮件",
+      "channelSms": "短信",
+      "channelPush": "推送",
+      "selectLabel": "{{event}} 的{{channel}}",
+      "optional": "可选",
+      "mandatory": "必需",
+      "notConfigured": "未配置：此渠道不发送任何内容。",
+      "explanation": "驾驶员会看到必需通知处于开启并锁定状态，并标明为您要求的通知。"
+    }
   },
   "reservations": {
     "title": "预约",
@@ -4960,7 +5056,9 @@
     "DEPARTURE_MANAGED_BY_DEPOT_SYSTEM": "此出发计划由公交车场系统管理，请在该系统中更改，或停用车场系统。",
     "DEPOT_SYSTEM_NOT_FOUND": "未找到公交车场系统。",
     "DEPOT_SYSTEM_ID_IN_USE": "另一个公交车场系统已使用此系统 ID。",
-    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "公交车场系统仅服务车场充电站。"
+    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "公交车场系统仅服务车场充电站。",
+    "RFID_SELF_SERVICE_DISABLED": "您的 RFID 卡由运营商管理。如需添加、更改、停用或移除卡片，请联系运营商。",
+    "NOTIFICATION_EVENT_MANDATORY": "运营商要求在此渠道接收此通知，因此无法关闭"
   },
   "logs": {
     "title": "日志",
@@ -5382,6 +5480,7 @@
     "failedStations": "失败",
     "noStationsTargeted": "无目标充电桩",
     "noCampaignRuns": "暂无活动运行",
+    "noCampaigns": "暂无固件活动",
     "error": "错误",
     "confirmStart": "启动活动",
     "confirmStartDescription": "这将立即向所有符合条件的在线充电桩发送固件更新。离线充电桩在连接时收到。是否继续?",
@@ -5610,6 +5709,11 @@
     "faultMode": "故障模式",
     "faultModeEnd": "结束会话",
     "faultModeSuspend": "保留会话（暂停）",
+    "faultType": "故障类型",
+    "faultCodes": {
+      "internalError": "内部错误",
+      "highTemp": "温度过高"
+    },
     "goOffline": "离线",
     "comeOnline": "上线",
     "actionSent": "{{action}} 已发送",
@@ -5618,7 +5722,42 @@
     "tokenRequired": "此操作需要令牌。",
     "tokenNotFound": "在驾驶员令牌中未找到令牌。授权和开始充电将被拒绝。",
     "stationOffline": "充电桩已离线。请先使其恢复在线。",
-    "invalidForState": "当前连接器状态（{{status}}）下不可用。"
+    "invalidForState": "当前连接器状态（{{status}}）下不可用。",
+    "securityEvent": "安全事件",
+    "securityEventType": "事件",
+    "securityEventOcppType": "OCPP 类型：{{type}}",
+    "securityEventTechInfo": "技术信息（可选）",
+    "sendSecurityEvent": "发送安全事件",
+    "securityEventDescription": "模拟器将此安全事件从充电桩发送到 CSMS。",
+    "securityEvents": {
+      "TamperDetectionActivated": "充电桩被打开（防拆传感器）",
+      "TiltDetected": "充电桩倾斜（厂商事件）",
+      "CableCutDetected": "充电线缆被剪断（厂商事件）",
+      "SettingSystemTime": "系统时间被更改",
+      "InvalidFirmwareSignature": "固件签名无效",
+      "InvalidFirmwareSigningCertificate": "固件签名证书无效",
+      "AttemptedReplayAttacks": "收到重放消息",
+      "FailedToAuthenticateAtCsms": "充电桩登录 CSMS 失败",
+      "FailedToAuthenticateAtCentralSystem": "充电桩登录 CSMS 失败",
+      "CsmsFailedToAuthenticate": "CSMS 登录充电桩失败",
+      "CentralSystemFailedToAuthenticate": "CSMS 登录充电桩失败",
+      "InvalidCsmsCertificate": "CSMS 证书无效",
+      "InvalidCentralSystemCertificate": "CSMS 证书无效",
+      "InvalidChargingStationCertificate": "充电桩证书无效",
+      "InvalidChargePointCertificate": "充电桩证书无效",
+      "InvalidTLSVersion": "TLS 版本不被允许",
+      "InvalidTLSCipherSuite": "TLS 密码套件不被允许",
+      "MaintenanceLoginFailed": "维护登录失败",
+      "SecurityLogWasCleared": "安全日志已清除",
+      "InvalidMessages": "收到无效消息",
+      "MemoryExhaustion": "内存即将耗尽",
+      "ReconfigurationOfSecurityParameters": "安全设置已更改",
+      "DiscardedRenewedClientCertificate": "已丢弃续期的客户端证书",
+      "StartupOfTheDevice": "充电桩已启动",
+      "ResetOrReboot": "充电桩已重置或重启",
+      "MaintenanceLoginAccepted": "维护登录成功",
+      "FirmwareUpdated": "固件已更新"
+    }
   },
   "loadManagement": {
     "allocationStrategy": "分配策略",
@@ -6400,7 +6539,9 @@
       "mcp": "MCP",
       "proposal": "已确认的 AI 操作"
     },
-    "entryTitle": "{{action}}（{{entity}}）"
+    "entryTitle": "{{action}}（{{entity}}）",
+    "actorKindUser": "用户",
+    "entityName": "名称"
   },
   "maintenance": {
     "colType": "类型",

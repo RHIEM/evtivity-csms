@@ -33,7 +33,17 @@
     "notCharged": "Not Charged",
     "copy": "Copy",
     "loadError": "Failed to load data. Please try again.",
-    "retry": "Retry"
+    "retry": "Retry",
+    "datePicker": {
+      "open": "Open Calendar",
+      "title": "Choose a Date",
+      "previousMonth": "Previous Month",
+      "nextMonth": "Next Month",
+      "month": "Month",
+      "year": "Year",
+      "today": "Today",
+      "clear": "Clear"
+    }
   },
   "nav": {
     "home": "Home",
@@ -195,6 +205,7 @@
     },
     "timeElapsed": "Duration",
     "power": "Power",
+    "chartView": "Chart",
     "details": "Details",
     "stopCharging": "Stop Charging",
     "stopping": "Stopping...",
@@ -275,9 +286,16 @@
     "mfaDisableFailed": "Failed to disable MFA.",
     "mfaSelectMethod": "Select method",
     "timezone": "Timezone",
-    "theme": "Theme",
+    "theme": "Mode",
     "themeLight": "Light",
     "themeDark": "Dark",
+    "uiTheme": "Theme",
+    "uiThemeDefault": "Default",
+    "uiThemeSoft": "Soft",
+    "uiThemeHighContrast": "High Contrast",
+    "uiThemeDefaultDescription": "The standard look of the app.",
+    "uiThemeSoftDescription": "Rounder corners, lighter borders and softer shadows.",
+    "uiThemeHighContrastDescription": "Plain black and white surfaces, strong borders and heavier text for the clearest reading.",
     "distanceUnit": "Distance Unit",
     "distanceMiles": "Miles",
     "distanceKm": "Kilometers",
@@ -374,8 +392,9 @@
     "title": "Start Charging",
     "searchPlaceholder": "Search by station ID or site name",
     "roamingSearchPlaceholder": "Search partner network locations",
-    "ourNetwork": "Our network",
-    "partnerNetworks": "Partner networks",
+    "ourNetwork": "Our Network",
+    "partnerNetworks": "Partner Networks",
+    "networkLabel": "Network",
     "noRoamingResults": "No partner locations found",
     "chargingPort": "Charging port",
     "evseDescription": "Enter the EVSE (port) number",
@@ -514,6 +533,7 @@
     "cancellationPolicyText": "If you cancel within {{minutes}} minutes of the start time, a {{fee}} cancellation fee will be charged.",
     "upcoming": "Upcoming",
     "past": "Past",
+    "viewLabel": "Reservations to Show",
     "cancelReason": {
       "driver_initiated": "Cancelled by you",
       "operator_manual": "Cancelled by the operator",
@@ -622,7 +642,9 @@
         "wait_and_retry": "Wait a few minutes and try again",
         "check_token_active": "Check that the card or token is active"
       }
-    }
+    },
+    "linkedSessionFallback": "Charging session",
+    "linkedStationFallback": "Charging station"
   },
   "errors": {
     "ACCOUNT_DEACTIVATED": "Account deactivated",
@@ -1029,7 +1051,9 @@
     "DEPARTURE_MANAGED_BY_DEPOT_SYSTEM": "This departure is managed by a bus depot system; change it there, or disable the depot system.",
     "DEPOT_SYSTEM_NOT_FOUND": "Bus depot system not found.",
     "DEPOT_SYSTEM_ID_IN_USE": "Another bus depot system uses this system ID.",
-    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "A bus depot system serves depot sites only."
+    "DEPOT_SYSTEM_SITE_NOT_DEPOT": "A bus depot system serves depot sites only.",
+    "RFID_SELF_SERVICE_DISABLED": "Your operator manages your RFID cards. Contact the operator to add, change, deactivate or remove a card.",
+    "NOTIFICATION_EVENT_MANDATORY": "Your operator requires this notification on this channel, so it cannot be turned off"
   },
   "validation": {
     "required": "This field is required",
@@ -1055,6 +1079,7 @@
     "cost": "Cost",
     "energy": "Energy",
     "distance": "Distance",
+    "metricLabel": "Metric",
     "sessions": "sessions",
     "noSessions": "No sessions this month.",
     "unknownStation": "Unknown station",
@@ -1100,6 +1125,7 @@
     "editAvatar": "Edit Avatar",
     "avatarCreate": "Create",
     "avatarUpload": "Upload",
+    "avatarSource": "Avatar Source",
     "avatarRandom": "Random",
     "avatarRemove": "Remove Avatar",
     "avatarRemoveTitle": "Remove Avatar",
@@ -1156,7 +1182,10 @@
     "labelPlaceholder": "Label (optional), e.g. Company RFID card",
     "labelHint": "A name that helps you tell your cards apart. Leave empty to show the card number.",
     "renameCard": "Rename RFID Card",
-    "renameFailed": "Could not rename the card. Try again."
+    "renameFailed": "Could not rename the card. Try again.",
+    "managedByOperator": "Your operator manages your RFID cards. To add, change or remove a card, or to block a lost one, contact the operator.",
+    "noCardsAssigned": "No RFID cards are assigned to you.",
+    "contactSupport": "Contact Support"
   },
   "vehicles": {
     "addVehicle": "Add Vehicle",
@@ -1241,6 +1270,7 @@
   "charts": {
     "popularTimes": "Popular Times",
     "popularTimesInfo": "Average sessions per hour over the past {{weeks}} weeks",
+    "popularTimesDay": "Day of the Week",
     "avgSessions": "avg sessions",
     "sun": "Sun",
     "mon": "Mon",
@@ -1277,7 +1307,7 @@
     "failedToStart": "Failed to start charging",
     "freeCharging": "Free",
     "connectorPort": "Port {{id}}",
-    "showAllConnectors": "Show all {{total}} connectors",
+    "showAllConnectors": "Show All {{total}} Connectors",
     "activeSessionWarning": "You already have an active session. You cannot start another one."
   },
   "homeCards": {
@@ -1546,5 +1576,91 @@
   "storageUnavailable": {
     "title": "Uploads Unavailable",
     "description": "Files cannot be uploaded right now. Please try again later, or contact support if this keeps happening."
+  },
+  "notificationPrefs": {
+    "intro": "Choose which notifications you get on each channel.",
+    "notification": "Notification",
+    "allNotifications": "All Notifications",
+    "allChannelLabel": "All {{channel}} notifications",
+    "eventChannelLabel": "{{event}} by {{channel}}",
+    "channels": {
+      "email": "Email",
+      "sms": "SMS",
+      "push": "Push"
+    },
+    "required": "Required by your operator",
+    "requiredNote": "Your operator requires the notifications marked with a lock. They are always sent on that channel.",
+    "alwaysSentNote": "Account and security messages, such as password resets and sign-in codes, are always sent.",
+    "noChannels": "Your operator has not set up email or text message notifications yet.",
+    "groups": {
+      "sessions": "Charging Sessions",
+      "payments": "Payments",
+      "reservations": "Reservations",
+      "invoices": "Invoices",
+      "supportCases": "Support Cases",
+      "rfidCards": "RFID Cards",
+      "maintenance": "Maintenance",
+      "stationWatch": "Station Watch",
+      "prepaidBalance": "Prepaid Balance",
+      "fleetBilling": "Fleet Billing"
+    },
+    "events": {
+      "session": {
+        "Started": "Charging started",
+        "Updated": "Charging progress",
+        "Completed": "Charging completed",
+        "Faulted": "Charging stopped by a fault",
+        "PaymentReceived": "Session payment received",
+        "IdlingStarted": "Idle fee started",
+        "Receipt": "Session receipt"
+      },
+      "payment": {
+        "Complete": "Payment complete",
+        "Refunded": "Payment refunded",
+        "FeeRefunded": "Reservation fee refunded",
+        "PreAuthFailed": "Payment authorization failed",
+        "CaptureFailed": "Payment failed",
+        "MissingPaymentMethod": "No payment method on file",
+        "AccountCreditLimit": "Fleet credit limit reached"
+      },
+      "reservation": {
+        "Created": "Reservation confirmed",
+        "Cancelled": "Reservation cancelled",
+        "CancelledForMaintenance": "Reservation cancelled for maintenance",
+        "Expiring": "Reservation ending soon",
+        "Expired": "Reservation expired",
+        "StationFaulted": "Reserved station out of service",
+        "TakenByOther": "Reserved charger taken by someone else"
+      },
+      "invoice": {
+        "Sent": "Invoice sent",
+        "CreditNote": "Credit note issued"
+      },
+      "supportCase": {
+        "Created": "Support case created",
+        "OperatorReply": "Reply to your support case",
+        "Resolved": "Support case resolved",
+        "AiAnswered": "Automatic answer to your support case"
+      },
+      "token": {
+        "Added": "RFID card added",
+        "Removed": "RFID card removed",
+        "Deactivated": "RFID card deactivated",
+        "Reactivated": "RFID card reactivated"
+      },
+      "maintenance": {
+        "SessionStopped": "Charging stopped for maintenance"
+      },
+      "watch": {
+        "StationAvailable": "Watched station available"
+      },
+      "prepaid": {
+        "LowCredit": "Prepaid balance low",
+        "CreditExhausted": "Prepaid balance used up"
+      },
+      "fleet": {
+        "AccountBillingChanged": "Fleet billing changed"
+      }
+    }
   }
 }
