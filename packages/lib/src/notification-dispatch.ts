@@ -10,6 +10,7 @@ import { createLogger } from './logger.js';
 import { readBodyPrefix } from './read-capped-body.js';
 import { decryptString } from './encryption.js';
 import { DEFAULT_CURRENCY } from './currency.js';
+import { COMPANY_PORTAL_TITLE_KEY, resolvePortalTitle } from './portal-title.js';
 import {
   isDriverEventType,
   isRequiredDriverEventType,
@@ -225,7 +226,7 @@ export const DEFAULT_EMAIL_WRAPPER = `<!DOCTYPE html>
           </tr>
           <tr>
             <td align="center" style="background-color:#f9fafb;padding:16px 24px;border-top:1px solid #e5e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
-              <p style="color:#9ca3af;font-size:12px;margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">{{companyName}}</p>
+              <p style="color:#9ca3af;font-size:12px;margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">{{#if companyLegalName}}{{companyLegalName}}{{else}}{{companyName}}{{/if}}</p>
               <p style="color:#9ca3af;font-size:11px;margin:0 0 4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">{{companyStreet}}{{#if companyCity}}, {{companyCity}}{{/if}}{{#if companyState}}, {{companyState}}{{/if}} {{companyZip}}{{#if companyCountry}}, {{companyCountry}}{{/if}}</p>
               <p style="color:#9ca3af;font-size:11px;margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">{{#if companyContactEmail}}{{companyContactEmail}}{{/if}}{{#if companySupportPhone}} | {{companySupportPhone}}{{/if}}</p>
             </td>
@@ -294,7 +295,10 @@ export function clearNotificationSettingsCache(): void {
 }
 
 interface CompanySettings {
+  /** The product name (Settings > Company > Portal title, else the company name). */
   companyName: string;
+  /** The company name itself, for the address block of the email footer. */
+  companyLegalName: string;
   companyCurrency: string;
   companyContactEmail: string;
   companySupportEmail: string;
@@ -356,7 +360,8 @@ export async function getCompanySettings(sql: postgres.Sql): Promise<CompanySett
     expiresAt: Date.now() + CACHE_TTL_MS,
   };
   const settings: CompanySettings = {
-    companyName: map.get('company.name') ?? 'EVtivity',
+    companyName: resolvePortalTitle(map.get(COMPANY_PORTAL_TITLE_KEY), map.get('company.name')),
+    companyLegalName: map.get('company.name') ?? 'EVtivity',
     companyCurrency: map.get('company.currency') ?? DEFAULT_CURRENCY,
     companyContactEmail: map.get('company.contactEmail') ?? '',
     companySupportEmail: map.get('company.supportEmail') ?? '',

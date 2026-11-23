@@ -4315,7 +4315,9 @@
       "enabled": "Check for New Releases",
       "enabledDesc": "On: the server reads the latest release number from evtivity.com once a day, and admins see a notice on the dashboard when a newer release is out. Only the server's IP address reaches evtivity.com; browsers never contact it. Off: nothing is sent.",
       "offEffect": "The server stops reading the latest release from evtivity.com, and admins no longer see a notice when a newer release is out."
-    }
+    },
+    "portalTitle": "Portal Title",
+    "portalTitleHelp": "Product name of the driver portal and of every email (header, browser title, app name, subject). Empty: the company name. Invoices and the portal footer keep the company name."
   },
   "pnc": {
     "certificates": "Certificates",

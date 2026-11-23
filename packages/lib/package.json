@@ -26,6 +26,9 @@
     "./currency": {
       "import": "./src/currency.ts"
     },
+    "./portal-title": {
+      "import": "./src/portal-title.ts"
+    },
     "./charger-plate-colors": {
       "import": "./src/charger-plate-colors.ts"
     },

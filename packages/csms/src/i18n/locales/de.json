@@ -4315,7 +4315,9 @@
       "enabled": "Nach neuen Versionen suchen",
       "enabledDesc": "Ein: Der Server liest einmal am Tag die neueste Versionsnummer von evtivity.com, und Admins sehen auf dem Dashboard einen Hinweis, wenn eine neuere Version erschienen ist. Nur die IP-Adresse des Servers erreicht evtivity.com; Browser kontaktieren die Seite nie. Aus: Es wird nichts gesendet.",
       "offEffect": "Der Server liest die neueste Version nicht mehr von evtivity.com, und Admins sehen keinen Hinweis mehr, wenn eine neuere Version erschienen ist."
-    }
+    },
+    "portalTitle": "Portaltitel",
+    "portalTitleHelp": "Produktname des Fahrerportals und aller E-Mails (Kopfzeile, Browser-Titel, App-Name, Betreff). Leer: der Unternehmensname. Rechnungen und der Portal-Footer behalten den Unternehmensnamen."
   },
   "pnc": {
     "certificates": "Zertifikate",

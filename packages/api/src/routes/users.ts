@@ -66,6 +66,7 @@ import {
   redactSensitiveNotificationContent,
   recordNotificationAttempt,
 } from '@evtivity/lib';
+import { COMPANY_PORTAL_TITLE_KEY, resolvePortalTitle } from '@evtivity/lib/portal-title';
 import QRCode from 'qrcode';
 import { clearAuthCookies, isSecureRequest, readRefreshCookie } from '../lib/auth-cookies.js';
 import { checkRecaptcha } from '../lib/recaptcha-check.js';
@@ -1018,11 +1019,16 @@ export function userRoutes(app: FastifyInstance): void {
               for (const row of companyRows) {
                 if (typeof row.value === 'string') companyMap.set(row.key as string, row.value);
               }
-              const companyName = companyMap.get('company.name') ?? 'EVtivity CSMS';
+              const companyName = resolvePortalTitle(
+                companyMap.get(COMPANY_PORTAL_TITLE_KEY),
+                companyMap.get('company.name'),
+                'EVtivity CSMS',
+              );
               const language = user.language;
 
               const enrichedVars: Record<string, unknown> = {
                 companyName,
+                companyLegalName: companyMap.get('company.name') ?? companyName,
                 companyContactEmail: companyMap.get('company.contactEmail') ?? '',
                 companySupportPhone: companyMap.get('company.supportPhone') ?? '',
                 companyStreet: companyMap.get('company.street') ?? '',

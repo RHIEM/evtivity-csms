@@ -56,6 +56,15 @@ describe('Portal web app routes', () => {
   });
 
   describe('GET /portal/manifest.webmanifest', () => {
+    it('names the app after the portal title, not the company', async () => {
+      useSettings({
+        'company.name': 'RHIEM Packaging & Print GmbH',
+        'company.portalTitle': 'RHIEM EV',
+      });
+      const res = await app.inject({ method: 'GET', url: '/portal/manifest.webmanifest' });
+      expect(res.json()).toMatchObject({ name: 'RHIEM EV', short_name: 'RHIEM EV' });
+    });
+
     it('describes the portal as a standalone app with the logo icons', async () => {
       useSettings({
         'company.name': 'RHIEM EV',

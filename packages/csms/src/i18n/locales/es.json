@@ -4315,7 +4315,9 @@
       "enabled": "Buscar Nuevas Versiones",
       "enabledDesc": "Activado: el servidor lee una vez al día el número de la última versión en evtivity.com, y los administradores ven un aviso en el panel cuando hay una versión más reciente. Solo la dirección IP del servidor llega a evtivity.com; los navegadores nunca lo contactan. Desactivado: no se envía nada.",
       "offEffect": "El servidor deja de leer la última versión en evtivity.com y los administradores ya no ven un aviso cuando hay una versión más reciente."
-    }
+    },
+    "portalTitle": "Título del portal",
+    "portalTitleHelp": "Nombre del producto del portal de conductores y de todos los correos (cabecera, título del navegador, nombre de la app, asunto). Vacío: el nombre de la empresa. Las facturas y el pie del portal mantienen el nombre de la empresa."
   },
   "pnc": {
     "certificates": "Certificados",

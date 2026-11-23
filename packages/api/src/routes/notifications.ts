@@ -42,6 +42,7 @@ import {
   driverNotificationChannels,
   getNotificationSettings,
 } from '@evtivity/lib';
+import { COMPANY_PORTAL_TITLE_KEY, resolvePortalTitle } from '@evtivity/lib/portal-title';
 import type { AllowedTemplateOptions } from '@evtivity/lib';
 import { isMissingFileError } from '../lib/fs-errors.js';
 import { getPubSub } from '@evtivity/lib/pubsub-instance';
@@ -2022,7 +2023,11 @@ export function notificationRoutes(app: FastifyInstance): void {
           EMAIL_LAYOUT_TEMPLATE,
         )({
           content: EMAIL_WRAPPER_SAMPLE_BODY,
-          companyName: company.get('company.name') ?? 'EVtivity',
+          companyName: resolvePortalTitle(
+            company.get(COMPANY_PORTAL_TITLE_KEY),
+            company.get('company.name'),
+          ),
+          companyLegalName: company.get('company.name') ?? 'EVtivity',
           companyCurrency: await getCompanyCurrency(),
           companyContactEmail: company.get('company.contactEmail') ?? '',
           companySupportEmail: company.get('company.supportEmail') ?? '',
@@ -2064,11 +2069,13 @@ export function notificationRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       const body = request.body as z.infer<typeof templatePreviewBody>;
 
-      const [[companyRow], [wrapperRow]] = await Promise.all([
+      const [[companyRow], [titleRow], [wrapperRow]] = await Promise.all([
         db.select().from(settings).where(eq(settings.key, 'company.name')).limit(1),
+        db.select().from(settings).where(eq(settings.key, COMPANY_PORTAL_TITLE_KEY)).limit(1),
         db.select().from(settings).where(eq(settings.key, 'email.wrapperTemplate')).limit(1),
       ]);
-      const companyName = (companyRow?.value as string | undefined) ?? 'EVtivity';
+      const companyLegalName = (companyRow?.value as string | undefined) ?? 'EVtivity';
+      const companyName = resolvePortalTitle(titleRow?.value, companyLegalName);
       const wrapperTemplate = (wrapperRow?.value as string | undefined) ?? null;
 
       const companyCurrency = await getCompanyCurrency();
@@ -2081,6 +2088,7 @@ export function notificationRoutes(app: FastifyInstance): void {
 
       const sampleVariables = {
         companyName,
+        companyLegalName,
         companyCurrency,
         companyContactEmail: companyMap.get('company.contactEmail') ?? '',
         companySupportEmail: companyMap.get('company.supportEmail') ?? '',

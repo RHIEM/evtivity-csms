@@ -92,6 +92,22 @@ describe('notification-dispatch', () => {
       expect(result).toBe('&lt;b&gt;Co&lt;/b&gt;<p>Hello</p>');
     });
 
+    it('names the company in the default footer, not the portal title', async () => {
+      const { wrapEmailHtml } = notificationDispatchModule;
+      const result = wrapEmailHtml('<p>Hello</p>', 'RHIEM EV', null, {
+        companyLegalName: 'RHIEM Packaging & Print GmbH',
+        companyStreet: 'Musterstr. 1',
+      });
+      expect(result).toContain('RHIEM EV');
+      expect(result).toContain('RHIEM Packaging &amp; Print GmbH');
+    });
+
+    it('names the product in the footer when no company name is passed', async () => {
+      const { wrapEmailHtml } = notificationDispatchModule;
+      const result = wrapEmailHtml('<p>Hello</p>', 'RHIEM EV');
+      expect(result.match(/RHIEM EV/g)).toHaveLength(2);
+    });
+
     it('falls back to default template when custom is empty', async () => {
       const { wrapEmailHtml } = notificationDispatchModule;
       const result = wrapEmailHtml('<p>Hello</p>', 'TestCo', '');
