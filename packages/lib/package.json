@@ -254,6 +254,9 @@
     "./invoice-seller": {
       "import": "./src/invoice-seller.ts"
     },
+    "./sage-export": {
+      "import": "./src/sage-export.ts"
+    },
     "./invoice-payment": {
       "import": "./src/invoice-payment.ts"
     },

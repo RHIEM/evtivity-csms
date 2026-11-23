@@ -136,6 +136,9 @@ import {
   COMPANY_INVOICE_EMAIL_KEY,
   isInvoiceSellerSettingKey,
   normalizeInvoiceSellerSetting,
+  SAGE_EXPORT_MAX_LENGTHS,
+  isSageExportSettingKey,
+  normalizeSageExportSetting,
   COMPANY_BIC_KEY,
   COMPANY_IBAN_KEY,
   INVOICE_EPC_QR_ENABLED_KEY,
@@ -369,6 +372,10 @@ function normalizeSettingValue(key: string, value: unknown): { value: unknown } 
     const seller = normalizeInvoiceSellerSetting(key, value);
     return seller != null ? { value: seller } : null;
   }
+  if (isSageExportSettingKey(key)) {
+    const sage = normalizeSageExportSetting(key, value);
+    return sage != null ? { value: sage } : null;
+  }
   if (isInvoicePaymentSettingKey(key)) {
     const bank = normalizeInvoicePaymentSetting(key, value);
     return bank != null ? { value: bank } : null;
@@ -530,6 +537,17 @@ function invalidInvoicePaymentError(key: keyof typeof INVOICE_PAYMENT_MAX_LENGTH
   };
 }
 
+function invalidSageExportError(key: keyof typeof SAGE_EXPORT_MAX_LENGTHS): {
+  error: string;
+  code: string;
+} {
+  const max = String(SAGE_EXPORT_MAX_LENGTHS[key]);
+  return {
+    error: `${key} must be one line of text of at most ${max} characters without a semicolon, and follow the format of its setting`,
+    code: 'VALIDATION_ERROR',
+  };
+}
+
 function invalidInvoiceSellerError(key: keyof typeof INVOICE_SELLER_MAX_LENGTHS): {
   error: string;
   code: string;
@@ -678,6 +696,7 @@ function invalidSettingError(key: string, value?: unknown): { error: string; cod
   if (key === PDF_FOOTER_KEY) return invalidPdfFooterError;
   if (key === PDF_LETTERHEAD_KEY) return pdfLetterheadSettingError;
   if (isInvoiceSellerSettingKey(key)) return invalidInvoiceSellerError(key);
+  if (isSageExportSettingKey(key)) return invalidSageExportError(key);
   if (isInvoicePaymentSettingKey(key)) return invalidInvoicePaymentError(key);
   if (
     key === INVOICE_EPC_QR_ENABLED_KEY ||

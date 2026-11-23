@@ -880,6 +880,35 @@ export {
 } from './invoice-seller.js';
 export type { InvoiceSellerSettingKey } from './invoice-seller.js';
 export {
+  SAGE_MANDANT_KEY,
+  SAGE_FILE_NAME_KEY,
+  SAGE_DEBTOR_PREFIX_KEY,
+  SAGE_REVENUE_ACCOUNT_PREFIX_KEY,
+  SAGE_REVENUE_ACCOUNT_KEY,
+  SAGE_TAX_KIND_KEY,
+  SAGE_TAX_CODES_KEY,
+  SAGE_PAYMENT_TERMS_KEY,
+  SAGE_POSTING_TEXT_KEY,
+  SAGE_BOOKING_DATE_KEY,
+  SAGE_OP_NUMBER_KEY,
+  SAGE_EXPORT_MAX_LENGTHS,
+  SAGE_EXPORT_SETTING_KEYS,
+  SAGE_EXPORT_DEFAULTS,
+  SAGE_EXPORT_REQUIRED_KEYS,
+  SAGE_BOOKING_DATE_MODES,
+  SAGE_OP_NUMBER_MODES,
+  isSageExportSettingKey,
+  normalizeSageExportSetting,
+  parseSageTaxCodes,
+  sageExportConfig,
+} from './sage-export.js';
+export type {
+  SageExportSettingKey,
+  SageExportConfig,
+  SageBookingDateMode,
+  SageOpNumberMode,
+} from './sage-export.js';
+export {
   COMPANY_BANK_ACCOUNT_HOLDER_KEY,
   COMPANY_IBAN_KEY,
   COMPANY_BIC_KEY,
