@@ -73,8 +73,8 @@ export const SAGE_EXPORT_REQUIRED_KEYS: readonly SageExportSettingKey[] = [
   SAGE_PAYMENT_TERMS_KEY,
 ];
 
-const FILE_NAME_PLACEHOLDERS = ['mandant', 'timestamp'];
-const POSTING_TEXT_PLACEHOLDERS = ['month', 'year', 'invoiceNumber'];
+const FILE_NAME_PLACEHOLDERS = ['mandant', 'timestamp', 'month', 'year'];
+const POSTING_TEXT_PLACEHOLDERS = ['month', 'year', 'invoiceNumber', 'employeeNumber'];
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/;
 const FILE_NAME_CHARACTERS = /^[A-Za-z0-9._{}-]+$/;

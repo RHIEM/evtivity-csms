@@ -63,6 +63,8 @@ const MESSAGES = {
     noDebtor: (numbers: string) => `Ohne Debitorennummer des Fahrers: ${numbers}.`,
     noTaxCode: (rates: string) =>
       `Ohne Steuercode in den Einstellungen (Sage-Export, Steuercodes): Steuersatz ${rates} %.`,
+    noEmployee: (numbers: string) =>
+      `Ohne Personalnummer des Fahrers (der Buchungstext verlangt sie): ${numbers}.`,
     noLines: (numbers: string) => `Ohne Rechnungszeilen: ${numbers}.`,
     stopped:
       'Der Sage-Export wurde nicht erzeugt, damit keine unvollständige Datei in Sage gelangt. Bitte beheben und erneut erzeugen.',
@@ -75,6 +77,8 @@ const MESSAGES = {
     noDebtor: (numbers: string) => `Without the driver's debtor number: ${numbers}.`,
     noTaxCode: (rates: string) =>
       `Without a tax code in the settings (Sage export, tax codes): tax rate ${rates} %.`,
+    noEmployee: (numbers: string) =>
+      `Without the driver's employee number (the posting text needs it): ${numbers}.`,
     noLines: (numbers: string) => `Without invoice lines: ${numbers}.`,
     stopped:
       'The Sage export was not created, so that no incomplete file reaches Sage. Fix this and create it again.',
@@ -109,11 +113,17 @@ async function loadConfig(): Promise<{
 }
 
 /** Fills the placeholders of the posting text; month and year are those of the billed month. */
-function postingText(template: string, invoiceNumber: string, monthSource: string): string {
+function postingText(
+  template: string,
+  invoiceNumber: string,
+  monthSource: string,
+  employeeNumber: string,
+): string {
   return template
     .replaceAll('{month}', monthSource.slice(5, 7))
     .replaceAll('{year}', monthSource.slice(0, 4))
-    .replaceAll('{invoiceNumber}', invoiceNumber);
+    .replaceAll('{invoiceNumber}', invoiceNumber)
+    .replaceAll('{employeeNumber}', employeeNumber);
 }
 
 /** yyyyMMddHHmmss of `now` in the system timezone. */
@@ -157,6 +167,7 @@ export async function generateSageInvoicesReport(
       periodEnd: invoices.periodEnd,
       currency: invoices.currency,
       debtorNumber: drivers.debtorNumber,
+      employeeNumber: drivers.employeeNumber,
     })
     .from(invoices)
     .leftJoin(drivers, eq(drivers.id, invoices.driverId))
@@ -199,12 +210,17 @@ export async function generateSageInvoicesReport(
   }
 
   const withoutDebtor: string[] = [];
+  const withoutEmployee: string[] = [];
   const withoutLines: string[] = [];
   const withoutTaxCode = new Set<number>();
   const rows: RabRow[] = [];
+  const serviceMonths: string[] = [];
+  const needsEmployeeNumber = config.postingText.includes('{employeeNumber}');
   for (const invoice of invoiceRows) {
     const debtorNumber = invoice.debtorNumber?.trim() ?? '';
     if (debtorNumber === '') withoutDebtor.push(invoice.invoiceNumber);
+    const employeeNumber = invoice.employeeNumber?.trim() ?? '';
+    if (needsEmployeeNumber && employeeNumber === '') withoutEmployee.push(invoice.invoiceNumber);
     const lines = linesByInvoice.get(invoice.id) ?? [];
     if (lines.length === 0) {
       withoutLines.push(invoice.invoiceNumber);
@@ -224,6 +240,7 @@ export async function generateSageInvoicesReport(
         continue;
       }
       const monthSource = invoice.periodStart ?? invoice.issuedDate;
+      serviceMonths.push(monthSource);
       rows.push({
         postingDate:
           config.bookingDate === 'periodEnd' && invoice.periodEnd != null
@@ -232,7 +249,12 @@ export async function generateSageInvoicesReport(
         documentDate: invoice.issuedDate,
         documentNumber: invoice.invoiceNumber,
         opNumber: config.opNumber === 'invoiceNumber' ? invoice.invoiceNumber : '',
-        postingText: postingText(config.postingText, invoice.invoiceNumber, monthSource),
+        postingText: postingText(
+          config.postingText,
+          invoice.invoiceNumber,
+          monthSource,
+          employeeNumber,
+        ),
         debitAccount: `${config.debtorPrefix}${debtorNumber}`,
         creditAccount: `${config.revenueAccountPrefix}${config.revenueAccount}`,
         grossCents: rate.grossCents,
@@ -250,11 +272,16 @@ export async function generateSageInvoicesReport(
   if (withoutTaxCode.size > 0) {
     problems.push(messages.noTaxCode([...withoutTaxCode].map(String).join(', ')));
   }
+  if (withoutEmployee.length > 0) problems.push(messages.noEmployee(listed(withoutEmployee)));
   if (withoutLines.length > 0) problems.push(messages.noLines(listed(withoutLines)));
   if (problems.length > 0) throw new Error(`${problems.join(' ')} ${messages.stopped}`);
 
+  // The billed month of the file: the earliest of its lines (the period filter when it has none).
+  const fileMonth = serviceMonths.sort()[0] ?? filters.dateFrom;
   const fileName = config.fileName
     .replaceAll('{mandant}', config.mandant)
-    .replaceAll('{timestamp}', fileTimestamp(new Date(), tz));
+    .replaceAll('{timestamp}', fileTimestamp(new Date(), tz))
+    .replaceAll('{month}', fileMonth.slice(5, 7))
+    .replaceAll('{year}', fileMonth.slice(0, 4));
   return { data: Buffer.from(buildRabCsv(rows), 'utf8'), fileName };
 }

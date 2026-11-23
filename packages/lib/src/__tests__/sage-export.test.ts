@@ -82,11 +82,20 @@ describe('normalizeSageExportSetting', () => {
     expect(normalizeSageExportSetting(SAGE_FILE_NAME_KEY, 'RAB-{mandant}-{timestamp}.txt')).toBe(
       'RAB-{mandant}-{timestamp}.txt',
     );
-    expect(normalizeSageExportSetting(SAGE_FILE_NAME_KEY, 'RAB-{month}.txt')).toBeNull();
+    expect(normalizeSageExportSetting(SAGE_FILE_NAME_KEY, 'RAB-{year}-{month}.txt')).toBe(
+      'RAB-{year}-{month}.txt',
+    );
+    expect(normalizeSageExportSetting(SAGE_FILE_NAME_KEY, 'RAB-{name}.txt')).toBeNull();
     expect(normalizeSageExportSetting(SAGE_FILE_NAME_KEY, 'RAB-{mandant.txt')).toBeNull();
     expect(
       normalizeSageExportSetting(SAGE_POSTING_TEXT_KEY, 'E-Laden {month}/{year} {invoiceNumber}'),
     ).toBe('E-Laden {month}/{year} {invoiceNumber}');
+    expect(
+      normalizeSageExportSetting(
+        SAGE_POSTING_TEXT_KEY,
+        'E-Laden {month}/{year} - PERSNR. {employeeNumber}',
+      ),
+    ).toBe('E-Laden {month}/{year} - PERSNR. {employeeNumber}');
     expect(normalizeSageExportSetting(SAGE_POSTING_TEXT_KEY, 'E-Laden {name}')).toBeNull();
   });
 
