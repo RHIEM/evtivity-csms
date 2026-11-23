@@ -373,7 +373,7 @@ describe('reportSchedulerHandler', () => {
       [{ status: 'completed', fileData: Buffer.from('a,b,c'), fileName: 'sessions.csv' }], // waitForReport
     );
     setupClientResults(
-      [{ value: 'Acme Charging' }], // company.name SELECT
+      [{ key: 'company.name', value: 'Acme Charging' }], // company.name SELECT
       [], // notifications INSERT
     );
     mockGetNotificationSettings.mockResolvedValue({

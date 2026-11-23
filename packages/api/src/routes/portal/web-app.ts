@@ -11,6 +11,7 @@ import { zodSchema } from '../../lib/zod-schema.js';
 import { errorWith } from '../../lib/response-schemas.js';
 import { ERROR_CODES } from '../../lib/error-codes.generated.js';
 import { config as apiConfig } from '../../lib/config.js';
+import { COMPANY_PORTAL_TITLE_KEY, resolvePortalTitle } from '@evtivity/lib/portal-title';
 
 /**
  * The driver portal as an installable web app: the web app manifest and the
@@ -23,6 +24,7 @@ import { config as apiConfig } from '../../lib/config.js';
 
 const KEYS = [
   'company.name',
+  COMPANY_PORTAL_TITLE_KEY,
   'company.logo',
   'company.favicon',
   'company.themeColor',
@@ -77,7 +79,12 @@ async function readBranding(): Promise<Branding> {
     ? value('company.themeColor')
     : DEFAULT_THEME_COLOR;
   const portalUrl = (value('company.portalUrl') || apiConfig.PORTAL_URL).replace(/\/+$/, '');
-  return { name: value('company.name') || 'EVtivity', image, themeColor, portalUrl };
+  return {
+    name: resolvePortalTitle(value(COMPANY_PORTAL_TITLE_KEY), value('company.name')),
+    image,
+    themeColor,
+    portalUrl,
+  };
 }
 
 function versionOf(image: Buffer): string {

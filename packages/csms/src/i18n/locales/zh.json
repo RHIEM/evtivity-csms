@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "发票编号",
     "sageExportSaved": "Sage 导出设置已保存",
     "sageExportSaveFailed": "无法保存 Sage 导出设置。",
-    "sageExportInvalid": "值无效（最多 {{max}} 个字符；请检查占位符和格式）。"
+    "sageExportInvalid": "值无效（最多 {{max}} 个字符；请检查占位符和格式）。",
+    "portalTitle": "门户标题",
+    "portalTitleHelp": "驾驶员门户和所有电子邮件使用的产品名称（页眉、浏览器标题、应用名称、邮件主题）。留空则使用公司名称。发票和门户页脚仍使用公司名称。"
   },
   "pnc": {
     "certificates": "证书",

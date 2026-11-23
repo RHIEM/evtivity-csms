@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "청구서 번호",
     "sageExportSaved": "Sage 내보내기 설정이 저장되었습니다",
     "sageExportSaveFailed": "Sage 내보내기 설정을 저장할 수 없습니다.",
-    "sageExportInvalid": "잘못된 값입니다(최대 {{max}}자, 자리 표시자와 형식을 확인하세요)."
+    "sageExportInvalid": "잘못된 값입니다(최대 {{max}}자, 자리 표시자와 형식을 확인하세요).",
+    "portalTitle": "포털 제목",
+    "portalTitleHelp": "운전자 포털과 모든 이메일의 제품 이름(머리글, 브라우저 제목, 앱 이름, 제목). 비워 두면 회사 이름을 사용합니다. 청구서와 포털 바닥글은 회사 이름을 유지합니다."
   },
   "pnc": {
     "certificates": "인증서",

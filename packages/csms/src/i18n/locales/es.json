@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "Número de factura",
     "sageExportSaved": "Ajustes de la exportación a Sage guardados",
     "sageExportSaveFailed": "No se pudieron guardar los ajustes de la exportación a Sage.",
-    "sageExportInvalid": "Valor no válido (máximo {{max}} caracteres; compruebe marcadores y formato)."
+    "sageExportInvalid": "Valor no válido (máximo {{max}} caracteres; compruebe marcadores y formato).",
+    "portalTitle": "Título del portal",
+    "portalTitleHelp": "Nombre del producto del portal de conductores y de todos los correos (cabecera, título del navegador, nombre de la app, asunto). Vacío: el nombre de la empresa. Las facturas y el pie del portal mantienen el nombre de la empresa."
   },
   "pnc": {
     "certificates": "Certificados",

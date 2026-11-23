@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "Invoice number",
     "sageExportSaved": "Sage export settings saved",
     "sageExportSaveFailed": "The Sage export settings could not be saved.",
-    "sageExportInvalid": "Invalid value (at most {{max}} characters; check placeholders and format)."
+    "sageExportInvalid": "Invalid value (at most {{max}} characters; check placeholders and format).",
+    "portalTitle": "Portal Title",
+    "portalTitleHelp": "Product name of the driver portal and of every email (header, browser title, app name, subject). Empty: the company name. Invoices and the portal footer keep the company name."
   },
   "pnc": {
     "certificates": "Certificates",

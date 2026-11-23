@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "Rechnungsnummer",
     "sageExportSaved": "Sage-Export-Einstellungen gespeichert",
     "sageExportSaveFailed": "Die Sage-Export-Einstellungen konnten nicht gespeichert werden.",
-    "sageExportInvalid": "Ungültiger Wert (höchstens {{max}} Zeichen; Platzhalter und Format prüfen)."
+    "sageExportInvalid": "Ungültiger Wert (höchstens {{max}} Zeichen; Platzhalter und Format prüfen).",
+    "portalTitle": "Portaltitel",
+    "portalTitleHelp": "Produktname des Fahrerportals und aller E-Mails (Kopfzeile, Browser-Titel, App-Name, Betreff). Leer: der Unternehmensname. Rechnungen und der Portal-Footer behalten den Unternehmensnamen."
   },
   "pnc": {
     "certificates": "Zertifikate",

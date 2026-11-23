@@ -20,6 +20,7 @@ import {
 } from '@evtivity/services/report-scope';
 import { writeReportGeneratedAudit } from '@evtivity/services/report-audit';
 import { getNotificationSettings, sendEmail, renderTemplate, wrapEmailHtml } from '@evtivity/lib';
+import { COMPANY_PORTAL_TITLE_KEY, resolvePortalTitle } from '@evtivity/lib/portal-title';
 import type { EmailAttachment, RenderedTemplate } from '@evtivity/lib';
 import { isUiLanguage } from '@evtivity/lib/languages';
 import { API_TEMPLATES_DIR } from '@evtivity/services/template-dirs';
@@ -117,10 +118,18 @@ async function runOneSchedule(
       siteScope,
       log,
     );
-    const companyRows = await client`SELECT value FROM settings WHERE key = 'company.name'`;
-    const companyName = (companyRows[0]?.value as string | undefined) ?? 'EVtivity CSMS';
+    const companyRows = await client`
+      SELECT key, value FROM settings WHERE key IN ('company.name', ${COMPANY_PORTAL_TITLE_KEY})
+    `;
+    const companyValue = (key: string): unknown => companyRows.find((r) => r.key === key)?.value;
+    const companyName = resolvePortalTitle(
+      companyValue(COMPANY_PORTAL_TITLE_KEY),
+      companyValue('company.name'),
+      'EVtivity CSMS',
+    );
     const templateVars = {
       companyName,
+      companyLegalName: (companyValue('company.name') as string | undefined) ?? companyName,
       reportName: schedule.name,
       generatedAt: new Date().toISOString(),
     };

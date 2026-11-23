@@ -14,6 +14,8 @@ import { APP_VERSION } from '@/lib/version';
 
 interface Branding {
   name?: string;
+  /** RHIEM: product name of the portal; the company name when empty. */
+  portalTitle?: string;
   logo?: string;
   themeColor?: string;
   contactEmail?: string;
@@ -98,7 +100,10 @@ export function useAuthBranding(): {
     queryKey: ['branding'],
     queryFn: () => api.get<Branding>('/v1/portal/branding'),
   });
-  const liveName = branding?.name != null && branding.name !== '' ? branding.name : null;
+  // RHIEM: the portal title is the name shown in the header and the browser title.
+  const title = branding?.portalTitle?.trim() ?? '';
+  const liveName =
+    title !== '' ? title : branding?.name != null && branding.name !== '' ? branding.name : null;
   const liveLogo = branding?.logo != null && branding.logo !== '' ? branding.logo : null;
   // Until branding loads (or while the API is down), show the last one this browser saw.
   const cached = branding == null ? readCachedBranding() : null;
@@ -177,7 +182,9 @@ export function AuthFooter({
   const { t, i18n } = useTranslation();
   const links = legalLinks(i18n.language);
   const year = new Date().getFullYear();
-  const name = companyName ?? 'EVtivity';
+  // RHIEM: the footer names the company, not the portal title.
+  const name =
+    branding?.name != null && branding.name !== '' ? branding.name : (companyName ?? 'EVtivity');
 
   const addressParts = [
     branding?.street,

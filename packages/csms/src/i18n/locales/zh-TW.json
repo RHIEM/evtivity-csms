@@ -4344,7 +4344,9 @@
     "sageExportOpNumberInvoice": "發票編號",
     "sageExportSaved": "Sage 匯出設定已儲存",
     "sageExportSaveFailed": "無法儲存 Sage 匯出設定。",
-    "sageExportInvalid": "值無效（最多 {{max}} 個字元；請檢查預留位置與格式）。"
+    "sageExportInvalid": "值無效（最多 {{max}} 個字元；請檢查預留位置與格式）。",
+    "portalTitle": "入口網站標題",
+    "portalTitleHelp": "駕駛人入口網站與所有電子郵件使用的產品名稱（頁首、瀏覽器標題、應用程式名稱、郵件主旨）。留空則使用公司名稱。發票與入口網站頁尾仍使用公司名稱。"
   },
   "pnc": {
     "certificates": "憑證",

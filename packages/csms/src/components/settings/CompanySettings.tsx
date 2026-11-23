@@ -28,6 +28,7 @@ import {
   type DistanceUnit,
 } from '@evtivity/lib/driver-defaults';
 import { isUiLanguage } from '@evtivity/lib/languages';
+import { PORTAL_TITLE_MAX_LENGTH } from '@evtivity/lib/portal-title';
 import { SaveButton } from '@/components/save-button';
 import { DistanceUnitSelect } from '@/components/ui/distance-unit-select';
 import { LanguageSelect } from '@/components/ui/language-select';
@@ -80,6 +81,7 @@ const CURRENCY_NAMES: Record<SupportedCurrency, string> = {
 
 interface CompanyValues {
   name: string;
+  portalTitle: string;
   currency: string;
   priceDisplay: PriceDisplay;
   taxBasis: TaxBasis;
@@ -113,6 +115,7 @@ function companyValuesFrom(settings: Record<string, unknown> | undefined): Compa
   const driverDistanceUnit = s('system.distanceUnit');
   return {
     name: s('company.name') || 'EVtivity',
+    portalTitle: s('company.portalTitle'),
     currency: s('company.currency').trim().toUpperCase() || DEFAULT_CURRENCY,
     priceDisplay: isPriceDisplay(priceDisplay) ? priceDisplay : DEFAULT_PRICE_DISPLAY,
     taxBasis: settings == null ? DEFAULT_TAX_BASIS : resolveTaxBasis(settings['company.taxBasis']),
@@ -182,6 +185,7 @@ export function CompanySettings({
     };
   const {
     name: companyName,
+    portalTitle: companyPortalTitle,
     currency: companyCurrency,
     priceDisplay: companyPriceDisplay,
     taxBasis: companyTaxBasis,
@@ -204,6 +208,7 @@ export function CompanySettings({
     metaKeywords,
   } = companyValues;
   const setCompanyName = companyField('name');
+  const setCompanyPortalTitle = companyField('portalTitle');
   const setCompanyCurrency = companyField('currency');
   const setCompanyPriceDisplay = companyField('priceDisplay');
   const setCompanyTaxBasis = companyField('taxBasis');
@@ -230,6 +235,7 @@ export function CompanySettings({
     mutationFn: (vals: CompanyValues) =>
       Promise.all([
         api.put('/v1/settings/company.name', { value: vals.name }),
+        api.put('/v1/settings/company.portalTitle', { value: vals.portalTitle.trim() }),
         api.put('/v1/settings/company.currency', { value: vals.currency }),
         api.put('/v1/settings/company.priceDisplay', { value: vals.priceDisplay }),
         api.put('/v1/settings/company.taxBasis', { value: vals.taxBasis }),
@@ -654,6 +660,22 @@ export function CompanySettings({
                   setCompanyName(e.target.value);
                 }}
               />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="company-portal-title" className="leading-6">
+                {t('settings.portalTitle')}
+              </Label>
+              <Input
+                id="company-portal-title"
+                maxLength={PORTAL_TITLE_MAX_LENGTH}
+                placeholder={companyName}
+                value={companyPortalTitle}
+                onChange={(e) => {
+                  setCompanyPortalTitle(e.target.value);
+                }}
+              />
+              <p className="text-xs text-muted-foreground">{t('settings.portalTitleHelp')}</p>
             </div>
 
             <div className="space-y-2">

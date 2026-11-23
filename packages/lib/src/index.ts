@@ -571,6 +571,11 @@ export {
 } from './csms-update-check.js';
 
 export { sendExpoPush, isExpoPushToken } from './push-send.js';
+export {
+  COMPANY_PORTAL_TITLE_KEY,
+  PORTAL_TITLE_MAX_LENGTH,
+  resolvePortalTitle,
+} from './portal-title.js';
 export type { ExpoPushMessage, ExpoPushResult, PushSendContext } from './push-send.js';
 export {
   resolveNotificationTestSinkUrl,

@@ -196,7 +196,8 @@ export const OPERATOR_EVENT_TYPES = [
 ] as const;
 
 export const COMMON_VARIABLES: TemplateVariable[] = [
-  { name: 'companyName', description: 'Company name' },
+  { name: 'companyName', description: 'Portal title (the company name when none is set)' },
+  { name: 'companyLegalName', description: 'Company name' },
   { name: 'companyCurrency', description: 'Platform currency code (e.g. USD)' },
   { name: 'companyContactEmail', description: 'Contact email' },
   { name: 'companySupportEmail', description: 'Support email' },
