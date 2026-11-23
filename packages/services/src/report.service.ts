@@ -16,6 +16,10 @@ import { generateUtilizationReport } from './report-generators/utilization-repor
 import { generateStationHealthReport } from './report-generators/station-health-report.js';
 import { generateSustainabilityReport } from './report-generators/sustainability-report.js';
 import { generateDriverActivityReport } from './report-generators/driver-activity-report.js';
+import {
+  generateSageInvoicesReport,
+  sageInvoicesFiltersError,
+} from './report-generators/sage-invoices-report.js';
 
 const log = createLogger('reports');
 
@@ -91,6 +95,7 @@ export const REPORT_TYPES = [
   'stationHealth',
   'sustainability',
   'driverActivity',
+  'sageInvoices',
 ] as const;
 
 export type ReportType = (typeof REPORT_TYPES)[number];
@@ -136,6 +141,19 @@ reportGenerators.register({
   // The EV-ChART template is fixed (no column can be left out) and holds the
   // payment method and the station cost tabs: payments:read.
   requiredPermissions: ['payments:read'],
+});
+
+// RHIEM: the Sage export (sage-invoices-report.ts): the member invoices and credit
+// notes of a period in the layout of the RAB import of Sage/OfficeLine. It
+// carries amounts and the debtor numbers of the drivers: payments:read and
+// drivers:read. Only a date range filters it (the invoices belong to no site).
+reportGenerators.register({
+  type: 'sageInvoices',
+  generate: generateSageInvoicesReport,
+  formats: ['csv'],
+  generateFromUi: true,
+  validateFilters: sageInvoicesFiltersError,
+  requiredPermissions: ['payments:read', 'drivers:read'],
 });
 
 export interface ReportTypeInfo {

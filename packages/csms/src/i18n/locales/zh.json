@@ -4315,7 +4315,36 @@
       "enabled": "检查新版本",
       "enabledDesc": "开启：服务器每天从 evtivity.com 读取一次最新版本号，有更新版本发布时，管理员会在仪表板上看到通知。只有服务器的 IP 地址会到达 evtivity.com，浏览器从不访问它。关闭：不发送任何内容。",
       "offEffect": "服务器不再从 evtivity.com 读取最新版本，有更新版本发布时管理员也不会再看到通知。"
-    }
+    },
+    "sageExport": "Sage 导出",
+    "sageExportDescription": "Sage 发票导出设置（报表类型“Sage 发票导出”）。文件按 RAB 导入的格式生成。仅导出车队成员的发票和贷项通知单。",
+    "sageExportMandant": "客户（Mandant）",
+    "sageExportMandantHelp": "导出所对应的 Sage 客户（Mandant），用于文件名。",
+    "sageExportFileName": "文件名",
+    "sageExportFileNameHelp": "占位符：{mandant} 和 {timestamp}。只能使用字母、数字、点、连字符和下划线。",
+    "sageExportDebtorPrefix": "应收账户前缀",
+    "sageExportDebtorPrefixHelp": "加在借方科目中驾驶员应收账号之前，例如“D”。",
+    "sageExportRevenueAccountPrefix": "收入账户前缀",
+    "sageExportRevenueAccountPrefixHelp": "加在贷方科目中收入科目之前，例如“S”。",
+    "sageExportRevenueAccount": "收入科目",
+    "sageExportRevenueAccountHelp": "发票行的收入科目（贷方），不含前缀。",
+    "sageExportTaxKind": "税种",
+    "sageExportTaxKindHelp": "行的税种，例如“UH”。",
+    "sageExportTaxCodes": "税码",
+    "sageExportTaxCodesHelp": "按税率（百分比）对应的 Sage 税码，例如“19=3, 7=2”。",
+    "sageExportPaymentTerms": "付款条件",
+    "sageExportPaymentTermsHelp": "写入每一行的付款条件，例如“BEZDebitor”（直接扣款）。",
+    "sageExportPostingText": "记账文本",
+    "sageExportPostingTextHelp": "占位符：{month}、{year} 和 {invoiceNumber}。",
+    "sageExportBookingDate": "记账日期",
+    "sageExportBookingDateInvoice": "发票日期",
+    "sageExportBookingDatePeriodEnd": "结算月份的最后一天",
+    "sageExportOpNumber": "OP 编号",
+    "sageExportOpNumberEmpty": "留空",
+    "sageExportOpNumberInvoice": "发票编号",
+    "sageExportSaved": "Sage 导出设置已保存",
+    "sageExportSaveFailed": "无法保存 Sage 导出设置。",
+    "sageExportInvalid": "值无效（最多 {{max}} 个字符；请检查占位符和格式）。"
   },
   "pnc": {
     "certificates": "证书",
@@ -5131,7 +5160,8 @@
       "sessions": "会话",
       "sustainability": "可持续性",
       "driverActivity": "驾驶员活动",
-      "nevi": "NEVI合规"
+      "nevi": "NEVI合规",
+      "sageInvoices": "Sage 发票导出"
     },
     "formats": {
       "csv": "CSV",

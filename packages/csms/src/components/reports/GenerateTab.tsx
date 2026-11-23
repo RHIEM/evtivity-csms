@@ -31,6 +31,8 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
   // Until the operator picks one, the first offered type and its first format are selected.
   const selectedType = reportType !== '' ? reportType : (offered[0]?.type ?? '');
   const formats = reportTypeFormats(offered, selectedType);
+  // RHIEM: invoices belong to no site, so the Sage export has no site or station filter.
+  const invoiceBased = selectedType === 'sageInvoices';
   const selectedFormat = formats.includes(format) ? format : (formats[0] ?? '');
 
   const { data: sitesResponse } = useQuery({
@@ -83,8 +85,10 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
     const filters: Record<string, string> = {};
     if (dateFrom) filters['dateFrom'] = dateFrom;
     if (dateTo) filters['dateTo'] = dateTo;
-    if (siteId) filters['siteId'] = siteId;
-    if (stationId) filters['stationId'] = stationId;
+    if (!invoiceBased) {
+      if (siteId) filters['siteId'] = siteId;
+      if (stationId) filters['stationId'] = stationId;
+    }
     generateMutation.mutate({
       name,
       reportType: selectedType,
@@ -184,48 +188,50 @@ export function GenerateTab({ onGenerated }: { onGenerated: () => void }): React
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 items-start">
-            <div className="space-y-2">
-              <Label htmlFor="report-site" className="leading-6">
-                {t('reports.site')}
-              </Label>
-              <Select
-                id="report-site"
-                value={siteId}
-                onChange={(e) => {
-                  setSiteId(e.target.value);
-                  setStationId('');
-                }}
-              >
-                <option value="">{t('common.all')}</option>
-                {sitesResponse?.data.map((site) => (
-                  <option key={site.id} value={site.id}>
-                    {site.name}
-                  </option>
-                ))}
-              </Select>
-            </div>
+          {!invoiceBased && (
+            <div className="grid gap-4 sm:grid-cols-2 items-start">
+              <div className="space-y-2">
+                <Label htmlFor="report-site" className="leading-6">
+                  {t('reports.site')}
+                </Label>
+                <Select
+                  id="report-site"
+                  value={siteId}
+                  onChange={(e) => {
+                    setSiteId(e.target.value);
+                    setStationId('');
+                  }}
+                >
+                  <option value="">{t('common.all')}</option>
+                  {sitesResponse?.data.map((site) => (
+                    <option key={site.id} value={site.id}>
+                      {site.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="report-station" className="leading-6">
-                {t('reports.station')}
-              </Label>
-              <Select
-                id="report-station"
-                value={stationId}
-                onChange={(e) => {
-                  setStationId(e.target.value);
-                }}
-              >
-                <option value="">{t('common.all')}</option>
-                {stationsResponse?.data.map((station) => (
-                  <option key={station.id} value={station.id}>
-                    {station.stationId}
-                  </option>
-                ))}
-              </Select>
+              <div className="space-y-2">
+                <Label htmlFor="report-station" className="leading-6">
+                  {t('reports.station')}
+                </Label>
+                <Select
+                  id="report-station"
+                  value={stationId}
+                  onChange={(e) => {
+                    setStationId(e.target.value);
+                  }}
+                >
+                  <option value="">{t('common.all')}</option>
+                  {stationsResponse?.data.map((station) => (
+                    <option key={station.id} value={station.id}>
+                      {station.stationId}
+                    </option>
+                  ))}
+                </Select>
+              </div>
             </div>
-          </div>
+          )}
 
           {generateMutation.isError && (
             <p className="text-sm text-destructive">{getErrorMessage(generateMutation.error, t)}</p>

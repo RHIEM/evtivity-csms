@@ -4315,7 +4315,36 @@
       "enabled": "Nach neuen Versionen suchen",
       "enabledDesc": "Ein: Der Server liest einmal am Tag die neueste Versionsnummer von evtivity.com, und Admins sehen auf dem Dashboard einen Hinweis, wenn eine neuere Version erschienen ist. Nur die IP-Adresse des Servers erreicht evtivity.com; Browser kontaktieren die Seite nie. Aus: Es wird nichts gesendet.",
       "offEffect": "Der Server liest die neueste Version nicht mehr von evtivity.com, und Admins sehen keinen Hinweis mehr, wenn eine neuere Version erschienen ist."
-    }
+    },
+    "sageExport": "Sage-Export",
+    "sageExportDescription": "Einstellungen des Sage-Rechnungsexports (Berichtstyp „Sage-Rechnungsexport“). Die Datei entsteht im Layout des RAB-Imports. Exportiert werden nur Rechnungen und Gutschriften von Flottenmitgliedern.",
+    "sageExportMandant": "Mandant",
+    "sageExportMandantHelp": "Sage-Mandant, für den exportiert wird. Wird im Dateinamen verwendet.",
+    "sageExportFileName": "Dateiname",
+    "sageExportFileNameHelp": "Platzhalter: {mandant} und {timestamp}. Nur Buchstaben, Ziffern, Punkt, Bindestrich und Unterstrich.",
+    "sageExportDebtorPrefix": "Präfix Debitorenkonto",
+    "sageExportDebtorPrefixHelp": "Wird der Debitorennummer des Fahrers im Soll-Konto vorangestellt, z. B. „D“.",
+    "sageExportRevenueAccountPrefix": "Präfix Erlöskonto",
+    "sageExportRevenueAccountPrefixHelp": "Wird dem Erlöskonto im Haben-Konto vorangestellt, z. B. „S“.",
+    "sageExportRevenueAccount": "Erlöskonto",
+    "sageExportRevenueAccountHelp": "Erlöskonto (Haben) der Rechnungszeilen, ohne Präfix.",
+    "sageExportTaxKind": "Steuerart",
+    "sageExportTaxKindHelp": "Steuerart der Zeilen, z. B. „UH“.",
+    "sageExportTaxCodes": "Steuercodes",
+    "sageExportTaxCodesHelp": "Sage-Steuercode je Steuersatz in Prozent, z. B. „19=3, 7=2“.",
+    "sageExportPaymentTerms": "Zahlungskondition",
+    "sageExportPaymentTermsHelp": "Zahlungskondition je Zeile, z. B. „BEZDebitor“ (Lastschrift).",
+    "sageExportPostingText": "Buchungstext",
+    "sageExportPostingTextHelp": "Platzhalter: {month}, {year} und {invoiceNumber}.",
+    "sageExportBookingDate": "Buchungsdatum",
+    "sageExportBookingDateInvoice": "Rechnungsdatum",
+    "sageExportBookingDatePeriodEnd": "Letzter Tag des abgerechneten Monats",
+    "sageExportOpNumber": "OP-Nummer",
+    "sageExportOpNumberEmpty": "Leer lassen",
+    "sageExportOpNumberInvoice": "Rechnungsnummer",
+    "sageExportSaved": "Sage-Export-Einstellungen gespeichert",
+    "sageExportSaveFailed": "Die Sage-Export-Einstellungen konnten nicht gespeichert werden.",
+    "sageExportInvalid": "Ungültiger Wert (höchstens {{max}} Zeichen; Platzhalter und Format prüfen)."
   },
   "pnc": {
     "certificates": "Zertifikate",
@@ -5131,7 +5160,8 @@
       "sessions": "Ladevorgänge",
       "sustainability": "Nachhaltigkeit",
       "driverActivity": "Fahreraktivität",
-      "nevi": "NEVI-Konformität"
+      "nevi": "NEVI-Konformität",
+      "sageInvoices": "Sage-Rechnungsexport"
     },
     "formats": {
       "csv": "CSV",

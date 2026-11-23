@@ -836,6 +836,51 @@ describe('Settings routes', () => {
   });
 
   it.each([
+    ['sage.revenueAccount', ' 8400 ', '8400'],
+    ['sage.taxCodes', ' 19=3, 7=2 ', '19=3, 7=2'],
+    ['sage.paymentTerms', 'BEZDebitor', 'BEZDebitor'],
+    ['sage.bookingDate', 'periodEnd', 'periodEnd'],
+    ['sage.fileName', 'RAB-{mandant}-{timestamp}.txt', 'RAB-{mandant}-{timestamp}.txt'],
+    ['sage.opNumber', ' ', ''],
+  ])('PUT /v1/settings/%s stores the normalized Sage export value', async (key, value, stored) => {
+    vi.mocked(db.insert).mockClear();
+    setupDbResults([], [{ key, value: stored }]);
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(200);
+    const insertChain = vi.mocked(db.insert).mock.results.at(-1)?.value as {
+      values: ReturnType<typeof vi.fn>;
+    };
+    expect(insertChain.values).toHaveBeenCalledWith({ key, value: stored });
+  });
+
+  it.each([
+    ['sage.revenueAccount', '84;00'],
+    ['sage.taxCodes', '19'],
+    ['sage.bookingDate', 'today'],
+    ['sage.fileName', '../RAB.txt'],
+    ['sage.postingText', 'E-Laden {name}'],
+    ['sage.mandant', 2],
+    ['sage.paymentTerms', 'x'.repeat(31)],
+  ])('PUT /v1/settings/%s rejects an invalid Sage export value', async (key, value) => {
+    vi.mocked(db.insert).mockClear();
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/settings/${key}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { value },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('VALIDATION_ERROR');
+    expect(response.json().error).toContain(key);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['company.iban', ' de89 3704 0044 0532 0130 00 ', 'DE89370400440532013000'],
     ['company.bic', 'cobadeffxxx', 'COBADEFFXXX'],
     ['company.bankAccountHolder', '  Acme Charging GmbH ', 'Acme Charging GmbH'],

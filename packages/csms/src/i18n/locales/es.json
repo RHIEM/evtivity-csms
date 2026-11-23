@@ -4315,7 +4315,36 @@
       "enabled": "Buscar Nuevas Versiones",
       "enabledDesc": "Activado: el servidor lee una vez al día el número de la última versión en evtivity.com, y los administradores ven un aviso en el panel cuando hay una versión más reciente. Solo la dirección IP del servidor llega a evtivity.com; los navegadores nunca lo contactan. Desactivado: no se envía nada.",
       "offEffect": "El servidor deja de leer la última versión en evtivity.com y los administradores ya no ven un aviso cuando hay una versión más reciente."
-    }
+    },
+    "sageExport": "Exportación a Sage",
+    "sageExportDescription": "Ajustes de la exportación de facturas a Sage (tipo de informe «Exportación de facturas a Sage»). El archivo usa el formato de la importación RAB. Solo se exportan facturas y abonos de miembros de flotas.",
+    "sageExportMandant": "Mandante",
+    "sageExportMandantHelp": "Mandante de Sage para el que se exporta. Se usa en el nombre del archivo.",
+    "sageExportFileName": "Nombre del archivo",
+    "sageExportFileNameHelp": "Marcadores: {mandant} y {timestamp}. Solo letras, dígitos, punto, guion y guion bajo.",
+    "sageExportDebtorPrefix": "Prefijo de la cuenta de deudores",
+    "sageExportDebtorPrefixHelp": "Se antepone al número de deudor del conductor en la cuenta del debe, p. ej. «D».",
+    "sageExportRevenueAccountPrefix": "Prefijo de la cuenta de ingresos",
+    "sageExportRevenueAccountPrefixHelp": "Se antepone a la cuenta de ingresos en la cuenta del haber, p. ej. «S».",
+    "sageExportRevenueAccount": "Cuenta de ingresos",
+    "sageExportRevenueAccountHelp": "Cuenta de ingresos (haber) de las líneas de factura, sin prefijo.",
+    "sageExportTaxKind": "Clase de impuesto",
+    "sageExportTaxKindHelp": "Clase de impuesto de las líneas, p. ej. «UH».",
+    "sageExportTaxCodes": "Códigos de impuesto",
+    "sageExportTaxCodesHelp": "Código de impuesto de Sage por tipo impositivo en porcentaje, p. ej. «19=3, 7=2».",
+    "sageExportPaymentTerms": "Condición de pago",
+    "sageExportPaymentTermsHelp": "Condición de pago de cada línea, p. ej. «BEZDebitor» (domiciliación).",
+    "sageExportPostingText": "Texto del asiento",
+    "sageExportPostingTextHelp": "Marcadores: {month}, {year} y {invoiceNumber}.",
+    "sageExportBookingDate": "Fecha del asiento",
+    "sageExportBookingDateInvoice": "Fecha de la factura",
+    "sageExportBookingDatePeriodEnd": "Último día del mes facturado",
+    "sageExportOpNumber": "Número OP",
+    "sageExportOpNumberEmpty": "Dejar vacío",
+    "sageExportOpNumberInvoice": "Número de factura",
+    "sageExportSaved": "Ajustes de la exportación a Sage guardados",
+    "sageExportSaveFailed": "No se pudieron guardar los ajustes de la exportación a Sage.",
+    "sageExportInvalid": "Valor no válido (máximo {{max}} caracteres; compruebe marcadores y formato)."
   },
   "pnc": {
     "certificates": "Certificados",
@@ -5131,7 +5160,8 @@
       "sessions": "Sesiones",
       "sustainability": "Sostenibilidad",
       "driverActivity": "Actividad del conductor",
-      "nevi": "Cumplimiento NEVI"
+      "nevi": "Cumplimiento NEVI",
+      "sageInvoices": "Exportación de facturas a Sage"
     },
     "formats": {
       "csv": "CSV",

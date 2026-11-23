@@ -101,6 +101,7 @@ const { generatorMocks, mockLogError, mockLogWarn } = vi.hoisted(() => ({
     stationHealth: vi.fn(),
     sustainability: vi.fn(),
     driverActivity: vi.fn(),
+    sageInvoices: vi.fn(),
   },
   mockLogError: vi.fn(),
   mockLogWarn: vi.fn(),
@@ -139,6 +140,11 @@ vi.mock('../report-generators/sustainability-report.js', () => ({
 }));
 vi.mock('../report-generators/driver-activity-report.js', () => ({
   generateDriverActivityReport: generatorMocks.driverActivity,
+}));
+vi.mock('../report-generators/sage-invoices-report.js', () => ({
+  generateSageInvoicesReport: generatorMocks.sageInvoices,
+  sageInvoicesFiltersError: (filters: Record<string, unknown>) =>
+    typeof filters['dateFrom'] === 'string' ? null : 'needs a date range',
 }));
 
 import {
@@ -180,15 +186,27 @@ describe('built-in report generators', () => {
       { type: 'sustainability', formats: all, generateFromUi: true },
       { type: 'driverActivity', formats: all, generateFromUi: true },
       { type: 'nevi', formats: ['xlsx'], generateFromUi: false },
+      { type: 'sageInvoices', formats: ['csv'], generateFromUi: true },
     ]);
   });
 
-  it('gives only NEVI a filter rule', () => {
+  it('gives only NEVI and the Sage export a filter rule', () => {
     const withRule = reportGenerators
       .list()
       .filter((d) => d.validateFilters != null)
       .map((d) => d.type);
-    expect(withRule).toEqual(['nevi']);
+    expect(withRule).toEqual(['nevi', 'sageInvoices']);
+  });
+});
+
+describe('Sage export report type', () => {
+  it('needs payments:read and drivers:read and asks for a date range', () => {
+    expect(reportGenerators.get('sageInvoices')?.requiredPermissions).toEqual([
+      'payments:read',
+      'drivers:read',
+    ]);
+    expect(reportFiltersError('sageInvoices', {})).toBe('needs a date range');
+    expect(reportFiltersError('sageInvoices', { dateFrom: '2026-12-01' })).toBeNull();
   });
 });
 
@@ -217,7 +235,7 @@ describe('reportFiltersError', () => {
   });
 
   it('has no required filters for the other report types', () => {
-    for (const type of REPORT_TYPES.filter((t) => t !== 'nevi')) {
+    for (const type of REPORT_TYPES.filter((t) => t !== 'nevi' && t !== 'sageInvoices')) {
       expect(reportFiltersError(type, {})).toBeNull();
     }
   });
