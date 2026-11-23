@@ -17,6 +17,7 @@ import { CompanySettings } from '@/components/settings/CompanySettings';
 import { InvoiceSellerSettings } from '@/components/settings/InvoiceSellerSettings';
 import { InvoiceIssuerSettings } from '@/components/settings/InvoiceIssuerSettings';
 import { InvoicePaymentSettings } from '@/components/settings/InvoicePaymentSettings';
+import { SageExportSettings } from '@/components/settings/SageExportSettings';
 import { PdfBrandingSettings } from '@/components/settings/PdfBrandingSettings';
 import { PdfLetterheadSettings } from '@/components/settings/PdfLetterheadSettings';
 import { UpdateCheckSettings } from '@/components/settings/UpdateCheckSettings';
@@ -232,6 +233,7 @@ export function Settings(): React.JSX.Element {
             <CompanySettings settings={settings} svgDataUri={svgDataUri} hasIcon={hasIcon} />
             <InvoiceSellerSettings settings={settings} />
             <InvoicePaymentSettings settings={settings} />
+            <SageExportSettings settings={settings} />
             <PdfBrandingSettings settings={settings} />
             <PdfLetterheadSettings />
           </TabsContent>

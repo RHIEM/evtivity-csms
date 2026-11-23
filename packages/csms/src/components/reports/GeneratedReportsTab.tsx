@@ -47,6 +47,7 @@ interface Report {
   reportType: string;
   format: string;
   status: string;
+  error?: string | null;
   fileSize: number | null;
   createdAt: string;
   completedAt: string | null;
@@ -192,6 +193,11 @@ export function GeneratedReportsTab(): React.JSX.Element {
                     <Badge variant={reportStatusVariant(report.status)}>
                       {t(`reports.statuses.${report.status}`, report.status)}
                     </Badge>
+                    {report.status === 'failed' && report.error != null && report.error !== '' && (
+                      <p className="mt-1 max-w-md whitespace-pre-line text-xs text-destructive">
+                        {report.error}
+                      </p>
+                    )}
                   </TableCell>
                   <TableCell>
                     {report.fileSize != null ? formatFileSize(report.fileSize) : '-'}

@@ -4315,7 +4315,36 @@
       "enabled": "새 릴리스 확인",
       "enabledDesc": "켜짐: 서버가 하루에 한 번 evtivity.com에서 최신 릴리스 번호를 읽고, 새 릴리스가 나오면 관리자가 대시보드에서 알림을 봅니다. evtivity.com에는 서버의 IP 주소만 전달되며 브라우저는 접속하지 않습니다. 꺼짐: 아무것도 보내지 않습니다.",
       "offEffect": "서버가 evtivity.com에서 최신 릴리스를 더 이상 읽지 않으며, 새 릴리스가 나와도 관리자에게 알림이 표시되지 않습니다."
-    }
+    },
+    "sageExport": "Sage 내보내기",
+    "sageExportDescription": "Sage 청구서 내보내기 설정(보고서 유형 \"Sage 청구서 내보내기\"). 파일은 RAB 가져오기 형식으로 작성됩니다. 플릿 구성원의 청구서와 대변 전표만 내보냅니다.",
+    "sageExportMandant": "클라이언트(Mandant)",
+    "sageExportMandantHelp": "내보내기 대상 Sage 클라이언트(Mandant). 파일 이름에 사용됩니다.",
+    "sageExportFileName": "파일 이름",
+    "sageExportFileNameHelp": "자리 표시자: {mandant}, {timestamp}. 영문자, 숫자, 마침표, 하이픈, 밑줄만 사용할 수 있습니다.",
+    "sageExportDebtorPrefix": "채권 계정 접두사",
+    "sageExportDebtorPrefixHelp": "차변 계정에서 운전자의 채권자 번호 앞에 붙습니다(예: \"D\").",
+    "sageExportRevenueAccountPrefix": "수익 계정 접두사",
+    "sageExportRevenueAccountPrefixHelp": "대변 계정에서 수익 계정 앞에 붙습니다(예: \"S\").",
+    "sageExportRevenueAccount": "수익 계정",
+    "sageExportRevenueAccountHelp": "청구서 행의 수익(대변) 계정, 접두사 제외.",
+    "sageExportTaxKind": "세금 종류",
+    "sageExportTaxKindHelp": "행의 세금 종류(예: \"UH\").",
+    "sageExportTaxCodes": "세금 코드",
+    "sageExportTaxCodesHelp": "세율(%)별 Sage 세금 코드(예: \"19=3, 7=2\").",
+    "sageExportPaymentTerms": "결제 조건",
+    "sageExportPaymentTermsHelp": "각 행에 기록되는 결제 조건(예: \"BEZDebitor\", 자동이체).",
+    "sageExportPostingText": "전기 텍스트",
+    "sageExportPostingTextHelp": "자리 표시자: {month}, {year}, {invoiceNumber}.",
+    "sageExportBookingDate": "전기일",
+    "sageExportBookingDateInvoice": "청구서 날짜",
+    "sageExportBookingDatePeriodEnd": "청구 월의 마지막 날",
+    "sageExportOpNumber": "OP 번호",
+    "sageExportOpNumberEmpty": "비워 두기",
+    "sageExportOpNumberInvoice": "청구서 번호",
+    "sageExportSaved": "Sage 내보내기 설정이 저장되었습니다",
+    "sageExportSaveFailed": "Sage 내보내기 설정을 저장할 수 없습니다.",
+    "sageExportInvalid": "잘못된 값입니다(최대 {{max}}자, 자리 표시자와 형식을 확인하세요)."
   },
   "pnc": {
     "certificates": "인증서",
@@ -5131,7 +5160,8 @@
       "sessions": "세션",
       "sustainability": "지속가능성",
       "driverActivity": "운전자 활동",
-      "nevi": "NEVI 규정 준수"
+      "nevi": "NEVI 규정 준수",
+      "sageInvoices": "Sage 청구서 내보내기"
     },
     "formats": {
       "csv": "CSV",
