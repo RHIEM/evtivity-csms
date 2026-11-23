@@ -1,6 +1,6 @@
 # Debitorennummer, Portal-Titel und Sage-Export
 
-- **Status:** Freigegeben am 20.11.2026 (Nutzer): Variante B für den Portal-Titel, Abbruch bei fehlender Debitorennummer, Bericht zunächst händisch. Antworten der FIBU (Philipp Krischke, Teams-Abfrage vom 20.11.2026) stehen noch aus; alle davon abhängigen Werte sind Einstellungen, kein Code.
+- **Status:** Alle drei Bausteine umgesetzt und in `rhiem/main` gemergt (23.11.2026), nicht deployt. Freigegeben am 20.11.2026 (Nutzer): Variante B für den Portal-Titel, Abbruch bei fehlender Debitorennummer, Bericht zunächst händisch. Antworten der FIBU (Philipp Krischke, Teams-Abfrage vom 20.11.2026) stehen noch aus; alle davon abhängigen Werte sind Einstellungen, kein Code.
 - **Anlass:** Termin vom 20.11.2026 (siehe `evtivity-prod/Entscheidungen.md`): Rechnungen erstellt und versendet EVtivity am 1. des Monats, die FIBU liest die Rechnungsdaten per Datei in Sage ein; Zahlung per Lastschrift; Debitorennummer je Fahrer.
 - **Basis:** `rhiem/main` (enthält `v0.1.51`). Die Zweige entstehen ausnahmsweise auf Basis von `rhiem/main` (siehe Abschnitt Zweige).
 - **Vorbild für das Format:** RAB-Datei des ERPHelper (`erp-helper/go/internal/entity/rab.go`, `controller/sage_importer.go`).

@@ -91,8 +91,8 @@ function listed(values: readonly string[]): string {
 }
 
 /** The tax rate as a percentage for the tax code lookup: 0.19 is 19, 0.095 is 9.5. */
-function ratePercent(taxRate: number): number {
-  return Math.round(taxRate * 10000) / 100;
+function ratePercent(fraction: number): number {
+  return Math.round(fraction * 10000) / 100;
 }
 
 async function loadConfig(): Promise<{
