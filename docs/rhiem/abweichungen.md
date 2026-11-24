@@ -57,6 +57,7 @@ Eigener Namenskreis `rhiem_NNNN` nach [ADR 0002](adr/0002-eigene-datenbankmigrat
 | `rhiem_0014`                                    | Briefbogen Baustein 1                                                                                    | auf `feature/pdf-letterhead` als `rhiem_0013`, im PR mit Upstream-Nummer                       |
 | `rhiem_0015`                                    | Briefbogen Baustein 2                                                                                    | aktiv                                                                                          |
 | `rhiem_0016`                                    | Debitorennummer                                                                                          | aktiv                                                                                          |
+| `rhiem_0017`                                    | Spalte `fleets.member_invoice_delivery` auf 32 Zeichen (Wert `driver_and_contacts` passte nicht in 16)   | aktiv                                                                                          |
 
 ## Upstream übernommen (Historie)
 
