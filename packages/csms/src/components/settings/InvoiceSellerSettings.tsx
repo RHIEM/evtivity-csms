@@ -16,6 +16,7 @@ import {
   normalizeInvoiceSellerSetting,
 } from '@evtivity/lib/invoice-seller';
 import type { InvoiceSellerSettingKey } from '@evtivity/lib/invoice-seller';
+import { settingText } from '@evtivity/lib/setting-text';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -71,7 +72,8 @@ function storedValues(settings: Record<string, unknown> | undefined): SellerValu
   const values = {} as SellerValues;
   for (const key of INVOICE_SELLER_SETTING_KEYS) {
     const stored = settings?.[key];
-    values[key] = typeof stored === 'string' ? stored : '';
+    // A number-like text (a postal code) comes back from the settings as a number.
+    values[key] = settingText(stored);
   }
   return values;
 }

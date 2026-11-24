@@ -25,6 +25,7 @@ import {
   isTaxBasis,
   normalizeInvoicePaymentSetting,
   type PriceDisplay,
+  settingText,
   type TaxBasis,
 } from '@evtivity/lib';
 import { db } from '../config.js';
@@ -300,7 +301,7 @@ export function readInvoicePaymentSettings(
       | typeof COMPANY_BIC_KEY
       | typeof COMPANY_BANK_NAME_KEY,
   ): string | null => {
-    const value = normalizeInvoicePaymentSetting(key, values[key] ?? '');
+    const value = normalizeInvoicePaymentSetting(key, settingText(values[key]));
     return value != null && value !== '' ? value : null;
   };
   return {

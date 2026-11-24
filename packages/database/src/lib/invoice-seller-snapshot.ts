@@ -8,6 +8,7 @@ import {
   COMPANY_REGISTRATION_NUMBER_KEY,
   COMPANY_TAX_ID_KEY,
   COMPANY_TAX_ID_LABEL_KEY,
+  settingText,
 } from '@evtivity/lib';
 import type { db } from '../config.js';
 import { settings } from '../schema/settings.js';
@@ -51,7 +52,9 @@ const SNAPSHOT_SETTING_KEYS: Record<keyof InvoiceSellerSnapshot, string> = {
 export const INVOICE_SELLER_SNAPSHOT_SETTING_KEYS = Object.values(SNAPSHOT_SETTING_KEYS);
 
 function trimmedOrNull(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+  // A postal code such as 46562 comes back from the settings table as a number.
+  const text = settingText(value).trim();
+  return text !== '' ? text : null;
 }
 
 /** The snapshot from the settings rows (key to value). */

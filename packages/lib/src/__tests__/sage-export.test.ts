@@ -144,6 +144,18 @@ describe('sageExportConfig', () => {
     });
   });
 
+  // The settings table returns a text such as "1" or "84030" as a number.
+  it('takes the Mandant and the account that came back as numbers', () => {
+    const { config, missing } = sageExportConfig({
+      ...stored,
+      [SAGE_MANDANT_KEY]: 1,
+      [SAGE_REVENUE_ACCOUNT_KEY]: 84030,
+    });
+    expect(missing).toEqual([]);
+    expect(config.mandant).toBe('1');
+    expect(config.revenueAccount).toBe('84030');
+  });
+
   it('lists the required settings that are empty, invalid or unset', () => {
     expect(sageExportConfig({}).missing).toEqual([
       SAGE_MANDANT_KEY,

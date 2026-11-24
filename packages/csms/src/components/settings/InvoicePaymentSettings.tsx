@@ -17,6 +17,7 @@ import {
   normalizeInvoicePaymentSetting,
 } from '@evtivity/lib/invoice-payment';
 import type { InvoicePaymentSettingKey } from '@evtivity/lib/invoice-payment';
+import { settingText } from '@evtivity/lib/setting-text';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -69,7 +70,7 @@ function storedValues(settings: Record<string, unknown> | undefined): BankValues
   const values = {} as BankValues;
   for (const key of INVOICE_PAYMENT_SETTING_KEYS) {
     const stored = settings?.[key];
-    const text = typeof stored === 'string' ? stored : '';
+    const text = settingText(stored);
     values[key] = key === COMPANY_IBAN_KEY ? formatIban(text) : text;
   }
   return values;

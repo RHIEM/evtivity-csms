@@ -570,6 +570,7 @@ export {
   parseReleasedCsmsVersion,
 } from './csms-update-check.js';
 
+export { settingText } from './setting-text.js';
 export { sendExpoPush, isExpoPushToken } from './push-send.js';
 export {
   COMPANY_PORTAL_TITLE_KEY,

@@ -9,6 +9,8 @@
  * so the CSMS imports it via `@evtivity/lib/sage-export`.
  */
 
+import { settingText } from './setting-text.js';
+
 export const SAGE_MANDANT_KEY = 'sage.mandant';
 export const SAGE_FILE_NAME_KEY = 'sage.fileName';
 export const SAGE_DEBTOR_PREFIX_KEY = 'sage.debtorPrefix';
@@ -165,7 +167,8 @@ export function sageExportConfig(stored: Record<string, unknown>): {
   missing: SageExportSettingKey[];
 } {
   const value = (key: SageExportSettingKey): string => {
-    const normalized = normalizeSageExportSetting(key, stored[key]);
+    // A number-like text (Mandant "1", account "84030") comes back as a number.
+    const normalized = normalizeSageExportSetting(key, settingText(stored[key]));
     if (normalized != null && normalized !== '') return normalized;
     return SAGE_EXPORT_DEFAULTS[key] ?? '';
   };

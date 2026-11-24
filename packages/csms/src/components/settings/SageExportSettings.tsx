@@ -23,6 +23,7 @@ import {
   normalizeSageExportSetting,
 } from '@evtivity/lib/sage-export';
 import type { SageExportSettingKey } from '@evtivity/lib/sage-export';
+import { settingText } from '@evtivity/lib/setting-text';
 import { SaveButton } from '@/components/save-button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -137,7 +138,8 @@ function storedValues(settings: Record<string, unknown> | undefined): SageValues
   const values = {} as SageValues;
   for (const key of SAGE_EXPORT_SETTING_KEYS) {
     const stored = settings?.[key];
-    values[key] = typeof stored === 'string' ? stored : '';
+    // A number-like text (Mandant "1", account "84030") comes back as a number.
+    values[key] = settingText(stored);
   }
   return values;
 }
