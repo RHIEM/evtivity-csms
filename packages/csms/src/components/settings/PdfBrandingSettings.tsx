@@ -14,6 +14,7 @@ import {
   defaultPdfLogoDataUri,
   normalizePdfFooter,
 } from '@evtivity/lib/pdf-branding';
+import { settingText } from '@evtivity/lib/setting-text';
 import { SaveButton } from '@/components/save-button';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -58,8 +59,7 @@ export function PdfBrandingSettings({ settings }: Props): React.JSX.Element {
   const canWrite = useHasCompanyWidePermission('settings.system:write');
 
   const storedLogo = typeof settings?.[PDF_LOGO_KEY] === 'string' ? settings[PDF_LOGO_KEY] : '';
-  const storedFooter =
-    typeof settings?.[PDF_FOOTER_KEY] === 'string' ? settings[PDF_FOOTER_KEY] : '';
+  const storedFooter = settingText(settings?.[PDF_FOOTER_KEY]);
   const isDefaultLogo = storedLogo === '';
   const [footer, setFooter] = useState(storedFooter);
 

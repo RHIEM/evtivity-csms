@@ -55,6 +55,16 @@ describe('SageExportSettings', () => {
     );
   });
 
+  // The settings table returns a text such as "1" as a number; the field must still show it.
+  it('shows a Mandant and an account that came back as numbers', () => {
+    renderWith({ 'sage.mandant': 1, 'sage.revenueAccount': 84030 });
+    expect(screen.getByLabelText(/settings.sageExportMandant/)).toHaveProperty('value', '1');
+    expect(screen.getByLabelText(/settings.sageExportRevenueAccount( \*)?$/)).toHaveProperty(
+      'value',
+      '84030',
+    );
+  });
+
   it('saves every setting trimmed, empty ones included', async () => {
     renderWith({});
     fireEvent.change(screen.getByLabelText(/settings.sageExportMandant/), {

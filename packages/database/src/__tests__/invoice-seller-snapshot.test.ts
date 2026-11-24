@@ -46,16 +46,23 @@ describe('invoiceSellerSnapshotFromSettings', () => {
     });
   });
 
-  it('trims values and keeps empty, missing and non-string values as null', () => {
+  it('trims values and keeps empty, missing and non-text values as null', () => {
     const snapshot = invoiceSellerSnapshotFromSettings({
       'company.name': '  Acme  ',
       'company.taxId': '   ',
-      'company.zip': 10115,
+      'company.state': { not: 'text' },
     });
     expect(snapshot.name).toBe('Acme');
     expect(snapshot.taxId).toBeNull();
-    expect(snapshot.zip).toBeNull();
+    expect(snapshot.state).toBeNull();
     expect(snapshot.city).toBeNull();
+  });
+
+  // The settings table returns a postal code such as 46562 as a number; it
+  // must reach the invoice as the text that was saved.
+  it('keeps a postal code that came back as a number', () => {
+    const snapshot = invoiceSellerSnapshotFromSettings({ 'company.zip': 46562 });
+    expect(snapshot.zip).toBe('46562');
   });
 });
 

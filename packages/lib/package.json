@@ -26,6 +26,9 @@
     "./currency": {
       "import": "./src/currency.ts"
     },
+    "./setting-text": {
+      "import": "./src/setting-text.ts"
+    },
     "./portal-title": {
       "import": "./src/portal-title.ts"
     },

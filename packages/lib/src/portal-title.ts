@@ -7,6 +7,8 @@
  * stands on invoices, in the portal footer and in the address block of emails.
  * Unset, it falls back to the company name.
  */
+import { settingText } from './setting-text.js';
+
 export const COMPANY_PORTAL_TITLE_KEY = 'company.portalTitle';
 export const PORTAL_TITLE_MAX_LENGTH = 100;
 
@@ -17,7 +19,8 @@ export function resolvePortalTitle(
   fallback = 'EVtivity',
 ): string {
   for (const value of [portalTitle, companyName]) {
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    const text = settingText(value).trim();
+    if (text !== '') return text;
   }
   return fallback;
 }

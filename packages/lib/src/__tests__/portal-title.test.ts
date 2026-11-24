@@ -13,7 +13,13 @@ describe('resolvePortalTitle', () => {
     expect(resolvePortalTitle(undefined, 'Acme')).toBe('Acme');
     expect(resolvePortalTitle('', 'Acme')).toBe('Acme');
     expect(resolvePortalTitle('   ', 'Acme')).toBe('Acme');
-    expect(resolvePortalTitle(42, 'Acme')).toBe('Acme');
+    expect(resolvePortalTitle({}, 'Acme')).toBe('Acme');
+    expect(resolvePortalTitle(null, 'Acme')).toBe('Acme');
+  });
+
+  // The settings table returns a title that is valid JSON, such as 2027, as a number.
+  it('takes a title that the settings table returned as a number', () => {
+    expect(resolvePortalTitle(2027, 'Acme')).toBe('2027');
   });
 
   it('falls back to the default when both are unset', () => {
