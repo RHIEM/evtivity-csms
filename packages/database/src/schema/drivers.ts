@@ -518,7 +518,7 @@ export const fleets = pgTable(
     settlementNote: varchar('settlement_note', { length: 500 }),
     // Who the member invoices and their credit notes are emailed to
     // (MEMBER_INVOICE_DELIVERIES): the member or the fleet's billing contacts.
-    memberInvoiceDelivery: varchar('member_invoice_delivery', { length: 16 })
+    memberInvoiceDelivery: varchar('member_invoice_delivery', { length: 32 })
       .$type<MemberInvoiceDelivery>()
       .notNull()
       .default('driver'),
