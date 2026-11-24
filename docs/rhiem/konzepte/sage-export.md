@@ -83,6 +83,12 @@ Entschieden am 20.11.2026: Portal-Titel als Produktname auch in E-Mails (Variant
 
 Offen, nach Antwort der FIBU: Eindeutigkeit der Debitorennummer erzwingen oder nicht, Format der Nummer, und die konkreten Werte der Einstellungen (Mandant, Konten, Steuercode, Zahlungskondition u. a.).
 
+## Antworten der FIBU (Philipp Krischke, 23.11.2026)
+
+Mandant `1` (RPP), Debitor `D` + 5 Stellen (je Mitarbeitende ein Debitor, die FIBU legt ihn in Sage an und nennt ihn für EVtivity), Erlöskonto `S84030` („Erlöse aus Ladestrom 19%“), Steuerart `UH`, Steuercode `101` (19 % USt), Zahlungskondition `BEZDebitor`, Buchungsdatum letzter Tag des Leistungsmonats (auch Gutschriften), OP-Nummer = Rechnungsnummer, Gutschriften negativ. Buchungstext `E-Laden {month}/{year} - PERSNR. {employeeNumber}` (die FIBU stimmt sich dazu noch mit FRH ab). Dateiname als CSV, mit Unterstrichen und Leistungsmonat, z. B. `Abrechnung_E-Laden_{year}-{month}.csv` (kein „/“ in Dateinamen möglich; entschieden mit dem Nutzer, 23.11.2026).
+
+Daraus folgt Code in `feature/sage-export-filename-posting`: Platzhalter `{year}`/`{month}` im Dateinamen (frühester Leistungsmonat der Zeilen, sonst Monat von `dateFrom`) und `{employeeNumber}` im Buchungstext (fehlt die Personalnummer, bricht der Export mit Liste ab). Alles andere sind Einstellungen.
+
 ## Zweige
 
 Die Bausteine hängen am Code der Personalnummer und der Unternehmenseinstellungen von `rhiem/main` und sind RHIEM-spezifisch; sie entstehen deshalb ausnahmsweise als `feature/…` auf Basis von `rhiem/main` und nicht vom Tag: `feature/driver-debtor-number`, `feature/sage-rab-report`, `feature/portal-title`.

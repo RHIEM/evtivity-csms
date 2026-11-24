@@ -19,7 +19,11 @@ function chain(): unknown {
 
 vi.mock('@evtivity/database', () => ({
   db: { select: vi.fn(() => chain()) },
-  drivers: { id: 'drivers.id', debtorNumber: 'drivers.debtor_number' },
+  drivers: {
+    id: 'drivers.id',
+    debtorNumber: 'drivers.debtor_number',
+    employeeNumber: 'drivers.employee_number',
+  },
   invoices: {
     id: 'invoices.id',
     invoiceNumber: 'invoices.invoice_number',
@@ -62,6 +66,7 @@ const INVOICE = {
   periodEnd: '2026-11-30',
   currency: 'EUR',
   debtorNumber: '10001',
+  employeeNumber: '5678',
 };
 
 const CREDIT_NOTE = {
@@ -149,6 +154,38 @@ describe('generateSageInvoicesReport', () => {
     expect(fileName).toBe('RAB-2.txt');
     expect(data.toString('utf8')).toContain(
       '30.11.2026;01.12.2026;INV-202611-0001;INV-202611-0001;Ladestrom 11/2026 INV-202611-0001;K10001;',
+    );
+  });
+
+  it('puts the employee number in the posting text and the billed month in the file name', async () => {
+    selectResults.push(
+      [
+        ...SETTINGS,
+        { key: 'sage.postingText', value: 'E-Laden {month}/{year} - PERSNR. {employeeNumber}' },
+        { key: 'sage.fileName', value: 'Abrechnung_E-Laden_{year}-{month}.csv' },
+      ],
+      [INVOICE],
+      [{ invoiceId: 'inv_1', taxRate: '0.19', netCents: 3950, taxCents: 750 }],
+    );
+
+    const { data, fileName } = await run();
+
+    expect(fileName).toBe('Abrechnung_E-Laden_2026-11.csv');
+    expect(data.toString('utf8')).toContain(';E-Laden 11/2026 - PERSNR. 5678;');
+  });
+
+  it('stops with the invoices without an employee number when the posting text needs it', async () => {
+    selectResults.push(
+      [...SETTINGS, { key: 'sage.postingText', value: 'E-Laden - PERSNR. {employeeNumber}' }],
+      [INVOICE, { ...CREDIT_NOTE, employeeNumber: null }],
+      [
+        { invoiceId: 'inv_1', taxRate: '0.19', netCents: 3950, taxCents: 750 },
+        { invoiceId: 'inv_2', taxRate: '0.19', netCents: -988, taxCents: -187 },
+      ],
+    );
+
+    await expect(run(FILTERS, 'de')).rejects.toThrow(
+      'Ohne Personalnummer des Fahrers (der Buchungstext verlangt sie): CN-202611-0001.',
     );
   });
 
