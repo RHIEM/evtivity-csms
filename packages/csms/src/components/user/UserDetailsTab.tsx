@@ -224,7 +224,11 @@ export function UserDetailsTab({
       firstName,
       lastName,
       phone: phone.trim() || null,
-      roleId,
+      // Only a changed role is sent: the API asks for a fresh proof whenever the
+      // role's defaults hold a permission the user lacks, also for an unchanged
+      // role (a user with a hand-picked set), and the form shows the proof field
+      // only for a changed role.
+      ...(roleId !== user.roleId ? { roleId } : {}),
       isActive,
       hasAllSiteAccess,
       siteIds: hasAllSiteAccess ? [] : selectedSiteIds,
