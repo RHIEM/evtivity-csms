@@ -90,3 +90,39 @@ describe('UserDetailsTab site access', () => {
     expect(screen.queryByText('users.siteAccessRequired')).toBeNull();
   });
 });
+
+describe('UserDetailsTab role', () => {
+  afterEach(() => {
+    cleanup();
+    getMock.mockReset();
+    patchMock.mockReset();
+  });
+
+  // RHIEM: an unchanged role must not be sent, else the API asks for a password
+  // proof the form never shows (user with a hand-picked permission set).
+  it('does not send the role when it is unchanged', async () => {
+    siteAccess.all = true;
+    getMock.mockResolvedValue({ data: [] });
+    patchMock.mockResolvedValue(USER);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <UserDetailsTab
+          user={{ ...USER, hasAllSiteAccess: true, siteIds: [] }}
+          userId="usr_1"
+          roles={[{ id: 'rol_operator', name: 'operator' }]}
+          canAdminister
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'common.edit' }));
+    const form = (await screen.findByLabelText('common.email')).closest('form') as HTMLFormElement;
+    fireEvent.submit(form);
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalled();
+    });
+    const body = patchMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(body).not.toHaveProperty('roleId');
+    expect(body).toHaveProperty('firstName', 'Op');
+  });
+});
